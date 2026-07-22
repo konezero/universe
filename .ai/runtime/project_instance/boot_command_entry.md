@@ -1,5 +1,18 @@
 # universe Boot Command Entry
 
+## Project-Owned Mode Entry
+
+`유니버스모드` / `유니버스` / `UNIVERSE` / `UNIVERSE mode`
+  -> internal `MODE_CHANGE`
+  -> resolve `UNIVERSE` from `.ai/runtime/project_instance/mode_registry.json`
+  -> Role `NAVIGATOR`
+  -> Scope `cross-project-context/path-navigation`
+
+`UNIVERSE` is the normal Universe operating Mode. `MASTER` remains the
+immutable root and maintenance Mode for Mode Registry, policy, schema,
+release, and Runtime lifecycle changes. Generic `BOOT` proposes registered
+Mode selection; it does not silently replace `MASTER` as the Registry root.
+
 <!-- ai-career-project-runtime-overlay:start -->
 ## Managed ai-career Runtime Binding
 
