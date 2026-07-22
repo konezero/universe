@@ -106,6 +106,8 @@ GENERATED_SURFACE_CLASSES = {
         "generated_project_instance"
     ),
     ".ai/runtime/continuity/.gitignore": "generated_state",
+    ".ai/runtime/task_frames/.gitignore": "generated_state",
+    ".ai/runtime/tmp/.gitignore": "generated_state",
     ".ai/runtime/state/session.md": "generated_state",
     ".ai/runtime/state/current_anchor_frame.md": "generated_state",
     VALIDATION_LATEST_PATH: "validation_evidence",
@@ -2071,7 +2073,11 @@ def _render_generated_surface(
             Execution Assignment: UNASSIGNED
             """
         )
-    if target_path == ".ai/runtime/continuity/.gitignore":
+    if target_path in {
+        ".ai/runtime/continuity/.gitignore",
+        ".ai/runtime/task_frames/.gitignore",
+        ".ai/runtime/tmp/.gitignore",
+    }:
         return b"*\n!.gitignore\n"
     if target_path == ".ai/runtime/state/session.md":
         return _markdown(

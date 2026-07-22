@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: ef2aa94d4ae0d985c7cfb9e2b523e94d067a7481
+Source Commit: fda8df56d46730045d511dfb4539356d89981a16
 
 ## Entry
 
@@ -158,6 +158,8 @@ Source Commit: ef2aa94d4ae0d985c7cfb9e2b523e94d067a7481
 - `.ai/runtime/project_instance/validation/latest.md`
 - `.ai/runtime/state/current_anchor_frame.md`
 - `.ai/runtime/state/session.md`
+- `.ai/runtime/task_frames/.gitignore`
+- `.ai/runtime/tmp/.gitignore`
 - `AGENTS.md`
 - `REPOSITORY_MANIFEST.md`
 

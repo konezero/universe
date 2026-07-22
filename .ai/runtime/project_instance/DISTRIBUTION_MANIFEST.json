@@ -19,13 +19,15 @@
     "gcs"
   ],
   "generated_surface_hashes": {
-    ".ai/core/README.md": "ca502eb6b89d4e7094bb4f4a09b96b46a038f8d55ac06c1d16abed943247ea8a",
+    ".ai/core/README.md": "c86006a797048561d87d58d49beb164a75fdff006b250d50d6a4fa6b8819e1cc",
     ".ai/runtime/continuity/.gitignore": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d",
-    ".ai/runtime/project_instance/VERSION_MANIFEST.md": "c784a204d859b3ccf019c198a3106b68e99a2ece5b94e62a99e94ccc24eb8885",
+    ".ai/runtime/project_instance/VERSION_MANIFEST.md": "72e2cc606283688747b394c9fe42d170d7b8bee217e80a64add773f7196daa86",
     ".ai/runtime/project_instance/scope_policy.md": "85c338d4cdc2778392ebc8c204189a85f95ef84297f3543821d5b303131f89da",
     ".ai/runtime/project_instance/status.md": "1ed1d1e41472a0f94d9380cab606744764bd46029ff50f2a291bf46b01a74f9c",
-    ".ai/runtime/project_instance/validation/history.md": "9f6e33a0587d5e8d94e84bdaaea6213d610a57549deacdb91c6d969548772a50",
-    ".ai/runtime/project_instance/validation/latest.md": "6f5fc5994915932e17480702becb9dc9bb521b8fec35d708e4a668faf8d8e6dd"
+    ".ai/runtime/project_instance/validation/history.md": "2f27b8b4a649f5af832e81a3745aa82e5bb3e1be0f91b1196e9ba49c52781911",
+    ".ai/runtime/project_instance/validation/latest.md": "4a32fef70c5702b6947c1e3f2319952a409a6708131324c9524ea63344e26f41",
+    ".ai/runtime/task_frames/.gitignore": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d",
+    ".ai/runtime/tmp/.gitignore": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d"
   },
   "generated_surfaces": [
     {
@@ -127,6 +129,16 @@
     },
     {
       "class": "generated_state",
+      "required": true,
+      "target_path": ".ai/runtime/task_frames/.gitignore"
+    },
+    {
+      "class": "generated_state",
+      "required": true,
+      "target_path": ".ai/runtime/tmp/.gitignore"
+    },
+    {
+      "class": "generated_state",
       "integrity_policy": "semantic",
       "ownership": "project-runtime-state",
       "required": true,
@@ -209,6 +221,8 @@
       ".ai/runtime/project_instance/memory",
       ".ai/runtime/project_instance/validation",
       ".ai/runtime/proof",
+      ".ai/runtime/task_frames",
+      ".ai/runtime/tmp",
       ".ai/sessions/checkpoints"
     ],
     "scan_classes": [
@@ -223,8 +237,8 @@
   "managed_overlay_hashes": {
     ".ai/START_HERE.md": "0f5e44489ef61365983d73ddc7a0c9822e46efbe2483bea95c1a981189b76d64",
     ".ai/runtime/project_instance/boot_command_entry.md": "cbfe6d47fa0570848896b668427db83bfa254ff9b8c1204d2185b96a883390cc",
-    ".ai/runtime/project_instance/os_install.md": "9f5e62799825b1ea2bfe4291d2d7d2f97277904d69b198d83e04fcef46e6c0ff",
-    ".ai/runtime/project_instance/project_anchor.md": "e02ce1cfdc5167e3f23cd24eeeac5c780e94805a7f8417c7afd943d169e1c3e0",
+    ".ai/runtime/project_instance/os_install.md": "dfbfae6867c993e340ea3a88db55bda45947d0e829910b4c1874188b969423c0",
+    ".ai/runtime/project_instance/project_anchor.md": "484b90b656de1d8f072ea74d77c8e74b8475d925448625a6ae6a3707e5c7c44c",
     ".ai/runtime/project_instance/role_selection_gate.md": "a1e70a97d5c761e12a92e8d84f33fdf0a721d7508cecad218a293b6df8c4167d",
     ".ai/runtime/project_instance/runtime_anchor_frame.md": "507a9ad418aea1fc9b750dd4bfc554d0c956c783da87d7757ac0396058f118ae",
     "AGENTS.md": "a9474a6c695e9e049706951196a7a485da7cb3bfdf5bcaae7f9950ed85439f31",
@@ -534,7 +548,7 @@
     {
       "class": "generated_core_index",
       "integrity_policy": "exact",
-      "local_sha256": "ca502eb6b89d4e7094bb4f4a09b96b46a038f8d55ac06c1d16abed943247ea8a",
+      "local_sha256": "c86006a797048561d87d58d49beb164a75fdff006b250d50d6a4fa6b8819e1cc",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -858,7 +872,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "exact",
-      "local_sha256": "c784a204d859b3ccf019c198a3106b68e99a2ece5b94e62a99e94ccc24eb8885",
+      "local_sha256": "72e2cc606283688747b394c9fe42d170d7b8bee217e80a64add773f7196daa86",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -894,7 +908,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "semantic",
-      "local_sha256": "db765064ee709f6a2f829b9a35a2bb829e39a152550981af02eaf16e6baae77a",
+      "local_sha256": "0fc88a630b00e2445605f87244c65327ab859dd2e2d5ad928cb219967cb5290f",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -906,7 +920,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "semantic",
-      "local_sha256": "3f6f9a9b59c74fe3604d076f85fa022984128c95f163d8dbdaa56d3978c5bbbd",
+      "local_sha256": "d15394ec7032b39f6643b9454f64124639c30c3578d9ee5357dcc88bd1220110",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -966,7 +980,7 @@
     {
       "class": "validation_evidence",
       "integrity_policy": "exact",
-      "local_sha256": "9f6e33a0587d5e8d94e84bdaaea6213d610a57549deacdb91c6d969548772a50",
+      "local_sha256": "2f27b8b4a649f5af832e81a3745aa82e5bb3e1be0f91b1196e9ba49c52781911",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -978,7 +992,7 @@
     {
       "class": "validation_evidence",
       "integrity_policy": "exact",
-      "local_sha256": "6f5fc5994915932e17480702becb9dc9bb521b8fec35d708e4a668faf8d8e6dd",
+      "local_sha256": "4a32fef70c5702b6947c1e3f2319952a409a6708131324c9524ea63344e26f41",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -990,12 +1004,12 @@
     {
       "class": "runtime",
       "integrity_policy": "exact",
-      "local_sha256": "9d004442b122218c1fbc925cfaaf5b5db70d8f1dc1c73f251bf46dfb3d445281",
+      "local_sha256": "5509e214f3dae2a19d1f57c473ebf2a0b79a0fa7c8f747a48c8abfe0fa74f217",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "580883be52b4cc69be5a1653536fcd99bc4ff461",
+      "source_blob_oid": "2470f165ddded8a8124e51bfbd2c75a176dc5209",
       "source_path": ".ai/runtime/reference_runtime/README.md",
-      "source_sha256": "9d004442b122218c1fbc925cfaaf5b5db70d8f1dc1c73f251bf46dfb3d445281",
+      "source_sha256": "5509e214f3dae2a19d1f57c473ebf2a0b79a0fa7c8f747a48c8abfe0fa74f217",
       "target_path": ".ai/runtime/reference_runtime/README.md",
       "update_policy": "replace_if_owned"
     },
@@ -1336,14 +1350,38 @@
       "update_policy": "initialize_if_absent"
     },
     {
+      "class": "generated_state",
+      "integrity_policy": "exact",
+      "local_sha256": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d",
+      "ownership": "project-runtime-installer",
+      "required": true,
+      "source_blob_oid": null,
+      "source_path": null,
+      "source_sha256": null,
+      "target_path": ".ai/runtime/task_frames/.gitignore",
+      "update_policy": "regenerate_if_owned"
+    },
+    {
+      "class": "generated_state",
+      "integrity_policy": "exact",
+      "local_sha256": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d",
+      "ownership": "project-runtime-installer",
+      "required": true,
+      "source_blob_oid": null,
+      "source_path": null,
+      "source_sha256": null,
+      "target_path": ".ai/runtime/tmp/.gitignore",
+      "update_policy": "regenerate_if_owned"
+    },
+    {
       "class": "installer",
       "integrity_policy": "exact",
-      "local_sha256": "49f970952ffaa34ec96b2052f531acb7f93c38aad653f6cdcc0c4e3f1cd68826",
+      "local_sha256": "b8324e8184fae491f195f6441fe0f6c5c96d92a2e71ee361eb424f42bbaad4d4",
       "ownership": "ai-career-project-runtime-installer",
       "required": true,
-      "source_blob_oid": "d16c595395cf4ec4b8d6416e1b54469983bee974",
+      "source_blob_oid": "36fc1c91d332b475d23904dee3280b7d8dfe698d",
       "source_path": ".ai/distribution/context_management_runtime_pack/project_runtime_installer.py",
-      "source_sha256": "49f970952ffaa34ec96b2052f531acb7f93c38aad653f6cdcc0c4e3f1cd68826",
+      "source_sha256": "b8324e8184fae491f195f6441fe0f6c5c96d92a2e71ee361eb424f42bbaad4d4",
       "target_path": ".ai/runtime/tools/project_runtime_installer.py",
       "update_policy": "replace_if_owned"
     },
@@ -1410,12 +1448,12 @@
     {
       "class": "skill",
       "integrity_policy": "exact",
-      "local_sha256": "71fa2dd2fa35c8c3a6ae054a933dfa409d3fd0f2d2de6aa3bc25a6e2ec2e25c5",
+      "local_sha256": "56d7d6375c3eb766b1dfb9abf05c70fad9bc59e5ac0337df5d723ed03b5b3f51",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "a20ea8671aebb089aa5cde97ed0295e0587bd1db",
+      "source_blob_oid": "fc3718e04f83e2b98728a3a704426c1452c6c6cc",
       "source_path": ".ai/skills/common/execution-guard/SKILL.md",
-      "source_sha256": "71fa2dd2fa35c8c3a6ae054a933dfa409d3fd0f2d2de6aa3bc25a6e2ec2e25c5",
+      "source_sha256": "56d7d6375c3eb766b1dfb9abf05c70fad9bc59e5ac0337df5d723ed03b5b3f51",
       "target_path": ".ai/skills/common/execution-guard/SKILL.md",
       "update_policy": "replace_if_owned"
     },
@@ -1807,8 +1845,8 @@
   "package": {
     "manifest_path": ".ai/distribution/context_management_runtime_pack/project_runtime_distribution_manifest.json",
     "name": "context-management-project-runtime",
-    "source_blob_oid": "5bd2e95b6a71e135eb96f687d1cc24828c783507",
-    "source_sha256": "4fbe5f6bc6d73841756007bd8c7dd16fba65e6372483600c63561bfaaf2cd824"
+    "source_blob_oid": "1d01601e8f21d7a3d36ef7e3df7751e9a652220b",
+    "source_sha256": "efd270d936617dc7613a2ba74e5111af6398d18fb3089b6edd05b63db4f8a796"
   },
   "package_schema": "ai-career.project-runtime-distribution.v1",
   "registry": {
@@ -2003,7 +2041,7 @@
     "bundle_manifest_sha256": "NOT_APPLICABLE",
     "capability_evidence_ref": "NOT_APPLICABLE",
     "cleanliness": "CLEAN",
-    "commit": "ef2aa94d4ae0d985c7cfb9e2b523e94d067a7481",
+    "commit": "fda8df56d46730045d511dfb4539356d89981a16",
     "commit_date": "2026-07-22",
     "provider": "local-git",
     "read_policy": "git-show-single-immutable-commit",

@@ -163,6 +163,18 @@ Windows PowerShell. Unsupported input encoding returns
 request file remains the preferred cross-Host transport because a parent shell
 may irreversibly replace characters before the child process receives them.
 
+Repository-local temporary request and approval files must be created under:
+
+```text
+<project-root>/.ai/runtime/tmp/
+```
+
+Use a bounded filename, pass it through `--request`, and delete it after the
+command completes. Do not place Runtime transport files in the project root,
+the parent workspace, or project-owned source directories. The installed
+directory-local `.gitignore` keeps transient transport data outside commits;
+the directory is not durable evidence.
+
 An unsupported capability returns `UNKNOWN` and a nonzero exit code. The CLI
 does not implement `OS_UPDATE` or `OS_VALIDATE`, and it is not an installer.
 `os-status source-only` accepts only an immutable provider-observed source and

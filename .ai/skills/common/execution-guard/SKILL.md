@@ -154,6 +154,13 @@ characters, the Runtime cannot reconstruct them. Use a UTF-8 request file or
 set `$OutputEncoding` to UTF-8 before creating the pipeline. Encoding failure
 must return `UNKNOWN` without issuing a receipt or performing mutation.
 
+When the repository Runtime is installed, create temporary request and
+approval JSON only under `<project-root>/.ai/runtime/tmp/`. Use a bounded
+filename and delete it after the command completes. Do not use the project
+root, its parent workspace, or a project-owned source directory for Runtime
+transport data. The directory-local `.gitignore` excludes transient contents;
+that exclusion does not make them durable evidence.
+
 `pre_write_hook: AVAILABLE` requires concrete Host evidence that the actual
 mutation path is receipt-aware. Generic access to a file or shell tool is not a
 pre-write hook. When that capability is not provable, keep it `UNKNOWN` and
