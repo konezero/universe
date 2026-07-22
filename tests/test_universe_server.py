@@ -13,7 +13,14 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from universe_server import UniverseError, create_server  # noqa: E402
+from universe_server import (  # noqa: E402
+    ConnectionCapabilities,
+    UniverseError,
+    auth_provider_for,
+    connection_profile,
+    create_server,
+    interface_profile,
+)
 
 
 class UniverseLocalServiceTests(unittest.TestCase):
@@ -108,6 +115,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, result = self.request("GET", "/health")
         self.assertEqual(200, status)
         self.assertEqual("READY", result["status"])
+        self.assertEqual("LOCAL", result["connection"]["kind"])
+        self.assertEqual("HTTP", result["connection"]["transport_kind"])
+        self.assertEqual("LOCAL_TOKEN", result["connection"]["auth"]["type"])
+        self.assertNotIn("token", result["connection"]["auth"])
+        self.assertTrue(result["connection"]["capabilities"]["realtime"])
+        self.assertEqual("HTTP_API", result["interfaces"][0]["kind"])
 
         status, result = self.request("GET", "/v1/projects")
         self.assertEqual(401, status)
@@ -196,6 +209,93 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 token="token",
                 host="0.0.0.0",
             )
+
+    def test_remote_auth_types_are_reserved_without_runtime_implementation(self) -> None:
+        profile = connection_profile(
+            connection_id="personal-cloud",
+            kind="REMOTE",
+            transport_kind="GIT",
+            endpoint="https://universe.example.com",
+            auth_type="OAUTH2",
+            credential_ref="os-keychain://universe/personal-cloud",
+            capabilities=ConnectionCapabilities(
+                read=True,
+                append=True,
+                realtime=False,
+                bidirectional=True,
+                durable=True,
+            ),
+        )
+        self.assertEqual("REMOTE", profile.kind)
+        self.assertEqual("GIT", profile.transport_kind)
+        self.assertEqual("OAUTH2", profile.auth.auth_type)
+        with self.assertRaisesRegex(UniverseError, "reserved but not implemented"):
+            auth_provider_for(profile, "not-used")
+
+    def test_local_connection_profile_requires_loopback(self) -> None:
+        with self.assertRaisesRegex(UniverseError, "loopback"):
+            connection_profile(
+                connection_id="local",
+                kind="LOCAL",
+                transport_kind="HTTP",
+                endpoint="https://universe.example.com",
+                auth_type="LOCAL_TOKEN",
+                credential_ref="server-state://token",
+                capabilities=ConnectionCapabilities(
+                    read=True,
+                    append=True,
+                    realtime=True,
+                    bidirectional=True,
+                    durable=True,
+                ),
+            )
+
+    def test_mcp_is_an_interface_not_a_transport(self) -> None:
+        profile = interface_profile(
+            interface_id="mcp-server",
+            kind="MCP",
+            direction="INBOUND",
+            active=False,
+        )
+        self.assertEqual("MCP", profile.kind)
+        self.assertFalse(profile.active)
+
+        with self.assertRaisesRegex(UniverseError, "transport kind"):
+            connection_profile(
+                connection_id="invalid-mcp-transport",
+                kind="REMOTE",
+                transport_kind="MCP",
+                endpoint="https://universe.example.com",
+                auth_type="OAUTH2",
+                credential_ref="os-keychain://universe/invalid",
+                capabilities=ConnectionCapabilities(
+                    read=True,
+                    append=True,
+                    realtime=True,
+                    bidirectional=True,
+                    durable=True,
+                ),
+            )
+
+    def test_reserved_p2p_transport_does_not_inherit_http_address_rules(self) -> None:
+        profile = connection_profile(
+            connection_id="peer-universe",
+            kind="PEER",
+            transport_kind="P2P",
+            endpoint="peer://universe/example",
+            auth_type="PEER_KEY",
+            credential_ref="os-keychain://universe/peer/example",
+            capabilities=ConnectionCapabilities(
+                read=True,
+                append=True,
+                realtime=True,
+                bidirectional=True,
+                durable=False,
+            ),
+        )
+        self.assertEqual("peer://universe/example", profile.endpoint)
+        with self.assertRaisesRegex(UniverseError, "reserved but not implemented"):
+            auth_provider_for(profile, "not-used")
 
 
 if __name__ == "__main__":

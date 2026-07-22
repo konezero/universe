@@ -10,11 +10,12 @@ import sqlite3
 import tempfile
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -23,9 +24,18 @@ from urllib.request import Request, urlopen
 API_SCHEMA = "universe.local-service.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
+CONNECTION_PROFILE_SCHEMA = "universe.connection-profile.v1"
+AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
+INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
+CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+CONNECTION_KINDS = frozenset({"LOCAL", "REMOTE", "PEER"})
+TRANSPORT_KINDS = frozenset({"HTTP", "GIT", "P2P"})
+INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
+ADAPTER_DIRECTIONS = frozenset({"INBOUND", "OUTBOUND"})
+AUTH_TYPES = frozenset({"LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 ALLOWED_REF_KEYS = frozenset(
     {"manifest", "mode_registry", "runtime_status", "anchor_store"}
 )
@@ -43,6 +53,102 @@ class UniverseError(ValueError):
         self.code = code
         self.detail = detail
         self.status = int(status)
+
+
+@dataclass(frozen=True)
+class AuthProfile:
+    auth_type: str
+    credential_ref: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "schema": AUTH_PROFILE_SCHEMA,
+            "type": self.auth_type,
+            "credential_ref": self.credential_ref,
+        }
+
+
+@dataclass(frozen=True)
+class ConnectionCapabilities:
+    read: bool
+    append: bool
+    realtime: bool
+    bidirectional: bool
+    durable: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": CAPABILITY_PROFILE_SCHEMA,
+            "read": self.read,
+            "append": self.append,
+            "realtime": self.realtime,
+            "bidirectional": self.bidirectional,
+            "durable": self.durable,
+        }
+
+
+@dataclass(frozen=True)
+class ConnectionProfile:
+    connection_id: str
+    kind: str
+    transport_kind: str
+    endpoint: str
+    auth: AuthProfile
+    capabilities: ConnectionCapabilities
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": CONNECTION_PROFILE_SCHEMA,
+            "connection_id": self.connection_id,
+            "kind": self.kind,
+            "transport_kind": self.transport_kind,
+            "endpoint": self.endpoint,
+            "auth": self.auth.as_dict(),
+            "capabilities": self.capabilities.as_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class InterfaceProfile:
+    interface_id: str
+    kind: str
+    direction: str
+    active: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": INTERFACE_PROFILE_SCHEMA,
+            "interface_id": self.interface_id,
+            "kind": self.kind,
+            "direction": self.direction,
+            "active": self.active,
+        }
+
+
+class AuthProvider(Protocol):
+    auth_type: str
+
+    def headers(self) -> dict[str, str]: ...
+
+
+class UniverseTransport(Protocol):
+    def request_json(
+        self,
+        *,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]: ...
+
+
+class LocalTokenAuthProvider:
+    auth_type = "LOCAL_TOKEN"
+
+    def __init__(self, token: str):
+        self._token = _required_text(token, "token")
+
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
 
 
 def utc_now() -> str:
@@ -68,6 +174,173 @@ def _required_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise UniverseError("REQUEST_INVALID", f"{field} must be non-empty text")
     return value.strip()
+
+
+def connection_profile(
+    *,
+    connection_id: str,
+    kind: str,
+    transport_kind: str,
+    endpoint: str,
+    auth_type: str,
+    credential_ref: str,
+    capabilities: ConnectionCapabilities,
+) -> ConnectionProfile:
+    normalized_id = _required_text(connection_id, "connection_id")
+    normalized_kind = _required_text(kind, "connection_kind").upper()
+    normalized_transport = _required_text(
+        transport_kind, "transport_kind"
+    ).upper()
+    normalized_auth = _required_text(auth_type, "auth_type").upper()
+    normalized_endpoint = _required_text(endpoint, "endpoint").rstrip("/")
+    if normalized_kind not in CONNECTION_KINDS:
+        raise UniverseError(
+            "CONNECTION_KIND_INVALID",
+            f"unsupported connection kind: {normalized_kind}",
+        )
+    if normalized_auth not in AUTH_TYPES:
+        raise UniverseError(
+            "AUTH_TYPE_INVALID",
+            f"unsupported authentication type: {normalized_auth}",
+        )
+    if normalized_transport not in TRANSPORT_KINDS:
+        raise UniverseError(
+            "TRANSPORT_KIND_INVALID",
+            f"unsupported transport kind: {normalized_transport}",
+        )
+    if not isinstance(capabilities, ConnectionCapabilities):
+        raise UniverseError(
+            "CONNECTION_CAPABILITIES_INVALID",
+            "capabilities must be a ConnectionCapabilities value",
+        )
+    if normalized_transport == "HTTP":
+        parsed = urlsplit(normalized_endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise UniverseError(
+                "CONNECTION_ENDPOINT_INVALID",
+                "HTTP transport endpoint must be an absolute HTTP or HTTPS URL",
+            )
+        if normalized_kind == "LOCAL":
+            try:
+                address = ipaddress.ip_address(parsed.hostname)
+            except ValueError as error:
+                raise UniverseError(
+                    "LOCAL_CONNECTION_ENDPOINT_INVALID",
+                    "local HTTP endpoint must use a literal loopback address",
+                ) from error
+            if not address.is_loopback:
+                raise UniverseError(
+                    "LOCAL_CONNECTION_ENDPOINT_INVALID",
+                    "local HTTP endpoint must use a loopback address",
+                )
+    return ConnectionProfile(
+        connection_id=normalized_id,
+        kind=normalized_kind,
+        transport_kind=normalized_transport,
+        endpoint=normalized_endpoint,
+        auth=AuthProfile(
+            auth_type=normalized_auth,
+            credential_ref=_required_text(credential_ref, "credential_ref"),
+        ),
+        capabilities=capabilities,
+    )
+
+
+def local_connection_profile(endpoint: str) -> ConnectionProfile:
+    return connection_profile(
+        connection_id="local",
+        kind="LOCAL",
+        transport_kind="HTTP",
+        endpoint=endpoint,
+        auth_type="LOCAL_TOKEN",
+        credential_ref="server-state://token",
+        capabilities=ConnectionCapabilities(
+            read=True,
+            append=True,
+            realtime=True,
+            bidirectional=True,
+            durable=True,
+        ),
+    )
+
+
+def interface_profile(
+    *, interface_id: str, kind: str, direction: str, active: bool
+) -> InterfaceProfile:
+    normalized_kind = _required_text(kind, "interface_kind").upper()
+    normalized_direction = _required_text(direction, "interface_direction").upper()
+    if normalized_kind not in INTERFACE_KINDS:
+        raise UniverseError(
+            "INTERFACE_KIND_INVALID",
+            f"unsupported interface kind: {normalized_kind}",
+        )
+    if normalized_direction not in ADAPTER_DIRECTIONS:
+        raise UniverseError(
+            "INTERFACE_DIRECTION_INVALID",
+            f"unsupported interface direction: {normalized_direction}",
+        )
+    if not isinstance(active, bool):
+        raise UniverseError("INTERFACE_STATE_INVALID", "active must be boolean")
+    return InterfaceProfile(
+        interface_id=_required_text(interface_id, "interface_id"),
+        kind=normalized_kind,
+        direction=normalized_direction,
+        active=active,
+    )
+
+
+def local_http_interface_profile() -> InterfaceProfile:
+    return interface_profile(
+        interface_id="local-http-api",
+        kind="HTTP_API",
+        direction="INBOUND",
+        active=True,
+    )
+
+
+def auth_provider_for(profile: ConnectionProfile, credential: str) -> AuthProvider:
+    if profile.auth.auth_type == "LOCAL_TOKEN":
+        return LocalTokenAuthProvider(credential)
+    raise UniverseError(
+        "AUTH_PROVIDER_NOT_IMPLEMENTED",
+        f"authentication provider is reserved but not implemented: {profile.auth.auth_type}",
+        HTTPStatus.NOT_IMPLEMENTED,
+    )
+
+
+class HttpUniverseTransport:
+    def __init__(self, profile: ConnectionProfile, auth_provider: AuthProvider):
+        self.profile = profile
+        self.auth_provider = auth_provider
+
+    def request_json(
+        self,
+        *,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        body = None
+        headers = self.auth_provider.headers()
+        if payload is not None:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            self.profile.endpoint + path,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            try:
+                return error.code, json.loads(error.read().decode("utf-8"))
+            finally:
+                error.close()
+        except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise UniverseError("SERVICE_UNAVAILABLE", str(error)) from error
 
 
 def _project_id(value: Any) -> str:
@@ -423,6 +696,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.store = store
         self.token = token
         super().__init__(address, UniverseRequestHandler)
+        host, port = self.server_address[:2]
+        self.connection_profile = local_connection_profile(f"http://{host}:{port}")
+        self.interface_profiles = (local_http_interface_profile(),)
 
 
 class UniverseRequestHandler(BaseHTTPRequestHandler):
@@ -432,7 +708,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
-            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "READY"})
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "READY",
+                    "connection": self.server.connection_profile.as_dict(),
+                    "interfaces": [
+                        profile.as_dict() for profile in self.server.interface_profiles
+                    ],
+                },
+            )
             return
         if not self._authorize():
             return
@@ -629,6 +915,8 @@ def write_server_state(
         "schema": "universe.local-service-state.v1",
         "endpoint": endpoint,
         "token": token,
+        "connection_profile": local_connection_profile(endpoint).as_dict(),
+        "interface_profiles": [local_http_interface_profile().as_dict()],
         "database": str(database_path.expanduser().resolve()),
         "pid": os.getpid(),
         "started_at": utc_now(),
@@ -663,21 +951,12 @@ def request_json(
     *, endpoint: str, token: str, method: str, path: str,
     payload: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    body = None
-    headers = {"Authorization": f"Bearer {token}"}
-    if payload is not None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = Request(
-        endpoint.rstrip("/") + path, data=body, headers=headers, method=method
+    profile = local_connection_profile(endpoint)
+    transport: UniverseTransport = HttpUniverseTransport(
+        profile,
+        auth_provider_for(profile, token),
     )
-    try:
-        with urlopen(request, timeout=10) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        return error.code, json.loads(error.read().decode("utf-8"))
-    except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise UniverseError("SERVICE_UNAVAILABLE", str(error)) from error
+    return transport.request_json(method=method, path=path, payload=payload)
 
 
 def parser() -> argparse.ArgumentParser:

@@ -90,6 +90,52 @@ An event body has this shape:
 Event IDs are idempotency keys. Repeating the same event is accepted; reusing
 an ID for different content is rejected.
 
+## Connection and authentication boundary
+
+The local service exposes a connection profile instead of making callers depend
+on a hard-coded local endpoint. The current implementation provides exactly one
+active combination:
+
+```yaml
+interface_kind: HTTP_API
+connection_kind: LOCAL
+transport_kind: HTTP
+auth_type: LOCAL_TOKEN
+credential_ref: server-state://token
+capabilities:
+  read: true
+  append: true
+  realtime: true
+  bidirectional: true
+  durable: true
+```
+
+The axes remain independent:
+
+- interface: `HTTP_API`, with `MCP` and `CLI` reserved
+- connection: `LOCAL`, with `REMOTE` and `PEER` reserved
+- transport: `HTTP`, with `GIT` and `P2P` reserved
+- authentication: `LOCAL_TOKEN`, with `OAUTH2` and `PEER_KEY` reserved
+
+Only HTTP addresses are currently validated as HTTP URLs. Git and P2P address
+formats remain Adapter-owned so this initial contract does not force future
+connections into an HTTP-specific shape.
+
+MCP is an interface contract, not a transport. A future MCP server adapter may
+expose Universe operations to an LLM, while an MCP client adapter may invoke an
+external project interface over whichever network transport that connection
+selects.
+
+Reserved values do not start remote synchronization, OAuth flows, peer
+discovery, key exchange, Git exchange, or MCP tools. Requesting an unimplemented
+authentication provider fails explicitly with `AUTH_PROVIDER_NOT_IMPLEMENTED`.
+
+Connection profiles carry only a `credential_ref`; they never contain the
+credential itself. The prototype continues to keep the local token in the
+protected local server state for compatibility. A desktop package can later
+resolve `credential_ref` through Windows Credential Manager or macOS Keychain
+without changing the transport interface.
+
 ## Next boundary
 
 OS_INSTALL integration should create a connection candidate and display it to
