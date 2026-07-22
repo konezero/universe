@@ -1,0 +1,65 @@
+# universe Runtime Start Here
+
+<!-- ai-career-project-runtime-overlay:start -->
+## Managed ai-career Runtime Binding
+
+This source-managed block augments the project-owned policy outside the
+block. The project may keep richer local routing, but shared Runtime
+package entry, capability, and execution-gate references in this block
+remain source-bound. Edit project policy outside this block.
+
+Schema: ai-career.project-runtime-entry.v1
+Project: universe
+
+## Boot Order
+
+1. `REPOSITORY_MANIFEST.md`
+2. `AGENTS.md`
+3. `.ai/core/README.md`
+4. `.ai/runtime/project_instance/boot_command_entry.md`
+5. `.ai/runtime/project_instance/project_anchor.md`
+6. `.ai/runtime/project_instance/role_selection_gate.md`
+7. `.ai/runtime/project_instance/mode_registry.json`
+8. `.ai/runtime/state/session.md`
+9. `.ai/runtime/state/current_anchor_frame.md`
+10. `.ai/runtime/project_instance/validation/latest.md`
+
+Report only source-backed fields. Unknown values remain UNKNOWN.
+
+For source-only `OS_STATUS`, repository checkpoint, Resume Archive,
+validation, Runtime Image, and state documents are
+`OBSERVED_REFERENCE` only. Follow
+`.ai/skills/common/runtime-status/SKILL.md`; do not promote their
+historical labels into current Runtime, Anchor, restore, validation,
+gate, authority, or assignment state.
+
+## Mutation Entry
+
+Before every durable mutation, execute
+`.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
+Current Anchor do not replace the required Guard result and receipt.
+The narrow exception is ordinary local Git staging and commit after
+completed, validated work. They create only the Git commit SHA and no
+Runtime proposal or proposal-database entry. Push still requires a
+separate `PUSH` proposal and later user approval.
+
+For a new mutation request, first follow
+`.ai/skills/common/task-assignment/SKILL.md`, then bind exact approval
+through `.ai/skills/common/execution-binding/SKILL.md`. Neither step
+replaces the final Guard.
+
+## Task Worker Entry
+
+Before any Host Worker invocation, follow
+`.ai/skills/common/task-frame/SKILL.md`. That Skill must load
+`.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md` and
+preserve unverified Host capability as `UNKNOWN`.
+
+The default bounded discussion route is
+`.ai/skills/common/task-frame-debate/SKILL.md`. Combined repository and
+process-local status uses `.ai/skills/common/runtime-status/SKILL.md`;
+durable conversation handoff uses `.ai/skills/common/resume-save/SKILL.md`.
+
+Authority: UNASSIGNED
+Execution Assignment: UNASSIGNED
+<!-- ai-career-project-runtime-overlay:end -->

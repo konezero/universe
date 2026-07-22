@@ -1,0 +1,10 @@
+{
+  "database": "dist/official-development-seed-v0.sqlite",
+  "database_sha256": "ecd4142d20e94e1a47cc9cc7a73b5f995a7b7d2443e684af0315add906d08f31",
+  "schema": "universe.official-development-seed-manifest.v0",
+  "seed_id": "official-development-seed-v0",
+  "source": "seed/official-development-seed-v0.json",
+  "source_sha256": "446f996dbaadb657a63d7f85178032a1ae1e56bbd66dc8bf4136f3ef1c8a33df",
+  "status": "EXPERIMENTAL_CURATED_BASELINE",
+  "version": "0.1.0"
+}

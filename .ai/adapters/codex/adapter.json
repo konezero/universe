@@ -1,0 +1,13 @@
+{
+  "schema": "ai-career.codex-reference-runtime-adapter.v1",
+  "adapter_id": "codex-reference-runtime",
+  "entrypoint": ".ai/adapters/codex/invoke.ps1",
+  "runtime_cli": ".ai/runtime/reference_runtime/cli.py",
+  "capabilities": ".ai/runtime/reference_runtime/capabilities.json",
+  "transport": {
+    "arguments": "UNCHANGED",
+    "stdout": "UNCHANGED",
+    "exit_code": "UNCHANGED",
+    "semantic_remapping": "NONE"
+  }
+}

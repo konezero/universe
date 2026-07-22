@@ -1,0 +1,195 @@
+{
+  "schema": "universe.official-development-seed-source.v0",
+  "seed_id": "official-development-seed-v0",
+  "version": "0.1.0",
+  "status": "EXPERIMENTAL_CURATED_BASELINE",
+  "domain": "software-development",
+  "claims": {
+    "evidence_level": "CURATED_HYPOTHESIS",
+    "forecast_output": "CANDIDATE_ONLY",
+    "probabilities": "NOT_AVAILABLE",
+    "current_anchor_effect": "NONE",
+    "authority_effect": "NONE",
+    "execution_effect": "NONE"
+  },
+  "project_kinds": [
+    {
+      "id": "generic-software",
+      "label": "Generic software project",
+      "description": "A software project without a more specific initial archetype.",
+      "keywords": ["software", "application", "system", "platform"]
+    },
+    {
+      "id": "cli-tool",
+      "label": "Command-line tool",
+      "description": "A bounded tool whose primary interface is a command line.",
+      "keywords": ["cli", "command", "terminal", "automation"]
+    },
+    {
+      "id": "desktop-app",
+      "label": "Desktop application",
+      "description": "An interactive local application with durable user state.",
+      "keywords": ["desktop", "gui", "window", "local"]
+    },
+    {
+      "id": "web-service",
+      "label": "Web service",
+      "description": "A network service with explicit API and persistence boundaries.",
+      "keywords": ["api", "web", "service", "server"]
+    },
+    {
+      "id": "agent-runtime",
+      "label": "Agent runtime",
+      "description": "A model-driven system with tools, loops, workers, and approval boundaries.",
+      "keywords": ["agent", "llm", "worker", "runtime", "orchestration"]
+    }
+  ],
+  "technologies": [
+    {"id": "git", "label": "Git", "category": "source-control", "aliases": ["github"]},
+    {"id": "python", "label": "Python", "category": "language", "aliases": ["py"]},
+    {"id": "pytest", "label": "pytest", "category": "testing", "aliases": []},
+    {"id": "sqlite", "label": "SQLite", "category": "database", "aliases": ["sqlite3"]},
+    {"id": "pyside6", "label": "PySide6", "category": "desktop-ui", "aliases": ["qt", "pyqt"]},
+    {"id": "http-api", "label": "HTTP API", "category": "interface", "aliases": ["rest", "responses-api"]},
+    {"id": "typescript", "label": "TypeScript", "category": "language", "aliases": ["ts"]},
+    {"id": "nodejs", "label": "Node.js", "category": "runtime", "aliases": ["node"]},
+    {"id": "relational-db", "label": "Relational database", "category": "database", "aliases": ["postgres", "postgresql", "mysql"]}
+  ],
+  "failure_patterns": [
+    {
+      "id": "scope-expansion",
+      "title": "Scope expands before the first validated slice",
+      "description": "Related ideas are promoted into the active project before the smallest end-to-end path is proven.",
+      "signals": ["many new abstractions", "no executable slice", "moving acceptance criteria"],
+      "response": "Freeze the final goal, select one vertical slice, and defer unrelated candidates."
+    },
+    {
+      "id": "contract-implementation-drift",
+      "title": "Documentation and implementation diverge",
+      "description": "The declared interface or state model changes without generated surfaces and tests changing with it.",
+      "signals": ["documentation-only fix", "fixture mismatch", "generated output differs"],
+      "response": "Bind contract, implementation, generated artifacts, and acceptance tests in one change."
+    },
+    {
+      "id": "state-identity-conflation",
+      "title": "Distinct state identities collapse into one field",
+      "description": "Project, session, task, runtime, or currentness coordinates overwrite one another.",
+      "signals": ["single global current", "session replaces project state", "ambiguous identity"],
+      "response": "Separate identity keys and define which operation may advance each state."
+    },
+    {
+      "id": "optimistic-readiness",
+      "title": "Readiness is claimed before evidence exists",
+      "description": "Presence of source, configuration, or historical status is treated as a current successful run.",
+      "signals": ["source implies active", "historical validation reused", "unknown promoted to ready"],
+      "response": "Report observed references separately and retain UNKNOWN until current evidence exists."
+    },
+    {
+      "id": "migration-gap",
+      "title": "A new schema strands existing installations",
+      "description": "Validation requires new fields but the update path cannot create or migrate them safely.",
+      "signals": ["update passes writes then fails validation", "missing new state fields", "manual repair required"],
+      "response": "Ship compatibility detection and an idempotent migration before enforcing the new schema."
+    },
+    {
+      "id": "untrusted-execution",
+      "title": "Untrusted project code executes during inspection",
+      "description": "Review data is allowed to influence host policy or execute without an isolated boundary.",
+      "signals": ["candidate tests run locally", "candidate instructions become policy", "host credentials inherited"],
+      "response": "Default to static review and require an attested disposable sandbox for execution."
+    },
+    {
+      "id": "missing-stop-condition",
+      "title": "Automated work has no reliable stop condition",
+      "description": "A loop continues because completion depends only on an agent claim.",
+      "signals": ["repeated actions", "no progress detector", "no evaluator"],
+      "response": "Define measurable success, retry, abort, budget, and independent evaluation conditions."
+    }
+  ],
+  "routes": [
+    {
+      "id": "validated-software-foundation",
+      "title": "Validated software foundation",
+      "description": "Create the smallest observable path from goal to a tested, releasable slice.",
+      "project_kinds": ["generic-software", "cli-tool", "desktop-app", "web-service", "agent-runtime"],
+      "technology_signals": ["git"],
+      "goal_signals": ["stable", "maintainable", "release", "production", "working"],
+      "failure_refs": ["scope-expansion", "contract-implementation-drift", "optimistic-readiness"],
+      "steps": [
+        {"id": "goal-contract", "title": "Fix the target state", "purpose": "State the user-visible outcome, exclusions, and acceptance evidence.", "exit_evidence": "A bounded goal contract with measurable completion."},
+        {"id": "architecture-boundary", "title": "Choose the smallest architecture", "purpose": "Select only the components required for one end-to-end path.", "exit_evidence": "A dependency map and explicit deferred list."},
+        {"id": "vertical-slice", "title": "Build one vertical slice", "purpose": "Connect input, core behavior, state, and output without placeholder claims.", "exit_evidence": "One runnable path produces the expected output."},
+        {"id": "validation", "title": "Bind validation to the contract", "purpose": "Test behavior and generated or installed surfaces that users will consume.", "exit_evidence": "Focused automated checks pass against the actual artifact."},
+        {"id": "release-baseline", "title": "Create a reproducible baseline", "purpose": "Record source identity, build inputs, result, and known limits.", "exit_evidence": "Another clean environment can reproduce the validated slice."}
+      ]
+    },
+    {
+      "id": "durable-desktop-state",
+      "title": "Durable desktop application state",
+      "description": "Separate interactive UI state from durable domain state and background work.",
+      "project_kinds": ["desktop-app"],
+      "technology_signals": ["python", "pyside6", "sqlite"],
+      "goal_signals": ["desktop", "stable", "unattended", "recoverable", "realtime"],
+      "failure_refs": ["state-identity-conflation", "migration-gap", "missing-stop-condition"],
+      "steps": [
+        {"id": "domain-state", "title": "Define domain state outside the UI", "purpose": "Give durable facts stable identities independent of windows and widgets.", "exit_evidence": "State transitions can be tested without opening the UI."},
+        {"id": "ui-projection", "title": "Project state into the UI", "purpose": "Make views consumers of observable state rather than owners of it.", "exit_evidence": "UI refresh does not mutate unrelated domain state."},
+        {"id": "background-boundary", "title": "Bound background work", "purpose": "Define ownership, retry, cancellation, and stale-result behavior.", "exit_evidence": "Background operations have deterministic completion and cancellation tests."},
+        {"id": "persistence-recovery", "title": "Prove persistence and recovery", "purpose": "Test restart, migration, partial write, and corrupted input behavior.", "exit_evidence": "A clean restart restores only validated durable state."},
+        {"id": "operational-observation", "title": "Add operational observation", "purpose": "Expose actionable health and event evidence without flooding file logs.", "exit_evidence": "Failures can be diagnosed from bounded current evidence."}
+      ]
+    },
+    {
+      "id": "explicit-service-boundary",
+      "title": "Explicit service and API boundary",
+      "description": "Stabilize a network service around contracts, persistence, and operational evidence.",
+      "project_kinds": ["web-service"],
+      "technology_signals": ["http-api", "relational-db", "sqlite", "typescript", "nodejs", "python"],
+      "goal_signals": ["api", "service", "scalable", "reliable", "production"],
+      "failure_refs": ["contract-implementation-drift", "migration-gap", "optimistic-readiness"],
+      "steps": [
+        {"id": "api-contract", "title": "Define the external contract", "purpose": "Fix request, response, error, idempotency, and compatibility behavior.", "exit_evidence": "Contract tests describe every supported outcome."},
+        {"id": "persistence-contract", "title": "Define persistence ownership", "purpose": "Separate durable records, caches, queues, and derived state.", "exit_evidence": "Every stored field has an owner and migration policy."},
+        {"id": "single-request-path", "title": "Complete one request path", "purpose": "Prove one real request through validation, state change, and response.", "exit_evidence": "Integration test passes against the actual service boundary."},
+        {"id": "failure-behavior", "title": "Make failure behavior explicit", "purpose": "Test timeout, retry, duplicate, dependency failure, and partial completion.", "exit_evidence": "Failure responses and side effects are deterministic."},
+        {"id": "deploy-observe", "title": "Deploy and observe", "purpose": "Prove startup, health, migration, rollback, and bounded telemetry.", "exit_evidence": "A clean deployment and rollback are reproducible."}
+      ]
+    },
+    {
+      "id": "governed-agent-execution",
+      "title": "Governed agent execution",
+      "description": "Separate model context, work graphs, host capability, approval, and evidence.",
+      "project_kinds": ["agent-runtime"],
+      "technology_signals": ["python", "sqlite", "http-api"],
+      "goal_signals": ["agent", "autonomous", "worker", "governed", "persistent"],
+      "failure_refs": ["state-identity-conflation", "untrusted-execution", "missing-stop-condition", "optimistic-readiness"],
+      "steps": [
+        {"id": "context-coordinate", "title": "Define context coordinates", "purpose": "Separate project state, session state, task state, and executable runtime identity.", "exit_evidence": "No identity can silently create another identity's currentness."},
+        {"id": "capability-boundary", "title": "Bind host capabilities", "purpose": "Distinguish observation, proposal, sandboxed execution, and source mutation.", "exit_evidence": "Every tool call has a source-backed capability decision."},
+        {"id": "bounded-work-graph", "title": "Create a bounded work graph", "purpose": "Define roles, inputs, outputs, joins, retries, budgets, and stop conditions.", "exit_evidence": "Workers cannot broaden or recursively delegate beyond allocation."},
+        {"id": "approval-evidence", "title": "Separate approval from evidence", "purpose": "Ensure selection, assignment, execution, result, and adoption remain distinct.", "exit_evidence": "A result cannot mutate source or current state without the required later gate."},
+        {"id": "adversarial-validation", "title": "Validate hostile and interrupted paths", "purpose": "Test untrusted instructions, stale results, crashes, replay, and partial side effects.", "exit_evidence": "Unsafe or uncertain outcomes stop with explicit bounded states."}
+      ]
+    }
+  ],
+  "pivot_rules": [
+    {
+      "id": "goal-changed",
+      "trigger": "The final goal or a defining constraint changes.",
+      "procedure": "Compare historical project states against the new target, rank reusable assets and transition cost, and propose the best prior state as a new branch basis.",
+      "invariant": "Preserve the abandoned path and its Evidence; do not rewrite history or move Current Anchor from a proposal alone."
+    },
+    {
+      "id": "dependency-blocked",
+      "trigger": "A required dependency remains unavailable or invalidates the selected route.",
+      "procedure": "Identify the earliest step that assumed the dependency and generate substitution, isolation, and deferment candidates.",
+      "invariant": "Unknown dependency behavior remains UNKNOWN and is not replaced by optimistic assumptions."
+    },
+    {
+      "id": "validation-failed",
+      "trigger": "Observed output fails the adopted acceptance evidence.",
+      "procedure": "Return to the latest state whose inputs and invariants remain valid, retain the failure as Evidence, and propose a corrected route.",
+      "invariant": "A failed result cannot be promoted to completion or used as a verified future pattern."
+    }
+  ]
+}

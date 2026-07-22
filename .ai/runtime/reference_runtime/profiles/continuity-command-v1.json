@@ -1,0 +1,98 @@
+{
+  "schema": "ai-career.continuity-command-profile.v1",
+  "profile_id": "continuity-command-v1",
+  "source": {
+    "binding": "installed-distribution",
+    "installation_manifest": ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
+  },
+  "contract_refs": [
+    ".ai/core/RUNTIME_COMMANDS.md",
+    ".ai/core/PERSISTENCE_MODEL.md",
+    ".ai/core/SESSION_CURRENTNESS.md",
+    ".ai/core/RUNTIME_STATE_TRUST_GATE.md",
+    ".ai/core/ANCHOR_TEMPORAL_COORDINATE.md"
+  ],
+  "command_policy": {
+    "checkpoint.prepare": {
+      "canonical_command": "SNAPSHOT_SAVE",
+      "content_selection": "CALLER_SELECTED",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "PREPARED"
+    },
+    "checkpoint.save": {
+      "canonical_command": "SNAPSHOT_SAVE",
+      "durable_write": "LOCAL_SQLITE_APPEND_ONLY",
+      "activation": "FORBIDDEN",
+      "result_status": "SAVED"
+    },
+    "checkpoint.list": {
+      "canonical_command": "SNAPSHOT_SAVE",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "CHECKPOINTS_LISTED"
+    },
+    "checkpoint.load": {
+      "canonical_command": "SNAPSHOT_SAVE",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "CHECKPOINT_LOADED_OR_NOT_FOUND"
+    },
+    "memory-sync.prepare": {
+      "canonical_command": "MEMORY_SYNC",
+      "content_selection": "USER_CONFIRMED",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "PREPARED"
+    },
+    "handoff-append.attest": {
+      "canonical_command": "HANDOFF_APPEND",
+      "content_selection": "USER_CONFIRMED",
+      "durable_write": "HOST_PROVIDER_ONLY",
+      "activation": "FORBIDDEN",
+      "result_status": "HANDOFF_APPEND_RECORDED"
+    },
+    "resume-save.prepare": {
+      "canonical_command": "RESUME_SAVE",
+      "content_selection": "CALLER_SELECTED",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "PREPARED"
+    },
+    "resume-save.save": {
+      "canonical_command": "RESUME_SAVE",
+      "durable_write": "LOCAL_SQLITE_APPEND_ONLY",
+      "activation": "FORBIDDEN",
+      "result_status": "SAVED"
+    },
+    "resume-restore.discover": {
+      "canonical_command": "RESUME",
+      "same_node_mode_required": true,
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "CANDIDATE"
+    },
+    "resume-restore.load": {
+      "canonical_command": "RESUME",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "REHYDRATION_CANDIDATE"
+    },
+    "conversation-recall.query": {
+      "canonical_command": "ARCHIVE_RECALL",
+      "corpus": "CALLER_SUPPLIED",
+      "semantic_adoption": "PARENT_ONLY",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "CANDIDATE"
+    },
+    "anchor-currentness.evaluate": {
+      "canonical_command": "ANCHOR_CURRENTNESS",
+      "currentness_key": "SESSION_ID_PLUS_FRAME_ID",
+      "physical_threshold": "SOURCE_SUPPLIED_RECHECK_ONLY",
+      "authority_effect": "NONE",
+      "durable_write": "FORBIDDEN",
+      "result_status": "EVALUATED"
+    }
+  }
+}
