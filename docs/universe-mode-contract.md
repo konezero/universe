@@ -31,9 +31,19 @@ project coordination run in `UNIVERSE` with Role `CONDUCTOR`. Release DB
 installation or update requested from `UNIVERSE` returns
 `MASTER_MODE_REQUIRED`.
 
-Universe does not directly mutate an attached project. It proposes a compatible
-release, the user approves it, and the Project Installer validates and applies
-the artifact inside that project's own boundary.
+Release artifact import and the persisted install/update proposal are Universe
+self-lifecycle operations and therefore require `MASTER`. The proposal itself
+has `project_write: NONE`. Universe does not expose an HTTP apply route.
+
+After the proposal, the user approves the exact plan in the attached Project.
+That Project Host performs receipt-aware writes, validate/status, and completion
+evidence inside its own boundary.
+
+Dispatch creation is allowed for daily `UNIVERSE` operation. Delivery is
+separate because it appends to the Project-owned MASTER Inbox; each delivery
+request must carry `approval: APPROVED` as explicit Project inbox-write
+approval. Wake, acknowledgement, start, and result events do not create project
+source-write authority.
 
 ## Invariants
 

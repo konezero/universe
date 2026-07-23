@@ -50,12 +50,37 @@ Implemented:
 - path traversal, symlink, size, and duplicate-path rejection;
 - per-file Git object ID, size, and SHA-256 storage;
 - deterministic payload identity and external database digest;
-- read-only verification without Candidate execution.
+- read-only verification without Candidate execution;
+- ordered Skill Load Profiles and Mode Profiles in Release DB v2;
+- legacy Release DB v1 verification without profile claims;
+- content-addressed Universe Catalog import;
+- read-only Project install/update planning with collision detection;
+- Project Host-owned application after exact plan approval.
 
 Not implemented yet:
 
 - signed release promotion;
-- Universe Catalog import and channel selection;
-- Release DB extraction/source adapter;
-- Project Installer invocation;
+- release channel selection;
+- receipt-aware Project Host apply adapter;
 - rollback and project fleet update orchestration.
+
+## Catalog and Project boundary
+
+Universe verifies the external manifest and immutable SQLite payload before
+copying both into content-addressed local catalog storage. Import and proposal
+creation require `MASTER`; `UNIVERSE` may display catalog and proposal state but
+cannot apply a release.
+
+```text
+POST /v1/releases/import
+GET  /v1/releases
+GET  /v1/releases/{release_id}
+POST /v1/projects/{project_id}/release-proposals
+GET  /v1/projects/{project_id}/release-proposals
+```
+
+A proposal computes `FRESH_INSTALL` or `UPDATE`, exact actions, collisions, and
+the plan digest. The service persists the proposal with `project_write: NONE`.
+The attached Project Host remains responsible for user approval, Execution
+Guard, receipt-aware writes, validate/status, and the final install receipt.
+Universe deliberately exposes no HTTP apply endpoint.

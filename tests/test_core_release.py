@@ -53,7 +53,13 @@ class CoreReleaseTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    def _write_fixture(self, extra_paths: list[str] | None = None) -> None:
+    def _write_fixture(
+        self,
+        extra_paths: list[str] | None = None,
+        *,
+        with_profiles: bool = False,
+        profile_surface: str | None = None,
+    ) -> None:
         source_index_path = (
             ".ai/distribution/context_management_runtime_pack/"
             "project_runtime_source_index.json"
@@ -69,6 +75,12 @@ class CoreReleaseTests(unittest.TestCase):
         core_path = ".ai/core/CORE_SURFACE_REGISTRY.md"
         paths = [source_index_path, manifest_path, installer_path, core_path]
         paths.extend(extra_paths or [])
+        catalog_path = (
+            ".ai/distribution/context_management_runtime_pack/"
+            "release_profile_catalog.json"
+        )
+        if with_profiles:
+            paths.append(catalog_path)
         source_index = {
             "schema": "ai-career.project-runtime-source-index.v1",
             "core_registry_path": core_path,
@@ -76,6 +88,8 @@ class CoreReleaseTests(unittest.TestCase):
             "package_manifest_path": manifest_path,
             "paths": paths,
         }
+        if with_profiles:
+            source_index["release_profile_catalog_path"] = catalog_path
         distribution = {
             "schema": "ai-career.project-runtime-distribution.v1",
             "package": {
@@ -87,6 +101,35 @@ class CoreReleaseTests(unittest.TestCase):
         self._write(manifest_path, json.dumps(distribution, sort_keys=True))
         self._write(installer_path, "raise RuntimeError('must not execute')\n")
         self._write(core_path, "# Fixture Core Registry\n")
+        if with_profiles:
+            catalog = {
+                "schema": "ai-career.release-profile-catalog.v1",
+                "owner": "fixture/ai-career",
+                "load_profiles": [
+                    {
+                        "profile_id": "BOOT_CORE",
+                        "description": "Ordered Boot control surfaces.",
+                        "surfaces": [
+                            {
+                                "path": profile_surface or core_path,
+                                "required": True,
+                            },
+                            {"path": installer_path, "required": False},
+                        ],
+                    }
+                ],
+                "skill_bindings": [
+                    {"skill_id": "boot", "profile_id": "BOOT_CORE"}
+                ],
+                "mode_profiles": [
+                    {
+                        "mode_profile_id": "MASTER_BASE",
+                        "overlay_policy": "APPEND_ONLY",
+                        "load_profiles": ["BOOT_CORE"],
+                    }
+                ],
+            }
+            self._write(catalog_path, json.dumps(catalog, sort_keys=True))
 
     def _commit(self, message: str) -> str:
         self._git("add", "--all")
@@ -115,6 +158,7 @@ class CoreReleaseTests(unittest.TestCase):
         self.assertEqual(4, verified["file_count"])
         self.assertEqual("FORBIDDEN", verified["candidate_execution"])
         self.assertEqual(self.commit, manifest["source_commit"])
+        self.assertEqual("ABSENT", verified["profile_catalog"]["status"])
 
         connection = sqlite3.connect(self.database)
         try:
@@ -160,6 +204,74 @@ class CoreReleaseTests(unittest.TestCase):
                 database_path=self.database,
                 manifest_path=self.manifest,
             )
+
+    def test_profile_catalog_is_normalized_into_ordered_release_tables(self) -> None:
+        self._write_fixture(with_profiles=True)
+        self.commit = self._commit("profile-catalog")
+
+        manifest = self._build()
+        verified = verify_release(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+
+        self.assertEqual("PRESENT", verified["profile_catalog"]["status"])
+        self.assertEqual(1, verified["profile_catalog"]["load_profile_count"])
+        self.assertEqual(
+            verified["profile_catalog"],
+            manifest["profile_catalog"],
+        )
+        connection = sqlite3.connect(self.database)
+        try:
+            surfaces = connection.execute(
+                """
+                SELECT ordinal, path, required
+                FROM load_profile_surface
+                WHERE profile_id = 'BOOT_CORE'
+                ORDER BY ordinal
+                """
+            ).fetchall()
+            skill = connection.execute(
+                """
+                SELECT profile_id
+                FROM skill_profile_binding
+                WHERE skill_id = 'boot'
+                """
+            ).fetchone()
+            mode = connection.execute(
+                """
+                SELECT profile_id
+                FROM mode_profile_load
+                WHERE mode_profile_id = 'MASTER_BASE'
+                ORDER BY ordinal
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(
+            [
+                (0, ".ai/core/CORE_SURFACE_REGISTRY.md", 1),
+                (
+                    1,
+                    ".ai/distribution/context_management_runtime_pack/"
+                    "project_runtime_installer.py",
+                    0,
+                ),
+            ],
+            surfaces,
+        )
+        self.assertEqual(("BOOT_CORE",), skill)
+        self.assertEqual([("BOOT_CORE",)], mode)
+
+    def test_profile_catalog_cannot_reference_an_unpacked_surface(self) -> None:
+        self._write_fixture(
+            with_profiles=True,
+            profile_surface=".ai/core/NOT_PACKAGED.md",
+        )
+        self.commit = self._commit("invalid-profile-catalog")
+
+        with self.assertRaisesRegex(CoreReleaseError, "not packaged"):
+            self._build()
 
 
 if __name__ == "__main__":

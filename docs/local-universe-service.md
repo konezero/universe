@@ -24,6 +24,9 @@ grants authority or permission to mutate an attached project. See
 - validate reference-only Project Seeds;
 - persist current Project Projections and missing-connection candidates;
 - create read-only `docs/universe` incorporation proposals;
+- verify and retain immutable ai-career Release artifacts;
+- create read-only Project release install/update proposals;
+- queue durable Project dispatches and retain their complete event/result timeline;
 - provide compact project summaries to a UI or LLM client.
 
 Each attached project remains responsible for its own source mutation,
@@ -33,7 +36,7 @@ evidence references; it does not merge or rewrite project Runtime databases.
 ## Start the service
 
 ```powershell
-python tools/universe_server.py serve
+python tools/universe_server.py serve --open-ui
 ```
 
 The process selects a free loopback port by default and writes its endpoint,
@@ -92,6 +95,19 @@ GET    /v1/projects/{project_id}/seed
 POST   /v1/projects/{project_id}/projection
 GET    /v1/projects/{project_id}/projection
 POST   /v1/projects/{project_id}/document-incorporation-proposals
+GET    /v1/releases
+GET    /v1/releases/{release_id}
+POST   /v1/releases/import
+GET    /v1/projects/{project_id}/release-proposals
+POST   /v1/projects/{project_id}/release-proposals
+GET    /v1/projects/{project_id}/dispatches
+POST   /v1/projects/{project_id}/dispatches
+GET    /v1/dispatches/{dispatch_id}
+POST   /v1/dispatches/{dispatch_id}/deliver
+POST   /v1/dispatches/{dispatch_id}/wake
+POST   /v1/dispatches/{dispatch_id}/acknowledge
+POST   /v1/dispatches/{dispatch_id}/start
+POST   /v1/dispatches/{dispatch_id}/result
 ```
 
 An event body has this shape:
@@ -108,6 +124,51 @@ An event body has this shape:
 
 Event IDs are idempotency keys. Repeating the same event is accepted; reusing
 an ID for different content is rejected.
+
+## Release and dispatch boundary
+
+Release import verifies both database and manifest, then copies the immutable
+pair into content-addressed Universe storage. Import and Project release
+proposal creation require the explicit request coordinate `mode: MASTER`.
+Proposal generation reads the attached Project only to calculate actions and
+collisions. It never applies those actions.
+
+Dispatch creation is durable and idempotent. Delivery to the Project-owned
+`.ai/inbox/MASTER` path is a separate mutation and requires
+`{"approval": "APPROVED"}` on that request. The explicit Deliver action in the
+desktop UI supplies this value. The Project must already expose the inbox path;
+Universe does not create it. Wake adapters record receipts but do not advance
+dispatch status.
+
+The ordered lifecycle is:
+
+```text
+QUEUED -> DELIVERED -> ACKNOWLEDGED -> STARTED -> COMPLETED | BLOCKED
+```
+
+Every compare-and-set transition and event append occurs in one SQLite
+transaction. A stale concurrent transition returns `DISPATCH_STATE_CHANGED`
+and appends no event. The desktop UI shows release proposal state, collisions,
+dispatch evidence, wake receipts, and the final Result Packet.
+
+## Desktop UI
+
+The UI is served by the same loopback process and contains no embedded access
+token. `--open-ui` opens a fragment URL once; the page moves the token into
+session storage and removes it from the visible URL.
+
+The first slice supports:
+
+- explicit local project connection;
+- System, Documents, and Future graph views;
+- immutable Release DB import in MASTER;
+- read-only Project install/update planning with collision visibility;
+- durable MASTER dispatch creation and approved Inbox delivery;
+- dispatch event and Result Packet inspection.
+
+Release proposals never apply project files from the browser. The proposal
+digest and plan are handed to the Project Host for approval, guarded writes,
+validate/status, and completion evidence.
 
 ## Project Seed and Projection
 

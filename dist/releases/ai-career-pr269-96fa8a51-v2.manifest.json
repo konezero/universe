@@ -1,0 +1,25 @@
+{
+  "candidate_execution": "FORBIDDEN",
+  "database": "ai-career-pr269-96fa8a51-v2.sqlite3",
+  "database_sha256": "aec1958fb991b490ecdd91c28ca18325e1f8ce22a7ab13579e8a1525ee6fc8c2",
+  "file_count": 117,
+  "package_name": "context-management-project-runtime",
+  "payload_bytes": 1429928,
+  "payload_sha256": "38db47398d7b43ce3b50702875e360323a686257be449e4a4aff9120b31b7df9",
+  "profile_catalog": {
+    "catalog_digest": "NONE",
+    "load_profile_count": 0,
+    "mode_profile_count": 0,
+    "path": "NONE",
+    "sha256": "NONE",
+    "skill_binding_count": 0,
+    "status": "ABSENT"
+  },
+  "release_id": "core-96fa8a51da46-38db47398d7b",
+  "schema": "universe.core-release-manifest.v2",
+  "source_access": "GIT_OBJECTS_DATA_ONLY",
+  "source_commit": "96fa8a51da46abdf44dfac260b29a5318d33fe80",
+  "source_committed_at": "2026-07-23T10:17:13+09:00",
+  "source_ref": "96fa8a51da46abdf44dfac260b29a5318d33fe80",
+  "source_repository": "https://github.com/konezero/ai-career.git"
+}

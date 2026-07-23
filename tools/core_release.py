@@ -13,9 +13,16 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from release_profile_catalog import (
+    ReleaseProfileCatalog,
+    ReleaseProfileError,
+    parse_release_profile_catalog,
+)
 
-RELEASE_SCHEMA = "universe.core-release-db.v1"
-MANIFEST_SCHEMA = "universe.core-release-manifest.v1"
+LEGACY_RELEASE_SCHEMA = "universe.core-release-db.v1"
+RELEASE_SCHEMA = "universe.core-release-db.v2"
+LEGACY_MANIFEST_SCHEMA = "universe.core-release-manifest.v1"
+MANIFEST_SCHEMA = "universe.core-release-manifest.v2"
 SOURCE_INDEX_SCHEMA = "ai-career.project-runtime-source-index.v1"
 DISTRIBUTION_SCHEMA = "ai-career.project-runtime-distribution.v1"
 DEFAULT_SOURCE_INDEX = (
@@ -43,6 +50,45 @@ CREATE TABLE release_file (
     size INTEGER NOT NULL CHECK (size >= 0),
     sha256 TEXT NOT NULL,
     content BLOB NOT NULL
+);
+
+CREATE TABLE load_profile (
+    profile_id TEXT PRIMARY KEY,
+    description TEXT NOT NULL
+);
+
+CREATE TABLE load_profile_surface (
+    profile_id TEXT NOT NULL
+        REFERENCES load_profile(profile_id)
+        ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    path TEXT NOT NULL
+        REFERENCES release_file(path),
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    PRIMARY KEY(profile_id, ordinal),
+    UNIQUE(profile_id, path)
+);
+
+CREATE TABLE skill_profile_binding (
+    skill_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL
+        REFERENCES load_profile(profile_id)
+);
+
+CREATE TABLE mode_profile (
+    mode_profile_id TEXT PRIMARY KEY,
+    overlay_policy TEXT NOT NULL
+);
+
+CREATE TABLE mode_profile_load (
+    mode_profile_id TEXT NOT NULL
+        REFERENCES mode_profile(mode_profile_id)
+        ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    profile_id TEXT NOT NULL
+        REFERENCES load_profile(profile_id),
+    PRIMARY KEY(mode_profile_id, ordinal),
+    UNIQUE(mode_profile_id, profile_id)
 );
 """
 
@@ -175,7 +221,13 @@ def _source_inventory(
     reader: GitObjectReader,
     commit: str,
     source_index_path: str,
-) -> tuple[dict[str, Any], dict[str, Any], list[GitBlob]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    list[GitBlob],
+    ReleaseProfileCatalog | None,
+    str,
+]:
     source_index_blob = reader.read_blob(commit, source_index_path)
     if len(source_index_blob.content) > MAX_INDEX_BYTES:
         raise CoreReleaseError("source index exceeds size limit")
@@ -220,7 +272,54 @@ def _source_inventory(
         raise CoreReleaseError("distribution manifest package is invalid")
     if package.get("source_index_path") != source_index_path:
         raise CoreReleaseError("distribution manifest source index does not match")
-    return source_index, distribution, blobs
+    catalog_path = "NONE"
+    catalog: ReleaseProfileCatalog | None = None
+    raw_catalog_path = source_index.get("release_profile_catalog_path")
+    if raw_catalog_path is not None:
+        catalog_path = validate_release_path(str(raw_catalog_path))
+        if catalog_path not in paths:
+            raise CoreReleaseError(
+                "source index reference is not packaged: "
+                "release_profile_catalog_path"
+            )
+        try:
+            catalog = parse_release_profile_catalog(
+                _json_object(
+                    blob_by_path[catalog_path].content,
+                    "release profile catalog",
+                ),
+                packaged_paths=paths,
+            )
+        except ReleaseProfileError as error:
+            raise CoreReleaseError(str(error)) from error
+    return source_index, distribution, blobs, catalog, catalog_path
+
+
+def _profile_material(
+    *,
+    catalog: ReleaseProfileCatalog | None,
+    catalog_path: str,
+    blob_by_path: dict[str, GitBlob],
+) -> dict[str, Any]:
+    if catalog is None:
+        return {
+            "status": "ABSENT",
+            "path": "NONE",
+            "sha256": "NONE",
+            "catalog_digest": "NONE",
+            "load_profile_count": 0,
+            "skill_binding_count": 0,
+            "mode_profile_count": 0,
+        }
+    return {
+        "status": "PRESENT",
+        "path": catalog_path,
+        "sha256": blob_by_path[catalog_path].sha256,
+        "catalog_digest": catalog.digest,
+        "load_profile_count": len(catalog.load_profiles),
+        "skill_binding_count": len(catalog.skill_bindings),
+        "mode_profile_count": len(catalog.mode_profiles),
+    }
 
 
 def _payload_material(
@@ -232,9 +331,11 @@ def _payload_material(
     source_index_sha256: str,
     distribution_manifest_sha256: str,
     files: list[dict[str, Any]],
+    schema: str = RELEASE_SCHEMA,
+    profile_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "schema": RELEASE_SCHEMA,
+    result: dict[str, Any] = {
+        "schema": schema,
         "source_repository": source_repository,
         "source_commit": source_commit,
         "package_name": package_name,
@@ -243,6 +344,9 @@ def _payload_material(
         "distribution_manifest_sha256": distribution_manifest_sha256,
         "files": files,
     }
+    if profile_catalog is not None:
+        result["profile_catalog"] = profile_catalog
+    return result
 
 
 def build_release(
@@ -264,10 +368,12 @@ def build_release(
     if expected_commit and source_commit != expected_commit.strip().lower():
         raise CoreReleaseError("resolved source commit does not match expected_commit")
 
-    source_index, distribution, blobs = _source_inventory(
+    source_index, distribution, blobs, profile_catalog, profile_catalog_path = (
+        _source_inventory(
         reader,
         source_commit,
         source_index_path,
+        )
     )
     blob_by_path = {blob.path: blob for blob in blobs}
     distribution_path = str(source_index["package_manifest_path"])
@@ -280,6 +386,11 @@ def build_release(
         }
         for blob in blobs
     ]
+    profile_material = _profile_material(
+        catalog=profile_catalog,
+        catalog_path=profile_catalog_path,
+        blob_by_path=blob_by_path,
+    )
     payload = _payload_material(
         source_repository=normalized_repository,
         source_commit=source_commit,
@@ -288,6 +399,7 @@ def build_release(
         source_index_sha256=blob_by_path[source_index_path].sha256,
         distribution_manifest_sha256=blob_by_path[distribution_path].sha256,
         files=file_material,
+        profile_catalog=profile_material,
     )
     payload_sha256 = sha256_bytes(canonical_bytes(payload))
     release_id = f"core-{source_commit[:12]}-{payload_sha256[:12]}"
@@ -308,8 +420,18 @@ def build_release(
         "payload_sha256": payload_sha256,
         "candidate_execution": "FORBIDDEN",
         "source_access": "GIT_OBJECTS_DATA_ONLY",
+        "profile_catalog_status": str(profile_material["status"]),
+        "profile_catalog_path": str(profile_material["path"]),
+        "profile_catalog_sha256": str(profile_material["sha256"]),
+        "profile_catalog_digest": str(profile_material["catalog_digest"]),
+        "profile_catalog_owner": (
+            profile_catalog.owner if profile_catalog is not None else "NONE"
+        ),
+        "load_profile_count": str(profile_material["load_profile_count"]),
+        "skill_binding_count": str(profile_material["skill_binding_count"]),
+        "mode_profile_count": str(profile_material["mode_profile_count"]),
     }
-    _write_database(database_path, metadata, blobs)
+    _write_database(database_path, metadata, blobs, profile_profile=profile_catalog)
     database_sha256 = sha256_bytes(database_path.read_bytes())
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -326,6 +448,7 @@ def build_release(
         "database_sha256": database_sha256,
         "source_access": "GIT_OBJECTS_DATA_ONLY",
         "candidate_execution": "FORBIDDEN",
+        "profile_catalog": profile_material,
     }
     _write_json_atomic(manifest_path, manifest)
     verify_release(database_path=database_path, manifest_path=manifest_path)
@@ -336,6 +459,8 @@ def _write_database(
     database_path: Path,
     metadata: dict[str, str],
     blobs: list[GitBlob],
+    *,
+    profile_profile: ReleaseProfileCatalog | None,
 ) -> None:
     database_path = database_path.expanduser().resolve()
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -375,6 +500,72 @@ def _write_database(
                         for blob in blobs
                     ],
                 )
+                if profile_profile is not None:
+                    connection.executemany(
+                        """
+                        INSERT INTO load_profile(profile_id, description)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            (profile.profile_id, profile.description)
+                            for profile in profile_profile.load_profiles
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO load_profile_surface(
+                            profile_id, ordinal, path, required
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                profile.profile_id,
+                                ordinal,
+                                surface.path,
+                                int(surface.required),
+                            )
+                            for profile in profile_profile.load_profiles
+                            for ordinal, surface in enumerate(profile.surfaces)
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO skill_profile_binding(skill_id, profile_id)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            (binding.skill_id, binding.profile_id)
+                            for binding in profile_profile.skill_bindings
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO mode_profile(mode_profile_id, overlay_policy)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            (profile.mode_profile_id, profile.overlay_policy)
+                            for profile in profile_profile.mode_profiles
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO mode_profile_load(
+                            mode_profile_id, ordinal, profile_id
+                        ) VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                profile.mode_profile_id,
+                                ordinal,
+                                load_profile_id,
+                            )
+                            for profile in profile_profile.mode_profiles
+                            for ordinal, load_profile_id in enumerate(
+                                profile.load_profiles
+                            )
+                        ],
+                    )
             connection.execute("VACUUM")
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity is None or integrity[0] != "ok":
@@ -410,7 +601,10 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any]:
     database_path = database_path.expanduser().resolve(strict=True)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+    if not isinstance(manifest, dict) or manifest.get("schema") not in {
+        MANIFEST_SCHEMA,
+        LEGACY_MANIFEST_SCHEMA,
+    }:
         raise CoreReleaseError("release manifest schema is unsupported")
     actual_database_sha = sha256_bytes(database_path.read_bytes())
     if actual_database_sha != manifest.get("database_sha256"):
@@ -425,6 +619,24 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
             raise CoreReleaseError("release database integrity check failed")
+        metadata = dict(connection.execute("SELECT key, value FROM release_metadata"))
+        schema = metadata.get("schema")
+        expected_objects = (
+            [
+                ("table", "load_profile"),
+                ("table", "load_profile_surface"),
+                ("table", "mode_profile"),
+                ("table", "mode_profile_load"),
+                ("table", "release_file"),
+                ("table", "release_metadata"),
+                ("table", "skill_profile_binding"),
+            ]
+            if schema == RELEASE_SCHEMA
+            else [
+                ("table", "release_file"),
+                ("table", "release_metadata"),
+            ]
+        )
         objects = connection.execute(
             """
             SELECT type, name
@@ -433,12 +645,16 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             ORDER BY type, name
             """
         ).fetchall()
-        if objects != [
-            ("table", "release_file"),
-            ("table", "release_metadata"),
-        ]:
+        if objects != expected_objects:
             raise CoreReleaseError("release database contains unexpected objects")
-        metadata = dict(connection.execute("SELECT key, value FROM release_metadata"))
+        if schema == RELEASE_SCHEMA:
+            foreign_key_issues = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            if foreign_key_issues:
+                raise CoreReleaseError(
+                    "release profile catalog violates foreign key constraints"
+                )
         rows = connection.execute(
             """
             SELECT path, git_mode, size, sha256, content
@@ -446,10 +662,15 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             ORDER BY path
             """
         ).fetchall()
+        profile_rows = (
+            _read_profile_rows(connection)
+            if schema == RELEASE_SCHEMA
+            else None
+        )
     finally:
         connection.close()
 
-    if metadata.get("schema") != RELEASE_SCHEMA:
+    if metadata.get("schema") not in {RELEASE_SCHEMA, LEGACY_RELEASE_SCHEMA}:
         raise CoreReleaseError("release database schema is unsupported")
     files: list[dict[str, Any]] = []
     payload_bytes = 0
@@ -473,6 +694,13 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
     if payload_bytes != int(metadata.get("payload_bytes", "-1")):
         raise CoreReleaseError("release payload size is inconsistent")
 
+    profile_material = None
+    if metadata["schema"] == RELEASE_SCHEMA:
+        profile_material = _verified_profile_material(
+            metadata=metadata,
+            rows=profile_rows,
+            files={item["path"]: item["sha256"] for item in files},
+        )
     payload = _payload_material(
         source_repository=metadata.get("source_repository", ""),
         source_commit=metadata.get("source_commit", ""),
@@ -484,6 +712,8 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             "",
         ),
         files=files,
+        schema=metadata["schema"],
+        profile_catalog=profile_material,
     )
     payload_sha256 = sha256_bytes(canonical_bytes(payload))
     if payload_sha256 != metadata.get("payload_sha256"):
@@ -499,6 +729,8 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         "source_access": metadata.get("source_access"),
         "candidate_execution": metadata.get("candidate_execution"),
     }
+    if profile_material is not None:
+        expected_manifest["profile_catalog"] = profile_material
     for field, value in expected_manifest.items():
         if manifest.get(field) != value:
             raise CoreReleaseError(f"release manifest field mismatch: {field}")
@@ -513,6 +745,140 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         "payload_sha256": payload_sha256,
         "database_sha256": actual_database_sha,
         "candidate_execution": metadata["candidate_execution"],
+        "profile_catalog": (
+            profile_material
+            if profile_material is not None
+            else {
+                "status": "LEGACY",
+                "path": "UNKNOWN",
+                "sha256": "UNKNOWN",
+                "catalog_digest": "UNKNOWN",
+                "load_profile_count": 0,
+                "skill_binding_count": 0,
+                "mode_profile_count": 0,
+            }
+        ),
+    }
+
+
+def _read_profile_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+    connection.row_factory = sqlite3.Row
+    return {
+        "profiles": connection.execute(
+            "SELECT profile_id, description FROM load_profile ORDER BY profile_id"
+        ).fetchall(),
+        "surfaces": connection.execute(
+            """
+            SELECT profile_id, ordinal, path, required
+            FROM load_profile_surface
+            ORDER BY profile_id, ordinal
+            """
+        ).fetchall(),
+        "skills": connection.execute(
+            """
+            SELECT skill_id, profile_id
+            FROM skill_profile_binding
+            ORDER BY skill_id
+            """
+        ).fetchall(),
+        "modes": connection.execute(
+            """
+            SELECT mode_profile_id, overlay_policy
+            FROM mode_profile
+            ORDER BY mode_profile_id
+            """
+        ).fetchall(),
+        "mode_loads": connection.execute(
+            """
+            SELECT mode_profile_id, ordinal, profile_id
+            FROM mode_profile_load
+            ORDER BY mode_profile_id, ordinal
+            """
+        ).fetchall(),
+    }
+
+
+def _verified_profile_material(
+    *,
+    metadata: dict[str, str],
+    rows: dict[str, list[sqlite3.Row]] | None,
+    files: dict[str, str],
+) -> dict[str, Any]:
+    if rows is None:
+        raise CoreReleaseError("release profile catalog tables are unavailable")
+    catalog_status = metadata.get("profile_catalog_status")
+    if catalog_status == "ABSENT":
+        if any(rows.values()):
+            raise CoreReleaseError("absent release profile catalog has stored rows")
+        return {
+            "status": "ABSENT",
+            "path": "NONE",
+            "sha256": "NONE",
+            "catalog_digest": "NONE",
+            "load_profile_count": 0,
+            "skill_binding_count": 0,
+            "mode_profile_count": 0,
+        }
+    if catalog_status != "PRESENT":
+        raise CoreReleaseError("release profile catalog status is invalid")
+
+    surfaces_by_profile: dict[str, list[dict[str, Any]]] = {}
+    for row in rows["surfaces"]:
+        surfaces_by_profile.setdefault(row["profile_id"], []).append(
+            {"path": row["path"], "required": bool(row["required"])}
+        )
+    loads_by_mode: dict[str, list[str]] = {}
+    for row in rows["mode_loads"]:
+        loads_by_mode.setdefault(row["mode_profile_id"], []).append(row["profile_id"])
+    raw = {
+        "schema": "ai-career.release-profile-catalog.v1",
+        "owner": metadata.get("profile_catalog_owner", ""),
+        "load_profiles": [
+            {
+                "profile_id": row["profile_id"],
+                "description": row["description"],
+                "surfaces": surfaces_by_profile.get(row["profile_id"], []),
+            }
+            for row in rows["profiles"]
+        ],
+        "skill_bindings": [
+            {"skill_id": row["skill_id"], "profile_id": row["profile_id"]}
+            for row in rows["skills"]
+        ],
+        "mode_profiles": [
+            {
+                "mode_profile_id": row["mode_profile_id"],
+                "overlay_policy": row["overlay_policy"],
+                "load_profiles": loads_by_mode.get(row["mode_profile_id"], []),
+            }
+            for row in rows["modes"]
+        ],
+    }
+    try:
+        catalog = parse_release_profile_catalog(raw, packaged_paths=files)
+    except ReleaseProfileError as error:
+        raise CoreReleaseError(str(error)) from error
+    expected_counts = {
+        "load_profile_count": len(catalog.load_profiles),
+        "skill_binding_count": len(catalog.skill_bindings),
+        "mode_profile_count": len(catalog.mode_profiles),
+    }
+    for key, value in expected_counts.items():
+        if metadata.get(key) != str(value):
+            raise CoreReleaseError(f"release profile count mismatch: {key}")
+    if metadata.get("profile_catalog_digest") != catalog.digest:
+        raise CoreReleaseError("release profile catalog digest is inconsistent")
+    catalog_path = metadata.get("profile_catalog_path", "")
+    if catalog_path not in files:
+        raise CoreReleaseError("release profile catalog path is not packaged")
+    if metadata.get("profile_catalog_sha256") != files[catalog_path]:
+        raise CoreReleaseError("release profile catalog file digest is inconsistent")
+    return {
+        "status": "PRESENT",
+        "path": catalog_path,
+        "sha256": metadata.get("profile_catalog_sha256"),
+        "catalog_digest": catalog.digest,
+        **expected_counts,
     }
 
 

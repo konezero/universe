@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Universe</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <strong>Universe</strong>
+        <span class="mode-label">Navigation</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="service-status" class="status-dot" data-state="loading">
+          Connecting
+        </span>
+        <button id="release-button" class="icon-button" type="button" title="Release catalog">
+          &#9638;
+        </button>
+        <button id="refresh-button" class="icon-button" type="button" title="Refresh">
+          &#8635;
+        </button>
+        <button id="access-button" class="icon-button" type="button" title="Local access">
+          &#9679;
+        </button>
+      </div>
+    </header>
+
+    <aside class="project-rail">
+      <div class="section-heading">
+        <span>Projects</span>
+        <button id="add-project-button" class="icon-button compact" type="button" title="Add project">
+          +
+        </button>
+      </div>
+      <div id="project-list" class="project-list" role="listbox" aria-label="Projects"></div>
+    </aside>
+
+    <main class="graph-workspace">
+      <div class="graph-toolbar">
+        <div>
+          <h1 id="workspace-title">Project network</h1>
+          <p id="workspace-subtitle">No project selected</p>
+        </div>
+        <div class="segmented-control" aria-label="Graph view">
+          <button type="button" class="selected" data-view="system">System</button>
+          <button type="button" data-view="documents">Documents</button>
+          <button type="button" data-view="future">Future</button>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="universe-graph" aria-label="Project system graph"></canvas>
+        <div id="graph-empty" class="graph-empty">Select a project</div>
+        <div class="graph-legend" aria-hidden="true">
+          <span><i class="node-key project"></i>Project</span>
+          <span><i class="node-key system"></i>System</span>
+          <span><i class="node-key document"></i>Document</span>
+          <span><i class="node-key predicted"></i>Predicted</span>
+        </div>
+      </div>
+      <form id="dispatch-form" class="command-composer">
+        <input id="dispatch-title" name="title" maxlength="120" placeholder="Task title" required>
+        <textarea id="dispatch-instruction" name="instruction" rows="2" placeholder="Instruction for Project MASTER" required></textarea>
+        <button id="dispatch-submit" class="primary-button" type="submit">
+          Queue
+        </button>
+      </form>
+    </main>
+
+    <aside class="inspector">
+      <div class="inspector-tabs" role="tablist">
+        <button class="selected" type="button" data-tab="details">Details</button>
+        <button type="button" data-tab="activity">Activity</button>
+      </div>
+      <section id="details-panel" class="inspector-panel"></section>
+      <section id="activity-panel" class="inspector-panel hidden"></section>
+    </aside>
+  </div>
+
+  <dialog id="project-dialog">
+    <form id="project-form" method="dialog">
+      <div class="dialog-heading">
+        <h2>Connect project</h2>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <label>
+        Project ID
+        <input name="project_id" autocomplete="off" required>
+      </label>
+      <label>
+        Project root
+        <input name="project_root" autocomplete="off" required>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
+        <button type="submit" class="primary-button">Connect</button>
+      </div>
+      <p id="project-form-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <dialog id="release-dialog" class="wide-dialog">
+    <form id="release-form" method="dialog">
+      <div class="dialog-heading">
+        <h2>Release catalog</h2>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <div class="release-layout">
+        <section>
+          <h3>Imported releases</h3>
+          <div id="release-list" class="release-list"></div>
+        </section>
+        <section class="release-import">
+          <h3>Import immutable Release DB</h3>
+          <label>
+            Database path
+            <input name="database_path" autocomplete="off" required>
+          </label>
+          <label>
+            Manifest path
+            <input name="manifest_path" autocomplete="off" required>
+          </label>
+          <label>
+            Mode
+            <input name="mode" value="MASTER" readonly>
+          </label>
+          <p class="boundary-copy">
+            Import verifies and copies the artifact into Universe. Project changes
+            remain a separate Project Host operation.
+          </p>
+          <button type="submit" class="primary-button">Import</button>
+          <p id="release-form-error" class="form-error" role="alert"></p>
+        </section>
+      </div>
+      <section id="release-proposal-output" class="proposal-output hidden"></section>
+    </form>
+  </dialog>
+
+  <dialog id="access-dialog">
+    <form id="access-form" method="dialog">
+      <div class="dialog-heading">
+        <h2>Local access</h2>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <label>
+        Access token
+        <input name="token" type="password" autocomplete="off" required>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-clear-token>Clear</button>
+        <button type="submit" class="primary-button">Apply</button>
+      </div>
+      <p id="access-form-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

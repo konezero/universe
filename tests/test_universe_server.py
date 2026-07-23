@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,6 +20,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 JsonObject = dict[str, Any]
 
 
+from core_release import build_release  # noqa: E402
 from universe_server import (  # noqa: E402
     ConnectionCapabilities,
     HttpUniverseTransport,
@@ -39,11 +41,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         temp_root = Path(self.temp.name)
+        self.temp_root = temp_root
         self.project_root = temp_root / "GCS"
         runtime_root = self.project_root / ".ai" / "runtime"
         project_instance = runtime_root / "project_instance"
         project_instance.mkdir(parents=True)
         (runtime_root / "anchor_store").mkdir()
+        (self.project_root / ".ai" / "inbox" / "MASTER").mkdir(parents=True)
         (self.project_root / "REPOSITORY_MANIFEST.md").write_text(
             "# GCS Repository Manifest\n",
             encoding="utf-8",
@@ -151,6 +155,127 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
+    def build_release_fixture(self) -> tuple[Path, Path]:
+        source = self.temp_root / "release-source"
+        source.mkdir()
+
+        def git(*args: str) -> str:
+            completed = subprocess.run(
+                ["git", "-C", str(source), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            return completed.stdout.strip()
+
+        def write(relative: str, content: str) -> None:
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+        source_index_path = (
+            ".ai/distribution/context_management_runtime_pack/"
+            "project_runtime_source_index.json"
+        )
+        distribution_path = (
+            ".ai/distribution/context_management_runtime_pack/"
+            "project_runtime_distribution_manifest.json"
+        )
+        installer_path = (
+            ".ai/distribution/context_management_runtime_pack/"
+            "project_runtime_installer.py"
+        )
+        catalog_path = (
+            ".ai/distribution/context_management_runtime_pack/"
+            "release_profile_catalog.json"
+        )
+        core_path = ".ai/core/CORE_SURFACE_REGISTRY.md"
+        paths = [
+            source_index_path,
+            distribution_path,
+            installer_path,
+            core_path,
+            catalog_path,
+        ]
+        write(
+            source_index_path,
+            json.dumps(
+                {
+                    "schema": "ai-career.project-runtime-source-index.v1",
+                    "core_registry_path": core_path,
+                    "installer_path": installer_path,
+                    "package_manifest_path": distribution_path,
+                    "release_profile_catalog_path": catalog_path,
+                    "paths": paths,
+                },
+                sort_keys=True,
+            ),
+        )
+        write(
+            distribution_path,
+            json.dumps(
+                {
+                    "schema": "ai-career.project-runtime-distribution.v1",
+                    "package": {
+                        "name": "fixture-runtime",
+                        "source_index_path": source_index_path,
+                    },
+                },
+                sort_keys=True,
+            ),
+        )
+        write(installer_path, "raise RuntimeError('must not execute')\n")
+        write(core_path, "# Fixture Core Registry\n")
+        write(
+            catalog_path,
+            json.dumps(
+                {
+                    "schema": "ai-career.release-profile-catalog.v1",
+                    "owner": "fixture/ai-career",
+                    "load_profiles": [
+                        {
+                            "profile_id": "BOOT_CORE",
+                            "description": "Boot control surfaces.",
+                            "surfaces": [
+                                {"path": core_path, "required": True},
+                                {"path": installer_path, "required": False},
+                            ],
+                        }
+                    ],
+                    "skill_bindings": [
+                        {"skill_id": "boot", "profile_id": "BOOT_CORE"}
+                    ],
+                    "mode_profiles": [
+                        {
+                            "mode_profile_id": "MASTER_BASE",
+                            "overlay_policy": "APPEND_ONLY",
+                            "load_profiles": ["BOOT_CORE"],
+                        }
+                    ],
+                },
+                sort_keys=True,
+            ),
+        )
+        git("init", "-q")
+        git("config", "user.name", "Universe Tests")
+        git("config", "user.email", "universe-tests@example.invalid")
+        git("add", "--all")
+        git("commit", "-q", "-m", "fixture")
+        commit = git("rev-parse", "HEAD")
+        database = self.temp_root / "fixture-release.sqlite3"
+        manifest = self.temp_root / "fixture-release.manifest.json"
+        build_release(
+            source_repo=source,
+            source_ref=commit,
+            expected_commit=commit,
+            source_repository="fixture/ai-career",
+            database_path=database,
+            manifest_path=manifest,
+        )
+        return database, manifest
+
     def project_seed(self, **overrides: object) -> JsonObject:
         value: JsonObject = {
             "seed_id": "gcs-seed-001",
@@ -234,6 +359,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(401, status)
         self.assertEqual("LOCAL_TOKEN_REQUIRED", result["error_code"])
 
+    def test_desktop_ui_is_public_static_but_api_data_is_not_embedded(self) -> None:
+        with urlopen(self.endpoint + "/", timeout=5) as response:
+            body = response.read().decode("utf-8")
+            self.assertEqual(200, response.status)
+            self.assertIn("Universe", body)
+            self.assertNotIn(self.token, body)
+            self.assertEqual("DENY", response.headers["X-Frame-Options"])
+            self.assertIn(
+                "default-src 'self'",
+                response.headers["Content-Security-Policy"],
+            )
+        with urlopen(self.endpoint + "/app.js", timeout=5) as response:
+            script = response.read().decode("utf-8")
+            self.assertEqual(200, response.status)
+            self.assertIn("/v1/projects", script)
+            self.assertNotIn(self.token, script)
+
     def test_registration_refresh_and_listing_are_idempotent(self) -> None:
         status, result = self.request(
             "POST",
@@ -258,6 +400,115 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(result["projects"]))
         self.assertEqual("Trading", result["projects"][0]["metadata"]["label"])
+
+    def test_release_import_and_project_plan_are_durable_and_read_only(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        database, manifest = self.build_release_fixture()
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        status, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("RELEASE_IMPORTED", imported["status"])
+        release = imported["release"]
+        self.assertEqual("PRESENT", release["profile_catalog"]["status"])
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("RELEASE_ALREADY_IMPORTED", repeated["status"])
+
+        status, listed = self.request(
+            "GET",
+            "/v1/releases",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([release["release_id"]], [
+            item["release_id"] for item in listed["releases"]
+        ])
+
+        status, proposed = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals",
+            {"release_id": release["release_id"], "mode": "MASTER"},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        proposal = proposed["proposal"]
+        self.assertEqual("PROJECT_HOST", proposal["execution_owner"])
+        self.assertEqual("NONE", proposal["effects"]["project_write"])
+        self.assertEqual(
+            "PROJECT_RELEASE_PROPOSAL_READY",
+            proposal["status"],
+        )
+
+        status, proposals = self.request(
+            "GET",
+            "/v1/projects/GCS/release-proposals",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            proposal["proposal_id"],
+            proposals["proposals"][0]["proposal_id"],
+        )
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_release_lifecycle_requires_master_and_rejects_tampering(self) -> None:
+        database, manifest = self.build_release_fixture()
+        status, blocked = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "UNIVERSE",
+            },
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("MASTER_MODE_REQUIRED", blocked["error_code"])
+
+        content = bytearray(database.read_bytes())
+        content[-1] ^= 0x01
+        database.write_bytes(bytes(content))
+        status, rejected = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("RELEASE_VERIFICATION_FAILED", rejected["error_code"])
 
     def test_event_append_is_idempotent_and_detach_cascades(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
@@ -287,6 +538,160 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(result["detached"])
         status, _ = self.request("GET", "/v1/projects/GCS", token=self.token)
         self.assertEqual(404, status)
+
+    def test_dispatch_delivery_wake_and_result_lifecycle_is_durable(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        dispatch_request = {
+            "idempotency_key": "gcs-broker-001",
+            "title": "Implement broker adapter",
+            "instruction": "Add the bounded broker adapter and tests.",
+            "constraints": ["Do not change live order execution."],
+            "expected_output": {"tests": "passing"},
+            "requested_mode": "MASTER",
+        }
+        status, queued = self.request(
+            "POST",
+            "/v1/projects/GCS/dispatches",
+            dispatch_request,
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("DISPATCH_QUEUED", queued["status"])
+        dispatch_id = queued["dispatch"]["dispatch_id"]
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/projects/GCS/dispatches",
+            dispatch_request,
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("DISPATCH_ALREADY_QUEUED", repeated["status"])
+        self.assertEqual(dispatch_id, repeated["dispatch"]["dispatch_id"])
+
+        status, unapproved = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/deliver",
+            {},
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "DISPATCH_DELIVERY_APPROVAL_REQUIRED",
+            unapproved["error_code"],
+        )
+        status, delivered = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/deliver",
+            {"approval": "APPROVED"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("DISPATCH_DELIVERED", delivered["status"])
+        inbox_file = (
+            self.project_root
+            / ".ai"
+            / "inbox"
+            / "MASTER"
+            / f"{dispatch_id}.json"
+        )
+        self.assertTrue(inbox_file.is_file())
+
+        status, woken = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/wake",
+            {"kind": "NONE"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_WAKE_RECORDED", woken["status"])
+
+        status, acknowledged = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/acknowledge",
+            {"evidence_ref": "project-inbox:ack-001"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("ACKNOWLEDGED", acknowledged["dispatch"]["status"])
+        status, started = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/start",
+            {
+                "evidence_ref": "project-master:task-frame-001",
+                "details": {"task_frame_ref": "task-frame-001"},
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("STARTED", started["dispatch"]["status"])
+        status, completed = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/result",
+            {
+                "status": "COMPLETED",
+                "summary": "Broker adapter completed.",
+                "evidence_refs": ["commit:abc", "pytest:pass"],
+                "outputs": {"changed": ["src/broker.py"]},
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("COMPLETED", completed["dispatch"]["status"])
+        self.assertEqual(
+            "COMPLETED",
+            completed["result_packet"]["status"],
+        )
+        self.assertEqual(
+            [
+                "QUEUED",
+                "DELIVERED",
+                "DELIVERED",
+                "ACKNOWLEDGED",
+                "STARTED",
+                "COMPLETED",
+            ],
+            [event["status"] for event in completed["events"]],
+        )
+
+        reopened = UniverseStore(self.server.store.database_path)
+        persisted = reopened.get_dispatch(dispatch_id)
+        self.assertEqual("COMPLETED", persisted["dispatch"]["status"])
+        self.assertEqual(
+            completed["result_packet"]["result_digest"],
+            persisted["result_packet"]["result_digest"],
+        )
+
+    def test_dispatch_stays_queued_when_master_inbox_is_unavailable(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        (self.project_root / ".ai" / "inbox" / "MASTER").rmdir()
+        status, queued = self.request(
+            "POST",
+            "/v1/projects/GCS/dispatches",
+            {
+                "idempotency_key": "offline-001",
+                "title": "Offline task",
+                "instruction": "Keep this task queued.",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        dispatch_id = queued["dispatch"]["dispatch_id"]
+        status, blocked = self.request(
+            "POST",
+            f"/v1/dispatches/{dispatch_id}/deliver",
+            {"approval": "APPROVED"},
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("DISPATCH_DELIVERY_BLOCKED", blocked["error_code"])
+        status, observed = self.request(
+            "GET",
+            f"/v1/dispatches/{dispatch_id}",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("QUEUED", observed["dispatch"]["status"])
 
     def test_project_seed_projection_and_incorporation_proposal_are_read_only(
         self,

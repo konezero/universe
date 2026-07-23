@@ -4,12 +4,14 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import mimetypes
 import os
 import re
 import secrets
 import sqlite3
 import tempfile
 import uuid
+import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,9 +20,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
+from core_release import CoreReleaseError, verify_release
+from release_runtime import ReleaseRuntime, ReleaseRuntimeError
+from universe_dispatch import (
+    DispatchError,
+    HttpProjectWakeAdapter,
+    LocalInboxConnector,
+    NoWakeAdapter,
+    ProjectWakeAdapter,
+    normalize_dispatch_request,
+    normalize_result_packet,
+    transition_event,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
@@ -28,6 +42,8 @@ EVENT_SCHEMA = "universe.project-event.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
 PROJECT_PROJECTION_SCHEMA = "universe.project-projection.v1"
 DOCUMENT_PROPOSAL_SCHEMA = "universe.document-incorporation-proposal.v1"
+RELEASE_ARTIFACT_SCHEMA = "universe.release-artifact.v1"
+RELEASE_PROPOSAL_SCHEMA = "universe.project-release-proposal.v1"
 CONNECTION_PROFILE_SCHEMA = "universe.connection-profile.v1"
 AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
 INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
@@ -43,13 +59,20 @@ INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
 ADAPTER_DIRECTIONS = frozenset({"INBOUND", "OUTBOUND"})
 AUTH_TYPES = frozenset({"LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 ALLOWED_REF_KEYS = frozenset(
-    {"manifest", "mode_registry", "runtime_status", "anchor_store"}
+    {
+        "manifest",
+        "mode_registry",
+        "runtime_status",
+        "anchor_store",
+        "master_inbox",
+    }
 )
 DEFAULT_REFS = {
     "manifest": "REPOSITORY_MANIFEST.md",
     "mode_registry": ".ai/runtime/project_instance/mode_registry.json",
     "runtime_status": ".ai/runtime/project_instance/status.md",
     "anchor_store": ".ai/runtime/anchor_store",
+    "master_inbox": ".ai/inbox/MASTER",
 }
 DOCUMENT_ROLES = frozenset(
     {"ARCHITECTURE", "CONTRACT", "DECISION", "DESIGN", "EVIDENCE", "REFERENCE"}
@@ -76,6 +99,7 @@ DEFAULT_MODE_REGISTRY_PATH = (
     / "project_instance"
     / "mode_registry.json"
 )
+UI_ROOT = Path(__file__).resolve().with_name("universe_ui")
 
 
 class UniverseError(ValueError):
@@ -545,6 +569,31 @@ def _canonical_json(value: Any) -> str:
 
 def _json_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _write_bytes_atomic(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file() and path.read_bytes() == content:
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        try:
+            path.chmod(0o444)
+        except OSError:
+            pass
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _sha256(value: Any, field: str) -> str:
@@ -1028,6 +1077,8 @@ class UniverseStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path.expanduser().resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.release_artifact_root = self.database_path.parent / "release-artifacts"
+        self.release_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -1120,6 +1171,79 @@ class UniverseStore:
                     proposal_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS project_dispatch (
+                    dispatch_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    content_digest TEXT NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_dispatch_project_time
+                ON project_dispatch(project_id, created_at, dispatch_id);
+
+                CREATE TABLE IF NOT EXISTS project_dispatch_event (
+                    event_id TEXT PRIMARY KEY,
+                    dispatch_id TEXT NOT NULL
+                        REFERENCES project_dispatch(dispatch_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL,
+                    previous_status TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_dispatch_event_order
+                ON project_dispatch_event(dispatch_id, observed_at, event_id);
+
+                CREATE TABLE IF NOT EXISTS project_result_packet (
+                    dispatch_id TEXT PRIMARY KEY
+                        REFERENCES project_dispatch(dispatch_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL,
+                    result_digest TEXT NOT NULL UNIQUE,
+                    packet_json TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS release_artifact (
+                    release_id TEXT PRIMARY KEY,
+                    source_repository TEXT NOT NULL,
+                    source_commit TEXT NOT NULL,
+                    package_name TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    database_sha256 TEXT NOT NULL UNIQUE,
+                    manifest_sha256 TEXT NOT NULL,
+                    database_path TEXT NOT NULL,
+                    manifest_path TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    verification_json TEXT NOT NULL,
+                    imported_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS project_release_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    release_id TEXT NOT NULL
+                        REFERENCES release_artifact(release_id),
+                    plan_digest TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, release_id, plan_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_release_proposal_project_time
+                ON project_release_proposal(project_id, created_at, proposal_id);
                 """
             )
 
@@ -1587,6 +1711,819 @@ class UniverseStore:
         proposal["created_at"] = now
         return proposal, True
 
+    def import_release(self, value: Any) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="release_import",
+            required=frozenset({"database_path", "manifest_path", "mode"}),
+        )
+        require_release_lifecycle_mode(request["mode"])
+        try:
+            source_database = Path(
+                _required_text(request["database_path"], "database_path")
+            ).expanduser().resolve(strict=True)
+            source_manifest = Path(
+                _required_text(request["manifest_path"], "manifest_path")
+            ).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise UniverseError("RELEASE_ARTIFACT_UNAVAILABLE", str(error)) from error
+        if not source_database.is_file() or not source_manifest.is_file():
+            raise UniverseError(
+                "RELEASE_ARTIFACT_INVALID",
+                "release database and manifest must be files",
+            )
+
+        database_content = source_database.read_bytes()
+        manifest_content = source_manifest.read_bytes()
+        database_sha256 = hashlib.sha256(database_content).hexdigest()
+        manifest_sha256 = hashlib.sha256(manifest_content).hexdigest()
+        try:
+            manifest = json.loads(manifest_content.decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise UniverseError(
+                    "RELEASE_VERIFICATION_FAILED",
+                    "release manifest must be an object",
+                    HTTPStatus.CONFLICT,
+                )
+            database_name = _required_text(
+                manifest.get("database"),
+                "manifest.database",
+            )
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise UniverseError(
+                "RELEASE_VERIFICATION_FAILED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        if Path(database_name).name != database_name or database_name in {".", ".."}:
+            raise UniverseError(
+                "RELEASE_VERIFICATION_FAILED",
+                "manifest database name must be a plain file name",
+                HTTPStatus.CONFLICT,
+            )
+        artifact_directory = self.release_artifact_root / database_sha256
+        stored_database = artifact_directory / database_name
+        stored_manifest = artifact_directory / (
+            manifest_sha256 + ".manifest.json"
+        )
+        for stored_path, expected_sha256, content in (
+            (stored_database, database_sha256, database_content),
+            (stored_manifest, manifest_sha256, manifest_content),
+        ):
+            if stored_path.exists():
+                if not stored_path.is_file() or stored_path.is_symlink():
+                    raise UniverseError(
+                        "RELEASE_CATALOG_CORRUPT",
+                        f"stored release artifact is not a regular file: {stored_path}",
+                        HTTPStatus.CONFLICT,
+                    )
+                if hashlib.sha256(stored_path.read_bytes()).hexdigest() != expected_sha256:
+                    raise UniverseError(
+                        "RELEASE_CATALOG_CORRUPT",
+                        f"stored release artifact digest mismatch: {stored_path}",
+                        HTTPStatus.CONFLICT,
+                    )
+                continue
+            _write_bytes_atomic(stored_path, content)
+        try:
+            verification = verify_release(
+                database_path=stored_database,
+                manifest_path=stored_manifest,
+            )
+        except (
+            CoreReleaseError,
+            OSError,
+            sqlite3.Error,
+        ) as error:
+            raise UniverseError(
+                "RELEASE_VERIFICATION_FAILED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        release_id = _identifier(verification["release_id"], "release_id")
+        source_repository = _required_text(
+            manifest.get("source_repository"),
+            "manifest.source_repository",
+        )
+        source_commit = _required_text(
+            verification["source_commit"],
+            "verification.source_commit",
+        )
+        package_name = _required_text(
+            manifest.get("package_name"),
+            "manifest.package_name",
+        )
+        imported_at = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT database_sha256, manifest_sha256
+                FROM release_artifact
+                WHERE release_id = ?
+                """,
+                (release_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["database_sha256"] != database_sha256
+                    or existing["manifest_sha256"] != manifest_sha256
+                ):
+                    raise UniverseError(
+                        "RELEASE_ID_CONFLICT",
+                        "release_id already refers to another immutable artifact",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self.get_release(release_id), False
+            connection.execute(
+                """
+                INSERT INTO release_artifact(
+                    release_id, source_repository, source_commit, package_name,
+                    payload_sha256, database_sha256, manifest_sha256,
+                    database_path, manifest_path, manifest_json,
+                    verification_json, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    release_id,
+                    source_repository,
+                    source_commit,
+                    package_name,
+                    verification["payload_sha256"],
+                    database_sha256,
+                    manifest_sha256,
+                    str(stored_database),
+                    str(stored_manifest),
+                    _canonical_json(manifest),
+                    _canonical_json(verification),
+                    imported_at,
+                ),
+            )
+        return self.get_release(release_id), True
+
+    def list_releases(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT release_id, source_repository, source_commit, package_name,
+                       payload_sha256, database_sha256, manifest_sha256,
+                       verification_json, imported_at
+                FROM release_artifact
+                ORDER BY imported_at DESC, release_id DESC
+                """
+            ).fetchall()
+        return [self._release_row(row) for row in rows]
+
+    def get_release(self, release_id: str) -> dict[str, Any]:
+        normalized = _identifier(release_id, "release_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT release_id, source_repository, source_commit, package_name,
+                       payload_sha256, database_sha256, manifest_sha256,
+                       verification_json, imported_at
+                FROM release_artifact
+                WHERE release_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "RELEASE_NOT_FOUND",
+                f"release is not imported: {normalized}",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._release_row(row)
+
+    def create_project_release_proposal(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="project_release_proposal",
+            required=frozenset({"release_id", "mode"}),
+        )
+        require_release_lifecycle_mode(request["mode"])
+        project = self.get_project(project_id)
+        release_id = _identifier(request["release_id"], "release_id")
+        with self._connection() as connection:
+            artifact = connection.execute(
+                """
+                SELECT database_path, manifest_path, database_sha256
+                FROM release_artifact
+                WHERE release_id = ?
+                """,
+                (release_id,),
+            ).fetchone()
+        if artifact is None:
+            raise UniverseError(
+                "RELEASE_NOT_FOUND",
+                f"release is not imported: {release_id}",
+                HTTPStatus.NOT_FOUND,
+            )
+        try:
+            with ReleaseRuntime(
+                database_path=Path(artifact["database_path"]),
+                manifest_path=Path(artifact["manifest_path"]),
+            ) as runtime:
+                plan = runtime.plan_project_install(
+                    Path(project["project_root"])
+                )
+        except (
+            CoreReleaseError,
+            ReleaseRuntimeError,
+            OSError,
+            sqlite3.Error,
+        ) as error:
+            raise UniverseError(
+                "PROJECT_RELEASE_PLAN_FAILED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        material = {
+            "schema": RELEASE_PROPOSAL_SCHEMA,
+            "project_id": project["project_id"],
+            "release_id": release_id,
+            "mode": MASTER_MODE,
+            "release_database_sha256": artifact["database_sha256"],
+            "plan": plan,
+            "approval": "REQUIRED",
+            "execution_owner": "PROJECT_HOST",
+            "effects": {
+                "project_write": "NONE",
+                "files_changed": 0,
+            },
+            "next_operation": (
+                "RESOLVE_COLLISIONS"
+                if plan["collisions"]
+                else "USER_APPROVAL_AND_PROJECT_HOST_APPLY"
+            ),
+        }
+        material["proposal_digest"] = _json_sha256(material)
+        material["proposal_id"] = "release_proposal_" + material[
+            "proposal_digest"
+        ][:20]
+        material["status"] = (
+            "PROJECT_RELEASE_PROPOSAL_BLOCKED"
+            if plan["collisions"]
+            else "PROJECT_RELEASE_PROPOSAL_READY"
+        )
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM project_release_proposal
+                WHERE project_id = ? AND release_id = ? AND plan_digest = ?
+                """,
+                (
+                    project["project_id"],
+                    release_id,
+                    plan["plan_digest"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["proposal_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_release_proposal(
+                    proposal_id, project_id, release_id, plan_digest,
+                    proposal_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["proposal_id"],
+                    project["project_id"],
+                    release_id,
+                    plan["plan_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def list_project_release_proposals(
+        self,
+        project_id: str,
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM project_release_proposal
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                """,
+                (project["project_id"],),
+            ).fetchall()
+        proposals = []
+        for row in rows:
+            proposal = json.loads(row["proposal_json"])
+            proposal["created_at"] = row["created_at"]
+            proposals.append(proposal)
+        return proposals
+
+    @staticmethod
+    def _release_row(row: sqlite3.Row) -> dict[str, Any]:
+        verification = json.loads(row["verification_json"])
+        return {
+            "schema": RELEASE_ARTIFACT_SCHEMA,
+            "release_id": row["release_id"],
+            "source_repository": row["source_repository"],
+            "source_commit": row["source_commit"],
+            "package_name": row["package_name"],
+            "payload_sha256": row["payload_sha256"],
+            "database_sha256": row["database_sha256"],
+            "manifest_sha256": row["manifest_sha256"],
+            "profile_catalog": verification["profile_catalog"],
+            "candidate_execution": verification["candidate_execution"],
+            "imported_at": row["imported_at"],
+        }
+
+    def create_dispatch(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            envelope = normalize_dispatch_request(project["project_id"], value)
+        except DispatchError as error:
+            raise UniverseError("DISPATCH_INVALID", str(error)) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT dispatch_id, content_digest
+                FROM project_dispatch
+                WHERE project_id = ? AND idempotency_key = ?
+                """,
+                (project["project_id"], envelope["idempotency_key"]),
+            ).fetchone()
+            if existing is not None:
+                if existing["content_digest"] != envelope["content_digest"]:
+                    raise UniverseError(
+                        "DISPATCH_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to another dispatch",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self.get_dispatch(existing["dispatch_id"]), False
+            connection.execute(
+                """
+                INSERT INTO project_dispatch(
+                    dispatch_id, project_id, idempotency_key, content_digest,
+                    envelope_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?)
+                """,
+                (
+                    envelope["dispatch_id"],
+                    envelope["project_id"],
+                    envelope["idempotency_key"],
+                    envelope["content_digest"],
+                    _canonical_json(envelope),
+                    envelope["created_at"],
+                    now,
+                ),
+            )
+            queued = {
+                "schema": "universe.dispatch-event.v1",
+                "event_id": "dispatch_event_" + envelope["content_digest"][:24],
+                "dispatch_id": envelope["dispatch_id"],
+                "project_id": envelope["project_id"],
+                "previous_status": "NONE",
+                "status": "QUEUED",
+                "evidence_ref": "universe-store:" + envelope["dispatch_id"],
+                "details": {},
+                "observed_at": envelope["created_at"],
+            }
+            self._insert_dispatch_event(connection, queued)
+        return self.get_dispatch(envelope["dispatch_id"]), True
+
+    def list_dispatches(
+        self,
+        project_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT dispatch_id, envelope_json, status, updated_at
+                FROM project_dispatch
+                WHERE project_id = ?
+                ORDER BY created_at DESC, dispatch_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], bounded_limit),
+            ).fetchall()
+        return [
+            self._dispatch_summary(row)
+            for row in rows
+        ]
+
+    def get_dispatch(self, dispatch_id: str) -> dict[str, Any]:
+        normalized = _required_text(dispatch_id, "dispatch_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT dispatch_id, project_id, envelope_json, status,
+                       created_at, updated_at
+                FROM project_dispatch
+                WHERE dispatch_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "DISPATCH_NOT_FOUND",
+                    f"dispatch is not recorded: {normalized}",
+                    HTTPStatus.NOT_FOUND,
+                )
+            event_rows = connection.execute(
+                """
+                SELECT event_json
+                FROM project_dispatch_event
+                WHERE dispatch_id = ?
+                ORDER BY rowid
+                """,
+                (normalized,),
+            ).fetchall()
+            result_row = connection.execute(
+                """
+                SELECT packet_json
+                FROM project_result_packet
+                WHERE dispatch_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        envelope = json.loads(row["envelope_json"])
+        envelope["status"] = row["status"]
+        return {
+            "dispatch": envelope,
+            "updated_at": row["updated_at"],
+            "events": [json.loads(item["event_json"]) for item in event_rows],
+            "result_packet": (
+                json.loads(result_row["packet_json"])
+                if result_row is not None
+                else None
+            ),
+        }
+
+    def deliver_dispatch(
+        self,
+        dispatch_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="dispatch_delivery",
+            required=frozenset(),
+            optional=frozenset({"approval"}),
+        )
+        approval = request.get("approval")
+        if not isinstance(approval, str) or approval.strip().upper() != "APPROVED":
+            raise UniverseError(
+                "DISPATCH_DELIVERY_APPROVAL_REQUIRED",
+                "project inbox delivery requires explicit approval",
+                HTTPStatus.CONFLICT,
+            )
+        current = self.get_dispatch(dispatch_id)
+        envelope = current["dispatch"]
+        if envelope["status"] != "QUEUED":
+            delivered = next(
+                (
+                    event
+                    for event in current["events"]
+                    if event["status"] == "DELIVERED"
+                ),
+                None,
+            )
+            if delivered is not None:
+                return self.get_dispatch(dispatch_id), False
+            raise UniverseError(
+                "DISPATCH_DELIVERY_STATE_INVALID",
+                "only a QUEUED dispatch can be delivered",
+                HTTPStatus.CONFLICT,
+            )
+        project = self.get_project(envelope["project_id"])
+        try:
+            receipt = LocalInboxConnector(
+                Path(project["project_root"]),
+                project["refs"]["master_inbox"],
+            ).deliver(envelope)
+            event = transition_event(
+                dispatch_id=envelope["dispatch_id"],
+                project_id=envelope["project_id"],
+                current_status="QUEUED",
+                next_status="DELIVERED",
+                evidence_ref=(
+                    "local-inbox:"
+                    + receipt["target_ref"]
+                    + "#"
+                    + receipt["content_sha256"]
+                ),
+                details={"delivery_receipt": receipt},
+            )
+        except DispatchError as error:
+            raise UniverseError(
+                "DISPATCH_DELIVERY_BLOCKED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        self._apply_dispatch_transition(event)
+        return self.get_dispatch(dispatch_id), True
+
+    def wake_dispatch(self, dispatch_id: str, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="wake_request",
+            required=frozenset({"kind"}),
+            optional=frozenset({"endpoint", "token"}),
+        )
+        current = self.get_dispatch(dispatch_id)
+        envelope = current["dispatch"]
+        if envelope["status"] not in {
+            "DELIVERED",
+            "ACKNOWLEDGED",
+            "STARTED",
+        }:
+            raise UniverseError(
+                "DISPATCH_WAKE_STATE_INVALID",
+                "dispatch must be delivered before wake",
+                HTTPStatus.CONFLICT,
+            )
+        kind = _required_text(request["kind"], "wake_request.kind").upper()
+        try:
+            adapter: ProjectWakeAdapter
+            if kind == "NONE":
+                adapter = NoWakeAdapter()
+            elif kind == "HTTP":
+                adapter = HttpProjectWakeAdapter(
+                    endpoint=_required_text(
+                        request.get("endpoint"),
+                        "wake_request.endpoint",
+                    ),
+                    token=_required_text(
+                        request.get("token"),
+                        "wake_request.token",
+                    ),
+                )
+            else:
+                raise UniverseError(
+                    "WAKE_ADAPTER_UNSUPPORTED",
+                    "wake kind must be NONE or HTTP",
+                )
+            receipt = adapter.wake(envelope)
+        except DispatchError as error:
+            raise UniverseError(
+                "PROJECT_WAKE_BLOCKED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        event = {
+            "schema": "universe.dispatch-event.v1",
+            "event_id": "dispatch_event_" + _json_sha256(receipt)[:24],
+            "dispatch_id": envelope["dispatch_id"],
+            "project_id": envelope["project_id"],
+            "previous_status": envelope["status"],
+            "status": envelope["status"],
+            "evidence_ref": "wake:" + receipt["status"],
+            "details": {"wake_receipt": receipt},
+            "observed_at": utc_now(),
+        }
+        with self._connection() as connection:
+            self._insert_dispatch_event(connection, event)
+        return self.get_dispatch(dispatch_id)
+
+    def acknowledge_dispatch(
+        self,
+        dispatch_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        return self._transition_from_request(
+            dispatch_id,
+            value,
+            expected_current="DELIVERED",
+            target="ACKNOWLEDGED",
+        )
+
+    def start_dispatch(self, dispatch_id: str, value: Any) -> dict[str, Any]:
+        return self._transition_from_request(
+            dispatch_id,
+            value,
+            expected_current="ACKNOWLEDGED",
+            target="STARTED",
+        )
+
+    def record_result_packet(
+        self,
+        dispatch_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        current = self.get_dispatch(dispatch_id)
+        try:
+            packet = normalize_result_packet(
+                dispatch=current["dispatch"],
+                value=value,
+            )
+            event = transition_event(
+                dispatch_id=packet["dispatch_id"],
+                project_id=packet["project_id"],
+                current_status="STARTED",
+                next_status=packet["status"],
+                evidence_ref="result-packet:" + packet["result_digest"],
+                details={"result_digest": packet["result_digest"]},
+            )
+        except DispatchError as error:
+            raise UniverseError(
+                "RESULT_PACKET_INVALID",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT result_digest
+                FROM project_result_packet
+                WHERE dispatch_id = ?
+                """,
+                (packet["dispatch_id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["result_digest"] != packet["result_digest"]:
+                    raise UniverseError(
+                        "RESULT_PACKET_CONFLICT",
+                        "dispatch already has another Result Packet",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self.get_dispatch(dispatch_id)
+            cursor = connection.execute(
+                """
+                UPDATE project_dispatch
+                SET status = ?, envelope_json = ?, updated_at = ?
+                WHERE dispatch_id = ? AND status = 'STARTED'
+                """,
+                (
+                    packet["status"],
+                    _canonical_json(
+                        {**current["dispatch"], "status": packet["status"]}
+                    ),
+                    event["observed_at"],
+                    packet["dispatch_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "DISPATCH_STATE_CHANGED",
+                    "dispatch state changed before Result Packet commit",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                INSERT INTO project_result_packet(
+                    dispatch_id, project_id, result_digest,
+                    packet_json, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    packet["dispatch_id"],
+                    packet["project_id"],
+                    packet["result_digest"],
+                    _canonical_json(packet),
+                    packet["completed_at"],
+                ),
+            )
+            self._insert_dispatch_event(connection, event)
+        return self.get_dispatch(dispatch_id)
+
+    def _transition_from_request(
+        self,
+        dispatch_id: str,
+        value: Any,
+        *,
+        expected_current: str,
+        target: str,
+    ) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="dispatch_transition",
+            required=frozenset({"evidence_ref"}),
+            optional=frozenset({"details"}),
+        )
+        current = self.get_dispatch(dispatch_id)
+        envelope = current["dispatch"]
+        if envelope["status"] != expected_current:
+            raise UniverseError(
+                "DISPATCH_TRANSITION_STATE_INVALID",
+                f"dispatch must be {expected_current} before {target}",
+                HTTPStatus.CONFLICT,
+            )
+        details = request.get("details", {})
+        if not isinstance(details, dict):
+            raise UniverseError(
+                "DISPATCH_TRANSITION_INVALID",
+                "details must be an object",
+            )
+        try:
+            event = transition_event(
+                dispatch_id=envelope["dispatch_id"],
+                project_id=envelope["project_id"],
+                current_status=expected_current,
+                next_status=target,
+                evidence_ref=_required_text(
+                    request["evidence_ref"],
+                    "dispatch_transition.evidence_ref",
+                ),
+                details=details,
+            )
+        except DispatchError as error:
+            raise UniverseError(
+                "DISPATCH_TRANSITION_INVALID",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        self._apply_dispatch_transition(event)
+        return self.get_dispatch(dispatch_id)
+
+    def _apply_dispatch_transition(self, event: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT envelope_json
+                FROM project_dispatch
+                WHERE dispatch_id = ? AND status = ?
+                """,
+                (event["dispatch_id"], event["previous_status"]),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "DISPATCH_STATE_CHANGED",
+                    "dispatch state changed before transition commit",
+                    HTTPStatus.CONFLICT,
+                )
+            envelope = json.loads(row["envelope_json"])
+            envelope["status"] = event["status"]
+            cursor = connection.execute(
+                """
+                UPDATE project_dispatch
+                SET status = ?, envelope_json = ?, updated_at = ?
+                WHERE dispatch_id = ? AND status = ?
+                """,
+                (
+                    event["status"],
+                    _canonical_json(envelope),
+                    event["observed_at"],
+                    event["dispatch_id"],
+                    event["previous_status"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "DISPATCH_STATE_CHANGED",
+                    "dispatch state changed before transition commit",
+                    HTTPStatus.CONFLICT,
+                )
+            self._insert_dispatch_event(connection, event)
+
+    @staticmethod
+    def _insert_dispatch_event(
+        connection: sqlite3.Connection,
+        event: dict[str, Any],
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO project_dispatch_event(
+                event_id, dispatch_id, project_id, previous_status,
+                status, event_json, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["event_id"],
+                event["dispatch_id"],
+                event["project_id"],
+                event["previous_status"],
+                event["status"],
+                _canonical_json(event),
+                event["observed_at"],
+            ),
+        )
+
+    @staticmethod
+    def _dispatch_summary(row: sqlite3.Row) -> dict[str, Any]:
+        envelope = json.loads(row["envelope_json"])
+        envelope["status"] = row["status"]
+        return {
+            "dispatch": envelope,
+            "updated_at": row["updated_at"],
+        }
+
     @staticmethod
     def _project_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -1621,6 +2558,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
+        if path in {"/", "/app.js", "/styles.css"}:
+            self._send_static(path)
+            return
         if path == "/health":
             self._send(
                 HTTPStatus.OK,
@@ -1636,6 +2576,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._authorize():
             return
+        if path == "/v1/releases":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "RELEASES_COLLECTED",
+                    "releases": self.server.store.list_releases(),
+                },
+            )
+            return
+        release_id = self._release_path(path)
+        if release_id is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.get_release(release_id),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/projects":
             self._send(
                 HTTPStatus.OK,
@@ -1645,6 +2605,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "projects": self.server.store.list_projects(),
                 },
             )
+            return
+        dispatch_parts = self._dispatch_path(path)
+        if dispatch_parts is not None and dispatch_parts[1] == "":
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.get_dispatch(dispatch_parts[0]),
+                )
+            except UniverseError as error:
+                self._send_error(error)
             return
         parts = self._project_path(path)
         if parts is None:
@@ -1663,6 +2633,34 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "PROJECT_EVENTS_COLLECTED",
                         "project_id": project_id,
                         "events": self.server.store.list_events(project_id),
+                    },
+                )
+                return
+            if suffix == "/dispatches":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_DISPATCHES_COLLECTED",
+                        "project_id": project_id,
+                        "dispatches": self.server.store.list_dispatches(
+                            project_id
+                        ),
+                    },
+                )
+                return
+            if suffix == "/release-proposals":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_RELEASE_PROPOSALS_COLLECTED",
+                        "project_id": project_id,
+                        "proposals": (
+                            self.server.store.list_project_release_proposals(
+                                project_id
+                            )
+                        ),
                     },
                 )
                 return
@@ -1699,6 +2697,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             body = self._read_json()
+            if path == "/v1/releases/import":
+                release, created = self.server.store.import_release(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "RELEASE_IMPORTED"
+                            if created
+                            else "RELEASE_ALREADY_IMPORTED"
+                        ),
+                        "release": release,
+                    },
+                )
+                return
             if path == "/v1/projects/register":
                 project, created = self.server.store.register_project(body)
                 self._send(
@@ -1711,6 +2724,44 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             parts = self._project_path(path)
+            if parts is not None and parts[1] == "/release-proposals":
+                proposal, created = (
+                    self.server.store.create_project_release_proposal(
+                        parts[0],
+                        body,
+                    )
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_RELEASE_PROPOSAL_RECORDED"
+                            if created
+                            else "PROJECT_RELEASE_PROPOSAL_ALREADY_RECORDED"
+                        ),
+                        "proposal": proposal,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/dispatches":
+                dispatch, created = self.server.store.create_dispatch(
+                    parts[0],
+                    body,
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "DISPATCH_QUEUED"
+                            if created
+                            else "DISPATCH_ALREADY_QUEUED"
+                        ),
+                        **dispatch,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/events":
                 event, created = self.server.store.append_event(parts[0], body)
                 self._send(
@@ -1778,6 +2829,83 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            dispatch_parts = self._dispatch_path(path)
+            if dispatch_parts is not None:
+                dispatch_id, operation = dispatch_parts
+                if operation == "/deliver":
+                    dispatch, changed = self.server.store.deliver_dispatch(
+                        dispatch_id,
+                        body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": (
+                                "DISPATCH_DELIVERED"
+                                if changed
+                                else "DISPATCH_ALREADY_DELIVERED"
+                            ),
+                            **dispatch,
+                        },
+                    )
+                    return
+                if operation == "/wake":
+                    dispatch = self.server.store.wake_dispatch(
+                        dispatch_id,
+                        body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "PROJECT_WAKE_RECORDED",
+                            **dispatch,
+                        },
+                    )
+                    return
+                if operation == "/acknowledge":
+                    dispatch = self.server.store.acknowledge_dispatch(
+                        dispatch_id,
+                        body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "DISPATCH_ACKNOWLEDGED",
+                            **dispatch,
+                        },
+                    )
+                    return
+                if operation == "/start":
+                    dispatch = self.server.store.start_dispatch(
+                        dispatch_id,
+                        body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "DISPATCH_STARTED",
+                            **dispatch,
+                        },
+                    )
+                    return
+                if operation == "/result":
+                    dispatch = self.server.store.record_result_packet(
+                        dispatch_id,
+                        body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "RESULT_PACKET_RECORDED",
+                            **dispatch,
+                        },
+                    )
+                    return
             self._not_found()
         except UniverseError as error:
             self._send_error(error)
@@ -1846,9 +2974,38 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         remainder = path[len(prefix):]
         for suffix in (
             "/document-incorporation-proposals",
+            "/release-proposals",
+            "/dispatches",
             "/projection",
             "/events",
             "/seed",
+        ):
+            if remainder.endswith(suffix):
+                return unquote(remainder[:-len(suffix)]), suffix
+        return unquote(remainder), ""
+
+    @staticmethod
+    def _release_path(path: str) -> str | None:
+        prefix = "/v1/releases/"
+        if not path.startswith(prefix):
+            return None
+        release_id = unquote(path[len(prefix):])
+        if not release_id or "/" in release_id:
+            return None
+        return release_id
+
+    @staticmethod
+    def _dispatch_path(path: str) -> tuple[str, str] | None:
+        prefix = "/v1/dispatches/"
+        if not path.startswith(prefix):
+            return None
+        remainder = path[len(prefix):]
+        for suffix in (
+            "/acknowledge",
+            "/deliver",
+            "/result",
+            "/start",
+            "/wake",
         ):
             if remainder.endswith(suffix):
                 return unquote(remainder[:-len(suffix)]), suffix
@@ -1879,6 +3036,33 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_static(self, path: str) -> None:
+        filename = {
+            "/": "index.html",
+            "/app.js": "app.js",
+            "/styles.css": "styles.css",
+        }[path]
+        target = UI_ROOT / filename
+        if not target.is_file() or target.is_symlink():
+            self._not_found()
+            return
+        body = target.read_bytes()
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -1967,6 +3151,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--database", type=Path, default=default_database_path())
     serve.add_argument("--state-file", type=Path, default=default_state_path())
     serve.add_argument("--token", default="")
+    serve.add_argument("--open-ui", action="store_true")
     serve.add_argument("--mode-registry", type=Path, default=DEFAULT_MODE_REGISTRY_PATH)
 
     register = commands.add_parser("register")
@@ -2029,6 +3214,11 @@ def main() -> int:
                 ),
                 flush=True,
             )
+            if args.open_ui:
+                webbrowser.open(
+                    endpoint + "/#token=" + quote(token, safe=""),
+                    new=1,
+                )
             try:
                 server.serve_forever(poll_interval=0.2)
             finally:
