@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-import sys
 
 sys.path.insert(0, str(ROOT / "tools"))
 

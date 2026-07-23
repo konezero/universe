@@ -10,6 +10,9 @@ assignments.
 - maintain the Universe project registry in SQLite;
 - accept one-time project registration and later refreshes;
 - retain append-only project observation events;
+- validate reference-only Project Seeds;
+- persist current Project Projections and missing-connection candidates;
+- create read-only `docs/universe` incorporation proposals;
 - provide compact project summaries to a UI or LLM client.
 
 Each attached project remains responsible for its own source mutation,
@@ -73,6 +76,11 @@ GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
 POST   /v1/projects/{project_id}/events
 GET    /v1/projects/{project_id}/events
+POST   /v1/projects/{project_id}/seed
+GET    /v1/projects/{project_id}/seed
+POST   /v1/projects/{project_id}/projection
+GET    /v1/projects/{project_id}/projection
+POST   /v1/projects/{project_id}/document-incorporation-proposals
 ```
 
 An event body has this shape:
@@ -89,6 +97,22 @@ An event body has this shape:
 
 Event IDs are idempotency keys. Repeating the same event is accepted; reusing
 an ID for different content is rejected.
+
+## Project Seed and Projection
+
+The Project initiates connection and submits a Project Seed containing only
+metadata plus repository-relative file references and SHA-256 digests.
+Universe validates those references against the registered root and stores no
+raw file contents.
+
+Building a Projection returns the current node/edge/document map, structural
+gaps, and user-selectable predicted paths. A newer Project Seed invalidates
+the prior current Projection until it is rebuilt.
+
+The document-incorporation endpoint returns a proposal for the Project-owned
+`docs/universe/` hierarchy. It never creates a directory or moves a document.
+The Project must approve and execute that mutation through its own Runtime.
+See `docs/project-projection-contract.md`.
 
 ## Connection and authentication boundary
 

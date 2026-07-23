@@ -193,9 +193,14 @@ def validate_source(data: Any) -> None:
 def _unique_ids(items: Any, label: str) -> set[str]:
     if not isinstance(items, list):
         raise SeedError(f"{label} must be an array")
-    ids = [item.get("id") for item in items if isinstance(item, dict)]
-    if len(ids) != len(items) or any(not value for value in ids):
-        raise SeedError(f"{label} contains an invalid id")
+    ids: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise SeedError(f"{label} contains an invalid id")
+        value = item.get("id")
+        if not isinstance(value, str) or not value:
+            raise SeedError(f"{label} contains an invalid id")
+        ids.append(value)
     if len(ids) != len(set(ids)):
         raise SeedError(f"{label} contains duplicate ids")
     return set(ids)
@@ -332,9 +337,17 @@ def _insert_catalog(connection: sqlite3.Connection, source: dict[str, Any]) -> N
 def inspect_seed(database_path: Path) -> dict[str, Any]:
     with closing(open_read_only(database_path)) as connection:
         metadata = dict(connection.execute("SELECT key, value FROM release_metadata"))
+        count_queries = (
+            ("project_kind", "SELECT COUNT(*) FROM project_kind"),
+            ("technology", "SELECT COUNT(*) FROM technology"),
+            ("route", "SELECT COUNT(*) FROM route"),
+            ("route_step", "SELECT COUNT(*) FROM route_step"),
+            ("failure_pattern", "SELECT COUNT(*) FROM failure_pattern"),
+            ("pivot_rule", "SELECT COUNT(*) FROM pivot_rule"),
+        )
         counts = {
-            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("project_kind", "technology", "route", "route_step", "failure_pattern", "pivot_rule")
+            table: connection.execute(query).fetchone()[0]
+            for table, query in count_queries
         }
     return {"metadata": metadata, "counts": counts}
 

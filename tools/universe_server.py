@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -24,6 +25,9 @@ from urllib.request import Request, urlopen
 API_SCHEMA = "universe.local-service.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
+PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
+PROJECT_PROJECTION_SCHEMA = "universe.project-projection.v1"
+DOCUMENT_PROPOSAL_SCHEMA = "universe.document-incorporation-proposal.v1"
 CONNECTION_PROFILE_SCHEMA = "universe.connection-profile.v1"
 AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
 INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
@@ -31,6 +35,8 @@ CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 CONNECTION_KINDS = frozenset({"LOCAL", "REMOTE", "PEER"})
 TRANSPORT_KINDS = frozenset({"HTTP", "GIT", "P2P"})
 INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
@@ -45,6 +51,9 @@ DEFAULT_REFS = {
     "runtime_status": ".ai/runtime/project_instance/status.md",
     "anchor_store": ".ai/runtime/anchor_store",
 }
+DOCUMENT_ROLES = frozenset(
+    {"ARCHITECTURE", "CONTRACT", "DECISION", "DESIGN", "EVIDENCE", "REFERENCE"}
+)
 
 
 class UniverseError(ValueError):
@@ -308,6 +317,43 @@ def auth_provider_for(profile: ConnectionProfile, credential: str) -> AuthProvid
     )
 
 
+def _validated_http_request_url(profile: ConnectionProfile, path: str) -> str:
+    if profile.transport_kind != "HTTP":
+        raise UniverseError(
+            "CONNECTION_TRANSPORT_INVALID",
+            "HTTP request transport requires an HTTP connection profile",
+        )
+    endpoint = urlsplit(profile.endpoint)
+    if endpoint.scheme not in {"http", "https"} or not endpoint.hostname:
+        raise UniverseError(
+            "CONNECTION_ENDPOINT_INVALID",
+            "HTTP transport endpoint must be an absolute HTTP or HTTPS URL",
+        )
+    normalized_path = _required_text(path, "path")
+    path_parts = urlsplit(normalized_path)
+    if (
+        not normalized_path.startswith("/")
+        or path_parts.scheme
+        or path_parts.netloc
+        or path_parts.fragment
+    ):
+        raise UniverseError(
+            "CONNECTION_PATH_INVALID",
+            "HTTP request path must be an absolute path without an origin or fragment",
+        )
+    request_url = urlsplit(profile.endpoint + normalized_path)
+    if (
+        request_url.scheme != endpoint.scheme
+        or request_url.netloc != endpoint.netloc
+        or request_url.scheme not in {"http", "https"}
+    ):
+        raise UniverseError(
+            "CONNECTION_ENDPOINT_INVALID",
+            "HTTP request URL must remain within the configured connection origin",
+        )
+    return request_url.geturl()
+
+
 class HttpUniverseTransport:
     def __init__(self, profile: ConnectionProfile, auth_provider: AuthProvider):
         self.profile = profile
@@ -326,13 +372,13 @@ class HttpUniverseTransport:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = Request(
-            self.profile.endpoint + path,
+            _validated_http_request_url(self.profile, path),
             data=body,
             headers=headers,
             method=method,
         )
         try:
-            with urlopen(request, timeout=10) as response:
+            with urlopen(request, timeout=10) as response:  # nosec B310
                 return response.status, json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             try:
@@ -363,6 +409,70 @@ def _event_type(value: Any) -> str:
     return event_type
 
 
+def _identifier(value: Any, field: str) -> str:
+    identifier = _required_text(value, field)
+    if not PROJECT_ID_PATTERN.fullmatch(identifier):
+        raise UniverseError(
+            "IDENTIFIER_INVALID",
+            f"{field} must use letters, digits, dot, underscore, or hyphen",
+        )
+    return identifier
+
+
+def _exact_object_fields(
+    value: Any,
+    *,
+    field: str,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise UniverseError("REQUEST_INVALID", f"{field} must be an object")
+    missing = required - set(value)
+    if missing:
+        raise UniverseError(
+            "REQUEST_INVALID",
+            f"{field} is missing: {', '.join(sorted(missing))}",
+        )
+    unknown = set(value) - required - optional
+    if unknown:
+        raise UniverseError(
+            "REQUEST_INVALID",
+            f"{field} contains unsupported fields: {', '.join(sorted(unknown))}",
+        )
+    return dict(value)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _json_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _sha256(value: Any, field: str) -> str:
+    digest = _required_text(value, field).lower()
+    if not SHA256_PATTERN.fullmatch(digest):
+        raise UniverseError("SHA256_INVALID", f"{field} must be lowercase SHA-256")
+    return digest
+
+
+def _source_commit(value: Any) -> str:
+    commit = _required_text(value, "source.commit").lower()
+    if not SOURCE_COMMIT_PATTERN.fullmatch(commit):
+        raise UniverseError(
+            "SOURCE_COMMIT_INVALID",
+            "source.commit must be a lowercase immutable commit digest",
+        )
+    return commit
+
+
 def _canonical_project_root(value: Any) -> Path:
     raw = Path(_required_text(value, "project_root")).expanduser()
     try:
@@ -374,13 +484,13 @@ def _canonical_project_root(value: Any) -> Path:
     return root
 
 
-def _relative_ref(project_root: Path, value: Any, field: str) -> str:
-    text = _required_text(value, f"refs.{field}").replace("\\", "/")
+def _relative_project_path(project_root: Path, value: Any, field: str) -> str:
+    text = _required_text(value, field).replace("\\", "/")
     path = Path(text)
     if path.is_absolute() or ".." in path.parts:
         raise UniverseError(
             "PROJECT_REF_INVALID",
-            f"refs.{field} must remain relative to project_root",
+            f"{field} must remain relative to project_root",
         )
     resolved = (project_root / path).resolve(strict=False)
     try:
@@ -388,9 +498,43 @@ def _relative_ref(project_root: Path, value: Any, field: str) -> str:
     except ValueError as error:
         raise UniverseError(
             "PROJECT_REF_OUTSIDE_ROOT",
-            f"refs.{field} escapes project_root",
+            f"{field} escapes project_root",
         ) from error
     return path.as_posix()
+
+
+def _relative_ref(project_root: Path, value: Any, field: str) -> str:
+    return _relative_project_path(project_root, value, f"refs.{field}")
+
+
+def _project_file_ref(project_root: Path, value: Any, field: str) -> dict[str, str]:
+    ref = _exact_object_fields(
+        value,
+        field=field,
+        required=frozenset({"path", "sha256"}),
+        optional=frozenset({"symbol", "kind"}),
+    )
+    relative_path = _relative_project_path(project_root, ref["path"], f"{field}.path")
+    target = project_root / relative_path
+    if not target.is_file() or target.is_symlink():
+        raise UniverseError(
+            "PROJECT_FILE_REF_UNAVAILABLE",
+            f"{field}.path is not a regular project file: {relative_path}",
+        )
+    expected = _sha256(ref["sha256"], f"{field}.sha256")
+    actual = hashlib.sha256(target.read_bytes()).hexdigest()
+    if actual != expected:
+        raise UniverseError(
+            "PROJECT_FILE_REF_DIGEST_MISMATCH",
+            f"{field}.sha256 does not match {relative_path}",
+            HTTPStatus.CONFLICT,
+        )
+    normalized = {"path": relative_path, "sha256": expected}
+    if "kind" in ref:
+        normalized["kind"] = _identifier(ref["kind"], f"{field}.kind").upper()
+    if "symbol" in ref:
+        normalized["symbol"] = _required_text(ref["symbol"], f"{field}.symbol")
+    return normalized
 
 
 def normalize_registration(value: Any) -> dict[str, Any]:
@@ -465,6 +609,330 @@ def normalize_event(project_id: str, value: Any) -> dict[str, Any]:
     }
 
 
+def _array(value: Any, field: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise UniverseError("REQUEST_INVALID", f"{field} must be an array")
+    return list(value)
+
+
+def _string_array(value: Any, field: str) -> list[str]:
+    values = _array(value, field)
+    normalized = [_required_text(item, f"{field}[]") for item in values]
+    if len(set(normalized)) != len(normalized):
+        raise UniverseError("REQUEST_INVALID", f"{field} must not contain duplicates")
+    return normalized
+
+
+def normalize_project_seed(
+    project: dict[str, Any], value: Any
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="project_seed",
+        required=frozenset(
+            {"seed_id", "source", "project", "nodes", "edges", "documents"}
+        ),
+    )
+    project_root = Path(project["project_root"]).resolve(strict=True)
+    source = _exact_object_fields(
+        request["source"],
+        field="source",
+        required=frozenset({"ref", "commit"}),
+    )
+    project_input = _exact_object_fields(
+        request["project"],
+        field="project",
+        required=frozenset({"kind", "technologies", "goal"}),
+    )
+    technologies = sorted(
+        set(
+            item.casefold()
+            for item in _string_array(
+                project_input["technologies"], "project.technologies"
+            )
+        )
+    )
+    if not technologies:
+        raise UniverseError(
+            "PROJECT_SEED_TECHNOLOGIES_REQUIRED",
+            "project.technologies must not be empty",
+        )
+
+    nodes: list[dict[str, Any]] = []
+    node_ids: set[str] = set()
+    for index, raw_node in enumerate(_array(request["nodes"], "nodes")):
+        field = f"nodes[{index}]"
+        node = _exact_object_fields(
+            raw_node,
+            field=field,
+            required=frozenset({"node_id", "kind", "title", "refs"}),
+            optional=frozenset({"summary"}),
+        )
+        node_id = _identifier(node["node_id"], f"{field}.node_id")
+        if node_id in node_ids:
+            raise UniverseError("PROJECT_SEED_NODE_DUPLICATE", f"duplicate node: {node_id}")
+        node_ids.add(node_id)
+        normalized_node: dict[str, Any] = {
+            "node_id": node_id,
+            "kind": _identifier(node["kind"], f"{field}.kind").upper(),
+            "title": _required_text(node["title"], f"{field}.title"),
+            "refs": [
+                _project_file_ref(project_root, ref, f"{field}.refs[{ref_index}]")
+                for ref_index, ref in enumerate(_array(node["refs"], f"{field}.refs"))
+            ],
+        }
+        if "summary" in node:
+            normalized_node["summary"] = _required_text(
+                node["summary"], f"{field}.summary"
+            )
+        nodes.append(normalized_node)
+    if not nodes:
+        raise UniverseError("PROJECT_SEED_NODES_REQUIRED", "nodes must not be empty")
+
+    edges: list[dict[str, Any]] = []
+    edge_ids: set[str] = set()
+    for index, raw_edge in enumerate(_array(request["edges"], "edges")):
+        field = f"edges[{index}]"
+        edge = _exact_object_fields(
+            raw_edge,
+            field=field,
+            required=frozenset({"edge_id", "from_node", "to_node", "kind"}),
+            optional=frozenset({"summary", "contract_ref"}),
+        )
+        edge_id = _identifier(edge["edge_id"], f"{field}.edge_id")
+        if edge_id in edge_ids:
+            raise UniverseError("PROJECT_SEED_EDGE_DUPLICATE", f"duplicate edge: {edge_id}")
+        edge_ids.add(edge_id)
+        from_node = _identifier(edge["from_node"], f"{field}.from_node")
+        to_node = _identifier(edge["to_node"], f"{field}.to_node")
+        if from_node not in node_ids or to_node not in node_ids:
+            raise UniverseError(
+                "PROJECT_SEED_EDGE_NODE_UNKNOWN",
+                f"{field} references an unknown node",
+            )
+        normalized_edge: dict[str, Any] = {
+            "edge_id": edge_id,
+            "from_node": from_node,
+            "to_node": to_node,
+            "kind": _identifier(edge["kind"], f"{field}.kind").upper(),
+        }
+        if "summary" in edge:
+            normalized_edge["summary"] = _required_text(
+                edge["summary"], f"{field}.summary"
+            )
+        if "contract_ref" in edge:
+            normalized_edge["contract_ref"] = _project_file_ref(
+                project_root, edge["contract_ref"], f"{field}.contract_ref"
+            )
+        edges.append(normalized_edge)
+
+    documents: list[dict[str, Any]] = []
+    document_ids: set[str] = set()
+    for index, raw_document in enumerate(_array(request["documents"], "documents")):
+        field = f"documents[{index}]"
+        document = _exact_object_fields(
+            raw_document,
+            field=field,
+            required=frozenset({"document_id", "path", "sha256", "role"}),
+            optional=frozenset({"node_ids"}),
+        )
+        document_id = _identifier(
+            document["document_id"], f"{field}.document_id"
+        )
+        if document_id in document_ids:
+            raise UniverseError(
+                "PROJECT_SEED_DOCUMENT_DUPLICATE",
+                f"duplicate document: {document_id}",
+            )
+        document_ids.add(document_id)
+        role = _identifier(document["role"], f"{field}.role").upper()
+        if role not in DOCUMENT_ROLES:
+            raise UniverseError(
+                "PROJECT_DOCUMENT_ROLE_INVALID",
+                f"unsupported document role: {role}",
+            )
+        ref = _project_file_ref(
+            project_root,
+            {"path": document["path"], "sha256": document["sha256"]},
+            field,
+        )
+        linked_nodes = _string_array(document.get("node_ids", []), f"{field}.node_ids")
+        if any(node_id not in node_ids for node_id in linked_nodes):
+            raise UniverseError(
+                "PROJECT_DOCUMENT_NODE_UNKNOWN",
+                f"{field}.node_ids contains an unknown node",
+            )
+        documents.append(
+            {
+                "document_id": document_id,
+                "path": ref["path"],
+                "sha256": ref["sha256"],
+                "role": role,
+                "node_ids": linked_nodes,
+            }
+        )
+
+    normalized = {
+        "schema": PROJECT_SEED_SCHEMA,
+        "seed_id": _identifier(request["seed_id"], "seed_id"),
+        "project_id": project["project_id"],
+        "source": {
+            "ref": _required_text(source["ref"], "source.ref"),
+            "commit": _source_commit(source["commit"]),
+        },
+        "verification": {
+            "source_commit": "PROJECT_SUBMITTED",
+            "file_digests": "VERIFIED_LOCAL",
+            "raw_file_content_stored": False,
+        },
+        "project": {
+            "kind": _identifier(project_input["kind"], "project.kind"),
+            "technologies": technologies,
+            "goal": _required_text(project_input["goal"], "project.goal"),
+        },
+        "nodes": sorted(nodes, key=lambda item: item["node_id"]),
+        "edges": sorted(edges, key=lambda item: item["edge_id"]),
+        "documents": sorted(documents, key=lambda item: item["document_id"]),
+    }
+    normalized["seed_digest"] = _json_sha256(normalized)
+    return normalized
+
+
+def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
+    degree = {node["node_id"]: 0 for node in seed["nodes"]}
+    missing_connections: list[dict[str, Any]] = []
+    predicted_paths: list[dict[str, Any]] = []
+    for edge in seed["edges"]:
+        degree[edge["from_node"]] += 1
+        degree[edge["to_node"]] += 1
+        if "contract_ref" not in edge:
+            missing_connections.append(
+                {
+                    "kind": "CONTRACT_REFERENCE_MISSING",
+                    "subject_ref": f"edge:{edge['edge_id']}",
+                }
+            )
+            predicted_paths.append(
+                {
+                    "candidate_id": f"document-contract-{edge['edge_id']}",
+                    "action": "DOCUMENT_CONNECTION_CONTRACT",
+                    "subject_ref": f"edge:{edge['edge_id']}",
+                    "selection_state": "USER_SELECTION_REQUIRED",
+                }
+            )
+    for node_id, count in sorted(degree.items()):
+        if count == 0:
+            missing_connections.append(
+                {"kind": "NODE_DISCONNECTED", "subject_ref": f"node:{node_id}"}
+            )
+            predicted_paths.append(
+                {
+                    "candidate_id": f"connect-{node_id}",
+                    "action": "CONNECT_NODE",
+                    "subject_ref": f"node:{node_id}",
+                    "selection_state": "USER_SELECTION_REQUIRED",
+                }
+            )
+    for document in seed["documents"]:
+        if not document["node_ids"]:
+            missing_connections.append(
+                {
+                    "kind": "DOCUMENT_UNMAPPED",
+                    "subject_ref": f"document:{document['document_id']}",
+                }
+            )
+            predicted_paths.append(
+                {
+                    "candidate_id": f"map-{document['document_id']}",
+                    "action": "MAP_DOCUMENT_TO_NODE",
+                    "subject_ref": f"document:{document['document_id']}",
+                    "selection_state": "USER_SELECTION_REQUIRED",
+                }
+            )
+    material = {
+        "schema": PROJECT_PROJECTION_SCHEMA,
+        "project_id": seed["project_id"],
+        "seed_id": seed["seed_id"],
+        "seed_digest": seed["seed_digest"],
+        "source": seed["source"],
+        "project": seed["project"],
+        "nodes": seed["nodes"],
+        "edges": seed["edges"],
+        "documents": seed["documents"],
+        "missing_connections": missing_connections,
+        "predicted_paths": predicted_paths,
+        "effects": {
+            "project_source_write": "NONE",
+            "project_document_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+        },
+    }
+    material["projection_digest"] = _json_sha256(material)
+    material["projection_id"] = "projection_" + material["projection_digest"][:20]
+    material["status"] = "CURRENT"
+    return material
+
+
+def _document_target(document: dict[str, Any]) -> str:
+    filename = Path(document["path"]).name
+    stable_name = f"{document['document_id']}-{filename}"
+    role = document["role"].casefold()
+    if document["role"] == "DECISION":
+        return f"docs/universe/decisions/{stable_name}"
+    if document["role"] == "CONTRACT":
+        return f"docs/universe/connections/{stable_name}"
+    if document["role"] == "EVIDENCE":
+        return f"docs/universe/evidence/{stable_name}"
+    if document["node_ids"]:
+        return (
+            f"docs/universe/nodes/{document['node_ids'][0]}/"
+            f"{role}/{stable_name}"
+        )
+    return f"docs/universe/reference/{stable_name}"
+
+
+def build_document_incorporation_proposal(
+    projection: dict[str, Any]
+) -> dict[str, Any]:
+    operations = []
+    for document in projection["documents"]:
+        already_incorporated = document["path"].startswith("docs/universe/")
+        target_path = (
+            document["path"] if already_incorporated else _document_target(document)
+        )
+        operations.append(
+            {
+                "document_id": document["document_id"],
+                "operation": "RETAIN" if already_incorporated else "MOVE",
+                "source_path": document["path"],
+                "source_sha256": document["sha256"],
+                "target_path": target_path,
+                "node_ids": document["node_ids"],
+                "role": document["role"],
+            }
+        )
+    material = {
+        "schema": DOCUMENT_PROPOSAL_SCHEMA,
+        "project_id": projection["project_id"],
+        "projection_id": projection["projection_id"],
+        "projection_digest": projection["projection_digest"],
+        "operations": operations,
+        "approval": "REQUIRED",
+        "execution_owner": "PROJECT",
+        "effects": {
+            "project_write": "NONE",
+            "documents_moved": 0,
+            "directories_created": 0,
+        },
+        "next_operation": "USER_APPROVAL_AND_PROJECT_MUTATION",
+    }
+    material["proposal_digest"] = _json_sha256(material)
+    material["proposal_id"] = "incorporation_" + material["proposal_digest"][:20]
+    material["status"] = "INCORPORATION_PROPOSAL_READY"
+    return material
+
+
 class UniverseStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path.expanduser().resolve()
@@ -513,6 +981,54 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_event_project_time
                 ON project_event(project_id, created_at, event_id);
+
+                CREATE TABLE IF NOT EXISTS project_seed (
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    seed_id TEXT NOT NULL,
+                    seed_digest TEXT NOT NULL,
+                    seed_json TEXT NOT NULL,
+                    is_current INTEGER NOT NULL CHECK(is_current IN (0, 1)),
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, seed_id),
+                    UNIQUE(project_id, seed_digest)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS project_seed_current
+                ON project_seed(project_id)
+                WHERE is_current = 1;
+
+                CREATE TABLE IF NOT EXISTS project_projection (
+                    projection_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    seed_id TEXT NOT NULL,
+                    seed_digest TEXT NOT NULL,
+                    projection_digest TEXT NOT NULL UNIQUE,
+                    projection_json TEXT NOT NULL,
+                    is_current INTEGER NOT NULL CHECK(is_current IN (0, 1)),
+                    built_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id, seed_id)
+                        REFERENCES project_seed(project_id, seed_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS project_projection_current
+                ON project_projection(project_id)
+                WHERE is_current = 1;
+
+                CREATE TABLE IF NOT EXISTS document_incorporation_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    projection_id TEXT NOT NULL
+                        REFERENCES project_projection(projection_id)
+                        ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    proposal_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -676,6 +1192,310 @@ class UniverseStore:
             for row in rows
         ]
 
+    def record_project_seed(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        seed = normalize_project_seed(project, value)
+        now = utc_now()
+        seed_json = _canonical_json(seed)
+        with self._connection() as connection:
+            by_id = connection.execute(
+                """
+                SELECT seed_digest, seed_json, recorded_at, is_current
+                FROM project_seed
+                WHERE project_id = ? AND seed_id = ?
+                """,
+                (project["project_id"], seed["seed_id"]),
+            ).fetchone()
+            if by_id is not None:
+                if by_id["seed_digest"] != seed["seed_digest"]:
+                    raise UniverseError(
+                        "PROJECT_SEED_ID_CONFLICT",
+                        "seed_id already refers to different content",
+                        HTTPStatus.CONFLICT,
+                    )
+                if not by_id["is_current"]:
+                    connection.execute(
+                        "UPDATE project_seed SET is_current = 0 WHERE project_id = ?",
+                        (project["project_id"],),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE project_seed SET is_current = 1
+                        WHERE project_id = ? AND seed_id = ?
+                        """,
+                        (project["project_id"], seed["seed_id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE project_projection SET is_current = 0
+                        WHERE project_id = ?
+                        """,
+                        (project["project_id"],),
+                    )
+                stored = json.loads(by_id["seed_json"])
+                stored["recorded_at"] = by_id["recorded_at"]
+                stored["is_current"] = True
+                return stored, False
+            by_digest = connection.execute(
+                """
+                SELECT seed_id, seed_json, recorded_at, is_current
+                FROM project_seed
+                WHERE project_id = ? AND seed_digest = ?
+                """,
+                (project["project_id"], seed["seed_digest"]),
+            ).fetchone()
+            if by_digest is not None:
+                if not by_digest["is_current"]:
+                    connection.execute(
+                        "UPDATE project_seed SET is_current = 0 WHERE project_id = ?",
+                        (project["project_id"],),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE project_seed SET is_current = 1
+                        WHERE project_id = ? AND seed_id = ?
+                        """,
+                        (project["project_id"], by_digest["seed_id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE project_projection SET is_current = 0
+                        WHERE project_id = ?
+                        """,
+                        (project["project_id"],),
+                    )
+                stored = json.loads(by_digest["seed_json"])
+                stored["recorded_at"] = by_digest["recorded_at"]
+                stored["is_current"] = True
+                return stored, False
+            connection.execute(
+                "UPDATE project_seed SET is_current = 0 WHERE project_id = ?",
+                (project["project_id"],),
+            )
+            connection.execute(
+                "UPDATE project_projection SET is_current = 0 WHERE project_id = ?",
+                (project["project_id"],),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_seed(
+                    project_id, seed_id, seed_digest, seed_json,
+                    is_current, recorded_at
+                ) VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    project["project_id"],
+                    seed["seed_id"],
+                    seed["seed_digest"],
+                    seed_json,
+                    now,
+                ),
+            )
+        seed["recorded_at"] = now
+        seed["is_current"] = True
+        return seed, True
+
+    def get_project_seed(
+        self, project_id: str, seed_id: str = ""
+    ) -> dict[str, Any]:
+        normalized_project = _project_id(project_id)
+        self.get_project(normalized_project)
+        with self._connection() as connection:
+            if seed_id:
+                normalized_seed = _identifier(seed_id, "seed_id")
+                row = connection.execute(
+                    """
+                    SELECT seed_json, recorded_at, is_current
+                    FROM project_seed
+                    WHERE project_id = ? AND seed_id = ?
+                    """,
+                    (normalized_project, normalized_seed),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT seed_json, recorded_at, is_current
+                    FROM project_seed
+                    WHERE project_id = ? AND is_current = 1
+                    """,
+                    (normalized_project,),
+                ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "PROJECT_SEED_NOT_FOUND",
+                "project has no matching Project Seed",
+                HTTPStatus.NOT_FOUND,
+            )
+        seed = json.loads(row["seed_json"])
+        seed["recorded_at"] = row["recorded_at"]
+        seed["is_current"] = bool(row["is_current"])
+        return seed
+
+    def build_project_projection(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="projection_request",
+            required=frozenset(),
+            optional=frozenset({"seed_id", "expected_seed_digest"}),
+        )
+        seed = self.get_project_seed(project_id, str(request.get("seed_id", "")))
+        if not seed["is_current"]:
+            raise UniverseError(
+                "PROJECT_SEED_NOT_CURRENT",
+                "projection may only be built from the current Project Seed",
+                HTTPStatus.CONFLICT,
+            )
+        expected_digest = request.get("expected_seed_digest")
+        if expected_digest is not None and _sha256(
+            expected_digest, "expected_seed_digest"
+        ) != seed["seed_digest"]:
+            raise UniverseError(
+                "PROJECT_SEED_DIGEST_MISMATCH",
+                "expected_seed_digest does not match the current Project Seed",
+                HTTPStatus.CONFLICT,
+            )
+        projection = build_projection(seed)
+        now = utc_now()
+        projection_json = _canonical_json(projection)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT projection_json, built_at
+                FROM project_projection WHERE projection_digest = ?
+                """,
+                (projection["projection_digest"],),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE project_projection
+                    SET is_current = CASE WHEN projection_digest = ? THEN 1 ELSE 0 END
+                    WHERE project_id = ?
+                    """,
+                    (projection["projection_digest"], projection["project_id"]),
+                )
+                stored = json.loads(existing["projection_json"])
+                stored["built_at"] = existing["built_at"]
+                return stored, False
+            connection.execute(
+                "UPDATE project_projection SET is_current = 0 WHERE project_id = ?",
+                (projection["project_id"],),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_projection(
+                    projection_id, project_id, seed_id, seed_digest,
+                    projection_digest, projection_json, is_current, built_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    projection["projection_id"],
+                    projection["project_id"],
+                    projection["seed_id"],
+                    projection["seed_digest"],
+                    projection["projection_digest"],
+                    projection_json,
+                    now,
+                ),
+            )
+        projection["built_at"] = now
+        return projection, True
+
+    def get_project_projection(self, project_id: str) -> dict[str, Any]:
+        normalized = _project_id(project_id)
+        self.get_project(normalized)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT projection_json, built_at
+                FROM project_projection
+                WHERE project_id = ? AND is_current = 1
+                """,
+                (normalized,),
+            ).fetchone()
+            any_projection = connection.execute(
+                "SELECT 1 FROM project_projection WHERE project_id = ? LIMIT 1",
+                (normalized,),
+            ).fetchone()
+        if row is None and any_projection is not None:
+            raise UniverseError(
+                "PROJECT_PROJECTION_REBUILD_REQUIRED",
+                "the current Project Seed has no current projection",
+                HTTPStatus.CONFLICT,
+            )
+        if row is None:
+            raise UniverseError(
+                "PROJECT_PROJECTION_NOT_FOUND",
+                "project has no Project Projection",
+                HTTPStatus.NOT_FOUND,
+            )
+        projection = json.loads(row["projection_json"])
+        projection["built_at"] = row["built_at"]
+        return projection
+
+    def create_document_incorporation_proposal(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="incorporation_request",
+            required=frozenset(),
+            optional=frozenset({"projection_id", "expected_projection_digest"}),
+        )
+        projection = self.get_project_projection(project_id)
+        if request.get("projection_id") not in {None, projection["projection_id"]}:
+            raise UniverseError(
+                "PROJECT_PROJECTION_ID_MISMATCH",
+                "projection_id does not match the current projection",
+                HTTPStatus.CONFLICT,
+            )
+        expected = request.get("expected_projection_digest")
+        if expected is not None and _sha256(
+            expected, "expected_projection_digest"
+        ) != projection["projection_digest"]:
+            raise UniverseError(
+                "PROJECT_PROJECTION_DIGEST_MISMATCH",
+                "expected_projection_digest does not match the current projection",
+                HTTPStatus.CONFLICT,
+            )
+        proposal = build_document_incorporation_proposal(projection)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM document_incorporation_proposal
+                WHERE proposal_digest = ?
+                """,
+                (proposal["proposal_digest"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["proposal_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO document_incorporation_proposal(
+                    proposal_id, project_id, projection_id,
+                    proposal_digest, proposal_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal["proposal_id"],
+                    proposal["project_id"],
+                    proposal["projection_id"],
+                    proposal["proposal_digest"],
+                    _canonical_json(proposal),
+                    now,
+                ),
+            )
+        proposal["created_at"] = now
+        return proposal, True
+
     @staticmethod
     def _project_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -697,7 +1517,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.token = token
         super().__init__(address, UniverseRequestHandler)
         host, port = self.server_address[:2]
-        self.connection_profile = local_connection_profile(f"http://{host}:{port}")
+        host_text = host.decode("ascii") if isinstance(host, bytes) else host
+        self.connection_profile = local_connection_profile(
+            f"http://{host_text}:{port}"
+        )
         self.interface_profiles = (local_http_interface_profile(),)
 
 
@@ -752,6 +1575,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/seed":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SEED_COLLECTED",
+                        "seed": self.server.store.get_project_seed(project_id),
+                    },
+                )
+                return
+            if suffix == "/projection":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_PROJECTION_COLLECTED",
+                        "projection": self.server.store.get_project_projection(
+                            project_id
+                        ),
+                    },
+                )
+                return
         except UniverseError as error:
             self._send_error(error)
             return
@@ -783,6 +1628,62 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_EVENT_APPENDED" if created else "PROJECT_EVENT_ALREADY_RECORDED",
                         "event": event,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/seed":
+                seed, created = self.server.store.record_project_seed(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_SEED_RECORDED"
+                            if created
+                            else "PROJECT_SEED_ALREADY_RECORDED"
+                        ),
+                        "seed": seed,
+                        "next_operation": "BUILD_PROJECT_PROJECTION",
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/projection":
+                projection, created = self.server.store.build_project_projection(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_PROJECTION_BUILT"
+                            if created
+                            else "PROJECT_PROJECTION_ALREADY_CURRENT"
+                        ),
+                        "projection": projection,
+                        "next_operation": "REVIEW_PREDICTED_PATHS",
+                    },
+                )
+                return
+            if (
+                parts is not None
+                and parts[1] == "/document-incorporation-proposals"
+            ):
+                proposal, created = (
+                    self.server.store.create_document_incorporation_proposal(
+                        parts[0], body
+                    )
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "INCORPORATION_PROPOSAL_READY"
+                            if created
+                            else "INCORPORATION_PROPOSAL_ALREADY_RECORDED"
+                        ),
+                        "proposal": proposal,
                     },
                 )
                 return
@@ -852,8 +1753,14 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not path.startswith(prefix):
             return None
         remainder = path[len(prefix):]
-        if remainder.endswith("/events"):
-            return unquote(remainder[:-len("/events")]), "/events"
+        for suffix in (
+            "/document-incorporation-proposals",
+            "/projection",
+            "/events",
+            "/seed",
+        ):
+            if remainder.endswith(suffix):
+                return unquote(remainder[:-len(suffix)]), suffix
         return unquote(remainder), ""
 
     def _not_found(self) -> None:
@@ -1003,7 +1910,8 @@ def main() -> int:
                 database_path=args.database, token=token, host=args.host, port=args.port
             )
             host, port = server.server_address[:2]
-            endpoint = f"http://{host}:{port}"
+            host_text = host.decode("ascii") if isinstance(host, bytes) else host
+            endpoint = f"http://{host_text}:{port}"
             write_server_state(
                 args.state_file,
                 endpoint=endpoint,
