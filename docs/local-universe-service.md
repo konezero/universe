@@ -4,6 +4,17 @@ The Universe local service is an application process. It is not the ai-career
 Session Boot executor and it does not create project authority or execution
 assignments.
 
+## Operating Mode contract
+
+The canonical operating coordinate is `Mode=UNIVERSE, Role=CONDUCTOR`.
+`Universe Mode` and `Conductor Mode` are project-local aliases for that same
+coordinate. The service validates the repository Mode Registry before listening.
+
+`MASTER` remains separate and is required for Release DB installation, update,
+Mode Registry mutation, and Universe policy lifecycle changes. Neither Mode
+grants authority or permission to mutate an attached project. See
+`docs/universe-mode-contract.md`.
+
 ## Responsibilities
 
 - listen only on a loopback address;

@@ -24,11 +24,14 @@ from universe_server import (  # noqa: E402
     HttpUniverseTransport,
     UniverseError,
     UniverseStore,
+    load_universe_mode_registry,
     auth_provider_for,
     connection_profile,
     create_server,
     interface_profile,
     local_connection_profile,
+    require_release_lifecycle_mode,
+    resolve_universe_mode_intent,
 )
 
 
@@ -499,6 +502,55 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(UniverseError, "absolute path"):
             safe_transport.request_json(method="GET", path="https://example.com")
+
+    def test_universe_mode_contract_and_aliases(self) -> None:
+        registry_path = Path(self.temp.name) / "universe-mode-registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "owner": "universe",
+                    "policy": "MASTER_MANAGED",
+                    "root_mode": "MASTER",
+                    "revision": 3,
+                    "modes": {
+                        "MASTER": {
+                            "role": "MASTER",
+                            "scope": "architecture/governance",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        },
+                        "UNIVERSE": {
+                            "role": "CONDUCTOR",
+                            "scope": "project-network/navigation/distribution",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        registry = load_universe_mode_registry(registry_path)
+        self.assertEqual("CONDUCTOR", registry["modes"]["UNIVERSE"]["role"])
+        for intent in (
+            "UNIVERSE",
+            "Universe mode",
+            "CONDUCTOR",
+            "Conductor mode",
+            "\uc720\ub2c8\ubc84\uc2a4",
+            "\uc720\ub2c8\ubc84\uc2a4\ubaa8\ub4dc",
+            "\ucee8\ub355\ud130",
+            "\ucee8\ub355\ud130\ubaa8\ub4dc",
+        ):
+            with self.subTest(intent=intent):
+                self.assertEqual("UNIVERSE", resolve_universe_mode_intent(intent))
+
+        require_release_lifecycle_mode("MASTER")
+        with self.assertRaisesRegex(UniverseError, "require MASTER Mode"):
+            require_release_lifecycle_mode("UNIVERSE")
+
+        registry["modes"]["UNIVERSE"]["role"] = "NAVIGATOR"
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        with self.assertRaisesRegex(UniverseError, "UNIVERSE"):
+            load_universe_mode_registry(registry_path)
 
     def test_remote_auth_types_are_reserved_without_runtime_implementation(self) -> None:
         profile = connection_profile(

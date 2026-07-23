@@ -54,6 +54,28 @@ DEFAULT_REFS = {
 DOCUMENT_ROLES = frozenset(
     {"ARCHITECTURE", "CONTRACT", "DECISION", "DESIGN", "EVIDENCE", "REFERENCE"}
 )
+MASTER_MODE = "MASTER"
+UNIVERSE_MODE = "UNIVERSE"
+UNIVERSE_ROLE = "CONDUCTOR"
+UNIVERSE_SCOPE = "project-network/navigation/distribution"
+UNIVERSE_MODE_PROFILE = "GOVERNANCE_ONLY"
+UNIVERSE_MODE_INTENTS = {
+    "UNIVERSE": UNIVERSE_MODE,
+    "UNIVERSE MODE": UNIVERSE_MODE,
+    "CONDUCTOR": UNIVERSE_MODE,
+    "CONDUCTOR MODE": UNIVERSE_MODE,
+    "\uc720\ub2c8\ubc84\uc2a4": UNIVERSE_MODE,
+    "\uc720\ub2c8\ubc84\uc2a4\ubaa8\ub4dc": UNIVERSE_MODE,
+    "\ucee8\ub355\ud130": UNIVERSE_MODE,
+    "\ucee8\ub355\ud130\ubaa8\ub4dc": UNIVERSE_MODE,
+}
+DEFAULT_MODE_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / ".ai"
+    / "runtime"
+    / "project_instance"
+    / "mode_registry.json"
+)
 
 
 class UniverseError(ValueError):
@@ -183,6 +205,75 @@ def _required_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise UniverseError("REQUEST_INVALID", f"{field} must be non-empty text")
     return value.strip()
+
+
+def resolve_universe_mode_intent(value: Any) -> str:
+    intent = _required_text(value, "mode_intent").upper()
+    try:
+        return UNIVERSE_MODE_INTENTS[intent]
+    except KeyError as error:
+        raise UniverseError(
+            "MODE_INTENT_UNSUPPORTED",
+            "Universe accepts only Universe or Conductor Mode intent",
+        ) from error
+
+
+def load_universe_mode_registry(path: Path) -> dict[str, Any]:
+    try:
+        registry = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise UniverseError(
+            "UNIVERSE_MODE_REGISTRY_UNAVAILABLE",
+            str(error),
+        ) from error
+    if not isinstance(registry, dict):
+        raise UniverseError(
+            "UNIVERSE_MODE_REGISTRY_INVALID",
+            "Universe Mode Registry must be an object",
+        )
+    if (
+        registry.get("owner") != "universe"
+        or registry.get("policy") != "MASTER_MANAGED"
+        or registry.get("root_mode") != MASTER_MODE
+    ):
+        raise UniverseError(
+            "UNIVERSE_MODE_CONTRACT_MISMATCH",
+            "Universe Mode Registry owner, policy, and root Mode must remain canonical",
+        )
+    modes = registry.get("modes")
+    if not isinstance(modes, dict):
+        raise UniverseError(
+            "UNIVERSE_MODE_REGISTRY_INVALID",
+            "Universe Mode Registry modes must be an object",
+        )
+    expected = {
+        MASTER_MODE: {
+            "role": MASTER_MODE,
+            "scope": "architecture/governance",
+            "mode_profile": "GOVERNANCE_ONLY",
+        },
+        UNIVERSE_MODE: {
+            "role": UNIVERSE_ROLE,
+            "scope": UNIVERSE_SCOPE,
+            "mode_profile": UNIVERSE_MODE_PROFILE,
+        },
+    }
+    for mode, definition in expected.items():
+        if modes.get(mode) != definition:
+            raise UniverseError(
+                "UNIVERSE_MODE_CONTRACT_MISMATCH",
+                f"Universe Mode Registry entry does not match the required contract: {mode}",
+            )
+    return registry
+
+
+def require_release_lifecycle_mode(mode: Any) -> None:
+    if _required_text(mode, "mode").upper() != MASTER_MODE:
+        raise UniverseError(
+            "MASTER_MODE_REQUIRED",
+            "Release database installation and update require MASTER Mode",
+            HTTPStatus.CONFLICT,
+        )
 
 
 def connection_profile(
@@ -1876,6 +1967,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--database", type=Path, default=default_database_path())
     serve.add_argument("--state-file", type=Path, default=default_state_path())
     serve.add_argument("--token", default="")
+    serve.add_argument("--mode-registry", type=Path, default=DEFAULT_MODE_REGISTRY_PATH)
 
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)
@@ -1905,6 +1997,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "serve":
+            mode_registry = load_universe_mode_registry(args.mode_registry)
             token = args.token or os.environ.get("UNIVERSE_TOKEN") or secrets.token_urlsafe(32)
             server = create_server(
                 database_path=args.database, token=token, host=args.host, port=args.port
@@ -1926,6 +2019,11 @@ def main() -> int:
                         "endpoint": endpoint,
                         "database": str(args.database.expanduser().resolve()),
                         "state_file": str(args.state_file.expanduser().resolve()),
+                        "mode_contract": {
+                            "mode": UNIVERSE_MODE,
+                            "role": UNIVERSE_ROLE,
+                            "registry_revision": mode_registry.get("revision", "UNKNOWN"),
+                        },
                     },
                     sort_keys=True,
                 ),

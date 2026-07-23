@@ -7,14 +7,14 @@
     },
     "UNIVERSE": {
       "mode_profile": "GOVERNANCE_ONLY",
-      "role": "NAVIGATOR",
-      "scope": "cross-project-context/path-navigation"
+      "role": "CONDUCTOR",
+      "scope": "project-network/navigation/distribution"
     }
   },
   "owner": "universe",
   "policy": "MASTER_MANAGED",
   "repository_kind": "PROJECT",
-  "revision": 2,
+  "revision": 3,
   "root_mode": "MASTER",
   "schema": "ai-career.mode-registry.v1"
 }
