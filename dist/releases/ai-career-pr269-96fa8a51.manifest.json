@@ -1,0 +1,16 @@
+{
+  "candidate_execution": "FORBIDDEN",
+  "database": "ai-career-pr269-96fa8a51.sqlite3",
+  "database_sha256": "f0abc550e060ce34b3debd2ed52d51291fe5f80f03064eecb92236e778616cf0",
+  "file_count": 117,
+  "package_name": "context-management-project-runtime",
+  "payload_bytes": 1429928,
+  "payload_sha256": "52ee8759256e747d207192fdf63095c7bd2f6face61dd1752e0cc2b21fb09054",
+  "release_id": "core-96fa8a51da46-52ee8759256e",
+  "schema": "universe.core-release-manifest.v1",
+  "source_access": "GIT_OBJECTS_DATA_ONLY",
+  "source_commit": "96fa8a51da46abdf44dfac260b29a5318d33fe80",
+  "source_committed_at": "2026-07-23T10:17:13+09:00",
+  "source_ref": "96fa8a51da46abdf44dfac260b29a5318d33fe80",
+  "source_repository": "konezero/ai-career"
+}
