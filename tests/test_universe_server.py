@@ -436,6 +436,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("RELEASE_ALREADY_IMPORTED", repeated["status"])
+        database.write_bytes(b"source artifact changed after import")
 
         status, listed = self.request(
             "GET",

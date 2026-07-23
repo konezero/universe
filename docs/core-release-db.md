@@ -84,3 +84,8 @@ the plan digest. The service persists the proposal with `project_write: NONE`.
 The attached Project Host remains responsible for user approval, Execution
 Guard, receipt-aware writes, validate/status, and the final install receipt.
 Universe deliberately exposes no HTTP apply endpoint.
+
+A v2 artifact may still report `profile_catalog.status: ABSENT` when its pinned
+source commit has no catalog surface. The artifact remains verifiable and
+installable, but Skill or Mode profile resolution fails explicitly with
+`PROFILE_CATALOG_REQUIRED`; Universe does not infer missing profile order.
