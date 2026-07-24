@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from universe_server import (  # noqa: E402
     HttpUniverseTransport,
     UniverseError,
     UniverseStore,
+    load_server_state,
     load_universe_mode_registry,
     auth_provider_for,
     connection_profile,
@@ -34,6 +36,7 @@ from universe_server import (  # noqa: E402
     local_connection_profile,
     require_release_lifecycle_mode,
     resolve_universe_mode_intent,
+    write_server_state,
 )
 
 
@@ -348,6 +351,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, result = self.request("GET", "/health")
         self.assertEqual(200, status)
         self.assertEqual("READY", result["status"])
+        self.assertEqual(
+            self.server.store.identity(),
+            result["universe"],
+        )
         self.assertEqual("LOCAL", result["connection"]["kind"])
         self.assertEqual("HTTP", result["connection"]["transport_kind"])
         self.assertEqual("LOCAL_TOKEN", result["connection"]["auth"]["type"])
@@ -358,6 +365,34 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, result = self.request("GET", "/v1/projects")
         self.assertEqual(401, status)
         self.assertEqual("LOCAL_TOKEN_REQUIRED", result["error_code"])
+
+    def test_universe_identity_is_durable_and_unique_per_database(self) -> None:
+        identity = self.server.store.identity()
+        self.assertEqual("universe.identity.v1", identity["schema"])
+        uuid.UUID(identity["universe_id"])
+
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual(identity, reopened.identity())
+
+        other = UniverseStore(self.temp_root / "other-universe.sqlite3")
+        self.assertNotEqual(
+            identity["universe_id"],
+            other.identity()["universe_id"],
+        )
+
+    def test_server_state_carries_the_database_universe_identity(self) -> None:
+        identity = self.server.store.identity()
+        state_path = self.temp_root / "server.json"
+
+        write_server_state(
+            state_path,
+            endpoint=self.endpoint,
+            token=self.token,
+            database_path=self.server.store.database_path,
+            universe_identity=identity,
+        )
+
+        self.assertEqual(identity, load_server_state(state_path)["universe"])
 
     def test_desktop_ui_is_public_static_but_api_data_is_not_embedded(self) -> None:
         with urlopen(self.endpoint + "/", timeout=5) as response:

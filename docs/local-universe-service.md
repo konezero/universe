@@ -52,6 +52,12 @@ The SQLite database defaults to:
 %LOCALAPPDATA%\Universe\universe.sqlite3
 ```
 
+The database receives one immutable `universe_id` UUID when it is created.
+Reopening the same database preserves that ID; creating another Universe
+database creates another ID. The value is returned by `/health`, the service
+startup result, and `server.json` so local clients can distinguish Universe
+instances. It does not create authority, network identity proof, or discovery.
+
 Use `--database`, `--state-file`, `--port`, or `--token` to override these
 values. Non-loopback listen addresses are rejected.
 

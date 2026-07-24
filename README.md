@@ -8,6 +8,10 @@ The first implementation surface is the Official Development Seed. It solves
 the cold-start problem before a user has accumulated enough project history to
 support useful path recall.
 
+Each local Universe database receives one immutable UUID on first creation.
+The same database preserves the ID across restarts, while a separate database
+represents a separate Universe.
+
 ## Official Development Seed v0
 
 The seed is intentionally split into two forms:

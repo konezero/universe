@@ -37,6 +37,7 @@ from universe_dispatch import (
 )
 
 API_SCHEMA = "universe.local-service.v1"
+UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
@@ -1244,8 +1245,53 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_release_proposal_project_time
                 ON project_release_proposal(project_id, created_at, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS universe_identity (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    universe_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO universe_identity(
+                    singleton, universe_id, created_at
+                )
+                VALUES (1, ?, ?)
+                """,
+                (str(uuid.uuid4()), utc_now()),
+            )
+
+    def identity(self) -> dict[str, str]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT universe_id, created_at
+                FROM universe_identity
+                WHERE singleton = 1
+                """
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "UNIVERSE_IDENTITY_UNAVAILABLE",
+                "Universe identity is missing from the local database",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        universe_id = str(row["universe_id"])
+        try:
+            uuid.UUID(universe_id)
+        except ValueError as error:
+            raise UniverseError(
+                "UNIVERSE_IDENTITY_INVALID",
+                "Universe identity is not a valid UUID",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            ) from error
+        return {
+            "schema": UNIVERSE_IDENTITY_SCHEMA,
+            "universe_id": universe_id,
+            "created_at": str(row["created_at"]),
+        }
 
     def register_project(self, value: Any) -> tuple[dict[str, Any], bool]:
         project = normalize_registration(value)
@@ -2567,6 +2613,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 {
                     "schema": API_SCHEMA,
                     "status": "READY",
+                    "universe": self.server.store.identity(),
                     "connection": self.server.connection_profile.as_dict(),
                     "interfaces": [
                         profile.as_dict() for profile in self.server.interface_profiles
@@ -3089,12 +3136,18 @@ def create_server(
 
 
 def write_server_state(
-    path: Path, *, endpoint: str, token: str, database_path: Path
+    path: Path,
+    *,
+    endpoint: str,
+    token: str,
+    database_path: Path,
+    universe_identity: dict[str, str],
 ) -> None:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": "universe.local-service-state.v1",
+        "universe": universe_identity,
         "endpoint": endpoint,
         "token": token,
         "connection_profile": local_connection_profile(endpoint).as_dict(),
@@ -3195,12 +3248,14 @@ def main() -> int:
                 endpoint=endpoint,
                 token=token,
                 database_path=args.database,
+                universe_identity=server.store.identity(),
             )
             print(
                 json.dumps(
                     {
                         "schema": API_SCHEMA,
                         "status": "UNIVERSE_SERVICE_READY",
+                        "universe": server.store.identity(),
                         "endpoint": endpoint,
                         "database": str(args.database.expanduser().resolve()),
                         "state_file": str(args.state_file.expanduser().resolve()),
