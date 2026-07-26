@@ -20,6 +20,7 @@
     "execution_approval": "REQUIRED",
     "parent_participation": "FORBIDDEN",
     "nested_worker_invoker": "BOSS_ONLY",
+    "parent_instruction_repository_boundary": "REQUIRED",
     "sub_mutation_lineage": "REQUIRED_FOR_MUTATION",
     "worker_invocation_evidence": "REQUIRED",
     "worker_actor_binding": "REQUIRED",

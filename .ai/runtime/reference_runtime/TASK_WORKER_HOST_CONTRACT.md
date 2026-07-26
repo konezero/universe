@@ -65,8 +65,9 @@ For an approval-gated profile, the Host must first generate and display one
 exact Task Frame execution proposal. The proposal binds the Parent actor,
 Execution Assignment reference, turn order, Worker slots, provider-local model
 selection, reasoning effort, Host capability status, and exact Frame/Anchor/
-Session/task/source coordinates. The user may revise the plan before approval.
-Any revision creates a new digest and invalidates the old approval.
+Session/task/source coordinates. It also binds `repository_write_scope` and
+the exact `mutation_scope`. The user may revise the plan before approval. Any
+revision creates a new digest and invalidates the old approval.
 
 The required preconditions are:
 
@@ -120,15 +121,17 @@ Using the Parent actor under a Worker-like label is
 
 ## Host Procedure
 
-1. Record the user's raw instruction, constraints, expected output, and current
-   Parent Session/Frame/Anchor coordinates in the Task Frame instruction ledger.
+1. Record the user's raw instruction, constraints, expected output,
+   `repository_write_scope`, exact `mutation_scope`, and current Parent
+   Session/Frame/Anchor coordinates in the Task Frame instruction ledger.
 2. Resolve the exact provider-local models, reasoning efforts, Worker slots,
    Parent actor, capability status, and turn route.
 3. Generate and display the source-bound execution proposal.
 4. Apply user edits by generating a new proposal; obtain exact approval for the
    final proposal.
 5. Create one Task Frame with that proposal, approval, source-backed Parent
-   observation, and the recorded Parent instruction.
+   observation, and the recorded Parent instruction. The instruction
+   repository boundary must exactly match the approved proposal.
 6. Declare exactly the approved turns through the Reference Runtime.
 7. Request the root Boss invocation plan as the Parent. Its input bundle must contain the
    unchanged Parent instruction ledger and Parent coordinates.
@@ -167,6 +170,9 @@ The Parent may return to the Commander conversation after Frame creation when
 the Host has concrete nonblocking Worker capability. It may append later user
 constraints to the instruction ledger, observe status, or cancel the Frame,
 but it must not join the Worker content path or author Sub allocations.
+Later Parent instructions may add constraints, but they may not change the
+Frame's repository boundary. A changed boundary requires a new proposal,
+approval, and Task Frame.
 
 The previous direct procedure is invalid:
 
@@ -250,6 +256,21 @@ Parent direct Sub invocation operation.
 scope. A Sub mutation is ineligible unless its Boss allocation declares the
 exact operation and target. The allocation is only a narrowing record; it does
 not create Authority, Write Scope, approval, assignment, or permission.
+
+The Parent instruction uses the same shape:
+
+```yaml
+repository_write_scope: NONE | BOUNDED
+mutation_scope:
+  operations: [<CREATE | MODIFY | DELETE>]
+  targets: [<exact absolute target>]
+```
+
+`NONE` requires both arrays to be empty. `BOUNDED` requires both arrays to be
+non-empty. The Boss must acknowledge the digest containing this boundary.
+Every mutating Sub allocation must be a subset of it. The Runtime blocks a
+mutating allocation under `NONE` and any allocation that expands a `BOUNDED`
+scope.
 
 The Host binds this envelope to the claimed turn when it constructs the
 dedicated Worker-result request. The Runtime computes `worker_result_digest`

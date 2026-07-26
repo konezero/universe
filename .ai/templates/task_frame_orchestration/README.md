@@ -77,6 +77,10 @@ task_frame:
   task_summary_ref: <bounded-parent-task-reference>
   source_ref: <contract-or-manifest-reference>
   execution_assignment_ref: <reference-or-UNASSIGNED>
+  repository_write_scope: NONE | BOUNDED
+  mutation_scope:
+    operations: []
+    targets: []
   status: DECLARED | ING | COMPLETED | FAILED | UNKNOWN
   boss_ref: <decision-role-reference-or-null>
   worker_refs: []
@@ -102,6 +106,11 @@ rechecks currentness;
 adopts, returns, defers, rejects, or leaves results UNKNOWN.
 ```
 
+Before invoking a Boss, the Parent records the unchanged instruction plus an
+explicit repository boundary. `NONE` requires empty `mutation_scope` arrays.
+`BOUNDED` requires exact operations and absolute targets. This boundary must
+match the approved execution proposal and cannot change inside the Frame.
+
 ### Boss / decision_role
 
 ```text
@@ -111,6 +120,11 @@ reviews evidence and declared routes;
 returns one Result Packet to the Parent;
 has no independent authority.
 ```
+
+The Boss acknowledges every current Parent instruction digest. It may omit
+mutation scope for read-only Sub work or narrow a `BOUNDED` scope. It may not
+allocate mutation under `NONE` or add an operation or target that the Parent
+did not declare.
 
 A simple one-Worker Task Frame may omit the Boss.
 
@@ -186,6 +200,8 @@ Adopted Task Frame result
 ```
 
 Neither a Boss decision nor Worker completion may bypass this route.
+The instruction boundary is enforced by the Task Frame ledger. It does not
+claim that the Runtime can revoke unrelated Host tools.
 
 ## Validation Checklist
 
@@ -196,6 +212,8 @@ Current Anchor and origin snapshot remain distinct.
 Parent conversation remains the adoption surface.
 Detailed Worker context does not have to enter the Parent context.
 Every Worker has a bounded task and result envelope.
+Parent instruction and approved proposal repository boundaries match.
+Boss allocations never expand the Parent mutation scope.
 Missing Host capability remains UNKNOWN.
 Completed results remain CANDIDATE until Parent adoption.
 Stale or mismatched results remain UNATTACHED.

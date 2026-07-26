@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .git_action_registry import command_payload_sha256, resolve_git_action
+
 
 GUARD_RESULT_SCHEMA = "ai-career.execution-guard-result.v1"
 PERMIT_RECEIPT_SCHEMA = "ai-career.execution-permit-receipt.v1"
@@ -486,12 +488,21 @@ def _normalize_request(
         )
     if normalized["operation"] == "COMMAND":
         command_argv = _normalize_command_argv(request.get("command_argv"))
-        if normalized["payload_sha256"] != _command_payload_sha256(command_argv):
+        if normalized["payload_sha256"] != command_payload_sha256(command_argv):
             raise ExecutionGuardError(
                 "EXECUTION_GUARD_REQUEST_INVALID",
                 "request.payload_sha256 must bind request.command_argv",
             )
+        git_action = resolve_git_action(
+            command_argv, repository_root=Path(normalized["target"])
+        )
+        if git_action is None:
+            raise ExecutionGuardError(
+                "EXECUTION_GUARD_GIT_ACTION_UNSUPPORTED",
+                "request.command_argv is not a supported bounded Git action",
+            )
         normalized["command_argv"] = command_argv
+        normalized["git_action"] = git_action.name
     lineage_candidate = request.get("task_frame_lineage")
     if lineage_candidate is not None:
         candidate = _normalize_lineage_candidate(lineage_candidate)

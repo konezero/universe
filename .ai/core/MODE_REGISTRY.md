@@ -74,6 +74,17 @@ Registry mutation is project configuration mutation. It requires explicit
 approval, bounded write scope, Execution Guard permission, and a receipt-aware
 write gateway. The Registry planner does not write files.
 
+Adding a project Mode also resolves its canonical handoff Inbox path:
+
+```text
+MODE_ID -> .ai/inbox/<lowercase-mode-id>/
+```
+
+If that path is absent, the approved `ADD_MODE` operation assembles it from
+`.ai/templates/handoff_inbox/`. If it already exists from an earlier
+registration of the same Mode, `ADD_MODE` reuses it without rewriting its
+queue or processed history.
+
 Registry Mode and Role identifiers use canonical uppercase ASCII. Duplicate
 JSON keys are invalid. The ai-career Registry owner is exactly `ai-career`;
 an installed project Registry owner must match the installed project identity.
@@ -137,6 +148,12 @@ DELETE_MODE with unregistered active Mode
 
 Deleting a registry entry does not delete its historical Current Anchor,
 Beyond Anchor footprints, Task Frames, or archive evidence.
+
+It also does not move, delete, archive, or rewrite the Mode Inbox. Registry
+membership is the only Inbox activation check: a preserved Inbox whose Mode is
+not registered is inactive and cannot receive new handoffs. Re-adding the same
+Mode makes that preserved Inbox available again at the same path. No Inbox
+status marker or archive move is required.
 
 Registry changes take effect on the next `MODE_CHANGE` or session preparation.
 They do not retroactively rewrite an already active Mode context.

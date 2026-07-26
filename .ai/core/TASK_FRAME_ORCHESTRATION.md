@@ -117,6 +117,22 @@ evidence, and decides adoption. In a Boss-routed Frame, the Parent records the
 whole instruction and invokes only the root Boss. It must not decompose,
 dispatch, or directly invoke the Boss's child Worker Turns.
 
+Before the Boss is invoked, the Parent instruction must state the repository
+boundary explicitly:
+
+```yaml
+repository_write_scope: NONE | BOUNDED
+mutation_scope:
+  operations: []
+  targets: []
+```
+
+`NONE` requires an empty mutation scope. `BOUNDED` requires at least one
+declared operation and absolute target. This boundary is part of the Parent
+instruction digest and must equal the approved Task Frame execution proposal.
+It cannot change inside an active Frame; a different boundary requires a new
+Task Frame.
+
 ### Boss / decision_role
 
 A Boss may decompose one bounded Task Frame, allocate declared Worker Turns,
@@ -132,6 +148,11 @@ Parent -X-> /root/boss/subN
 
 The Host may supply physical Worker transport, but Host transport does not
 change the logical invoker from Boss to Parent or Host.
+
+The Boss must acknowledge every current Parent instruction digest before
+allocating Sub turns. A Boss allocation may be read-only or may narrow the
+Parent mutation scope. It must never introduce a new operation or target. A
+read-only Parent instruction makes every mutating Boss allocation invalid.
 
 ```text
 Boss decision role = orchestration responsibility
@@ -290,6 +311,10 @@ Boss allocation != authority
 Sub claim != Write Scope
 Task Frame lineage != execution permission
 ```
+
+The Parent instruction boundary is a ledger invariant. It prevents the
+Runtime from accepting an undeclared Boss or Sub mutation, but it does not
+claim that the Runtime can revoke tools held independently by the Host.
 
 ## Context Isolation Boundary
 

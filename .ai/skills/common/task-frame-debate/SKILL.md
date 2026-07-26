@@ -85,6 +85,8 @@ fallback reason
 Task Frame, Origin Anchor, Session, task, and source coordinates
 Parent actor reference
 Execution Assignment reference
+repository_write_scope: NONE or BOUNDED
+exact mutation_scope operations and absolute targets
 ```
 
 `AUTO` resolves models only within the currently selected provider. The user
@@ -142,7 +144,19 @@ scope requires it, but must not add undeclared turns after execution begins.
 Before declaring turns, the Parent must append the user's instruction unchanged
 to the process-local Task Frame ledger. The record binds the raw instruction to
 the Parent `session_id`, `frame_id`, `anchor_ref`, constraints, expected output,
-and a Runtime-computed digest.
+`repository_write_scope`, exact `mutation_scope`, and a Runtime-computed digest.
+
+```yaml
+repository_write_scope: NONE | BOUNDED
+mutation_scope:
+  operations: []
+  targets: []
+```
+
+`NONE` requires an empty mutation scope. `BOUNDED` requires at least one
+operation and absolute target. The instruction boundary must exactly match the
+approved proposal. It may not change while the Frame is active; create a new
+proposal and Task Frame when the boundary changes.
 
 ```text
 Parent
@@ -173,6 +187,12 @@ output. A write-capable allocation additionally binds exact
 allocation omits the field and receives an empty scope. The Runtime rejects
 missing, incomplete, duplicated, stale, or malformed allocations. A Sub input
 becomes ready only from a validated Boss allocation.
+
+The Boss must acknowledge every current Parent instruction digest. A mutating
+allocation is invalid when the Parent boundary is `NONE`, and every allocation
+under `BOUNDED` must be a subset of the Parent operations and targets. This is
+a Task Frame ledger invariant; it does not assert control over unrelated tools
+that the Host may expose outside the Runtime.
 
 The Boss must invoke each Sub itself through the Host's nested-Worker
 capability. The Host owns physical process or model transport, but it is not

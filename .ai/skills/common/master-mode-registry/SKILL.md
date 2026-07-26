@@ -40,12 +40,19 @@ Mode mutation is available only from `MASTER`.
 ```text
 1. Read the current Registry.
 2. Create an exact plan with `mode-registry plan`.
-3. Display operation, target Mode, definition, and revision change.
+3. Display operation, target Mode, definition, revision change, and Inbox action.
 4. Obtain explicit User approval.
-5. Bind an exact assignment and Registry-file write scope.
+5. Bind an exact assignment and Registry-file write scope. For `ADD_MODE`
+   with `inbox.action: ASSEMBLE`, include the planned Mode Inbox path.
 6. Run Execution Guard.
-7. Apply the exact postimage through the receipt-aware file gateway.
-8. Validate the Registry owner, canonical identifiers, and new revision.
+7. Apply the exact Registry postimage through the receipt-aware file gateway.
+8. For `ADD_MODE`, apply the planned Inbox action:
+   - `ASSEMBLE`: create `README.md`, `queue.md`, and `processed.md` from
+     `.ai/templates/handoff_inbox/` inside the same approved mutation.
+   - `REUSE`: do not rewrite the existing Inbox; continue from its existing
+     queue and processed history.
+9. Validate the Registry owner, canonical identifiers, new revision, and
+   resolved Inbox state.
 ```
 
 Planner input:
@@ -82,6 +89,15 @@ The active Mode cannot be deleted.
 DELETE requires a registered, source-backed active Mode; `UNKNOWN` and
 unregistered labels are not accepted.
 Deleted Mode history remains in Anchor and Task Frame stores.
+Mode Registry membership is the only Inbox activation check. Directory
+existence alone never activates an Inbox or permits delivery.
+Deleting a Mode does not move, delete, archive, or rewrite its Inbox. The
+Inbox stays at `.ai/inbox/<lowercase-mode-id>/` and becomes inactive because
+the Mode no longer resolves through the Registry.
+Re-adding the same Mode automatically reuses the preserved Inbox. Existing
+queue and processed history must not be reset or copied.
+Adding a Mode with no existing Inbox assembles one from the generic handoff
+Inbox template. `MODIFY_MODE` does not create a missing Inbox implicitly.
 Changes apply on the next MODE_CHANGE or session preparation. The changed
 Registry revision/definition binding creates a new Mode Current Anchor and
 retires the previous Anchor to Beyond evidence.

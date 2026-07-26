@@ -37,6 +37,10 @@ SOURCE_INDEX_PATH = (
     ".ai/distribution/context_management_runtime_pack/"
     "project_runtime_source_index.json"
 )
+RELEASE_PROFILE_CATALOG_PATH = (
+    ".ai/distribution/context_management_runtime_pack/"
+    "release_profile_catalog.json"
+)
 SOURCE_BUNDLE_MANIFEST_NAME = "SOURCE_BUNDLE.json"
 SOURCE_BUNDLE_OBJECT_ROOT = "objects/sha256"
 SOURCE_BUNDLE_MAX_FILES = 4096
@@ -170,6 +174,7 @@ EXPECTED_EXCLUDED_ROOTS = {
 EXPECTED_EXCLUDED_TEMPLATE_FAMILIES = {
     "tutorial",
     "gcs",
+    "conductor",
 }
 
 REQUIRED_GROUP_EXCLUDED_COMPONENTS = {
@@ -1189,6 +1194,7 @@ def _validate_source_index(
         "package_manifest_path",
         "core_registry_path",
         "installer_path",
+        "release_profile_catalog_path",
         "paths",
     }:
         raise InstallerError(
@@ -1203,6 +1209,8 @@ def _validate_source_index(
         source_index.get("package_manifest_path") != MANIFEST_SOURCE_PATH
         or source_index.get("core_registry_path") != REGISTRY_SOURCE_PATH
         or source_index.get("installer_path") != INSTALLER_SOURCE_PATH
+        or source_index.get("release_profile_catalog_path")
+        != RELEASE_PROFILE_CATALOG_PATH
     ):
         raise InstallerError(
             "SOURCE_INDEX_SCHEMA_INVALID", "project runtime source pins are invalid"
@@ -2939,6 +2947,7 @@ def _inspect_migration(arguments: argparse.Namespace) -> dict[str, Any]:
         REGISTRY_SOURCE_PATH,
         SOURCE_INDEX_PATH,
         HOST_FRESH_INSTALL_SOURCE_PATH,
+        RELEASE_PROFILE_CATALOG_PATH,
         *(str(spec["source_path"]) for spec in copy_specs),
     ]
     source_index_bytes = source.read(SOURCE_INDEX_PATH)
@@ -3225,6 +3234,7 @@ def _install(arguments: argparse.Namespace) -> dict[str, Any]:
         REGISTRY_SOURCE_PATH,
         SOURCE_INDEX_PATH,
         HOST_FRESH_INSTALL_SOURCE_PATH,
+        RELEASE_PROFILE_CATALOG_PATH,
         *(str(spec["source_path"]) for spec in copy_specs),
     ]
     source_index_bytes = source.read(SOURCE_INDEX_PATH)

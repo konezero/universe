@@ -23,6 +23,7 @@ from .execution_guard_adapter import invoke_execution_guard
 from .execution_guard_runtime import ExecutionGuardError, ExecutionGuardRuntime
 from .file_mutation_gateway import FileMutationGateway
 from .git_command_gateway import GitCommandGateway
+from .git_action_registry import GitAction, resolve_git_action
 from .git_proposal_runtime import GitProposalError, GitProposalJournal
 from .mode_registry_runtime import (
     ModeDefinition,
@@ -73,6 +74,7 @@ __all__ = [
     "ExecutionGuardRuntime",
     "FileMutationGateway",
     "GitCommandGateway",
+    "GitAction",
     "GitProposalError",
     "GitProposalJournal",
     "ModeDefinition",
@@ -104,5 +106,6 @@ __all__ = [
     "read_installation_manifest",
     "read_project_runtime_status",
     "run_continuity_command",
+    "resolve_git_action",
     "verify_mode_request",
 ]

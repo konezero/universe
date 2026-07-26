@@ -27,6 +27,7 @@ if __package__:
         ModeRegistryError,
         load_mode_registry,
         plan_mode_registry_mutation,
+        resolve_mode_inbox,
     )
     from .os_status_runtime import (
         OsStatusError,
@@ -69,6 +70,7 @@ else:
         ModeRegistryError,
         load_mode_registry,
         plan_mode_registry_mutation,
+        resolve_mode_inbox,
     )
     from reference_runtime.os_status_runtime import (
         OsStatusError,
@@ -998,6 +1000,9 @@ def _mode_registry(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
                 "status": "MODE_REGISTRY_ENTRY_RESOLVED",
                 "mode": definition.mode,
                 "definition": definition.as_dict(),
+                "inbox": resolve_mode_inbox(
+                    repository_root, definition.mode
+                ),
                 "revision": registry.revision,
                 "repository_write": False,
             }

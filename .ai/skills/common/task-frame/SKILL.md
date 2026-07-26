@@ -76,6 +76,21 @@ model, reasoning effort, Worker count, or execution shape. Any edit creates a
 new proposal and invalidates prior approval. Do not create the Task Frame until
 the exact current proposal is approved.
 
+The proposal and Parent instruction must both declare the same repository
+boundary:
+
+```yaml
+repository_write_scope: NONE | BOUNDED
+mutation_scope:
+  operations: []
+  targets: []
+```
+
+Use `NONE` with an empty scope for read-only work. Use `BOUNDED` with exact
+operations and absolute targets for implementation work. The Boss must
+acknowledge the instruction digest and may only narrow this boundary. Changing
+it requires a new proposal and Task Frame.
+
 For a bounded Task Frame that must survive separate CLI calls, pass one
 project-local, ignored database path and create the frame once:
 
@@ -90,11 +105,11 @@ python .ai/runtime/reference_runtime/cli.py task-frame continue \
   --database <same-frame-db> --request <operation-request.json>
 ```
 
-The durable journal records a dispatch-time copy of Parent coordinates, purpose,
-raw instruction, constraints, expected output, Boss allocation, and returned
-Worker envelopes. It is not the Mode Current Anchor and must not be used
-to refresh or infer that Anchor's currentness. The default without `--database`
-remains disposable `:memory:` behavior.
+The durable journal records a dispatch-time copy of Parent coordinates,
+purpose, raw instruction, constraints, expected output, repository boundary,
+Boss allocation, and returned Worker envelopes. It is not the Mode Current
+Anchor and must not be used to refresh or infer that Anchor's currentness. The
+default without `--database` remains disposable `:memory:` behavior.
 
 Return stdout and the exit code unchanged. Do not normalize `UNKNOWN`,
 `UNATTACHED`, or `CANDIDATE`.

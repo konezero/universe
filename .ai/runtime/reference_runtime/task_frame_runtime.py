@@ -28,12 +28,14 @@ INSTALLATION_MANIFEST_PATH = ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST
 GENERIC_WRITE_PROOF = "GENERIC_WRITE_PROOF"
 IMMUTABLE_COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40,64}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-TASK_FRAME_EXECUTION_PROPOSAL_SCHEMA = "ai-career.task-frame-execution-proposal.v1"
+TASK_FRAME_EXECUTION_PROPOSAL_SCHEMA = "ai-career.task-frame-execution-proposal.v2"
 TASK_FRAME_EXECUTION_SHAPES = {"DEBATE"}
 TASK_FRAME_MODEL_MODES = {"AUTO", "EXPLICIT"}
 TASK_FRAME_TRANSCRIPT_POLICY = "BOUNDED_RETURNED_MESSAGES_ONLY"
 PARENT_OBSERVATION_STATUSES = {"MATCHED", "MISSING", "MISMATCHED", "UNKNOWN"}
 HOST_CAPABILITY_STATUSES = {"AVAILABLE", "UNAVAILABLE", "UNKNOWN"}
+REPOSITORY_WRITE_SCOPES = {"NONE", "BOUNDED"}
+REPOSITORY_MUTATION_OPERATIONS = {"CREATE", "MODIFY", "DELETE"}
 REVIEW_DECISIONS = {"ACCEPT", "RETURN", "BLOCKED", "UNKNOWN"}
 PROHIBITED_TURN_RESULT_CLAIMS = frozenset(
     {
@@ -89,6 +91,8 @@ CREATE TABLE IF NOT EXISTS task_instructions (
     user_instruction_raw TEXT NOT NULL,
     constraints_json TEXT NOT NULL,
     expected_output_json TEXT NOT NULL,
+    repository_write_scope TEXT NOT NULL,
+    mutation_scope_json TEXT NOT NULL,
     instruction_digest TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL,
     acknowledged_by TEXT NOT NULL DEFAULT '',
@@ -250,6 +254,67 @@ def _execution_exact_fields(
         raise ValueError(f"{context} is missing required field: {missing[0]}")
 
 
+def _normalize_mutation_scope(value: Any, context: str) -> dict[str, list[str]]:
+    if not isinstance(value, Mapping) or set(value) != {"operations", "targets"}:
+        raise ValueError(f"{context} must contain operations and targets")
+    operations = value.get("operations")
+    targets = value.get("targets")
+    if (
+        not isinstance(operations, list)
+        or not isinstance(targets, list)
+        or any(not isinstance(item, str) for item in operations)
+        or any(not isinstance(item, str) for item in targets)
+    ):
+        raise ValueError(f"{context} operations and targets must be arrays of strings")
+    normalized_operations = list(
+        dict.fromkeys(item.strip().upper() for item in operations if item.strip())
+    )
+    if any(
+        item not in REPOSITORY_MUTATION_OPERATIONS
+        for item in normalized_operations
+    ):
+        raise ValueError(f"{context}.operations contains an unsupported operation")
+    normalized_targets: list[str] = []
+    for item in targets:
+        if not item.strip() or not Path(item).is_absolute():
+            raise ValueError(f"{context}.targets must contain absolute paths")
+        normalized_target = os.path.normpath(item.strip())
+        if normalized_target not in normalized_targets:
+            normalized_targets.append(normalized_target)
+    if bool(normalized_operations) != bool(normalized_targets):
+        raise ValueError(f"{context} operations and targets must both be empty or non-empty")
+    return {
+        "operations": normalized_operations,
+        "targets": normalized_targets,
+    }
+
+
+def _normalize_repository_boundary(
+    *,
+    repository_write_scope: Any,
+    mutation_scope: Any,
+    context: str,
+) -> tuple[str, dict[str, list[str]]]:
+    write_scope = _execution_text(
+        repository_write_scope,
+        f"{context}.repository_write_scope",
+    ).upper()
+    if write_scope not in REPOSITORY_WRITE_SCOPES:
+        raise ValueError(
+            f"{context}.repository_write_scope must be NONE or BOUNDED"
+        )
+    normalized_mutation_scope = _normalize_mutation_scope(
+        mutation_scope,
+        f"{context}.mutation_scope",
+    )
+    has_mutation = bool(normalized_mutation_scope["operations"])
+    if write_scope == "NONE" and has_mutation:
+        raise ValueError(f"{context} NONE scope requires an empty mutation_scope")
+    if write_scope == "BOUNDED" and not has_mutation:
+        raise ValueError(f"{context} BOUNDED scope requires a non-empty mutation_scope")
+    return write_scope, normalized_mutation_scope
+
+
 def _normalize_execution_turns(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, list) or not value:
         raise ValueError("execution_plan.turns must be a non-empty array")
@@ -308,6 +373,8 @@ def _normalize_execution_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         "commander_surface",
         "execution_assignment_ref",
         "host_worker_capability",
+        "repository_write_scope",
+        "mutation_scope",
         "fallback_reason",
         "transcript_policy",
         "turns",
@@ -336,6 +403,11 @@ def _normalize_execution_plan(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "execution_plan.host_worker_capability must be AVAILABLE for Task Frame execution"
         )
+    repository_write_scope, mutation_scope = _normalize_repository_boundary(
+        repository_write_scope=value.get("repository_write_scope"),
+        mutation_scope=value.get("mutation_scope"),
+        context="execution_plan",
+    )
     transcript_policy = _execution_text(
         value.get("transcript_policy"), "execution_plan.transcript_policy"
     )
@@ -392,6 +464,8 @@ def _normalize_execution_plan(value: Mapping[str, Any]) -> dict[str, Any]:
             "execution_plan.execution_assignment_ref",
         ),
         "host_worker_capability": host_capability,
+        "repository_write_scope": repository_write_scope,
+        "mutation_scope": mutation_scope,
         "fallback_reason": _execution_text(
             value.get("fallback_reason"), "execution_plan.fallback_reason"
         ),
@@ -757,6 +831,7 @@ def load_profile(repo_root: Path, profile_path: Path) -> TaskFrameProofProfile:
             "execution_approval": "REQUIRED",
             "parent_participation": "FORBIDDEN",
             "nested_worker_invoker": "BOSS_ONLY",
+            "parent_instruction_repository_boundary": "REQUIRED",
             "sub_mutation_lineage": "REQUIRED_FOR_MUTATION",
             "worker_invocation_evidence": "REQUIRED",
             "worker_actor_binding": "REQUIRED",
@@ -829,6 +904,7 @@ class TaskFrameRuntime:
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self._ensure_profile_path_column(profile.profile_path)
+        self._ensure_instruction_boundary_columns()
 
         timestamp = self._normalize_timestamp(observed_at)
         if not timestamp:
@@ -1011,6 +1087,7 @@ class TaskFrameRuntime:
         instance.conn.execute("PRAGMA journal_mode=WAL")
         instance.conn.executescript(SCHEMA)
         instance._ensure_profile_path_column(profile.profile_path)
+        instance._ensure_instruction_boundary_columns()
         context = instance._context_or_none()
         if context is None:
             instance.close()
@@ -1094,6 +1171,25 @@ class TaskFrameRuntime:
             """,
             (profile_path,),
         )
+
+    def _ensure_instruction_boundary_columns(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute(
+                "PRAGMA table_info(task_instructions)"
+            ).fetchall()
+        }
+        if "repository_write_scope" not in columns:
+            self.conn.execute(
+                "ALTER TABLE task_instructions "
+                "ADD COLUMN repository_write_scope TEXT NOT NULL DEFAULT 'UNKNOWN'"
+            )
+        if "mutation_scope_json" not in columns:
+            self.conn.execute(
+                "ALTER TABLE task_instructions "
+                "ADD COLUMN mutation_scope_json TEXT NOT NULL "
+                "DEFAULT '{\"operations\":[],\"targets\":[]}'"
+            )
 
     def _load_context_coordinates(self, context: sqlite3.Row) -> None:
         expected = {
@@ -1359,6 +1455,8 @@ class TaskFrameRuntime:
             "user_instruction_raw",
             "constraints",
             "expected_output",
+            "repository_write_scope",
+            "mutation_scope",
         }:
             return {"status": "PARENT_INSTRUCTION_INVALID"}
         instruction_id = str(instruction.get("instruction_id", "")).strip()
@@ -1374,11 +1472,43 @@ class TaskFrameRuntime:
         ):
             return {"status": "PARENT_INSTRUCTION_CONSTRAINTS_INVALID"}
         try:
+            repository_write_scope, mutation_scope = _normalize_repository_boundary(
+                repository_write_scope=instruction.get("repository_write_scope"),
+                mutation_scope=instruction.get("mutation_scope"),
+                context="parent_instruction",
+            )
+        except ValueError:
+            return {"status": "PARENT_INSTRUCTION_REPOSITORY_BOUNDARY_INVALID"}
+        if self.execution_gate is not None:
+            execution_plan = self.execution_gate["execution_plan"]
+            if (
+                repository_write_scope
+                != execution_plan.get("repository_write_scope")
+                or mutation_scope != execution_plan.get("mutation_scope")
+            ):
+                return {"status": "PARENT_INSTRUCTION_EXECUTION_PLAN_MISMATCH"}
+        existing_instructions = self.instructions()
+        if existing_instructions:
+            first = existing_instructions[0]
+            if (
+                repository_write_scope != first["repository_write_scope"]
+                or mutation_scope != first["mutation_scope"]
+            ):
+                return {
+                    "status": "PARENT_INSTRUCTION_REPOSITORY_BOUNDARY_CHANGED"
+                }
+        try:
             constraints_json = json.dumps(
                 constraints, ensure_ascii=True, separators=(",", ":")
             )
             expected_output_json = json.dumps(
                 expected_output,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            mutation_scope_json = json.dumps(
+                mutation_scope,
                 ensure_ascii=True,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -1394,6 +1524,8 @@ class TaskFrameRuntime:
             "user_instruction_raw": raw_instruction,
             "constraints": constraints,
             "expected_output": expected_output,
+            "repository_write_scope": repository_write_scope,
+            "mutation_scope": mutation_scope,
         }
         instruction_digest = _digest(canonical)
         try:
@@ -1402,9 +1534,10 @@ class TaskFrameRuntime:
                 INSERT INTO task_instructions(
                     instruction_id, parent_session_id, parent_frame_id,
                     parent_anchor_ref, user_instruction_raw, constraints_json,
-                    expected_output_json, instruction_digest, state, recorded_at
+                    expected_output_json, repository_write_scope,
+                    mutation_scope_json, instruction_digest, state, recorded_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', ?)
                 """,
                 (
                     instruction_id,
@@ -1414,6 +1547,8 @@ class TaskFrameRuntime:
                     raw_instruction,
                     constraints_json,
                     expected_output_json,
+                    repository_write_scope,
+                    mutation_scope_json,
                     instruction_digest,
                     timestamp,
                 ),
@@ -1429,6 +1564,8 @@ class TaskFrameRuntime:
                 "parent_session_id": self.origin_session_id,
                 "parent_frame_id": self.origin_frame_id,
                 "parent_anchor_ref": self.origin_anchor_ref,
+                "repository_write_scope": repository_write_scope,
+                "mutation_scope": mutation_scope,
             },
             timestamp,
         )
@@ -2455,7 +2592,8 @@ class TaskFrameRuntime:
             """
             SELECT instruction_id, parent_session_id, parent_frame_id,
                    parent_anchor_ref, user_instruction_raw, constraints_json,
-                   expected_output_json, instruction_digest, state,
+                   expected_output_json, repository_write_scope,
+                   mutation_scope_json, instruction_digest, state,
                    acknowledged_by, acknowledged_at, recorded_at
             FROM task_instructions WHERE instruction_id = ?
             """,
@@ -2468,7 +2606,8 @@ class TaskFrameRuntime:
             """
             SELECT instruction_id, parent_session_id, parent_frame_id,
                    parent_anchor_ref, user_instruction_raw, constraints_json,
-                   expected_output_json, instruction_digest, state,
+                   expected_output_json, repository_write_scope,
+                   mutation_scope_json, instruction_digest, state,
                    acknowledged_by, acknowledged_at, recorded_at
             FROM task_instructions ORDER BY instruction_ordinal
             """
@@ -2900,8 +3039,16 @@ class TaskFrameRuntime:
             for candidate in self.turns()
             if candidate["role"] == "SUB_REVIEWER"
         ]
+        parent_instructions = self.instructions()
+        if not parent_instructions:
+            return {"status": "PARENT_INSTRUCTION_REQUIRED"}
+        parent_boundary = parent_instructions[-1]
+        if parent_boundary["repository_write_scope"] not in REPOSITORY_WRITE_SCOPES:
+            return {
+                "status": "PARENT_INSTRUCTION_REPOSITORY_BOUNDARY_REQUIRED"
+            }
         expected_digests = [
-            instruction["instruction_digest"] for instruction in self.instructions()
+            instruction["instruction_digest"] for instruction in parent_instructions
         ]
         if not reviewer_turns:
             return {"status": "BOSS_ALLOCATION_NOT_REQUIRED"}
@@ -2959,6 +3106,28 @@ class TaskFrameRuntime:
             )
             if mutation_scope is None:
                 return {"status": "BOSS_ALLOCATION_MUTATION_SCOPE_INVALID"}
+            if (
+                parent_boundary["repository_write_scope"] == "NONE"
+                and mutation_scope["operations"]
+            ):
+                return {
+                    "status": "TASK_FRAME_READ_ONLY_MUTATION_BLOCKED",
+                    "turn_id": target_turn_id,
+                }
+            if parent_boundary["repository_write_scope"] == "BOUNDED":
+                parent_mutation_scope = parent_boundary["mutation_scope"]
+                if (
+                    not set(mutation_scope["operations"]).issubset(
+                        parent_mutation_scope["operations"]
+                    )
+                    or not set(mutation_scope["targets"]).issubset(
+                        parent_mutation_scope["targets"]
+                    )
+                ):
+                    return {
+                        "status": "BOSS_ALLOCATION_PARENT_SCOPE_EXCEEDED",
+                        "turn_id": target_turn_id,
+                    }
             normalized.append(
                 {
                     "turn_id": target_turn_id,
@@ -3156,6 +3325,8 @@ class TaskFrameRuntime:
             "user_instruction_raw": str(row["user_instruction_raw"]),
             "constraints": json.loads(str(row["constraints_json"])),
             "expected_output": json.loads(str(row["expected_output_json"])),
+            "repository_write_scope": str(row["repository_write_scope"]),
+            "mutation_scope": json.loads(str(row["mutation_scope_json"])),
             "instruction_digest": str(row["instruction_digest"]),
             "state": str(row["state"]),
             "acknowledged_by": str(row["acknowledged_by"]),
@@ -3185,35 +3356,13 @@ class TaskFrameRuntime:
     def _normalize_allocation_mutation_scope(value: Any) -> dict[str, list[str]] | None:
         if value is None:
             return {"operations": [], "targets": []}
-        if not isinstance(value, Mapping) or set(value) != {"operations", "targets"}:
+        try:
+            return _normalize_mutation_scope(
+                value,
+                "boss_allocation.mutation_scope",
+            )
+        except ValueError:
             return None
-        operations = value.get("operations")
-        targets = value.get("targets")
-        if (
-            not isinstance(operations, list)
-            or not isinstance(targets, list)
-            or any(not isinstance(item, str) for item in operations)
-            or any(not isinstance(item, str) for item in targets)
-        ):
-            return None
-        normalized_operations = list(
-            dict.fromkeys(item.strip().upper() for item in operations if item.strip())
-        )
-        if any(item not in {"CREATE", "MODIFY", "DELETE"} for item in normalized_operations):
-            return None
-        normalized_targets: list[str] = []
-        for item in targets:
-            if not item.strip() or not Path(item).is_absolute():
-                return None
-            normalized_target = os.path.normpath(item.strip())
-            if normalized_target not in normalized_targets:
-                normalized_targets.append(normalized_target)
-        if bool(normalized_operations) != bool(normalized_targets):
-            return None
-        return {
-            "operations": normalized_operations,
-            "targets": normalized_targets,
-        }
 
     @staticmethod
     def _normalize_timestamp(value: str) -> str:

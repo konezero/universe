@@ -207,20 +207,27 @@ The request must use `operation: COMMAND`, target the installed repository root,
 and bind `command_argv` with `payload_sha256` computed from canonical compact
 JSON of that argv list. Use
 `target_preimage: {"status":"NOT_APPLICABLE","sha256":"NONE"}` for a
-command request. The gateway accepts only these exact shell-free forms:
+command request. The shared Git Action Registry is the only command authority
+for proposal, Guard, and gateway. It accepts only these exact shell-free forms:
 
 ```text
 git add -- <repository-relative-path...>
 git commit -m <non-empty-message>
 git push origin HEAD:refs/heads/<current-branch>
+git pull --rebase origin <current-branch>
 ```
 
-It rejects force push, branch rewrites, arbitrary Git configuration, pathspec
-magic, absolute or parent-relative paths, shell composition, and unlisted Git
-subcommands. For commit, the gateway disables repository hooks and commit
-signing so a bounded commit cannot trigger repository-controlled programs or
-external signing helpers. The gateway has no authority over raw Host shell
-tools, APIs, databases, or any other mutation path.
+The final form resolves to `REBASE_CURRENT_BRANCH`. It requires the same
+exact proposal, approval, Binding, and one-time Guard receipt as every other
+Git mutation. The gateway executes it as a fixed fetch of that branch followed
+by `git rebase --no-verify origin/<current-branch>`. It does not force-push,
+select another branch, or grant a later `PUSH` action.
+
+It rejects force push, unapproved branch rewrites, arbitrary Git configuration,
+pathspec magic, absolute or parent-relative paths, shell composition, and
+unlisted Git subcommands. For commit and rebase, the gateway disables repository
+hooks; it also disables commit signing for commits. The gateway has no authority
+over raw Host shell tools, APIs, databases, or any other mutation path.
 
 The receipt is process-local, one-time, target-bound, request-bound, and Anchor
 snapshot-bound. It is not Authority. A stale, forged, reused, remapped, or

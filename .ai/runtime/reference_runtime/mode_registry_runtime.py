@@ -19,6 +19,9 @@ INSTALLATION_MANIFEST_RELATIVE_PATH = Path(
     ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
 )
 INSTALLATION_MANIFEST_SCHEMA = "ai-career.project-runtime-installation.v1"
+MODE_INBOX_RELATIVE_ROOT = Path(".ai/inbox")
+MODE_INBOX_TEMPLATE_RELATIVE_PATH = Path(".ai/templates/handoff_inbox")
+MODE_INBOX_FILES = ("README.md", "queue.md", "processed.md")
 MODE_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,63}$")
 REGISTRY_POLICIES = frozenset({"IMMUTABLE", "MASTER_MANAGED"})
 REPOSITORY_KINDS = frozenset({"AI_CAREER", "PROJECT"})
@@ -407,6 +410,7 @@ def plan_mode_registry_mutation(
     )
     preimage = _canonical_json(registry.as_dict())
     postimage = _canonical_json(updated.as_dict())
+    inbox = _plan_mode_inbox(repository_root, operation, mode)
     return {
         "schema": "ai-career.mode-registry-mutation-plan.v1",
         "status": "MODE_REGISTRY_MUTATION_PLANNED",
@@ -419,8 +423,34 @@ def plan_mode_registry_mutation(
         "postimage_text": postimage.decode("utf-8"),
         "revision_before": registry.revision,
         "revision_after": updated.revision,
+        "inbox": inbox,
         "approval_required": True,
         "execution_guard_required": True,
+        "repository_write": False,
+    }
+
+
+def resolve_mode_inbox(
+    repository_root: Path,
+    mode: str,
+) -> dict[str, Any]:
+    """Resolve an Inbox only after the Mode resolves through the Registry."""
+
+    root = repository_root.expanduser().resolve()
+    registry = load_mode_registry(root)
+    definition = registry.resolve(mode)
+    path = _mode_inbox_path(root, definition.mode)
+    assembled = _mode_inbox_exists(path)
+    return {
+        "status": (
+            "MODE_INBOX_ACTIVE" if assembled else "MODE_INBOX_NOT_ASSEMBLED"
+        ),
+        "mode": definition.mode,
+        "path": str(path),
+        "relative_path": _relative_posix(path, root),
+        "assembled": assembled,
+        "accepting_handoffs": assembled,
+        "registry_revision": registry.revision,
         "repository_write": False,
     }
 
@@ -453,6 +483,76 @@ def mode_definition_digest(definition: ModeDefinition) -> str:
 
 def mode_registry_digest(registry: ModeRegistry) -> str:
     return _sha256(_canonical_json(registry.as_dict()))
+
+
+def _plan_mode_inbox(
+    repository_root: Path,
+    operation: str,
+    mode: str,
+) -> dict[str, Any]:
+    root = repository_root.expanduser().resolve()
+    path = _mode_inbox_path(root, mode)
+    assembled = _mode_inbox_exists(path)
+
+    if operation == "ADD":
+        action = "REUSE" if assembled else "ASSEMBLE"
+        status = (
+            "MODE_INBOX_REUSED"
+            if assembled
+            else "MODE_INBOX_ASSEMBLY_REQUIRED"
+        )
+        accepting_handoffs_after = True
+        write_required = not assembled
+    elif operation == "DELETE":
+        action = "PRESERVE_INACTIVE" if assembled else "ABSENT"
+        status = (
+            "MODE_INBOX_PRESERVED_INACTIVE"
+            if assembled
+            else "MODE_INBOX_ABSENT"
+        )
+        accepting_handoffs_after = False
+        write_required = False
+    else:
+        action = "UNCHANGED" if assembled else "NOT_ASSEMBLED"
+        status = (
+            "MODE_INBOX_ACTIVE"
+            if assembled
+            else "MODE_INBOX_NOT_ASSEMBLED"
+        )
+        accepting_handoffs_after = assembled
+        write_required = False
+
+    return {
+        "status": status,
+        "action": action,
+        "path": str(path),
+        "relative_path": _relative_posix(path, root),
+        "template": MODE_INBOX_TEMPLATE_RELATIVE_PATH.as_posix(),
+        "files": list(MODE_INBOX_FILES),
+        "assembled_before": assembled,
+        "accepting_handoffs_after": accepting_handoffs_after,
+        "write_required": write_required,
+    }
+
+
+def _mode_inbox_path(repository_root: Path, mode: str) -> Path:
+    normalized = normalize_mode_id(mode)
+    return repository_root / MODE_INBOX_RELATIVE_ROOT / normalized.lower()
+
+
+def _mode_inbox_exists(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if not path.is_dir():
+        raise ModeRegistryError(
+            "MODE_INBOX_PATH_INVALID",
+            f"Mode Inbox path is not a directory: {path}",
+        )
+    return True
+
+
+def _relative_posix(path: Path, repository_root: Path) -> str:
+    return path.relative_to(repository_root).as_posix()
 
 
 def _mode_definition(mode: str, payload: Any) -> ModeDefinition:

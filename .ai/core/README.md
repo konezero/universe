@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: fda8df56d46730045d511dfb4539356d89981a16
+Source Commit: e0b0557ae5ca01857d87d881b862db283c8b0100
 
 ## Entry
 
@@ -22,7 +22,7 @@ Source Commit: fda8df56d46730045d511dfb4539356d89981a16
 ### contract_template
 - `.ai/templates/carrier_profile/README.md`
 - `.ai/templates/codex_environment_snapshot/README.md`
-- `.ai/templates/conductor_inbox/README.md`
+- `.ai/templates/handoff_inbox/README.md`
 - `.ai/templates/label_profile/README.md`
 - `.ai/templates/master_merge_archive/README.md`
 - `.ai/templates/project_boot_command_entry/README.md`
@@ -105,6 +105,7 @@ Source Commit: fda8df56d46730045d511dfb4539356d89981a16
 - `.ai/runtime/reference_runtime/execution_guard_adapter.py`
 - `.ai/runtime/reference_runtime/execution_guard_runtime.py`
 - `.ai/runtime/reference_runtime/file_mutation_gateway.py`
+- `.ai/runtime/reference_runtime/git_action_registry.py`
 - `.ai/runtime/reference_runtime/git_command_gateway.py`
 - `.ai/runtime/reference_runtime/git_proposal_runtime.py`
 - `.ai/runtime/reference_runtime/mode_registry_runtime.py`
@@ -181,6 +182,7 @@ These registry-classified source references are intentionally not copied.
 - `.ai/core/TASK_QUEUE_RUNTIME_V1.md`: unregistered core runtime candidate
 - `.ai/core/TUTORIAL_GUIDE_MODE.md`: ai-career-only, read-only entry candidate
 - `.ai/core/VERSION_COMMAND_POLICY.md`: unregistered candidate command policy
+- `.ai/templates/conductor_inbox/README.md`: ai-career-only Conductor/Carrier specialization
 
 ## Authority Boundary
 

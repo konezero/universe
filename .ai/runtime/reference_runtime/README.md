@@ -282,7 +282,10 @@ file_mutation_gateway.py
   -> receipt-aware bounded file mutation Host path
 
 git_command_gateway.py
-  -> receipt-aware bounded Git add/commit/push Host path
+  -> receipt-aware bounded Git execution Host path
+
+git_action_registry.py
+  -> one shared bounded Git action registry for proposal, Guard, and gateway
 
 git_proposal_runtime.py
   -> file-backed push proposal/approval journal

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import re
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -13,10 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .execution_guard_runtime import ExecutionGuardError, ExecutionGuardRuntime
+from .git_action_registry import (
+    LOCAL_GIT_TIMEOUT_SECONDS,
+    GitAction,
+    command_payload_sha256,
+    resolve_git_action,
+)
 
 
-_BRANCH_REF = re.compile(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$")
-LOCAL_GIT_TIMEOUT_SECONDS = 30
 REMOTE_GIT_TIMEOUT_SECONDS = 120
 GIT_MUTATION_TIMEOUT_SECONDS = 300
 
@@ -31,49 +32,20 @@ class GitCommandGateway:
     def command_payload_sha256(command_argv: Sequence[str]) -> str:
         """Return the canonical command payload digest required by the Guard."""
 
-        return hashlib.sha256(
-            json.dumps(list(command_argv), ensure_ascii=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()
+        return command_payload_sha256(command_argv)
 
     @classmethod
     def validate_command(cls, command_argv: Any, *, repository_root: Path) -> list[str] | None:
-        """Accept only non-interactive, shell-free bounded Git commands."""
+        """Return argv only when it resolves through the shared registry."""
 
-        if not isinstance(command_argv, Sequence) or isinstance(command_argv, (str, bytes)):
-            return None
-        argv = list(command_argv)
-        if not argv or any(not isinstance(item, str) or not item or "\x00" in item for item in argv):
-            return None
-        if len(argv) < 2 or argv[0] != "git":
-            return None
+        action = resolve_git_action(command_argv, repository_root=repository_root)
+        return list(action.command_argv) if action is not None else None
 
-        command = argv[1]
-        if command == "add":
-            if len(argv) < 4 or argv[2] != "--":
-                return None
-            if not all(cls._safe_relative_path(path) for path in argv[3:]):
-                return None
-            return argv
-
-        if command == "commit":
-            if len(argv) != 4 or argv[2] != "-m" or not argv[3].strip():
-                return None
-            return argv
-
-        if command == "push":
-            if len(argv) != 4 or argv[2] != "origin":
-                return None
-            refspec = argv[3]
-            if not refspec.startswith("HEAD:") or not cls._safe_branch_ref(refspec[5:]):
-                return None
-            current_branch = cls._current_branch(repository_root)
-            if current_branch is None or refspec[5:] != f"refs/heads/{current_branch}":
-                return None
-            return argv
-
-        return None
+    @classmethod
+    def resolve_action(
+        cls, command_argv: Any, *, repository_root: Path
+    ) -> GitAction | None:
+        return resolve_git_action(command_argv, repository_root=repository_root)
 
     def apply(
         self,
@@ -88,11 +60,12 @@ class GitCommandGateway:
             return _blocked("GIT_COMMAND_OPERATION_REQUIRED")
         if not self._matches_repository_root(request.get("target")):
             return _blocked("GIT_COMMAND_TARGET_MISMATCH")
-        argv = self.validate_command(
+        action = self.resolve_action(
             request.get("command_argv"), repository_root=self.repository_root
         )
-        if argv is None:
+        if action is None:
             return _blocked("GIT_COMMAND_NOT_ALLOWLISTED")
+        argv = list(action.command_argv)
         if str(request.get("payload_sha256", "")) != self.command_payload_sha256(argv):
             return _blocked("GIT_COMMAND_PAYLOAD_MISMATCH")
         if not self._is_git_work_tree():
@@ -119,7 +92,11 @@ class GitCommandGateway:
             "terminal_prompt": False,
         }
         try:
-            if argv[1] == "commit":
+            if action.name == "REBASE_CURRENT_BRANCH":
+                result, execution_argv, hardening = self._run_rebase_action(
+                    action, environment=environment, hardening=hardening
+                )
+            elif argv[1] == "commit":
                 with tempfile.TemporaryDirectory(prefix="ai-career-git-hooks-") as hooks:
                     execution_argv = [
                         "git",
@@ -132,7 +109,9 @@ class GitCommandGateway:
                     hardening.update(
                         {
                             "repository_hooks": "DISABLED",
-                            "commit_signing": "DISABLED",
+                            "commit_signing": (
+                                "DISABLED" if argv[1] == "commit" else "NOT_APPLICABLE"
+                            ),
                         }
                     )
                     result = self._run(
@@ -156,6 +135,8 @@ class GitCommandGateway:
             "decision": "APPLIED" if result.returncode == 0 else "BLOCKED",
             "repository_write": result.returncode == 0,
             "command_argv": argv,
+            "git_action": action.name,
+            "execution_argv": execution_argv,
             "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -182,6 +163,33 @@ class GitCommandGateway:
             env=dict(environment),
         )
 
+    def _run_rebase_action(
+        self,
+        action: GitAction,
+        *,
+        environment: Mapping[str, str],
+        hardening: dict[str, Any],
+    ) -> tuple[subprocess.CompletedProcess[str], list[str], dict[str, Any]]:
+        fetch_argv, rebase_argv = action.execution_argvs
+        fetch = self._run(fetch_argv, environment=environment)
+        if fetch.returncode != 0:
+            return fetch, list(fetch_argv), hardening
+        with tempfile.TemporaryDirectory(prefix="ai-career-git-hooks-") as hooks:
+            execution_argv = [
+                "git",
+                "-c",
+                f"core.hooksPath={hooks}",
+                *rebase_argv[1:],
+            ]
+            hardening.update(
+                {
+                    "repository_hooks": "DISABLED",
+                    "commit_signing": "NOT_APPLICABLE",
+                }
+            )
+            result = self._run(execution_argv, environment=environment)
+        return result, execution_argv, hardening
+
     def _matches_repository_root(self, target: Any) -> bool:
         if not isinstance(target, str) or not target.strip():
             return False
@@ -206,54 +214,6 @@ class GitCommandGateway:
         except (OSError, subprocess.TimeoutExpired):
             return False
         return result.returncode == 0 and result.stdout.strip() == "true"
-
-    @staticmethod
-    def _current_branch(repository_root: Path) -> str | None:
-        try:
-            result = subprocess.run(
-                ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
-                cwd=repository_root,
-                capture_output=True,
-                check=False,
-                shell=False,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=LOCAL_GIT_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        branch = result.stdout.strip()
-        return branch if result.returncode == 0 and branch else None
-
-    @staticmethod
-    def _safe_relative_path(value: str) -> bool:
-        path = Path(value)
-        return (
-            bool(value)
-            and not value.startswith(":")
-            and not path.is_absolute()
-            and all(part not in {"", ".", ".."} for part in path.parts)
-            and (not path.parts or path.parts[0].casefold() != ".git")
-        )
-
-    @staticmethod
-    def _safe_branch_ref(value: str) -> bool:
-        if not _BRANCH_REF.fullmatch(value):
-            return False
-        branch = value.removeprefix("refs/heads/")
-        forbidden = ("..", "@{", "//", "~", "^", ":", "?", "*", "[", "\\", " ")
-        return (
-            bool(branch)
-            and not branch.startswith(".")
-            and not branch.endswith(".")
-            and not any(token in branch for token in forbidden)
-            and all(
-                part and part not in {".", ".."} and not part.endswith(".lock")
-                for part in branch.split("/")
-            )
-        )
-
 
 def _blocked(reason: str, **extra: Any) -> dict[str, Any]:
     return {

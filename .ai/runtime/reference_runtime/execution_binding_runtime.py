@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .git_action_registry import command_payload_sha256, resolve_git_action
+
 
 PROPOSAL_SCHEMA = "ai-career.execution-assignment-proposal.v1"
 BINDING_SCHEMA = "ai-career.execution-binding-result.v1"
@@ -90,8 +92,15 @@ def build_assignment_proposal(
     }
     if operation == "COMMAND":
         command_argv = _command_argv(request.get("command_argv"), "request.command_argv")
+        git_action = resolve_git_action(command_argv, repository_root=Path(target))
+        if git_action is None:
+            raise ExecutionBindingError(
+                "ASSIGNMENT_PROPOSAL_GIT_ACTION_UNSUPPORTED",
+                "command_argv is not a supported bounded Git action",
+            )
         material["command_argv"] = command_argv
-        material["command_payload_sha256"] = _command_payload_sha256(command_argv)
+        material["command_payload_sha256"] = command_payload_sha256(command_argv)
+        material["git_action"] = git_action.name
     proposal_id = "assignment_" + _digest(material)[:24]
     return {
         "schema": PROPOSAL_SCHEMA,
@@ -328,6 +337,9 @@ def apply_execution_binding(
         bound_snapshot["execution_assignment"]["command_payload_sha256"] = (
             normalized_proposal["command_payload_sha256"]
         )
+        bound_snapshot["execution_assignment"]["git_action"] = normalized_proposal[
+            "git_action"
+        ]
     bound_snapshot["assignment_ref"] = approval_ref
     bound_snapshot["execution_binding"] = {
         "binding_id": binding_id,
@@ -742,13 +754,30 @@ def _validated_proposal(value: Mapping[str, Any]) -> dict[str, Any]:
             proposal.get("command_payload_sha256"),
             "proposal.command_payload_sha256",
         )
-        if payload_sha256 != _command_payload_sha256(command_argv):
+        if payload_sha256 != command_payload_sha256(command_argv):
             raise ExecutionBindingError(
                 "EXECUTION_BINDING_PROPOSAL_INVALID",
                 "proposal command payload does not match command_argv",
             )
         material["command_argv"] = command_argv
         material["command_payload_sha256"] = payload_sha256
+        git_action = resolve_git_action(
+            command_argv, repository_root=Path(material["target"])
+        )
+        if git_action is None:
+            raise ExecutionBindingError(
+                "EXECUTION_BINDING_PROPOSAL_INVALID",
+                "proposal command is not a supported bounded Git action",
+            )
+        proposed_git_action = _required_text(
+            proposal.get("git_action"), "proposal.git_action"
+        )
+        if proposed_git_action != git_action.name:
+            raise ExecutionBindingError(
+                "EXECUTION_BINDING_PROPOSAL_INVALID",
+                "proposal git_action does not match command_argv",
+            )
+        material["git_action"] = git_action.name
     expected_id = "assignment_" + _digest(material)[:24]
     if proposal.get("proposal_id") != expected_id:
         raise ExecutionBindingError(
