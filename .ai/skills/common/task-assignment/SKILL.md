@@ -10,7 +10,7 @@ Invocation class: `REFERENCE_RUNTIME_ADAPTER`
 Capability classification: `task_assignment_proposal = AVAILABLE`
 
 This Skill selects the narrowest valid assignment route. It does not grant
-generic repository authority, execution permission, or push permission.
+generic repository authority or execution permission.
 
 Read-only discussion, inspection, and Task Frame coordination may keep
 `execution_assignment_ref: UNASSIGNED`.
@@ -49,11 +49,10 @@ The resulting `WORK_RECEIPT_ACTIVATED` permits scope expansion only inside the
 declared roots. Each concrete file write still goes through Execution Guard and
 receives a one-time internal Mutation Receipt.
 
-After implementation and validation, stage the completed work paths and create
-an ordinary local Git commit. Do not create a Runtime proposal, approval, or
-proposal-database entry for the commit. The resulting Git SHA is the commit
-evidence. Push remains excluded and uses a separate durable `PUSH` proposal
-after that SHA exists.
+After implementation and validation, ordinary local Git staging, commit, and
+push remain outside the Runtime. Do not create a Runtime proposal, approval,
+or Execution Binding for those SCM operations. The resulting Git SHA may be
+appended later to the approved Task Proposal's Result Receipt as work evidence.
 
 When `write_roots` is omitted, let the Runtime resolve the root. A project-owned
 `REPOSITORY_MANIFEST.md` declaration at `layers.application.root` is used first

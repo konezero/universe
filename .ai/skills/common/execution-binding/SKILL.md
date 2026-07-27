@@ -19,10 +19,10 @@ certificate, or grant final execution permission.
 `execution-binding begin-work` is available only after task-assignment has
 classified a direct user request as `PROJECT_SOURCE_WORK`. The Instruction
 Receipt evidence reference is the activation basis. It is not a reusable
-conversation-wide approval and it cannot authorize DELETE, MOVE, COMMAND,
-Core/policy/template/configuration changes, push, or external effects. An
-ordinary local commit after completed, validated work is outside the durable
-proposal import path; it creates only the Git commit SHA.
+conversation-wide approval and it cannot authorize DELETE, MOVE,
+Core/policy/template/configuration changes, or external effects. Ordinary Git
+staging, commit, and push after completed work are outside this Runtime path;
+their immutable commit SHA may be appended to a Task Result Receipt.
 
 The output is `WORK_RECEIPT_ACTIVATED`. It creates process-local Work Scope and
 Assignment state; each later concrete write is still verified by Execution
@@ -60,30 +60,12 @@ process-local Anchor snapshot. Both outputs remain session-scoped and must
 still pass `.ai/skills/common/execution-guard/SKILL.md` immediately before each
 mutation.
 
-## Durable Git Proposal Import
+## Task Result Recording
 
-Push proposals are created and approved in the file-backed proposal journal
-before a live execution endpoint is required. When an approved push is ready
-to execute, import that action into the active process-local binding:
-
-```text
-python .ai/runtime/reference_runtime/cli.py execution-binding \
-  import-git-proposal \
-  --endpoint <session-boot-endpoint> \
-  --token <session-boot-token> \
-  --request <utf8-json-file-or->
-```
-
-The request names `session_id`, `proposal_id`, and action `PUSH`. The Runtime
-rechecks branch, HEAD, and remote HEAD. Only `DURABLE_GIT_PROPOSAL_BOUND`
-enters the normal Execution Guard path. The import does not create canonical
-authority.
-
-Before import, an approved durable proposal is an explicit executable task.
-Evaluate Session preparation with Task and Evidence profiles both set to
-`EXECUTABLE_PROOF_REQUIRED`. A Registry-resolved `GOVERNANCE_ONLY` Mode still
-does not start Runtime on Mode entry, but it does not block this approved task
-from requesting an available execution Host.
+The file-backed Task Proposal journal is task history, not an execution route.
+After the Host completes ordinary source-control work, append a Result Receipt
+with any already-created immutable commit SHA values. This does not start a
+Runtime endpoint, import an SCM action, or create authority.
 
 ```text
 binding != canonical authority

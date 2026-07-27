@@ -17,12 +17,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .git_action_registry import command_payload_sha256, resolve_git_action
-
-
 GUARD_RESULT_SCHEMA = "ai-career.execution-guard-result.v1"
 PERMIT_RECEIPT_SCHEMA = "ai-career.execution-permit-receipt.v1"
-MUTATION_OPERATIONS = frozenset({"CREATE", "MODIFY", "DELETE", "MOVE", "COMMAND"})
+MUTATION_OPERATIONS = frozenset({"CREATE", "MODIFY", "DELETE", "MOVE"})
 RECEIPT_TTL_SECONDS = 30
 
 SCHEMA = """
@@ -317,10 +314,6 @@ def _blocking_reasons(
         reasons.append("DELETE_PAYLOAD_FORBIDDEN")
     if request["operation"] in {"CREATE", "MODIFY"} and request["payload_sha256"] == "NONE":
         reasons.append("MUTATION_PAYLOAD_REQUIRED")
-    if request["operation"] == "COMMAND" and request["payload_sha256"] == "NONE":
-        reasons.append("COMMAND_PAYLOAD_REQUIRED")
-    if request["operation"] == "COMMAND" and preimage_status != "NOT_APPLICABLE":
-        reasons.append("COMMAND_PREIMAGE_MUST_BE_NOT_APPLICABLE")
 
     capability = request["host_capability"]
     if capability.get("filesystem_write") != "AVAILABLE":
@@ -400,12 +393,6 @@ def _blocking_reasons(
                 reasons.append("EXECUTION_ASSIGNMENT_OPERATION_MISMATCH")
             if assignment.get("target") != request["target"]:
                 reasons.append("EXECUTION_ASSIGNMENT_TARGET_MISMATCH")
-            if (
-                request["operation"] == "COMMAND"
-                and assignment.get("command_payload_sha256")
-                != request["payload_sha256"]
-            ):
-                reasons.append("EXECUTION_ASSIGNMENT_COMMAND_MISMATCH")
         if assignment.get("boundary") != request["boundary"]:
             reasons.append("EXECUTION_ASSIGNMENT_BOUNDARY_MISMATCH")
         if not _evidence_ref(assignment):
@@ -473,10 +460,7 @@ def _normalize_request(
             request.get("validation_ref"), "request.validation_ref"
         ),
         "payload_sha256": _sha256_or_none(request.get("payload_sha256")),
-        "target_preimage": _normalize_preimage(
-            request.get("target_preimage"),
-            allow_not_applicable=str(request.get("operation", "")).upper() == "COMMAND",
-        ),
+        "target_preimage": _normalize_preimage(request.get("target_preimage")),
         "host_capability": _mapping_copy(
             request.get("host_capability"), "request.host_capability"
         ),
@@ -486,23 +470,6 @@ def _normalize_request(
             "EXECUTION_GUARD_REQUEST_INVALID",
             f"unsupported mutation operation: {normalized['operation']}",
         )
-    if normalized["operation"] == "COMMAND":
-        command_argv = _normalize_command_argv(request.get("command_argv"))
-        if normalized["payload_sha256"] != command_payload_sha256(command_argv):
-            raise ExecutionGuardError(
-                "EXECUTION_GUARD_REQUEST_INVALID",
-                "request.payload_sha256 must bind request.command_argv",
-            )
-        git_action = resolve_git_action(
-            command_argv, repository_root=Path(normalized["target"])
-        )
-        if git_action is None:
-            raise ExecutionGuardError(
-                "EXECUTION_GUARD_GIT_ACTION_UNSUPPORTED",
-                "request.command_argv is not a supported bounded Git action",
-            )
-        normalized["command_argv"] = command_argv
-        normalized["git_action"] = git_action.name
     lineage_candidate = request.get("task_frame_lineage")
     if lineage_candidate is not None:
         candidate = _normalize_lineage_candidate(lineage_candidate)
@@ -520,10 +487,6 @@ def _normalize_request(
         normalized["approval"] = _derived_work_receipt_approval(
             snapshot=snapshot, request=normalized
         )
-    elif approval is None and _is_durable_git_proposal(snapshot):
-        normalized["approval"] = _derived_git_proposal_approval(
-            snapshot=snapshot, request=normalized
-        )
     else:
         normalized["approval"] = _mapping_copy(approval, "request.approval")
     return normalized
@@ -535,17 +498,6 @@ def _is_project_source_work(snapshot: Mapping[str, Any]) -> bool:
         isinstance(assignment, Mapping)
         and assignment.get("status") == "ASSIGNED"
         and assignment.get("assignment_kind") == "PROJECT_SOURCE_WORK"
-    )
-
-
-def _is_durable_git_proposal(snapshot: Mapping[str, Any]) -> bool:
-    assignment = snapshot.get("execution_assignment")
-    return (
-        isinstance(assignment, Mapping)
-        and assignment.get("status") == "ASSIGNED"
-        and assignment.get("assignment_kind") == "DURABLE_GIT_PROPOSAL"
-        and assignment.get("git_proposal_kind") == "PUSH"
-        and assignment.get("git_action") == "PUSH"
     )
 
 
@@ -576,34 +528,6 @@ def _derived_work_receipt_approval(
         "boundary": _required_text(request.get("boundary"), "request.boundary"),
         "evidence_ref": _required_text(
             assignment.get("evidence_ref"), "snapshot.execution_assignment.evidence_ref"
-        ),
-    }
-
-
-def _derived_git_proposal_approval(
-    *, snapshot: Mapping[str, Any], request: Mapping[str, Any]
-) -> dict[str, str]:
-    assignment = _mapping_copy(
-        snapshot.get("execution_assignment"), "snapshot.execution_assignment"
-    )
-    coordinates = _mapping_copy(snapshot.get("coordinates"), "snapshot.coordinates")
-    return {
-        "status": "APPROVED",
-        "approval_kind": "DURABLE_GIT_PROPOSAL",
-        "proposal_id": _required_text(
-            assignment.get("durable_proposal_id"),
-            "snapshot.execution_assignment.durable_proposal_id",
-        ),
-        "commander_surface": _required_text(
-            coordinates.get("commander_surface"),
-            "snapshot.coordinates.commander_surface",
-        ),
-        "operation": _required_text(request.get("operation"), "request.operation"),
-        "target": _required_text(request.get("target"), "request.target"),
-        "boundary": _required_text(request.get("boundary"), "request.boundary"),
-        "evidence_ref": _required_text(
-            assignment.get("approval_ref"),
-            "snapshot.execution_assignment.approval_ref",
         ),
     }
 

@@ -15,16 +15,13 @@ from .continuity_runtime import (
 from .continuity_store_runtime import ContinuityStore, ContinuityStoreError
 from .execution_binding_runtime import (
     ExecutionBindingError,
-    apply_approved_git_proposal,
     apply_execution_binding,
     build_assignment_proposal,
 )
 from .execution_guard_adapter import invoke_execution_guard
 from .execution_guard_runtime import ExecutionGuardError, ExecutionGuardRuntime
 from .file_mutation_gateway import FileMutationGateway
-from .git_command_gateway import GitCommandGateway
-from .git_action_registry import GitAction, resolve_git_action
-from .git_proposal_runtime import GitProposalError, GitProposalJournal
+from .task_proposal_journal import TaskProposalError, TaskProposalJournal
 from .mode_registry_runtime import (
     ModeDefinition,
     ModeRegistry,
@@ -73,10 +70,8 @@ __all__ = [
     "ExecutionGuardError",
     "ExecutionGuardRuntime",
     "FileMutationGateway",
-    "GitCommandGateway",
-    "GitAction",
-    "GitProposalError",
-    "GitProposalJournal",
+    "TaskProposalError",
+    "TaskProposalJournal",
     "ModeDefinition",
     "ModeRegistry",
     "ModeRegistryError",
@@ -97,7 +92,6 @@ __all__ = [
     "invoke_execution_guard",
     "evaluate_source_only_os_status",
     "apply_execution_binding",
-    "apply_approved_git_proposal",
     "load_profile",
     "load_mode_registry",
     "load_continuity_profile",
@@ -106,6 +100,5 @@ __all__ = [
     "read_installation_manifest",
     "read_project_runtime_status",
     "run_continuity_command",
-    "resolve_git_action",
     "verify_mode_request",
 ]

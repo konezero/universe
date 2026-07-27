@@ -22,7 +22,7 @@ if __package__:
         call_host_adapter,
     )
     from .execution_guard_adapter import invoke_execution_guard
-    from .git_proposal_runtime import GitProposalError, GitProposalJournal
+    from .task_proposal_journal import TaskProposalError, TaskProposalJournal
     from .mode_registry_runtime import (
         ModeRegistryError,
         load_mode_registry,
@@ -62,9 +62,9 @@ else:
         call_host_adapter,
     )
     from reference_runtime.execution_guard_adapter import invoke_execution_guard
-    from reference_runtime.git_proposal_runtime import (
-        GitProposalError,
-        GitProposalJournal,
+    from reference_runtime.task_proposal_journal import (
+        TaskProposalError,
+        TaskProposalJournal,
     )
     from reference_runtime.mode_registry_runtime import (
         ModeRegistryError,
@@ -1017,12 +1017,10 @@ def _execution_binding(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
         "propose",
         "apply",
         "begin-work",
-        "import-git-proposal",
     }:
         raise CliFailure(
             "CLI_USAGE_ERROR",
-            "execution-binding requires propose, apply, begin-work, or "
-            "import-git-proposal",
+            "execution-binding requires propose, apply, or begin-work",
         )
     operation = args[0]
     options = _parse_options(
@@ -1041,17 +1039,16 @@ def _execution_binding(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
         "propose": "EXECUTION_ASSIGNMENT_PROPOSED",
         "apply": "EXECUTION_BINDING_APPLIED",
         "begin-work": "WORK_RECEIPT_ACTIVATED",
-        "import-git-proposal": "DURABLE_GIT_PROPOSAL_BOUND",
     }
     return (0 if payload.get("status") == expected[operation] else 4), payload
 
 
-def _git_proposal(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
-    operations = {"propose-push", "approve", "status"}
+def _task_proposal(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
+    operations = {"create", "approve", "record-result", "status"}
     if not args or args[0] not in operations:
         raise CliFailure(
             "CLI_USAGE_ERROR",
-            "git-proposal requires propose-push, approve, or status",
+            "task-proposal requires create, approve, record-result, or status",
         )
     operation = args[0]
     required = {"--repo-root"}
@@ -1061,20 +1058,22 @@ def _git_proposal(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
         required.add("--request")
     options = _parse_options(args[1:], required=frozenset(required))
     try:
-        journal = GitProposalJournal(Path(options["--repo-root"]))
+        journal = TaskProposalJournal(Path(options["--repo-root"]))
         try:
             if operation == "status":
                 return 0, journal.status(options["--proposal-id"])
             request = _load_request(options["--request"])
             observed_at = _physical_time()
-            if operation == "propose-push":
-                result = journal.propose_push(request, observed_at=observed_at)
-            else:
+            if operation == "create":
+                result = journal.propose(request, observed_at=observed_at)
+            elif operation == "approve":
                 result = journal.approve(request, observed_at=observed_at)
+            else:
+                result = journal.record_result(request, observed_at=observed_at)
             return 0, result
         finally:
             journal.close()
-    except GitProposalError as error:
+    except TaskProposalError as error:
         raise CliFailure(error.error_code, error.detail, 4) from error
 
 
@@ -1178,10 +1177,8 @@ def _execution_guard(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
 
 
 def _mutation_gateway(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
-    if not args or args[0] not in {"apply-file", "apply-git"}:
-        raise CliFailure(
-            "CLI_USAGE_ERROR", "mutation-gateway requires apply-file or apply-git"
-        )
+    if not args or args[0] != "apply-file":
+        raise CliFailure("CLI_USAGE_ERROR", "mutation-gateway requires apply-file")
     options = _parse_options(
         args[1:],
         required=frozenset({"--endpoint", "--token", "--request"}),
@@ -1328,23 +1325,22 @@ def _help() -> Mapping[str, Any]:
             ),
             "os-status source-only --request <path|->",
             (
-                "execution-binding "
-                "<propose|apply|begin-work|import-git-proposal> --endpoint <url> "
+                "execution-binding <propose|apply|begin-work> --endpoint <url> "
                 "--token <token> --request <path|->"
             ),
             (
-                "git-proposal <propose-push|approve> "
+                "task-proposal <create|approve|record-result> "
                 "--repo-root <path> --request <path|->"
             ),
             (
-                "git-proposal status --repo-root <path> --proposal-id <id>"
+                "task-proposal status --repo-root <path> --proposal-id <id>"
             ),
             (
                 "execution-guard <check|consume> --endpoint <url> "
                 "--token <token> --request <path|->"
             ),
             (
-                "mutation-gateway <apply-file|apply-git> --endpoint <url> "
+                "mutation-gateway apply-file --endpoint <url> "
                 "--token <token> --request <path|->"
             ),
             (
@@ -1419,8 +1415,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _session_boot_serve(command_args[1:])
         elif command == "execution-binding":
             code, payload = _execution_binding(command_args)
-        elif command == "git-proposal":
-            code, payload = _git_proposal(command_args)
+        elif command == "task-proposal":
+            code, payload = _task_proposal(command_args)
         elif command == "runtime-status":
             code, payload = _runtime_status(command_args)
         elif command == "os-status":

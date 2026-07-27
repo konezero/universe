@@ -120,14 +120,14 @@ python .ai/runtime/reference_runtime/cli.py execution-binding propose \
   --endpoint <session-boot-url> --token <token> --request <json-file-or->
 python .ai/runtime/reference_runtime/cli.py execution-binding apply \
   --endpoint <session-boot-url> --token <token> --request <json-file-or->
-python .ai/runtime/reference_runtime/cli.py git-proposal propose-push \
+python .ai/runtime/reference_runtime/cli.py task-proposal create \
   --repo-root <project-root> --request <json-file-or->
-python .ai/runtime/reference_runtime/cli.py git-proposal approve \
+python .ai/runtime/reference_runtime/cli.py task-proposal approve \
   --repo-root <project-root> --request <json-file-or->
-python .ai/runtime/reference_runtime/cli.py git-proposal status \
+python .ai/runtime/reference_runtime/cli.py task-proposal record-result \
+  --repo-root <project-root> --request <json-file-or->
+python .ai/runtime/reference_runtime/cli.py task-proposal status \
   --repo-root <project-root> --proposal-id <proposal-id>
-python .ai/runtime/reference_runtime/cli.py execution-binding import-git-proposal \
-  --endpoint <session-boot-url> --token <token> --request <json-file-or->
 python .ai/runtime/reference_runtime/cli.py runtime-status \
   --repo-root <project-root> --endpoint <session-boot-url> \
   --token <token> --session-id <active-session-id>
@@ -138,8 +138,6 @@ python .ai/runtime/reference_runtime/cli.py execution-guard check \
 python .ai/runtime/reference_runtime/cli.py execution-guard consume \
   --endpoint <session-boot-url> --token <token> --request <json-file-or->
 python .ai/runtime/reference_runtime/cli.py mutation-gateway apply-file \
-  --endpoint <session-boot-url> --token <token> --request <json-file-or->
-python .ai/runtime/reference_runtime/cli.py mutation-gateway apply-git \
   --endpoint <session-boot-url> --token <token> --request <json-file-or->
 python .ai/runtime/reference_runtime/cli.py checkpoint prepare \
   --repo-root <project-root> --request <json-file-or->
@@ -197,28 +195,14 @@ must not claim hard enforcement without a receipt-aware pre-write hook.
 The bundled file gateway is a hard-enforced path for exact `CREATE`, `MODIFY`,
 and `DELETE` requests within the installed repository root. It verifies the
 declared payload hash and target preimage before consuming the receipt. It does
-not intercept unrelated Host tools, shell commands, APIs, or databases. The
-same installed Host can expose a receipt-aware Git command path for exact,
-shell-free `git add -- <relative-path...>`, `git commit -m <message>`, and
-`git push origin HEAD:refs/heads/<current-branch>` requests. The command argv
-is part of the receipt-bound request hash and its canonical SHA-256 payload;
-its request uses `target_preimage: {status: NOT_APPLICABLE, sha256: NONE}`.
-Force push, branch rewriting, arbitrary Git subcommands, shell composition,
-and unrelated Host tools remain outside this gateway. Commit execution
-disables repository hooks and commit signing.
+not intercept unrelated Host tools, shell commands, APIs, databases, or source
+control operations.
 
-The file-backed Git proposal journal can be used before a Session Runtime
-endpoint exists. Local staging and commit are ordinary Git operations after
-completed, validated work; the commit SHA is their evidence and no Runtime
-proposal-database record is created. A `PUSH` proposal binds that immutable
-commit SHA and the observed remote head. Its approval must come from a distinct
-later user input. The journal stores only push proposal, approval, action, and
-result linkage.
-
-Git-backed HTTP calls use one bounded long-running budget for approved proposal
-import and `add`, `commit`, or `push` execution. Local Git observations, remote
-head observations, and mutation subprocesses retain separate finite limits, and
-the HTTP budget is longer than the complete server-side mutation path.
+The file-backed Task Proposal journal can be used before a Session Runtime
+endpoint exists. It records a user-facing task proposal, a distinct approval,
+and an appended Result Receipt. A Result Receipt may link zero or more
+already-created immutable Git commit SHAs. The journal never stages, commits,
+pushes, observes remote heads, or executes source-control commands.
 
 Task Frame proposal requests contain one exact `execution_plan`. A successful
 proposal remains passive and reports `task_frame_started: false`. Installed v1
@@ -281,17 +265,11 @@ execution_guard_adapter.py
 file_mutation_gateway.py
   -> receipt-aware bounded file mutation Host path
 
-git_command_gateway.py
-  -> receipt-aware bounded Git execution Host path
-
-git_action_registry.py
-  -> one shared bounded Git action registry for proposal, Guard, and gateway
-
-git_proposal_runtime.py
-  -> file-backed push proposal/approval journal
+task_proposal_journal.py
+  -> file-backed user task proposal, approval, result receipt, and commit evidence linkage
 
 receipt_verifying_write_gateway.py
-  -> aggregate receipt-aware file and Git mutation paths
+  -> receipt-aware file mutation path
 
 continuity_runtime.py
   -> deterministic continuity preparation, persistence, discovery, and currentness checks

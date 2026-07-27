@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: e0b0557ae5ca01857d87d881b862db283c8b0100
+Source Commit: 30c470816640591ceda1ecae2316dfbc724d67ec
 
 ## Entry
 
@@ -105,9 +105,6 @@ Source Commit: e0b0557ae5ca01857d87d881b862db283c8b0100
 - `.ai/runtime/reference_runtime/execution_guard_adapter.py`
 - `.ai/runtime/reference_runtime/execution_guard_runtime.py`
 - `.ai/runtime/reference_runtime/file_mutation_gateway.py`
-- `.ai/runtime/reference_runtime/git_action_registry.py`
-- `.ai/runtime/reference_runtime/git_command_gateway.py`
-- `.ai/runtime/reference_runtime/git_proposal_runtime.py`
 - `.ai/runtime/reference_runtime/mode_registry_runtime.py`
 - `.ai/runtime/reference_runtime/os_status_runtime.py`
 - `.ai/runtime/reference_runtime/profiles/continuity-command-v1.json`
@@ -120,6 +117,7 @@ Source Commit: e0b0557ae5ca01857d87d881b862db283c8b0100
 - `.ai/runtime/reference_runtime/source_review_runtime.py`
 - `.ai/runtime/reference_runtime/task_frame_adapter.py`
 - `.ai/runtime/reference_runtime/task_frame_runtime.py`
+- `.ai/runtime/reference_runtime/task_proposal_journal.py`
 
 ### skill
 - `.ai/skills/common/anchor-currentness/SKILL.md`

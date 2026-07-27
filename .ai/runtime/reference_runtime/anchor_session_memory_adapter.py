@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import secrets
 import stat
 import threading
@@ -22,17 +21,11 @@ if __package__:
     from .anchor_session_memory_runtime import AnchorSessionMemoryRuntime
     from .execution_binding_runtime import (
         ExecutionBindingError,
-        apply_approved_git_proposal,
         apply_execution_binding,
         begin_project_source_work,
         build_assignment_proposal,
     )
     from .execution_guard_runtime import ExecutionGuardError, ExecutionGuardRuntime
-    from .git_command_gateway import (
-        GIT_MUTATION_TIMEOUT_SECONDS,
-        LOCAL_GIT_TIMEOUT_SECONDS,
-    )
-    from .git_proposal_runtime import GitProposalError, GitProposalJournal
     from .mode_registry_runtime import (
         ModeRegistryError,
         load_mode_registry,
@@ -46,17 +39,11 @@ else:  # Direct module execution remains available for the loopback server.
     from anchor_session_memory_runtime import AnchorSessionMemoryRuntime
     from execution_binding_runtime import (
         ExecutionBindingError,
-        apply_approved_git_proposal,
         apply_execution_binding,
         begin_project_source_work,
         build_assignment_proposal,
     )
     from execution_guard_runtime import ExecutionGuardError, ExecutionGuardRuntime
-    from git_command_gateway import (
-        GIT_MUTATION_TIMEOUT_SECONDS,
-        LOCAL_GIT_TIMEOUT_SECONDS,
-    )
-    from git_proposal_runtime import GitProposalError, GitProposalJournal
     from mode_registry_runtime import (
         ModeRegistryError,
         load_mode_registry,
@@ -71,13 +58,6 @@ else:  # Direct module execution remains available for the loopback server.
 LOOPBACK_HOST = "127.0.0.1"
 TOKEN_HEADER = "X-Anchor-Session-Memory-Token"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 2
-GIT_HTTP_TIMEOUT_SECONDS = (
-    GIT_MUTATION_TIMEOUT_SECONDS + (3 * LOCAL_GIT_TIMEOUT_SECONDS) + 10
-)
-GIT_HTTP_PATHS = {
-    "/v1/execution-binding/import-git-proposal",
-    "/v1/mutation-gateway/apply-git",
-}
 MEMORY_STORAGE_SCOPE = "process-local sqlite :memory:"
 FILE_STORAGE_SCOPE = "project-local anchor SQLite file"
 ANCHOR_STORE_RELATIVE_PATH = Path(".ai/runtime/anchor_store")
@@ -101,7 +81,6 @@ class AnchorSessionMemoryHostAdapter:
             if repository_root is None
             else ReceiptVerifyingWriteGateway(repository_root)
         )
-        self._git_proposals: GitProposalJournal | None = None
 
     @property
     def storage_scope(self) -> str:
@@ -396,63 +375,6 @@ class AnchorSessionMemoryHostAdapter:
             "snapshot": outcome["snapshot"],
         }
 
-    def bind_git_proposal(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if self._repository_root is None:
-            return {
-                "status": "GIT_PROPOSAL_JOURNAL_UNAVAILABLE",
-                "repository_write": False,
-            }
-        session_id = self._required_text(payload, "session_id", "SESSION_ID_REQUIRED")
-        if isinstance(session_id, dict):
-            return session_id
-        runtime = self._runtime_for(session_id, create=False)
-        if runtime is None:
-            return {"status": "HOST_SESSION_MEMORY_UNKNOWN", "session_id": session_id}
-        stored = runtime.stored_snapshot()
-        if stored is None:
-            return {"status": "HOST_SESSION_MEMORY_UNKNOWN", "session_id": session_id}
-        coordinates = stored["snapshot"].get("coordinates")
-        coordinate_mode = (
-            coordinates.get("mode", "") if isinstance(coordinates, Mapping) else ""
-        )
-        mode = self._resolved_anchor_mode(session_id, str(coordinate_mode))
-        if mode is None:
-            return {"status": "ANCHOR_MODE_REQUIRED", "session_id": session_id}
-        try:
-            approved_action = self._git_proposal_journal().approved_scoped_action(
-                session_id=session_id,
-                mode=mode,
-                proposal_id=str(payload.get("proposal_id", "")),
-                action=str(payload.get("action", "")),
-            )
-            result = apply_approved_git_proposal(
-                snapshot=stored["snapshot"],
-                approved_action=approved_action,
-                observed_at=_physical_time(),
-            )
-        except (ExecutionBindingError, GitProposalError) as error:
-            return {
-                "status": "UNKNOWN",
-                "error_code": error.error_code,
-                "detail": error.detail,
-                "session_id": session_id,
-            }
-        outcome = runtime.record_snapshot(
-            snapshot=result["snapshot"], source_ref=stored["source_ref"]
-        )
-        if outcome.get("status") != "SNAPSHOT_UPDATED":
-            return {
-                "status": "UNKNOWN",
-                "error_code": "EXECUTION_BINDING_SNAPSHOT_UPDATE_FAILED",
-                "detail": str(outcome.get("status", "UNKNOWN")),
-                "session_id": session_id,
-            }
-        return {
-            **result,
-            "session_id": session_id,
-            "snapshot": outcome["snapshot"],
-        }
-
     def begin_project_source_work(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Activate a bounded user-instruction work receipt in this session."""
 
@@ -595,75 +517,6 @@ class AnchorSessionMemoryHostAdapter:
             payload=physical_payload,
             task_frame_lineage_verification=lineage_verification,
         )
-
-    def apply_git_command(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if self._write_gateway is None:
-            return {
-                "status": "MUTATION_GATEWAY_UNAVAILABLE",
-                "decision": "BLOCKED",
-                "repository_write": False,
-            }
-        session_id = self._required_text(payload, "session_id", "SESSION_ID_REQUIRED")
-        if isinstance(session_id, dict):
-            return session_id
-        runtime = self._runtime_for(session_id, create=False)
-        guard = self._execution_guards.get(session_id)
-        if runtime is None or guard is None:
-            return {"status": "HOST_SESSION_MEMORY_UNKNOWN", "session_id": session_id}
-        stored = runtime.stored_snapshot()
-        if stored is None:
-            return {"status": "HOST_SESSION_MEMORY_UNKNOWN", "session_id": session_id}
-        request = payload.get("request")
-        physical_payload = dict(payload)
-        physical_payload["observed_at"] = _physical_time()
-        lineage_verification = (
-            self._task_frame_lineage_verification(
-                session_id=session_id,
-                request=request,
-            )
-            if isinstance(request, Mapping)
-            else None
-        )
-        result = self._write_gateway.apply_git(
-            guard=guard,
-            snapshot=stored["snapshot"],
-            payload=physical_payload,
-            task_frame_lineage_verification=lineage_verification,
-        )
-        assignment = stored["snapshot"].get("execution_assignment")
-        if (
-            self._repository_root is not None
-            and isinstance(assignment, Mapping)
-            and assignment.get("assignment_kind") == "DURABLE_GIT_PROPOSAL"
-            and assignment.get("git_proposal_kind") == "PUSH"
-            and assignment.get("git_action") == "PUSH"
-        ):
-            try:
-                journal_result = self._git_proposal_journal().record_result(
-                    proposal_id=str(assignment.get("durable_proposal_id", "")),
-                    action=str(assignment.get("git_action", "")),
-                    result=result,
-                    observed_at=_physical_time(),
-                )
-            except GitProposalError as error:
-                return {
-                    **result,
-                    "status": "GIT_COMMAND_RESULT_JOURNAL_FAILED",
-                    "journal_error_code": error.error_code,
-                    "journal_detail": error.detail,
-                }
-            result = {**result, "git_proposal_journal": journal_result}
-        return result
-
-    def _git_proposal_journal(self) -> GitProposalJournal:
-        if self._repository_root is None:
-            raise GitProposalError(
-                "GIT_PROPOSAL_JOURNAL_UNAVAILABLE",
-                "repository-bound Git proposal journal is unavailable",
-            )
-        if self._git_proposals is None:
-            self._git_proposals = GitProposalJournal(self._repository_root)
-        return self._git_proposals
 
     def _task_frame_lineage_verification(
         self,
@@ -971,9 +824,6 @@ class AnchorSessionMemoryHostAdapter:
         for runtime in self._task_frames.values():
             runtime.close()
         self._task_frames.clear()
-        if self._git_proposals is not None:
-            self._git_proposals.close()
-            self._git_proposals = None
 
     def _runtime_for(
         self,
@@ -1285,9 +1135,6 @@ class AnchorSessionMemoryHostServer:
                 if parsed.path == "/v1/execution-binding/begin-work":
                     self._send(200, adapter.begin_project_source_work(payload))
                     return
-                if parsed.path == "/v1/execution-binding/import-git-proposal":
-                    self._send(200, adapter.bind_git_proposal(payload))
-                    return
                 if parsed.path == "/v1/execution-guard/check":
                     self._send(200, adapter.check_execution(payload))
                     return
@@ -1296,9 +1143,6 @@ class AnchorSessionMemoryHostServer:
                     return
                 if parsed.path == "/v1/mutation-gateway/apply-file":
                     self._send(200, adapter.apply_file_mutation(payload))
-                    return
-                if parsed.path == "/v1/mutation-gateway/apply-git":
-                    self._send(200, adapter.apply_git_command(payload))
                     return
                 if parsed.path == "/v1/task-frame/create":
                     self._send(200, adapter.create_task_frame(payload))
@@ -1365,13 +1209,8 @@ def call_host_adapter(
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = Request(f"{endpoint}{path}", data=data, headers=headers, method=method)
-    timeout = (
-        GIT_HTTP_TIMEOUT_SECONDS
-        if path in GIT_HTTP_PATHS
-        else DEFAULT_HTTP_TIMEOUT_SECONDS
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         try:

@@ -21,7 +21,7 @@ Direct User Instruction
   -> one-time Mutation Receipt
   -> ordinary local Git commit
   -> commit SHA
-  -> Push Proposal and separate approval
+  -> Task Result Receipt (optional commit SHA links)
 ```
 
 ### Instruction Receipt
@@ -29,7 +29,7 @@ Direct User Instruction
 An Instruction Receipt is Host-attested evidence of a direct user request. It
 records the task summary, declared project-source roots, permitted operations,
 boundary, and instruction evidence reference. It is not a generic repository
-delegation, push approval, or authority outside its roots.
+delegation or authority outside its roots.
 
 ### Work Receipt
 
@@ -40,7 +40,7 @@ current initial profile is deliberately narrow:
 scope_kind: PROJECT_SOURCE_WORK
 operations: CREATE | MODIFY
 scope expansion: within declared project-source roots only
-push policy: SEPARATE_DURABLE_PROPOSAL_APPROVAL_REQUIRED
+source-control policy: HOST_AND_SCM_CONTROLLED
 ```
 
 It may cover source files discovered during implementation. A file need not be
@@ -77,20 +77,18 @@ a separate user-facing approval prompt.
 
 ### Local Commit
 
-After the bounded work and validation finish, the Host stages the completed
-work paths and creates an ordinary local Git commit. The commit itself creates
-the evidence: its immutable Git SHA. Local staging and commit do not create a
-Runtime proposal, approval, closure record, or proposal-database entry and do
-not require a separate user approval.
+After the bounded work and validation finish, ordinary local Git staging,
+commit, and push remain source-control operations outside the Runtime. The
+immutable commit SHA is Git evidence; it neither creates Runtime authority nor
+requires a Runtime endpoint, execution receipt, proposal, or approval.
 
-### Push Proposal
+### Task Result Receipt
 
-Push is never implied by a Work Receipt or local commit. After the local commit
-exists, the Host creates a separate file-backed `PUSH` proposal
-that binds the exact immutable local commit SHA, current branch, remote,
-target branch, and observed remote HEAD. It requires a separate explicit
-approval from a later user input and permits only a fast-forward push of that
-bound HEAD. The input that creates the proposal cannot also approve it.
+The file-backed Task Proposal journal preserves the user-facing task proposal
+and its approval. After work completes, it appends a Result Receipt. That
+receipt may link zero or more already-created immutable Git commit SHAs with a
+repository reference. The journal never invokes or validates Git commands; Git
+and any remote branch policy remain the responsible SCM boundary.
 
 ## Direct User Instruction Route
 
@@ -116,10 +114,10 @@ Execution Guard route when work would:
 
 ```text
 leave the declared roots
-DELETE, MOVE, or execute COMMAND
+DELETE or MOVE
 change .ai/, .git/, Core, policy, templates, or configuration
 touch an external system or unclassified durable target
-push without a separately approved PUSH proposal
+run source-control operations through the Runtime
 ```
 
 Task Frame Boss allocation may narrow an active Work Receipt for a Sub. It may
@@ -127,7 +125,7 @@ not expand roots, operations, or the user instruction boundary.
 
 ## Non-Goals
 
-This contract does not remove the Execution Guard from file/source mutations
-or push, make a Work Receipt durable authority, grant a Host capability, or
-allow a Worker to self-delegate writes. It also does not treat a local commit
-as push approval.
+This contract does not remove the Execution Guard from file/source mutations,
+make a Work Receipt durable authority, grant a Host capability, or allow a
+Worker to self-delegate writes. Git commit and push evidence remain separate
+from Runtime authority and are recorded only after the Host completes them.

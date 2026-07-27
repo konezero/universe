@@ -52,8 +52,9 @@ sandbox.
 Mode and Role do not create authority. A current, scoped assignment and
 immediate pre-execution verification are required before mutation.
 
-Before every file create/edit/delete/move, write-capable command, API or
-database mutation, push, or durable side effect, execute
+Before every file create/edit/delete/move, write-capable API or database
+mutation, or durable side effect other than ordinary source-control
+operations, execute
 `.ai/skills/common/execution-guard/SKILL.md`. Reading or summarizing that
 Skill is not sufficient. Do not call a raw mutation tool first.
 
@@ -62,11 +63,10 @@ A mutation may proceed only when the active Session Boot process returns
 a receipt-aware pre-write hook. Missing endpoint, token, Authority, Write
 Scope, Execution Assignment, approval, or Host hook blocks mutation.
 
-After completed, validated work, ordinary local Git staging and commit do
-not use a Runtime proposal, proposal database, separate approval, or this
-Guard. The immutable Git commit SHA is the commit evidence. Push remains
-separate: create a file-backed `PUSH` proposal, display it, and require
-approval from a later user input before executing the guarded push.
+After completed, validated work, ordinary local Git staging, commit, and
+push remain outside the Runtime. The immutable Git commit SHA may be
+appended to the approved Task Proposal's Result Receipt as work evidence.
+It does not create Runtime authority, Binding, or an execution receipt.
 
 ## Normal Runtime Route
 

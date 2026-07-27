@@ -22,9 +22,9 @@ Host capability, approval, currentness, or permission.
 
 ## Mandatory Route
 
-Before calling any file edit/create/delete/move tool, write-capable shell
-command, API mutation, database mutation, push, or other project-owned,
-external, or unclassified durable side effect:
+Before calling any file edit/create/delete/move tool, write-capable API or
+database mutation, or other project-owned, external, or unclassified durable
+side effect other than ordinary source-control operations:
 
 ```text
 STOP before mutation
@@ -46,12 +46,10 @@ created by task-assignment from an attested direct user instruction; the Guard
 derives its effective approval from that current receipt and still issues one
 exact, one-time Mutation Receipt per file operation.
 
-After completed, validated work, ordinary local Git staging and commit do not
-use the Runtime proposal journal or this Guard. They create the immutable Git
-commit SHA and no separate Runtime evidence. Push remains a distinct mutation.
-An approved file-backed `PUSH` proposal does not bypass this Skill: the active
-Runtime imports the exact push action, and the receipt-aware Git gateway
-consumes a one-time receipt.
+After completed, validated work, ordinary local Git staging, commit, and push
+do not use the Runtime proposal journal or this Guard. Their immutable commit
+SHA may be appended to the completed Task Proposal's Result Receipt; it does
+not create Runtime authority or execution evidence.
 
 ## Runtime-Owned State Exception
 
@@ -92,7 +90,7 @@ Request envelope:
     "session_id": "<active-session-id>",
     "frame_id": "<active-frame-id>",
     "anchor_id": "<active-anchor-id>",
-    "operation": "CREATE|MODIFY|DELETE|MOVE|COMMAND",
+    "operation": "CREATE|MODIFY|DELETE|MOVE",
     "target": "<absolute-target>",
     "boundary": "<exact-boundary>",
     "source_commit": "<active-source-commit>",
@@ -193,52 +191,15 @@ The consume envelope adds:
 Host that already provides its own attested pre-write hook. It does not perform
 the mutation itself.
 
-For an installed Host that exposes `mutation_gateway: AVAILABLE`, bounded Git
-repository mutations may use the same receipt through:
-
-```text
-python .ai/runtime/reference_runtime/cli.py mutation-gateway apply-git
-  --endpoint <session-boot-endpoint>
-  --token <session-boot-token>
-  --request <json-file-or->
-```
-
-The request must use `operation: COMMAND`, target the installed repository root,
-and bind `command_argv` with `payload_sha256` computed from canonical compact
-JSON of that argv list. Use
-`target_preimage: {"status":"NOT_APPLICABLE","sha256":"NONE"}` for a
-command request. The shared Git Action Registry is the only command authority
-for proposal, Guard, and gateway. It accepts only these exact shell-free forms:
-
-```text
-git add -- <repository-relative-path...>
-git commit -m <non-empty-message>
-git push origin HEAD:refs/heads/<current-branch>
-git pull --rebase origin <current-branch>
-```
-
-The final form resolves to `REBASE_CURRENT_BRANCH`. It requires the same
-exact proposal, approval, Binding, and one-time Guard receipt as every other
-Git mutation. The gateway executes it as a fixed fetch of that branch followed
-by `git rebase --no-verify origin/<current-branch>`. It does not force-push,
-select another branch, or grant a later `PUSH` action.
-
-It rejects force push, unapproved branch rewrites, arbitrary Git configuration,
-pathspec magic, absolute or parent-relative paths, shell composition, and
-unlisted Git subcommands. For commit and rebase, the gateway disables repository
-hooks; it also disables commit signing for commits. The gateway has no authority
-over raw Host shell tools, APIs, databases, or any other mutation path.
-
 The receipt is process-local, one-time, target-bound, request-bound, and Anchor
 snapshot-bound. It is not Authority. A stale, forged, reused, remapped, or
 target-mismatched receipt blocks execution.
 
 An active Work Receipt may cover multiple expected source files inside its
-declared roots, but it does not cover DELETE, MOVE, COMMAND, `.ai/`, `.git/`,
-Core, policy, templates, configuration, push, or external effects. Ordinary
-local staging and commit occur after completed, validated work as defined by
-`.ai/core/INSTRUCTION_WORK_RECEIPT_CONTRACT.md`. Push becomes eligible only
-through its own approved durable proposal.
+declared roots, but it does not cover DELETE, MOVE, `.ai/`, `.git/`, Core,
+policy, templates, configuration, or external effects. Ordinary source-control
+operations are outside this Runtime and any resulting commit SHA is attached
+only to a completed Task Result Receipt.
 
 ## Result Transport
 

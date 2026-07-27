@@ -12,7 +12,6 @@ ROUTES = {
     "check": "/v1/execution-guard/check",
     "consume": "/v1/execution-guard/consume",
     "apply-file": "/v1/mutation-gateway/apply-file",
-    "apply-git": "/v1/mutation-gateway/apply-git",
 }
 
 

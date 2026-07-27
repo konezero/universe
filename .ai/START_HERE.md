@@ -38,10 +38,10 @@ gate, authority, or assignment state.
 Before every durable mutation, execute
 `.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
 Current Anchor do not replace the required Guard result and receipt.
-The narrow exception is ordinary local Git staging and commit after
-completed, validated work. They create only the Git commit SHA and no
-Runtime proposal or proposal-database entry. Push still requires a
-separate `PUSH` proposal and later user approval.
+Ordinary local Git staging, commit, and push after completed,
+validated work remain outside the Runtime. Their immutable commit SHA
+may be appended to the approved Task Proposal's Result Receipt and
+never creates Runtime authority, Binding, or an execution receipt.
 
 For a new mutation request, first follow
 `.ai/skills/common/task-assignment/SKILL.md`, then bind exact approval

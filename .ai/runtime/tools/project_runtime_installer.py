@@ -1768,8 +1768,9 @@ def _render_generated_surface(
             Mode and Role do not create authority. A current, scoped assignment and
             immediate pre-execution verification are required before mutation.
 
-            Before every file create/edit/delete/move, write-capable command, API or
-            database mutation, push, or durable side effect, execute
+            Before every file create/edit/delete/move, write-capable API or database
+            mutation, or durable side effect other than ordinary source-control
+            operations, execute
             `.ai/skills/common/execution-guard/SKILL.md`. Reading or summarizing that
             Skill is not sufficient. Do not call a raw mutation tool first.
 
@@ -1778,11 +1779,10 @@ def _render_generated_surface(
             a receipt-aware pre-write hook. Missing endpoint, token, Authority, Write
             Scope, Execution Assignment, approval, or Host hook blocks mutation.
 
-            After completed, validated work, ordinary local Git staging and commit do
-            not use a Runtime proposal, proposal database, separate approval, or this
-            Guard. The immutable Git commit SHA is the commit evidence. Push remains
-            separate: create a file-backed `PUSH` proposal, display it, and require
-            approval from a later user input before executing the guarded push.
+            After completed, validated work, ordinary local Git staging, commit, and
+            push remain outside the Runtime. The immutable Git commit SHA may be
+            appended to the approved Task Proposal's Result Receipt as work evidence.
+            It does not create Runtime authority, Binding, or an execution receipt.
 
             ## Normal Runtime Route
 
@@ -1838,10 +1838,10 @@ def _render_generated_surface(
             Before every durable mutation, execute
             `.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
             Current Anchor do not replace the required Guard result and receipt.
-            The narrow exception is ordinary local Git staging and commit after
-            completed, validated work. They create only the Git commit SHA and no
-            Runtime proposal or proposal-database entry. Push still requires a
-            separate `PUSH` proposal and later user approval.
+            Ordinary local Git staging, commit, and push after completed,
+            validated work remain outside the Runtime. Their immutable commit SHA
+            may be appended to the approved Task Proposal's Result Receipt and
+            never creates Runtime authority, Binding, or an execution receipt.
 
             For a new mutation request, first follow
             `.ai/skills/common/task-assignment/SKILL.md`, then bind exact approval

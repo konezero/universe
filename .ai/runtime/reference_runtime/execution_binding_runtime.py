@@ -16,14 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .git_action_registry import command_payload_sha256, resolve_git_action
-
-
 PROPOSAL_SCHEMA = "ai-career.execution-assignment-proposal.v1"
 BINDING_SCHEMA = "ai-career.execution-binding-result.v1"
 INSTRUCTION_RECEIPT_SCHEMA = "ai-career.instruction-receipt.v1"
 WORK_RECEIPT_SCHEMA = "ai-career.project-source-work-receipt.v1"
-MUTATION_OPERATIONS = frozenset({"CREATE", "MODIFY", "DELETE", "MOVE", "COMMAND"})
+MUTATION_OPERATIONS = frozenset({"CREATE", "MODIFY", "DELETE", "MOVE"})
 PROJECT_SOURCE_WORK_OPERATIONS = frozenset({"CREATE", "MODIFY"})
 FRESH_PROJECT_DEFAULT_SOURCE_ROOT = "src"
 RUNTIME_LAYOUT_ENTRIES = frozenset({".ai", ".git", "AGENTS.md", "REPOSITORY_MANIFEST.md"})
@@ -90,17 +87,6 @@ def build_assignment_proposal(
         "request_ref": request_ref,
         "proposed_at": proposed_at,
     }
-    if operation == "COMMAND":
-        command_argv = _command_argv(request.get("command_argv"), "request.command_argv")
-        git_action = resolve_git_action(command_argv, repository_root=Path(target))
-        if git_action is None:
-            raise ExecutionBindingError(
-                "ASSIGNMENT_PROPOSAL_GIT_ACTION_UNSUPPORTED",
-                "command_argv is not a supported bounded Git action",
-            )
-        material["command_argv"] = command_argv
-        material["command_payload_sha256"] = command_payload_sha256(command_argv)
-        material["git_action"] = git_action.name
     proposal_id = "assignment_" + _digest(material)[:24]
     return {
         "schema": PROPOSAL_SCHEMA,
@@ -330,16 +316,6 @@ def apply_execution_binding(
         "boundary": normalized_proposal["boundary"],
         "evidence_ref": approval_ref,
     }
-    if normalized_proposal["operation"] == "COMMAND":
-        bound_snapshot["execution_assignment"]["command_argv"] = list(
-            normalized_proposal["command_argv"]
-        )
-        bound_snapshot["execution_assignment"]["command_payload_sha256"] = (
-            normalized_proposal["command_payload_sha256"]
-        )
-        bound_snapshot["execution_assignment"]["git_action"] = normalized_proposal[
-            "git_action"
-        ]
     bound_snapshot["assignment_ref"] = approval_ref
     bound_snapshot["execution_binding"] = {
         "binding_id": binding_id,
@@ -359,118 +335,6 @@ def apply_execution_binding(
         "canonical_authority_changed": False,
         "process_local_state_updated": True,
         "repository_write": False,
-    }
-
-
-def apply_approved_git_proposal(
-    *,
-    snapshot: Mapping[str, Any],
-    approved_action: Mapping[str, Any],
-    observed_at: str,
-) -> dict[str, Any]:
-    """Import one approved durable push into current process-local state."""
-
-    if approved_action.get("status") != "GIT_PROPOSAL_ACTION_APPROVED":
-        raise ExecutionBindingError(
-            "EXECUTION_BINDING_GIT_PROPOSAL_INVALID",
-            "durable Git action is not approved",
-        )
-    proposal = _mapping(approved_action.get("proposal"), "approved_action.proposal")
-    approval = _mapping(approved_action.get("approval"), "approved_action.approval")
-    action = _mapping(approved_action.get("action"), "approved_action.action")
-    if proposal.get("proposal_kind") != "PUSH" or action.get("action") != "PUSH":
-        raise ExecutionBindingError(
-            "EXECUTION_BINDING_GIT_PROPOSAL_INVALID",
-            "only an approved PUSH proposal can be imported",
-        )
-    proposal_id = _required_text(proposal.get("proposal_id"), "proposal.proposal_id")
-    proposal_digest = _required_text(
-        proposal.get("proposal_digest"), "proposal.proposal_digest"
-    )
-    if approval.get("proposal_id") != proposal_id or approval.get(
-        "proposal_digest"
-    ) != proposal_digest:
-        raise ExecutionBindingError(
-            "EXECUTION_BINDING_GIT_PROPOSAL_INVALID",
-            "durable Git approval does not match the proposal",
-        )
-    repository_root = _absolute_path(
-        proposal.get("repository_root"), "proposal.repository_root"
-    )
-    command_argv = _command_argv(
-        action.get("command_argv"), "approved_action.action.command_argv"
-    )
-    action_name = _required_text(action.get("action"), "approved_action.action").upper()
-    assignment_proposal = build_assignment_proposal(
-        snapshot=snapshot,
-        request={
-            "operation": "COMMAND",
-            "target": repository_root,
-            "boundary": (
-                f"approved durable Git {proposal.get('proposal_kind')} "
-                f"proposal {proposal_id}"
-            ),
-            "write_roots": [repository_root],
-            "write_operations": ["COMMAND"],
-            "task_summary": _required_text(
-                proposal.get("task_summary"), "proposal.task_summary"
-            ),
-            "request_ref": _required_text(
-                proposal.get("request_ref"), "proposal.request_ref"
-            ),
-            "command_argv": command_argv,
-        },
-        observed_at=observed_at,
-    )
-    coordinates = _surface_coordinates(_current_snapshot(snapshot))
-    binding = apply_execution_binding(
-        snapshot=snapshot,
-        proposal=assignment_proposal,
-        approval={
-            "status": "APPROVED",
-            "proposal_id": assignment_proposal["proposal_id"],
-            "commander_surface": coordinates["commander_surface"],
-            "operation": "COMMAND",
-            "target": repository_root,
-            "boundary": assignment_proposal["boundary"],
-            "evidence_ref": _evidence_ref(
-                approval.get("evidence_ref"), "approval.evidence_ref"
-            ),
-            "authority_source_ref": _evidence_ref(
-                approval.get("authority_source_ref"),
-                "approval.authority_source_ref",
-            ),
-        },
-        observed_at=observed_at,
-    )
-    bound_snapshot = dict(binding["snapshot"])
-    assignment = dict(bound_snapshot["execution_assignment"])
-    assignment.update(
-        {
-            "assignment_kind": "DURABLE_GIT_PROPOSAL",
-            "durable_proposal_id": proposal_id,
-            "durable_proposal_digest": proposal_digest,
-            "git_proposal_kind": proposal.get("proposal_kind"),
-            "git_action": action_name,
-            "approval_ref": approval["evidence_ref"],
-        }
-    )
-    bound_snapshot["execution_assignment"] = assignment
-    execution_binding = dict(bound_snapshot["execution_binding"])
-    execution_binding.update(
-        {
-            "binding_kind": "DURABLE_GIT_PROPOSAL",
-            "durable_proposal_id": proposal_id,
-            "git_action": action_name,
-        }
-    )
-    bound_snapshot["execution_binding"] = execution_binding
-    return {
-        **binding,
-        "status": "DURABLE_GIT_PROPOSAL_BOUND",
-        "durable_proposal_id": proposal_id,
-        "git_action": action_name,
-        "snapshot": bound_snapshot,
     }
 
 
@@ -746,38 +610,6 @@ def _validated_proposal(value: Mapping[str, Any]) -> dict[str, Any]:
             _required_text(proposal.get("proposed_at"), "proposal.proposed_at")
         ),
     }
-    if material["operation"] == "COMMAND":
-        command_argv = _command_argv(
-            proposal.get("command_argv"), "proposal.command_argv"
-        )
-        payload_sha256 = _required_text(
-            proposal.get("command_payload_sha256"),
-            "proposal.command_payload_sha256",
-        )
-        if payload_sha256 != command_payload_sha256(command_argv):
-            raise ExecutionBindingError(
-                "EXECUTION_BINDING_PROPOSAL_INVALID",
-                "proposal command payload does not match command_argv",
-            )
-        material["command_argv"] = command_argv
-        material["command_payload_sha256"] = payload_sha256
-        git_action = resolve_git_action(
-            command_argv, repository_root=Path(material["target"])
-        )
-        if git_action is None:
-            raise ExecutionBindingError(
-                "EXECUTION_BINDING_PROPOSAL_INVALID",
-                "proposal command is not a supported bounded Git action",
-            )
-        proposed_git_action = _required_text(
-            proposal.get("git_action"), "proposal.git_action"
-        )
-        if proposed_git_action != git_action.name:
-            raise ExecutionBindingError(
-                "EXECUTION_BINDING_PROPOSAL_INVALID",
-                "proposal git_action does not match command_argv",
-            )
-        material["git_action"] = git_action.name
     expected_id = "assignment_" + _digest(material)[:24]
     if proposal.get("proposal_id") != expected_id:
         raise ExecutionBindingError(

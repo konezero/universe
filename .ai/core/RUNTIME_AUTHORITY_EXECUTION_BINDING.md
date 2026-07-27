@@ -86,7 +86,8 @@ Runtime-owned operational-state exception in `PRE_EXECUTION_VERIFICATION.md`.
 An exact Assignment binds one target. A `PROJECT_SOURCE_WORK` receipt may bind
 declared source roots and `CREATE`/`MODIFY` operations from one direct user
 instruction; the final Guard receipt still binds the exact target, payload, and
-preimage. Commit and push remain separate explicit approvals.
+preimage. Ordinary source-control operations remain outside the Runtime; their
+immutable commit SHA may be attached to the Task Result Receipt after work.
 
 ```text
 execution_assignment = UNASSIGNED

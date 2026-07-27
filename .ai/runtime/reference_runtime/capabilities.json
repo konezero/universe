@@ -9,7 +9,7 @@
     "session_boot_executor": "AVAILABLE",
     "task_assignment_proposal": "AVAILABLE",
     "execution_binding": "AVAILABLE",
-    "durable_git_proposal_journal": "AVAILABLE",
+    "durable_task_proposal_journal": "AVAILABLE",
     "runtime_status_collection": "AVAILABLE",
     "source_only_os_status": "AVAILABLE",
     "execution_guard": "AVAILABLE",
