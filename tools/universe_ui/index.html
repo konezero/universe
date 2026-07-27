@@ -59,6 +59,17 @@
       <div class="canvas-wrap">
         <canvas id="universe-graph" aria-label="Project system graph"></canvas>
         <div id="graph-empty" class="graph-empty">Select a project</div>
+        <section id="conversation-layer" class="conversation-layer collapsed" aria-label="Project Room conversation">
+          <header class="conversation-layer-header">
+            <strong>Conversation</strong>
+            <label class="layer-opacity" title="Conversation transparency">
+              <span>Opacity</span>
+              <input id="conversation-opacity" type="range" min="25" max="100" value="86">
+            </label>
+            <button id="conversation-toggle" class="icon-button compact" type="button" title="Expand conversation" aria-label="Expand conversation">+</button>
+          </header>
+          <div id="room-message-list" class="room-message-list"></div>
+        </section>
         <div class="graph-legend" aria-hidden="true">
           <span><i class="node-key project"></i>Adopted path</span>
           <span><i class="node-key system"></i>Parallel work</span>
@@ -66,11 +77,14 @@
         </div>
       </div>
       <form id="dispatch-form" class="command-composer project-room">
-        <div class="room-heading"><strong>Project Room</strong><span>Universe Conductor to Project Master</span></div>
         <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
-        <textarea id="dispatch-instruction" name="instruction" rows="2" placeholder="Ask the Project Master about design, review, status, or an implementation queue" required></textarea>
-        <button id="dispatch-submit" class="primary-button" type="submit">
-          Send
+        <textarea id="dispatch-instruction" name="instruction" rows="3" placeholder="Message the Project Master" required></textarea>
+        <div class="room-actions">
+          <span class="room-context">GCS · Project Master</span>
+          <span class="room-hint">Review, design, question, or implementation request</span>
+        </div>
+        <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send message" aria-label="Send message">
+          &#8593;
         </button>
       </form>
     </main>

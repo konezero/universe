@@ -37,6 +37,10 @@ const elements = {
   accessDialog: document.querySelector("#access-dialog"),
   accessForm: document.querySelector("#access-form"),
   accessFormError: document.querySelector("#access-form-error"),
+  conversationLayer: document.querySelector("#conversation-layer"),
+  conversationToggle: document.querySelector("#conversation-toggle"),
+  conversationOpacity: document.querySelector("#conversation-opacity"),
+  roomMessageList: document.querySelector("#room-message-list"),
   toasts: document.querySelector("#toast-region"),
 };
 
@@ -291,7 +295,27 @@ async function selectProject(projectId) {
   buildGraph();
   renderDetails();
   renderActivity();
+  renderRoomMessages();
   renderReleaseCatalog();
+}
+
+function renderRoomMessages() {
+  elements.roomMessageList.replaceChildren();
+  if (!state.roomMessages.length) {
+    elements.roomMessageList.append(
+      node("p", "empty-copy", "Messages to the Project Master appear here")
+    );
+    return;
+  }
+  for (const message of state.roomMessages.slice(-8)) {
+    const item = node("article", "room-message");
+    item.append(
+      node("strong", "", `${message.sender} · ${message.kind}`),
+      node("p", "", message.body),
+      node("small", "", message.delivery_state)
+    );
+    elements.roomMessageList.append(item);
+  }
 }
 
 function buildGraph() {
@@ -592,6 +616,18 @@ function drawGraph() {
   context.clearRect(0, 0, width, height);
   context.save();
   context.scale(ratio, ratio);
+  const viewportWidth = width / ratio;
+  const viewportHeight = height / ratio;
+  // Stable points make the observation surface feel spatial without implying data.
+  for (let index = 0; index < 96; index += 1) {
+    const x = (index * 149 + 41) % viewportWidth;
+    const y = (index * 83 + 67) % viewportHeight;
+    const radius = index % 11 === 0 ? 1.4 : 0.65;
+    context.fillStyle = index % 11 === 0 ? "rgba(114, 189, 255, 0.58)" : "rgba(178, 205, 244, 0.24)";
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fill();
+  }
   const centerX = width / ratio / 2 + state.graph.x;
   const centerY = height / ratio / 2 + state.graph.y;
   context.translate(centerX, centerY);
@@ -1035,6 +1071,18 @@ function bindEvents() {
     .addEventListener("click", () => elements.projectDialog.showModal());
   elements.dispatchForm.addEventListener("submit", submitDispatch);
   elements.prepareProject.addEventListener("click", prepareProjectSeed);
+  elements.conversationToggle.addEventListener("click", () => {
+    const collapsed = elements.conversationLayer.classList.toggle("collapsed");
+    elements.conversationToggle.textContent = collapsed ? "+" : "−";
+    elements.conversationToggle.title = collapsed ? "Expand conversation" : "Collapse conversation";
+    elements.conversationToggle.setAttribute("aria-label", elements.conversationToggle.title);
+  });
+  elements.conversationOpacity.addEventListener("input", () => {
+    elements.conversationLayer.style.setProperty(
+      "--conversation-opacity",
+      String(Number(elements.conversationOpacity.value) / 100)
+    );
+  });
   elements.projectForm.addEventListener("submit", submitProject);
   elements.releaseForm.addEventListener("submit", submitRelease);
   elements.accessForm.addEventListener("submit", submitAccess);
