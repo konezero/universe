@@ -22,6 +22,7 @@ JsonObject = dict[str, Any]
 
 
 from core_release import build_release  # noqa: E402
+from project_seed_assets import materialize_project_seed_assets  # noqa: E402
 from universe_server import (  # noqa: E402
     ConnectionCapabilities,
     HttpUniverseTransport,
@@ -807,11 +808,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(0, proposal["effects"]["documents_moved"])
         self.assertTrue(
             all(
-                operation["target_path"].startswith("docs/universe/")
+                operation["target_path"].startswith(".ai/universe/")
                 for operation in proposal["operations"]
             )
         )
-        self.assertFalse((self.project_root / "docs" / "universe").exists())
+        self.assertFalse((self.project_root / ".ai" / "universe").exists())
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(
             projection["projection_digest"],
@@ -823,6 +824,111 @@ class UniverseLocalServiceTests(unittest.TestCase):
             if path.is_file()
         }
         self.assertEqual(before, after)
+
+    def test_project_seed_preserves_reference_context_and_document_roles(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        seed_input = self.project_seed()
+        seed_input["project"]["summary"] = "Trading system architecture and work context"
+        seed_input["project"]["working_rules"] = [
+            "Keep source mutations inside an approved Project scope.",
+            "Use linked design and contract documents before implementation.",
+        ]
+        seed_input["documents"][0]["title"] = "System architecture"
+        seed_input["documents"][0]["role"] = "specification"
+        seed_input["documents"][0]["node_ids"] = []
+        seed_input["documents"][0]["project_wide"] = True
+
+        status, result = self.request(
+            "POST", "/v1/projects/GCS/seed", seed_input, self.token
+        )
+
+        self.assertEqual(201, status)
+        seed = result["seed"]
+        self.assertEqual(
+            "Trading system architecture and work context", seed["project"]["summary"]
+        )
+        self.assertEqual(
+            seed_input["project"]["working_rules"], seed["project"]["working_rules"]
+        )
+        document = next(
+            item for item in seed["documents"] if item["document_id"] == "architecture"
+        )
+        self.assertEqual("System architecture", document["title"])
+        self.assertEqual("SPECIFICATION", document["role"])
+        self.assertEqual([], document["node_ids"])
+        self.assertTrue(document["project_wide"])
+
+    def test_gcs_project_seed_assets_separate_functional_and_implementation_graphs(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        seed_input = self.project_seed(seed_id="gcs-seed-assets-001")
+        seed_input["implementation_nodes"] = [
+            {
+                "implementation_id": "broker-client-class",
+                "kind": "class",
+                "title": "BrokerClient",
+                "refs": [
+                    {
+                        "path": "src/broker.py",
+                        "sha256": self.digest(self.broker_source),
+                        "kind": "source",
+                        "symbol": "BrokerClient",
+                    }
+                ],
+            }
+        ]
+        seed_input["implementation_bindings"] = [
+            {
+                "binding_id": "broker-client-implements",
+                "functional_node_id": "broker-client",
+                "implementation_node_id": "broker-client-class",
+                "relation": "implements",
+            }
+        ]
+        status, seeded = self.request(
+            "POST", "/v1/projects/GCS/seed", seed_input, self.token
+        )
+        self.assertEqual(201, status)
+        materialized = materialize_project_seed_assets(
+            self.project_root, seeded["seed"]
+        )
+        self.assertEqual(".ai/universe", materialized["asset_root"])
+
+        status, synced = self.request(
+            "POST", "/v1/projects/GCS/sync", {}, self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_SEED_ASSETS_SYNCED", synced["status"])
+        projection = synced["projection"]
+        self.assertEqual(
+            "broker-client-class",
+            projection["implementation"]["nodes"][0]["implementation_id"],
+        )
+        self.assertEqual(
+            "IMPLEMENTS", projection["implementation_bindings"][0]["relation"]
+        )
+
+        status, template = self.request(
+            "GET", "/v1/templates/project-seed", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(".ai/universe", template["template"]["asset_root"])
+
+    def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, result = self.request(
+            "POST", "/v1/projects/GCS/discovery-dispatch", {}, self.token
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("PROJECT_DISCOVERY_DISPATCH_QUEUED", result["status"])
+        dispatch = result["dispatch"]
+        self.assertEqual("QUEUED", dispatch["status"])
+        self.assertEqual(
+            "universe.project-discovery-dispatch.v1",
+            dispatch["expected_output"]["schema"],
+        )
+        self.assertFalse((self.project_root / ".ai" / "universe").exists())
 
     def test_project_seed_rejects_digest_mismatch_and_root_escape(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

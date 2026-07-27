@@ -257,6 +257,14 @@ button {
   font-weight: 680;
 }
 
+.graph-toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
 .graph-toolbar p {
   margin: 4px 0 0;
   color: var(--muted);
@@ -353,6 +361,10 @@ button {
 
 .node-key.document {
   background: var(--amber);
+}
+
+.node-key.implementation {
+  background: #6b4fa3;
 }
 
 .node-key.predicted {
@@ -490,6 +502,28 @@ textarea:focus {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.context-copy {
+  margin: 0 0 10px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.context-list,
+.document-references {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 17px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.document-references {
+  margin-top: 10px;
 }
 
 .status-badge {
@@ -782,6 +816,11 @@ dialog label {
 
   .segmented-control button {
     padding: 0 7px;
+  }
+
+  .graph-toolbar-actions {
+    align-items: flex-end;
+    flex-direction: column;
   }
 
   .command-composer {

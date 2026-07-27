@@ -35,6 +35,11 @@ from universe_dispatch import (
     normalize_result_packet,
     transition_event,
 )
+from project_seed_assets import (
+    ProjectSeedAssetError,
+    load_project_seed_assets,
+    project_seed_template,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -42,6 +47,7 @@ PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
 PROJECT_PROJECTION_SCHEMA = "universe.project-projection.v1"
+PROJECT_DISCOVERY_DISPATCH_SCHEMA = "universe.project-discovery-dispatch.v1"
 DOCUMENT_PROPOSAL_SCHEMA = "universe.document-incorporation-proposal.v1"
 RELEASE_ARTIFACT_SCHEMA = "universe.release-artifact.v1"
 RELEASE_PROPOSAL_SCHEMA = "universe.project-release-proposal.v1"
@@ -76,7 +82,23 @@ DEFAULT_REFS = {
     "master_inbox": ".ai/inbox/MASTER",
 }
 DOCUMENT_ROLES = frozenset(
-    {"ARCHITECTURE", "CONTRACT", "DECISION", "DESIGN", "EVIDENCE", "REFERENCE"}
+    {
+        "ARCHITECTURE",
+        "CHANGELOG",
+        "CONTRACT",
+        "DECISION",
+        "DESIGN",
+        "EVIDENCE",
+        "POLICY",
+        "REFERENCE",
+        "SPECIFICATION",
+    }
+)
+IMPLEMENTATION_NODE_KINDS = frozenset(
+    {"PACKAGE", "MODULE", "CLASS", "SERVICE", "ADAPTER", "ENDPOINT"}
+)
+IMPLEMENTATION_BINDING_RELATIONS = frozenset(
+    {"IMPLEMENTS", "SUPPORTS", "ADAPTS", "EXPOSES"}
 )
 MASTER_MODE = "MASTER"
 UNIVERSE_MODE = "UNIVERSE"
@@ -773,6 +795,7 @@ def normalize_project_seed(
         required=frozenset(
             {"seed_id", "source", "project", "nodes", "edges", "documents"}
         ),
+        optional=frozenset({"implementation_nodes", "implementation_bindings"}),
     )
     project_root = Path(project["project_root"]).resolve(strict=True)
     source = _exact_object_fields(
@@ -784,6 +807,7 @@ def normalize_project_seed(
         request["project"],
         field="project",
         required=frozenset({"kind", "technologies", "goal"}),
+        optional=frozenset({"summary", "working_rules"}),
     )
     technologies = sorted(
         set(
@@ -798,6 +822,12 @@ def normalize_project_seed(
             "PROJECT_SEED_TECHNOLOGIES_REQUIRED",
             "project.technologies must not be empty",
         )
+    working_rules = [
+        _required_text(rule, f"project.working_rules[{index}]")
+        for index, rule in enumerate(
+            _array(project_input.get("working_rules", []), "project.working_rules")
+        )
+    ]
 
     nodes: list[dict[str, Any]] = []
     node_ids: set[str] = set()
@@ -867,6 +897,110 @@ def normalize_project_seed(
             )
         edges.append(normalized_edge)
 
+    implementation_nodes: list[dict[str, Any]] = []
+    implementation_ids: set[str] = set()
+    for index, raw_node in enumerate(
+        _array(request.get("implementation_nodes", []), "implementation_nodes")
+    ):
+        field = f"implementation_nodes[{index}]"
+        implementation = _exact_object_fields(
+            raw_node,
+            field=field,
+            required=frozenset({"implementation_id", "kind", "title", "refs"}),
+            optional=frozenset({"summary"}),
+        )
+        implementation_id = _identifier(
+            implementation["implementation_id"], f"{field}.implementation_id"
+        )
+        if implementation_id in implementation_ids:
+            raise UniverseError(
+                "PROJECT_SEED_IMPLEMENTATION_DUPLICATE",
+                f"duplicate implementation node: {implementation_id}",
+            )
+        implementation_ids.add(implementation_id)
+        kind = _identifier(implementation["kind"], f"{field}.kind").upper()
+        if kind not in IMPLEMENTATION_NODE_KINDS:
+            raise UniverseError(
+                "PROJECT_SEED_IMPLEMENTATION_KIND_INVALID",
+                f"unsupported implementation node kind: {kind}",
+            )
+        normalized_implementation: dict[str, Any] = {
+            "implementation_id": implementation_id,
+            "kind": kind,
+            "title": _required_text(implementation["title"], f"{field}.title"),
+            "refs": [
+                _project_file_ref(project_root, ref, f"{field}.refs[{ref_index}]")
+                for ref_index, ref in enumerate(
+                    _array(implementation["refs"], f"{field}.refs")
+                )
+            ],
+        }
+        if "summary" in implementation:
+            normalized_implementation["summary"] = _required_text(
+                implementation["summary"], f"{field}.summary"
+            )
+        implementation_nodes.append(normalized_implementation)
+
+    implementation_bindings: list[dict[str, Any]] = []
+    binding_ids: set[str] = set()
+    for index, raw_binding in enumerate(
+        _array(request.get("implementation_bindings", []), "implementation_bindings")
+    ):
+        field = f"implementation_bindings[{index}]"
+        binding = _exact_object_fields(
+            raw_binding,
+            field=field,
+            required=frozenset(
+                {
+                    "binding_id",
+                    "functional_node_id",
+                    "implementation_node_id",
+                    "relation",
+                }
+            ),
+            optional=frozenset({"summary"}),
+        )
+        binding_id = _identifier(binding["binding_id"], f"{field}.binding_id")
+        if binding_id in binding_ids:
+            raise UniverseError(
+                "PROJECT_SEED_IMPLEMENTATION_BINDING_DUPLICATE",
+                f"duplicate implementation binding: {binding_id}",
+            )
+        binding_ids.add(binding_id)
+        functional_node_id = _identifier(
+            binding["functional_node_id"], f"{field}.functional_node_id"
+        )
+        implementation_node_id = _identifier(
+            binding["implementation_node_id"], f"{field}.implementation_node_id"
+        )
+        if functional_node_id not in node_ids:
+            raise UniverseError(
+                "PROJECT_SEED_FUNCTIONAL_NODE_UNKNOWN",
+                f"{field} references an unknown functional node",
+            )
+        if implementation_node_id not in implementation_ids:
+            raise UniverseError(
+                "PROJECT_SEED_IMPLEMENTATION_NODE_UNKNOWN",
+                f"{field} references an unknown implementation node",
+            )
+        relation = _identifier(binding["relation"], f"{field}.relation").upper()
+        if relation not in IMPLEMENTATION_BINDING_RELATIONS:
+            raise UniverseError(
+                "PROJECT_SEED_IMPLEMENTATION_BINDING_RELATION_INVALID",
+                f"unsupported implementation binding relation: {relation}",
+            )
+        normalized_binding: dict[str, Any] = {
+            "binding_id": binding_id,
+            "functional_node_id": functional_node_id,
+            "implementation_node_id": implementation_node_id,
+            "relation": relation,
+        }
+        if "summary" in binding:
+            normalized_binding["summary"] = _required_text(
+                binding["summary"], f"{field}.summary"
+            )
+        implementation_bindings.append(normalized_binding)
+
     documents: list[dict[str, Any]] = []
     document_ids: set[str] = set()
     for index, raw_document in enumerate(_array(request["documents"], "documents")):
@@ -875,7 +1009,7 @@ def normalize_project_seed(
             raw_document,
             field=field,
             required=frozenset({"document_id", "path", "sha256", "role"}),
-            optional=frozenset({"node_ids"}),
+            optional=frozenset({"node_ids", "project_wide", "title"}),
         )
         document_id = _identifier(
             document["document_id"], f"{field}.document_id"
@@ -903,15 +1037,31 @@ def normalize_project_seed(
                 "PROJECT_DOCUMENT_NODE_UNKNOWN",
                 f"{field}.node_ids contains an unknown node",
             )
-        documents.append(
-            {
-                "document_id": document_id,
-                "path": ref["path"],
-                "sha256": ref["sha256"],
-                "role": role,
-                "node_ids": linked_nodes,
-            }
-        )
+        project_wide = document.get("project_wide", False)
+        if not isinstance(project_wide, bool):
+            raise UniverseError(
+                "PROJECT_DOCUMENT_PROJECT_WIDE_INVALID",
+                f"{field}.project_wide must be a boolean",
+            )
+        if project_wide and linked_nodes:
+            raise UniverseError(
+                "PROJECT_DOCUMENT_ATTACHMENT_INVALID",
+                f"{field}.project_wide cannot be combined with node_ids",
+            )
+        normalized_document: dict[str, Any] = {
+            "document_id": document_id,
+            "path": ref["path"],
+            "sha256": ref["sha256"],
+            "role": role,
+            "node_ids": linked_nodes,
+        }
+        if "title" in document:
+            normalized_document["title"] = _required_text(
+                document["title"], f"{field}.title"
+            )
+        if project_wide:
+            normalized_document["project_wide"] = True
+        documents.append(normalized_document)
 
     normalized = {
         "schema": PROJECT_SEED_SCHEMA,
@@ -933,8 +1083,22 @@ def normalize_project_seed(
         },
         "nodes": sorted(nodes, key=lambda item: item["node_id"]),
         "edges": sorted(edges, key=lambda item: item["edge_id"]),
+        "implementation": {
+            "nodes": sorted(
+                implementation_nodes, key=lambda item: item["implementation_id"]
+            )
+        },
+        "implementation_bindings": sorted(
+            implementation_bindings, key=lambda item: item["binding_id"]
+        ),
         "documents": sorted(documents, key=lambda item: item["document_id"]),
     }
+    if "summary" in project_input:
+        normalized["project"]["summary"] = _required_text(
+            project_input["summary"], "project.summary"
+        )
+    if working_rules:
+        normalized["project"]["working_rules"] = working_rules
     normalized["seed_digest"] = _json_sha256(normalized)
     return normalized
 
@@ -975,7 +1139,7 @@ def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
                 }
             )
     for document in seed["documents"]:
-        if not document["node_ids"]:
+        if not document["node_ids"] and not document.get("project_wide", False):
             missing_connections.append(
                 {
                     "kind": "DOCUMENT_UNMAPPED",
@@ -999,6 +1163,8 @@ def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
         "project": seed["project"],
         "nodes": seed["nodes"],
         "edges": seed["edges"],
+        "implementation": seed.get("implementation", {"nodes": []}),
+        "implementation_bindings": seed.get("implementation_bindings", []),
         "documents": seed["documents"],
         "missing_connections": missing_connections,
         "predicted_paths": predicted_paths,
@@ -1020,17 +1186,17 @@ def _document_target(document: dict[str, Any]) -> str:
     stable_name = f"{document['document_id']}-{filename}"
     role = document["role"].casefold()
     if document["role"] == "DECISION":
-        return f"docs/universe/decisions/{stable_name}"
+        return f".ai/universe/documents/decisions/{stable_name}"
     if document["role"] == "CONTRACT":
-        return f"docs/universe/connections/{stable_name}"
+        return f".ai/universe/documents/connections/{stable_name}"
     if document["role"] == "EVIDENCE":
-        return f"docs/universe/evidence/{stable_name}"
+        return f".ai/universe/documents/evidence/{stable_name}"
     if document["node_ids"]:
         return (
-            f"docs/universe/nodes/{document['node_ids'][0]}/"
+            f".ai/universe/documents/nodes/{document['node_ids'][0]}/"
             f"{role}/{stable_name}"
         )
-    return f"docs/universe/reference/{stable_name}"
+    return f".ai/universe/documents/reference/{stable_name}"
 
 
 def build_document_incorporation_proposal(
@@ -1038,14 +1204,14 @@ def build_document_incorporation_proposal(
 ) -> dict[str, Any]:
     operations = []
     for document in projection["documents"]:
-        already_incorporated = document["path"].startswith("docs/universe/")
+        already_incorporated = document["path"].startswith(".ai/universe/")
         target_path = (
             document["path"] if already_incorporated else _document_target(document)
         )
         operations.append(
             {
                 "document_id": document["document_id"],
-                "operation": "RETAIN" if already_incorporated else "MOVE",
+                "operation": "RETAIN" if already_incorporated else "DERIVE",
                 "source_path": document["path"],
                 "source_sha256": document["sha256"],
                 "target_path": target_path,
@@ -1557,6 +1723,31 @@ class UniverseStore:
         seed["recorded_at"] = now
         seed["is_current"] = True
         return seed, True
+
+    def sync_project_seed_assets(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        try:
+            seed_input = load_project_seed_assets(Path(project["project_root"]))
+        except ProjectSeedAssetError as error:
+            raise UniverseError(error.args[0], error.args[0], HTTPStatus.CONFLICT) from error
+        seed, seed_created = self.record_project_seed(project["project_id"], seed_input)
+        projection, projection_created = self.build_project_projection(
+            project["project_id"],
+            {
+                "seed_id": seed["seed_id"],
+                "expected_seed_digest": seed["seed_digest"],
+            },
+        )
+        return {
+            "schema": PROJECT_SEED_SCHEMA,
+            "status": "PROJECT_SEED_ASSETS_SYNCED",
+            "project_id": project["project_id"],
+            "seed": seed,
+            "projection": projection,
+            "seed_recorded": seed_created,
+            "projection_built": projection_created,
+            "asset_root": ".ai/universe",
+        }
 
     def get_project_seed(
         self, project_id: str, seed_id: str = ""
@@ -2150,6 +2341,40 @@ class UniverseStore:
             self._insert_dispatch_event(connection, queued)
         return self.get_dispatch(envelope["dispatch_id"]), True
 
+    def create_project_seed_discovery_dispatch(
+        self, project_id: str
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        template = project_seed_template()
+        return self.create_dispatch(
+            project["project_id"],
+            {
+                "idempotency_key": (
+                    f"project-seed-discovery-{project['project_id']}-{template['template_id']}"
+                ),
+                "title": "Prepare Universe project seed",
+                "instruction": (
+                    "Read this Project's policy, source, and existing documents without "
+                    "executing Project code. Create or update the canonical .ai/universe "
+                    "Seed assets using the supplied template. Keep functional nodes, "
+                    "implementation nodes, and their bindings separate. Return the published "
+                    "Seed revision; do not mutate application source as part of this request."
+                ),
+                "constraints": [
+                    "STATIC_DISCOVERY_ONLY",
+                    "PROJECT_MASTER_OWNS_PROJECT_WRITES",
+                    "FUNCTIONAL_AND_IMPLEMENTATION_GRAPHS_MUST_REMAIN_SEPARATE",
+                    "DO_NOT_EXECUTE_PROJECT_CODE",
+                ],
+                "expected_output": {
+                    "schema": PROJECT_DISCOVERY_DISPATCH_SCHEMA,
+                    "template": template,
+                    "result": "PUBLISHED_PROJECT_SEED_ASSETS_OR_BLOCKED_RESULT_PACKET",
+                },
+                "requested_mode": MASTER_MODE,
+            },
+        )
+
     def list_dispatches(
         self,
         project_id: str,
@@ -2653,6 +2878,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/templates/project-seed":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "PROJECT_SEED_TEMPLATE_COLLECTED",
+                    "template": project_seed_template(),
+                },
+            )
+            return
         dispatch_parts = self._dispatch_path(path)
         if dispatch_parts is not None and dispatch_parts[1] == "":
             try:
@@ -2790,6 +3025,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "proposal": proposal,
                     },
                 )
+                return
+            if parts is not None and parts[1] == "/discovery-dispatch":
+                dispatch, created = self.server.store.create_project_seed_discovery_dispatch(
+                    parts[0]
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_DISCOVERY_DISPATCH_QUEUED"
+                            if created
+                            else "PROJECT_DISCOVERY_DISPATCH_ALREADY_QUEUED"
+                        ),
+                        **dispatch,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/sync":
+                result = self.server.store.sync_project_seed_assets(parts[0])
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 return
             if parts is not None and parts[1] == "/dispatches":
                 dispatch, created = self.server.store.create_dispatch(
@@ -3023,9 +3279,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/document-incorporation-proposals",
             "/release-proposals",
             "/dispatches",
+            "/discovery-dispatch",
             "/projection",
             "/events",
             "/seed",
+            "/sync",
         ):
             if remainder.endswith(suffix):
                 return unquote(remainder[:-len(suffix)]), suffix

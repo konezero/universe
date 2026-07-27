@@ -1,7 +1,7 @@
 # Project Projection Contract
 
 Universe connects projects by reference. It does not copy project source,
-original documents, test results, or Runtime databases into its own storage.
+legacy documents, test results, or Runtime databases into its own storage.
 
 ## Ownership
 
@@ -9,7 +9,7 @@ original documents, test results, or Runtime databases into its own storage.
 |---|---|
 | Career | Reusable governance and adopted common patterns |
 | Universe | Universe Seed, Project Projection, cross-project relationships, predicted path candidates |
-| Project | Source, tests, original documents, and adopted result documents |
+| Project | Source, tests, and canonical `.ai/universe/` Seed assets |
 
 References bind a Project ID, immutable source commit, repository-relative
 path, optional symbol, and SHA-256 digest. Raw file contents remain in the
@@ -24,36 +24,40 @@ registered local root.
 
 ```text
 PROJECT_REGISTERED
-  -> PROJECT_SEED_RECORDED
+  -> PROJECT_DISCOVERY_DISPATCH_QUEUED
+  -> Project Master publishes `.ai/universe/` Seed assets
+  -> PROJECT_SEED_ASSETS_SYNCED
   -> PROJECT_PROJECTION_BUILT
   -> INCORPORATION_PROPOSAL_READY
   -> USER_APPROVAL_AND_PROJECT_MUTATION
 ```
 
-`PROJECT_SEED_RECORDED` validates every submitted source and document
-reference against the registered Project root. It stores metadata and
-digests, not file contents.
+`PROJECT_SEED_ASSETS_SYNCED` verifies the Project Master-published
+`.ai/universe/manifest.json` and its graph assets against the registered
+Project root. Universe stores an indexed copy and digests, not raw source
+content.
 
 `PROJECT_PROJECTION_BUILT` creates the current node, edge, and document map.
 It also returns deterministic missing-connection candidates. These candidates
 require user selection and create no Authority, Assignment, or Project write.
 A new current Project Seed makes the prior Projection stale until rebuilt.
 
-`INCORPORATION_PROPOSAL_READY` proposes where Project documents would live
-under the Project-owned `docs/universe/` structure:
+`INCORPORATION_PROPOSAL_READY` proposes where a Project Master would derive
+canonical Universe-facing documents under the Project-owned `.ai/universe/`
+structure:
 
 ```text
-docs/universe/
-  nodes/<node-id>/<role>/
-  connections/
-  decisions/
-  evidence/
-  reference/
+.ai/universe/
+  documents/nodes/<node-id>/<role>/
+  documents/connections/
+  documents/decisions/
+  documents/evidence/
+  documents/reference/
 ```
 
 The proposal does not create directories or move files. The Project executes
 an approved proposal through its own Assignment, Guard, validation, and commit
-flow. Existing documents already under `docs/universe/` are retained.
+flow. Existing canonical documents under `.ai/universe/` are retained.
 
 ## Project Seed
 
@@ -61,10 +65,28 @@ A Project Seed contains:
 
 - a Project-owned ID;
 - an immutable source reference and commit;
-- project kind, technology signals, and goal;
-- system nodes with source references;
-- edges with optional contract-document references;
-- documents with roles and node links.
+- project kind, technology signals, goal, optional summary, and optional
+  working-reference rules;
+- functional nodes with source references;
+- functional edges with optional contract-document references;
+- implementation nodes for packages, modules, classes, services, adapters, and
+  endpoints;
+- many-to-many functional-to-implementation bindings;
+- documents with a title, role, and functional-node links.
+
+`working_rules` are Project Seed reference context for planning and LLM work.
+They do not grant authority, replace Project policy, or allow source mutation.
+Functional nodes and implementation nodes are separate planes. A binding is
+evidence that an implementation realizes, supports, adapts, or exposes a
+functional node; it is not a claim that either plane owns the other.
+
+Document roles include `ARCHITECTURE`, `DESIGN`, `SPECIFICATION`, `CONTRACT`,
+`POLICY`, `DECISION`, `CHANGELOG`, `EVIDENCE`, and `REFERENCE`. A document with
+`project_wide: true` belongs to the main Project node and cannot also name a
+component. An empty `node_ids` array without that marker remains an unmapped
+document candidate. The Project node can therefore retain project-wide design,
+specification, policy, decision, and change references without assigning them
+to an unrelated component.
 
 Only repository-relative regular-file references are accepted. Parent
 traversal, root escape, missing files, symlinks, and digest mismatches are
@@ -86,5 +108,6 @@ mutation.
 ## Non-Goals
 
 This contract does not implement WebGL, remote synchronization, OAuth, P2P,
-MCP, automatic project discovery, automatic document movement, or Project
-source editing.
+MCP, automatic document movement, or Project source editing. Project discovery
+is Master-owned: Universe queues the read-only request and reads a published
+`.ai/universe/` bundle after the Project Master completes it.

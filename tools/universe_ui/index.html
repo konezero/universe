@@ -46,10 +46,16 @@
           <h1 id="workspace-title">Project network</h1>
           <p id="workspace-subtitle">No project selected</p>
         </div>
-        <div class="segmented-control" aria-label="Graph view">
-          <button type="button" class="selected" data-view="system">System</button>
-          <button type="button" data-view="documents">Documents</button>
-          <button type="button" data-view="future">Future</button>
+        <div class="graph-toolbar-actions">
+          <button id="prepare-project-button" class="secondary-button" type="button">
+            Prepare
+          </button>
+          <div class="segmented-control" aria-label="Graph view">
+            <button type="button" class="selected" data-view="system">Functional</button>
+            <button type="button" data-view="implementation">Implementation</button>
+            <button type="button" data-view="documents">Documents</button>
+            <button type="button" data-view="future">Future</button>
+          </div>
         </div>
       </div>
       <div class="canvas-wrap">
@@ -57,7 +63,8 @@
         <div id="graph-empty" class="graph-empty">Select a project</div>
         <div class="graph-legend" aria-hidden="true">
           <span><i class="node-key project"></i>Project</span>
-          <span><i class="node-key system"></i>System</span>
+          <span><i class="node-key system"></i>Functional</span>
+          <span><i class="node-key implementation"></i>Implementation</span>
           <span><i class="node-key document"></i>Document</span>
           <span><i class="node-key predicted"></i>Predicted</span>
         </div>

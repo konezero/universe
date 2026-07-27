@@ -24,6 +24,7 @@ const elements = {
   activity: document.querySelector("#activity-panel"),
   dispatchForm: document.querySelector("#dispatch-form"),
   dispatchSubmit: document.querySelector("#dispatch-submit"),
+  prepareProject: document.querySelector("#prepare-project-button"),
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
@@ -261,6 +262,10 @@ async function selectProject(projectId) {
   state.selectedProject = project;
   state.selectedNode = null;
   renderProjects();
+  await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
+    method: "POST",
+    body: {},
+  }).catch(() => null);
   const [projectionResult, dispatchResult, proposalResult] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
@@ -304,6 +309,45 @@ function buildGraph() {
   const graphEdges = [];
   const projection = state.projection;
   if (projection) {
+    if (state.view === "implementation") {
+      for (const item of projection.nodes || []) {
+        graphNodes.push({
+          id: `node:${item.node_id}`,
+          label: item.title,
+          kind: "system",
+          data: item,
+        });
+        graphEdges.push({
+          from: graphNodes[0].id,
+          to: `node:${item.node_id}`,
+          kind: "contains",
+        });
+      }
+      for (const item of projection.implementation?.nodes || []) {
+        graphNodes.push({
+          id: `implementation:${item.implementation_id}`,
+          label: item.title,
+          kind: "implementation",
+          data: item,
+        });
+      }
+      for (const binding of projection.implementation_bindings || []) {
+        graphEdges.push({
+          from: `node:${binding.functional_node_id}`,
+          to: `implementation:${binding.implementation_node_id}`,
+          kind: "implementation-binding",
+        });
+      }
+      layoutGraph(graphNodes, state.view);
+      state.graph.nodes = graphNodes;
+      state.graph.edges = graphEdges;
+      state.graph.scale = 1;
+      state.graph.x = 0;
+      state.graph.y = 0;
+      elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+      drawGraph();
+      return;
+    }
     for (const item of projection.nodes || []) {
       graphNodes.push({
         id: `node:${item.node_id}`,
@@ -328,7 +372,7 @@ function buildGraph() {
       for (const item of projection.documents || []) {
         graphNodes.push({
           id: `document:${item.document_id}`,
-          label: item.document_id,
+          label: item.title || readableLabel(item.document_id),
           kind: "document",
           data: item,
         });
@@ -366,15 +410,7 @@ function buildGraph() {
       }
     }
   }
-  const ring = graphNodes.slice(1);
-  graphNodes[0].x = 0;
-  graphNodes[0].y = 0;
-  ring.forEach((item, index) => {
-    const angle = (Math.PI * 2 * index) / Math.max(ring.length, 1) - Math.PI / 2;
-    const radius = 170 + (index % 3) * 32;
-    item.x = Math.cos(angle) * radius;
-    item.y = Math.sin(angle) * radius;
-  });
+  layoutGraph(graphNodes, state.view);
   state.graph.nodes = graphNodes;
   state.graph.edges = graphEdges;
   state.graph.scale = 1;
@@ -382,6 +418,120 @@ function buildGraph() {
   state.graph.y = 0;
   elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
   drawGraph();
+}
+
+function readableLabel(value) {
+  return String(value)
+    .replaceAll("-", " ")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function layoutGraph(graphNodes, view) {
+  const project = graphNodes[0];
+  project.x = 0;
+  project.y = 0;
+  const systems = graphNodes.filter((item) => item.kind === "system");
+  if (elements.canvas.clientWidth <= 540) {
+    layoutCompactGraph(project, systems, graphNodes, view);
+    return;
+  }
+  if (view !== "documents") {
+    graphNodes.slice(1).forEach((item, index, items) => {
+      const angle = (Math.PI * 2 * index) / Math.max(items.length, 1) - Math.PI / 2;
+      const radius = 170 + (index % 3) * 32;
+      item.x = Math.cos(angle) * radius;
+      item.y = Math.sin(angle) * radius;
+    });
+    return;
+  }
+
+  const systemById = new Map();
+  systems.forEach((item, index) => {
+    const angle = (Math.PI * 2 * index) / Math.max(systems.length, 1) - Math.PI / 2;
+    item.x = Math.cos(angle) * 185;
+    item.y = Math.sin(angle) * 185;
+    systemById.set(item.data.node_id, item);
+  });
+
+  const documentsByOwner = new Map();
+  for (const item of graphNodes.filter((candidate) => candidate.kind === "document")) {
+    const ownerId = item.data.node_ids?.[0] || "";
+    const owned = documentsByOwner.get(ownerId) || [];
+    owned.push(item);
+    documentsByOwner.set(ownerId, owned);
+  }
+  for (const [ownerId, documents] of documentsByOwner) {
+    const owner = systemById.get(ownerId) || project;
+    if (owner === project) {
+      documents.forEach((item, index) => {
+        const spread = (index - (documents.length - 1) / 2) * 132;
+        item.x = spread;
+        item.y = -292;
+      });
+      continue;
+    }
+    const length = Math.hypot(owner.x, owner.y) || 1;
+    const outwardX = owner.x / length;
+    const outwardY = owner.y / length;
+    const perpendicularX = -outwardY;
+    const perpendicularY = outwardX;
+    documents.forEach((item, index) => {
+      const spread = (index - (documents.length - 1) / 2) * 62;
+      item.x = owner.x + outwardX * 154 + perpendicularX * spread;
+      item.y = owner.y + outwardY * 154 + perpendicularY * spread;
+    });
+  }
+}
+
+function layoutCompactGraph(project, systems, graphNodes, view) {
+  const positions = [
+    [-104, -92],
+    [104, -92],
+    [-104, 92],
+    [104, 92],
+  ];
+  const systemById = new Map();
+  systems.forEach((item, index) => {
+    const [x, y] = positions[index % positions.length];
+    item.x = x;
+    item.y = y + Math.floor(index / positions.length) * 110;
+    systemById.set(item.data.node_id, item);
+  });
+
+  if (view === "documents") {
+    const documentsByOwner = new Map();
+    for (const item of graphNodes.filter((candidate) => candidate.kind === "document")) {
+      const ownerId = item.data.node_ids?.[0] || "";
+      const owned = documentsByOwner.get(ownerId) || [];
+      owned.push(item);
+      documentsByOwner.set(ownerId, owned);
+    }
+    for (const [ownerId, documents] of documentsByOwner) {
+      const owner = systemById.get(ownerId) || project;
+      if (owner === project) {
+        documents.forEach((item, index) => {
+          item.x = (index - (documents.length - 1) / 2) * 132;
+          item.y = -212;
+        });
+        continue;
+      }
+      const direction = owner.y <= project.y ? -1 : 1;
+      documents.forEach((item, index) => {
+        const spread = (index - (documents.length - 1) / 2) * 56;
+        item.x = owner.x + spread;
+        item.y = owner.y + direction * 72;
+      });
+    }
+    return;
+  }
+
+  graphNodes
+    .filter((item) => item.kind !== "project" && item.kind !== "system")
+    .forEach((item, index) => {
+      item.x = index % 2 === 0 ? -104 : 104;
+      item.y = 190 + Math.floor(index / 2) * 78;
+    });
 }
 
 function canvasMetrics() {
@@ -407,23 +557,32 @@ function drawGraph() {
   context.translate(centerX, centerY);
   context.scale(state.graph.scale, state.graph.scale);
   const byId = new Map(state.graph.nodes.map((item) => [item.id, item]));
-  context.lineWidth = 1.2;
-  context.strokeStyle = "#aeb7c1";
   for (const edge of state.graph.edges) {
     const from = byId.get(edge.from);
     const to = byId.get(edge.to);
     if (!from || !to) continue;
+    const isDocumentLink = edge.kind === "documents";
+    const isImplementationLink = edge.kind === "implementation-binding";
+    context.lineWidth = isDocumentLink ? 1.4 : 1.2;
+    context.strokeStyle = isDocumentLink
+      ? "#a15c00"
+      : isImplementationLink
+        ? "#6b4fa3"
+        : "#aeb7c1";
+    context.setLineDash(isDocumentLink ? [5, 4] : isImplementationLink ? [3, 3] : []);
     context.beginPath();
     context.moveTo(from.x, from.y);
     context.lineTo(to.x, to.y);
     context.stroke();
   }
+  context.setLineDash([]);
   for (const item of state.graph.nodes) {
     const selected = state.selectedNode?.id === item.id;
     const color = {
       project: "#087f78",
       system: "#1769aa",
       document: "#a15c00",
+      implementation: "#6b4fa3",
       predicted: "#b13b36",
     }[item.kind];
     const widthValue = item.kind === "project" ? 116 : 108;
@@ -507,7 +666,7 @@ function renderDetails() {
     )
   );
   const grid = node("dl", "detail-grid");
-  const data = selected?.data || state.selectedProject;
+  const data = selected?.data || state.projection?.project || state.selectedProject;
   addDetail(grid, "Type", selected?.kind || "project");
   addDetail(
     grid,
@@ -515,11 +674,45 @@ function renderDetails() {
     selected?.kind === "predicted" ? "USER_SELECTION_REQUIRED" : "CURRENT"
   );
   if (data.kind) addDetail(grid, "Kind", data.kind);
+  if (data.role) addDetail(grid, "Role", data.role);
+  if (data.node_ids?.length) addDetail(grid, "Related to", data.node_ids.join(", "));
   if (data.path) addDetail(grid, "Path", data.path);
   if (data.project_root) addDetail(grid, "Root", data.project_root);
   if (data.symbol) addDetail(grid, "Symbol", data.symbol);
   heading.append(grid);
   elements.details.append(heading);
+
+  const relatedDocuments = (state.projection?.documents || []).filter((item) =>
+    selected?.kind === "system"
+      ? item.node_ids?.includes(data.node_id)
+      : item.project_wide === true
+  );
+  if (!selected || relatedDocuments.length) {
+    const contextGroup = node("div", "detail-group");
+    contextGroup.append(node("h3", "", selected ? "Related documents" : "Project context"));
+    if (!selected && data.summary) {
+      contextGroup.append(node("p", "context-copy", data.summary));
+    }
+    if (!selected && data.working_rules?.length) {
+      const rules = node("ul", "context-list");
+      for (const rule of data.working_rules) rules.append(node("li", "", rule));
+      contextGroup.append(rules);
+    }
+    if (relatedDocuments.length) {
+      const references = node("ul", "document-references");
+      for (const document of relatedDocuments) {
+        references.append(
+          node(
+            "li",
+            "",
+            `${document.role} · ${document.title || readableLabel(document.document_id)}`
+          )
+        );
+      }
+      contextGroup.append(references);
+    }
+    elements.details.append(contextGroup);
+  }
 
   const projectionGroup = node("div", "detail-group");
   projectionGroup.append(node("h3", "", "Projection"));
@@ -672,6 +865,29 @@ async function submitDispatch(event) {
   }
 }
 
+async function prepareProjectSeed() {
+  if (!state.selectedProject) {
+    toast("Select a project", true);
+    return;
+  }
+  elements.prepareProject.disabled = true;
+  try {
+    await api(
+      `/v1/projects/${encodeURIComponent(
+        state.selectedProject.project_id
+      )}/discovery-dispatch`,
+      { method: "POST", body: {} }
+    );
+    toast("Project seed preparation queued");
+    await selectProject(state.selectedProject.project_id);
+    showInspectorTab("activity");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    elements.prepareProject.disabled = false;
+  }
+}
+
 async function submitProject(event) {
   event.preventDefault();
   elements.projectFormError.textContent = "";
@@ -765,6 +981,7 @@ function bindEvents() {
     .querySelector("#add-project-button")
     .addEventListener("click", () => elements.projectDialog.showModal());
   elements.dispatchForm.addEventListener("submit", submitDispatch);
+  elements.prepareProject.addEventListener("click", prepareProjectSeed);
   elements.projectForm.addEventListener("submit", submitProject);
   elements.releaseForm.addEventListener("submit", submitRelease);
   elements.accessForm.addEventListener("submit", submitAccess);

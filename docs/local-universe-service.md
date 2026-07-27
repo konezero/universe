@@ -21,9 +21,9 @@ grants authority or permission to mutate an attached project. See
 - maintain the Universe project registry in SQLite;
 - accept one-time project registration and later refreshes;
 - retain append-only project observation events;
-- validate reference-only Project Seeds;
+- queue Master-owned Project Seed discovery and verify published `.ai/universe` Seed assets;
 - persist current Project Projections and missing-connection candidates;
-- create read-only `docs/universe` incorporation proposals;
+- create read-only `.ai/universe/documents` derivation proposals;
 - verify and retain immutable ai-career Release artifacts;
 - create read-only Project release install/update proposals;
 - queue durable Project dispatches and retain their complete event/result timeline;
@@ -98,6 +98,9 @@ POST   /v1/projects/{project_id}/events
 GET    /v1/projects/{project_id}/events
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
+GET    /v1/templates/project-seed
+POST   /v1/projects/{project_id}/discovery-dispatch
+POST   /v1/projects/{project_id}/sync
 POST   /v1/projects/{project_id}/projection
 GET    /v1/projects/{project_id}/projection
 POST   /v1/projects/{project_id}/document-incorporation-proposals
@@ -166,7 +169,8 @@ session storage and removes it from the visible URL.
 The first slice supports:
 
 - explicit local project connection;
-- System, Documents, and Future graph views;
+- Functional, Implementation, Documents, and Future graph views;
+- Project Seed preparation Dispatch creation and automatic asset sync on refresh;
 - immutable Release DB import in MASTER;
 - read-only Project install/update planning with collision visibility;
 - durable MASTER dispatch creation and approved Inbox delivery;
@@ -178,18 +182,23 @@ validate/status, and completion evidence.
 
 ## Project Seed and Projection
 
-The Project initiates connection and submits a Project Seed containing only
-metadata plus repository-relative file references and SHA-256 digests.
-Universe validates those references against the registered root and stores no
-raw file contents.
+Universe queues a Master-owned, read-only discovery request. The Project Master
+then publishes the canonical Seed bundle under `.ai/universe/`: a manifest,
+functional graph, implementation graph, functional-to-implementation bindings,
+and document catalog. Universe verifies the manifest and its file digests,
+reconstructs the Seed, and stores no raw project source content.
 
 Building a Projection returns the current node/edge/document map, structural
-gaps, and user-selectable predicted paths. A newer Project Seed invalidates
-the prior current Projection until it is rebuilt.
+gaps, and user-selectable predicted paths. The UI places component documents
+next to their linked system nodes and Project-wide documents next to the main
+Project node. Project summaries and working-reference rules are shown in the
+main-node inspector. A newer Project Seed invalidates the prior current
+Projection until it is rebuilt.
 
 The document-incorporation endpoint returns a proposal for the Project-owned
-`docs/universe/` hierarchy. It never creates a directory or moves a document.
-The Project must approve and execute that mutation through its own Runtime.
+`.ai/universe/documents/` hierarchy. It never creates a directory or moves a
+legacy document. The Project Master must approve and execute canonical document
+derivation through its own Runtime.
 See `docs/project-projection-contract.md`.
 
 ## Connection and authentication boundary
