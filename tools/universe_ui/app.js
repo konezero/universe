@@ -9,6 +9,7 @@ const state = {
   releases: [],
   releaseProposals: [],
   selectedNode: null,
+  focusedNodeId: null,
   view: "timeline",
   roomMessages: [],
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
@@ -41,6 +42,10 @@ const elements = {
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
+  nodeBreadcrumb: document.querySelector("#node-breadcrumb"),
+  nodeBreadcrumbProject: document.querySelector("#node-breadcrumb-project"),
+  nodeBreadcrumbNode: document.querySelector("#node-breadcrumb-node"),
+  exitNodeUniverse: document.querySelector("#exit-node-universe"),
   toasts: document.querySelector("#toast-region"),
 };
 
@@ -266,6 +271,7 @@ async function selectProject(projectId) {
   if (!project) return;
   state.selectedProject = project;
   state.selectedNode = null;
+  state.focusedNodeId = null;
   renderProjects();
   await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
     method: "POST",
@@ -325,6 +331,11 @@ function buildGraph() {
     drawGraph();
     return;
   }
+  if (state.focusedNodeId) {
+    buildNodeUniverseGraph();
+    return;
+  }
+  elements.nodeBreadcrumb.classList.add("hidden");
   if (state.view === "timeline") {
     buildTimelineGraph();
     return;
@@ -451,6 +462,149 @@ function buildGraph() {
   drawGraph();
 }
 
+function focusedProjectionNode() {
+  return (state.projection?.nodes || []).find(
+    (item) => item.node_id === state.focusedNodeId
+  );
+}
+
+function buildNodeUniverseGraph() {
+  const focus = focusedProjectionNode();
+  if (!focus) {
+    state.focusedNodeId = null;
+    buildGraph();
+    return;
+  }
+  const projection = state.projection || {};
+  const focusId = `node:${focus.node_id}`;
+  const graphNodes = [
+    {
+      id: focusId,
+      label: focus.title,
+      kind: "focus",
+      data: focus,
+      x: 0,
+      y: 0,
+    },
+  ];
+  const graphEdges = [];
+  const visibleIds = new Set([focus.node_id]);
+  for (const edge of projection.edges || []) {
+    if (edge.from_node === focus.node_id) visibleIds.add(edge.to_node);
+    if (edge.to_node === focus.node_id) visibleIds.add(edge.from_node);
+  }
+  for (const item of projection.nodes || []) {
+    if (item.node_id === focus.node_id || !visibleIds.has(item.node_id)) continue;
+    graphNodes.push({
+      id: `node:${item.node_id}`,
+      label: item.title,
+      kind: "related",
+      data: item,
+    });
+  }
+  for (const edge of projection.edges || []) {
+    if (!visibleIds.has(edge.from_node) || !visibleIds.has(edge.to_node)) continue;
+    graphEdges.push({
+      from: `node:${edge.from_node}`,
+      to: `node:${edge.to_node}`,
+      kind: edge.kind,
+    });
+  }
+  for (const binding of projection.implementation_bindings || []) {
+    if (binding.functional_node_id !== focus.node_id) continue;
+    const implementation = (projection.implementation?.nodes || []).find(
+      (item) => item.implementation_id === binding.implementation_node_id
+    );
+    if (!implementation) continue;
+    graphNodes.push({
+      id: `implementation:${implementation.implementation_id}`,
+      label: implementation.title,
+      kind: "implementation",
+      data: implementation,
+    });
+    graphEdges.push({
+      from: focusId,
+      to: `implementation:${implementation.implementation_id}`,
+      kind: "implementation-binding",
+    });
+  }
+  for (const document of projection.documents || []) {
+    if (!document.node_ids?.includes(focus.node_id)) continue;
+    graphNodes.push({
+      id: `document:${document.document_id}`,
+      label: document.title || readableLabel(document.document_id),
+      kind: "document",
+      data: document,
+    });
+    graphEdges.push({
+      from: focusId,
+      to: `document:${document.document_id}`,
+      kind: "documents",
+    });
+  }
+  for (const candidate of projection.predicted_paths || []) {
+    if (candidate.subject_ref !== focusId) continue;
+    graphNodes.push({
+      id: `predicted:${candidate.candidate_id}`,
+      label: readableLabel(candidate.action),
+      kind: "predicted",
+      data: candidate,
+    });
+    graphEdges.push({ from: focusId, to: `predicted:${candidate.candidate_id}`, kind: "predicts" });
+  }
+  layoutNodeUniverseGraph(graphNodes);
+  state.graph.nodes = graphNodes;
+  state.graph.edges = graphEdges;
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  state.selectedNode = graphNodes.find((item) => item.id === focusId) || null;
+  elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  renderNodeBreadcrumb(focus);
+  drawGraph();
+}
+
+function layoutNodeUniverseGraph(graphNodes) {
+  const focus = graphNodes[0];
+  focus.x = 0;
+  focus.y = 0;
+  const groups = {
+    related: graphNodes.filter((item) => item.kind === "related"),
+    implementation: graphNodes.filter((item) => item.kind === "implementation"),
+    document: graphNodes.filter((item) => item.kind === "document"),
+    predicted: graphNodes.filter((item) => item.kind === "predicted"),
+  };
+  const placements = [
+    [groups.related, -148, -86, 78],
+    [groups.implementation, 148, -86, 74],
+    [groups.document, 148, 94, 70],
+    [groups.predicted, -148, 94, 70],
+  ];
+  for (const [items, x, y, spread] of placements) {
+    items.forEach((item, index) => {
+      item.x = x + (index - (items.length - 1) / 2) * spread;
+      item.y = y + (index % 2 ? 28 : 0);
+    });
+  }
+}
+
+function renderNodeBreadcrumb(focus) {
+  const isFocused = Boolean(focus && state.selectedProject);
+  elements.nodeBreadcrumb.classList.toggle("hidden", !isFocused);
+  if (!isFocused) return;
+  elements.nodeBreadcrumbProject.textContent = state.selectedProject.project_id;
+  elements.nodeBreadcrumbNode.textContent = focus.title;
+}
+
+function exitNodeUniverse() {
+  if (!state.focusedNodeId) return;
+  state.focusedNodeId = null;
+  state.selectedNode = null;
+  elements.nodeBreadcrumb.classList.add("hidden");
+  buildGraph();
+  renderDetails();
+}
+
 function buildTimelineGraph() {
   const project = state.selectedProject;
   const projection = state.projection || {};
@@ -481,6 +635,7 @@ function buildTimelineGraph() {
   state.graph.x = 0;
   state.graph.y = 0;
   elements.graphEmpty.classList.toggle("hidden", nodes.length > 0);
+  elements.nodeBreadcrumb.classList.add("hidden");
   drawGraph();
 }
 
@@ -660,13 +815,15 @@ function drawGraph() {
     const color = {
       project: "#087f78",
       system: "#1769aa",
+      focus: "#41d7c3",
+      related: "#61a8ff",
       document: "#a15c00",
       implementation: "#6b4fa3",
       predicted: "#b13b36",
     }[item.kind];
-    const widthValue = item.kind === "project" ? 116 : 108;
-    const heightValue = item.kind === "project" ? 42 : 36;
-    context.fillStyle = selected ? "#20262d" : "#ffffff";
+    const widthValue = ["project", "focus"].includes(item.kind) ? 126 : 108;
+    const heightValue = ["project", "focus"].includes(item.kind) ? 42 : 36;
+    context.fillStyle = selected ? "#20262d" : item.kind === "focus" ? "#0e2528" : "#ffffff";
     context.strokeStyle = selected ? "#20262d" : color;
     context.lineWidth = selected ? 2.4 : 1.6;
     roundedRect(
@@ -717,7 +874,7 @@ function graphPoint(event) {
 
 function selectGraphNode(event) {
   const point = graphPoint(event);
-  state.selectedNode =
+  const selected =
     [...state.graph.nodes]
       .reverse()
       .find(
@@ -725,6 +882,18 @@ function selectGraphNode(event) {
           Math.abs(point.x - item.x) <= 58 &&
           Math.abs(point.y - item.y) <= 24
       ) || null;
+  if (!selected) return;
+  if (selected.kind === "project") {
+    exitNodeUniverse();
+    return;
+  }
+  if (selected.kind === "system" || selected.kind === "related") {
+    state.focusedNodeId = selected.data.node_id;
+    buildGraph();
+    renderDetails();
+    return;
+  }
+  state.selectedNode = selected;
   drawGraph();
   renderDetails();
 }
@@ -762,7 +931,7 @@ function renderDetails() {
   elements.details.append(heading);
 
   const relatedDocuments = (state.projection?.documents || []).filter((item) =>
-    selected?.kind === "system"
+    ["system", "related", "focus"].includes(selected?.kind)
       ? item.node_ids?.includes(data.node_id)
       : item.project_wide === true
   );
@@ -914,6 +1083,8 @@ function renderEmpty() {
   elements.graphEmpty.classList.remove("hidden");
   state.graph.nodes = [];
   state.graph.edges = [];
+  state.focusedNodeId = null;
+  elements.nodeBreadcrumb.classList.add("hidden");
   drawGraph();
   renderDetails();
   renderActivity();
@@ -1071,9 +1242,10 @@ function bindEvents() {
     .addEventListener("click", () => elements.projectDialog.showModal());
   elements.dispatchForm.addEventListener("submit", submitDispatch);
   elements.prepareProject.addEventListener("click", prepareProjectSeed);
+  elements.exitNodeUniverse.addEventListener("click", exitNodeUniverse);
   elements.conversationToggle.addEventListener("click", () => {
     const collapsed = elements.conversationLayer.classList.toggle("collapsed");
-    elements.conversationToggle.textContent = collapsed ? "+" : "−";
+    elements.conversationToggle.textContent = collapsed ? "+" : "-";
     elements.conversationToggle.title = collapsed ? "Expand conversation" : "Collapse conversation";
     elements.conversationToggle.setAttribute("aria-label", elements.conversationToggle.title);
   });
@@ -1103,6 +1275,8 @@ function bindEvents() {
         candidate.classList.toggle("selected", candidate === button);
       }
       state.selectedNode = null;
+      state.focusedNodeId = null;
+      elements.nodeBreadcrumb.classList.add("hidden");
       buildGraph();
       renderDetails();
     });

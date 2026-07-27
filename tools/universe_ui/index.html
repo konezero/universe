@@ -59,6 +59,12 @@
       <div class="canvas-wrap">
         <canvas id="universe-graph" aria-label="Project system graph"></canvas>
         <div id="graph-empty" class="graph-empty">Select a project</div>
+        <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
+          <button id="exit-node-universe" class="icon-button compact" type="button" title="Return to project universe" aria-label="Return to project universe">&#8592;</button>
+          <span id="node-breadcrumb-project"></span>
+          <span aria-hidden="true">/</span>
+          <strong id="node-breadcrumb-node"></strong>
+        </nav>
         <section id="conversation-layer" class="conversation-layer collapsed" aria-label="Project Room conversation">
           <header class="conversation-layer-header">
             <strong>Conversation</strong>
