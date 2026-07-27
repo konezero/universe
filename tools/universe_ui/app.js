@@ -331,10 +331,6 @@ function buildGraph() {
     drawGraph();
     return;
   }
-  if (state.focusedNodeId) {
-    buildNodeUniverseGraph();
-    return;
-  }
   elements.nodeBreadcrumb.classList.add("hidden");
   if (state.view === "timeline") {
     buildTimelineGraph();
@@ -608,27 +604,135 @@ function exitNodeUniverse() {
 function buildTimelineGraph() {
   const project = state.selectedProject;
   const projection = state.projection || {};
+  const projectData = projection.project || project;
+  const functional = projection.nodes || [];
+  const focus = focusedProjectionNode();
+  const rootSelected = state.selectedNode?.kind === "project";
+  const spacing = Math.max(138, Math.min(184, 660 / Math.max(functional.length, 1)));
+  const startX = -((Math.max(functional.length, 1) - 1) * spacing) / 2;
   const nodes = [
-    { id: `project:${project.project_id}`, label: "Development start", kind: "project", data: project, x: -300, y: 0 },
+    {
+      id: `project:${project.project_id}`,
+      label: "Development start",
+      kind: "project",
+      data: projectData,
+      x: startX - spacing * 1.18,
+      y: 0,
+    },
   ];
   const edges = [];
-  const functional = projection.nodes || [];
-  const adopted = functional.slice(0, 5);
-  adopted.forEach((item, index) => {
-    const x = -110 + index * 150;
-    nodes.push({ id: `node:${item.node_id}`, label: item.title, kind: "system", data: item, x, y: index % 2 ? -84 : 84 });
-    edges.push({ from: index ? `node:${adopted[index - 1].node_id}` : `project:${project.project_id}`, to: `node:${item.node_id}`, kind: "adopted" });
+
+  functional.forEach((item, index) => {
+    const id = `node:${item.node_id}`;
+    nodes.push({
+      id,
+      label: item.title,
+      kind: focus?.node_id === item.node_id ? "focus" : "system",
+      data: item,
+      x: startX + index * spacing,
+      y: index % 2 ? -84 : 84,
+    });
+    edges.push({
+      from: index ? `node:${functional[index - 1].node_id}` : `project:${project.project_id}`,
+      to: id,
+      kind: "adopted",
+    });
   });
-  const last = adopted.length ? `node:${adopted[adopted.length - 1].node_id}` : `project:${project.project_id}`;
-  (projection.predicted_paths || []).slice(0, 3).forEach((item, index) => {
-    const id = `predicted:${item.candidate_id}`;
-    nodes.push({ id, label: readableLabel(item.action), kind: "predicted", data: item, x: 260 + index * 115, y: 150 + index * 72 });
-    edges.push({ from: last, to: id, kind: "predicts" });
-  });
-  if (!adopted.length) {
+
+  if (!functional.length) {
     nodes.push({ id: "seed:pending", label: "Prepare Project Seed", kind: "predicted", data: {}, x: -80, y: 0 });
     edges.push({ from: `project:${project.project_id}`, to: "seed:pending", kind: "predicts" });
   }
+
+  if (focus) {
+    const focusGraphId = `node:${focus.node_id}`;
+    const focusGraph = nodes.find((item) => item.id === focusGraphId);
+    const focusX = focusGraph?.x || 0;
+    const focusY = focusGraph?.y || 0;
+    const implementationNodes = projection.implementation?.nodes || [];
+    const implementationBindings = (projection.implementation_bindings || []).filter(
+      (item) => item.functional_node_id === focus.node_id
+    );
+    implementationBindings.forEach((binding, index) => {
+      const implementation = implementationNodes.find(
+        (item) => item.implementation_id === binding.implementation_node_id
+      );
+      if (!implementation) return;
+      const id = `implementation:${implementation.implementation_id}`;
+      nodes.push({
+        id,
+        label: implementation.title,
+        kind: "implementation",
+        data: implementation,
+        x: focusX + (index - (implementationBindings.length - 1) / 2) * 126,
+        y: focusY - 154,
+      });
+      edges.push({ from: focusGraphId, to: id, kind: "implementation-binding" });
+    });
+
+    const documents = (projection.documents || []).filter((item) =>
+      item.node_ids?.includes(focus.node_id)
+    );
+    documents.forEach((document, index) => {
+      const id = `document:${document.document_id}`;
+      nodes.push({
+        id,
+        label: document.title || readableLabel(document.document_id),
+        kind: "document",
+        data: document,
+        x: focusX + (index - (documents.length - 1) / 2) * 126,
+        y: focusY + 154,
+      });
+      edges.push({ from: focusGraphId, to: id, kind: "documents" });
+    });
+
+    const predicted = (projection.predicted_paths || []).filter(
+      (item) => item.subject_ref === focusGraphId
+    );
+    predicted.forEach((item, index) => {
+      const id = `predicted:${item.candidate_id}`;
+      nodes.push({
+        id,
+        label: readableLabel(item.action),
+        kind: "predicted",
+        data: item,
+        x: focusX + 170 + index * 120,
+        y: focusY + 16 + index * 68,
+      });
+      edges.push({ from: focusGraphId, to: id, kind: "predicts" });
+    });
+  } else if (rootSelected) {
+    const rootDocuments = (projection.documents || []).filter(
+      (item) => item.project_wide === true
+    );
+    rootDocuments.forEach((document, index) => {
+      const id = `document:${document.document_id}`;
+      nodes.push({
+        id,
+        label: document.title || readableLabel(document.document_id),
+        kind: "document",
+        data: document,
+        x: nodes[0].x + (index - (rootDocuments.length - 1) / 2) * 126,
+        y: -150,
+      });
+      edges.push({ from: nodes[0].id, to: id, kind: "documents" });
+    });
+  } else {
+    const last = functional.length ? `node:${functional[functional.length - 1].node_id}` : `project:${project.project_id}`;
+    (projection.predicted_paths || []).slice(0, 3).forEach((item, index) => {
+      const id = `predicted:${item.candidate_id}`;
+      nodes.push({
+        id,
+        label: readableLabel(item.action),
+        kind: "predicted",
+        data: item,
+        x: startX + Math.max(functional.length, 1) * spacing + index * 118,
+        y: 150 + index * 72,
+      });
+      edges.push({ from: last, to: id, kind: "predicts" });
+    });
+  }
+
   state.graph.nodes = nodes;
   state.graph.edges = edges;
   state.graph.scale = 1;
@@ -638,7 +742,6 @@ function buildTimelineGraph() {
   elements.nodeBreadcrumb.classList.add("hidden");
   drawGraph();
 }
-
 function readableLabel(value) {
   return String(value)
     .replaceAll("-", " ")
@@ -884,11 +987,16 @@ function selectGraphNode(event) {
       ) || null;
   if (!selected) return;
   if (selected.kind === "project") {
-    exitNodeUniverse();
+    state.focusedNodeId = null;
+    state.selectedNode = selected;
+    buildGraph();
+    renderDetails();
     return;
   }
-  if (selected.kind === "system" || selected.kind === "related") {
-    state.focusedNodeId = selected.data.node_id;
+  if (["system", "related", "focus"].includes(selected.kind)) {
+    state.focusedNodeId =
+      state.focusedNodeId === selected.data.node_id ? null : selected.data.node_id;
+    state.selectedNode = selected;
     buildGraph();
     renderDetails();
     return;
@@ -923,25 +1031,31 @@ function renderDetails() {
   );
   if (data.kind) addDetail(grid, "Kind", data.kind);
   if (data.role) addDetail(grid, "Role", data.role);
+  if (data.goal) addDetail(grid, "Goal", data.goal);
+  if (data.technologies?.length) addDetail(grid, "Technologies", data.technologies.join(", "));
   if (data.node_ids?.length) addDetail(grid, "Related to", data.node_ids.join(", "));
   if (data.path) addDetail(grid, "Path", data.path);
   if (data.project_root) addDetail(grid, "Root", data.project_root);
   if (data.symbol) addDetail(grid, "Symbol", data.symbol);
+  if (selected?.kind === "project" && state.projection?.source?.commit) {
+    addDetail(grid, "Source commit", state.projection.source.commit);
+  }
   heading.append(grid);
   elements.details.append(heading);
 
+  const isProjectContext = !selected || selected.kind === "project";
   const relatedDocuments = (state.projection?.documents || []).filter((item) =>
     ["system", "related", "focus"].includes(selected?.kind)
       ? item.node_ids?.includes(data.node_id)
       : item.project_wide === true
   );
-  if (!selected || relatedDocuments.length) {
+  if (isProjectContext || relatedDocuments.length) {
     const contextGroup = node("div", "detail-group");
-    contextGroup.append(node("h3", "", selected ? "Related documents" : "Project context"));
-    if (!selected && data.summary) {
+    contextGroup.append(node("h3", "", isProjectContext ? "Project context" : "Related documents"));
+    if (isProjectContext && data.summary) {
       contextGroup.append(node("p", "context-copy", data.summary));
     }
-    if (!selected && data.working_rules?.length) {
+    if (isProjectContext && data.working_rules?.length) {
       const rules = node("ul", "context-list");
       for (const rule of data.working_rules) rules.append(node("li", "", rule));
       contextGroup.append(rules);
