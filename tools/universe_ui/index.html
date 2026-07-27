@@ -30,9 +30,9 @@
       </div>
     </header>
 
-    <aside class="project-rail">
+    <aside class="project-rail universe-rail">
       <div class="section-heading">
-        <span>Projects</span>
+        <span>Project Universes</span>
         <button id="add-project-button" class="icon-button compact" type="button" title="Add project">
           +
         </button>
@@ -43,18 +43,16 @@
     <main class="graph-workspace">
       <div class="graph-toolbar">
         <div>
-          <h1 id="workspace-title">Project network</h1>
-          <p id="workspace-subtitle">No project selected</p>
+          <h1 id="workspace-title">Universe observation</h1>
+          <p id="workspace-subtitle">Select a project universe to inspect its timeline</p>
         </div>
         <div class="graph-toolbar-actions">
           <button id="prepare-project-button" class="secondary-button" type="button">
-            Prepare
+            Prepare Project Seed
           </button>
           <div class="segmented-control" aria-label="Graph view">
-            <button type="button" class="selected" data-view="system">Functional</button>
-            <button type="button" data-view="implementation">Implementation</button>
-            <button type="button" data-view="documents">Documents</button>
-            <button type="button" data-view="future">Future</button>
+            <button type="button" class="selected" data-view="timeline">Timeline</button>
+            <button type="button" data-view="universe">Universe map</button>
           </div>
         </div>
       </div>
@@ -62,18 +60,17 @@
         <canvas id="universe-graph" aria-label="Project system graph"></canvas>
         <div id="graph-empty" class="graph-empty">Select a project</div>
         <div class="graph-legend" aria-hidden="true">
-          <span><i class="node-key project"></i>Project</span>
-          <span><i class="node-key system"></i>Functional</span>
-          <span><i class="node-key implementation"></i>Implementation</span>
-          <span><i class="node-key document"></i>Document</span>
-          <span><i class="node-key predicted"></i>Predicted</span>
+          <span><i class="node-key project"></i>Adopted path</span>
+          <span><i class="node-key system"></i>Parallel work</span>
+          <span><i class="node-key predicted"></i>Future branch</span>
         </div>
       </div>
-      <form id="dispatch-form" class="command-composer">
-        <input id="dispatch-title" name="title" maxlength="120" placeholder="Task title" required>
-        <textarea id="dispatch-instruction" name="instruction" rows="2" placeholder="Instruction for Project MASTER" required></textarea>
+      <form id="dispatch-form" class="command-composer project-room">
+        <div class="room-heading"><strong>Project Room</strong><span>Universe Conductor to Project Master</span></div>
+        <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
+        <textarea id="dispatch-instruction" name="instruction" rows="2" placeholder="Ask the Project Master about design, review, status, or an implementation queue" required></textarea>
         <button id="dispatch-submit" class="primary-button" type="submit">
-          Queue
+          Send
         </button>
       </form>
     </main>

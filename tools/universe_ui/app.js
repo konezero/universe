@@ -9,7 +9,8 @@ const state = {
   releases: [],
   releaseProposals: [],
   selectedNode: null,
-  view: "system",
+  view: "timeline",
+  roomMessages: [],
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
 };
 
@@ -266,12 +267,13 @@ async function selectProject(projectId) {
     method: "POST",
     body: {},
   }).catch(() => null);
-  const [projectionResult, dispatchResult, proposalResult] = await Promise.all([
+  const [projectionResult, dispatchResult, proposalResult, roomResult] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
     ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/dispatches`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
   ]);
   state.projection = projectionResult?.projection || null;
   state.dispatches = await Promise.all(
@@ -282,6 +284,7 @@ async function selectProject(projectId) {
     )
   );
   state.releaseProposals = proposalResult.proposals;
+  state.roomMessages = roomResult.messages || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -296,6 +299,10 @@ function buildGraph() {
     state.graph.nodes = [];
     state.graph.edges = [];
     drawGraph();
+    return;
+  }
+  if (state.view === "timeline") {
+    buildTimelineGraph();
     return;
   }
   const graphNodes = [
@@ -417,6 +424,39 @@ function buildGraph() {
   state.graph.x = 0;
   state.graph.y = 0;
   elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  drawGraph();
+}
+
+function buildTimelineGraph() {
+  const project = state.selectedProject;
+  const projection = state.projection || {};
+  const nodes = [
+    { id: `project:${project.project_id}`, label: "Development start", kind: "project", data: project, x: -300, y: 0 },
+  ];
+  const edges = [];
+  const functional = projection.nodes || [];
+  const adopted = functional.slice(0, 5);
+  adopted.forEach((item, index) => {
+    const x = -110 + index * 150;
+    nodes.push({ id: `node:${item.node_id}`, label: item.title, kind: "system", data: item, x, y: index % 2 ? -84 : 84 });
+    edges.push({ from: index ? `node:${adopted[index - 1].node_id}` : `project:${project.project_id}`, to: `node:${item.node_id}`, kind: "adopted" });
+  });
+  const last = adopted.length ? `node:${adopted[adopted.length - 1].node_id}` : `project:${project.project_id}`;
+  (projection.predicted_paths || []).slice(0, 3).forEach((item, index) => {
+    const id = `predicted:${item.candidate_id}`;
+    nodes.push({ id, label: readableLabel(item.action), kind: "predicted", data: item, x: 260 + index * 115, y: 150 + index * 72 });
+    edges.push({ from: last, to: id, kind: "predicts" });
+  });
+  if (!adopted.length) {
+    nodes.push({ id: "seed:pending", label: "Prepare Project Seed", kind: "predicted", data: {}, x: -80, y: 0 });
+    edges.push({ from: `project:${project.project_id}`, to: "seed:pending", kind: "predicts" });
+  }
+  state.graph.nodes = nodes;
+  state.graph.edges = edges;
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  elements.graphEmpty.classList.toggle("hidden", nodes.length > 0);
   drawGraph();
 }
 
@@ -562,14 +602,17 @@ function drawGraph() {
     const to = byId.get(edge.to);
     if (!from || !to) continue;
     const isDocumentLink = edge.kind === "documents";
+    const isPredicted = edge.kind === "predicts";
     const isImplementationLink = edge.kind === "implementation-binding";
     context.lineWidth = isDocumentLink ? 1.4 : 1.2;
-    context.strokeStyle = isDocumentLink
+    context.strokeStyle = isPredicted
+      ? "#ac8bff"
+      : isDocumentLink
       ? "#a15c00"
       : isImplementationLink
         ? "#6b4fa3"
         : "#aeb7c1";
-    context.setLineDash(isDocumentLink ? [5, 4] : isImplementationLink ? [3, 3] : []);
+    context.setLineDash(isPredicted ? [7, 6] : isDocumentLink ? [5, 4] : isImplementationLink ? [3, 3] : []);
     context.beginPath();
     context.moveTo(from.x, from.y);
     context.lineTo(to.x, to.y);
@@ -751,11 +794,22 @@ function renderActivity() {
     elements.activity.append(node("p", "empty-copy", "No project selected"));
     return;
   }
-  if (!state.dispatches.length) {
+  if (!state.dispatches.length && !state.roomMessages.length) {
     elements.activity.append(node("p", "empty-copy", "No dispatches"));
     return;
   }
   const timeline = node("div", "timeline");
+  for (const message of state.roomMessages) {
+    const row = node("div", "timeline-item room-message");
+    const copy = node("div", "timeline-copy");
+    copy.append(
+      node("strong", "", `${message.kind} / ${message.sender}`),
+      node("small", "", message.body),
+      node("small", "", `${message.delivery_state} / ${message.created_at}`)
+    );
+    row.append(node("span"), copy);
+    timeline.append(row);
+  }
   for (const item of state.dispatches) {
     const dispatch = item.dispatch;
     const row = node("div", "timeline-item");
@@ -841,21 +895,20 @@ async function submitDispatch(event) {
     await api(
       `/v1/projects/${encodeURIComponent(
         state.selectedProject.project_id
-      )}/dispatches`,
+      )}/room/messages`,
       {
         method: "POST",
         body: {
           idempotency_key: crypto.randomUUID(),
-          title: form.get("title"),
-          instruction: form.get("instruction"),
-          requested_mode: "MASTER",
-          constraints: [],
-          expected_output: {},
+          kind: "QUESTION",
+          sender: "UNIVERSE_CONDUCTOR",
+          body: form.get("instruction"),
+          idempotency_key: crypto.randomUUID(),
         },
       }
     );
     elements.dispatchForm.reset();
-    toast("Dispatch queued");
+    toast("Project Room message recorded; Inbox fallback is available");
     await selectProject(state.selectedProject.project_id);
     showInspectorTab("activity");
   } catch (error) {

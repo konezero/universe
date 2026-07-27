@@ -1,21 +1,21 @@
 :root {
-  color-scheme: light;
+  color-scheme: dark;
   font-family: Inter, "Segoe UI", Arial, sans-serif;
   font-size: 14px;
   letter-spacing: 0;
-  --bg: #eef1f4;
-  --surface: #ffffff;
-  --surface-quiet: #f7f8fa;
-  --line: #d8dde3;
-  --line-strong: #b7c0ca;
-  --text: #20262d;
-  --muted: #69737f;
-  --blue: #1769aa;
-  --teal: #087f78;
-  --green: #2d7d46;
-  --amber: #a15c00;
-  --red: #b13b36;
-  --shadow: 0 6px 20px rgba(32, 38, 45, 0.09);
+  --bg: #05070d;
+  --surface: #0b101b;
+  --surface-quiet: #111827;
+  --line: #233047;
+  --line-strong: #40536e;
+  --text: #e8eefb;
+  --muted: #94a3b8;
+  --blue: #61a8ff;
+  --teal: #41d7c3;
+  --green: #6fdd8d;
+  --amber: #f6c76a;
+  --red: #ff7777;
+  --shadow: 0 16px 38px rgba(0, 0, 0, 0.42);
 }
 
 * {
@@ -300,11 +300,11 @@ button {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background-color: var(--surface);
+  background-color: #070b14;
   background-image:
-    linear-gradient(#edf0f3 1px, transparent 1px),
-    linear-gradient(90deg, #edf0f3 1px, transparent 1px);
-  background-size: 24px 24px;
+    linear-gradient(rgba(95, 140, 190, 0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(95, 140, 190, 0.09) 1px, transparent 1px);
+  background-size: 42px 42px;
 }
 
 #universe-graph {
@@ -380,12 +380,29 @@ button {
   background: var(--surface);
 }
 
+.project-room {
+  grid-template-columns: minmax(180px, 0.28fr) minmax(260px, 1fr) 74px;
+  align-items: center;
+}
+
+.room-heading {
+  display: grid;
+  gap: 3px;
+  padding: 0 4px;
+}
+
+.room-heading strong { font-size: 12px; }
+.room-heading span { color: var(--muted); font-size: 10px; }
+.room-message small:nth-child(2) { color: var(--text); line-height: 1.45; }
+.universe-rail .project-item { border-left: 2px solid transparent; }
+.universe-rail .project-item.selected { border-left-color: var(--teal); }
+
 input,
 textarea {
   width: 100%;
   border: 1px solid var(--line-strong);
   border-radius: 5px;
-  background: var(--surface);
+  background: #09111e;
   color: var(--text);
   outline: none;
 }
@@ -418,9 +435,9 @@ textarea:focus {
 }
 
 .primary-button {
-  border: 1px solid #10598f;
-  background: var(--blue);
-  color: #ffffff;
+  border: 1px solid #4b8edb;
+  background: #2367b2;
+  color: #f7fbff;
 }
 
 .primary-button:hover {

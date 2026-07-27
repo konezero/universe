@@ -55,6 +55,7 @@ CONNECTION_PROFILE_SCHEMA = "universe.connection-profile.v1"
 AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
 INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
 CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
+PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1103,6 +1104,31 @@ def normalize_project_seed(
     return normalized
 
 
+def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise UniverseError("REQUEST_INVALID", "room message body must be an object")
+    kind = _identifier(value.get("kind", "QUESTION"), "kind").upper()
+    if kind not in {"QUESTION", "REVIEW", "STATUS", "TASK_DRAFT", "RESULT"}:
+        raise UniverseError("ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind")
+    body = _required_text(value.get("body"), "body")
+    if len(body) > 12000:
+        raise UniverseError("ROOM_MESSAGE_BODY_INVALID", "body is too long")
+    sender = _identifier(value.get("sender", "UNIVERSE_CONDUCTOR"), "sender").upper()
+    idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
+    material = {"project_id": _project_id(project_id), "kind": kind, "sender": sender, "body": body}
+    digest = hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+    return {
+        "schema": PROJECT_ROOM_MESSAGE_SCHEMA,
+        "message_id": "room_" + uuid.uuid4().hex,
+        "project_id": material["project_id"],
+        "idempotency_key": idempotency_key,
+        "kind": kind,
+        "sender": sender,
+        "body": body,
+        "content_digest": digest,
+        "delivery_state": "INBOX_FALLBACK_AVAILABLE",
+        "created_at": utc_now(),
+    }
 def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
     degree = {node["node_id"]: 0 for node in seed["nodes"]}
     missing_connections: list[dict[str, Any]] = []
@@ -1355,6 +1381,22 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_dispatch_project_time
                 ON project_dispatch(project_id, created_at, dispatch_id);
+
+                CREATE TABLE IF NOT EXISTS project_room_message (
+                    message_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    message_json TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_room_message_project_time
+                ON project_room_message(project_id, created_at, message_id);
 
                 CREATE TABLE IF NOT EXISTS project_dispatch_event (
                     event_id TEXT PRIMARY KEY,
@@ -1618,6 +1660,72 @@ class UniverseStore:
             }
             for row in rows
         ]
+
+    def create_room_message(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        message = normalize_room_message(project["project_id"], value)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT message_json, delivery_state, created_at, updated_at
+                FROM project_room_message
+                WHERE project_id = ? AND idempotency_key = ?
+                """,
+                (project["project_id"], message["idempotency_key"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["message_json"])
+                if stored["content_digest"] != message["content_digest"]:
+                    raise UniverseError(
+                        "ROOM_MESSAGE_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to another message",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored["delivery_state"] = existing["delivery_state"]
+                stored["created_at"] = existing["created_at"]
+                stored["updated_at"] = existing["updated_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_room_message(
+                    message_id, project_id, idempotency_key, message_json,
+                    delivery_state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message["message_id"], message["project_id"],
+                    message["idempotency_key"], _canonical_json(message),
+                    "INBOX_FALLBACK_AVAILABLE", message["created_at"],
+                    message["created_at"],
+                ),
+            )
+        message["delivery_state"] = "INBOX_FALLBACK_AVAILABLE"
+        message["updated_at"] = message["created_at"]
+        return message, True
+
+    def list_room_messages(self, project_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_json, delivery_state, created_at, updated_at
+                FROM project_room_message
+                WHERE project_id = ?
+                ORDER BY created_at, message_id
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        messages = []
+        for row in rows:
+            message = json.loads(row["message_json"])
+            message["delivery_state"] = row["delivery_state"]
+            message["created_at"] = row["created_at"]
+            message["updated_at"] = row["updated_at"]
+            messages.append(message)
+        return messages
 
     def record_project_seed(
         self, project_id: str, value: Any
@@ -2918,6 +3026,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/room/messages":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_ROOM_MESSAGES_COLLECTED",
+                        "project_id": project_id,
+                        "messages": self.server.store.list_room_messages(project_id),
+                    },
+                )
+                return
             if suffix == "/dispatches":
                 self._send(
                     HTTPStatus.OK,
@@ -3073,6 +3192,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_EVENT_APPENDED" if created else "PROJECT_EVENT_ALREADY_RECORDED",
                         "event": event,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/room/messages":
+                message, created = self.server.store.create_room_message(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_ROOM_MESSAGE_RECORDED" if created else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
+                        "message": message,
                     },
                 )
                 return
@@ -3462,7 +3592,19 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--database", type=Path, default=default_database_path())
     serve.add_argument("--state-file", type=Path, default=default_state_path())
     serve.add_argument("--token", default="")
-    serve.add_argument("--open-ui", action="store_true")
+    serve.add_argument(
+        "--open-ui",
+        dest="open_ui",
+        action="store_true",
+        help="Open the local UI with its one-time session token (default).",
+    )
+    serve.add_argument(
+        "--no-open-ui",
+        dest="open_ui",
+        action="store_false",
+        help="Keep the local service headless.",
+    )
+    serve.set_defaults(open_ui=True)
     serve.add_argument("--mode-registry", type=Path, default=DEFAULT_MODE_REGISTRY_PATH)
 
     register = commands.add_parser("register")
