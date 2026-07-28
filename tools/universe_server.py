@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -60,6 +61,9 @@ CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
+SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
+SKILL_RUN_OBSERVATION_SCHEMA = "universe.skill-run-observation.v1"
+SKILL_BENCH_SCHEMA = "universe.skill-bench.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -70,6 +74,12 @@ TRANSPORT_KINDS = frozenset({"HTTP", "GIT", "P2P"})
 INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
 ADAPTER_DIRECTIONS = frozenset({"INBOUND", "OUTBOUND"})
 AUTH_TYPES = frozenset({"NONE", "LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
+SKILL_OPERATION_CLASSES = frozenset({"READ", "PROPOSE", "EXECUTE"})
+SKILL_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "UNKNOWN"})
+SKILL_VALIDATION_STATES = frozenset({"PASS", "FAIL", "NOT_RUN", "UNKNOWN"})
+SKILL_METRIC_KEYS = frozenset(
+    {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
+)
 ALLOWED_REF_KEYS = frozenset(
     {
         "manifest",
@@ -800,6 +810,194 @@ def _string_array(value: Any, field: str) -> list[str]:
     return normalized
 
 
+def _observed_at(value: Any, field: str) -> str:
+    text = _required_text(value, field)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise UniverseError(
+            "OBSERVATION_TIME_INVALID",
+            f"{field} must be an ISO-8601 timestamp",
+        ) from error
+    if parsed.tzinfo is None:
+        raise UniverseError(
+            "OBSERVATION_TIME_INVALID",
+            f"{field} must include a timezone",
+        )
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _skill_metrics(value: Any, field: str) -> dict[str, int | float]:
+    metrics = _exact_object_fields(
+        value,
+        field=field,
+        required=frozenset(),
+        optional=SKILL_METRIC_KEYS,
+    )
+    normalized: dict[str, int | float] = {}
+    for key, metric in metrics.items():
+        if isinstance(metric, bool) or not isinstance(metric, (int, float)):
+            raise UniverseError(
+                "SKILL_METRICS_INVALID",
+                f"{field}.{key} must be a non-negative number",
+            )
+        if not math.isfinite(metric) or metric < 0:
+            raise UniverseError(
+                "SKILL_METRICS_INVALID",
+                f"{field}.{key} must be a non-negative number",
+            )
+        normalized[key] = metric
+    return normalized
+
+
+def normalize_skill_observation_candidate(
+    project_id: str, value: Any
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="skill_observation_request",
+        required=frozenset({"candidate_id", "candidate"}),
+    )
+    candidate = _exact_object_fields(
+        request["candidate"],
+        field="skill_observation_candidate",
+        required=frozenset(
+            {
+                "schema",
+                "project_ref",
+                "task_frame_ref",
+                "source_ref",
+                "observations",
+                "observed_at",
+                "target_ref",
+                "redaction_state",
+            }
+        ),
+    )
+    normalized_project = _project_id(project_id)
+    if candidate["schema"] != SKILL_OBSERVATION_CANDIDATE_SCHEMA:
+        raise UniverseError(
+            "SKILL_OBSERVATION_SCHEMA_INVALID",
+            "candidate schema must be the ai-career redacted Skill observation schema",
+        )
+    if candidate["redaction_state"] != "REDACTED":
+        raise UniverseError(
+            "SKILL_OBSERVATION_REDACTION_REQUIRED",
+            "Universe accepts only REDACTED Skill observation candidates",
+        )
+    expected_project_ref = f"project://{normalized_project}"
+    if candidate["project_ref"] != expected_project_ref:
+        raise UniverseError(
+            "SKILL_OBSERVATION_PROJECT_MISMATCH",
+            "candidate project_ref must match the attached project",
+            HTTPStatus.CONFLICT,
+        )
+    observations = _array(candidate["observations"], "candidate.observations")
+    if not observations or len(observations) > 256:
+        raise UniverseError(
+            "SKILL_OBSERVATION_COUNT_INVALID",
+            "candidate.observations must contain 1..256 observations",
+        )
+    normalized_observations: list[dict[str, Any]] = []
+    observation_digests: set[str] = set()
+    for index, observation_value in enumerate(observations):
+        field = f"candidate.observations[{index}]"
+        observation = _exact_object_fields(
+            observation_value,
+            field=field,
+            required=frozenset(
+                {
+                    "observation_digest",
+                    "skill_binding_digest",
+                    "skill",
+                    "model_ref",
+                    "outcome",
+                    "validation_state",
+                    "evidence_refs",
+                    "metrics",
+                }
+            ),
+        )
+        skill = _exact_object_fields(
+            observation["skill"],
+            field=f"{field}.skill",
+            required=frozenset(
+                {"skill_id", "skill_version", "operation_class", "context_pack_digest"}
+            ),
+        )
+        operation_class = _required_text(
+            skill["operation_class"], f"{field}.skill.operation_class"
+        ).upper()
+        if operation_class not in SKILL_OPERATION_CLASSES:
+            raise UniverseError(
+                "SKILL_OPERATION_CLASS_INVALID",
+                f"{field}.skill.operation_class is unsupported",
+            )
+        outcome = _required_text(observation["outcome"], f"{field}.outcome").upper()
+        if outcome not in SKILL_OUTCOMES:
+            raise UniverseError("SKILL_OUTCOME_INVALID", f"{field}.outcome is unsupported")
+        validation_state = _required_text(
+            observation["validation_state"], f"{field}.validation_state"
+        ).upper()
+        if validation_state not in SKILL_VALIDATION_STATES:
+            raise UniverseError(
+                "SKILL_VALIDATION_STATE_INVALID",
+                f"{field}.validation_state is unsupported",
+            )
+        observation_digest = _sha256(
+            observation["observation_digest"], f"{field}.observation_digest"
+        )
+        if observation_digest in observation_digests:
+            raise UniverseError(
+                "SKILL_OBSERVATION_DUPLICATE",
+                "candidate.observations must not repeat observation_digest",
+            )
+        observation_digests.add(observation_digest)
+        normalized_observations.append(
+            {
+                "observation_digest": observation_digest,
+                "skill_binding_digest": _sha256(
+                    observation["skill_binding_digest"], f"{field}.skill_binding_digest"
+                ),
+                "skill": {
+                    "skill_id": _identifier(skill["skill_id"], f"{field}.skill.skill_id"),
+                    "skill_version": _required_text(
+                        skill["skill_version"], f"{field}.skill.skill_version"
+                    ),
+                    "operation_class": operation_class,
+                    "context_pack_digest": _sha256(
+                        skill["context_pack_digest"],
+                        f"{field}.skill.context_pack_digest",
+                    ),
+                },
+                "model_ref": _required_text(observation["model_ref"], f"{field}.model_ref"),
+                "outcome": outcome,
+                "validation_state": validation_state,
+                "evidence_refs": _string_array(
+                    observation["evidence_refs"], f"{field}.evidence_refs"
+                ),
+                "metrics": _skill_metrics(observation["metrics"], f"{field}.metrics"),
+            }
+        )
+    normalized_candidate = {
+        "schema": SKILL_OBSERVATION_CANDIDATE_SCHEMA,
+        "project_ref": expected_project_ref,
+        "task_frame_ref": _required_text(candidate["task_frame_ref"], "candidate.task_frame_ref"),
+        "source_ref": _required_text(candidate["source_ref"], "candidate.source_ref"),
+        "observations": normalized_observations,
+        "observed_at": _observed_at(candidate["observed_at"], "candidate.observed_at"),
+        "target_ref": _required_text(candidate["target_ref"], "candidate.target_ref"),
+        "redaction_state": "REDACTED",
+    }
+    return {
+        "candidate_id": _identifier(request["candidate_id"], "candidate_id"),
+        "candidate": normalized_candidate,
+        "candidate_digest": _json_sha256(normalized_candidate),
+    }
+
+
 def normalize_project_seed(
     project: dict[str, Any], value: Any
 ) -> dict[str, Any]:
@@ -1418,6 +1616,48 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_event_project_time
                 ON project_event(project_id, created_at, event_id);
 
+                CREATE TABLE IF NOT EXISTS skill_catalog (
+                    skill_id TEXT NOT NULL,
+                    skill_version TEXT NOT NULL,
+                    operation_class TEXT NOT NULL,
+                    first_observed_at TEXT NOT NULL,
+                    last_observed_at TEXT NOT NULL,
+                    PRIMARY KEY(skill_id, skill_version, operation_class)
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_run_observation (
+                    observation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    candidate_id TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL,
+                    task_frame_ref TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    observation_digest TEXT NOT NULL,
+                    skill_binding_digest TEXT NOT NULL,
+                    skill_id TEXT NOT NULL,
+                    skill_version TEXT NOT NULL,
+                    operation_class TEXT NOT NULL,
+                    context_pack_digest TEXT NOT NULL,
+                    model_ref TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    validation_state TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    UNIQUE(project_id, candidate_id, observation_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS skill_run_observation_project_time
+                ON skill_run_observation(project_id, observed_at, observation_id);
+
+                CREATE INDEX IF NOT EXISTS skill_run_observation_skill_model
+                ON skill_run_observation(
+                    skill_id, skill_version, operation_class, model_ref
+                );
+
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
                         REFERENCES project_connection(project_id)
@@ -1788,6 +2028,236 @@ class UniverseStore:
             }
             for row in rows
         ]
+
+    def ingest_skill_observations(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_skill_observation_candidate(project["project_id"], value)
+        candidate = request["candidate"]
+        now = utc_now()
+        rows: list[dict[str, Any]] = []
+        with self._connection() as connection:
+            existing_candidate = connection.execute(
+                """
+                SELECT DISTINCT candidate_digest
+                FROM skill_run_observation
+                WHERE project_id = ? AND candidate_id = ?
+                """,
+                (project["project_id"], request["candidate_id"]),
+            ).fetchall()
+            if existing_candidate and any(
+                row["candidate_digest"] != request["candidate_digest"]
+                for row in existing_candidate
+            ):
+                raise UniverseError(
+                    "SKILL_OBSERVATION_CANDIDATE_CONFLICT",
+                    "candidate_id already refers to different redacted content",
+                    HTTPStatus.CONFLICT,
+                )
+            for observation in candidate["observations"]:
+                existing = connection.execute(
+                    """
+                    SELECT *
+                    FROM skill_run_observation
+                    WHERE project_id = ?
+                      AND candidate_id = ?
+                      AND observation_digest = ?
+                    """,
+                    (
+                        project["project_id"],
+                        request["candidate_id"],
+                        observation["observation_digest"],
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    rows.append(self._skill_observation_row(existing))
+                    continue
+                skill = observation["skill"]
+                observation_id = "skillrun_" + _json_sha256(
+                    {
+                        "project_id": project["project_id"],
+                        "candidate_id": request["candidate_id"],
+                        "observation_digest": observation["observation_digest"],
+                    }
+                )[:24]
+                connection.execute(
+                    """
+                    INSERT INTO skill_run_observation(
+                        observation_id, project_id, candidate_id, candidate_digest,
+                        task_frame_ref, source_ref, observation_digest,
+                        skill_binding_digest, skill_id, skill_version,
+                        operation_class, context_pack_digest, model_ref, outcome,
+                        validation_state, evidence_refs_json, metrics_json,
+                        observed_at, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        observation_id,
+                        project["project_id"],
+                        request["candidate_id"],
+                        request["candidate_digest"],
+                        candidate["task_frame_ref"],
+                        candidate["source_ref"],
+                        observation["observation_digest"],
+                        observation["skill_binding_digest"],
+                        skill["skill_id"],
+                        skill["skill_version"],
+                        skill["operation_class"],
+                        skill["context_pack_digest"],
+                        observation["model_ref"],
+                        observation["outcome"],
+                        observation["validation_state"],
+                        _canonical_json(observation["evidence_refs"]),
+                        _canonical_json(observation["metrics"]),
+                        candidate["observed_at"],
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO skill_catalog(
+                        skill_id, skill_version, operation_class,
+                        first_observed_at, last_observed_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(skill_id, skill_version, operation_class)
+                    DO UPDATE SET
+                        first_observed_at = MIN(
+                            skill_catalog.first_observed_at,
+                            excluded.first_observed_at
+                        ),
+                        last_observed_at = MAX(
+                            skill_catalog.last_observed_at,
+                            excluded.last_observed_at
+                        )
+                    """,
+                    (
+                        skill["skill_id"],
+                        skill["skill_version"],
+                        skill["operation_class"],
+                        candidate["observed_at"],
+                        candidate["observed_at"],
+                    ),
+                )
+                rows.append(
+                    {
+                        "schema": SKILL_RUN_OBSERVATION_SCHEMA,
+                        "observation_id": observation_id,
+                        "project_id": project["project_id"],
+                        "candidate_id": request["candidate_id"],
+                        "candidate_digest": request["candidate_digest"],
+                        "task_frame_ref": candidate["task_frame_ref"],
+                        "source_ref": candidate["source_ref"],
+                        **observation,
+                        "observed_at": candidate["observed_at"],
+                        "recorded_at": now,
+                    }
+                )
+        created = not existing_candidate
+        return {
+            "project_id": project["project_id"],
+            "candidate_id": request["candidate_id"],
+            "candidate_digest": request["candidate_digest"],
+            "redaction_state": "REDACTED",
+            "observations": rows,
+        }, created
+
+    def list_skill_observations(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM skill_run_observation
+                WHERE project_id = ?
+                ORDER BY observed_at DESC, observation_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], limit),
+            ).fetchall()
+        return [self._skill_observation_row(row) for row in rows]
+
+    def list_skill_bench(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM skill_run_observation
+                ORDER BY skill_id, skill_version, operation_class, model_ref,
+                         observed_at, observation_id
+                """
+            ).fetchall()
+        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            item = self._skill_observation_row(row)
+            skill = item["skill"]
+            key = (
+                skill["skill_id"],
+                skill["skill_version"],
+                skill["operation_class"],
+                item["model_ref"],
+            )
+            group = grouped.setdefault(
+                key,
+                {
+                    "schema": SKILL_BENCH_SCHEMA,
+                    "skill": skill,
+                    "model_ref": item["model_ref"],
+                    "observation_count": 0,
+                    "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
+                    "validation_states": {
+                        state: 0 for state in sorted(SKILL_VALIDATION_STATES)
+                    },
+                    "metric_totals": {},
+                    "first_observed_at": item["observed_at"],
+                    "last_observed_at": item["observed_at"],
+                },
+            )
+            group["observation_count"] += 1
+            group["outcomes"][item["outcome"]] += 1
+            group["validation_states"][item["validation_state"]] += 1
+            group["first_observed_at"] = min(
+                group["first_observed_at"], item["observed_at"]
+            )
+            group["last_observed_at"] = max(
+                group["last_observed_at"], item["observed_at"]
+            )
+            for metric_key, metric_value in item["metrics"].items():
+                group["metric_totals"][metric_key] = (
+                    group["metric_totals"].get(metric_key, 0) + metric_value
+                )
+        return list(grouped.values())[:limit]
+
+    @staticmethod
+    def _skill_observation_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": SKILL_RUN_OBSERVATION_SCHEMA,
+            "observation_id": row["observation_id"],
+            "project_id": row["project_id"],
+            "candidate_id": row["candidate_id"],
+            "candidate_digest": row["candidate_digest"],
+            "task_frame_ref": row["task_frame_ref"],
+            "source_ref": row["source_ref"],
+            "observation_digest": row["observation_digest"],
+            "skill_binding_digest": row["skill_binding_digest"],
+            "skill": {
+                "skill_id": row["skill_id"],
+                "skill_version": row["skill_version"],
+                "operation_class": row["operation_class"],
+                "context_pack_digest": row["context_pack_digest"],
+            },
+            "model_ref": row["model_ref"],
+            "outcome": row["outcome"],
+            "validation_state": row["validation_state"],
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "metrics": json.loads(row["metrics_json"]),
+            "observed_at": row["observed_at"],
+            "recorded_at": row["recorded_at"],
+        }
 
     def register_master_bridge(
         self, project_id: str, value: Any
@@ -3354,6 +3824,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/bench/skills":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_BENCH_COLLECTED",
+                    "bench": self.server.store.list_skill_bench(),
+                },
+            )
+            return
         dispatch_parts = self._dispatch_path(path)
         if dispatch_parts is not None and dispatch_parts[1] == "":
             try:
@@ -3392,6 +3872,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "PROJECT_ROOM_MESSAGES_COLLECTED",
                         "project_id": project_id,
                         "messages": self.server.store.list_room_messages(project_id),
+                    },
+                )
+                return
+            if suffix == "/skill-observations":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_OBSERVATIONS_COLLECTED",
+                        "project_id": project_id,
+                        "observations": self.server.store.list_skill_observations(
+                            project_id
+                        ),
                     },
                 )
                 return
@@ -3571,6 +4064,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_ROOM_MESSAGE_RECORDED" if created else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
                         "message": message,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-observations":
+                result, created = self.server.store.ingest_skill_observations(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "SKILL_OBSERVATIONS_INGESTED"
+                            if created
+                            else "SKILL_OBSERVATIONS_ALREADY_INGESTED"
+                        ),
+                        **result,
                     },
                 )
                 return
@@ -3819,6 +4329,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/discovery-dispatch",
             "/projection",
             "/events",
+            "/skill-observations",
             "/seed",
             "/sync",
         ):

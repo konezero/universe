@@ -353,6 +353,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def skill_observation_candidate(self, **overrides: object) -> JsonObject:
+        value: JsonObject = {
+            "candidate_id": "skill-observation-gcs-001",
+            "candidate": {
+                "schema": "ai-career.skill-observation-candidate.v1",
+                "project_ref": "project://GCS",
+                "task_frame_ref": "task-frame-gcs-001",
+                "source_ref": "git:GCS@1111111111111111111111111111111111111111",
+                "observations": [
+                    {
+                        "observation_digest": "a" * 64,
+                        "skill_binding_digest": "b" * 64,
+                        "skill": {
+                            "skill_id": "source-review",
+                            "skill_version": "1.0.0",
+                            "operation_class": "READ",
+                            "context_pack_digest": "c" * 64,
+                        },
+                        "model_ref": "gpt-test",
+                        "outcome": "SUCCEEDED",
+                        "validation_state": "PASS",
+                        "evidence_refs": ["receipt://gcs/test-001"],
+                        "metrics": {
+                            "duration_ms": 12,
+                            "input_tokens": 42,
+                            "output_tokens": 7,
+                        },
+                    }
+                ],
+                "observed_at": "2026-07-28T00:00:00Z",
+                "target_ref": "universe://local",
+                "redaction_state": "REDACTED",
+            },
+        }
+        value.update(overrides)
+        return value
+
     def test_loopback_health_and_project_data_do_not_require_a_token(self) -> None:
         status, result = self.request("GET", "/health")
         self.assertEqual(200, status)
@@ -723,6 +760,68 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(result["detached"])
         status, _ = self.request("GET", "/v1/projects/GCS", token=self.token)
         self.assertEqual(404, status)
+
+    def test_skill_observation_ingest_is_redacted_idempotent_and_bench_queryable(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        candidate = self.skill_observation_candidate()
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            candidate,
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("SKILL_OBSERVATIONS_INGESTED", result["status"])
+        self.assertEqual("REDACTED", result["redaction_state"])
+        self.assertEqual(1, len(result["observations"]))
+        self.assertNotIn("skill_ref", result["observations"][0]["skill"])
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            candidate,
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("SKILL_OBSERVATIONS_ALREADY_INGESTED", repeated["status"])
+
+        status, observations = self.request(
+            "GET", "/v1/projects/GCS/skill-observations", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(observations["observations"]))
+        self.assertNotIn("skill_ref", observations["observations"][0]["skill"])
+
+        status, bench = self.request("GET", "/v1/bench/skills", token=self.token)
+        self.assertEqual(200, status)
+        self.assertEqual("SKILL_BENCH_COLLECTED", bench["status"])
+        self.assertEqual(1, len(bench["bench"]))
+        entry = bench["bench"][0]
+        self.assertEqual("source-review", entry["skill"]["skill_id"])
+        self.assertEqual(1, entry["observation_count"])
+        self.assertEqual(1, entry["outcomes"]["SUCCEEDED"])
+        self.assertEqual(12, entry["metric_totals"]["duration_ms"])
+
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual(1, len(reopened.list_skill_observations("GCS")))
+
+        unsafe = self.skill_observation_candidate()
+        unsafe["candidate"] = dict(unsafe["candidate"])
+        observation = dict(unsafe["candidate"]["observations"][0])
+        skill = dict(observation["skill"])
+        skill["skill_ref"] = ".ai/skills/private/source-review/SKILL.md"
+        observation["skill"] = skill
+        unsafe["candidate"]["observations"] = [observation]
+        status, rejected = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            unsafe,
+            self.token,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("REQUEST_INVALID", rejected["error_code"])
 
     def test_dispatch_delivery_wake_and_result_lifecycle_is_durable(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
