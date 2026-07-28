@@ -74,6 +74,9 @@ FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA = (
     "universe.fresh-project-composition-adoption.v1"
 )
 PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
+PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
+    "universe.project-archive-receipt-candidate.v1"
+)
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -6012,6 +6015,81 @@ def publish_skill_observation(
     return status, receipt
 
 
+def prepare_skill_observation_archive(
+    *,
+    project_id: str,
+    receipt: Any,
+    selection_ref: str,
+    archive_path: str,
+) -> dict[str, Any]:
+    if not isinstance(receipt, dict):
+        raise UniverseError(
+            "PROJECT_ARCHIVE_RECEIPT_INVALID",
+            "Universe Skill observation receipt must be an object",
+        )
+    if (
+        receipt.get("schema") != "universe.skill-observation-publication-receipt.v1"
+        or receipt.get("operation_class") != "UNIVERSE_BENCH_INGEST"
+        or receipt.get("project_archive_write") != "NOT_PERFORMED"
+    ):
+        raise UniverseError(
+            "PROJECT_ARCHIVE_RECEIPT_INVALID",
+            "receipt must be an unarchived Universe Skill observation ingest receipt",
+        )
+    normalized_project = _project_id(project_id)
+    normalized_path = archive_path.replace("\\", "/")
+    parts = normalized_path.split("/")
+    if (
+        len(parts) < 3
+        or parts[:2] != [".ai", "archive"]
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise UniverseError(
+            "PROJECT_ARCHIVE_PATH_INVALID",
+            "archive_path must be a normalized file path below .ai/archive/",
+        )
+    result_ref = _required_text(receipt.get("result_ref"), "receipt.result_ref")
+    expected_project_segment = f"/projects/{normalized_project}/"
+    if expected_project_segment not in result_ref:
+        raise UniverseError(
+            "PROJECT_ARCHIVE_PROJECT_MISMATCH",
+            "receipt result_ref is not bound to the requested Project",
+            HTTPStatus.CONFLICT,
+        )
+    material = {
+        "schema": PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA,
+        "status": "PROJECT_ARCHIVE_RECEIPT_CANDIDATE_READY",
+        "operation_class": "HANDOFF_APPEND",
+        "project_ref": f"project://{normalized_project}",
+        "archive_path": normalized_path,
+        "selection_ref": _required_text(selection_ref, "selection_ref"),
+        "source": {
+            "universe_result_ref": result_ref,
+            "universe_provider_receipt_ref": _required_text(
+                receipt.get("provider_receipt_ref"), "receipt.provider_receipt_ref"
+            ),
+            "candidate_id": _identifier(receipt.get("candidate_id"), "receipt.candidate_id"),
+            "candidate_digest": _sha256(
+                receipt.get("candidate_digest"), "receipt.candidate_digest"
+            ),
+            "base_source_ref": _required_text(
+                receipt.get("base_source_ref"), "receipt.base_source_ref"
+            ),
+        },
+        "project_archive_write": "NOT_PERFORMED",
+        "provider_write_evidence": "NOT_OBSERVED",
+        "effects": {
+            "project_archive_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+        },
+        "next_operation": "PROJECT_OWNED_HANDOFF_APPEND",
+    }
+    material["candidate_digest"] = _json_sha256(material)
+    material["candidate_id"] = "archivecandidate_" + material["candidate_digest"][:24]
+    return material
+
+
 def load_prepared_skill_observation(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.expanduser().read_text(encoding="utf-8"))
@@ -6069,6 +6147,12 @@ def parser() -> argparse.ArgumentParser:
     publish.add_argument("--endpoint", default="")
     publish.add_argument("--token", default="")
     publish.add_argument("--state-file", type=Path, default=default_state_path())
+
+    archive = commands.add_parser("prepare-skill-observation-archive")
+    archive.add_argument("--project-id", required=True)
+    archive.add_argument("--receipt-file", type=Path, required=True)
+    archive.add_argument("--selection-ref", required=True)
+    archive.add_argument("--archive-path", required=True)
     return root
 
 
@@ -6131,31 +6215,40 @@ def main() -> int:
                 server.server_close()
             return 0
 
-        endpoint, token = _connection_options(args)
-        if args.command == "register":
-            status, result = request_json(
-                endpoint=endpoint,
-                token=token,
-                method="POST",
-                path="/v1/projects/register",
-                payload={
-                    "project_id": args.project_id,
-                    "project_root": str(args.project_root),
-                    "refs": DEFAULT_REFS,
-                },
-            )
-        elif args.command == "publish-skill-observation":
-            status, result = publish_skill_observation(
+        if args.command == "prepare-skill-observation-archive":
+            result = prepare_skill_observation_archive(
                 project_id=args.project_id,
-                prepared=load_prepared_skill_observation(args.candidate_file),
+                receipt=load_prepared_skill_observation(args.receipt_file),
                 selection_ref=args.selection_ref,
-                endpoint=endpoint,
-                token=token,
+                archive_path=args.archive_path,
             )
+            status = HTTPStatus.OK
         else:
-            status, result = request_json(
-                endpoint=endpoint, token=token, method="GET", path="/v1/projects"
-            )
+            endpoint, token = _connection_options(args)
+            if args.command == "register":
+                status, result = request_json(
+                    endpoint=endpoint,
+                    token=token,
+                    method="POST",
+                    path="/v1/projects/register",
+                    payload={
+                        "project_id": args.project_id,
+                        "project_root": str(args.project_root),
+                        "refs": DEFAULT_REFS,
+                    },
+                )
+            elif args.command == "publish-skill-observation":
+                status, result = publish_skill_observation(
+                    project_id=args.project_id,
+                    prepared=load_prepared_skill_observation(args.candidate_file),
+                    selection_ref=args.selection_ref,
+                    endpoint=endpoint,
+                    token=token,
+                )
+            else:
+                status, result = request_json(
+                    endpoint=endpoint, token=token, method="GET", path="/v1/projects"
+                )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if 200 <= status < 300 else 1
     except (UniverseError, OSError, sqlite3.Error) as error:

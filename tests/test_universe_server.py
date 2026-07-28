@@ -38,6 +38,7 @@ from universe_server import (  # noqa: E402
     interface_profile,
     local_connection_profile,
     publish_skill_observation,
+    prepare_skill_observation_archive,
     require_release_lifecycle_mode,
     resolve_universe_mode_intent,
     write_server_state,
@@ -861,6 +862,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             receipt["result_ref"], repeated["result_ref"]
         )
+
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        archive_candidate = prepare_skill_observation_archive(
+            project_id="GCS",
+            receipt=receipt,
+            selection_ref="user-selection-gcs-archive-001",
+            archive_path=".ai/archive/universe/skill-observation-gcs-001.json",
+        )
+        self.assertEqual(
+            "PROJECT_ARCHIVE_RECEIPT_CANDIDATE_READY", archive_candidate["status"]
+        )
+        self.assertEqual("HANDOFF_APPEND", archive_candidate["operation_class"])
+        self.assertEqual("NOT_PERFORMED", archive_candidate["project_archive_write"])
+        self.assertEqual(
+            "NOT_OBSERVED", archive_candidate["provider_write_evidence"]
+        )
+        self.assertEqual(
+            "PROJECT_OWNED_HANDOFF_APPEND", archive_candidate["next_operation"]
+        )
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+        with self.assertRaisesRegex(UniverseError, "normalized file path"):
+            prepare_skill_observation_archive(
+                project_id="GCS",
+                receipt=receipt,
+                selection_ref="user-selection-gcs-archive-001",
+                archive_path=".ai/archive/../core/forbidden.json",
+            )
 
     def test_fresh_project_intent_returns_seed_routes_without_project_state(self) -> None:
         status, result = self.request(

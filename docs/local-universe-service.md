@@ -182,6 +182,21 @@ nor starts a Task Frame. Retaining that receipt under a Project `.ai/archive/`
 path is a later, separately approved ai-career `HANDOFF_APPEND` operation; the
 ingest receipt itself is not handoff evidence.
 
+To prepare a Project-owned archive step without writing the Project, use:
+
+```powershell
+python tools/universe_server.py prepare-skill-observation-archive `
+  --project-id GCS `
+  --receipt-file C:\path\to\universe-ingest-receipt.json `
+  --selection-ref user-selection-gcs-001 `
+  --archive-path .ai/archive/universe/skill-observation-gcs-001.json
+```
+
+This returns `universe.project-archive-receipt-candidate.v1`. It is only a
+bounded handoff input for the Project's approved `HANDOFF_APPEND` operation.
+The candidate has no provider write evidence and cannot claim that an archive
+entry exists.
+
 A Context Pack is built from a current Project Seed, selected functional node
 IDs, node-linked or project-wide document references, and a bounded set of
 redacted observations already recorded for that Project. It contains no raw
