@@ -11,6 +11,7 @@ const state = {
   focusedNodeId: null,
   view: "timeline",
   roomMessages: [],
+  masterBridge: null,
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
 };
 
@@ -100,6 +101,7 @@ async function refresh() {
       state.selectedProject = null;
       state.projection = null;
       state.dispatches = [];
+      state.masterBridge = null;
       renderEmpty();
     }
   } catch (error) {
@@ -258,13 +260,14 @@ async function selectProject(projectId) {
     method: "POST",
     body: {},
   }).catch(() => null);
-  const [projectionResult, dispatchResult, proposalResult, roomResult] = await Promise.all([
+  const [projectionResult, dispatchResult, proposalResult, roomResult, bridgeResult] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
     ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/dispatches`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/master-bridge`).catch(() => ({ bridge: null })),
   ]);
   state.projection = projectionResult?.projection || null;
   state.dispatches = await Promise.all(
@@ -276,10 +279,13 @@ async function selectProject(projectId) {
   );
   state.releaseProposals = proposalResult.proposals;
   state.roomMessages = roomResult.messages || [];
+  state.masterBridge = bridgeResult.bridge || null;
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
-  elements.roomContext.textContent = `${project.project_id} · Project Master`;
+  elements.roomContext.textContent = state.masterBridge?.status === "AVAILABLE"
+    ? `${project.project_id} · Master bridge connected`
+    : `${project.project_id} · Project Master · Inbox fallback`;
   buildGraph();
   renderDetails();
   renderActivity();
@@ -1235,14 +1241,13 @@ async function submitDispatch(event) {
   const form = new FormData(elements.dispatchForm);
   elements.dispatchSubmit.disabled = true;
   try {
-    await api(
+    const result = await api(
       `/v1/projects/${encodeURIComponent(
         state.selectedProject.project_id
       )}/room/messages`,
       {
         method: "POST",
         body: {
-          idempotency_key: crypto.randomUUID(),
           kind: "QUESTION",
           sender: "UNIVERSE_CONDUCTOR",
           body: form.get("instruction"),
@@ -1251,7 +1256,11 @@ async function submitDispatch(event) {
       }
     );
     elements.dispatchForm.reset();
-    toast("Project Room message recorded; Inbox fallback is available");
+    toast(
+      result.message.delivery_state === "DELIVERED_TO_MASTER"
+        ? "Delivered to the registered Project Master"
+        : "Project Room message recorded; Inbox fallback is available"
+    );
     await selectProject(state.selectedProject.project_id);
     showInspectorTab("activity");
   } catch (error) {

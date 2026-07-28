@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import hashlib
 import ipaddress
 import json
@@ -27,6 +28,7 @@ from core_release import CoreReleaseError, verify_release
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
 from universe_dispatch import (
     DispatchError,
+    HttpProjectMasterBridge,
     HttpProjectWakeAdapter,
     LocalInboxConnector,
     NoWakeAdapter,
@@ -56,6 +58,8 @@ AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
 INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
 CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
+PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
+PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1124,9 +1128,21 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
         raise UniverseError("ROOM_MESSAGE_BODY_INVALID", "body is too long")
     sender = _identifier(value.get("sender", "UNIVERSE_CONDUCTOR"), "sender").upper()
     idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
-    material = {"project_id": _project_id(project_id), "kind": kind, "sender": sender, "body": body}
+    in_reply_to = value.get("in_reply_to")
+    if in_reply_to is not None:
+        in_reply_to = _required_text(in_reply_to, "in_reply_to")
+        if len(in_reply_to) > 160:
+            raise UniverseError("ROOM_MESSAGE_REPLY_INVALID", "in_reply_to is too long")
+    material = {
+        "project_id": _project_id(project_id),
+        "kind": kind,
+        "sender": sender,
+        "body": body,
+    }
+    if in_reply_to is not None:
+        material["in_reply_to"] = in_reply_to
     digest = hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
-    return {
+    message = {
         "schema": PROJECT_ROOM_MESSAGE_SCHEMA,
         "message_id": "room_" + uuid.uuid4().hex,
         "project_id": material["project_id"],
@@ -1138,6 +1154,82 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
         "delivery_state": "INBOX_FALLBACK_AVAILABLE",
         "created_at": utc_now(),
     }
+    if in_reply_to is not None:
+        message["in_reply_to"] = in_reply_to
+    return message
+
+
+def normalize_master_bridge(project_id: str, value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_bridge",
+        required=frozenset(
+            {
+                "endpoint",
+                "credential_env",
+                "master_session_ref",
+                "binding_evidence_ref",
+            }
+        ),
+    )
+    try:
+        endpoint = HttpProjectMasterBridge(
+            endpoint=_required_text(request["endpoint"], "master_bridge.endpoint"),
+            credential_env=_required_text(
+                request["credential_env"], "master_bridge.credential_env"
+            ),
+        ).validate()
+    except DispatchError as error:
+        raise UniverseError("MASTER_BRIDGE_INVALID", str(error)) from error
+    normalized_project = _project_id(project_id)
+    credential_env = _required_text(
+        request["credential_env"], "master_bridge.credential_env"
+    )
+    master_session_ref = _required_text(
+        request["master_session_ref"], "master_bridge.master_session_ref"
+    )
+    binding_evidence_ref = _required_text(
+        request["binding_evidence_ref"], "master_bridge.binding_evidence_ref"
+    )
+    material = {
+        "project_id": normalized_project,
+        "endpoint": endpoint,
+        "credential_env": credential_env,
+        "master_session_ref": master_session_ref,
+        "binding_evidence_ref": binding_evidence_ref,
+    }
+    return {
+        "schema": PROJECT_MASTER_BRIDGE_SCHEMA,
+        "bridge_id": "bridge_" + _json_sha256(material)[:24],
+        **material,
+        "status": "REGISTERED",
+    }
+
+
+def normalize_master_bridge_reply(project_id: str, value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_bridge_reply",
+        required=frozenset(
+            {"bridge_id", "in_reply_to", "kind", "body", "idempotency_key"}
+        ),
+    )
+    return {
+        "schema": PROJECT_MASTER_BRIDGE_REPLY_SCHEMA,
+        "bridge_id": _required_text(request["bridge_id"], "master_bridge_reply.bridge_id"),
+        "message": normalize_room_message(
+            project_id,
+            {
+                "kind": request["kind"],
+                "sender": "PROJECT_MASTER",
+                "body": request["body"],
+                "in_reply_to": request["in_reply_to"],
+                "idempotency_key": request["idempotency_key"],
+            },
+        ),
+    }
+
+
 def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
     degree = {node["node_id"]: 0 for node in seed["nodes"]}
     missing_connections: list[dict[str, Any]] = []
@@ -1399,6 +1491,7 @@ class UniverseStore:
                     idempotency_key TEXT NOT NULL,
                     message_json TEXT NOT NULL,
                     delivery_state TEXT NOT NULL,
+                    delivery_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(project_id, idempotency_key)
@@ -1406,6 +1499,21 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_room_message_project_time
                 ON project_room_message(project_id, created_at, message_id);
+
+                CREATE TABLE IF NOT EXISTS project_master_bridge (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    bridge_id TEXT NOT NULL UNIQUE,
+                    endpoint TEXT NOT NULL,
+                    credential_env TEXT NOT NULL,
+                    master_session_ref TEXT NOT NULL,
+                    binding_evidence_ref TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    registered_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_delivery_at TEXT
+                );
 
                 CREATE TABLE IF NOT EXISTS project_dispatch_event (
                     event_id TEXT PRIMARY KEY,
@@ -1470,6 +1578,17 @@ class UniverseStore:
                 );
                 """
             )
+            room_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(project_room_message)"
+                ).fetchall()
+            }
+            if "delivery_json" not in room_columns:
+                connection.execute(
+                    "ALTER TABLE project_room_message "
+                    "ADD COLUMN delivery_json TEXT NOT NULL DEFAULT '{}'"
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO universe_identity(
@@ -1670,15 +1789,84 @@ class UniverseStore:
             for row in rows
         ]
 
-    def create_room_message(
+    def register_master_bridge(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
+        bridge = normalize_master_bridge(project["project_id"], value)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT bridge_id FROM project_master_bridge WHERE project_id = ?",
+                (project["project_id"],),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO project_master_bridge(
+                    project_id, bridge_id, endpoint, credential_env,
+                    master_session_ref, binding_evidence_ref, status,
+                    registered_at, updated_at, last_delivery_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    bridge_id = excluded.bridge_id,
+                    endpoint = excluded.endpoint,
+                    credential_env = excluded.credential_env,
+                    master_session_ref = excluded.master_session_ref,
+                    binding_evidence_ref = excluded.binding_evidence_ref,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    last_delivery_at = NULL
+                """,
+                (
+                    project["project_id"],
+                    bridge["bridge_id"],
+                    bridge["endpoint"],
+                    bridge["credential_env"],
+                    bridge["master_session_ref"],
+                    bridge["binding_evidence_ref"],
+                    bridge["status"],
+                    now,
+                    now,
+                ),
+            )
+        return self.get_master_bridge(project["project_id"]), existing is None
+
+    def get_master_bridge(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT project_id, bridge_id, endpoint, credential_env,
+                       master_session_ref, binding_evidence_ref, status,
+                       registered_at, updated_at, last_delivery_at
+                FROM project_master_bridge
+                WHERE project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MASTER_BRIDGE_NOT_REGISTERED",
+                "project has no registered Project Master Bridge",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._master_bridge_row(row)
+
+    def create_room_message(
+        self,
+        project_id: str,
+        value: Any,
+        *,
+        delivery_state: str = "INBOX_FALLBACK_AVAILABLE",
+        delivery: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
         message = normalize_room_message(project["project_id"], value)
+        delivery_json = _canonical_json(delivery or {})
         with self._connection() as connection:
             existing = connection.execute(
                 """
-                SELECT message_json, delivery_state, created_at, updated_at
+                SELECT message_json, delivery_state, delivery_json, created_at, updated_at
                 FROM project_room_message
                 WHERE project_id = ? AND idempotency_key = ?
                 """,
@@ -1693,6 +1881,7 @@ class UniverseStore:
                         HTTPStatus.CONFLICT,
                     )
                 stored["delivery_state"] = existing["delivery_state"]
+                stored["delivery"] = json.loads(existing["delivery_json"])
                 stored["created_at"] = existing["created_at"]
                 stored["updated_at"] = existing["updated_at"]
                 return stored, False
@@ -1700,26 +1889,123 @@ class UniverseStore:
                 """
                 INSERT INTO project_room_message(
                     message_id, project_id, idempotency_key, message_json,
-                    delivery_state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    delivery_state, delivery_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message["message_id"], message["project_id"],
                     message["idempotency_key"], _canonical_json(message),
-                    "INBOX_FALLBACK_AVAILABLE", message["created_at"],
+                    delivery_state, delivery_json, message["created_at"],
                     message["created_at"],
                 ),
             )
-        message["delivery_state"] = "INBOX_FALLBACK_AVAILABLE"
+        message["delivery_state"] = delivery_state
+        message["delivery"] = delivery or {}
         message["updated_at"] = message["created_at"]
         return message, True
+
+    def send_room_message(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        message, created = self.create_room_message(
+            project_id,
+            value,
+            delivery_state="INBOX_FALLBACK_AVAILABLE",
+        )
+        if not created:
+            return message, False
+        try:
+            bridge = self.get_master_bridge(project_id)
+        except UniverseError as error:
+            if error.code == "MASTER_BRIDGE_NOT_REGISTERED":
+                return message, True
+            raise
+        try:
+            receipt = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+            ).deliver(bridge=bridge, message=message)
+        except DispatchError as error:
+            self._set_master_bridge_status(
+                project_id,
+                status="UNAVAILABLE",
+                last_delivery_at=None,
+            )
+            return self._update_room_delivery(
+                message,
+                delivery_state="INBOX_FALLBACK_AVAILABLE",
+                delivery={"status": "FALLBACK", "reason": str(error)},
+            ), True
+        self._set_master_bridge_status(
+            project_id,
+            status="AVAILABLE",
+            last_delivery_at=receipt["delivered_at"],
+        )
+        return self._update_room_delivery(
+            message,
+            delivery_state="DELIVERED_TO_MASTER",
+            delivery=receipt,
+        ), True
+
+    def append_master_bridge_reply(
+        self,
+        project_id: str,
+        value: Any,
+        credential: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        reply = normalize_master_bridge_reply(project["project_id"], value)
+        bridge = self.get_master_bridge(project["project_id"])
+        expected = os.environ.get(bridge["credential_env"])
+        if not expected:
+            raise UniverseError(
+                "MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE",
+                "registered bridge credential is unavailable on this Host",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if not credential or not hmac.compare_digest(expected, credential):
+            raise UniverseError(
+                "MASTER_BRIDGE_UNAUTHORIZED",
+                "bridge reply credential does not match the registered binding",
+                HTTPStatus.FORBIDDEN,
+            )
+        if reply["bridge_id"] != bridge["bridge_id"]:
+            raise UniverseError(
+                "MASTER_BRIDGE_BINDING_MISMATCH",
+                "reply bridge_id does not match the registered binding",
+                HTTPStatus.CONFLICT,
+            )
+        with self._connection() as connection:
+            parent = connection.execute(
+                """
+                SELECT 1 FROM project_room_message
+                WHERE project_id = ? AND message_id = ?
+                """,
+                (project["project_id"], reply["message"]["in_reply_to"]),
+            ).fetchone()
+        if parent is None:
+            raise UniverseError(
+                "ROOM_MESSAGE_NOT_FOUND",
+                "reply target does not exist in this project room",
+                HTTPStatus.CONFLICT,
+            )
+        message, created = self.create_room_message(
+            project["project_id"],
+            reply["message"],
+            delivery_state="MASTER_REPLY_RECORDED",
+            delivery={"bridge_id": bridge["bridge_id"], "status": "REPLIED"},
+        )
+        self._set_master_bridge_status(
+            project["project_id"], status="AVAILABLE", last_delivery_at=utc_now()
+        )
+        return message, created
 
     def list_room_messages(self, project_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT message_json, delivery_state, created_at, updated_at
+                SELECT message_json, delivery_state, delivery_json, created_at, updated_at
                 FROM project_room_message
                 WHERE project_id = ?
                 ORDER BY created_at, message_id
@@ -1731,10 +2017,57 @@ class UniverseStore:
         for row in rows:
             message = json.loads(row["message_json"])
             message["delivery_state"] = row["delivery_state"]
+            message["delivery"] = json.loads(row["delivery_json"])
             message["created_at"] = row["created_at"]
             message["updated_at"] = row["updated_at"]
             messages.append(message)
         return messages
+
+    def _update_room_delivery(
+        self,
+        message: dict[str, Any],
+        *,
+        delivery_state: str,
+        delivery: dict[str, Any],
+    ) -> dict[str, Any]:
+        updated_at = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE project_room_message
+                SET delivery_state = ?, delivery_json = ?, updated_at = ?
+                WHERE message_id = ? AND project_id = ?
+                """,
+                (
+                    delivery_state,
+                    _canonical_json(delivery),
+                    updated_at,
+                    message["message_id"],
+                    message["project_id"],
+                ),
+            )
+        updated = dict(message)
+        updated["delivery_state"] = delivery_state
+        updated["delivery"] = delivery
+        updated["updated_at"] = updated_at
+        return updated
+
+    def _set_master_bridge_status(
+        self,
+        project_id: str,
+        *,
+        status: str,
+        last_delivery_at: str | None,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE project_master_bridge
+                SET status = ?, last_delivery_at = ?, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (status, last_delivery_at, utc_now(), _project_id(project_id)),
+            )
 
     def record_project_seed(
         self, project_id: str, value: Any
@@ -2924,6 +3257,22 @@ class UniverseStore:
             "updated_at": row["updated_at"],
         }
 
+    @staticmethod
+    def _master_bridge_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": PROJECT_MASTER_BRIDGE_SCHEMA,
+            "project_id": row["project_id"],
+            "bridge_id": row["bridge_id"],
+            "endpoint": row["endpoint"],
+            "credential_env": row["credential_env"],
+            "master_session_ref": row["master_session_ref"],
+            "binding_evidence_ref": row["binding_evidence_ref"],
+            "status": row["status"],
+            "registered_at": row["registered_at"],
+            "updated_at": row["updated_at"],
+            "last_delivery_at": row["last_delivery_at"],
+        }
+
 
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -3043,6 +3392,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "PROJECT_ROOM_MESSAGES_COLLECTED",
                         "project_id": project_id,
                         "messages": self.server.store.list_room_messages(project_id),
+                    },
+                )
+                return
+            if suffix == "/master-bridge":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MASTER_BRIDGE_COLLECTED",
+                        "bridge": self.server.store.get_master_bridge(project_id),
                     },
                 )
                 return
@@ -3205,12 +3564,47 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/room/messages":
-                message, created = self.server.store.create_room_message(parts[0], body)
+                message, created = self.server.store.send_room_message(parts[0], body)
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
                         "status": "PROJECT_ROOM_MESSAGE_RECORDED" if created else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
+                        "message": message,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/master-bridge":
+                bridge, created = self.server.store.register_master_bridge(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_MASTER_BRIDGE_REGISTERED"
+                            if created
+                            else "PROJECT_MASTER_BRIDGE_REFRESHED"
+                        ),
+                        "bridge": bridge,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/master-bridge/replies":
+                credential = self.headers.get("X-Universe-Bridge-Token")
+                message, created = self.server.store.append_master_bridge_reply(
+                    parts[0], body, credential
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_MASTER_REPLY_RECORDED"
+                            if created
+                            else "PROJECT_MASTER_REPLY_ALREADY_RECORDED"
+                        ),
                         "message": message,
                     },
                 )
@@ -3416,6 +3810,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return None
         remainder = path[len(prefix):]
         for suffix in (
+            "/master-bridge/replies",
+            "/master-bridge",
+            "/room/messages",
             "/document-incorporation-proposals",
             "/release-proposals",
             "/dispatches",

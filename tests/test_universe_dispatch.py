@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
+import threading
 import unittest
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, cast
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_dispatch import (  # noqa: E402
     DispatchError,
+    HttpProjectMasterBridge,
     HttpProjectWakeAdapter,
     LocalInboxConnector,
     normalize_dispatch_request,
@@ -113,6 +119,87 @@ class UniverseDispatchTests(unittest.TestCase):
                 "https://example.com",
                 "secret",
             ).wake(envelope)
+
+    def test_master_bridge_rejects_non_loopback_and_missing_credential(self) -> None:
+        bridge = HttpProjectMasterBridge(
+            endpoint="https://example.com",
+            credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+        )
+        with self.assertRaisesRegex(DispatchError, "loopback"):
+            bridge.validate()
+
+        bridge = HttpProjectMasterBridge(
+            endpoint="http://127.0.0.1:9010",
+            credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+        )
+        previous = os.environ.pop("UNIVERSE_TEST_MASTER_TOKEN", None)
+        try:
+            with self.assertRaisesRegex(DispatchError, "CREDENTIAL_UNAVAILABLE"):
+                bridge.deliver(
+                    bridge={
+                        "bridge_id": "bridge_123",
+                        "project_id": "GCS",
+                        "master_session_ref": "host-session-opaque",
+                    },
+                    message={"message_id": "room_123"},
+                )
+        finally:
+            if previous is not None:
+                os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
+
+    def test_master_bridge_delivers_a_bound_room_envelope(self) -> None:
+        captured: dict[str, object] = {}
+
+        class BridgeHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                captured["path"] = self.path
+                captured["authorization"] = self.headers.get("Authorization")
+                length = int(self.headers["Content-Length"])
+                captured["payload"] = json.loads(self.rfile.read(length))
+                body = b'{"status":"accepted"}'
+                self.send_response(HTTPStatus.ACCEPTED)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BridgeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address[:2]
+        host_text = host.decode("ascii") if isinstance(host, bytes) else host
+        previous = os.environ.get("UNIVERSE_TEST_MASTER_TOKEN")
+        os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = "bridge-test-token"
+        try:
+            receipt = HttpProjectMasterBridge(
+                endpoint=f"http://{host_text}:{port}",
+                credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+            ).deliver(
+                bridge={
+                    "bridge_id": "bridge_123",
+                    "project_id": "GCS",
+                    "master_session_ref": "host-session-opaque",
+                },
+                message={"message_id": "room_123", "body": "Review the route."},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            if previous is None:
+                os.environ.pop("UNIVERSE_TEST_MASTER_TOKEN", None)
+            else:
+                os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
+
+        self.assertEqual("DELIVERED", receipt["status"])
+        self.assertEqual("/v1/project-master/messages", captured["path"])
+        self.assertEqual("Bearer bridge-test-token", captured["authorization"])
+        payload = cast(dict[str, Any], captured["payload"])
+        self.assertEqual("bridge_123", payload["bridge_id"])
+        self.assertEqual("host-session-opaque", payload["master_session_ref"])
 
 
 if __name__ == "__main__":

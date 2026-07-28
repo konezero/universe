@@ -163,8 +163,8 @@ dispatch evidence, wake receipts, and the final Result Packet.
 ## Desktop UI
 
 The UI is served by the same loopback process and contains no embedded access
-token. `--open-ui` opens a fragment URL once; the page moves the token into
-session storage and removes it from the visible URL.
+token. Loopback UI use does not need an access-token prompt. Remote access is
+not part of this service contract.
 
 The first slice supports:
 
@@ -175,6 +175,53 @@ The first slice supports:
 - read-only Project install/update planning with collision visibility;
 - durable MASTER dispatch creation and approved Inbox delivery;
 - dispatch event and Result Packet inspection.
+
+## Project Master Bridge
+
+A Project Room is durable Universe-side conversation history. It is not, by
+itself, a vendor chat session. A project may register one local Project Master
+Bridge to carry room messages to a separately running Project Host:
+
+```text
+Universe Project Room
+  -> registered loopback Project Master Bridge
+  -> Project Host / opaque Master session reference
+  -> authenticated reply callback
+  -> Universe Project Room
+```
+
+The binding is registered through:
+
+```text
+POST /v1/projects/<project_id>/master-bridge
+```
+
+with a literal loopback HTTP origin, an opaque `master_session_ref`, a
+`binding_evidence_ref`, and the name of an uppercase environment variable that
+contains the bridge credential. Universe stores the environment-variable name,
+not the credential. The adapter sends a room envelope to:
+
+```text
+POST <bridge-origin>/v1/project-master/messages
+Authorization: Bearer <credential>
+```
+
+The Project Host replies through:
+
+```text
+POST /v1/projects/<project_id>/master-bridge/replies
+X-Universe-Bridge-Token: <credential>
+```
+
+The reply must name the registered `bridge_id` and the room message it answers.
+It appends a `PROJECT_MASTER` message only; it cannot create execution
+authority, write source files, start a Task Frame, or control a vendor chat
+application.
+
+When no bridge is registered, its credential is unavailable, or the local Host
+does not respond, the original room message remains durable with
+`INBOX_FALLBACK_AVAILABLE`. Existing Master Inbox dispatch remains a separate,
+explicit operation and is not silently created by a conversation message.
 
 Release proposals never apply project files from the browser. The proposal
 digest and plan are handed to the Project Host for approval, guarded writes,

@@ -21,6 +21,8 @@ DISPATCH_EVENT_SCHEMA = "universe.dispatch-event.v1"
 RESULT_PACKET_SCHEMA = "universe.project-result-packet.v1"
 DELIVERY_RECEIPT_SCHEMA = "universe.dispatch-delivery-receipt.v1"
 WAKE_RECEIPT_SCHEMA = "universe.project-wake-receipt.v1"
+MASTER_BRIDGE_ENVELOPE_SCHEMA = "universe.project-master-bridge-envelope.v1"
+MASTER_BRIDGE_RECEIPT_SCHEMA = "universe.project-master-bridge-receipt.v1"
 DISPATCH_ID_PATTERN = re.compile(r"^dispatch_[0-9a-f]{20,64}$")
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -47,6 +49,15 @@ class ProjectInboxConnector(Protocol):
 
 class ProjectWakeAdapter(Protocol):
     def wake(self, envelope: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class ProjectMasterBridge(Protocol):
+    def deliver(
+        self,
+        *,
+        bridge: dict[str, Any],
+        message: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -152,6 +163,82 @@ class HttpProjectWakeAdapter:
             "endpoint": endpoint,
             "host_response": payload,
             "woken_at": utc_now(),
+        }
+
+
+@dataclass(frozen=True)
+class HttpProjectMasterBridge:
+    """Deliver a room envelope to one registered local Project Master Host.
+
+    The bridge is deliberately transport-only. It does not create a vendor
+    chat session, infer authority, or execute an instruction received in a
+    room message.
+    """
+
+    endpoint: str
+    credential_env: str
+    timeout_seconds: float = 5.0
+
+    def validate(self) -> str:
+        _environment_name(self.credential_env)
+        return _loopback_endpoint(self.endpoint, label="master bridge")
+
+    def deliver(
+        self,
+        *,
+        bridge: dict[str, Any],
+        message: dict[str, Any],
+    ) -> dict[str, Any]:
+        endpoint = self.validate()
+        credential_env = _environment_name(self.credential_env)
+        token = os.environ.get(credential_env)
+        if not token:
+            raise DispatchError("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE")
+        bridge_id = _text(bridge.get("bridge_id"), "bridge.bridge_id")
+        project_id = _project_id(bridge.get("project_id"))
+        master_session_ref = _text(
+            bridge.get("master_session_ref"), "bridge.master_session_ref"
+        )
+        message_id = _text(message.get("message_id"), "message.message_id")
+        body = json.dumps(
+            {
+                "schema": MASTER_BRIDGE_ENVELOPE_SCHEMA,
+                "bridge_id": bridge_id,
+                "project_id": project_id,
+                "master_session_ref": master_session_ref,
+                "message": message,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        request = Request(
+            endpoint + "/v1/project-master/messages",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:  # nosec B310
+                payload = json.loads(response.read().decode("utf-8"))
+                status_code = response.status
+        except HTTPError as error:
+            raise DispatchError(f"MASTER_BRIDGE_HTTP_{error.code}") from error
+        except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise DispatchError("MASTER_BRIDGE_UNAVAILABLE") from error
+        if not 200 <= status_code < 300 or not isinstance(payload, dict):
+            raise DispatchError("MASTER_BRIDGE_REJECTED")
+        return {
+            "schema": MASTER_BRIDGE_RECEIPT_SCHEMA,
+            "status": "DELIVERED",
+            "bridge_id": bridge_id,
+            "project_id": project_id,
+            "message_id": message_id,
+            "endpoint": endpoint,
+            "host_response": payload,
+            "delivered_at": utc_now(),
         }
 
 
@@ -388,7 +475,7 @@ def _inbox_path(root: Path, value: Any) -> Path:
     return resolved
 
 
-def _loopback_endpoint(value: Any) -> str:
+def _loopback_endpoint(value: Any, *, label: str = "wake") -> str:
     endpoint = _text(value, "endpoint").rstrip("/")
     parsed = urlsplit(endpoint)
     if (
@@ -400,13 +487,13 @@ def _loopback_endpoint(value: Any) -> str:
         or parsed.path not in {"", "/"}
         or parsed.hostname is None
     ):
-        raise DispatchError("wake endpoint must be a plain loopback HTTP origin")
+        raise DispatchError(f"{label} endpoint must be a plain loopback HTTP origin")
     try:
         address = ipaddress.ip_address(parsed.hostname)
     except ValueError as error:
-        raise DispatchError("wake endpoint must use a literal loopback IP") from error
+        raise DispatchError(f"{label} endpoint must use a literal loopback IP") from error
     if not address.is_loopback:
-        raise DispatchError("wake endpoint must remain on loopback")
+        raise DispatchError(f"{label} endpoint must remain on loopback")
     return endpoint
 
 
@@ -439,6 +526,13 @@ def _text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DispatchError(f"{field} must be non-empty text")
     return value.strip()
+
+
+def _environment_name(value: Any) -> str:
+    name = _text(value, "credential_env")
+    if re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", name) is None:
+        raise DispatchError("credential_env must be an uppercase environment name")
+    return name
 
 
 def _json_bytes(value: Any, field: str, maximum: int) -> bytes:

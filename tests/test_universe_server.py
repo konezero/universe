@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -124,11 +126,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         path: str,
         payload: object | None = None,
         token: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[int, JsonObject]:
         body = None
         headers: dict[str, str] = {}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
+        if extra_headers:
+            headers.update(extra_headers)
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -436,6 +441,149 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(result["projects"]))
         self.assertEqual("Trading", result["projects"][0]["metadata"]["label"])
+
+    def test_room_message_uses_inbox_fallback_without_a_master_bridge(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/room/messages",
+            {
+                "kind": "QUESTION",
+                "body": "What should the project Master review next?",
+                "idempotency_key": "room-question-fallback-001",
+            },
+            self.token,
+        )
+
+        self.assertEqual(201, status)
+        self.assertEqual("INBOX_FALLBACK_AVAILABLE", result["message"]["delivery_state"])
+        self.assertEqual({}, result["message"]["delivery"])
+
+    def test_master_bridge_delivers_room_message_and_accepts_bound_reply(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        bridge_request = {
+            "endpoint": "http://127.0.0.1:9011",
+            "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+            "master_session_ref": "opaque-project-master-session",
+            "binding_evidence_ref": "project-host://GCS/master-session/registered",
+        }
+        status, registered = self.request(
+            "POST", "/v1/projects/GCS/master-bridge", bridge_request, self.token
+        )
+        self.assertEqual(201, status)
+        bridge = registered["bridge"]
+        self.assertEqual("REGISTERED", bridge["status"])
+        self.assertEqual(
+            "opaque-project-master-session", bridge["master_session_ref"]
+        )
+
+        receipt = {
+            "status": "DELIVERED",
+            "bridge_id": bridge["bridge_id"],
+            "project_id": "GCS",
+            "message_id": "room-placeholder",
+            "delivered_at": "2026-07-28T04:45:00Z",
+        }
+        with patch(
+            "universe_server.HttpProjectMasterBridge.deliver",
+            return_value=receipt,
+        ) as deliver:
+            status, delivered = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "REVIEW",
+                    "body": "Review the proposed route before dispatch.",
+                    "idempotency_key": "room-review-bridge-001",
+                },
+                self.token,
+            )
+        self.assertEqual(201, status)
+        message = delivered["message"]
+        self.assertEqual("DELIVERED_TO_MASTER", message["delivery_state"])
+        self.assertEqual("DELIVERED", message["delivery"]["status"])
+        self.assertEqual(bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"])
+        self.assertEqual(
+            "opaque-project-master-session",
+            deliver.call_args.kwargs["bridge"]["master_session_ref"],
+        )
+
+        status, rejected = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge/replies",
+            {
+                "bridge_id": bridge["bridge_id"],
+                "in_reply_to": message["message_id"],
+                "kind": "STATUS",
+                "body": "Master received the review request.",
+                "idempotency_key": "room-review-reply-001",
+            },
+            self.token,
+        )
+        self.assertEqual(503, status)
+        self.assertEqual("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE", rejected["error_code"])
+
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            status, replied = self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/replies",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": message["message_id"],
+                    "kind": "STATUS",
+                    "body": "Master received the review request.",
+                    "idempotency_key": "room-review-reply-001",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+        self.assertEqual(201, status)
+        self.assertEqual("PROJECT_MASTER_REPLY_RECORDED", replied["status"])
+        self.assertEqual("PROJECT_MASTER", replied["message"]["sender"])
+        self.assertEqual(message["message_id"], replied["message"]["in_reply_to"])
+
+        status, listing = self.request(
+            "GET", "/v1/projects/GCS/room/messages", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, len(listing["messages"]))
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual("AVAILABLE", reopened.get_master_bridge("GCS")["status"])
+        self.assertEqual(2, len(reopened.list_room_messages("GCS")))
+
+    def test_master_bridge_requires_a_loopback_endpoint(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "https://example.com",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("MASTER_BRIDGE_INVALID", result["error_code"])
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "not-an-environment-name",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("MASTER_BRIDGE_INVALID", result["error_code"])
 
     def test_release_import_and_project_plan_are_durable_and_read_only(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
