@@ -95,6 +95,10 @@ GET    /v1/projects
 GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
 POST   /v1/future-paths
+POST   /v1/fresh-project-compositions
+GET    /v1/fresh-project-compositions
+POST   /v1/fresh-project-composition-adoptions
+GET    /v1/fresh-project-composition-adoptions
 POST   /v1/projects/{project_id}/events
 GET    /v1/projects/{project_id}/events
 POST   /v1/projects/{project_id}/skill-observations
@@ -389,3 +393,10 @@ credential reference and authentication provider when implemented.
 OS_INSTALL integration should create a connection candidate and display it to
 the user. Only the approved registration request is sent to this service.
 Installation must not silently attach every discovered project.
+`POST /v1/fresh-project-compositions` turns one selected official Seed route
+into a Fresh Project Composition proposal: functional nodes, initial
+specification and document plan, technology signals, and known route risks.
+It does not create a project, write project files, bind a Master, create a
+Task Frame, or grant authority. `POST /v1/fresh-project-composition-adoptions`
+requires explicit `ADOPTED` selection and produces only a later Project Master
+handoff candidate.

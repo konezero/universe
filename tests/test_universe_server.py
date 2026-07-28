@@ -902,6 +902,93 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("REQUEST_INVALID", rejected["error_code"])
 
+    def test_fresh_project_composition_requires_explicit_adoption(self) -> None:
+        request = {
+            "intent": {
+                "project": "Local trading workstation",
+                "kind": "desktop-app",
+                "technologies": ["python", "pyside6", "sqlite"],
+                "goal": "stable unattended operation with recoverable state",
+                "constraints": ["No live order mutation during discovery."],
+                "target_users": "Individual trading operator",
+            },
+            "route_id": "durable-desktop-state",
+        }
+        status, result = self.request(
+            "POST", "/v1/fresh-project-compositions", request, self.token
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("FRESH_PROJECT_COMPOSITION_PROPOSAL_READY", result["status"])
+        composition = result["composition"]
+        self.assertEqual("USER_SELECTION_REQUIRED", composition["selection_state"])
+        self.assertEqual(
+            "durable-desktop-state", composition["selected_route"]["route_id"]
+        )
+        self.assertTrue(composition["specification"]["functional_nodes"])
+        self.assertEqual(
+            {"SPECIFICATION", "DESIGN", "ARCHITECTURE", "DECISION", "CONTRACT"},
+            {document["role"] for document in composition["document_plan"]},
+        )
+        self.assertTrue(
+            all(value == "NONE" for value in composition["effects"].values())
+        )
+        self.assertEqual([], self.server.store.list_projects())
+
+        status, repeated = self.request(
+            "POST", "/v1/fresh-project-compositions", request, self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "FRESH_PROJECT_COMPOSITION_ALREADY_RECORDED", repeated["status"]
+        )
+        self.assertEqual(
+            composition["composition_id"], repeated["composition"]["composition_id"]
+        )
+
+        status, adopted = self.request(
+            "POST",
+            "/v1/fresh-project-composition-adoptions",
+            {
+                "composition_id": composition["composition_id"],
+                "approval": "ADOPTED",
+                "user_notes": "Use the proposed document plan as the initial scope.",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("FRESH_PROJECT_COMPOSITION_ADOPTED", adopted["status"])
+        adoption = adopted["adoption"]
+        self.assertEqual(
+            "PROJECT_MASTER_HANDOFF_CANDIDATE", adoption["next_operation"]
+        )
+        self.assertTrue(all(value == "NONE" for value in adoption["effects"].values()))
+        self.assertEqual([], self.server.store.list_projects())
+
+        status, compositions = self.request(
+            "GET", "/v1/fresh-project-compositions", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [composition["composition_id"]],
+            [item["composition_id"] for item in compositions["compositions"]],
+        )
+        status, adoptions = self.request(
+            "GET", "/v1/fresh-project-composition-adoptions", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [adoption["adoption_id"]],
+            [item["adoption_id"] for item in adoptions["adoptions"]],
+        )
+
+        invalid = dict(request)
+        invalid["route_id"] = "not-a-route"
+        status, rejected = self.request(
+            "POST", "/v1/fresh-project-compositions", invalid, self.token
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("FRESH_PROJECT_ROUTE_NOT_SELECTABLE", rejected["error_code"])
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {

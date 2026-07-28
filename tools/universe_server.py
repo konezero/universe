@@ -69,6 +69,10 @@ SKILL_BENCH_SCHEMA = "universe.skill-bench.v1"
 PROJECT_CONTEXT_PACK_SCHEMA = "universe.project-context-pack.v1"
 PROJECT_SKILL_PLAN_SCHEMA = "universe.project-skill-plan.v1"
 PROJECT_SKILL_PLAN_ADOPTION_SCHEMA = "universe.project-skill-plan-adoption.v1"
+FRESH_PROJECT_COMPOSITION_SCHEMA = "universe.fresh-project-composition.v1"
+FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA = (
+    "universe.fresh-project-composition-adoption.v1"
+)
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1031,6 +1035,64 @@ def normalize_fresh_project_intent(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_fresh_project_composition_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="fresh_project_composition_request",
+        required=frozenset({"intent", "route_id"}),
+    )
+    intent = _exact_object_fields(
+        request["intent"],
+        field="fresh_project_composition_request.intent",
+        required=frozenset({"project", "kind", "technologies", "goal"}),
+        optional=frozenset({"constraints", "target_users"}),
+    )
+    normalized_intent = normalize_fresh_project_intent(
+        {
+            "project": intent["project"],
+            "kind": intent["kind"],
+            "technologies": intent["technologies"],
+            "goal": intent["goal"],
+        }
+    )
+    constraints = _string_array(intent.get("constraints", []), "intent.constraints")
+    if len(constraints) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_CONSTRAINTS_INVALID",
+            "intent.constraints must contain at most 32 entries",
+        )
+    normalized_intent["constraints"] = constraints
+    if "target_users" in intent:
+        normalized_intent["target_users"] = _required_text(
+            intent["target_users"], "intent.target_users"
+        )
+    return {
+        "intent": normalized_intent,
+        "route_id": _identifier(request["route_id"], "route_id"),
+    }
+
+
+def normalize_fresh_project_composition_adoption_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="fresh_project_composition_adoption_request",
+        required=frozenset({"composition_id", "approval"}),
+        optional=frozenset({"user_notes"}),
+    )
+    if request["approval"] != "ADOPTED":
+        raise UniverseError(
+            "FRESH_PROJECT_COMPOSITION_ADOPTION_REQUIRED",
+            "approval must be ADOPTED before recording a Composition selection",
+            HTTPStatus.CONFLICT,
+        )
+    normalized = {
+        "composition_id": _identifier(request["composition_id"], "composition_id")
+    }
+    if "user_notes" in request:
+        normalized["user_notes"] = _required_text(request["user_notes"], "user_notes")
+    return normalized
+
+
 def normalize_context_pack_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -1620,6 +1682,104 @@ def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
     return material
 
 
+def build_fresh_project_composition(
+    intent: dict[str, Any], route: dict[str, Any], seed_result: dict[str, Any]
+) -> dict[str, Any]:
+    functional_nodes = [
+        {
+            "node_id": "capability_" + step["id"],
+            "title": step["title"],
+            "purpose": step["purpose"],
+            "acceptance_condition": step["exit_evidence"],
+            "state": "PROPOSED",
+        }
+        for step in route["steps"]
+    ]
+    implementation_workstreams = [
+        {
+            "workstream_id": "implementation_" + step["id"],
+            "functional_node_id": "capability_" + step["id"],
+            "title": step["title"],
+            "planning_state": "TECHNOLOGY_AND_DESIGN_SELECTION_REQUIRED",
+        }
+        for step in route["steps"]
+    ]
+    material = {
+        "schema": FRESH_PROJECT_COMPOSITION_SCHEMA,
+        "intent": {
+            key: value for key, value in intent.items() if key != "limit"
+        },
+        "seed": seed_result["seed"],
+        "selected_route": {
+            "route_id": route["route_id"],
+            "title": route["title"],
+            "description": route["description"],
+            "support_level": route["support_level"],
+            "matches": route["matches"],
+        },
+        "specification": {
+            "problem_statement": intent["goal"],
+            "target_users": intent.get("target_users", "USER_SELECTION_REQUIRED"),
+            "constraints": intent["constraints"],
+            "functional_nodes": functional_nodes,
+            "completion_conditions": [
+                step["exit_evidence"] for step in route["steps"]
+            ],
+        },
+        "design": {
+            "direction": route["description"],
+            "state": "USER_AND_LLM_DESIGN_REFINEMENT_REQUIRED",
+        },
+        "technology": {
+            "selected_signals": intent["technologies"],
+            "unresolved_signals": seed_result["input"]["unresolved_technologies"],
+            "selection_state": "USER_SELECTION_REQUIRED",
+        },
+        "implementation_workstreams": implementation_workstreams,
+        "document_plan": [
+            {
+                "document_id": "project-specification",
+                "role": "SPECIFICATION",
+                "title": "Project specification",
+            },
+            {
+                "document_id": "project-design",
+                "role": "DESIGN",
+                "title": "Project design direction",
+            },
+            {
+                "document_id": "project-architecture",
+                "role": "ARCHITECTURE",
+                "title": "Project architecture and implementation bindings",
+            },
+            {
+                "document_id": "project-decisions",
+                "role": "DECISION",
+                "title": "Selected technology and route decisions",
+            },
+            {
+                "document_id": "project-acceptance",
+                "role": "CONTRACT",
+                "title": "Acceptance and completion conditions",
+            },
+        ],
+        "risk_conditions": route["risk_patterns"],
+        "selection_state": "USER_SELECTION_REQUIRED",
+        "effects": {
+            "project_source_write": "NONE",
+            "project_seed_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame": "NONE",
+        },
+        "next_operation": "USER_ADOPTION_OR_COMPOSITION_REVISION",
+    }
+    material["composition_digest"] = _json_sha256(material)
+    material["composition_id"] = "composition_" + material["composition_digest"][:24]
+    material["status"] = "FRESH_PROJECT_COMPOSITION_PROPOSAL_READY"
+    return material
+
+
 def _document_target(document: dict[str, Any]) -> str:
     filename = Path(document["path"]).name
     stable_name = f"{document['document_id']}-{filename}"
@@ -1819,6 +1979,31 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_skill_plan_adoption_project_time
                 ON project_skill_plan_adoption(project_id, adopted_at, adoption_id);
+
+                CREATE TABLE IF NOT EXISTS fresh_project_composition (
+                    composition_id TEXT PRIMARY KEY,
+                    composition_digest TEXT NOT NULL UNIQUE,
+                    intent_json TEXT NOT NULL,
+                    composition_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS fresh_project_composition_created
+                ON fresh_project_composition(created_at, composition_id);
+
+                CREATE TABLE IF NOT EXISTS fresh_project_composition_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    composition_id TEXT NOT NULL
+                        REFERENCES fresh_project_composition(composition_id)
+                        ON DELETE CASCADE,
+                    selection_digest TEXT NOT NULL,
+                    adoption_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL,
+                    UNIQUE(composition_id, selection_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS fresh_project_composition_adoption_time
+                ON fresh_project_composition_adoption(adopted_at, adoption_id);
 
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
@@ -2772,6 +2957,190 @@ class UniverseStore:
                 LIMIT ?
                 """,
                 (project["project_id"], limit),
+            ).fetchall()
+        adoptions = []
+        for row in rows:
+            adoption = json.loads(row["adoption_json"])
+            adoption["adopted_at"] = row["adopted_at"]
+            adoptions.append(adoption)
+        return adoptions
+
+    def create_fresh_project_composition(
+        self, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = normalize_fresh_project_composition_request(value)
+        intent = request["intent"]
+        try:
+            seed_result = suggest_paths(
+                OFFICIAL_SEED_DATABASE,
+                project=intent["project"],
+                kind=intent["kind"],
+                technologies=intent["technologies"],
+                goal=intent["goal"],
+                limit=10,
+            )
+        except SeedError as error:
+            raise UniverseError(
+                "FRESH_PROJECT_COMPOSITION_INVALID", str(error)
+            ) from error
+        route = next(
+            (
+                candidate
+                for candidate in seed_result["candidates"]
+                if candidate["route_id"] == request["route_id"]
+            ),
+            None,
+        )
+        if route is None:
+            raise UniverseError(
+                "FRESH_PROJECT_ROUTE_NOT_SELECTABLE",
+                "route_id is not a candidate for the supplied Fresh Project intent",
+                HTTPStatus.CONFLICT,
+            )
+        composition = build_fresh_project_composition(intent, route, seed_result)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT composition_json, created_at
+                FROM fresh_project_composition
+                WHERE composition_digest = ?
+                """,
+                (composition["composition_digest"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["composition_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO fresh_project_composition(
+                    composition_id, composition_digest, intent_json,
+                    composition_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    composition["composition_id"],
+                    composition["composition_digest"],
+                    _canonical_json(composition["intent"]),
+                    _canonical_json(composition),
+                    now,
+                ),
+            )
+        composition["created_at"] = now
+        return composition, True
+
+    def get_fresh_project_composition(self, composition_id: str) -> dict[str, Any]:
+        normalized_id = _identifier(composition_id, "composition_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT composition_json, created_at
+                FROM fresh_project_composition
+                WHERE composition_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "FRESH_PROJECT_COMPOSITION_NOT_FOUND",
+                "Universe has no matching Fresh Project Composition",
+                HTTPStatus.NOT_FOUND,
+            )
+        composition = json.loads(row["composition_json"])
+        composition["created_at"] = row["created_at"]
+        return composition
+
+    def list_fresh_project_compositions(
+        self, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT composition_json, created_at
+                FROM fresh_project_composition
+                ORDER BY created_at DESC, composition_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        compositions = []
+        for row in rows:
+            composition = json.loads(row["composition_json"])
+            composition["created_at"] = row["created_at"]
+            compositions.append(composition)
+        return compositions
+
+    def adopt_fresh_project_composition(
+        self, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = normalize_fresh_project_composition_adoption_request(value)
+        composition = self.get_fresh_project_composition(request["composition_id"])
+        material: dict[str, Any] = {
+            "schema": FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA,
+            "composition_id": composition["composition_id"],
+            "composition_digest": composition["composition_digest"],
+            "selected_route_id": composition["selected_route"]["route_id"],
+            "next_operation": "PROJECT_MASTER_HANDOFF_CANDIDATE",
+            "effects": {
+                "project_source_write": "NONE",
+                "project_seed_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
+            },
+        }
+        if "user_notes" in request:
+            material["user_notes"] = request["user_notes"]
+        material["selection_digest"] = _json_sha256(material)
+        material["adoption_id"] = "compositionadopt_" + material["selection_digest"][:24]
+        material["status"] = "FRESH_PROJECT_COMPOSITION_ADOPTED"
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM fresh_project_composition_adoption
+                WHERE composition_id = ? AND selection_digest = ?
+                """,
+                (composition["composition_id"], material["selection_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["adoption_json"])
+                stored["adopted_at"] = existing["adopted_at"]
+                return stored, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO fresh_project_composition_adoption(
+                    adoption_id, composition_id, selection_digest,
+                    adoption_json, adopted_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    material["adoption_id"],
+                    composition["composition_id"],
+                    material["selection_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["adopted_at"] = now
+        return material, True
+
+    def list_fresh_project_composition_adoptions(
+        self, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM fresh_project_composition_adoption
+                ORDER BY adopted_at DESC, adoption_id DESC
+                LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
         adoptions = []
         for row in rows:
@@ -4372,6 +4741,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/fresh-project-compositions":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FRESH_PROJECT_COMPOSITIONS_COLLECTED",
+                    "compositions": self.server.store.list_fresh_project_compositions(),
+                },
+            )
+            return
+        if path == "/v1/fresh-project-composition-adoptions":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FRESH_PROJECT_COMPOSITION_ADOPTIONS_COLLECTED",
+                    "adoptions": (
+                        self.server.store.list_fresh_project_composition_adoptions()
+                    ),
+                },
+            )
+            return
         if path == "/v1/bench/skills":
             self._send(
                 HTTPStatus.OK,
@@ -4592,6 +4983,40 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "FRESH_PROJECT_ROUTE_CANDIDATES",
                         "intent": intent,
                         "proposal": proposal,
+                    },
+                )
+                return
+            if path == "/v1/fresh-project-compositions":
+                composition, created = self.server.store.create_fresh_project_composition(
+                    body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FRESH_PROJECT_COMPOSITION_PROPOSAL_READY"
+                            if created
+                            else "FRESH_PROJECT_COMPOSITION_ALREADY_RECORDED"
+                        ),
+                        "composition": composition,
+                    },
+                )
+                return
+            if path == "/v1/fresh-project-composition-adoptions":
+                adoption, created = self.server.store.adopt_fresh_project_composition(
+                    body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FRESH_PROJECT_COMPOSITION_ADOPTED"
+                            if created
+                            else "FRESH_PROJECT_COMPOSITION_ADOPTION_ALREADY_RECORDED"
+                        ),
+                        "adoption": adoption,
                     },
                 )
                 return
