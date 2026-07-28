@@ -4,6 +4,13 @@
   "entrypoint": ".ai/adapters/codex/invoke.ps1",
   "runtime_cli": ".ai/runtime/reference_runtime/cli.py",
   "capabilities": ".ai/runtime/reference_runtime/capabilities.json",
+  "task_frame_worker": {
+    "entrypoint": ".ai/adapters/codex/worker.ps1",
+    "input_schema": "universe.codex-worker-request.v1",
+    "output_schema": "universe.codex-worker-result.v1",
+    "capability": "HOST_DEPENDENT",
+    "source_mutation": "HOST_GATEWAY_ONLY"
+  },
   "transport": {
     "arguments": "UNCHANGED",
     "stdout": "UNCHANGED",
