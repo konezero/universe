@@ -196,6 +196,9 @@ relations remain distinct from observed evidence. Career adoption is separate.
    implemented; LLM-assisted specification, design, and composition remain
    follow-ups.
 3. Assemble Context Packs and propose Skill Plans from selected routes.
+   Initial Project-local Context Pack assembly, Skill Plan proposal, and
+   explicit adoption record are implemented. Cross-project applicability and
+   Project Master handoff delivery remain follow-ups.
 4. Add Project-side Task Frame SkillRunObservation publication as an
    ai-career/Core Runtime follow-up. The redacted candidate preparation
    surface is implemented; a provider append adapter remains a follow-up.

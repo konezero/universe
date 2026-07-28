@@ -66,6 +66,9 @@ PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
 SKILL_RUN_OBSERVATION_SCHEMA = "universe.skill-run-observation.v1"
 SKILL_BENCH_SCHEMA = "universe.skill-bench.v1"
+PROJECT_CONTEXT_PACK_SCHEMA = "universe.project-context-pack.v1"
+PROJECT_SKILL_PLAN_SCHEMA = "universe.project-skill-plan.v1"
+PROJECT_SKILL_PLAN_ADOPTION_SCHEMA = "universe.project-skill-plan-adoption.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1028,6 +1031,87 @@ def normalize_fresh_project_intent(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_context_pack_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="context_pack_request",
+        required=frozenset({"purpose", "node_ids"}),
+        optional=frozenset({"bench_limit"}),
+    )
+    node_ids = [_identifier(item, "node_ids[]") for item in _array(request["node_ids"], "node_ids")]
+    if not node_ids or len(node_ids) > 32 or len(set(node_ids)) != len(node_ids):
+        raise UniverseError(
+            "CONTEXT_PACK_NODES_INVALID",
+            "node_ids must contain 1..32 unique node identifiers",
+        )
+    bench_limit = request.get("bench_limit", 20)
+    if (
+        isinstance(bench_limit, bool)
+        or not isinstance(bench_limit, int)
+        or not 0 <= bench_limit <= 100
+    ):
+        raise UniverseError(
+            "CONTEXT_PACK_BENCH_LIMIT_INVALID",
+            "bench_limit must be an integer from 0 through 100",
+        )
+    return {
+        "purpose": _required_text(request["purpose"], "purpose"),
+        "node_ids": sorted(node_ids),
+        "bench_limit": bench_limit,
+    }
+
+
+def normalize_skill_plan_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="skill_plan_request",
+        required=frozenset({"context_pack_id", "purpose"}),
+        optional=frozenset({"max_candidates"}),
+    )
+    max_candidates = request.get("max_candidates", 10)
+    if (
+        isinstance(max_candidates, bool)
+        or not isinstance(max_candidates, int)
+        or not 1 <= max_candidates <= 32
+    ):
+        raise UniverseError(
+            "SKILL_PLAN_LIMIT_INVALID",
+            "max_candidates must be an integer from 1 through 32",
+        )
+    return {
+        "context_pack_id": _identifier(request["context_pack_id"], "context_pack_id"),
+        "purpose": _required_text(request["purpose"], "purpose"),
+        "max_candidates": max_candidates,
+    }
+
+
+def normalize_skill_plan_adoption_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="skill_plan_adoption_request",
+        required=frozenset({"proposal_id", "candidate_ids", "approval"}),
+    )
+    if request["approval"] != "ADOPTED":
+        raise UniverseError(
+            "SKILL_PLAN_ADOPTION_REQUIRED",
+            "approval must be ADOPTED before recording a Skill Plan selection",
+            HTTPStatus.CONFLICT,
+        )
+    candidate_ids = [
+        _identifier(item, "candidate_ids[]")
+        for item in _array(request["candidate_ids"], "candidate_ids")
+    ]
+    if not candidate_ids or len(set(candidate_ids)) != len(candidate_ids):
+        raise UniverseError(
+            "SKILL_PLAN_CANDIDATES_INVALID",
+            "candidate_ids must be a non-empty unique array",
+        )
+    return {
+        "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
+        "candidate_ids": sorted(candidate_ids),
+    }
+
+
 def normalize_project_seed(
     project: dict[str, Any], value: Any
 ) -> dict[str, Any]:
@@ -1688,6 +1772,54 @@ class UniverseStore:
                     skill_id, skill_version, operation_class, model_ref
                 );
 
+                CREATE TABLE IF NOT EXISTS project_context_pack (
+                    context_pack_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    seed_id TEXT NOT NULL,
+                    seed_digest TEXT NOT NULL,
+                    context_pack_digest TEXT NOT NULL UNIQUE,
+                    pack_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_context_pack_project_time
+                ON project_context_pack(project_id, created_at, context_pack_id);
+
+                CREATE TABLE IF NOT EXISTS project_skill_plan_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    context_pack_id TEXT NOT NULL
+                        REFERENCES project_context_pack(context_pack_id)
+                        ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    proposal_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_skill_plan_project_time
+                ON project_skill_plan_proposal(project_id, created_at, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS project_skill_plan_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    proposal_id TEXT NOT NULL
+                        REFERENCES project_skill_plan_proposal(proposal_id)
+                        ON DELETE CASCADE,
+                    selection_digest TEXT NOT NULL,
+                    adoption_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL,
+                    UNIQUE(proposal_id, selection_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_skill_plan_adoption_project_time
+                ON project_skill_plan_adoption(project_id, adopted_at, adoption_id);
+
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
                         REFERENCES project_connection(project_id)
@@ -2261,6 +2393,392 @@ class UniverseStore:
                     group["metric_totals"].get(metric_key, 0) + metric_value
                 )
         return list(grouped.values())[:limit]
+
+    def create_context_pack(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_context_pack_request(value)
+        seed = self.get_project_seed(project["project_id"])
+        known_nodes = {node["node_id"]: node for node in seed["nodes"]}
+        unknown_nodes = set(request["node_ids"]) - set(known_nodes)
+        if unknown_nodes:
+            raise UniverseError(
+                "CONTEXT_PACK_NODE_UNKNOWN",
+                f"node_ids are not present in the current Project Seed: {', '.join(sorted(unknown_nodes))}",
+                HTTPStatus.CONFLICT,
+            )
+        selected_nodes = [known_nodes[node_id] for node_id in request["node_ids"]]
+        selected_node_ids = set(request["node_ids"])
+        selected_edges = [
+            edge
+            for edge in seed["edges"]
+            if edge["from_node"] in selected_node_ids
+            or edge["to_node"] in selected_node_ids
+        ]
+        selected_documents = [
+            document
+            for document in seed["documents"]
+            if document.get("project_wide", False)
+            or selected_node_ids.intersection(document["node_ids"])
+        ]
+        selected_bindings = [
+            binding
+            for binding in seed.get("implementation_bindings", [])
+            if binding["functional_node_id"] in selected_node_ids
+        ]
+        selected_implementation_ids = {
+            binding["implementation_node_id"] for binding in selected_bindings
+        }
+        selected_implementation = [
+            item
+            for item in seed.get("implementation", {}).get("nodes", [])
+            if item["implementation_id"] in selected_implementation_ids
+        ]
+        bench_observations = self.list_skill_observations(
+            project["project_id"], limit=request["bench_limit"]
+        ) if request["bench_limit"] else []
+        material = {
+            "schema": PROJECT_CONTEXT_PACK_SCHEMA,
+            "project_id": project["project_id"],
+            "seed": {
+                "seed_id": seed["seed_id"],
+                "seed_digest": seed["seed_digest"],
+                "source": seed["source"],
+            },
+            "purpose": request["purpose"],
+            "node_ids": request["node_ids"],
+            "project": seed["project"],
+            "functional_nodes": selected_nodes,
+            "functional_edges": selected_edges,
+            "implementation": {"nodes": selected_implementation},
+            "implementation_bindings": selected_bindings,
+            "documents": selected_documents,
+            "bench": {
+                "scope": "PROJECT_LOCAL_ONLY",
+                "observations": bench_observations,
+                "observation_count": len(bench_observations),
+            },
+            "effects": {
+                "project_source_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
+            },
+        }
+        material["context_pack_digest"] = _json_sha256(material)
+        material["context_pack_id"] = "context_" + material["context_pack_digest"][:24]
+        material["status"] = "CONTEXT_PACK_READY"
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT pack_json, created_at
+                FROM project_context_pack
+                WHERE context_pack_digest = ?
+                """,
+                (material["context_pack_digest"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["pack_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_context_pack(
+                    context_pack_id, project_id, seed_id, seed_digest,
+                    context_pack_digest, pack_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["context_pack_id"],
+                    project["project_id"],
+                    seed["seed_id"],
+                    seed["seed_digest"],
+                    material["context_pack_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def get_context_pack(self, project_id: str, context_pack_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_id = _identifier(context_pack_id, "context_pack_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT pack_json, created_at
+                FROM project_context_pack
+                WHERE project_id = ? AND context_pack_id = ?
+                """,
+                (project["project_id"], normalized_id),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "CONTEXT_PACK_NOT_FOUND",
+                "project has no matching Context Pack",
+                HTTPStatus.NOT_FOUND,
+            )
+        pack = json.loads(row["pack_json"])
+        pack["created_at"] = row["created_at"]
+        return pack
+
+    def list_context_packs(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT pack_json, created_at
+                FROM project_context_pack
+                WHERE project_id = ?
+                ORDER BY created_at DESC, context_pack_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], limit),
+            ).fetchall()
+        packs = []
+        for row in rows:
+            pack = json.loads(row["pack_json"])
+            pack["created_at"] = row["created_at"]
+            packs.append(pack)
+        return packs
+
+    def create_skill_plan_proposal(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_skill_plan_request(value)
+        pack = self.get_context_pack(project["project_id"], request["context_pack_id"])
+        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        for observation in pack["bench"]["observations"]:
+            skill = observation["skill"]
+            key = (
+                skill["skill_id"],
+                skill["skill_version"],
+                skill["operation_class"],
+                skill["context_pack_digest"],
+                observation["model_ref"],
+            )
+            candidate = grouped.setdefault(
+                key,
+                {
+                    "candidate_id": "skill_" + _json_sha256(key)[:24],
+                    "skill": skill,
+                    "model_ref": observation["model_ref"],
+                    "bench_rationale": {
+                        "scope": "PROJECT_LOCAL_ONLY",
+                        "observation_count": 0,
+                        "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
+                        "validation_states": {
+                            state: 0 for state in sorted(SKILL_VALIDATION_STATES)
+                        },
+                    },
+                    "selection_state": "USER_SELECTION_REQUIRED",
+                    "binding_state": "PROJECT_MASTER_BINDING_REQUIRED",
+                },
+            )
+            candidate["bench_rationale"]["observation_count"] += 1
+            candidate["bench_rationale"]["outcomes"][observation["outcome"]] += 1
+            candidate["bench_rationale"]["validation_states"][
+                observation["validation_state"]
+            ] += 1
+        candidates = sorted(
+            grouped.values(),
+            key=lambda item: (
+                -item["bench_rationale"]["observation_count"],
+                item["candidate_id"],
+            ),
+        )[: request["max_candidates"]]
+        material = {
+            "schema": PROJECT_SKILL_PLAN_SCHEMA,
+            "project_id": project["project_id"],
+            "context_pack_id": pack["context_pack_id"],
+            "context_pack_digest": pack["context_pack_digest"],
+            "purpose": request["purpose"],
+            "candidates": candidates,
+            "evidence_state": (
+                "PROJECT_LOCAL_BENCH_AVAILABLE"
+                if candidates
+                else "NO_PROJECT_LOCAL_BENCH_MATCHES"
+            ),
+            "effects": {
+                "project_source_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
+            },
+            "next_operation": "USER_SELECTION_REQUIRED",
+        }
+        material["proposal_digest"] = _json_sha256(material)
+        material["proposal_id"] = "skillplan_" + material["proposal_digest"][:24]
+        material["status"] = "SKILL_PLAN_PROPOSAL_READY"
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM project_skill_plan_proposal
+                WHERE proposal_digest = ?
+                """,
+                (material["proposal_digest"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["proposal_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_skill_plan_proposal(
+                    proposal_id, project_id, context_pack_id, proposal_digest,
+                    proposal_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["proposal_id"],
+                    project["project_id"],
+                    pack["context_pack_id"],
+                    material["proposal_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def list_skill_plan_proposals(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM project_skill_plan_proposal
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], limit),
+            ).fetchall()
+        proposals = []
+        for row in rows:
+            proposal = json.loads(row["proposal_json"])
+            proposal["created_at"] = row["created_at"]
+            proposals.append(proposal)
+        return proposals
+
+    def adopt_skill_plan(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_skill_plan_adoption_request(value)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json
+                FROM project_skill_plan_proposal
+                WHERE project_id = ? AND proposal_id = ?
+                """,
+                (project["project_id"], request["proposal_id"]),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "SKILL_PLAN_PROPOSAL_NOT_FOUND",
+                    "project has no matching Skill Plan proposal",
+                    HTTPStatus.NOT_FOUND,
+                )
+            proposal = json.loads(row["proposal_json"])
+            candidates = {
+                candidate["candidate_id"]: candidate
+                for candidate in proposal["candidates"]
+            }
+            unknown = set(request["candidate_ids"]) - set(candidates)
+            if unknown:
+                raise UniverseError(
+                    "SKILL_PLAN_SELECTION_INVALID",
+                    f"candidate_ids are not in the Skill Plan proposal: {', '.join(sorted(unknown))}",
+                    HTTPStatus.CONFLICT,
+                )
+            selected = [candidates[candidate_id] for candidate_id in request["candidate_ids"]]
+            material = {
+                "schema": PROJECT_SKILL_PLAN_ADOPTION_SCHEMA,
+                "project_id": project["project_id"],
+                "proposal_id": proposal["proposal_id"],
+                "proposal_digest": proposal["proposal_digest"],
+                "context_pack_id": proposal["context_pack_id"],
+                "selected_candidates": selected,
+                "binding_state": "PROJECT_MASTER_BINDING_REQUIRED",
+                "effects": {
+                    "project_source_write": "NONE",
+                    "authority": "NONE",
+                    "execution_assignment": "NONE",
+                    "task_frame": "NONE",
+                },
+                "next_operation": "PROJECT_MASTER_HANDOFF_CANDIDATE",
+            }
+            material["selection_digest"] = _json_sha256(material)
+            material["adoption_id"] = "skilladopt_" + material["selection_digest"][:24]
+            material["status"] = "SKILL_PLAN_ADOPTED"
+            existing = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM project_skill_plan_adoption
+                WHERE proposal_id = ? AND selection_digest = ?
+                """,
+                (proposal["proposal_id"], material["selection_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["adoption_json"])
+                stored["adopted_at"] = existing["adopted_at"]
+                return stored, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO project_skill_plan_adoption(
+                    adoption_id, project_id, proposal_id, selection_digest,
+                    adoption_json, adopted_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["adoption_id"],
+                    project["project_id"],
+                    proposal["proposal_id"],
+                    material["selection_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["adopted_at"] = now
+        return material, True
+
+    def list_skill_plan_adoptions(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM project_skill_plan_adoption
+                WHERE project_id = ?
+                ORDER BY adopted_at DESC, adoption_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], limit),
+            ).fetchall()
+        adoptions = []
+        for row in rows:
+            adoption = json.loads(row["adoption_json"])
+            adoption["adopted_at"] = row["adopted_at"]
+            adoptions.append(adoption)
+        return adoptions
 
     @staticmethod
     def _skill_observation_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -3918,6 +4436,45 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/context-packs":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_CONTEXT_PACKS_COLLECTED",
+                        "project_id": project_id,
+                        "context_packs": self.server.store.list_context_packs(
+                            project_id
+                        ),
+                    },
+                )
+                return
+            if suffix == "/skill-plan-proposals":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_PLAN_PROPOSALS_COLLECTED",
+                        "project_id": project_id,
+                        "proposals": self.server.store.list_skill_plan_proposals(
+                            project_id
+                        ),
+                    },
+                )
+                return
+            if suffix == "/skill-plan-adoptions":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_PLAN_ADOPTIONS_COLLECTED",
+                        "project_id": project_id,
+                        "adoptions": self.server.store.list_skill_plan_adoptions(
+                            project_id
+                        ),
+                    },
+                )
+                return
             if suffix == "/master-bridge":
                 self._send(
                     HTTPStatus.OK,
@@ -4134,6 +4691,53 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "SKILL_OBSERVATIONS_ALREADY_INGESTED"
                         ),
                         **result,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/context-packs":
+                pack, created = self.server.store.create_context_pack(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "CONTEXT_PACK_READY"
+                            if created
+                            else "CONTEXT_PACK_ALREADY_RECORDED"
+                        ),
+                        "context_pack": pack,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-plan-proposals":
+                proposal, created = self.server.store.create_skill_plan_proposal(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "SKILL_PLAN_PROPOSAL_READY"
+                            if created
+                            else "SKILL_PLAN_PROPOSAL_ALREADY_RECORDED"
+                        ),
+                        "proposal": proposal,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-plan-adoptions":
+                adoption, created = self.server.store.adopt_skill_plan(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "SKILL_PLAN_ADOPTED"
+                            if created
+                            else "SKILL_PLAN_ADOPTION_ALREADY_RECORDED"
+                        ),
+                        "adoption": adoption,
                     },
                 )
                 return
@@ -4377,6 +4981,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-bridge",
             "/room/messages",
             "/document-incorporation-proposals",
+            "/skill-plan-proposals",
+            "/skill-plan-adoptions",
+            "/context-packs",
             "/release-proposals",
             "/dispatches",
             "/discovery-dispatch",

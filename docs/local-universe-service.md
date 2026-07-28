@@ -100,6 +100,12 @@ GET    /v1/projects/{project_id}/events
 POST   /v1/projects/{project_id}/skill-observations
 GET    /v1/projects/{project_id}/skill-observations
 GET    /v1/bench/skills
+POST   /v1/projects/{project_id}/context-packs
+GET    /v1/projects/{project_id}/context-packs
+POST   /v1/projects/{project_id}/skill-plan-proposals
+GET    /v1/projects/{project_id}/skill-plan-proposals
+POST   /v1/projects/{project_id}/skill-plan-adoptions
+GET    /v1/projects/{project_id}/skill-plan-adoptions
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
 GET    /v1/templates/project-seed
@@ -149,6 +155,14 @@ ai-career Skill observation candidate. The service rejects raw source,
 prompts, commands, `skill_ref`, and arbitrary extension fields. Replaying the
 same candidate is idempotent; `GET /v1/bench/skills` returns aggregate observed
 counts, validation states, and metric totals without universal rankings.
+
+A Context Pack is built from a current Project Seed, selected functional node
+IDs, node-linked or project-wide document references, and a bounded set of
+redacted observations already recorded for that Project. It contains no raw
+project file content and creates no Task Frame. A Skill Plan proposal can use
+only the observations contained in that Context Pack. Explicit `ADOPTED`
+selection records a handoff candidate for the Project Master, but does not bind
+a Skill, start a Task Frame, create authority, or deliver a dispatch.
 
 ## Release and dispatch boundary
 

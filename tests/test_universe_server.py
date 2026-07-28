@@ -863,6 +863,111 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("REQUEST_INVALID", rejected["error_code"])
 
+    def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
+        self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            self.skill_observation_candidate(),
+            self.token,
+        )
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/context-packs",
+            {
+                "purpose": "Review the broker integration contract.",
+                "node_ids": ["broker-client"],
+                "bench_limit": 10,
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("CONTEXT_PACK_READY", result["status"])
+        pack = result["context_pack"]
+        self.assertEqual(["broker-client"], pack["node_ids"])
+        self.assertEqual(
+            {"architecture", "broker-contract"},
+            {document["document_id"] for document in pack["documents"]},
+        )
+        self.assertEqual("PROJECT_LOCAL_ONLY", pack["bench"]["scope"])
+        self.assertEqual(1, pack["bench"]["observation_count"])
+        self.assertEqual("NONE", pack["effects"]["task_frame"])
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/projects/GCS/context-packs",
+            {
+                "purpose": "Review the broker integration contract.",
+                "node_ids": ["broker-client"],
+                "bench_limit": 10,
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("CONTEXT_PACK_ALREADY_RECORDED", repeated["status"])
+
+        status, plan_result = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-plan-proposals",
+            {
+                "context_pack_id": pack["context_pack_id"],
+                "purpose": "Review the broker integration contract.",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("SKILL_PLAN_PROPOSAL_READY", plan_result["status"])
+        proposal = plan_result["proposal"]
+        self.assertEqual("PROJECT_LOCAL_BENCH_AVAILABLE", proposal["evidence_state"])
+        self.assertEqual(1, len(proposal["candidates"]))
+        candidate = proposal["candidates"][0]
+        self.assertEqual("source-review", candidate["skill"]["skill_id"])
+        self.assertEqual("PROJECT_MASTER_BINDING_REQUIRED", candidate["binding_state"])
+
+        status, adoption_result = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-plan-adoptions",
+            {
+                "proposal_id": proposal["proposal_id"],
+                "candidate_ids": [candidate["candidate_id"]],
+                "approval": "ADOPTED",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("SKILL_PLAN_ADOPTED", adoption_result["status"])
+        adoption = adoption_result["adoption"]
+        self.assertEqual("PROJECT_MASTER_HANDOFF_CANDIDATE", adoption["next_operation"])
+        self.assertEqual("NONE", adoption["effects"]["task_frame"])
+
+        status, collected = self.request(
+            "GET", "/v1/projects/GCS/skill-plan-adoptions", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([adoption["adoption_id"]], [item["adoption_id"] for item in collected["adoptions"]])
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+        status, rejected = self.request(
+            "POST",
+            "/v1/projects/GCS/context-packs",
+            {"purpose": "Unknown node", "node_ids": ["does-not-exist"]},
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("CONTEXT_PACK_NODE_UNKNOWN", rejected["error_code"])
+
     def test_dispatch_delivery_wake_and_result_lifecycle_is_durable(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         dispatch_request = {
