@@ -1214,6 +1214,59 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.assertEqual(before, after)
 
+    def test_experience_case_match_is_local_and_non_causal(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        first = self.skill_observation_candidate()
+        status, first_result = self.request(
+            "POST", "/v1/projects/GCS/skill-observations", first, self.token
+        )
+        self.assertEqual(201, status)
+        first_observation = first_result["observations"][0]["observation_id"]
+        second = json.loads(json.dumps(self.skill_observation_candidate()))
+        second["candidate_id"] = "skill-observation-gcs-002"
+        second["candidate"]["observations"][0]["observation_digest"] = "d" * 64
+        second["candidate"]["observations"][0]["evidence_refs"] = [
+            "receipt://gcs/test-002"
+        ]
+        status, second_result = self.request(
+            "POST", "/v1/projects/GCS/skill-observations", second, self.token
+        )
+        self.assertEqual(201, status)
+        second_observation = second_result["observations"][0]["observation_id"]
+
+        status, first_case_result = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {"observation_ids": [first_observation]},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        first_case = first_case_result["case"]
+        status, second_case_result = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {"observation_ids": [second_observation]},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        second_case = second_case_result["case"]
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-matches",
+            {"case_id": first_case["case_id"]},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("EXPERIENCE_CASE_MATCHES_COLLECTED", result["status"])
+        self.assertEqual("PROJECT_LOCAL_OBSERVED_CASES", result["match_scope"])
+        self.assertEqual([second_case["case_id"]], [item["case_id"] for item in result["matches"]])
+        match = result["matches"][0]
+        self.assertEqual("OBSERVED_SIMILARITY", match["relation"])
+        self.assertEqual("NOT_INFERRED", match["causal_state"])
+        self.assertEqual("NOT_EVALUATED", match["pattern_state"])
+        self.assertEqual("source-review", match["shared_skills"][0]["skill_id"])
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {

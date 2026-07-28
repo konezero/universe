@@ -115,6 +115,7 @@ GET    /v1/projects/{project_id}/master-handoffs
 POST   /v1/projects/{project_id}/master-handoffs/{handoff_id}/deliver
 POST   /v1/projects/{project_id}/experience-cases
 GET    /v1/projects/{project_id}/experience-cases
+POST   /v1/projects/{project_id}/experience-matches
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
 GET    /v1/templates/project-seed
@@ -203,6 +204,12 @@ An Experience Case records only existing redacted Skill observations for one
 Project. It starts as `case_state: OBSERVED`, `causal_state: NOT_INFERRED`, and
 `pattern_state: NOT_EVALUATED`. Universe does not turn a model explanation into
 a causal fact at case-record time.
+
+`POST /v1/projects/{project_id}/experience-matches` compares one recorded Case
+with other Cases from the same Project. It returns only explicit shared Skill
+bindings, Skill identities, outcomes, and validation states. Its relationship
+is `OBSERVED_SIMILARITY`, not causation, risk probability, or a promoted
+cross-project pattern.
 
 A Context Pack is built from a current Project Seed, selected functional node
 IDs, node-linked or project-wide document references, and a bounded set of

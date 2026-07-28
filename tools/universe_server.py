@@ -1164,6 +1164,25 @@ def normalize_experience_case_request(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def normalize_experience_match_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="experience_match_request",
+        required=frozenset({"case_id"}),
+        optional=frozenset({"limit"}),
+    )
+    limit = request.get("limit", 20)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise UniverseError(
+            "EXPERIENCE_MATCH_LIMIT_INVALID",
+            "limit must be an integer from 1 through 100",
+        )
+    return {
+        "case_id": _identifier(request["case_id"], "case_id"),
+        "limit": limit,
+    }
+
+
 def normalize_context_pack_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -3550,6 +3569,125 @@ class UniverseStore:
             cases.append(case)
         return cases
 
+    def get_experience_case(self, project_id: str, case_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_id = _identifier(case_id, "case_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT case_json, created_at
+                FROM experience_case
+                WHERE project_id = ? AND case_id = ?
+                """,
+                (project["project_id"], normalized_id),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "EXPERIENCE_CASE_NOT_FOUND",
+                "Experience Case does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        case = json.loads(row["case_json"])
+        case["created_at"] = row["created_at"]
+        return case
+
+    def match_experience_case(self, project_id: str, value: Any) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        request = normalize_experience_match_request(value)
+        subject = self.get_experience_case(project["project_id"], request["case_id"])
+        candidates = [
+            case
+            for case in self.list_experience_cases(project["project_id"], limit=500)
+            if case["case_id"] != subject["case_id"]
+        ]
+        subject_observations = subject["observations"]
+        subject_bindings = {
+            observation["skill_binding_digest"] for observation in subject_observations
+        }
+        subject_skills = {
+            (
+                observation["skill"]["skill_id"],
+                observation["skill"]["skill_version"],
+                observation["skill"]["operation_class"],
+            )
+            for observation in subject_observations
+        }
+        subject_outcomes = {observation["outcome"] for observation in subject_observations}
+        subject_validation = {
+            observation["validation_state"] for observation in subject_observations
+        }
+        matches = []
+        for candidate in candidates:
+            observations = candidate["observations"]
+            bindings = {item["skill_binding_digest"] for item in observations}
+            skills = {
+                (
+                    item["skill"]["skill_id"],
+                    item["skill"]["skill_version"],
+                    item["skill"]["operation_class"],
+                )
+                for item in observations
+            }
+            outcomes = {item["outcome"] for item in observations}
+            validation_states = {item["validation_state"] for item in observations}
+            shared_bindings = sorted(subject_bindings & bindings)
+            shared_skills = sorted(subject_skills & skills)
+            shared_outcomes = sorted(subject_outcomes & outcomes)
+            shared_validation = sorted(subject_validation & validation_states)
+            observed_dimension_count = sum(
+                bool(value)
+                for value in (
+                    shared_bindings,
+                    shared_skills,
+                    shared_outcomes,
+                    shared_validation,
+                )
+            )
+            if not observed_dimension_count:
+                continue
+            matches.append(
+                {
+                    "case_id": candidate["case_id"],
+                    "title": candidate.get("title"),
+                    "relation": "OBSERVED_SIMILARITY",
+                    "observed_dimension_count": observed_dimension_count,
+                    "shared_skill_binding_digests": shared_bindings,
+                    "shared_skills": [
+                        {
+                            "skill_id": skill_id,
+                            "skill_version": skill_version,
+                            "operation_class": operation_class,
+                        }
+                        for skill_id, skill_version, operation_class in shared_skills
+                    ],
+                    "shared_outcomes": shared_outcomes,
+                    "shared_validation_states": shared_validation,
+                    "causal_state": "NOT_INFERRED",
+                    "pattern_state": "NOT_EVALUATED",
+                }
+            )
+        matches.sort(
+            key=lambda item: (
+                -item["observed_dimension_count"],
+                item["case_id"],
+            )
+        )
+        return {
+            "schema": "universe.experience-case-match.v1",
+            "status": "EXPERIENCE_CASE_MATCHES_COLLECTED",
+            "project_id": project["project_id"],
+            "subject_case_id": subject["case_id"],
+            "matches": matches[: request["limit"]],
+            "match_scope": "PROJECT_LOCAL_OBSERVED_CASES",
+            "effects": {
+                "project_source_write": "NONE",
+                "project_runtime_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "USER_REVIEW_OR_PATTERN_PROPOSAL",
+        }
+
     def deliver_master_handoff(
         self, project_id: str, handoff_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -5693,6 +5831,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/experience-matches":
+                result = self.server.store.match_experience_case(parts[0], body)
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
             if parts is not None and parts[1] == "/master-bridge":
                 bridge, created = self.server.store.register_master_bridge(
                     parts[0], body
@@ -5937,6 +6079,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/skill-plan-adoptions",
             "/master-handoffs",
             "/experience-cases",
+            "/experience-matches",
             "/context-packs",
             "/release-proposals",
             "/dispatches",
