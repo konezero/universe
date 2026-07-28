@@ -78,6 +78,7 @@ PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
     "universe.project-archive-receipt-candidate.v1"
 )
 EXPERIENCE_CASE_SCHEMA = "universe.experience-case.v1"
+EXPERIENCE_PATTERN_PROPOSAL_SCHEMA = "universe.experience-pattern-proposal.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1183,6 +1184,29 @@ def normalize_experience_match_request(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_experience_pattern_proposal_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="experience_pattern_proposal_request",
+        required=frozenset({"case_id"}),
+        optional=frozenset({"minimum_support"}),
+    )
+    minimum_support = request.get("minimum_support", 2)
+    if (
+        isinstance(minimum_support, bool)
+        or not isinstance(minimum_support, int)
+        or not 2 <= minimum_support <= 100
+    ):
+        raise UniverseError(
+            "EXPERIENCE_PATTERN_SUPPORT_INVALID",
+            "minimum_support must be an integer from 2 through 100",
+        )
+    return {
+        "case_id": _identifier(request["case_id"], "case_id"),
+        "minimum_support": minimum_support,
+    }
+
+
 def normalize_context_pack_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -2137,6 +2161,20 @@ class UniverseStore:
                         ON DELETE RESTRICT,
                     PRIMARY KEY(case_id, observation_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS experience_pattern_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    proposal_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, proposal_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS experience_pattern_proposal_project_time
+                ON experience_pattern_proposal(project_id, created_at, proposal_id);
 
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
@@ -3687,6 +3725,165 @@ class UniverseStore:
             },
             "next_operation": "USER_REVIEW_OR_PATTERN_PROPOSAL",
         }
+
+    def create_experience_pattern_proposal(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_experience_pattern_proposal_request(value)
+        subject = self.get_experience_case(project["project_id"], request["case_id"])
+        match_result = self.match_experience_case(
+            project["project_id"],
+            {"case_id": subject["case_id"], "limit": 100},
+        )
+        supporting_ids = [subject["case_id"]] + [
+            match["case_id"] for match in match_result["matches"]
+        ]
+        if len(supporting_ids) < request["minimum_support"]:
+            raise UniverseError(
+                "EXPERIENCE_PATTERN_INSUFFICIENT_SUPPORT",
+                "not enough observed Cases share a supported similarity dimension",
+                HTTPStatus.CONFLICT,
+            )
+        by_id = {
+            case["case_id"]: case
+            for case in self.list_experience_cases(project["project_id"], limit=500)
+        }
+        supporting_cases = [by_id[case_id] for case_id in supporting_ids]
+
+        common_bindings = sorted(
+            set.intersection(
+                *[
+                    {
+                        observation["skill_binding_digest"]
+                        for observation in case["observations"]
+                    }
+                    for case in supporting_cases
+                ]
+            )
+        )
+        common_outcomes = sorted(
+            set.intersection(
+                *[
+                    {observation["outcome"] for observation in case["observations"]}
+                    for case in supporting_cases
+                ]
+            )
+        )
+        common_validation_states = sorted(
+            set.intersection(
+                *[
+                    {
+                        observation["validation_state"]
+                        for observation in case["observations"]
+                    }
+                    for case in supporting_cases
+                ]
+            )
+        )
+        skill_signatures = [
+            {
+                _canonical_json(
+                    {
+                        "skill_id": observation["skill"]["skill_id"],
+                        "skill_version": observation["skill"]["skill_version"],
+                        "operation_class": observation["skill"]["operation_class"],
+                    }
+                )
+                for observation in case["observations"]
+            }
+            for case in supporting_cases
+        ]
+        common_skills = (
+            set.intersection(*skill_signatures) if skill_signatures else set()
+        )
+        if not any(
+            (common_bindings, common_skills, common_outcomes, common_validation_states)
+        ):
+            raise UniverseError(
+                "EXPERIENCE_PATTERN_SIGNATURE_EMPTY",
+                "supporting Cases do not have an exact observed signature in common",
+                HTTPStatus.CONFLICT,
+            )
+        material = {
+            "schema": EXPERIENCE_PATTERN_PROPOSAL_SCHEMA,
+            "project_id": project["project_id"],
+            "subject_case_id": subject["case_id"],
+            "support_case_ids": sorted(supporting_ids),
+            "support_case_count": len(supporting_ids),
+            "observed_signature": {
+                "skill_binding_digests": common_bindings,
+                "skills": [json.loads(signature) for signature in sorted(common_skills)],
+                "outcomes": common_outcomes,
+                "validation_states": common_validation_states,
+            },
+            "causal_state": "NOT_INFERRED",
+            "predictive_state": "NOT_EVALUATED",
+            "promotion_state": "PROPOSAL_ONLY",
+            "effects": {
+                "career_governance_write": "NONE",
+                "project_source_write": "NONE",
+                "project_runtime_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "USER_REVIEW_OR_PATTERN_ADOPTION",
+        }
+        material["proposal_digest"] = _json_sha256(material)
+        material["proposal_id"] = "patternproposal_" + material["proposal_digest"][:24]
+        material["status"] = "EXPERIENCE_PATTERN_PROPOSAL_READY"
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM experience_pattern_proposal
+                WHERE project_id = ? AND proposal_digest = ?
+                """,
+                (project["project_id"], material["proposal_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["proposal_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO experience_pattern_proposal(
+                    proposal_id, project_id, proposal_digest, proposal_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    material["proposal_id"],
+                    project["project_id"],
+                    material["proposal_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def list_experience_pattern_proposals(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM experience_pattern_proposal
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        proposals = []
+        for row in rows:
+            proposal = json.loads(row["proposal_json"])
+            proposal["created_at"] = row["created_at"]
+            proposals.append(proposal)
+        return proposals
 
     def deliver_master_handoff(
         self, project_id: str, handoff_id: str, value: Any
@@ -5481,6 +5678,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/experience-pattern-proposals":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "EXPERIENCE_PATTERN_PROPOSALS_COLLECTED",
+                        "project_id": project_id,
+                        "proposals": self.server.store.list_experience_pattern_proposals(
+                            project_id
+                        ),
+                    },
+                )
+                return
             if suffix == "/master-bridge":
                 self._send(
                     HTTPStatus.OK,
@@ -5835,6 +6045,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.store.match_experience_case(parts[0], body)
                 self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 return
+            if parts is not None and parts[1] == "/experience-pattern-proposals":
+                proposal, created = self.server.store.create_experience_pattern_proposal(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "EXPERIENCE_PATTERN_PROPOSAL_RECORDED"
+                            if created
+                            else "EXPERIENCE_PATTERN_PROPOSAL_ALREADY_RECORDED"
+                        ),
+                        "proposal": proposal,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/master-bridge":
                 bridge, created = self.server.store.register_master_bridge(
                     parts[0], body
@@ -6080,6 +6307,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-handoffs",
             "/experience-cases",
             "/experience-matches",
+            "/experience-pattern-proposals",
             "/context-packs",
             "/release-proposals",
             "/dispatches",

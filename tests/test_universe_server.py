@@ -1267,6 +1267,35 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("NOT_EVALUATED", match["pattern_state"])
         self.assertEqual("source-review", match["shared_skills"][0]["skill_id"])
 
+        status, proposal_result = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-pattern-proposals",
+            {"case_id": first_case["case_id"]},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(
+            "EXPERIENCE_PATTERN_PROPOSAL_RECORDED", proposal_result["status"]
+        )
+        proposal = proposal_result["proposal"]
+        self.assertEqual(2, proposal["support_case_count"])
+        self.assertEqual("PROPOSAL_ONLY", proposal["promotion_state"])
+        self.assertEqual("NOT_INFERRED", proposal["causal_state"])
+        self.assertEqual("NOT_EVALUATED", proposal["predictive_state"])
+        self.assertEqual("source-review", proposal["observed_signature"]["skills"][0]["skill_id"])
+        self.assertTrue(all(value == "NONE" for value in proposal["effects"].values()))
+
+        status, collected = self.request(
+            "GET",
+            "/v1/projects/GCS/experience-pattern-proposals",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [proposal["proposal_id"]],
+            [item["proposal_id"] for item in collected["proposals"]],
+        )
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {

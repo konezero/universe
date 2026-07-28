@@ -116,6 +116,8 @@ POST   /v1/projects/{project_id}/master-handoffs/{handoff_id}/deliver
 POST   /v1/projects/{project_id}/experience-cases
 GET    /v1/projects/{project_id}/experience-cases
 POST   /v1/projects/{project_id}/experience-matches
+POST   /v1/projects/{project_id}/experience-pattern-proposals
+GET    /v1/projects/{project_id}/experience-pattern-proposals
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
 GET    /v1/templates/project-seed
@@ -210,6 +212,11 @@ with other Cases from the same Project. It returns only explicit shared Skill
 bindings, Skill identities, outcomes, and validation states. Its relationship
 is `OBSERVED_SIMILARITY`, not causation, risk probability, or a promoted
 cross-project pattern.
+
+An Experience Pattern proposal needs at least two recorded Cases with an exact
+observed signature in common. It stores support case IDs and the shared Skill,
+outcome, and validation dimensions, but remains `promotion_state: PROPOSAL_ONLY`.
+It never writes Career governance or adds a Task Frame constraint.
 
 A Context Pack is built from a current Project Seed, selected functional node
 IDs, node-linked or project-wide document references, and a bounded set of
