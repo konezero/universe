@@ -208,8 +208,21 @@ button {
 }
 
 .project-item.selected {
-  border-color: #9bc9c5;
-  background: #edf8f7;
+  border-color: rgba(65, 215, 195, 0.72);
+  background: rgba(65, 215, 195, 0.16);
+}
+
+.project-item.selected .project-name {
+  color: #f3fffd;
+}
+
+.project-item.selected .project-meta {
+  color: #b7f5ed;
+}
+
+.project-item.selected .project-avatar {
+  background: rgba(65, 215, 195, 0.22);
+  color: #d5fffa;
 }
 
 .project-avatar {
@@ -626,6 +639,22 @@ textarea:focus {
 
 .inspector {
   display: none;
+  position: fixed;
+  z-index: 10;
+  top: 64px;
+  right: 16px;
+  width: min(360px, calc(100vw - 260px));
+  max-height: calc(100vh - 154px);
+  overflow: hidden;
+  border: 1px solid rgba(126, 162, 213, 0.42);
+  border-radius: 8px;
+  background: rgba(11, 16, 27, 0.94);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+body.inspector-open .inspector {
+  display: block;
 }
 
 .inspector-tabs {
@@ -647,6 +676,17 @@ textarea:focus {
   border-bottom-color: var(--teal);
   color: var(--text);
   font-weight: 650;
+}
+
+#close-inspector {
+  flex: 0 0 38px;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+}
+
+#close-inspector:hover {
+  color: var(--text);
+  background: var(--surface-quiet);
 }
 
 .inspector-panel {

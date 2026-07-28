@@ -38,6 +38,8 @@ const elements = {
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
+  roomContext: document.querySelector("#room-context"),
+  closeInspector: document.querySelector("#close-inspector"),
   nodeBreadcrumb: document.querySelector("#node-breadcrumb"),
   nodeBreadcrumbProject: document.querySelector("#node-breadcrumb-project"),
   nodeBreadcrumbNode: document.querySelector("#node-breadcrumb-node"),
@@ -277,6 +279,7 @@ async function selectProject(projectId) {
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
+  elements.roomContext.textContent = `${project.project_id} · Project Master`;
   buildGraph();
   renderDetails();
   renderActivity();
@@ -580,6 +583,14 @@ function exitNodeUniverse() {
   renderDetails();
 }
 
+function closeInspector() {
+  state.focusedNodeId = null;
+  state.selectedNode = null;
+  document.body.classList.remove("inspector-open");
+  buildGraph();
+  renderDetails();
+}
+
 function buildTimelineGraph() {
   const project = state.selectedProject;
   const projection = state.projection || {};
@@ -621,6 +632,32 @@ function buildTimelineGraph() {
   if (!functional.length) {
     nodes.push({ id: "seed:pending", label: "Prepare Project Seed", kind: "predicted", data: {}, x: -80, y: 0 });
     edges.push({ from: `project:${project.project_id}`, to: "seed:pending", kind: "predicts" });
+  }
+
+  if (!focus && !rootSelected) {
+    const documentsByOwner = new Map();
+    for (const document of projection.documents || []) {
+      const ownerId = document.node_ids?.[0] ? `node:${document.node_ids[0]}` : `project:${project.project_id}`;
+      const group = documentsByOwner.get(ownerId) || [];
+      group.push(document);
+      documentsByOwner.set(ownerId, group);
+    }
+    for (const [ownerId, documents] of documentsByOwner) {
+      const owner = nodes.find((item) => item.id === ownerId) || nodes[0];
+      documents.forEach((document, index) => {
+        const id = `document:${document.document_id}`;
+        const isProjectDocument = owner.kind === "project";
+        nodes.push({
+          id,
+          label: document.title || readableLabel(document.document_id),
+          kind: "document",
+          data: document,
+          x: owner.x + (index - (documents.length - 1) / 2) * 126,
+          y: isProjectDocument ? -154 : owner.y + (owner.y >= 0 ? 136 : -136),
+        });
+        edges.push({ from: owner.id, to: id, kind: "documents" });
+      });
+    }
   }
 
   if (focus) {
@@ -715,7 +752,10 @@ function buildTimelineGraph() {
   state.graph.nodes = nodes;
   state.graph.edges = edges;
   state.graph.scale = 1;
-  state.graph.x = 0;
+  state.graph.x =
+    window.innerWidth <= 720 && functional.length
+      ? spacing * (functional.length / 2 + 0.2)
+      : 0;
   state.graph.y = 0;
   elements.graphEmpty.classList.toggle("hidden", nodes.length > 0);
   elements.nodeBreadcrumb.classList.add("hidden");
@@ -992,6 +1032,7 @@ function renderDetails() {
     return;
   }
   const selected = state.selectedNode;
+  document.body.classList.toggle("inspector-open", Boolean(selected));
   const heading = node("div", "detail-group");
   heading.append(
     node(
@@ -1173,6 +1214,8 @@ async function deliverDispatch(dispatchId) {
 function renderEmpty() {
   elements.workspaceTitle.textContent = "Project network";
   elements.workspaceSubtitle.textContent = "No project selected";
+  elements.roomContext.textContent = "Project Master";
+  document.body.classList.remove("inspector-open");
   elements.graphEmpty.classList.remove("hidden");
   state.graph.nodes = [];
   state.graph.edges = [];
@@ -1320,6 +1363,7 @@ function bindEvents() {
   elements.dispatchForm.addEventListener("submit", submitDispatch);
   elements.prepareProject.addEventListener("click", prepareProjectSeed);
   elements.exitNodeUniverse.addEventListener("click", exitNodeUniverse);
+  elements.closeInspector.addEventListener("click", closeInspector);
   elements.conversationToggle.addEventListener("click", () => {
     const collapsed = elements.conversationLayer.classList.toggle("collapsed");
     elements.conversationToggle.textContent = collapsed ? "+" : "-";
@@ -1334,7 +1378,6 @@ function bindEvents() {
   });
   elements.projectForm.addEventListener("submit", submitProject);
   elements.releaseForm.addEventListener("submit", submitRelease);
-  elements.accessForm.addEventListener("submit", submitAccess);
   for (const button of document.querySelectorAll("[data-close-dialog]")) {
     button.addEventListener("click", () => button.closest("dialog").close());
   }

@@ -45,12 +45,13 @@
           <p id="workspace-subtitle">Select a project universe to inspect its timeline</p>
         </div>
         <div class="graph-toolbar-actions">
-          <button id="prepare-project-button" class="secondary-button" type="button">
-            Prepare Project Seed
+          <button id="prepare-project-button" class="secondary-button" type="button" title="Queue a project-map discovery request for the Project Master">
+            Request Project Map
           </button>
           <div class="segmented-control" aria-label="Graph view">
             <button type="button" class="selected" data-view="timeline">Timeline</button>
             <button type="button" data-view="universe">Universe map</button>
+            <button type="button" data-view="documents">Documents</button>
           </div>
         </div>
       </div>
@@ -78,13 +79,14 @@
           <span><i class="node-key project"></i>Adopted path</span>
           <span><i class="node-key system"></i>Parallel work</span>
           <span><i class="node-key predicted"></i>Future branch</span>
+          <span><i class="node-key document"></i>Documents</span>
         </div>
       </div>
       <form id="dispatch-form" class="command-composer project-room">
         <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
         <textarea id="dispatch-instruction" name="instruction" rows="3" placeholder="Message the Project Master" required></textarea>
         <div class="room-actions">
-          <span class="room-context">GCS · Project Master</span>
+          <span id="room-context" class="room-context">Project Master</span>
           <span class="room-hint">Review, design, question, or implementation request</span>
         </div>
         <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send message" aria-label="Send message">
@@ -93,10 +95,11 @@
       </form>
     </main>
 
-    <aside class="inspector">
+    <aside class="inspector" aria-label="Selected project context">
       <div class="inspector-tabs" role="tablist">
         <button class="selected" type="button" data-tab="details">Details</button>
         <button type="button" data-tab="activity">Activity</button>
+        <button id="close-inspector" class="icon-button compact" type="button" title="Close selected context" aria-label="Close selected context">&times;</button>
       </div>
       <section id="details-panel" class="inspector-panel"></section>
       <section id="activity-panel" class="inspector-panel hidden"></section>
