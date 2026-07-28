@@ -166,6 +166,11 @@ After user adoption, Universe produces a Project Seed and implementation
 handoff. The Project Master decomposes the selected route into Task Frames and
 performs source work through the Project Runtime and its guards.
 
+For an already recorded Project Seed, Universe may prepare an exact five-file
+Seed asset proposal for the Project Master. That proposal is read-only and
+digest-bound; it cannot create `.ai/universe/`, create a write receipt, or
+replace the Project Master's approval and validation path.
+
 The Universe Project Room and Project Master Bridge are discussion and
 delivery surfaces only. They do not create vendor chat sessions, execute source
 changes, or turn a design selection into a repository mutation.
@@ -274,7 +279,9 @@ relations remain distinct from observed evidence. Career adoption is separate.
    The local publisher and receipt are implemented; Project-owned archive
    retention remains a separate `HANDOFF_APPEND` integration.
 6. Hand selected Project Seeds and Skill Plans to Project Masters through the
-   existing handoff and Bridge boundaries.
+   existing handoff and Bridge boundaries. Exact-byte Seed asset proposal
+   preparation is implemented; receipt-aware Project Master application is
+   the next Project Runtime integration.
 7. Add Experience and causal comparison only after observed Skill data exists.
 
 ## Explicit Deferred Boundary

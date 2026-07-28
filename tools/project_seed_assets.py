@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import base64
 from pathlib import Path
 from typing import Any
 
 
 ASSET_MANIFEST_SCHEMA = "universe.project-seed-assets.v1"
+ASSET_PROPOSAL_SCHEMA = "universe.project-seed-asset-proposal.v1"
 FUNCTIONAL_GRAPH_SCHEMA = "universe.functional-graph.v1"
 IMPLEMENTATION_GRAPH_SCHEMA = "universe.implementation-graph.v1"
 BINDINGS_SCHEMA = "universe.implementation-bindings.v1"
@@ -80,6 +82,60 @@ def build_project_seed_asset_bundle(seed: dict[str, Any]) -> dict[str, bytes]:
     }
     payloads["manifest.json"] = canonical_json(manifest) + b"\n"
     return payloads
+
+
+def build_project_seed_asset_proposal(seed: dict[str, Any]) -> dict[str, Any]:
+    """Build a read-only, exact-byte proposal for Project Master application.
+
+    The Universe service may prepare this object but must never materialize it
+    into a Project. The receiving Project Master binds each asset to its normal
+    receipt-aware Project Runtime state write scope before decoding or writing.
+    """
+
+    payloads = build_project_seed_asset_bundle(seed)
+    assets = [
+        {
+            "target_path": (ASSET_ROOT / relative_path).as_posix(),
+            "operation": "CREATE_OR_REPLACE",
+            "sha256": sha256_bytes(content),
+            "content_base64": base64.b64encode(content).decode("ascii"),
+        }
+        for relative_path, content in sorted(payloads.items())
+    ]
+    material = {
+        "schema": ASSET_PROPOSAL_SCHEMA,
+        "project_id": seed["project_id"],
+        "seed_id": seed["seed_id"],
+        "seed_digest": seed["seed_digest"],
+        "assets": [
+            {
+                "target_path": asset["target_path"],
+                "operation": asset["operation"],
+                "sha256": asset["sha256"],
+            }
+            for asset in assets
+        ],
+    }
+    return {
+        **material,
+        "proposal_id": "seed_assets_" + sha256_bytes(canonical_json(material))[:24],
+        "proposal_digest": sha256_bytes(canonical_json(material)),
+        "target_root": ASSET_ROOT.as_posix(),
+        "source": seed["source"],
+        "assets": assets,
+        "effects": {
+            "project_source_write": "NONE",
+            "project_runtime_state_write": "PROPOSED",
+            "universe_publish": "NONE",
+            "career_promotion": "NONE",
+        },
+        "apply_contract": {
+            "owner": "PROJECT_MASTER",
+            "approval": "EXACT_USER_APPROVAL_REQUIRED",
+            "write_path": "RECEIPT_AWARE_PROJECT_RUNTIME_STATE_WRITE",
+            "validation": "MANIFEST_AND_ASSET_DIGESTS_REQUIRED",
+        },
+    }
 
 
 def materialize_project_seed_assets(project_root: Path, seed: dict[str, Any]) -> dict[str, Any]:

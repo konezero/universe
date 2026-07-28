@@ -40,6 +40,7 @@ from universe_dispatch import (
 )
 from project_seed_assets import (
     ProjectSeedAssetError,
+    build_project_seed_asset_proposal,
     load_project_seed_assets,
     project_seed_template,
 )
@@ -51,6 +52,7 @@ UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
+PROJECT_SEED_ASSET_PROPOSAL_SCHEMA = "universe.project-seed-asset-proposal.v1"
 PROJECT_PROJECTION_SCHEMA = "universe.project-projection.v1"
 PROJECT_DISCOVERY_DISPATCH_SCHEMA = "universe.project-discovery-dispatch.v1"
 DOCUMENT_PROPOSAL_SCHEMA = "universe.document-incorporation-proposal.v1"
@@ -4412,6 +4414,25 @@ class UniverseStore:
         seed["is_current"] = bool(row["is_current"])
         return seed
 
+    def prepare_project_seed_asset_proposal(self, project_id: str) -> dict[str, Any]:
+        """Prepare assets for a Project Master without modifying the Project."""
+
+        seed = self.get_project_seed(project_id)
+        if not seed["is_current"]:
+            raise UniverseError(
+                "PROJECT_SEED_NOT_CURRENT",
+                "asset proposal may only be prepared from the current Project Seed",
+                HTTPStatus.CONFLICT,
+            )
+        proposal = build_project_seed_asset_proposal(seed)
+        if proposal["schema"] != PROJECT_SEED_ASSET_PROPOSAL_SCHEMA:
+            raise UniverseError(
+                "PROJECT_SEED_ASSET_PROPOSAL_INVALID",
+                "prepared Project Seed asset proposal has an unexpected schema",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        return proposal
+
     def build_project_projection(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -5739,6 +5760,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/seed-asset-proposal":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SEED_ASSET_PROPOSAL_READY",
+                        "proposal": self.server.store.prepare_project_seed_asset_proposal(
+                            project_id
+                        ),
+                    },
+                )
+                return
             if suffix == "/projection":
                 self._send(
                     HTTPStatus.OK,
@@ -6315,6 +6348,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/projection",
             "/events",
             "/skill-observations",
+            "/seed-asset-proposal",
             "/seed",
             "/sync",
         ):

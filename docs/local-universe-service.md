@@ -369,6 +369,13 @@ functional graph, implementation graph, functional-to-implementation bindings,
 and document catalog. Universe verifies the manifest and its file digests,
 reconstructs the Seed, and stores no raw project source content.
 
+For a recorded current Seed, Universe can return a read-only
+`universe.project-seed-asset-proposal.v1` containing the exact five target
+paths, encoded bytes, and per-asset SHA-256 values. It is a preparation aid
+for the Project Master, not a project mutation API: the Project Master still
+requires exact user approval, receipt-aware Project Runtime state writes, and
+post-write manifest validation before `.ai/universe/` exists or changes.
+
 Building a Projection returns the current node/edge/document map, structural
 gaps, and user-selectable predicted paths. The UI places component documents
 next to their linked system nodes and Project-wide documents next to the main

@@ -1740,6 +1740,49 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(".ai/universe", template["template"]["asset_root"])
 
+    def test_project_seed_asset_proposal_is_exact_and_read_only(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        status, seeded = self.request(
+            "POST", "/v1/projects/GCS/seed", self.project_seed(), self.token
+        )
+        self.assertEqual(201, status)
+
+        status, result = self.request(
+            "GET", "/v1/projects/GCS/seed-asset-proposal", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_SEED_ASSET_PROPOSAL_READY", result["status"])
+        proposal = result["proposal"]
+        self.assertEqual("universe.project-seed-asset-proposal.v1", proposal["schema"])
+        self.assertEqual(seeded["seed"]["seed_digest"], proposal["seed_digest"])
+        self.assertEqual(".ai/universe", proposal["target_root"])
+        self.assertEqual("NONE", proposal["effects"]["project_source_write"])
+        self.assertEqual("PROPOSED", proposal["effects"]["project_runtime_state_write"])
+        self.assertEqual(
+            {
+                ".ai/universe/manifest.json",
+                ".ai/universe/functional-graph.json",
+                ".ai/universe/implementation-graph.json",
+                ".ai/universe/bindings.json",
+                ".ai/universe/documents.json",
+            },
+            {asset["target_path"] for asset in proposal["assets"]},
+        )
+        self.assertTrue(all(len(asset["sha256"]) == 64 for asset in proposal["assets"]))
+        self.assertTrue(all(asset["content_base64"] for asset in proposal["assets"]))
+        self.assertFalse((self.project_root / ".ai" / "universe").exists())
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
     def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, result = self.request(
