@@ -10,6 +10,7 @@ import threading
 import unittest
 import uuid
 from dataclasses import replace
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -2121,6 +2122,62 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("peer://universe/example", profile.endpoint)
         with self.assertRaisesRegex(UniverseError, "reserved but not implemented"):
             auth_provider_for(profile, "not-used")
+
+    def test_runtime_worker_invocation_is_redacted_and_idempotent(self) -> None:
+        class FakeRuntimeHost:
+            def provider_capabilities(self) -> list[dict[str, str]]:
+                return [{"provider": "GROK", "status": "AVAILABLE"}]
+
+            def invoke_read_only(self, request: dict[str, object]) -> dict[str, object]:
+                self.request = request
+                return {
+                    "status": "TASK_FRAME_RESULT_RECORDED",
+                    "provider": "GROK",
+                    "worker_id": "grok-worker-001",
+                    "result_receipt_ref": "result-001",
+                    "repository_write": False,
+                }
+
+        self.server.runtime_host = FakeRuntimeHost()
+        status, _ = self.request("POST", "/v1/projects/register", self.registration())
+        self.assertEqual(HTTPStatus.CREATED, status)
+        status, providers = self.request("GET", "/v1/runtime/providers")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AVAILABLE", providers["providers"][0]["status"])
+        payload = {
+            "schema": "universe.runtime-worker-invocation-request.v1",
+            "invocation_id": "runtime-worker-001",
+            "provider": "GROK",
+            "endpoint": "http://127.0.0.1:19090",
+            "token": "never-store-this-token",
+            "session_id": "session-001",
+            "frame_id": "frame-001",
+            "turn_id": "turn-001",
+            "invoker_actor_ref": "universe-host",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "context_pack": {"prompt": "must not persist"},
+            "output_contract": {"format": "review"},
+            "max_turns": 1,
+        }
+        path = "/v1/projects/GCS/runtime-worker-invocations"
+        status, created = self.request("POST", path, payload)
+        self.assertEqual(HTTPStatus.CREATED, status)
+        encoded = json.dumps(created, sort_keys=True)
+        self.assertNotIn("never-store-this-token", encoded)
+        self.assertNotIn("must not persist", encoded)
+        self.assertFalse(created["invocation"]["result"]["repository_write"])
+        self.assertEqual(
+            "result-001",
+            created["invocation"]["result"]["result_receipt_ref"],
+        )
+        self.assertNotIn("worker_run_ref", created["invocation"]["result"])
+        status, repeated = self.request("POST", path, payload)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("RUNTIME_WORKER_INVOCATION_ALREADY_RECORDED", repeated["status"])
+        status, listed = self.request("GET", path)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(listed["invocations"]))
 
 
 if __name__ == "__main__":

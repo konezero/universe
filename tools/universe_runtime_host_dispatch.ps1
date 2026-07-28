@@ -7,7 +7,19 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+$dispatchProvider = ''
+$stage = 'DISPATCH_SETUP'
+trap {
+    [ordered]@{
+        status = 'WORKER_TRANSPORT_FAILED'
+        provider = $dispatchProvider
+        stage = $stage
+        reason = 'DISPATCH_EXCEPTION'
+        repository_write = $false
+    } | ConvertTo-Json -Depth 6
+    exit 4
+}
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $stateRoot = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     Join-Path $env:TEMP 'Universe'
 } else {
@@ -35,41 +47,50 @@ function Get-ProviderCapability([string]$Name) {
     $normalized = $Name.Trim().ToUpperInvariant()
     if ($normalized -eq 'GROK') { return Get-GrokCapability }
     if ($normalized -eq 'CODEX') {
-        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repositoryRoot 'tools\runtime_host\codex\worker.ps1') -CapabilityOnly
+        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repositoryRoot 'tools\universe_runtime_host_codex_worker.ps1') -CapabilityOnly
         return (($output -join "`n") | ConvertFrom-Json)
     }
     return [ordered]@{ status='UNAVAILABLE'; provider=$normalized; reason='WORKER_PROVIDER_UNSUPPORTED' }
 }
 
 if ($CapabilityOnly) {
+    $stage = 'CAPABILITY_CHECK'
     if ([string]::IsNullOrWhiteSpace($Provider)) { throw 'Provider is required for capability check.' }
     Get-ProviderCapability $Provider | ConvertTo-Json -Depth 6
     exit 0
 }
+$stage = 'REQUEST_LOAD'
 if ([string]::IsNullOrWhiteSpace($RequestPath)) { throw 'RequestPath is required.' }
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
 if ($request.schema -ne 'universe.task-frame-worker-dispatch-request.v1') { throw 'Unsupported dispatch request schema.' }
-$provider = [string]$request.provider
-$capability = Get-ProviderCapability $provider
-if ($capability.status -ne 'AVAILABLE') { [ordered]@{ status='WORKER_INVOCATION_UNAVAILABLE'; provider=$provider; capability=$capability; repository_write=$false } | ConvertTo-Json -Depth 8; exit 4 }
+$dispatchProvider = [string]$request.provider
+$stage = 'CAPABILITY_CHECK'
+$capability = Get-ProviderCapability $dispatchProvider
+if ($capability.status -ne 'AVAILABLE') { [ordered]@{ status='WORKER_INVOCATION_UNAVAILABLE'; provider=$dispatchProvider; capability=$capability; repository_write=$false } | ConvertTo-Json -Depth 8; exit 4 }
 if ([string]$request.repository_write_scope -ne 'NONE' -or $null -eq $request.mutation_scope -or $request.mutation_scope.operations.Count -ne 0 -or $request.mutation_scope.targets.Count -ne 0) { throw 'Dispatcher currently supports read-only Task Frame turns only.' }
+$stage = 'TASK_FRAME_PLAN'
 $now = (Get-Date).ToUniversalTime().ToString('o')
 $planPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; operation=[ordered]@{ operation='worker_invocation_plan'; turn_id=$request.turn_id; host_capability_status='AVAILABLE'; capability_evidence_ref=$capability.capability_evidence_ref; invoker_actor_ref=$request.invoker_actor_ref; observed_at=$now } }
 $plan = Invoke-HostPost $request.endpoint $request.token '/v1/task-frame/operation' $planPayload
 if ($plan.status -ne 'TASK_FRAME_OPERATION_APPLIED' -or $plan.output.status -ne 'WORKER_INVOCATION_READY') { $plan | ConvertTo-Json -Depth 12; exit 4 }
 $plannedProvider = [string]$plan.output.worker_invocation.provider
-if (-not [string]::IsNullOrWhiteSpace($plannedProvider) -and $plannedProvider.Trim().ToUpperInvariant() -ne $provider.Trim().ToUpperInvariant()) { [ordered]@{ status='WORKER_PROVIDER_PLAN_MISMATCH'; requested=$provider; planned=$plannedProvider; repository_write=$false } | ConvertTo-Json -Depth 6; exit 4 }
+if (-not [string]::IsNullOrWhiteSpace($plannedProvider) -and $plannedProvider.Trim().ToUpperInvariant() -ne $dispatchProvider.Trim().ToUpperInvariant()) { [ordered]@{ status='WORKER_PROVIDER_PLAN_MISMATCH'; requested=$dispatchProvider; planned=$plannedProvider; repository_write=$false } | ConvertTo-Json -Depth 6; exit 4 }
 [IO.Directory]::CreateDirectory($runtimeTmp) | Out-Null
 $callId = [guid]::NewGuid().ToString('N')
+$workerRunRef = "universe-runtime-host:$callId"
 $adapterRequestPath = Join-Path $runtimeTmp "worker-dispatch-$callId.json"
-$adapterRequest = [ordered]@{ task_frame_id=$request.frame_id; turn_id=$request.turn_id; repository_write_scope='NONE'; mutation_scope=[ordered]@{ operations=@(); targets=@() }; context_pack=$request.context_pack; output_contract=$request.output_contract; max_turns=$request.max_turns }
-if ($provider.Trim().ToUpperInvariant() -eq 'GROK') { $adapterRequest.schema='universe.grok-worker-request.v1'; $adapterRequest.runtime_profile='TASK_FRAME_RUNTIME'; $adapter = Join-Path $repositoryRoot 'tools\runtime_host\grok\invoke.ps1' } else { $adapterRequest.schema='universe.codex-worker-request.v1'; $adapter = Join-Path $repositoryRoot 'tools\runtime_host\codex\worker.ps1' }
+$adapterRequest = [ordered]@{ task_frame_id=$request.frame_id; turn_id=$request.turn_id; worker_run_ref=$workerRunRef; repository_write_scope='NONE'; mutation_scope=[ordered]@{ operations=@(); targets=@() }; context_pack=$request.context_pack; output_contract=$request.output_contract; max_turns=$request.max_turns }
+if ($dispatchProvider.Trim().ToUpperInvariant() -eq 'GROK') { $adapterRequest.schema='universe.grok-worker-request.v1'; $adapterRequest.runtime_profile='TASK_FRAME_RUNTIME'; $adapter = Join-Path $repositoryRoot 'tools\universe_runtime_host_grok_invoke.ps1' } else { $adapterRequest.schema='universe.codex-worker-request.v1'; $adapter = Join-Path $repositoryRoot 'tools\universe_runtime_host_codex_worker.ps1' }
+$stage = 'WORKER_ADAPTER'
 try { [IO.File]::WriteAllText($adapterRequestPath, ($adapterRequest | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false)); $adapterOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $adapter -RequestPath $adapterRequestPath; $worker = (($adapterOutput -join "`n") | ConvertFrom-Json) } finally { Remove-Item -LiteralPath $adapterRequestPath -Force -ErrorAction SilentlyContinue }
-if ($worker.status -ne 'COMPLETED') { [ordered]@{ status='WORKER_PROVIDER_FAILED'; provider=$provider; worker=$worker; repository_write=$false } | ConvertTo-Json -Depth 12; exit 4 }
-$claimPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; operation=[ordered]@{ operation='claim_turn'; turn_id=$request.turn_id; worker_id=$worker.worker_id; host_invocation_receipt_ref=$worker.host_invocation_receipt_ref; capability_evidence_ref=$capability.capability_evidence_ref; invoker_actor_ref=$request.invoker_actor_ref; observed_at=(Get-Date).ToUniversalTime().ToString('o') } }
+if ($worker.status -ne 'COMPLETED') { [ordered]@{ status='WORKER_PROVIDER_FAILED'; provider=$dispatchProvider; worker=$worker; repository_write=$false } | ConvertTo-Json -Depth 12; exit 4 }
+if ([string]$worker.worker_run_ref -ne $workerRunRef) { [ordered]@{ status='WORKER_RUN_REF_MISMATCH'; provider=$dispatchProvider; repository_write=$false } | ConvertTo-Json -Depth 6; exit 4 }
+$stage = 'TASK_FRAME_CLAIM'
+$claimPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; operation=[ordered]@{ operation='claim_turn'; turn_id=$request.turn_id; worker_id=$worker.worker_id; worker_run_ref=$workerRunRef; capability_evidence_ref=$capability.capability_evidence_ref; invoker_actor_ref=$request.invoker_actor_ref; observed_at=(Get-Date).ToUniversalTime().ToString('o') } }
 $claim = Invoke-HostPost $request.endpoint $request.token '/v1/task-frame/operation' $claimPayload
 if ($claim.status -ne 'TASK_FRAME_OPERATION_APPLIED' -or $claim.output.status -ne 'TURN_CLAIMED') { $claim | ConvertTo-Json -Depth 12; exit 4 }
-$envelope = [ordered]@{ turn_id=$request.turn_id; worker_id=$worker.worker_id; host_invocation_receipt_ref=$worker.host_invocation_receipt_ref; status=$worker.status; evidence_refs=@($worker.host_result_evidence_ref); result=$worker.result; review_decision='' }
-$resultPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; envelope=$envelope; host_result_evidence_ref=$worker.host_result_evidence_ref; observed_at=(Get-Date).ToUniversalTime().ToString('o') }
+$stage = 'TASK_FRAME_RESULT'
+$envelope = [ordered]@{ turn_id=$request.turn_id; worker_id=$worker.worker_id; worker_run_ref=$workerRunRef; result_receipt_ref=$worker.result_receipt_ref; status=$worker.status; evidence_refs=@($worker.result_receipt_ref); result=$worker.result; review_decision='' }
+$resultPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; envelope=$envelope; observed_at=(Get-Date).ToUniversalTime().ToString('o') }
 $result = Invoke-HostPost $request.endpoint $request.token '/v1/task-frame/worker-result' $resultPayload
-[ordered]@{ status=$result.status; provider=$provider; worker_id=$worker.worker_id; host_invocation_receipt_ref=$worker.host_invocation_receipt_ref; host_result_evidence_ref=$worker.host_result_evidence_ref; repository_write=$false; runtime_result=$result } | ConvertTo-Json -Depth 16
+[ordered]@{ status=$result.status; provider=$dispatchProvider; worker_id=$worker.worker_id; result_receipt_ref=$worker.result_receipt_ref; repository_write=$false; runtime_result=$result } | ConvertTo-Json -Depth 16

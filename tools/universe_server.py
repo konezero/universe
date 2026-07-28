@@ -46,6 +46,11 @@ from project_seed_assets import (
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
+from universe_runtime_host import (
+    RuntimeHostError,
+    UniverseRuntimeHost,
+    redacted_invocation_record,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -84,6 +89,7 @@ EXPERIENCE_CASE_SCHEMA = "universe.experience-case.v1"
 EXPERIENCE_PATTERN_PROPOSAL_SCHEMA = "universe.experience-pattern-proposal.v1"
 CAREER_PROMOTION_CANDIDATE_SCHEMA = "universe.career-promotion-candidate.v1"
 CAREER_PROMOTION_QUEUE_SCHEMA = "universe.career-promotion-queue-item.v1"
+RUNTIME_WORKER_INVOCATION_SCHEMA = "universe.runtime-worker-invocation.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -2325,6 +2331,23 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_dispatch_event_order
                 ON project_dispatch_event(dispatch_id, observed_at, event_id);
+
+                CREATE TABLE IF NOT EXISTS runtime_worker_invocation (
+                    invocation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    request_digest TEXT NOT NULL,
+                    invocation_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(project_id, invocation_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS runtime_worker_invocation_project_time
+                ON runtime_worker_invocation(project_id, created_at, invocation_id);
 
                 CREATE TABLE IF NOT EXISTS project_result_packet (
                     dispatch_id TEXT PRIMARY KEY
@@ -5248,6 +5271,128 @@ class UniverseStore:
             "imported_at": row["imported_at"],
         }
 
+    def list_runtime_worker_invocations(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT invocation_json, status, result_json, created_at, completed_at
+                FROM runtime_worker_invocation
+                WHERE project_id = ?
+                ORDER BY created_at DESC, invocation_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], bounded_limit),
+            ).fetchall()
+        return [self._runtime_worker_invocation_row(row) for row in rows]
+
+    def invoke_runtime_worker(
+        self,
+        project_id: str,
+        value: Any,
+        runtime_host: UniverseRuntimeHost,
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            redacted = redacted_invocation_record(value)
+        except RuntimeHostError as error:
+            raise UniverseError(error.code, error.detail) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT invocation_json, status, result_json, created_at, completed_at
+                FROM runtime_worker_invocation
+                WHERE project_id = ? AND invocation_id = ?
+                """,
+                (project["project_id"], redacted["invocation_id"]),
+            ).fetchone()
+            if existing is not None:
+                record = self._runtime_worker_invocation_row(existing)
+                if record["invocation"]["request_digest"] != redacted["request_digest"]:
+                    raise UniverseError(
+                        "RUNTIME_WORKER_INVOCATION_CONFLICT",
+                        "invocation_id already refers to a different read-only request",
+                        HTTPStatus.CONFLICT,
+                    )
+                return record, False
+            connection.execute(
+                """
+                INSERT INTO runtime_worker_invocation(
+                    invocation_id, project_id, request_digest, invocation_json,
+                    status, result_json, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, 'REQUESTED', '{}', ?, NULL)
+                """,
+                (
+                    redacted["invocation_id"],
+                    project["project_id"],
+                    redacted["request_digest"],
+                    _canonical_json(redacted),
+                    now,
+                ),
+            )
+        try:
+            result = runtime_host.invoke_read_only(value)
+        except RuntimeHostError as error:
+            result = {
+                "status": "RUNTIME_HOST_UNAVAILABLE",
+                "reason": error.code,
+            }
+        result_record = {
+            "status": _required_text(result.get("status"), "runtime result status"),
+            "provider": redacted["provider"],
+            "worker_id": str(result.get("worker_id") or "UNKNOWN"),
+            "result_receipt_ref": str(
+                result.get("result_receipt_ref") or "UNKNOWN"
+            ),
+            "repository_write": False,
+        }
+        for field in ("reason", "stage"):
+            if isinstance(result.get(field), str) and result[field]:
+                result_record[field] = result[field]
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE runtime_worker_invocation
+                SET status = ?, result_json = ?, completed_at = ?
+                WHERE project_id = ? AND invocation_id = ?
+                """,
+                (
+                    result_record["status"],
+                    _canonical_json(result_record),
+                    utc_now(),
+                    project["project_id"],
+                    redacted["invocation_id"],
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT invocation_json, status, result_json, created_at, completed_at
+                FROM runtime_worker_invocation
+                WHERE project_id = ? AND invocation_id = ?
+                """,
+                (project["project_id"], redacted["invocation_id"]),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "RUNTIME_WORKER_INVOCATION_UNAVAILABLE", "invocation record disappeared"
+            )
+        return self._runtime_worker_invocation_row(row), True
+
+    @staticmethod
+    def _runtime_worker_invocation_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": RUNTIME_WORKER_INVOCATION_SCHEMA,
+            "invocation": json.loads(row["invocation_json"]),
+            "status": row["status"],
+            "result": json.loads(row["result_json"]),
+            "created_at": row["created_at"],
+            "completed_at": row["completed_at"],
+        }
+
     def create_dispatch(
         self,
         project_id: str,
@@ -5793,9 +5938,18 @@ class UniverseStore:
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], store: UniverseStore, token: str):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        store: UniverseStore,
+        token: str,
+        runtime_host: UniverseRuntimeHost | None = None,
+    ):
         self.store = store
         self.token = token
+        self.runtime_host = runtime_host or UniverseRuntimeHost(
+            Path(__file__).resolve().parents[1]
+        )
         super().__init__(address, UniverseRequestHandler)
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
@@ -5829,6 +5983,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorize():
+            return
+        if path == "/v1/runtime/providers":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "RUNTIME_PROVIDER_CAPABILITIES_COLLECTED",
+                    "providers": self.server.runtime_host.provider_capabilities(),
+                },
+            )
             return
         if path == "/v1/releases":
             self._send(
@@ -6060,6 +6224,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_MASTER_BRIDGE_COLLECTED",
                         "bridge": self.server.store.get_master_bridge(project_id),
+                    },
+                )
+                return
+            if suffix == "/runtime-worker-invocations":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "RUNTIME_WORKER_INVOCATIONS_COLLECTED",
+                        "project_id": project_id,
+                        "invocations": self.server.store.list_runtime_worker_invocations(
+                            project_id
+                        ),
                     },
                 )
                 return
@@ -6299,6 +6476,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if parts is not None and parts[1] == "/sync":
                 result = self.server.store.sync_project_seed_assets(parts[0])
                 self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
+            if parts is not None and parts[1] == "/runtime-worker-invocations":
+                invocation, created = self.server.store.invoke_runtime_worker(
+                    parts[0], body, self.server.runtime_host
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "RUNTIME_WORKER_INVOCATION_RECORDED"
+                            if created
+                            else "RUNTIME_WORKER_INVOCATION_ALREADY_RECORDED"
+                        ),
+                        "invocation": invocation,
+                    },
+                )
                 return
             if parts is not None and parts[1] == "/dispatches":
                 dispatch, created = self.server.store.create_dispatch(
@@ -6740,6 +6934,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/career-promotion-queue",
             "/context-packs",
             "/release-proposals",
+            "/runtime-worker-invocations",
             "/dispatches",
             "/discovery-dispatch",
             "/projection",
@@ -6855,7 +7050,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(
-    *, database_path: Path, token: str, host: str = "127.0.0.1", port: int = 0
+    *,
+    database_path: Path,
+    token: str,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    runtime_host: UniverseRuntimeHost | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -6868,7 +7068,8 @@ def create_server(
             "SERVER_HOST_FORBIDDEN", "Universe local service may listen only on loopback"
         )
     return UniverseHTTPServer(
-        (host, port), UniverseStore(database_path), _required_text(token, "token")
+        (host, port), UniverseStore(database_path), _required_text(token, "token"),
+        runtime_host,
     )
 
 

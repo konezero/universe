@@ -46,6 +46,8 @@ if ($null -eq $request.mutation_scope -or $request.mutation_scope.operations.Cou
 $contextPack = [string]$request.context_pack
 $outputContract = [string]$request.output_contract
 if ([string]::IsNullOrWhiteSpace($contextPack) -or [string]::IsNullOrWhiteSpace($outputContract)) { throw 'Context Pack and output contract are required.' }
+$workerRunRef = [string]$request.worker_run_ref
+if ([string]::IsNullOrWhiteSpace($workerRunRef)) { throw 'worker_run_ref is required.' }
 $prompt = "Task Frame ID: $($request.task_frame_id)`nTurn ID: $($request.turn_id)`n`nContext Pack:`n$contextPack`n`nOutput Contract:`n$outputContract"
 $raw = & (Get-CodexCli) exec --json --sandbox read-only --skip-git-repo-check -C $env:TEMP $prompt 2>&1
 if ($LASTEXITCODE -ne 0) { throw 'Codex CLI worker execution failed.' }
@@ -66,8 +68,8 @@ $runId = [guid]::NewGuid().ToString('N')
     runtime_profile='TASK_FRAME_RUNTIME'
     source_mutation='HOST_GATEWAY_ONLY'
     worker_id="codex-cli:$runId"
-    host_invocation_receipt_ref="codex-cli:$runId"
-    host_result_evidence_ref="codex-cli:$runId"
+    worker_run_ref=$workerRunRef
+    result_receipt_ref="codex-cli:$runId"
     result=[ordered]@{ text=($messages -join "`n"); stop_reason='COMPLETED' }
     repository_write_scope='NONE'
 } | ConvertTo-Json -Depth 6

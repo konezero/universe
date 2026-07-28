@@ -32,6 +32,7 @@ if ($runtimeProfile -notin @('READ_ONLY', 'TASK_FRAME_RUNTIME')) {
 }
 $contextPack = Require-Text $request.context_pack 'context_pack'
 $outputContract = Require-Text $request.output_contract 'output_contract'
+$workerRunRef = Require-Text $request.worker_run_ref 'worker_run_ref'
 $maxTurns = if ($null -eq $request.max_turns) { 3 } else { [int]$request.max_turns }
 if ($maxTurns -lt 1 -or $maxTurns -gt 8) {
     throw 'max_turns must be between 1 and 8.'
@@ -67,8 +68,8 @@ $requestId = Require-Text $response.requestId 'response.requestId'
     runtime_profile = $runtimeProfile
     source_mutation = 'HOST_GATEWAY_ONLY'
     worker_id = "grok-cli:$grokSessionId"
-    host_invocation_receipt_ref = "grok-cli:$grokSessionId`:$requestId"
-    host_result_evidence_ref = "grok-cli:$grokSessionId`:$requestId"
+    worker_run_ref = $workerRunRef
+    result_receipt_ref = "grok-cli:$grokSessionId`:$requestId"
     result = [ordered]@{ text = $text; stop_reason = $response.stopReason }
     sandbox_profile = 'read-only'
     permission_mode = 'plan'

@@ -95,6 +95,7 @@ requires the local Bearer token from the state file.
 ```text
 POST   /v1/projects/register
 GET    /v1/projects
+GET    /v1/runtime/providers
 GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
 POST   /v1/future-paths
@@ -134,6 +135,8 @@ GET    /v1/releases/{release_id}
 POST   /v1/releases/import
 GET    /v1/projects/{project_id}/release-proposals
 POST   /v1/projects/{project_id}/release-proposals
+GET    /v1/projects/{project_id}/runtime-worker-invocations
+POST   /v1/projects/{project_id}/runtime-worker-invocations
 GET    /v1/projects/{project_id}/dispatches
 POST   /v1/projects/{project_id}/dispatches
 GET    /v1/dispatches/{dispatch_id}
@@ -261,6 +264,14 @@ Every compare-and-set transition and event append occurs in one SQLite
 transaction. A stale concurrent transition returns `DISPATCH_STATE_CHANGED`
 and appends no event. The desktop UI shows release proposal state, collisions,
 dispatch evidence, wake receipts, and the final Result Packet.
+
+## Runtime Host invocation timeline
+
+A Runtime Host invocation is a synchronous, read-only bridge to an already
+active Project Task Frame. The request must declare `repository_write_scope:
+NONE` with empty mutation operations and targets. Universe records only redacted
+metadata and receipt references. It never stores a Task Frame endpoint, token,
+Context Pack body, or Worker response body.
 
 ## Desktop UI
 

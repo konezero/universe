@@ -37,7 +37,8 @@
   "task_frame": {
     "worker_invocation": "HOST_PROVIDED",
     "worker_actor": "grok-cli:<session_id>",
-    "host_invocation_receipt": "grok-cli:<session_id>:<request_id>",
+    "worker_run_ref": "universe-runtime-host:<call_id>",
+    "result_receipt_ref": "grok-cli:<session_id>:<request_id>",
     "parent_adoption": "FORBIDDEN"
   }
 }
