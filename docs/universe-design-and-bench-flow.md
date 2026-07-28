@@ -45,6 +45,42 @@ Career
 Universe must not mutate Project source, create execution authority, or treat
 a room message, Skill Plan, or Bench result as execution permission.
 
+## Project Queue and Career Carrier Boundary
+
+Project progress is useful Universe evidence, but it is not Career input by
+default. A Project publishes bounded, redacted observations to its
+Project-to-Universe queue. Universe consumes that queue asynchronously and
+uses the observations for the connected Project's Bench, composition, and
+cross-project comparison.
+
+```text
+Project Task Frame / Project Master
+  -> Project-to-Universe queue
+  -> Universe ingest and Bench aggregation
+```
+
+A scheduler may wake a queue consumer, but it does not define the data
+relationship, create authority, or permit source work. Queue records and their
+receipts remain the durable cross-Host contract.
+
+Only a Universe-generated, reusable promotion candidate may leave this
+boundary. The Career Carrier transports that candidate from Universe to Career
+for Conductor review. It does not poll Projects, copy Project progress into
+Career, or adopt a pattern itself.
+
+```text
+Universe aggregate or promotion candidate
+  -> Universe-to-Career queue
+  -> Career Carrier
+  -> Career Conductor review
+  -> adopted release or governance candidate
+```
+
+Candidate sharing is opt-in and redacted. The Career Carrier receives the
+candidate's provenance, evidence digest, scope, redaction state, and aggregate
+support or contradiction summary. It must not receive raw Project source,
+prompts, secrets, worker transcripts, or unbounded execution logs.
+
 ## Fresh Project Flow
 
 A Fresh Project starts with minimum user intent rather than a prescribed stack.
@@ -158,6 +194,12 @@ Universe stores the accepted observations in its local Bench database and
 exposes only observations and aggregate counts, validation states, and metric
 totals. It does not rank Skills universally or turn Bench records into source
 authority.
+
+Bench observations are shareable inputs to common learning, not automatic
+Career policy. Universe may compare compatible redacted observations across
+Projects and create a reusable promotion candidate only when provenance,
+applicability conditions, evidence references, and redaction state remain
+intact. Career adoption remains a separate Conductor decision.
 
 The Universe application provides a local HTTP publisher for an explicitly
 selected, already prepared candidate. The publisher returns a durable Universe
