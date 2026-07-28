@@ -81,6 +81,24 @@ candidate's provenance, evidence digest, scope, redaction state, and aggregate
 support or contradiction summary. It must not receive raw Project source,
 prompts, secrets, worker transcripts, or unbounded execution logs.
 
+## Memory Sync Is Not Publication
+
+```text
+MEMORY_SYNC != Candidate creation != Queue publication
+```
+
+Memory Sync preserves user-selected brainstorming, questions, observations,
+and decision notes. A Project may attach such a note to a functional or
+implementation node in its published Seed, while retaining it under a
+Project-local memory path. The attachment improves recall and later review; it
+does not alter the Seed graph, create a Bench observation, or leave the
+Project.
+
+Only a separate Master or Universe review may turn selected memory material
+into a bounded candidate. That candidate then requires its own provenance,
+redaction, approval, and queue receipt before Universe ingest or Career
+promotion.
+
 ## Fresh Project Flow
 
 A Fresh Project starts with minimum user intent rather than a prescribed stack.
