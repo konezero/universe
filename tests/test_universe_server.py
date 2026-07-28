@@ -348,7 +348,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def test_health_is_public_but_project_data_requires_token(self) -> None:
+    def test_loopback_health_and_project_data_do_not_require_a_token(self) -> None:
         status, result = self.request("GET", "/health")
         self.assertEqual(200, status)
         self.assertEqual("READY", result["status"])
@@ -358,14 +358,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("LOCAL", result["connection"]["kind"])
         self.assertEqual("HTTP", result["connection"]["transport_kind"])
-        self.assertEqual("LOCAL_TOKEN", result["connection"]["auth"]["type"])
-        self.assertNotIn("token", result["connection"]["auth"])
+        self.assertEqual("NONE", result["connection"]["auth"]["type"])
+        self.assertEqual("NONE", result["connection"]["auth"]["credential_ref"])
         self.assertTrue(result["connection"]["capabilities"]["realtime"])
         self.assertEqual("HTTP_API", result["interfaces"][0]["kind"])
 
         status, result = self.request("GET", "/v1/projects")
-        self.assertEqual(401, status)
-        self.assertEqual("LOCAL_TOKEN_REQUIRED", result["error_code"])
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECTS_COLLECTED", result["status"])
 
     def test_universe_identity_is_durable_and_unique_per_database(self) -> None:
         identity = self.server.store.identity()

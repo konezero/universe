@@ -24,9 +24,7 @@
         <button id="refresh-button" class="icon-button" type="button" title="Refresh">
           &#8635;
         </button>
-        <button id="access-button" class="icon-button" type="button" title="Local access">
-          &#9679;
-        </button>
+
       </div>
     </header>
 
@@ -164,23 +162,6 @@
     </form>
   </dialog>
 
-  <dialog id="access-dialog">
-    <form id="access-form" method="dialog">
-      <div class="dialog-heading">
-        <h2>Local access</h2>
-        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
-      </div>
-      <label>
-        Access token
-        <input name="token" type="password" autocomplete="off" required>
-      </label>
-      <div class="dialog-actions">
-        <button type="button" class="secondary-button" data-clear-token>Clear</button>
-        <button type="submit" class="primary-button">Apply</button>
-      </div>
-      <p id="access-form-error" class="form-error" role="alert"></p>
-    </form>
-  </dialog>
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <script src="/app.js" defer></script>

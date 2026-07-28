@@ -65,7 +65,7 @@ CONNECTION_KINDS = frozenset({"LOCAL", "REMOTE", "PEER"})
 TRANSPORT_KINDS = frozenset({"HTTP", "GIT", "P2P"})
 INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
 ADAPTER_DIRECTIONS = frozenset({"INBOUND", "OUTBOUND"})
-AUTH_TYPES = frozenset({"LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
+AUTH_TYPES = frozenset({"NONE", "LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 ALLOWED_REF_KEYS = frozenset(
     {
         "manifest",
@@ -218,6 +218,13 @@ class UniverseTransport(Protocol):
         path: str,
         payload: dict[str, Any] | None = None,
     ) -> tuple[int, dict[str, Any]]: ...
+
+
+class LoopbackNoAuthProvider:
+    auth_type = "NONE"
+
+    def headers(self) -> dict[str, str]:
+        return {}
 
 
 class LocalTokenAuthProvider:
@@ -400,8 +407,8 @@ def local_connection_profile(endpoint: str) -> ConnectionProfile:
         kind="LOCAL",
         transport_kind="HTTP",
         endpoint=endpoint,
-        auth_type="LOCAL_TOKEN",
-        credential_ref="server-state://token",
+        auth_type="NONE",
+        credential_ref="NONE",
         capabilities=ConnectionCapabilities(
             read=True,
             append=True,
@@ -447,6 +454,8 @@ def local_http_interface_profile() -> InterfaceProfile:
 
 
 def auth_provider_for(profile: ConnectionProfile, credential: str) -> AuthProvider:
+    if profile.auth.auth_type == "NONE":
+        return LoopbackNoAuthProvider()
     if profile.auth.auth_type == "LOCAL_TOKEN":
         return LocalTokenAuthProvider(credential)
     raise UniverseError(
@@ -3370,16 +3379,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             self._send_error(error)
 
     def _authorize(self) -> bool:
-        expected = f"Bearer {self.server.token}"
-        provided = self.headers.get("Authorization", "")
-        if secrets.compare_digest(provided, expected):
-            return True
+        try:
+            if ipaddress.ip_address(self.client_address[0]).is_loopback:
+                return True
+        except ValueError:
+            pass
         self._send(
-            HTTPStatus.UNAUTHORIZED,
+            HTTPStatus.FORBIDDEN,
             {
                 "schema": API_SCHEMA,
-                "status": "UNAUTHORIZED",
-                "error_code": "LOCAL_TOKEN_REQUIRED",
+                "status": "FORBIDDEN",
+                "error_code": "LOOPBACK_CLIENT_REQUIRED",
             },
         )
         return False

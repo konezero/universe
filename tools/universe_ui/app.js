@@ -1,7 +1,6 @@
 "use strict";
 
 const state = {
-  token: "",
   projects: [],
   selectedProject: null,
   projection: null,
@@ -35,9 +34,6 @@ const elements = {
   releaseList: document.querySelector("#release-list"),
   releaseFormError: document.querySelector("#release-form-error"),
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
-  accessDialog: document.querySelector("#access-dialog"),
-  accessForm: document.querySelector("#access-form"),
-  accessFormError: document.querySelector("#access-form-error"),
   conversationLayer: document.querySelector("#conversation-layer"),
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
@@ -56,22 +52,9 @@ function node(tag, className, text) {
   return item;
 }
 
-function tokenFromLocation() {
-  const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
-  const incoming = fragment.get("token");
-  if (incoming) {
-    sessionStorage.setItem("universe-token", incoming);
-    history.replaceState(null, "", location.pathname + location.search);
-  }
-  return incoming || sessionStorage.getItem("universe-token") || "";
-}
 
 async function api(path, options = {}) {
-  if (!state.token) throw new Error("Local access token required");
-  const headers = {
-    Authorization: `Bearer ${state.token}`,
-    ...(options.body ? { "Content-Type": "application/json" } : {}),
-  };
+  const headers = options.body ? { "Content-Type": "application/json" } : {};
   const response = await fetch(path, {
     method: options.method || "GET",
     headers,
@@ -93,11 +76,7 @@ async function refresh() {
     elements.serviceStatus.dataset.state = health.status === "READY" ? "ready" : "error";
     elements.serviceStatus.textContent =
       health.status === "READY" ? "Local service" : health.status;
-    if (!state.token) {
-      elements.accessDialog.showModal();
-      renderEmpty();
-      return;
-    }
+
     const [projectResult, releaseResult] = await Promise.all([
       api("/v1/projects"),
       api("/v1/releases"),
@@ -1307,20 +1286,6 @@ async function submitRelease(event) {
   }
 }
 
-function submitAccess(event) {
-  event.preventDefault();
-  const form = new FormData(elements.accessForm);
-  const token = String(form.get("token") || "").trim();
-  if (!token) {
-    elements.accessFormError.textContent = "Access token required";
-    return;
-  }
-  state.token = token;
-  sessionStorage.setItem("universe-token", token);
-  elements.accessDialog.close();
-  elements.accessForm.reset();
-  refresh();
-}
 
 function showInspectorTab(name) {
   for (const button of document.querySelectorAll("[data-tab]")) {
@@ -1341,9 +1306,7 @@ function bindEvents() {
   document
     .querySelector("#refresh-button")
     .addEventListener("click", refresh);
-  document
-    .querySelector("#access-button")
-    .addEventListener("click", () => elements.accessDialog.showModal());
+
   document
     .querySelector("#release-button")
     .addEventListener("click", () => {
@@ -1375,13 +1338,7 @@ function bindEvents() {
   for (const button of document.querySelectorAll("[data-close-dialog]")) {
     button.addEventListener("click", () => button.closest("dialog").close());
   }
-  document.querySelector("[data-clear-token]").addEventListener("click", () => {
-    sessionStorage.removeItem("universe-token");
-    state.token = "";
-    elements.accessForm.reset();
-    elements.accessDialog.close();
-    renderEmpty();
-  });
+
   for (const button of document.querySelectorAll("[data-view]")) {
     button.addEventListener("click", () => {
       state.view = button.dataset.view;
@@ -1415,6 +1372,5 @@ function bindEvents() {
   resize.observe(elements.canvas);
 }
 
-state.token = tokenFromLocation();
 bindEvents();
 refresh();

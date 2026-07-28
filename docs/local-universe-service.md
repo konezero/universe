@@ -211,8 +211,8 @@ active combination:
 interface_kind: HTTP_API
 connection_kind: LOCAL
 transport_kind: HTTP
-auth_type: LOCAL_TOKEN
-credential_ref: server-state://token
+auth_type: NONE
+credential_ref: NONE
 capabilities:
   read: true
   append: true
@@ -226,7 +226,7 @@ The axes remain independent:
 - interface: `HTTP_API`, with `MCP` and `CLI` reserved
 - connection: `LOCAL`, with `REMOTE` and `PEER` reserved
 - transport: `HTTP`, with `GIT` and `P2P` reserved
-- authentication: `LOCAL_TOKEN`, with `OAUTH2` and `PEER_KEY` reserved
+- authentication: `NONE` for loopback local HTTP, with `OAUTH2` and `PEER_KEY` reserved for future remote or peer adapters
 
 Only HTTP addresses are currently validated as HTTP URLs. Git and P2P address
 formats remain Adapter-owned so this initial contract does not force future
@@ -241,11 +241,10 @@ Reserved values do not start remote synchronization, OAuth flows, peer
 discovery, key exchange, Git exchange, or MCP tools. Requesting an unimplemented
 authentication provider fails explicitly with `AUTH_PROVIDER_NOT_IMPLEMENTED`.
 
-Connection profiles carry only a `credential_ref`; they never contain the
-credential itself. The prototype continues to keep the local token in the
-protected local server state for compatibility. A desktop package can later
-resolve `credential_ref` through Windows Credential Manager or macOS Keychain
-without changing the transport interface.
+The local service binds only to a literal loopback address and accepts local
+HTTP requests without a browser or API token. That exemption applies only to
+this local connection profile; remote and peer adapters must declare their own
+credential reference and authentication provider when implemented.
 
 ## Next boundary
 
