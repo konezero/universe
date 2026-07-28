@@ -18,6 +18,7 @@ grants authority or permission to mutate an attached project. See
 ## Responsibilities
 
 - listen only on a loopback address;
+- own local Task Frame provider adapters and dispatcher under `tools/`;
 - maintain the Universe project registry in SQLite;
 - accept one-time project registration and later refreshes;
 - retain append-only project observation events;
@@ -28,6 +29,8 @@ grants authority or permission to mutate an attached project. See
 - create read-only Project release install/update proposals;
 - queue durable Project dispatches and retain their complete event/result timeline;
 - provide compact project summaries to a UI or LLM client.
+
+Universe Runtime Host provider processes remain outside the installed project Runtime. They can return a bounded read-only Worker result, but cannot create project authority, write scope, or mutation permission. See `docs/universe-runtime-host.md`.
 
 Each attached project remains responsible for its own source mutation,
 validation, Execution Guard, and evidence. Universe stores project roots and

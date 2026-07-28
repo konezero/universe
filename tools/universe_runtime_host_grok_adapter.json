@@ -1,7 +1,7 @@
 {
   "schema": "universe.grok-cli-runtime-adapter.v2",
-  "adapter_id": "universe-grok-cli-read-only",
-  "entrypoint": ".ai/adapters/grok/invoke.ps1",
+  "adapter_id": "universe-runtime-host-grok-cli-read-only",
+  "entrypoint": "tools/universe_runtime_host_grok_invoke.ps1",
   "transport": {
     "kind": "local-process",
     "input_schema": "universe.grok-worker-request.v1",
@@ -24,7 +24,8 @@
       }
     },
     "external_tool_execution": "HOST_CAPABILITY_REQUIRED"
-  },  "worker_policy": {
+  },
+  "worker_policy": {
     "repository_write_scope": "NONE",
     "mutation_scope": "EMPTY_REQUIRED",
     "permission_mode": "plan",
