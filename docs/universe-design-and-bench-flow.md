@@ -159,6 +159,13 @@ exposes only observations and aggregate counts, validation states, and metric
 totals. It does not rank Skills universally or turn Bench records into source
 authority.
 
+The Universe application provides a local HTTP publisher for an explicitly
+selected, already prepared candidate. The publisher returns a durable Universe
+ingest receipt but does not write a Project archive. A Project that needs an
+append-only cross-Host record must perform its existing approved
+`HANDOFF_APPEND` operation separately; neither receipt creates Project
+authority or Task Frame execution permission.
+
 ```text
 Task Worker -> Task Frame -> Project publication -> Universe ingest
 Universe Bench -> Context Pack -> next Project or next Task proposal
@@ -204,6 +211,8 @@ relations remain distinct from observed evidence. Career adoption is separate.
    surface is implemented; a provider append adapter remains a follow-up.
 5. Connect an approved Project publication provider to the existing Universe
    ingest endpoint, then use observed Bench records for Context Pack assembly.
+   The local publisher and receipt are implemented; Project-owned archive
+   retention remains a separate `HANDOFF_APPEND` integration.
 6. Hand selected Project Seeds and Skill Plans to Project Masters through the
    existing handoff and Bridge boundaries.
 7. Add Experience and causal comparison only after observed Skill data exists.

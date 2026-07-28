@@ -5160,6 +5160,97 @@ def request_json(
     return transport.request_json(method=method, path=path, payload=payload)
 
 
+def publish_skill_observation(
+    *,
+    project_id: str,
+    prepared: Any,
+    selection_ref: str,
+    endpoint: str,
+    token: str,
+) -> tuple[int, dict[str, Any]]:
+    if not isinstance(prepared, dict):
+        raise UniverseError(
+            "SKILL_OBSERVATION_PREPARED_INVALID",
+            "prepared Skill observation must be an object",
+        )
+    if prepared.get("status") != "PREPARED" or prepared.get("command") != "SKILL_OBSERVATION":
+        raise UniverseError(
+            "SKILL_OBSERVATION_PREPARED_INVALID",
+            "candidate must be a PREPARED SKILL_OBSERVATION artifact",
+        )
+    envelope = {
+        "candidate_id": prepared.get("candidate_id"),
+        "candidate": prepared.get("candidate"),
+    }
+    normalized_project = _project_id(project_id)
+    normalized = normalize_skill_observation_candidate(normalized_project, envelope)
+    _, health = request_json(
+        endpoint=endpoint,
+        token=token,
+        method="GET",
+        path="/health",
+    )
+    universe = health.get("universe")
+    if not isinstance(universe, dict):
+        raise UniverseError(
+            "UNIVERSE_IDENTITY_UNAVAILABLE",
+            "Universe service health response did not contain an identity",
+        )
+    universe_id = _required_text(universe.get("universe_id"), "universe.universe_id")
+    status, response = request_json(
+        endpoint=endpoint,
+        token=token,
+        method="POST",
+        path=(
+            "/v1/projects/"
+            + quote(normalized_project, safe="")
+            + "/skill-observations"
+        ),
+        payload=envelope,
+    )
+    if not 200 <= status < 300:
+        return status, response
+    candidate_digest = _required_text(
+        response.get("candidate_digest"), "response.candidate_digest"
+    )
+    result_ref = (
+        f"universe://{universe_id}/projects/{normalized_project}/"
+        f"skill-observations/{normalized['candidate_id']}/{candidate_digest}"
+    )
+    receipt = {
+        "schema": "universe.skill-observation-publication-receipt.v1",
+        "status": (
+            "UNIVERSE_SKILL_OBSERVATION_PUBLISHED"
+            if response.get("status") == "SKILL_OBSERVATIONS_INGESTED"
+            else "UNIVERSE_SKILL_OBSERVATION_ALREADY_PUBLISHED"
+        ),
+        "operation_class": "UNIVERSE_BENCH_INGEST",
+        "provider": "UNIVERSE_LOCAL_HTTP",
+        "selection_ref": _required_text(selection_ref, "selection_ref"),
+        "base_source_ref": normalized["candidate"]["source_ref"],
+        "candidate_id": normalized["candidate_id"],
+        "candidate_digest": candidate_digest,
+        "result_ref": result_ref,
+        "provider_receipt_ref": result_ref + "/receipt",
+        "durability": "UNIVERSE_LOCAL_SQLITE",
+        "project_archive_write": "NOT_PERFORMED",
+    }
+    return status, receipt
+
+
+def load_prepared_skill_observation(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise UniverseError("SKILL_OBSERVATION_PREPARED_UNAVAILABLE", str(error)) from error
+    if not isinstance(value, dict):
+        raise UniverseError(
+            "SKILL_OBSERVATION_PREPARED_INVALID",
+            "prepared Skill observation file must contain an object",
+        )
+    return value
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Universe local application service")
     commands = root.add_subparsers(dest="command", required=True)
@@ -5196,6 +5287,14 @@ def parser() -> argparse.ArgumentParser:
     list_command.add_argument("--endpoint", default="")
     list_command.add_argument("--token", default="")
     list_command.add_argument("--state-file", type=Path, default=default_state_path())
+
+    publish = commands.add_parser("publish-skill-observation")
+    publish.add_argument("--project-id", required=True)
+    publish.add_argument("--candidate-file", type=Path, required=True)
+    publish.add_argument("--selection-ref", required=True)
+    publish.add_argument("--endpoint", default="")
+    publish.add_argument("--token", default="")
+    publish.add_argument("--state-file", type=Path, default=default_state_path())
     return root
 
 
@@ -5270,6 +5369,14 @@ def main() -> int:
                     "project_root": str(args.project_root),
                     "refs": DEFAULT_REFS,
                 },
+            )
+        elif args.command == "publish-skill-observation":
+            status, result = publish_skill_observation(
+                project_id=args.project_id,
+                prepared=load_prepared_skill_observation(args.candidate_file),
+                selection_ref=args.selection_ref,
+                endpoint=endpoint,
+                token=token,
             )
         else:
             status, result = request_json(

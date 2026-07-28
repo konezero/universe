@@ -37,6 +37,7 @@ from universe_server import (  # noqa: E402
     create_server,
     interface_profile,
     local_connection_profile,
+    publish_skill_observation,
     require_release_lifecycle_mode,
     resolve_universe_mode_intent,
     write_server_state,
@@ -822,6 +823,44 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("REQUEST_INVALID", rejected["error_code"])
+
+    def test_prepared_skill_observation_publisher_returns_durable_ingest_receipt(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        prepared = {
+            "status": "PREPARED",
+            "command": "SKILL_OBSERVATION",
+            **self.skill_observation_candidate(),
+        }
+        status, receipt = publish_skill_observation(
+            project_id="GCS",
+            prepared=prepared,
+            selection_ref="user-selection-gcs-001",
+            endpoint=self.endpoint,
+            token=self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("UNIVERSE_SKILL_OBSERVATION_PUBLISHED", receipt["status"])
+        self.assertEqual("UNIVERSE_BENCH_INGEST", receipt["operation_class"])
+        self.assertEqual("UNIVERSE_LOCAL_HTTP", receipt["provider"])
+        self.assertEqual("NOT_PERFORMED", receipt["project_archive_write"])
+        self.assertIn(self.server.store.identity()["universe_id"], receipt["result_ref"])
+
+        status, repeated = publish_skill_observation(
+            project_id="GCS",
+            prepared=prepared,
+            selection_ref="user-selection-gcs-001",
+            endpoint=self.endpoint,
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "UNIVERSE_SKILL_OBSERVATION_ALREADY_PUBLISHED", repeated["status"]
+        )
+        self.assertEqual(
+            receipt["result_ref"], repeated["result_ref"]
+        )
 
     def test_fresh_project_intent_returns_seed_routes_without_project_state(self) -> None:
         status, result = self.request(

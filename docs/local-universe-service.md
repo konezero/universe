@@ -156,6 +156,25 @@ prompts, commands, `skill_ref`, and arbitrary extension fields. Replaying the
 same candidate is idempotent; `GET /v1/bench/skills` returns aggregate observed
 counts, validation states, and metric totals without universal rankings.
 
+## Publish a prepared Skill observation
+
+The Universe application can publish an already prepared ai-career candidate
+without becoming an ai-career Runtime dependency:
+
+```powershell
+python tools/universe_server.py publish-skill-observation `
+  --project-id GCS `
+  --candidate-file C:\path\to\skill-observation-prepared.json `
+  --selection-ref user-selection-gcs-001
+```
+
+The command reads the local service state file for its loopback endpoint and
+token, accepts only `PREPARED` `SKILL_OBSERVATION` artifacts, and returns a
+Universe-local SQLite ingest receipt. It neither writes the Project repository
+nor starts a Task Frame. Retaining that receipt under a Project `.ai/archive/`
+path is a later, separately approved ai-career `HANDOFF_APPEND` operation; the
+ingest receipt itself is not handoff evidence.
+
 A Context Pack is built from a current Project Seed, selected functional node
 IDs, node-linked or project-wide document references, and a bounded set of
 redacted observations already recorded for that Project. It contains no raw
