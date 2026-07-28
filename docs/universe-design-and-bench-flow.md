@@ -192,7 +192,9 @@ relations remain distinct from observed evidence. Career adoption is separate.
    applicability constraints. Initial redacted asynchronous ingest,
    idempotency, and aggregate Bench query are implemented.
 2. Add Fresh Project intent, specification, design, and route proposal
-   contracts.
+   contracts. Minimum intent to read-only Official Seed route candidates is
+   implemented; LLM-assisted specification, design, and composition remain
+   follow-ups.
 3. Assemble Context Packs and propose Skill Plans from selected routes.
 4. Add Project-side Task Frame SkillRunObservation publication as an
    ai-career/Core Runtime follow-up. The redacted candidate preparation

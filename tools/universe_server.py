@@ -43,6 +43,8 @@ from project_seed_assets import (
     load_project_seed_assets,
     project_seed_template,
 )
+from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
+from seed import SeedError, suggest_paths
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -995,6 +997,34 @@ def normalize_skill_observation_candidate(
         "candidate_id": _identifier(request["candidate_id"], "candidate_id"),
         "candidate": normalized_candidate,
         "candidate_digest": _json_sha256(normalized_candidate),
+    }
+
+
+def normalize_fresh_project_intent(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="fresh_project_intent",
+        required=frozenset({"project", "kind", "technologies", "goal"}),
+        optional=frozenset({"limit"}),
+    )
+    technologies = _string_array(request["technologies"], "technologies")
+    if len(technologies) > 64:
+        raise UniverseError(
+            "FRESH_PROJECT_TECHNOLOGIES_INVALID",
+            "technologies must contain at most 64 entries",
+        )
+    limit = request.get("limit", 3)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
+        raise UniverseError(
+            "FRESH_PROJECT_LIMIT_INVALID",
+            "limit must be an integer from 1 through 10",
+        )
+    return {
+        "project": _required_text(request["project"], "project"),
+        "kind": _required_text(request["kind"], "kind"),
+        "technologies": technologies,
+        "goal": _required_text(request["goal"], "goal"),
+        "limit": limit,
     }
 
 
@@ -3982,6 +4012,29 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_REGISTERED" if created else "PROJECT_REFRESHED",
                         "project": project,
+                    },
+                )
+                return
+            if path == "/v1/future-paths":
+                intent = normalize_fresh_project_intent(body)
+                try:
+                    proposal = suggest_paths(
+                        OFFICIAL_SEED_DATABASE,
+                        project=intent["project"],
+                        kind=intent["kind"],
+                        technologies=intent["technologies"],
+                        goal=intent["goal"],
+                        limit=intent["limit"],
+                    )
+                except SeedError as error:
+                    raise UniverseError("FRESH_PROJECT_INTENT_INVALID", str(error)) from error
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FRESH_PROJECT_ROUTE_CANDIDATES",
+                        "intent": intent,
+                        "proposal": proposal,
                     },
                 )
                 return

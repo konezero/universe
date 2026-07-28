@@ -823,6 +823,46 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("REQUEST_INVALID", rejected["error_code"])
 
+    def test_fresh_project_intent_returns_seed_routes_without_project_state(self) -> None:
+        status, result = self.request(
+            "POST",
+            "/v1/future-paths",
+            {
+                "project": "Local trading workstation",
+                "kind": "desktop-app",
+                "technologies": ["python", "pyside6", "sqlite"],
+                "goal": "stable unattended operation with recoverable state",
+                "limit": 2,
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("FRESH_PROJECT_ROUTE_CANDIDATES", result["status"])
+        self.assertEqual([], self.server.store.list_projects())
+        proposal = result["proposal"]
+        self.assertEqual("FUTURE_PATH_CANDIDATES", proposal["status"])
+        self.assertEqual("NOT_AVAILABLE", proposal["probabilities"])
+        self.assertEqual("USER_SELECTION_REQUIRED", proposal["next_operation"])
+        self.assertEqual(
+            "durable-desktop-state", proposal["candidates"][0]["route_id"]
+        )
+        self.assertEqual("NONE", proposal["effects"]["execution"])
+
+        status, rejected = self.request(
+            "POST",
+            "/v1/future-paths",
+            {
+                "project": "Local trading workstation",
+                "kind": "desktop-app",
+                "technologies": ["python"],
+                "goal": "stable state",
+                "unexpected": "raw prompt material",
+            },
+            self.token,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("REQUEST_INVALID", rejected["error_code"])
+
     def test_dispatch_delivery_wake_and_result_lifecycle_is_durable(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         dispatch_request = {

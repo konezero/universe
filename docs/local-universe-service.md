@@ -94,8 +94,12 @@ POST   /v1/projects/register
 GET    /v1/projects
 GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
+POST   /v1/future-paths
 POST   /v1/projects/{project_id}/events
 GET    /v1/projects/{project_id}/events
+POST   /v1/projects/{project_id}/skill-observations
+GET    /v1/projects/{project_id}/skill-observations
+GET    /v1/bench/skills
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
 GET    /v1/templates/project-seed
@@ -133,6 +137,18 @@ An event body has this shape:
 
 Event IDs are idempotency keys. Repeating the same event is accepted; reusing
 an ID for different content is rejected.
+
+`POST /v1/future-paths` accepts a Fresh Project's name, project kind,
+technology signals, final goal, and an optional candidate limit. It queries the
+read-only Official Development Seed and returns user-selectable route
+candidates. It does not require a registered repository, persist the intent,
+create a Project Seed, or grant execution authority.
+
+`POST /v1/projects/{project_id}/skill-observations` accepts only a redacted
+ai-career Skill observation candidate. The service rejects raw source,
+prompts, commands, `skill_ref`, and arbitrary extension fields. Replaying the
+same candidate is idempotent; `GET /v1/bench/skills` returns aggregate observed
+counts, validation states, and metric totals without universal rankings.
 
 ## Release and dispatch boundary
 
