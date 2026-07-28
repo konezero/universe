@@ -1148,6 +1148,72 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.assertEqual(before, after)
 
+    def test_experience_case_contains_only_recorded_observations(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            self.skill_observation_candidate(),
+            self.token,
+        )
+        observation = self.server.store.list_skill_observations("GCS")[0]
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {
+                "title": "Source review evidence case",
+                "observation_ids": [observation["observation_id"]],
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("EXPERIENCE_CASE_RECORDED", result["status"])
+        case = result["case"]
+        self.assertEqual("OBSERVED", case["case_state"])
+        self.assertEqual("NOT_INFERRED", case["causal_state"])
+        self.assertEqual("NOT_EVALUATED", case["pattern_state"])
+        self.assertEqual([observation["observation_id"]], case["observation_ids"])
+        self.assertEqual(observation["evidence_refs"], case["observations"][0]["evidence_refs"])
+        self.assertTrue(all(value == "NONE" for value in case["effects"].values()))
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {
+                "title": "Source review evidence case",
+                "observation_ids": [observation["observation_id"]],
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("EXPERIENCE_CASE_ALREADY_RECORDED", repeated["status"])
+
+        status, listed = self.request(
+            "GET", "/v1/projects/GCS/experience-cases", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([case["case_id"]], [item["case_id"] for item in listed["cases"]])
+
+        status, rejected = self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {"observation_ids": ["observation_unknown"]},
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("EXPERIENCE_CASE_OBSERVATION_NOT_FOUND", rejected["error_code"])
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {

@@ -77,6 +77,7 @@ PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
 PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
     "universe.project-archive-receipt-candidate.v1"
 )
+EXPERIENCE_CASE_SCHEMA = "universe.experience-case.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1141,6 +1142,28 @@ def normalize_master_handoff_delivery_request(value: Any) -> dict[str, Any]:
     return {"approval": "DELIVER"}
 
 
+def normalize_experience_case_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="experience_case_request",
+        required=frozenset({"observation_ids"}),
+        optional=frozenset({"title"}),
+    )
+    observation_ids = [
+        _identifier(item, "observation_ids[]")
+        for item in _array(request["observation_ids"], "observation_ids")
+    ]
+    if not observation_ids or len(observation_ids) > 64 or len(set(observation_ids)) != len(observation_ids):
+        raise UniverseError(
+            "EXPERIENCE_CASE_OBSERVATIONS_INVALID",
+            "observation_ids must contain 1..64 unique observed records",
+        )
+    normalized = {"observation_ids": sorted(observation_ids)}
+    if "title" in request:
+        normalized["title"] = _required_text(request["title"], "title")
+    return normalized
+
+
 def normalize_context_pack_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -2071,6 +2094,30 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_master_handoff_project_time
                 ON project_master_handoff(project_id, created_at, handoff_id);
+
+                CREATE TABLE IF NOT EXISTS experience_case (
+                    case_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    case_digest TEXT NOT NULL UNIQUE,
+                    case_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, case_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS experience_case_project_time
+                ON experience_case(project_id, created_at, case_id);
+
+                CREATE TABLE IF NOT EXISTS experience_case_observation (
+                    case_id TEXT NOT NULL
+                        REFERENCES experience_case(case_id)
+                        ON DELETE CASCADE,
+                    observation_id TEXT NOT NULL
+                        REFERENCES skill_run_observation(observation_id)
+                        ON DELETE RESTRICT,
+                    PRIMARY KEY(case_id, observation_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
@@ -3385,6 +3432,123 @@ class UniverseStore:
                 (project["project_id"], max(1, min(int(limit), 500))),
             ).fetchall()
         return [self._master_handoff_row(row) for row in rows]
+
+    def create_experience_case(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_experience_case_request(value)
+        placeholders = ", ".join("?" for _ in request["observation_ids"])
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT observation_id, project_id, candidate_id, candidate_digest, task_frame_ref,
+                       source_ref, observation_digest, skill_binding_digest,
+                       skill_id, skill_version, operation_class, context_pack_digest,
+                       model_ref, outcome, validation_state, evidence_refs_json,
+                       metrics_json, observed_at, recorded_at
+                FROM skill_run_observation
+                WHERE project_id = ? AND observation_id IN ({placeholders})
+                """,
+                (project["project_id"], *request["observation_ids"]),
+            ).fetchall()
+        observations_by_id = {
+            row["observation_id"]: self._skill_observation_row(row) for row in rows
+        }
+        missing = sorted(set(request["observation_ids"]) - set(observations_by_id))
+        if missing:
+            raise UniverseError(
+                "EXPERIENCE_CASE_OBSERVATION_NOT_FOUND",
+                "observation_ids are not recorded for this Project: " + ", ".join(missing),
+                HTTPStatus.CONFLICT,
+            )
+        observations = [
+            observations_by_id[observation_id]
+            for observation_id in request["observation_ids"]
+        ]
+        material: dict[str, Any] = {
+            "schema": EXPERIENCE_CASE_SCHEMA,
+            "project_id": project["project_id"],
+            "observation_ids": request["observation_ids"],
+            "observations": observations,
+            "case_state": "OBSERVED",
+            "causal_state": "NOT_INFERRED",
+            "pattern_state": "NOT_EVALUATED",
+            "effects": {
+                "project_source_write": "NONE",
+                "project_runtime_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "USER_REVIEW_OR_EXPERIENCE_MATCH",
+        }
+        if "title" in request:
+            material["title"] = request["title"]
+        material["case_digest"] = _json_sha256(material)
+        material["case_id"] = "case_" + material["case_digest"][:24]
+        material["status"] = "EXPERIENCE_CASE_RECORDED"
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT case_json, created_at
+                FROM experience_case
+                WHERE project_id = ? AND case_digest = ?
+                """,
+                (project["project_id"], material["case_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["case_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO experience_case(
+                    case_id, project_id, case_digest, case_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    material["case_id"],
+                    project["project_id"],
+                    material["case_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO experience_case_observation(case_id, observation_id)
+                VALUES (?, ?)
+                """,
+                [
+                    (material["case_id"], observation_id)
+                    for observation_id in request["observation_ids"]
+                ],
+            )
+        material["created_at"] = now
+        return material, True
+
+    def list_experience_cases(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT case_json, created_at
+                FROM experience_case
+                WHERE project_id = ?
+                ORDER BY created_at DESC, case_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        cases = []
+        for row in rows:
+            case = json.loads(row["case_json"])
+            case["created_at"] = row["created_at"]
+            cases.append(case)
+        return cases
 
     def deliver_master_handoff(
         self, project_id: str, handoff_id: str, value: Any
@@ -5168,6 +5332,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/experience-cases":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_EXPERIENCE_CASES_COLLECTED",
+                        "project_id": project_id,
+                        "cases": self.server.store.list_experience_cases(project_id),
+                    },
+                )
+                return
             if suffix == "/master-bridge":
                 self._send(
                     HTTPStatus.OK,
@@ -5503,6 +5678,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/experience-cases":
+                case, created = self.server.store.create_experience_case(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "EXPERIENCE_CASE_RECORDED"
+                            if created
+                            else "EXPERIENCE_CASE_ALREADY_RECORDED"
+                        ),
+                        "case": case,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/master-bridge":
                 bridge, created = self.server.store.register_master_bridge(
                     parts[0], body
@@ -5746,6 +5936,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/skill-plan-proposals",
             "/skill-plan-adoptions",
             "/master-handoffs",
+            "/experience-cases",
             "/context-packs",
             "/release-proposals",
             "/dispatches",
