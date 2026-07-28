@@ -825,10 +825,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("REQUEST_INVALID", rejected["error_code"])
 
-    def test_prepared_skill_observation_publisher_returns_durable_ingest_receipt(
+    def test_prepared_skill_observation_publisher_returns_durable_queue_receipt(
         self,
     ) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
         prepared = {
             "status": "PREPARED",
             "command": "SKILL_OBSERVATION",
@@ -842,10 +847,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             token=self.token,
         )
         self.assertEqual(201, status)
-        self.assertEqual("UNIVERSE_SKILL_OBSERVATION_PUBLISHED", receipt["status"])
-        self.assertEqual("UNIVERSE_BENCH_INGEST", receipt["operation_class"])
+        self.assertEqual("UNIVERSE_SKILL_OBSERVATION_QUEUED", receipt["status"])
+        self.assertEqual("UNIVERSE_OBSERVATION_QUEUE", receipt["operation_class"])
         self.assertEqual("UNIVERSE_LOCAL_HTTP", receipt["provider"])
         self.assertEqual("NOT_PERFORMED", receipt["project_archive_write"])
+        self.assertEqual("QUEUED", receipt["queue_state"])
         self.assertIn(self.server.store.identity()["universe_id"], receipt["result_ref"])
 
         status, repeated = publish_skill_observation(
@@ -857,11 +863,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual(
-            "UNIVERSE_SKILL_OBSERVATION_ALREADY_PUBLISHED", repeated["status"]
+            "UNIVERSE_SKILL_OBSERVATION_ALREADY_QUEUED", repeated["status"]
         )
         self.assertEqual(
             receipt["result_ref"], repeated["result_ref"]
         )
+
+        status, queued = self.request(
+            "GET", "/v1/projects/GCS/skill-observation-queue", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["QUEUED"], [item["status"] for item in queued["items"]])
+
+        status, drained = self.request(
+            "POST", "/v1/skill-observation-queue/drain", {"limit": 10}, self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("SKILL_OBSERVATION_QUEUE_DRAINED", drained["status"])
+        self.assertEqual(1, len(drained["items"]))
+        self.assertEqual("INGESTED", drained["items"][0]["status"])
+
+        status, observations = self.request(
+            "GET", "/v1/projects/GCS/skill-observations", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(observations["observations"]))
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
 
         before = {
             path.relative_to(self.project_root).as_posix(): self.digest(path)

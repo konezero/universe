@@ -67,6 +67,7 @@ PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
 SKILL_RUN_OBSERVATION_SCHEMA = "universe.skill-run-observation.v1"
+SKILL_OBSERVATION_QUEUE_SCHEMA = "universe.skill-observation-queue-item.v1"
 SKILL_BENCH_SCHEMA = "universe.skill-bench.v1"
 PROJECT_CONTEXT_PACK_SCHEMA = "universe.project-context-pack.v1"
 PROJECT_SKILL_PLAN_SCHEMA = "universe.project-skill-plan.v1"
@@ -2048,6 +2049,23 @@ class UniverseStore:
                     skill_id, skill_version, operation_class, model_ref
                 );
 
+                CREATE TABLE IF NOT EXISTS project_skill_observation_queue (
+                    queue_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    candidate_id TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('QUEUED', 'INGESTED')),
+                    queued_at TEXT NOT NULL,
+                    ingested_at TEXT,
+                    UNIQUE(project_id, candidate_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_skill_observation_queue_state
+                ON project_skill_observation_queue(status, queued_at, queue_id);
+
                 CREATE TABLE IF NOT EXISTS project_context_pack (
                     context_pack_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -2681,6 +2699,149 @@ class UniverseStore:
             "redaction_state": "REDACTED",
             "observations": rows,
         }, created
+
+    def enqueue_skill_observations(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist a redacted Project observation before asynchronous ingest."""
+
+        project = self.get_project(project_id)
+        request = normalize_skill_observation_candidate(project["project_id"], value)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT queue_id, candidate_id, candidate_digest, status, queued_at, ingested_at
+                FROM project_skill_observation_queue
+                WHERE project_id = ? AND candidate_id = ?
+                """,
+                (project["project_id"], request["candidate_id"]),
+            ).fetchone()
+            if existing is not None:
+                if existing["candidate_digest"] != request["candidate_digest"]:
+                    raise UniverseError(
+                        "SKILL_OBSERVATION_CANDIDATE_CONFLICT",
+                        "candidate_id already refers to different redacted content",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self._skill_observation_queue_row(existing, project["project_id"]), False
+            queue_id = "observation_queue_" + _json_sha256(
+                {
+                    "project_id": project["project_id"],
+                    "candidate_id": request["candidate_id"],
+                    "candidate_digest": request["candidate_digest"],
+                }
+            )[:24]
+            connection.execute(
+                """
+                INSERT INTO project_skill_observation_queue(
+                    queue_id, project_id, candidate_id, candidate_digest,
+                    candidate_json, status, queued_at, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, NULL)
+                """,
+                (
+                    queue_id,
+                    project["project_id"],
+                    request["candidate_id"],
+                    request["candidate_digest"],
+                    _canonical_json(
+                        {
+                            "candidate_id": request["candidate_id"],
+                            "candidate": request["candidate"],
+                        }
+                    ),
+                    now,
+                ),
+            )
+        return {
+            "schema": SKILL_OBSERVATION_QUEUE_SCHEMA,
+            "queue_id": queue_id,
+            "project_id": project["project_id"],
+            "candidate_id": request["candidate_id"],
+            "candidate_digest": request["candidate_digest"],
+            "status": "QUEUED",
+            "queued_at": now,
+            "ingested_at": None,
+        }, True
+
+    def list_skill_observation_queue(
+        self, project_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT queue_id, candidate_id, candidate_digest, status, queued_at, ingested_at
+                FROM project_skill_observation_queue
+                WHERE project_id = ?
+                ORDER BY queued_at, queue_id
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._skill_observation_queue_row(row, project["project_id"]) for row in rows]
+
+    def drain_skill_observation_queue(self, *, limit: int = 100) -> dict[str, Any]:
+        """Consume Universe-owned queue items without touching Project files."""
+
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT queue_id, project_id, candidate_json
+                FROM project_skill_observation_queue
+                WHERE status = 'QUEUED'
+                ORDER BY queued_at, queue_id
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        ingested: list[dict[str, Any]] = []
+        for row in rows:
+            envelope = json.loads(row["candidate_json"])
+            result, created = self.ingest_skill_observations(row["project_id"], envelope)
+            now = utc_now()
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE project_skill_observation_queue
+                    SET status = 'INGESTED', ingested_at = ?
+                    WHERE queue_id = ? AND status = 'QUEUED'
+                    """,
+                    (now, row["queue_id"]),
+                )
+            ingested.append(
+                {
+                    "queue_id": row["queue_id"],
+                    "project_id": row["project_id"],
+                    "status": "INGESTED",
+                    "ingested_at": now,
+                    "new_observations": created,
+                    "candidate_digest": result["candidate_digest"],
+                }
+            )
+        return {
+            "schema": "universe.skill-observation-queue-drain.v1",
+            "status": "SKILL_OBSERVATION_QUEUE_DRAINED",
+            "items": ingested,
+            "project_source_write": "NONE",
+            "project_runtime_state_write": "NONE",
+        }
+
+    @staticmethod
+    def _skill_observation_queue_row(
+        row: sqlite3.Row, project_id: str
+    ) -> dict[str, Any]:
+        return {
+            "schema": SKILL_OBSERVATION_QUEUE_SCHEMA,
+            "queue_id": row["queue_id"],
+            "project_id": project_id,
+            "candidate_id": row["candidate_id"],
+            "candidate_digest": row["candidate_digest"],
+            "status": row["status"],
+            "queued_at": row["queued_at"],
+            "ingested_at": row["ingested_at"],
+        }
 
     def list_skill_observations(
         self, project_id: str, *, limit: int = 100
@@ -5638,6 +5799,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/skill-observation-queue":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_OBSERVATION_QUEUE_COLLECTED",
+                        "project_id": project_id,
+                        "items": self.server.store.list_skill_observation_queue(
+                            project_id
+                        ),
+                    },
+                )
+                return
             if suffix == "/context-packs":
                 self._send(
                     HTTPStatus.OK,
@@ -5821,6 +5995,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/v1/skill-observation-queue/drain":
+                request = _exact_object_fields(
+                    body,
+                    field="skill_observation_queue_drain",
+                    required=frozenset(),
+                    optional=frozenset({"limit"}),
+                )
+                limit = request.get("limit", 100)
+                if isinstance(limit, bool) or not isinstance(limit, int):
+                    raise UniverseError(
+                        "SKILL_OBSERVATION_QUEUE_LIMIT_INVALID",
+                        "limit must be an integer",
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **self.server.store.drain_skill_observation_queue(limit=limit),
+                    },
+                )
+                return
             if path == "/v1/future-paths":
                 intent = normalize_fresh_project_intent(body)
                 try:
@@ -5992,6 +6187,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "SKILL_OBSERVATIONS_ALREADY_INGESTED"
                         ),
                         **result,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-observation-queue":
+                item, created = self.server.store.enqueue_skill_observations(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "SKILL_OBSERVATION_QUEUED"
+                            if created
+                            else "SKILL_OBSERVATION_ALREADY_QUEUED"
+                        ),
+                        "item": item,
                     },
                 )
                 return
@@ -6348,6 +6560,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/projection",
             "/events",
             "/skill-observations",
+            "/skill-observation-queue",
             "/seed-asset-proposal",
             "/seed",
             "/sync",
@@ -6577,32 +6790,41 @@ def publish_skill_observation(
         path=(
             "/v1/projects/"
             + quote(normalized_project, safe="")
-            + "/skill-observations"
+            + "/skill-observation-queue"
         ),
         payload=envelope,
     )
     if not 200 <= status < 300:
         return status, response
+    item = response.get("item")
+    if not isinstance(item, dict):
+        raise UniverseError(
+            "SKILL_OBSERVATION_QUEUE_RESPONSE_INVALID",
+            "Universe queue response did not contain an item",
+        )
     candidate_digest = _required_text(
-        response.get("candidate_digest"), "response.candidate_digest"
+        item.get("candidate_digest"), "response.item.candidate_digest"
     )
+    queue_id = _required_text(item.get("queue_id"), "response.item.queue_id")
     result_ref = (
         f"universe://{universe_id}/projects/{normalized_project}/"
-        f"skill-observations/{normalized['candidate_id']}/{candidate_digest}"
+        f"skill-observation-queue/{queue_id}"
     )
     receipt = {
         "schema": "universe.skill-observation-publication-receipt.v1",
         "status": (
-            "UNIVERSE_SKILL_OBSERVATION_PUBLISHED"
-            if response.get("status") == "SKILL_OBSERVATIONS_INGESTED"
-            else "UNIVERSE_SKILL_OBSERVATION_ALREADY_PUBLISHED"
+            "UNIVERSE_SKILL_OBSERVATION_QUEUED"
+            if response.get("status") == "SKILL_OBSERVATION_QUEUED"
+            else "UNIVERSE_SKILL_OBSERVATION_ALREADY_QUEUED"
         ),
-        "operation_class": "UNIVERSE_BENCH_INGEST",
+        "operation_class": "UNIVERSE_OBSERVATION_QUEUE",
         "provider": "UNIVERSE_LOCAL_HTTP",
         "selection_ref": _required_text(selection_ref, "selection_ref"),
         "base_source_ref": normalized["candidate"]["source_ref"],
         "candidate_id": normalized["candidate_id"],
         "candidate_digest": candidate_digest,
+        "queue_id": queue_id,
+        "queue_state": _required_text(item.get("status"), "response.item.status"),
         "result_ref": result_ref,
         "provider_receipt_ref": result_ref + "/receipt",
         "durability": "UNIVERSE_LOCAL_SQLITE",
@@ -6625,7 +6847,8 @@ def prepare_skill_observation_archive(
         )
     if (
         receipt.get("schema") != "universe.skill-observation-publication-receipt.v1"
-        or receipt.get("operation_class") != "UNIVERSE_BENCH_INGEST"
+        or receipt.get("operation_class")
+        not in {"UNIVERSE_BENCH_INGEST", "UNIVERSE_OBSERVATION_QUEUE"}
         or receipt.get("project_archive_write") != "NOT_PERFORMED"
     ):
         raise UniverseError(
@@ -6744,6 +6967,14 @@ def parser() -> argparse.ArgumentParser:
     publish.add_argument("--token", default="")
     publish.add_argument("--state-file", type=Path, default=default_state_path())
 
+    drain_observation_queue = commands.add_parser("drain-skill-observation-queue")
+    drain_observation_queue.add_argument("--limit", type=int, default=100)
+    drain_observation_queue.add_argument("--endpoint", default="")
+    drain_observation_queue.add_argument("--token", default="")
+    drain_observation_queue.add_argument(
+        "--state-file", type=Path, default=default_state_path()
+    )
+
     archive = commands.add_parser("prepare-skill-observation-archive")
     archive.add_argument("--project-id", required=True)
     archive.add_argument("--receipt-file", type=Path, required=True)
@@ -6840,6 +7071,14 @@ def main() -> int:
                     selection_ref=args.selection_ref,
                     endpoint=endpoint,
                     token=token,
+                )
+            elif args.command == "drain-skill-observation-queue":
+                status, result = request_json(
+                    endpoint=endpoint,
+                    token=token,
+                    method="POST",
+                    path="/v1/skill-observation-queue/drain",
+                    payload={"limit": args.limit},
                 )
             else:
                 status, result = request_json(

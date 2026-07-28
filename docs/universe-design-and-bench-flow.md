@@ -194,8 +194,8 @@ evidence references and redaction state
 ```
 
 The Project publishes this observation asynchronously. It retains only the
-Task Frame result and a publication receipt. Universe accepts only the exact
-redacted surface below, validates it before storage, and uses
+Task Frame result and a queue publication receipt. Universe accepts only the
+exact redacted surface below, validates it before durable queue storage, and uses
 `project_id + candidate_id + observation_digest` with the candidate digest for
 idempotency and conflict detection.
 
@@ -213,10 +213,10 @@ Rejected at the Universe boundary
   repository documents, executable commands, and arbitrary extension fields
 ```
 
-Universe stores the accepted observations in its local Bench database and
-exposes only observations and aggregate counts, validation states, and metric
-totals. It does not rank Skills universally or turn Bench records into source
-authority.
+Universe stores accepted observations in its local ingress queue first. Its
+consumer performs the later Bench database insert and exposes only observations
+and aggregate counts, validation states, and metric totals. It does not rank
+Skills universally or turn Bench records into source authority.
 
 Bench observations are shareable inputs to common learning, not automatic
 Career policy. Universe may compare compatible redacted observations across
@@ -226,14 +226,14 @@ intact. Career adoption remains a separate Conductor decision.
 
 The Universe application provides a local HTTP publisher for an explicitly
 selected, already prepared candidate. The publisher returns a durable Universe
-ingest receipt but does not write a Project archive. A Project that needs an
+queue receipt but does not write a Project archive. A Project that needs an
 append-only cross-Host record must perform its existing approved
 `HANDOFF_APPEND` operation separately; neither receipt creates Project
 authority or Task Frame execution permission.
 
 ```text
-Task Worker -> Task Frame -> Project publication -> Universe ingest
-Universe Bench -> Context Pack -> next Project or next Task proposal
+Task Worker -> Task Frame -> Project publication -> Universe ingress queue
+Universe queue consumer -> Bench -> Context Pack -> next Project or next Task proposal
 ```
 
 Workers never write directly to the Universe database. Universe never reads
@@ -274,10 +274,11 @@ relations remain distinct from observed evidence. Career adoption is separate.
 4. Add Project-side Task Frame SkillRunObservation publication as an
    ai-career/Core Runtime follow-up. The redacted candidate preparation
    surface is implemented; a provider append adapter remains a follow-up.
-5. Connect an approved Project publication provider to the existing Universe
-   ingest endpoint, then use observed Bench records for Context Pack assembly.
-   The local publisher and receipt are implemented; Project-owned archive
-   retention remains a separate `HANDOFF_APPEND` integration.
+5. Connect an approved Project publication provider to the Universe ingress
+   queue, then use consumed Bench records for Context Pack assembly. The local
+   publisher, queue receipt, and deterministic queue drain are implemented;
+   Project-owned archive retention remains a separate `HANDOFF_APPEND`
+   integration.
 6. Hand selected Project Seeds and Skill Plans to Project Masters through the
    existing handoff and Bridge boundaries. Exact-byte Seed asset proposal
    preparation is implemented; receipt-aware Project Master application is

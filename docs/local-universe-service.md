@@ -182,10 +182,12 @@ python tools/universe_server.py publish-skill-observation `
 
 The command reads the local service state file for its loopback endpoint and
 token, accepts only `PREPARED` `SKILL_OBSERVATION` artifacts, and returns a
-Universe-local SQLite ingest receipt. It neither writes the Project repository
-nor starts a Task Frame. Retaining that receipt under a Project `.ai/archive/`
-path is a later, separately approved ai-career `HANDOFF_APPEND` operation; the
-ingest receipt itself is not handoff evidence.
+Universe-local SQLite queue receipt. It neither writes the Project repository
+nor starts a Task Frame. A separately scheduled or manually invoked
+`drain-skill-observation-queue` consumer performs Bench ingest after the queue
+write. Retaining that receipt under a Project `.ai/archive/` path is a later,
+separately approved ai-career `HANDOFF_APPEND` operation; the queue receipt
+itself is not handoff evidence.
 
 To prepare a Project-owned archive step without writing the Project, use:
 
