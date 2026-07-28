@@ -1,0 +1,42 @@
+{
+  "schema": "universe.grok-cli-runtime-adapter.v2",
+  "adapter_id": "universe-grok-cli-read-only",
+  "entrypoint": ".ai/adapters/grok/invoke.ps1",
+  "transport": {
+    "kind": "local-process",
+    "input_schema": "universe.grok-worker-request.v1",
+    "output_schema": "universe.grok-worker-result.v1",
+    "context_source": "caller-supplied-context-pack-only",
+    "stdout": "bounded-json-result",
+    "hidden_reasoning": "excluded"
+  },
+  "runtime_provider": {
+    "kind": "task-frame-agent-runtime",
+    "profiles": {
+      "READ_ONLY": {
+        "execution": "BOUNDED_ANALYSIS",
+        "repository_write_scope": "NONE"
+      },
+      "TASK_FRAME_RUNTIME": {
+        "execution": "BOUNDED_TASK_FRAME_TURN",
+        "repository_write_scope": "NONE",
+        "source_mutation": "HOST_GATEWAY_ONLY"
+      }
+    },
+    "external_tool_execution": "HOST_CAPABILITY_REQUIRED"
+  },  "worker_policy": {
+    "repository_write_scope": "NONE",
+    "mutation_scope": "EMPTY_REQUIRED",
+    "permission_mode": "plan",
+    "sandbox_profile": "read-only",
+    "subagents": "FORBIDDEN",
+    "memory": "DISABLED",
+    "web_search": "DISABLED"
+  },
+  "task_frame": {
+    "worker_invocation": "HOST_PROVIDED",
+    "worker_actor": "grok-cli:<session_id>",
+    "host_invocation_receipt": "grok-cli:<session_id>:<request_id>",
+    "parent_adoption": "FORBIDDEN"
+  }
+}
