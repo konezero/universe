@@ -989,6 +989,127 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("FRESH_PROJECT_ROUTE_NOT_SELECTABLE", rejected["error_code"])
 
+    def test_master_handoff_is_proposed_then_explicitly_delivered(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, composition_result = self.request(
+            "POST",
+            "/v1/fresh-project-compositions",
+            {
+                "intent": {
+                    "project": "Local trading workstation",
+                    "kind": "desktop-app",
+                    "technologies": ["python", "pyside6", "sqlite"],
+                    "goal": "stable unattended operation with recoverable state",
+                },
+                "route_id": "durable-desktop-state",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        composition = composition_result["composition"]
+        status, adoption_result = self.request(
+            "POST",
+            "/v1/fresh-project-composition-adoptions",
+            {"composition_id": composition["composition_id"], "approval": "ADOPTED"},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        adoption = adoption_result["adoption"]
+
+        before = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        status, proposed = self.request(
+            "POST",
+            "/v1/projects/GCS/master-handoffs",
+            {
+                "source": {
+                    "kind": "FRESH_PROJECT_COMPOSITION",
+                    "adoption_id": adoption["adoption_id"],
+                },
+                "purpose": "Have the Project Master review the initial scope.",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("PROJECT_MASTER_HANDOFF_PROPOSAL_RECORDED", proposed["status"])
+        handoff = proposed["handoff"]
+        self.assertEqual("PROPOSAL_ONLY", handoff["delivery_state"])
+        self.assertEqual(
+            "USER_APPROVAL_REQUIRED_FOR_MASTER_DELIVERY", handoff["next_operation"]
+        )
+        self.assertTrue(all(value == "NONE" for value in handoff["effects"].values()))
+        self.assertEqual([], self.server.store.list_room_messages("GCS"))
+
+        status, rejected = self.request(
+            "POST",
+            f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}/deliver",
+            {"approval": "ADOPTED"},
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "MASTER_HANDOFF_DELIVERY_APPROVAL_REQUIRED", rejected["error_code"]
+        )
+
+        status, bridge_result = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        bridge = bridge_result["bridge"]
+        receipt = {
+            "status": "DELIVERED",
+            "bridge_id": bridge["bridge_id"],
+            "project_id": "GCS",
+            "message_id": "bridge-created-placeholder",
+            "delivered_at": "2026-07-28T04:45:00Z",
+        }
+        with patch(
+            "universe_server.HttpProjectMasterBridge.deliver", return_value=receipt
+        ) as deliver:
+            status, delivered = self.request(
+                "POST",
+                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}/deliver",
+                {"approval": "DELIVER"},
+                self.token,
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_MASTER_HANDOFF_DELIVERED", delivered["status"])
+        self.assertEqual("DELIVERED_TO_MASTER", delivered["handoff"]["delivery_state"])
+        self.assertIsNotNone(delivered["handoff"]["room_message_id"])
+        self.assertEqual(bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"])
+
+        status, repeated = self.request(
+            "POST",
+            f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}/deliver",
+            {"approval": "DELIVER"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_MASTER_HANDOFF_ALREADY_DELIVERED", repeated["status"])
+
+        status, listed = self.request(
+            "GET", "/v1/projects/GCS/master-handoffs", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([handoff["handoff_id"]], [item["handoff_id"] for item in listed["handoffs"]])
+        after = {
+            path.relative_to(self.project_root).as_posix(): self.digest(path)
+            for path in self.project_root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {

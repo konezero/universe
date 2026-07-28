@@ -110,6 +110,9 @@ POST   /v1/projects/{project_id}/skill-plan-proposals
 GET    /v1/projects/{project_id}/skill-plan-proposals
 POST   /v1/projects/{project_id}/skill-plan-adoptions
 GET    /v1/projects/{project_id}/skill-plan-adoptions
+POST   /v1/projects/{project_id}/master-handoffs
+GET    /v1/projects/{project_id}/master-handoffs
+POST   /v1/projects/{project_id}/master-handoffs/{handoff_id}/deliver
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
 GET    /v1/templates/project-seed
@@ -400,3 +403,9 @@ It does not create a project, write project files, bind a Master, create a
 Task Frame, or grant authority. `POST /v1/fresh-project-composition-adoptions`
 requires explicit `ADOPTED` selection and produces only a later Project Master
 handoff candidate.
+
+A Project Master handoff only accepts an already adopted Fresh Project
+Composition or project-local Skill Plan. It is recorded as `PROPOSAL_ONLY`.
+An explicit `DELIVER` request is required before Universe writes a room message
+to the registered Master bridge. Delivery creates neither a Task Frame nor
+project write authority; the Project Master must make any later proposal.

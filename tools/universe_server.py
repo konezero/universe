@@ -73,6 +73,7 @@ FRESH_PROJECT_COMPOSITION_SCHEMA = "universe.fresh-project-composition.v1"
 FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA = (
     "universe.fresh-project-composition-adoption.v1"
 )
+PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -1093,6 +1094,50 @@ def normalize_fresh_project_composition_adoption_request(value: Any) -> dict[str
     return normalized
 
 
+def normalize_master_handoff_proposal_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_handoff_proposal_request",
+        required=frozenset({"source"}),
+        optional=frozenset({"purpose"}),
+    )
+    source = _exact_object_fields(
+        request["source"],
+        field="master_handoff_proposal_request.source",
+        required=frozenset({"kind", "adoption_id"}),
+    )
+    kind = _identifier(source["kind"], "source.kind").upper()
+    if kind not in {"FRESH_PROJECT_COMPOSITION", "SKILL_PLAN"}:
+        raise UniverseError(
+            "MASTER_HANDOFF_SOURCE_INVALID",
+            "source.kind must be FRESH_PROJECT_COMPOSITION or SKILL_PLAN",
+        )
+    normalized = {
+        "source": {
+            "kind": kind,
+            "adoption_id": _identifier(source["adoption_id"], "source.adoption_id"),
+        }
+    }
+    if "purpose" in request:
+        normalized["purpose"] = _required_text(request["purpose"], "purpose")
+    return normalized
+
+
+def normalize_master_handoff_delivery_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_handoff_delivery_request",
+        required=frozenset({"approval"}),
+    )
+    if request["approval"] != "DELIVER":
+        raise UniverseError(
+            "MASTER_HANDOFF_DELIVERY_APPROVAL_REQUIRED",
+            "approval must be DELIVER before sending a handoff to Project Master",
+            HTTPStatus.CONFLICT,
+        )
+    return {"approval": "DELIVER"}
+
+
 def normalize_context_pack_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -2004,6 +2049,25 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS fresh_project_composition_adoption_time
                 ON fresh_project_composition_adoption(adopted_at, adoption_id);
+
+                CREATE TABLE IF NOT EXISTS project_master_handoff (
+                    handoff_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL,
+                    source_adoption_id TEXT NOT NULL,
+                    handoff_digest TEXT NOT NULL UNIQUE,
+                    handoff_json TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    room_message_id TEXT,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    UNIQUE(project_id, source_kind, source_adoption_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_master_handoff_project_time
+                ON project_master_handoff(project_id, created_at, handoff_id);
 
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
@@ -3148,6 +3212,230 @@ class UniverseStore:
             adoption["adopted_at"] = row["adopted_at"]
             adoptions.append(adoption)
         return adoptions
+
+    def _get_fresh_project_composition_adoption(
+        self, adoption_id: str
+    ) -> dict[str, Any]:
+        normalized_id = _identifier(adoption_id, "adoption_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM fresh_project_composition_adoption
+                WHERE adoption_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MASTER_HANDOFF_SOURCE_NOT_FOUND",
+                "Fresh Project Composition adoption does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        adoption = json.loads(row["adoption_json"])
+        adoption["adopted_at"] = row["adopted_at"]
+        return adoption
+
+    def _get_skill_plan_adoption(
+        self, project_id: str, adoption_id: str
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_id = _identifier(adoption_id, "adoption_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM project_skill_plan_adoption
+                WHERE project_id = ? AND adoption_id = ?
+                """,
+                (project["project_id"], normalized_id),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MASTER_HANDOFF_SOURCE_NOT_FOUND",
+                "Skill Plan adoption does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        adoption = json.loads(row["adoption_json"])
+        adoption["adopted_at"] = row["adopted_at"]
+        return adoption
+
+    def _master_handoff_source(
+        self, project_id: str, source: dict[str, str]
+    ) -> dict[str, Any]:
+        if source["kind"] == "FRESH_PROJECT_COMPOSITION":
+            adoption = self._get_fresh_project_composition_adoption(
+                source["adoption_id"]
+            )
+            composition = self.get_fresh_project_composition(adoption["composition_id"])
+            return {
+                "kind": source["kind"],
+                "adoption": adoption,
+                "composition": composition,
+            }
+        adoption = self._get_skill_plan_adoption(project_id, source["adoption_id"])
+        return {"kind": source["kind"], "adoption": adoption}
+
+    def create_master_handoff(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = normalize_master_handoff_proposal_request(value)
+        source = self._master_handoff_source(project["project_id"], request["source"])
+        material: dict[str, Any] = {
+            "schema": PROJECT_MASTER_HANDOFF_SCHEMA,
+            "project_id": project["project_id"],
+            "source": source,
+            "delivery_state": "PROPOSAL_ONLY",
+            "effects": {
+                "project_source_write": "NONE",
+                "project_runtime_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
+            },
+            "next_operation": "USER_APPROVAL_REQUIRED_FOR_MASTER_DELIVERY",
+        }
+        if "purpose" in request:
+            material["purpose"] = request["purpose"]
+        material["handoff_digest"] = _json_sha256(material)
+        material["handoff_id"] = "handoff_" + material["handoff_digest"][:24]
+        material["status"] = "PROJECT_MASTER_HANDOFF_PROPOSAL_READY"
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT handoff_json, delivery_state, room_message_id, created_at, delivered_at
+                FROM project_master_handoff
+                WHERE project_id = ? AND source_kind = ? AND source_adoption_id = ?
+                """,
+                (
+                    project["project_id"],
+                    request["source"]["kind"],
+                    request["source"]["adoption_id"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["handoff_json"])
+                if stored["handoff_digest"] != material["handoff_digest"]:
+                    raise UniverseError(
+                        "MASTER_HANDOFF_SOURCE_CONFLICT",
+                        "the selected source now produces a different handoff",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self._master_handoff_row(existing), False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO project_master_handoff(
+                    handoff_id, project_id, source_kind, source_adoption_id,
+                    handoff_digest, handoff_json, delivery_state, room_message_id,
+                    created_at, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+                """,
+                (
+                    material["handoff_id"],
+                    project["project_id"],
+                    request["source"]["kind"],
+                    request["source"]["adoption_id"],
+                    material["handoff_digest"],
+                    _canonical_json(material),
+                    "PROPOSAL_ONLY",
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def get_master_handoff(self, project_id: str, handoff_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_id = _identifier(handoff_id, "handoff_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT handoff_json, delivery_state, room_message_id, created_at, delivered_at
+                FROM project_master_handoff
+                WHERE project_id = ? AND handoff_id = ?
+                """,
+                (project["project_id"], normalized_id),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MASTER_HANDOFF_NOT_FOUND",
+                "Project Master handoff proposal does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._master_handoff_row(row)
+
+    def list_master_handoffs(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT handoff_json, delivery_state, room_message_id, created_at, delivered_at
+                FROM project_master_handoff
+                WHERE project_id = ?
+                ORDER BY created_at DESC, handoff_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._master_handoff_row(row) for row in rows]
+
+    def deliver_master_handoff(
+        self, project_id: str, handoff_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        normalize_master_handoff_delivery_request(value)
+        handoff = self.get_master_handoff(project_id, handoff_id)
+        if handoff["delivery_state"] != "PROPOSAL_ONLY":
+            return handoff, False
+        message, _ = self.send_room_message(
+            handoff["project_id"],
+            {
+                "kind": "TASK_DRAFT",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "idempotency_key": "master-handoff-" + handoff["handoff_id"],
+                "body": _canonical_json(
+                    {
+                        "schema": PROJECT_MASTER_HANDOFF_SCHEMA,
+                        "handoff_id": handoff["handoff_id"],
+                        "handoff_digest": handoff["handoff_digest"],
+                        "source": handoff["source"],
+                        "purpose": handoff.get("purpose", "PROJECT_MASTER_REVIEW"),
+                        "next_operation": "PROJECT_MASTER_REVIEW_OR_TASK_FRAME_PROPOSAL",
+                    }
+                ),
+            },
+        )
+        delivered_at = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE project_master_handoff
+                SET delivery_state = ?, room_message_id = ?, delivered_at = ?
+                WHERE project_id = ? AND handoff_id = ? AND delivery_state = 'PROPOSAL_ONLY'
+                """,
+                (
+                    message["delivery_state"],
+                    message["message_id"],
+                    delivered_at,
+                    handoff["project_id"],
+                    handoff["handoff_id"],
+                ),
+            )
+        if cursor.rowcount != 1:
+            return self.get_master_handoff(project_id, handoff_id), False
+        return self.get_master_handoff(project_id, handoff_id), True
+
+    @staticmethod
+    def _master_handoff_row(row: sqlite3.Row) -> dict[str, Any]:
+        handoff = json.loads(row["handoff_json"])
+        handoff["delivery_state"] = row["delivery_state"]
+        handoff["room_message_id"] = row["room_message_id"]
+        handoff["created_at"] = row["created_at"]
+        handoff["delivered_at"] = row["delivered_at"]
+        return handoff
 
     @staticmethod
     def _skill_observation_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -4866,6 +5154,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/master-handoffs":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MASTER_HANDOFFS_COLLECTED",
+                        "project_id": project_id,
+                        "handoffs": self.server.store.list_master_handoffs(project_id),
+                    },
+                )
+                return
             if suffix == "/master-bridge":
                 self._send(
                     HTTPStatus.OK,
@@ -5020,6 +5319,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            handoff_parts = self._master_handoff_path(path)
+            if handoff_parts is not None and handoff_parts[1] == "/deliver":
+                handoff, delivered = self.server.store.deliver_master_handoff(
+                    handoff_parts[0], handoff_parts[1 + 1], body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_MASTER_HANDOFF_DELIVERED"
+                            if delivered
+                            else "PROJECT_MASTER_HANDOFF_ALREADY_DELIVERED"
+                        ),
+                        "handoff": handoff,
+                    },
+                )
+                return
             parts = self._project_path(path)
             if parts is not None and parts[1] == "/release-proposals":
                 proposal, created = (
@@ -5163,6 +5480,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "SKILL_PLAN_ADOPTION_ALREADY_RECORDED"
                         ),
                         "adoption": adoption,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/master-handoffs":
+                handoff, created = self.server.store.create_master_handoff(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROJECT_MASTER_HANDOFF_PROPOSAL_RECORDED"
+                            if created
+                            else "PROJECT_MASTER_HANDOFF_PROPOSAL_ALREADY_RECORDED"
+                        ),
+                        "handoff": handoff,
                     },
                 )
                 return
@@ -5408,6 +5742,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/document-incorporation-proposals",
             "/skill-plan-proposals",
             "/skill-plan-adoptions",
+            "/master-handoffs",
             "/context-packs",
             "/release-proposals",
             "/dispatches",
@@ -5448,6 +5783,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if remainder.endswith(suffix):
                 return unquote(remainder[:-len(suffix)]), suffix
         return unquote(remainder), ""
+
+    @staticmethod
+    def _master_handoff_path(path: str) -> tuple[str, str, str] | None:
+        prefix = "/v1/projects/"
+        suffix = "/master-handoffs/"
+        if not path.startswith(prefix) or suffix not in path:
+            return None
+        project_id, remainder = path[len(prefix):].split(suffix, 1)
+        if not project_id or not remainder.endswith("/deliver"):
+            return None
+        handoff_id = remainder[: -len("/deliver")]
+        if not handoff_id or "/" in handoff_id:
+            return None
+        return unquote(project_id), "/deliver", unquote(handoff_id)
 
     def _not_found(self) -> None:
         self._send(
