@@ -224,6 +224,13 @@ Projects and create a reusable promotion candidate only when provenance,
 applicability conditions, evidence references, and redaction state remain
 intact. Career adoption remains a separate Conductor decision.
 
+An `OBSERVED_EXPERIENCE_PATTERN` Career candidate is derived only from a
+recorded Universe pattern proposal and is placed on the Universe-to-Career
+queue with `promotion_state: CANDIDATE_ONLY`. The queue contains redacted
+aggregate support only. Career Carrier later prepares two append candidates,
+for its Memory Inbox and the Conductor Inbox, but the queue record does not
+write Career or make a governance decision.
+
 The Universe application provides a local HTTP publisher for an explicitly
 selected, already prepared candidate. The publisher returns a durable Universe
 queue receipt but does not write a Project archive. A Project that needs an

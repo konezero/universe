@@ -220,6 +220,11 @@ observed signature in common. It stores support case IDs and the shared Skill,
 outcome, and validation dimensions, but remains `promotion_state: PROPOSAL_ONLY`.
 It never writes Career governance or adds a Task Frame constraint.
 
+Universe may turn that recorded proposal into one redacted
+`universe.career-promotion-candidate.v1` on its durable Universe-to-Career
+queue. The candidate remains `CANDIDATE_ONLY`; it is read by Career Carrier and
+cannot itself append a Career Inbox record or adopt a governance rule.
+
 A Context Pack is built from a current Project Seed, selected functional node
 IDs, node-linked or project-wide document references, and a bounded set of
 redacted observations already recorded for that Project. It contains no raw

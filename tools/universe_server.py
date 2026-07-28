@@ -82,6 +82,8 @@ PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
 )
 EXPERIENCE_CASE_SCHEMA = "universe.experience-case.v1"
 EXPERIENCE_PATTERN_PROPOSAL_SCHEMA = "universe.experience-pattern-proposal.v1"
+CAREER_PROMOTION_CANDIDATE_SCHEMA = "universe.career-promotion-candidate.v1"
+CAREER_PROMOTION_QUEUE_SCHEMA = "universe.career-promotion-queue-item.v1"
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -2196,6 +2198,22 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS experience_pattern_proposal_project_time
                 ON experience_pattern_proposal(project_id, created_at, proposal_id);
 
+                CREATE TABLE IF NOT EXISTS career_promotion_queue (
+                    queue_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    source_proposal_id TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL UNIQUE,
+                    candidate_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('QUEUED')),
+                    queued_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_proposal_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS career_promotion_queue_order
+                ON career_promotion_queue(queued_at, queue_id);
+
                 CREATE TABLE IF NOT EXISTS project_seed (
                     project_id TEXT NOT NULL
                         REFERENCES project_connection(project_id)
@@ -4048,6 +4066,145 @@ class UniverseStore:
             proposals.append(proposal)
         return proposals
 
+    def queue_career_promotion_candidate(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Queue a Career candidate derived only from a recorded pattern proposal."""
+
+        project = self.get_project(project_id)
+        request = _exact_object_fields(
+            value,
+            field="career_promotion_request",
+            required=frozenset({"pattern_proposal_id"}),
+        )
+        proposal_id = _identifier(
+            request["pattern_proposal_id"], "pattern_proposal_id"
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM experience_pattern_proposal
+                WHERE project_id = ? AND proposal_id = ?
+                """,
+                (project["project_id"], proposal_id),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "EXPERIENCE_PATTERN_PROPOSAL_NOT_FOUND",
+                "Career promotion requires a recorded Universe pattern proposal",
+                HTTPStatus.NOT_FOUND,
+            )
+        pattern = json.loads(row["proposal_json"])
+        if pattern.get("promotion_state") != "PROPOSAL_ONLY":
+            raise UniverseError(
+                "EXPERIENCE_PATTERN_PROMOTION_STATE_INVALID",
+                "Career candidate source must remain a proposal-only pattern",
+                HTTPStatus.CONFLICT,
+            )
+        universe_id = self.identity()["universe_id"]
+        material = {
+            "schema": CAREER_PROMOTION_CANDIDATE_SCHEMA,
+            "universe_ref": f"universe://{universe_id}",
+            "project_ref": f"project://{project['project_id']}",
+            "promotion_kind": "OBSERVED_EXPERIENCE_PATTERN",
+            "source": {
+                "pattern_proposal_id": pattern["proposal_id"],
+                "pattern_proposal_digest": pattern["proposal_digest"],
+                "support_case_ids": pattern["support_case_ids"],
+                "support_case_count": pattern["support_case_count"],
+            },
+            "observed_signature": pattern["observed_signature"],
+            "redaction_state": "REDACTED",
+            "evidence_state": "OBSERVED_AGGREGATE",
+            "promotion_state": "CANDIDATE_ONLY",
+            "effects": {
+                "career_governance_write": "NONE",
+                "project_source_write": "NONE",
+                "project_runtime_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "CAREER_CARRIER_INTAKE",
+        }
+        candidate_digest = _json_sha256(material)
+        candidate = {
+            **material,
+            "candidate_digest": candidate_digest,
+            "candidate_id": "careerpromotion_" + candidate_digest[:24],
+        }
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT queue_id, candidate_json, queued_at
+                FROM career_promotion_queue
+                WHERE project_id = ? AND source_proposal_id = ?
+                """,
+                (project["project_id"], proposal_id),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["candidate_json"])
+                if stored["candidate_digest"] != candidate_digest:
+                    raise UniverseError(
+                        "CAREER_PROMOTION_SOURCE_CONFLICT",
+                        "pattern proposal already maps to another Career candidate",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self._career_promotion_queue_row(existing, stored), False
+            queue_id = "career_queue_" + candidate_digest[:24]
+            connection.execute(
+                """
+                INSERT INTO career_promotion_queue(
+                    queue_id, project_id, source_proposal_id, candidate_digest,
+                    candidate_json, status, queued_at
+                ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?)
+                """,
+                (
+                    queue_id,
+                    project["project_id"],
+                    proposal_id,
+                    candidate_digest,
+                    _canonical_json(candidate),
+                    now,
+                ),
+            )
+        return {
+            "schema": CAREER_PROMOTION_QUEUE_SCHEMA,
+            "queue_id": queue_id,
+            "candidate": candidate,
+            "status": "QUEUED",
+            "queued_at": now,
+        }, True
+
+    def list_career_promotion_queue(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT queue_id, candidate_json, queued_at
+                FROM career_promotion_queue
+                ORDER BY queued_at, queue_id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [
+            self._career_promotion_queue_row(row, json.loads(row["candidate_json"]))
+            for row in rows
+        ]
+
+    @staticmethod
+    def _career_promotion_queue_row(
+        row: sqlite3.Row, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "schema": CAREER_PROMOTION_QUEUE_SCHEMA,
+            "queue_id": row["queue_id"],
+            "candidate": candidate,
+            "status": "QUEUED",
+            "queued_at": row["queued_at"],
+        }
+
     def deliver_master_handoff(
         self, project_id: str, handoff_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -5745,6 +5902,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/career-promotion-queue":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "CAREER_PROMOTION_QUEUE_COLLECTED",
+                    "items": self.server.store.list_career_promotion_queue(),
+                },
+            )
+            return
         dispatch_parts = self._dispatch_path(path)
         if dispatch_parts is not None and dispatch_parts[1] == "":
             try:
@@ -6307,6 +6474,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/career-promotion-queue":
+                item, created = self.server.store.queue_career_promotion_candidate(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "CAREER_PROMOTION_CANDIDATE_QUEUED"
+                            if created
+                            else "CAREER_PROMOTION_CANDIDATE_ALREADY_QUEUED"
+                        ),
+                        "item": item,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/master-bridge":
                 bridge, created = self.server.store.register_master_bridge(
                     parts[0], body
@@ -6553,6 +6737,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/experience-cases",
             "/experience-matches",
             "/experience-pattern-proposals",
+            "/career-promotion-queue",
             "/context-packs",
             "/release-proposals",
             "/dispatches",

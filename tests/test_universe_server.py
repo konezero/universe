@@ -1328,6 +1328,42 @@ class UniverseLocalServiceTests(unittest.TestCase):
             [item["proposal_id"] for item in collected["proposals"]],
         )
 
+        status, queued = self.request(
+            "POST",
+            "/v1/projects/GCS/career-promotion-queue",
+            {"pattern_proposal_id": proposal["proposal_id"]},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("CAREER_PROMOTION_CANDIDATE_QUEUED", queued["status"])
+        item = queued["item"]
+        candidate = item["candidate"]
+        self.assertEqual("QUEUED", item["status"])
+        self.assertEqual(
+            "universe.career-promotion-candidate.v1", candidate["schema"]
+        )
+        self.assertEqual("CANDIDATE_ONLY", candidate["promotion_state"])
+        self.assertEqual("REDACTED", candidate["redaction_state"])
+        self.assertEqual(
+            proposal["proposal_digest"], candidate["source"]["pattern_proposal_digest"]
+        )
+        self.assertTrue(all(value == "NONE" for value in candidate["effects"].values()))
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/projects/GCS/career-promotion-queue",
+            {"pattern_proposal_id": proposal["proposal_id"]},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("CAREER_PROMOTION_CANDIDATE_ALREADY_QUEUED", repeated["status"])
+
+        status, queue = self.request(
+            "GET", "/v1/career-promotion-queue", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([item["queue_id"]], [entry["queue_id"] for entry in queue["items"]])
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {
