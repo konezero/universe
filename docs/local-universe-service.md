@@ -223,6 +223,48 @@ does not respond, the original room message remains durable with
 `INBOX_FALLBACK_AVAILABLE`. Existing Master Inbox dispatch remains a separate,
 explicit operation and is not silently created by a conversation message.
 
+### Project Master Bridge Host
+
+`tools/project_master_bridge.py` is the supplied deterministic receiver for a
+separately running local Project Master Host. It does not start, restore, or
+control a vendor chat session. It only writes authenticated Universe room
+envelopes to the project's existing `.ai/inbox/MASTER` directory.
+
+Set one shared credential in the same local environment as both services, then
+start the receiver for the attached project:
+
+```powershell
+$env:UNIVERSE_GCS_MASTER_BRIDGE_TOKEN = "<local-secret>"
+python tools/project_master_bridge.py serve `
+  --project-root C:\workspace\GCS `
+  --token-env UNIVERSE_GCS_MASTER_BRIDGE_TOKEN
+```
+
+Register the returned literal loopback endpoint with the Universe service using
+that same environment-variable name. The opaque `master_session_ref` belongs
+to the Project Host integration; it is an identifier only, not proof that a
+chat session is live or authorized.
+
+The separately running Master reads the recorded envelope and replies only by
+an explicit callback. The reply client keeps the credential out of command
+history by reading it from an environment variable:
+
+```powershell
+python tools/project_master_bridge.py reply `
+  --universe-endpoint http://127.0.0.1:<universe-port> `
+  --project-id GCS `
+  --bridge-id <registered-bridge-id> `
+  --in-reply-to <room-message-id> `
+  --kind STATUS `
+  --body "Master received the question." `
+  --idempotency-key <stable-reply-key> `
+  --token-env UNIVERSE_GCS_MASTER_BRIDGE_TOKEN
+```
+
+Neither receipt starts Task Frames, grants Execution Guard permission, or
+executes a room instruction. Those remain Project Master decisions through the
+Project Runtime.
+
 Release proposals never apply project files from the browser. The proposal
 digest and plan are handed to the Project Host for approval, guarded writes,
 validate/status, and completion evidence.
