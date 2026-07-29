@@ -2135,6 +2135,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "provider": "GROK",
                     "worker_id": "grok-worker-001",
                     "result_receipt_ref": "result-001",
+                    "skill_run_observation_count": 1,
                     "repository_write": False,
                 }
 
@@ -2170,6 +2171,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "result-001",
             created["invocation"]["result"]["result_receipt_ref"],
+        )
+        self.assertEqual(
+            1,
+            created["invocation"]["result"]["skill_run_observation_count"],
         )
         self.assertNotIn("worker_run_ref", created["invocation"]["result"])
         status, repeated = self.request("POST", path, payload)

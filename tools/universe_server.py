@@ -5341,6 +5341,13 @@ class UniverseStore:
                 "status": "RUNTIME_HOST_UNAVAILABLE",
                 "reason": error.code,
             }
+        observation_count = result.get("skill_run_observation_count", 0)
+        if (
+            isinstance(observation_count, bool)
+            or not isinstance(observation_count, int)
+            or observation_count < 0
+        ):
+            observation_count = 0
         result_record = {
             "status": _required_text(result.get("status"), "runtime result status"),
             "provider": redacted["provider"],
@@ -5348,6 +5355,7 @@ class UniverseStore:
             "result_receipt_ref": str(
                 result.get("result_receipt_ref") or "UNKNOWN"
             ),
+            "skill_run_observation_count": observation_count,
             "repository_write": False,
         }
         for field in ("reason", "stage"):

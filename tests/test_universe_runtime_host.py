@@ -36,6 +36,8 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
         self.assertIn("LOCALAPPDATA", dispatcher)
         self.assertIn("worker_run_ref", dispatcher)
         self.assertIn("result_receipt_ref", dispatcher)
+        self.assertIn("skill_run_observations", dispatcher)
+        self.assertIn("validation_state = 'NOT_RUN'", dispatcher)
         self.assertNotIn("host_invocation_receipt_ref", dispatcher)
         self.assertNotIn("host_result_evidence_ref", dispatcher)
 
@@ -109,7 +111,8 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                 stdout=(
                     '{"status":"TASK_FRAME_RESULT_RECORDED",'
                     '"worker_id":"grok-1",'
-                    '"result_receipt_ref":"result-1"}'
+                    '"result_receipt_ref":"result-1",'
+                    '"skill_run_observation_count":2}'
                 ),
                 returncode=0,
             )
@@ -120,6 +123,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
         self.assertFalse(result["repository_write"])
         self.assertEqual("result-1", result["result_receipt_ref"])
+        self.assertEqual(2, result["skill_run_observation_count"])
         self.assertNotIn("worker_run_ref", result)
         self.assertEqual(2, len(calls))
         self.assertEqual(

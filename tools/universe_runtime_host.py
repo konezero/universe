@@ -153,6 +153,18 @@ class UniverseRuntimeHost:
         request = normalize_read_only_request(value)
         with self._transient_request_file(request) as request_path:
             response = self._invoke_dispatch(["-RequestPath", str(request_path)], timeout=180)
+        observation_count = response.get("skill_run_observation_count", 0)
+        if (
+            isinstance(observation_count, bool)
+            or not isinstance(observation_count, int)
+            or observation_count < 0
+        ):
+            observation_count = 0
+        optional_details: dict[str, str] = {}
+        for key in ("reason", "stage"):
+            detail = response.get(key)
+            if isinstance(detail, str) and detail:
+                optional_details[key] = detail
         return {
             "status": _text_or(response.get("status"), "WORKER_PROVIDER_FAILED"),
             "provider": request["provider"],
@@ -160,12 +172,9 @@ class UniverseRuntimeHost:
             "result_receipt_ref": _text_or(
                 response.get("result_receipt_ref"), "UNKNOWN"
             ),
+            "skill_run_observation_count": observation_count,
             "repository_write": False,
-            **{
-                key: value
-                for key in ("reason", "stage")
-                if isinstance((value := response.get(key)), str) and value
-            },
+            **optional_details,
         }
 
     def _invoke_dispatch(self, arguments: list[str], *, timeout: int) -> dict[str, Any]:

@@ -61,3 +61,13 @@ canonical result record.
 The route does not queue a live Worker call. Session credentials are volatile,
 so an invocation is synchronous against an already active Task Frame. A later
 durable Project dispatch can request that a Master prepare a new session.
+
+When a Sub turn carries Boss-declared project Skill bindings, the Host appends
+one bounded observation per binding to the unchanged Worker envelope. The Host
+records only the declared binding digest, Runtime-selected model reference,
+terminal result receipt, and measured adapter duration. A completed transport
+maps to `outcome: SUCCEEDED`, while validation remains `NOT_RUN`; the Host does
+not infer task quality from model text. The project Task Frame journal validates
+and owns these observations. Universe persists only their count in the redacted
+invocation timeline. Publishing the reviewed Result Packet through the existing
+Project-to-Universe queue remains a separate operation.
