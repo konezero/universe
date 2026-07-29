@@ -477,10 +477,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "default-src 'self'",
                 response.headers["Content-Security-Policy"],
             )
+            self.assertIn('id="fresh-project-dialog"', body)
+            self.assertIn('id="start-project-button"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
             self.assertIn("/v1/projects", script)
+            self.assertIn("/v1/future-paths", script)
+            self.assertIn("/v1/fresh-project-compositions", script)
+            self.assertIn("/v1/fresh-project-refinement-requests", script)
+            self.assertIn("/v1/fresh-project-composition-adoptions", script)
             self.assertNotIn(self.token, script)
 
     def test_registration_refresh_and_listing_are_idempotent(self) -> None:
@@ -1115,6 +1121,151 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(409, status)
         self.assertEqual("FRESH_PROJECT_ROUTE_NOT_SELECTABLE", rejected["error_code"])
+
+    def test_fresh_project_refinement_requires_bound_candidate_and_user_adoption(self) -> None:
+        status, created = self.request(
+            "POST",
+            "/v1/fresh-project-compositions",
+            {
+                "intent": {
+                    "project": "Local trading workstation",
+                    "kind": "desktop-app",
+                    "technologies": ["python", "pyside6", "sqlite"],
+                    "goal": "stable unattended operation with recoverable state",
+                    "constraints": ["Local-first only."],
+                    "target_users": "Individual trading operator",
+                },
+                "route_id": "durable-desktop-state",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        composition = created["composition"]
+
+        status, prepared = self.request(
+            "POST",
+            "/v1/fresh-project-refinement-requests",
+            {"composition_id": composition["composition_id"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        refinement_request = prepared["request"]
+        self.assertEqual(
+            "FRESH_PROJECT_REFINEMENT_REQUEST_READY", prepared["status"]
+        )
+        self.assertEqual(
+            "UNIVERSE_PLANNING_FRAME_REQUIRED",
+            refinement_request["runtime_boundary"]["task_frame"],
+        )
+        self.assertEqual(
+            "NOT_REQUESTED",
+            refinement_request["runtime_boundary"]["provider_invocation"],
+        )
+        self.assertEqual("FORBIDDEN", refinement_request["output_contract"]["raw_worker_text"])
+        self.assertTrue(
+            all(value == "NONE" for value in refinement_request["effects"].values())
+        )
+
+        candidate = {
+            "schema": "universe.fresh-project-refinement-candidate.v1",
+            "request_id": refinement_request["request_id"],
+            "request_digest": refinement_request["request_digest"],
+            "composition_id": composition["composition_id"],
+            "composition_digest": composition["composition_digest"],
+            "producer": {
+                "provider": "GROK",
+                "model_ref": "provider://GROK/model/grok-build",
+                "worker_id": "grok-cli:planning-001",
+                "result_receipt_ref": "grok-cli:planning-001:result-001",
+            },
+            "refinement": {
+                "problem_statement": "Provide a recoverable local trading workspace.",
+                "target_users": "Individual trading operator",
+                "constraints": ["Local-first only.", "No order mutation during discovery."],
+                "design_direction": "Keep recovery state visible beside live observations.",
+                "technology_recommendations": [
+                    {
+                        "technology": "structured-local-events",
+                        "rationale": "Preserve recovery evidence without a remote dependency.",
+                    }
+                ],
+                "document_additions": [
+                    {
+                        "document_id": "project-observability",
+                        "role": "EVIDENCE",
+                        "title": "Operational observation boundaries",
+                    }
+                ],
+                "risk_additions": ["Recovery state can diverge from the displayed UI."],
+            },
+        }
+        invalid = dict(candidate)
+        invalid["request_digest"] = "different-request"
+        status, rejected = self.request(
+            "POST", "/v1/fresh-project-refinement-candidates", invalid, self.token
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "FRESH_PROJECT_REFINEMENT_REQUEST_MISMATCH", rejected["error_code"]
+        )
+
+        status, recorded = self.request(
+            "POST", "/v1/fresh-project-refinement-candidates", candidate, self.token
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        refinement_candidate = recorded["candidate"]
+        self.assertNotIn("raw_text", json.dumps(refinement_candidate, sort_keys=True))
+        self.assertEqual(
+            "FRESH_PROJECT_REFINEMENT_CANDIDATE_READY", recorded["status"]
+        )
+
+        status, adoption_result = self.request(
+            "POST",
+            "/v1/fresh-project-refinement-adoptions",
+            {
+                "candidate_id": refinement_candidate["candidate_id"],
+                "approval": "ADOPTED",
+                "user_notes": "Use this as the next composition revision.",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("FRESH_PROJECT_REFINEMENT_ADOPTED", adoption_result["status"])
+        refined = adoption_result["composition"]
+        self.assertNotEqual(composition["composition_id"], refined["composition_id"])
+        self.assertEqual(
+            candidate["refinement"]["problem_statement"],
+            refined["specification"]["problem_statement"],
+        )
+        self.assertEqual(
+            candidate["refinement"]["technology_recommendations"],
+            refined["technology"]["recommendations"],
+        )
+        self.assertIn(
+            "project-observability",
+            {item["document_id"] for item in refined["document_plan"]},
+        )
+        self.assertTrue(all(value == "NONE" for value in refined["effects"].values()))
+        self.assertEqual([], self.server.store.list_projects())
+
+        status, requests = self.request(
+            "GET", "/v1/fresh-project-refinement-requests", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([refinement_request["request_id"]], [item["request_id"] for item in requests["requests"]])
+        status, candidates = self.request(
+            "GET", "/v1/fresh-project-refinement-candidates", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([refinement_candidate["candidate_id"]], [item["candidate_id"] for item in candidates["candidates"]])
+        status, adoptions = self.request(
+            "GET", "/v1/fresh-project-refinement-adoptions", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            [adoption_result["adoption"]["adoption_id"]],
+            [item["adoption_id"] for item in adoptions["adoptions"]],
+        )
 
     def test_master_handoff_is_proposed_then_explicitly_delivered(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

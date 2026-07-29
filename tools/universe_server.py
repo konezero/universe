@@ -84,6 +84,9 @@ FRESH_PROJECT_COMPOSITION_SCHEMA = "universe.fresh-project-composition.v1"
 FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA = (
     "universe.fresh-project-composition-adoption.v1"
 )
+FRESH_PROJECT_REFINEMENT_REQUEST_SCHEMA = "universe.fresh-project-refinement-request.v1"
+FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA = "universe.fresh-project-refinement-candidate.v1"
+FRESH_PROJECT_REFINEMENT_ADOPTION_SCHEMA = "universe.fresh-project-refinement-adoption.v1"
 PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
 PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
     "universe.project-archive-receipt-candidate.v1"
@@ -106,6 +109,7 @@ AUTH_TYPES = frozenset({"NONE", "LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 SKILL_OPERATION_CLASSES = frozenset({"READ", "PROPOSE", "EXECUTE"})
 SKILL_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "UNKNOWN"})
 SKILL_VALIDATION_STATES = frozenset({"PASS", "FAIL", "NOT_RUN", "UNKNOWN"})
+FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
 )
@@ -1196,6 +1200,240 @@ def normalize_fresh_project_composition_adoption_request(value: Any) -> dict[str
     return normalized
 
 
+def normalize_fresh_project_refinement_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="fresh_project_refinement_request",
+        required=frozenset({"composition_id"}),
+        optional=frozenset({"purpose"}),
+    )
+    purpose = _required_text(
+        request.get("purpose", "SPECIFICATION_AND_DESIGN"),
+        "purpose",
+    ).upper()
+    if purpose != "SPECIFICATION_AND_DESIGN":
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_PURPOSE_INVALID",
+            "purpose must be SPECIFICATION_AND_DESIGN",
+        )
+    return {
+        "composition_id": _identifier(request["composition_id"], "composition_id"),
+        "purpose": purpose,
+    }
+
+
+def _normalize_fresh_project_refinement_document(
+    value: Any, field: str
+) -> dict[str, str]:
+    document = _exact_object_fields(
+        value,
+        field=field,
+        required=frozenset({"document_id", "role", "title"}),
+    )
+    role = _required_text(document["role"], f"{field}.role").upper()
+    if role not in DOCUMENT_ROLES:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_DOCUMENT_ROLE_INVALID",
+            f"{field}.role must be a supported document role",
+        )
+    return {
+        "document_id": _identifier(document["document_id"], f"{field}.document_id"),
+        "role": role,
+        "title": _required_text(document["title"], f"{field}.title"),
+    }
+
+
+def normalize_fresh_project_refinement_candidate(value: Any) -> dict[str, Any]:
+    candidate = _exact_object_fields(
+        value,
+        field="fresh_project_refinement_candidate",
+        required=frozenset(
+            {
+                "schema",
+                "request_id",
+                "request_digest",
+                "composition_id",
+                "composition_digest",
+                "producer",
+                "refinement",
+            }
+        ),
+    )
+    if candidate["schema"] != FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_SCHEMA_INVALID",
+            "candidate schema is unsupported",
+        )
+    producer = _exact_object_fields(
+        candidate["producer"],
+        field="fresh_project_refinement_candidate.producer",
+        required=frozenset(
+            {"provider", "model_ref", "worker_id", "result_receipt_ref"}
+        ),
+    )
+    provider = _required_text(
+        producer["provider"], "fresh_project_refinement_candidate.producer.provider"
+    ).upper()
+    if provider not in FRESH_PROJECT_REFINEMENT_PROVIDERS:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_PROVIDER_INVALID",
+            "producer.provider must be a supported Runtime Host provider",
+        )
+    refinement = _exact_object_fields(
+        candidate["refinement"],
+        field="fresh_project_refinement_candidate.refinement",
+        required=frozenset(
+            {
+                "problem_statement",
+                "target_users",
+                "constraints",
+                "design_direction",
+                "technology_recommendations",
+                "document_additions",
+                "risk_additions",
+            }
+        ),
+    )
+    constraints = _string_array(
+        refinement["constraints"],
+        "fresh_project_refinement_candidate.refinement.constraints",
+    )
+    risk_additions = _string_array(
+        refinement["risk_additions"],
+        "fresh_project_refinement_candidate.refinement.risk_additions",
+    )
+    if len(constraints) > 32 or len(risk_additions) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
+            "constraints and risk_additions must contain at most 32 entries",
+        )
+    technology_recommendations = []
+    for index, item in enumerate(
+        _array(
+            refinement["technology_recommendations"],
+            "fresh_project_refinement_candidate.refinement.technology_recommendations",
+        )
+    ):
+        technology_recommendations.append(
+            _exact_object_fields(
+                item,
+                field=(
+                    "fresh_project_refinement_candidate.refinement."
+                    f"technology_recommendations[{index}]"
+                ),
+                required=frozenset({"technology", "rationale"}),
+            )
+        )
+    if len(technology_recommendations) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
+            "technology_recommendations must contain at most 32 entries",
+        )
+    normalized_recommendations = [
+        {
+            "technology": _required_text(
+                item["technology"],
+                "fresh_project_refinement_candidate.refinement."
+                "technology_recommendations[].technology",
+            ),
+            "rationale": _required_text(
+                item["rationale"],
+                "fresh_project_refinement_candidate.refinement."
+                "technology_recommendations[].rationale",
+            ),
+        }
+        for item in technology_recommendations
+    ]
+    if len({item["technology"] for item in normalized_recommendations}) != len(
+        normalized_recommendations
+    ):
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_DUPLICATE_TECHNOLOGY",
+            "technology_recommendations must not repeat a technology",
+        )
+    document_additions = [
+        _normalize_fresh_project_refinement_document(
+            item,
+            "fresh_project_refinement_candidate.refinement."
+            f"document_additions[{index}]",
+        )
+        for index, item in enumerate(
+            _array(
+                refinement["document_additions"],
+                "fresh_project_refinement_candidate.refinement.document_additions",
+            )
+        )
+    ]
+    if len(document_additions) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
+            "document_additions must contain at most 32 entries",
+        )
+    if len({item["document_id"] for item in document_additions}) != len(
+        document_additions
+    ):
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_DUPLICATE_DOCUMENT",
+            "document_additions must not repeat a document_id",
+        )
+    return {
+        "schema": FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA,
+        "request_id": _identifier(candidate["request_id"], "request_id"),
+        "request_digest": _required_text(candidate["request_digest"], "request_digest"),
+        "composition_id": _identifier(candidate["composition_id"], "composition_id"),
+        "composition_digest": _required_text(
+            candidate["composition_digest"], "composition_digest"
+        ),
+        "producer": {
+            "provider": provider,
+            "model_ref": _required_text(producer["model_ref"], "producer.model_ref"),
+            "worker_id": _required_text(producer["worker_id"], "producer.worker_id"),
+            "result_receipt_ref": _required_text(
+                producer["result_receipt_ref"], "producer.result_receipt_ref"
+            ),
+        },
+        "refinement": {
+            "problem_statement": _required_text(
+                refinement["problem_statement"],
+                "fresh_project_refinement_candidate.refinement.problem_statement",
+            ),
+            "target_users": _required_text(
+                refinement["target_users"],
+                "fresh_project_refinement_candidate.refinement.target_users",
+            ),
+            "constraints": constraints,
+            "design_direction": _required_text(
+                refinement["design_direction"],
+                "fresh_project_refinement_candidate.refinement.design_direction",
+            ),
+            "technology_recommendations": normalized_recommendations,
+            "document_additions": document_additions,
+            "risk_additions": risk_additions,
+        },
+    }
+
+
+def normalize_fresh_project_refinement_adoption_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="fresh_project_refinement_adoption_request",
+        required=frozenset({"candidate_id", "approval"}),
+        optional=frozenset({"user_notes"}),
+    )
+    if request["approval"] != "ADOPTED":
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_ADOPTION_REQUIRED",
+            "approval must be ADOPTED before recording a refinement selection",
+            HTTPStatus.CONFLICT,
+        )
+    normalized = {
+        "candidate_id": _identifier(request["candidate_id"], "candidate_id")
+    }
+    if "user_notes" in request:
+        normalized["user_notes"] = _required_text(request["user_notes"], "user_notes")
+    return normalized
+
+
 def normalize_master_handoff_proposal_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -1991,6 +2229,188 @@ def build_fresh_project_composition(
     return material
 
 
+def build_fresh_project_refinement_request(
+    composition: dict[str, Any], *, purpose: str
+) -> dict[str, Any]:
+    context = {
+        "intent": composition["intent"],
+        "selected_route": composition["selected_route"],
+        "specification": composition["specification"],
+        "design": composition["design"],
+        "technology": composition["technology"],
+        "document_plan": composition["document_plan"],
+        "risk_conditions": composition["risk_conditions"],
+    }
+    material = {
+        "schema": FRESH_PROJECT_REFINEMENT_REQUEST_SCHEMA,
+        "composition_id": composition["composition_id"],
+        "composition_digest": composition["composition_digest"],
+        "purpose": purpose,
+        "context": context,
+        "output_contract": {
+            "schema": FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA,
+            "required": [
+                "request_id",
+                "request_digest",
+                "composition_id",
+                "composition_digest",
+                "producer",
+                "refinement",
+            ],
+            "refinement_fields": [
+                "problem_statement",
+                "target_users",
+                "constraints",
+                "design_direction",
+                "technology_recommendations",
+                "document_additions",
+                "risk_additions",
+            ],
+            "raw_worker_text": "FORBIDDEN",
+        },
+        "runtime_boundary": {
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "task_frame": "UNIVERSE_PLANNING_FRAME_REQUIRED",
+            "provider_invocation": "NOT_REQUESTED",
+        },
+        "effects": {
+            "project_source_write": "NONE",
+            "project_seed_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame": "NONE",
+        },
+        "next_operation": "UNIVERSE_PLANNING_FRAME_BINDING_REQUIRED",
+    }
+    material["request_digest"] = _json_sha256(material)
+    material["request_id"] = "refinementreq_" + material["request_digest"][:24]
+    material["status"] = "FRESH_PROJECT_REFINEMENT_REQUEST_READY"
+    return material
+
+
+def build_fresh_project_refinement_candidate(
+    normalized: dict[str, Any]
+) -> dict[str, Any]:
+    material = {
+        **normalized,
+        "effects": {
+            "project_source_write": "NONE",
+            "project_seed_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame": "NONE",
+        },
+        "next_operation": "USER_REFINEMENT_ADOPTION_OR_REVISION",
+    }
+    material["candidate_digest"] = _json_sha256(material)
+    material["candidate_id"] = "refinement_" + material["candidate_digest"][:24]
+    material["status"] = "FRESH_PROJECT_REFINEMENT_CANDIDATE_READY"
+    return material
+
+
+def build_refined_fresh_project_composition(
+    composition: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    refinement = candidate["refinement"]
+    original_document_ids = {
+        document["document_id"] for document in composition["document_plan"]
+    }
+    conflicting = original_document_ids.intersection(
+        document["document_id"] for document in refinement["document_additions"]
+    )
+    if conflicting:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_DOCUMENT_CONFLICT",
+            "document_additions must not replace an existing document_id: "
+            + ", ".join(sorted(conflicting)),
+            HTTPStatus.CONFLICT,
+        )
+    material = json.loads(_canonical_json(composition))
+    for field in ("composition_id", "composition_digest", "created_at", "status"):
+        material.pop(field, None)
+    material["specification"] = {
+        **material["specification"],
+        "problem_statement": refinement["problem_statement"],
+        "target_users": refinement["target_users"],
+        "constraints": refinement["constraints"],
+    }
+    material["design"] = {
+        **material["design"],
+        "direction": refinement["design_direction"],
+        "state": "USER_SELECTION_REQUIRED",
+    }
+    material["technology"] = {
+        **material["technology"],
+        "recommendations": refinement["technology_recommendations"],
+        "selection_state": "USER_SELECTION_REQUIRED",
+    }
+    material["document_plan"] = [
+        *material["document_plan"],
+        *refinement["document_additions"],
+    ]
+    merged_risks = []
+    seen_risk_digests = set()
+    for risk in [*material["risk_conditions"], *refinement["risk_additions"]]:
+        risk_digest = _json_sha256(risk)
+        if risk_digest in seen_risk_digests:
+            continue
+        seen_risk_digests.add(risk_digest)
+        merged_risks.append(risk)
+    material["risk_conditions"] = merged_risks
+    material["refinement"] = {
+        "base_composition_id": composition["composition_id"],
+        "base_composition_digest": composition["composition_digest"],
+        "candidate_id": candidate["candidate_id"],
+        "candidate_digest": candidate["candidate_digest"],
+        "producer": {
+            "provider": candidate["producer"]["provider"],
+            "model_ref": candidate["producer"]["model_ref"],
+            "result_receipt_ref": candidate["producer"]["result_receipt_ref"],
+        },
+    }
+    material["selection_state"] = "USER_SELECTION_REQUIRED"
+    material["next_operation"] = "USER_ADOPTION_OR_COMPOSITION_REVISION"
+    material["composition_digest"] = _json_sha256(material)
+    material["composition_id"] = "composition_" + material["composition_digest"][:24]
+    material["status"] = "FRESH_PROJECT_COMPOSITION_PROPOSAL_READY"
+    return material
+
+
+def build_fresh_project_refinement_adoption(
+    candidate: dict[str, Any],
+    refined_composition: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    user_notes: str | None = None,
+) -> dict[str, Any]:
+    material = {
+        "schema": FRESH_PROJECT_REFINEMENT_ADOPTION_SCHEMA,
+        "request_id": request["request_id"],
+        "request_digest": request["request_digest"],
+        "candidate_id": candidate["candidate_id"],
+        "candidate_digest": candidate["candidate_digest"],
+        "source_composition_id": candidate["composition_id"],
+        "source_composition_digest": candidate["composition_digest"],
+        "refined_composition_id": refined_composition["composition_id"],
+        "refined_composition_digest": refined_composition["composition_digest"],
+        "next_operation": "USER_ADOPTION_OF_REFINED_COMPOSITION_REQUIRED",
+        "effects": {
+            "project_source_write": "NONE",
+            "project_seed_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame": "NONE",
+        },
+    }
+    if user_notes is not None:
+        material["user_notes"] = user_notes
+    material["selection_digest"] = _json_sha256(material)
+    material["adoption_id"] = "refinementadopt_" + material["selection_digest"][:24]
+    material["status"] = "FRESH_PROJECT_REFINEMENT_ADOPTED"
+    return material
+
+
 def _document_target(document: dict[str, Any]) -> str:
     filename = Path(document["path"]).name
     stable_name = f"{document['document_id']}-{filename}"
@@ -2233,6 +2653,51 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS fresh_project_composition_adoption_time
                 ON fresh_project_composition_adoption(adopted_at, adoption_id);
+
+                CREATE TABLE IF NOT EXISTS fresh_project_refinement_request (
+                    request_id TEXT PRIMARY KEY,
+                    composition_id TEXT NOT NULL
+                        REFERENCES fresh_project_composition(composition_id)
+                        ON DELETE CASCADE,
+                    composition_digest TEXT NOT NULL,
+                    request_digest TEXT NOT NULL UNIQUE,
+                    request_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS fresh_project_refinement_request_time
+                ON fresh_project_refinement_request(created_at, request_id);
+
+                CREATE TABLE IF NOT EXISTS fresh_project_refinement_candidate (
+                    candidate_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL
+                        REFERENCES fresh_project_refinement_request(request_id)
+                        ON DELETE CASCADE,
+                    candidate_digest TEXT NOT NULL UNIQUE,
+                    candidate_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(request_id, candidate_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS fresh_project_refinement_candidate_time
+                ON fresh_project_refinement_candidate(created_at, candidate_id);
+
+                CREATE TABLE IF NOT EXISTS fresh_project_refinement_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL
+                        REFERENCES fresh_project_refinement_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    refined_composition_id TEXT NOT NULL
+                        REFERENCES fresh_project_composition(composition_id)
+                        ON DELETE RESTRICT,
+                    selection_digest TEXT NOT NULL,
+                    adoption_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL,
+                    UNIQUE(candidate_id, selection_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS fresh_project_refinement_adoption_time
+                ON fresh_project_refinement_adoption(adopted_at, adoption_id);
 
                 CREATE TABLE IF NOT EXISTS project_master_handoff (
                     handoff_id TEXT PRIMARY KEY,
@@ -3684,6 +4149,286 @@ class UniverseStore:
                 """
                 SELECT adoption_json, adopted_at
                 FROM fresh_project_composition_adoption
+                ORDER BY adopted_at DESC, adoption_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        adoptions = []
+        for row in rows:
+            adoption = json.loads(row["adoption_json"])
+            adoption["adopted_at"] = row["adopted_at"]
+            adoptions.append(adoption)
+        return adoptions
+
+    def create_fresh_project_refinement_request(
+        self, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = normalize_fresh_project_refinement_request(value)
+        composition = self.get_fresh_project_composition(request["composition_id"])
+        material = build_fresh_project_refinement_request(
+            composition,
+            purpose=request["purpose"],
+        )
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT request_json, created_at
+                FROM fresh_project_refinement_request
+                WHERE request_digest = ?
+                """,
+                (material["request_digest"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["request_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO fresh_project_refinement_request(
+                    request_id, composition_id, composition_digest, request_digest,
+                    request_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["request_id"],
+                    composition["composition_id"],
+                    composition["composition_digest"],
+                    material["request_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def get_fresh_project_refinement_request(self, request_id: str) -> dict[str, Any]:
+        normalized_id = _identifier(request_id, "request_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT request_json, created_at
+                FROM fresh_project_refinement_request
+                WHERE request_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "FRESH_PROJECT_REFINEMENT_REQUEST_NOT_FOUND",
+                "Universe has no matching Fresh Project refinement request",
+                HTTPStatus.NOT_FOUND,
+            )
+        request = json.loads(row["request_json"])
+        request["created_at"] = row["created_at"]
+        return request
+
+    def list_fresh_project_refinement_requests(
+        self, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT request_json, created_at
+                FROM fresh_project_refinement_request
+                ORDER BY created_at DESC, request_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        requests = []
+        for row in rows:
+            request = json.loads(row["request_json"])
+            request["created_at"] = row["created_at"]
+            requests.append(request)
+        return requests
+
+    def record_fresh_project_refinement_candidate(
+        self, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        normalized = normalize_fresh_project_refinement_candidate(value)
+        request = self.get_fresh_project_refinement_request(normalized["request_id"])
+        if (
+            normalized["request_digest"] != request["request_digest"]
+            or normalized["composition_id"] != request["composition_id"]
+            or normalized["composition_digest"] != request["composition_digest"]
+        ):
+            raise UniverseError(
+                "FRESH_PROJECT_REFINEMENT_REQUEST_MISMATCH",
+                "candidate must match its exact prepared refinement request",
+                HTTPStatus.CONFLICT,
+            )
+        composition = self.get_fresh_project_composition(normalized["composition_id"])
+        if composition["composition_digest"] != normalized["composition_digest"]:
+            raise UniverseError(
+                "FRESH_PROJECT_REFINEMENT_COMPOSITION_MISMATCH",
+                "candidate does not match the current stored composition digest",
+                HTTPStatus.CONFLICT,
+            )
+        material = build_fresh_project_refinement_candidate(normalized)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT candidate_json, created_at
+                FROM fresh_project_refinement_candidate
+                WHERE candidate_digest = ?
+                """,
+                (material["candidate_digest"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["candidate_json"])
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO fresh_project_refinement_candidate(
+                    candidate_id, request_id, candidate_digest, candidate_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    material["candidate_id"],
+                    request["request_id"],
+                    material["candidate_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        return material, True
+
+    def get_fresh_project_refinement_candidate(self, candidate_id: str) -> dict[str, Any]:
+        normalized_id = _identifier(candidate_id, "candidate_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT candidate_json, created_at
+                FROM fresh_project_refinement_candidate
+                WHERE candidate_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "FRESH_PROJECT_REFINEMENT_CANDIDATE_NOT_FOUND",
+                "Universe has no matching Fresh Project refinement candidate",
+                HTTPStatus.NOT_FOUND,
+            )
+        candidate = json.loads(row["candidate_json"])
+        candidate["created_at"] = row["created_at"]
+        return candidate
+
+    def list_fresh_project_refinement_candidates(
+        self, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT candidate_json, created_at
+                FROM fresh_project_refinement_candidate
+                ORDER BY created_at DESC, candidate_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            candidate = json.loads(row["candidate_json"])
+            candidate["created_at"] = row["created_at"]
+            candidates.append(candidate)
+        return candidates
+
+    def adopt_fresh_project_refinement(
+        self, value: Any
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        selection = normalize_fresh_project_refinement_adoption_request(value)
+        candidate = self.get_fresh_project_refinement_candidate(selection["candidate_id"])
+        request = self.get_fresh_project_refinement_request(candidate["request_id"])
+        composition = self.get_fresh_project_composition(candidate["composition_id"])
+        refined = build_refined_fresh_project_composition(composition, candidate)
+        adoption = build_fresh_project_refinement_adoption(
+            candidate,
+            refined,
+            request,
+            user_notes=selection.get("user_notes"),
+        )
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT adoption_json, adopted_at, refined_composition_id
+                FROM fresh_project_refinement_adoption
+                WHERE candidate_id = ? AND selection_digest = ?
+                """,
+                (candidate["candidate_id"], adoption["selection_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["adoption_json"])
+                stored["adopted_at"] = existing["adopted_at"]
+                return (
+                    stored,
+                    self.get_fresh_project_composition(existing["refined_composition_id"]),
+                    False,
+                )
+            now = utc_now()
+            stored_refined = connection.execute(
+                """
+                SELECT composition_json, created_at
+                FROM fresh_project_composition
+                WHERE composition_digest = ?
+                """,
+                (refined["composition_digest"],),
+            ).fetchone()
+            if stored_refined is None:
+                connection.execute(
+                    """
+                    INSERT INTO fresh_project_composition(
+                        composition_id, composition_digest, intent_json,
+                        composition_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        refined["composition_id"],
+                        refined["composition_digest"],
+                        _canonical_json(refined["intent"]),
+                        _canonical_json(refined),
+                        now,
+                    ),
+                )
+                refined["created_at"] = now
+            else:
+                refined = json.loads(stored_refined["composition_json"])
+                refined["created_at"] = stored_refined["created_at"]
+            connection.execute(
+                """
+                INSERT INTO fresh_project_refinement_adoption(
+                    adoption_id, candidate_id, refined_composition_id,
+                    selection_digest, adoption_json, adopted_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    adoption["adoption_id"],
+                    candidate["candidate_id"],
+                    refined["composition_id"],
+                    adoption["selection_digest"],
+                    _canonical_json(adoption),
+                    now,
+                ),
+            )
+        adoption["adopted_at"] = now
+        return adoption, refined, True
+
+    def list_fresh_project_refinement_adoptions(
+        self, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT adoption_json, adopted_at
+                FROM fresh_project_refinement_adoption
                 ORDER BY adopted_at DESC, adoption_id DESC
                 LIMIT ?
                 """,
@@ -6236,6 +6981,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/fresh-project-refinement-requests":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FRESH_PROJECT_REFINEMENT_REQUESTS_COLLECTED",
+                    "requests": self.server.store.list_fresh_project_refinement_requests(),
+                },
+            )
+            return
+        if path == "/v1/fresh-project-refinement-candidates":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FRESH_PROJECT_REFINEMENT_CANDIDATES_COLLECTED",
+                    "candidates": self.server.store.list_fresh_project_refinement_candidates(),
+                },
+            )
+            return
+        if path == "/v1/fresh-project-refinement-adoptions":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FRESH_PROJECT_REFINEMENT_ADOPTIONS_COLLECTED",
+                    "adoptions": self.server.store.list_fresh_project_refinement_adoptions(),
+                },
+            )
+            return
         if path == "/v1/bench/skills":
             self._send(
                 HTTPStatus.OK,
@@ -6594,6 +7369,58 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "FRESH_PROJECT_COMPOSITION_ADOPTION_ALREADY_RECORDED"
                         ),
                         "adoption": adoption,
+                    },
+                )
+                return
+            if path == "/v1/fresh-project-refinement-requests":
+                request, created = self.server.store.create_fresh_project_refinement_request(
+                    body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FRESH_PROJECT_REFINEMENT_REQUEST_READY"
+                            if created
+                            else "FRESH_PROJECT_REFINEMENT_REQUEST_ALREADY_RECORDED"
+                        ),
+                        "request": request,
+                    },
+                )
+                return
+            if path == "/v1/fresh-project-refinement-candidates":
+                candidate, created = self.server.store.record_fresh_project_refinement_candidate(
+                    body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FRESH_PROJECT_REFINEMENT_CANDIDATE_READY"
+                            if created
+                            else "FRESH_PROJECT_REFINEMENT_CANDIDATE_ALREADY_RECORDED"
+                        ),
+                        "candidate": candidate,
+                    },
+                )
+                return
+            if path == "/v1/fresh-project-refinement-adoptions":
+                adoption, composition, created = self.server.store.adopt_fresh_project_refinement(
+                    body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FRESH_PROJECT_REFINEMENT_ADOPTED"
+                            if created
+                            else "FRESH_PROJECT_REFINEMENT_ADOPTION_ALREADY_RECORDED"
+                        ),
+                        "adoption": adoption,
+                        "composition": composition,
                     },
                 )
                 return

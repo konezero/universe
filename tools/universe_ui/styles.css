@@ -69,6 +69,7 @@ button {
 .brand,
 .topbar-actions,
 .section-heading,
+.section-actions,
 .dialog-heading,
 .dialog-actions,
 .graph-toolbar,
@@ -181,6 +182,14 @@ button {
   font-size: 12px;
   font-weight: 650;
   text-transform: uppercase;
+}
+
+.section-actions {
+  gap: 2px;
+}
+
+.mobile-project-start {
+  display: none;
 }
 
 .project-list {
@@ -574,9 +583,12 @@ textarea {
   min-height: 74px;
   max-height: 150px;
   padding: 10px 12px;
+  resize: none;
+}
+
+.command-composer textarea {
   border: 0;
   background: transparent;
-  resize: none;
 }
 
 .send-button {
@@ -595,7 +607,7 @@ textarea {
   line-height: 1;
 }
 
-textarea:focus {
+.command-composer textarea:focus {
   border: 0;
   box-shadow: none;
 }
@@ -865,6 +877,198 @@ dialog label {
   font-weight: 620;
 }
 
+.wizard-dialog {
+  width: min(900px, calc(100vw - 28px));
+}
+
+.wizard-dialog form {
+  min-height: 480px;
+}
+
+.wizard-step,
+.wizard-kicker {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--teal);
+  font-size: 10px;
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.wizard-dialog h2,
+.wizard-panel-heading h3,
+.wizard-complete h3 {
+  margin: 0;
+}
+
+.wizard-panel {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.wizard-panel.hidden {
+  display: none;
+}
+
+.wizard-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.wizard-panel-heading,
+.route-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.route-list {
+  display: grid;
+  gap: 10px;
+  max-height: min(560px, calc(100vh - 190px));
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.route-card {
+  display: grid;
+  gap: 9px;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+}
+
+.route-card:hover {
+  border-color: var(--line-strong);
+}
+
+.route-card strong,
+.route-card small {
+  display: block;
+}
+
+.route-card small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.route-card p,
+.composition-section p,
+.composition-node p,
+.wizard-complete p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.route-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 18px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.composition-output {
+  display: grid;
+  gap: 16px;
+  max-height: min(520px, calc(100vh - 220px));
+  overflow-y: auto;
+  padding-right: 5px;
+}
+
+.composition-section {
+  display: grid;
+  gap: 9px;
+  padding-bottom: 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.composition-section:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.composition-node-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 18px;
+}
+
+.composition-node {
+  display: grid;
+  gap: 4px;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(64, 83, 110, 0.58);
+}
+
+.composition-node strong {
+  font-size: 12px;
+}
+
+.composition-node small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.composition-decisions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+}
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.signal-tag {
+  padding: 4px 7px;
+  border: 1px solid rgba(65, 215, 195, 0.34);
+  border-radius: 4px;
+  background: rgba(65, 215, 195, 0.08);
+  color: #b7f5ed;
+  font-size: 10px;
+}
+
+.composition-documents {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 17px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.wizard-complete {
+  display: grid;
+  place-items: center;
+  min-height: 330px;
+  gap: 11px;
+  text-align: center;
+}
+
+.wizard-complete-mark {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid rgba(111, 221, 141, 0.55);
+  border-radius: 50%;
+  background: rgba(111, 221, 141, 0.1);
+  color: var(--green);
+  font-size: 22px;
+}
+
 .dialog-actions {
   justify-content: flex-end;
   gap: 8px;
@@ -1056,6 +1260,35 @@ dialog label {
 
   .command-composer {
     grid-template-columns: 1fr 70px;
+  }
+
+  .mobile-project-start {
+    display: inline-grid;
+  }
+
+  .wizard-dialog form {
+    min-height: calc(100vh - 28px);
+  }
+
+  .wizard-grid,
+  .composition-node-list,
+  .composition-decisions {
+    grid-template-columns: 1fr;
+  }
+
+  .route-list,
+  .composition-output {
+    max-height: none;
+    overflow-y: visible;
+  }
+
+  .route-card-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .route-card-heading .primary-button {
+    width: 100%;
   }
 
   .command-composer input {

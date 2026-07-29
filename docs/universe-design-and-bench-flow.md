@@ -283,8 +283,13 @@ relations remain distinct from observed evidence. Career adoption is separate.
    idempotency, and aggregate Bench query are implemented.
 2. Add Fresh Project intent, specification, design, and route proposal
    contracts. Minimum intent to read-only Official Seed route candidates is
-   implemented; LLM-assisted specification, design, and composition remain
-   follow-ups.
+   implemented. The local Fresh Project Wizard now exposes route selection,
+   Composition review, optional refinement-request preparation, and explicit
+   adoption without creating a Project or Task Frame. A refinement request is
+   bound to one Composition digest. Only a matching, validated structured
+   candidate with a provider Worker result receipt may be recorded; explicit
+   selection then creates a revised Composition proposal. Browser preparation
+   never invokes a provider, and raw Worker text is never persisted.
 3. Assemble Context Packs and propose Skill Plans from selected routes.
    Initial Project-local Context Pack assembly, Skill Plan proposal, and
    explicit adoption record are implemented. Cross-project applicability and

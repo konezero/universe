@@ -18,6 +18,9 @@
         <span id="service-status" class="status-dot" data-state="loading">
           Connecting
         </span>
+        <button id="start-project-topbar-button" class="icon-button mobile-project-start" type="button" title="Start fresh project" aria-label="Start fresh project">
+          &#10022;
+        </button>
         <button id="release-button" class="icon-button" type="button" title="Release catalog">
           &#9638;
         </button>
@@ -31,9 +34,14 @@
     <aside class="project-rail universe-rail">
       <div class="section-heading">
         <span>Project Universes</span>
-        <button id="add-project-button" class="icon-button compact" type="button" title="Add project">
-          +
-        </button>
+        <span class="section-actions">
+          <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project">
+            &#10022;
+          </button>
+          <button id="add-project-button" class="icon-button compact" type="button" title="Connect existing project" aria-label="Connect existing project">
+            +
+          </button>
+        </span>
       </div>
       <div id="project-list" class="project-list" role="listbox" aria-label="Projects"></div>
     </aside>
@@ -125,6 +133,107 @@
         <button type="submit" class="primary-button">Connect</button>
       </div>
       <p id="project-form-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <dialog id="fresh-project-dialog" class="wide-dialog wizard-dialog">
+    <form id="fresh-project-form">
+      <div class="dialog-heading">
+        <div>
+          <span id="fresh-project-step" class="wizard-step">01 / Intent</span>
+          <h2>Start a project universe</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+
+      <section id="fresh-project-intent" class="wizard-panel">
+        <div class="wizard-grid">
+          <label>
+            Project name
+            <input name="project" autocomplete="off" required>
+          </label>
+          <label>
+            Project kind
+            <input name="kind" autocomplete="off" placeholder="desktop-app" required>
+          </label>
+        </div>
+        <label>
+          Goal
+          <textarea name="goal" rows="3" required></textarea>
+        </label>
+        <label>
+          Target users
+          <input name="target_users" autocomplete="off">
+        </label>
+        <div class="wizard-grid">
+          <label>
+            Technology signals
+            <input name="technologies" autocomplete="off" placeholder="python, sqlite">
+          </label>
+          <label>
+            Constraints
+            <input name="constraints" autocomplete="off" placeholder="local-first, offline">
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
+          <button id="find-routes-button" type="submit" class="primary-button">Find routes</button>
+        </div>
+      </section>
+
+      <section id="fresh-project-routes" class="wizard-panel hidden">
+        <header class="wizard-panel-heading">
+          <div>
+            <span class="wizard-kicker">Seed routes</span>
+            <h3>Select a development path</h3>
+          </div>
+          <button id="edit-project-intent" type="button" class="secondary-button">Edit intent</button>
+        </header>
+        <div id="fresh-project-route-list" class="route-list"></div>
+      </section>
+
+      <section id="fresh-project-composition" class="wizard-panel hidden">
+        <header class="wizard-panel-heading">
+          <div>
+            <span class="wizard-kicker">Composition</span>
+            <h3 id="fresh-project-composition-title">Review the project plan</h3>
+          </div>
+          <span class="status-badge" data-status="PROPOSAL">PROPOSAL</span>
+        </header>
+        <div id="fresh-project-composition-output" class="composition-output"></div>
+        <div class="dialog-actions">
+          <button id="back-to-routes" type="button" class="secondary-button">Routes</button>
+          <button id="prepare-refinement-button" type="button" class="secondary-button">Prepare assistant refinement</button>
+          <button id="adopt-composition-button" type="button" class="primary-button">Adopt plan</button>
+        </div>
+      </section>
+
+      <section id="fresh-project-refinement" class="wizard-panel hidden">
+        <div class="wizard-complete">
+          <span class="wizard-complete-mark" aria-hidden="true">&#10022;</span>
+          <span class="wizard-kicker">Structured refinement</span>
+          <h3>Assistant refinement request prepared</h3>
+          <p id="fresh-project-refinement-ref"></p>
+          <p class="boundary-copy">
+            The browser did not start a model. An approved Universe Planning Frame
+            must return the bound structured candidate before you can adopt a revision.
+          </p>
+          <div class="dialog-actions">
+            <button id="back-to-composition" type="button" class="secondary-button">Back to composition</button>
+            <button type="button" class="primary-button" data-close-dialog>Done</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="fresh-project-adopted" class="wizard-panel hidden">
+        <div class="wizard-complete">
+          <span class="wizard-complete-mark" aria-hidden="true">&#10003;</span>
+          <h3>Project plan adopted</h3>
+          <p id="fresh-project-adoption-ref"></p>
+          <button type="button" class="primary-button" data-close-dialog>Done</button>
+        </div>
+      </section>
+      <p id="fresh-project-error" class="form-error" role="alert"></p>
     </form>
   </dialog>
 

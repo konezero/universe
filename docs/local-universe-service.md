@@ -103,6 +103,12 @@ POST   /v1/fresh-project-compositions
 GET    /v1/fresh-project-compositions
 POST   /v1/fresh-project-composition-adoptions
 GET    /v1/fresh-project-composition-adoptions
+POST   /v1/fresh-project-refinement-requests
+GET    /v1/fresh-project-refinement-requests
+POST   /v1/fresh-project-refinement-candidates
+GET    /v1/fresh-project-refinement-candidates
+POST   /v1/fresh-project-refinement-adoptions
+GET    /v1/fresh-project-refinement-adoptions
 POST   /v1/projects/{project_id}/events
 GET    /v1/projects/{project_id}/events
 POST   /v1/projects/{project_id}/skill-observations
@@ -167,6 +173,14 @@ technology signals, final goal, and an optional candidate limit. It queries the
 read-only Official Development Seed and returns user-selectable route
 candidates. It does not require a registered repository, persist the intent,
 create a Project Seed, or grant execution authority.
+
+The local web UI exposes that boundary as a Fresh Project Wizard: Intent, Seed
+Routes, Composition, optional assistant-refinement preparation, and Adoption.
+The Wizard calls `future-paths`, `fresh-project-compositions`, and
+`fresh-project-composition-adoptions` without creating a repository or
+registering a Project. Adoption records only a Project Master handoff
+candidate. Installing or connecting the Project and delivering that candidate
+remain later explicit operations.
 
 `POST /v1/projects/{project_id}/skill-observations` accepts only a redacted
 ai-career Skill observation candidate. The service rejects raw source,
@@ -276,6 +290,15 @@ active Project Task Frame. The request must declare `repository_write_scope:
 NONE` with empty mutation operations and targets. Universe records only redacted
 metadata and receipt references. It never stores a Task Frame endpoint, token,
 Context Pack body, or Worker response body.
+
+A Fresh Project refinement request is different: the Wizard prepares a
+composition-bound `universe.fresh-project-refinement-request.v1`, but it does
+not start a provider or create a Task Frame. The request declares a
+`UNIVERSE_PLANNING_FRAME_REQUIRED` boundary and the exact structured output
+contract. A later bound Planning Frame may submit only a matching
+`universe.fresh-project-refinement-candidate.v1`. Universe validates the
+request and composition digests, provider, worker ID, and result receipt before
+storing the candidate. Raw Worker text is rejected and is never stored.
 
 ## Desktop UI
 
@@ -471,6 +494,15 @@ It does not create a project, write project files, bind a Master, create a
 Task Frame, or grant authority. `POST /v1/fresh-project-composition-adoptions`
 requires explicit `ADOPTED` selection and produces only a later Project Master
 handoff candidate.
+
+The current Wizard uses deterministic Official Seed output. It can prepare a
+separately validated structured refinement request, but a browser click never
+starts a model. A bound Universe Planning Frame must return the exact candidate
+schema with the prepared request and composition digests plus one provider
+result receipt. Explicit refinement `ADOPTED` selection creates a new Fresh
+Project Composition proposal; it still needs the normal explicit Composition
+adoption before any Project Master handoff. Arbitrary Worker text is not
+persisted as a Composition.
 
 A Project Master handoff only accepts an already adopted Fresh Project
 Composition or project-local Skill Plan. It is recorded as `PROPOSAL_ONLY`.

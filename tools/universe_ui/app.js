@@ -12,6 +12,13 @@ const state = {
   view: "timeline",
   roomMessages: [],
   masterBridge: null,
+  freshProject: {
+    intent: null,
+    routes: [],
+    composition: null,
+    refinementRequest: null,
+    adoption: null,
+  },
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
 };
 
@@ -30,6 +37,23 @@ const elements = {
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
+  freshProjectDialog: document.querySelector("#fresh-project-dialog"),
+  freshProjectForm: document.querySelector("#fresh-project-form"),
+  freshProjectStep: document.querySelector("#fresh-project-step"),
+  freshProjectIntent: document.querySelector("#fresh-project-intent"),
+  freshProjectRoutes: document.querySelector("#fresh-project-routes"),
+  freshProjectRouteList: document.querySelector("#fresh-project-route-list"),
+  freshProjectComposition: document.querySelector("#fresh-project-composition"),
+  freshProjectCompositionTitle: document.querySelector("#fresh-project-composition-title"),
+  freshProjectCompositionOutput: document.querySelector("#fresh-project-composition-output"),
+  freshProjectRefinement: document.querySelector("#fresh-project-refinement"),
+  freshProjectRefinementRef: document.querySelector("#fresh-project-refinement-ref"),
+  freshProjectAdopted: document.querySelector("#fresh-project-adopted"),
+  freshProjectAdoptionRef: document.querySelector("#fresh-project-adoption-ref"),
+  freshProjectError: document.querySelector("#fresh-project-error"),
+  findRoutesButton: document.querySelector("#find-routes-button"),
+  prepareRefinementButton: document.querySelector("#prepare-refinement-button"),
+  adoptCompositionButton: document.querySelector("#adopt-composition-button"),
   releaseDialog: document.querySelector("#release-dialog"),
   releaseForm: document.querySelector("#release-form"),
   releaseList: document.querySelector("#release-list"),
@@ -1293,6 +1317,238 @@ async function prepareProjectSeed() {
   }
 }
 
+function commaList(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function showFreshProjectPanel(name) {
+  const panels = {
+    intent: elements.freshProjectIntent,
+    routes: elements.freshProjectRoutes,
+    composition: elements.freshProjectComposition,
+    refinement: elements.freshProjectRefinement,
+    adopted: elements.freshProjectAdopted,
+  };
+  const labels = {
+    intent: "01 / Intent",
+    routes: "02 / Routes",
+    composition: "03 / Composition",
+    refinement: "04 / Refinement",
+    adopted: "05 / Adopted",
+  };
+  for (const [key, panel] of Object.entries(panels)) {
+    panel.classList.toggle("hidden", key !== name);
+  }
+  elements.freshProjectStep.textContent = labels[name];
+  elements.freshProjectError.textContent = "";
+}
+
+function openFreshProjectWizard() {
+  state.freshProject = {
+    intent: null,
+    routes: [],
+    composition: null,
+    refinementRequest: null,
+    adoption: null,
+  };
+  elements.freshProjectForm.reset();
+  elements.freshProjectRouteList.replaceChildren();
+  elements.freshProjectCompositionOutput.replaceChildren();
+  elements.freshProjectRefinementRef.textContent = "";
+  showFreshProjectPanel("intent");
+  elements.freshProjectDialog.showModal();
+}
+
+function renderFreshProjectRoutes() {
+  elements.freshProjectRouteList.replaceChildren();
+  for (const route of state.freshProject.routes) {
+    const card = node("article", "route-card");
+    const heading = node("div", "route-card-heading");
+    const copy = node("div");
+    copy.append(
+      node("strong", "", route.title),
+      node("small", "", route.support_level || "Seed candidate")
+    );
+    const choose = node("button", "primary-button", "Build plan");
+    choose.type = "button";
+    choose.addEventListener("click", () =>
+      createFreshProjectComposition(route.route_id, choose)
+    );
+    heading.append(copy, choose);
+    const steps = node("ol", "route-steps");
+    for (const step of route.steps || []) {
+      steps.append(node("li", "", step.title));
+    }
+    card.append(heading, node("p", "", route.description), steps);
+    elements.freshProjectRouteList.append(card);
+  }
+  if (!state.freshProject.routes.length) {
+    elements.freshProjectRouteList.append(
+      node("p", "empty-copy", "No matching Seed route")
+    );
+  }
+}
+
+async function submitFreshProjectIntent(event) {
+  event.preventDefault();
+  const form = new FormData(elements.freshProjectForm);
+  const intent = {
+    project: String(form.get("project") || "").trim(),
+    kind: String(form.get("kind") || "").trim(),
+    technologies: commaList(form.get("technologies")),
+    goal: String(form.get("goal") || "").trim(),
+    constraints: commaList(form.get("constraints")),
+  };
+  const targetUsers = String(form.get("target_users") || "").trim();
+  if (targetUsers) intent.target_users = targetUsers;
+  elements.findRoutesButton.disabled = true;
+  elements.freshProjectError.textContent = "";
+  try {
+    const result = await api("/v1/future-paths", {
+      method: "POST",
+      body: {
+        project: intent.project,
+        kind: intent.kind,
+        technologies: intent.technologies,
+        goal: intent.goal,
+        limit: 4,
+      },
+    });
+    state.freshProject.intent = intent;
+    state.freshProject.routes = result.proposal.candidates || [];
+    renderFreshProjectRoutes();
+    showFreshProjectPanel("routes");
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+  } finally {
+    elements.findRoutesButton.disabled = false;
+  }
+}
+
+async function createFreshProjectComposition(routeId, button) {
+  button.disabled = true;
+  elements.freshProjectError.textContent = "";
+  try {
+    const result = await api("/v1/fresh-project-compositions", {
+      method: "POST",
+      body: {
+        intent: state.freshProject.intent,
+        route_id: routeId,
+      },
+    });
+    state.freshProject.composition = result.composition;
+    renderFreshProjectComposition();
+    showFreshProjectPanel("composition");
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderFreshProjectComposition() {
+  const composition = state.freshProject.composition;
+  elements.freshProjectCompositionTitle.textContent =
+    composition.selected_route.title;
+  elements.freshProjectCompositionOutput.replaceChildren();
+
+  const summary = node("section", "composition-section");
+  summary.append(
+    node("span", "wizard-kicker", "Direction"),
+    node("p", "", composition.selected_route.description)
+  );
+
+  const capabilities = node("section", "composition-section");
+  capabilities.append(node("span", "wizard-kicker", "Functional nodes"));
+  const capabilityList = node("div", "composition-node-list");
+  for (const item of composition.specification.functional_nodes) {
+    const row = node("article", "composition-node");
+    row.append(
+      node("strong", "", item.title),
+      node("p", "", item.purpose),
+      node("small", "", item.acceptance_condition)
+    );
+    capabilityList.append(row);
+  }
+  capabilities.append(capabilityList);
+
+  const decisions = node("section", "composition-section composition-decisions");
+  const technology = node("div");
+  technology.append(node("span", "wizard-kicker", "Technology signals"));
+  const tags = node("div", "tag-list");
+  for (const item of composition.technology.selected_signals) {
+    tags.append(node("span", "signal-tag", item));
+  }
+  if (!composition.technology.selected_signals.length) {
+    tags.append(node("span", "empty-copy", "Selection pending"));
+  }
+  technology.append(tags);
+  const documents = node("div");
+  documents.append(node("span", "wizard-kicker", "Initial documents"));
+  const documentList = node("ul", "composition-documents");
+  for (const item of composition.document_plan) {
+    documentList.append(node("li", "", `${item.role} · ${item.title}`));
+  }
+  documents.append(documentList);
+  decisions.append(technology, documents);
+
+  elements.freshProjectCompositionOutput.append(
+    summary,
+    capabilities,
+    decisions
+  );
+}
+
+async function prepareFreshProjectRefinement() {
+  const composition = state.freshProject.composition;
+  if (!composition) return;
+  elements.prepareRefinementButton.disabled = true;
+  elements.freshProjectError.textContent = "";
+  try {
+    const result = await api("/v1/fresh-project-refinement-requests", {
+      method: "POST",
+      body: { composition_id: composition.composition_id },
+    });
+    state.freshProject.refinementRequest = result.request;
+    elements.freshProjectRefinementRef.textContent =
+      `${result.request.request_id} · structured output only`;
+    showFreshProjectPanel("refinement");
+    toast("Assistant refinement request prepared");
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+  } finally {
+    elements.prepareRefinementButton.disabled = false;
+  }
+}
+
+async function adoptFreshProjectComposition() {
+  const composition = state.freshProject.composition;
+  if (!composition) return;
+  elements.adoptCompositionButton.disabled = true;
+  elements.freshProjectError.textContent = "";
+  try {
+    const result = await api("/v1/fresh-project-composition-adoptions", {
+      method: "POST",
+      body: {
+        composition_id: composition.composition_id,
+        approval: "ADOPTED",
+      },
+    });
+    state.freshProject.adoption = result.adoption;
+    elements.freshProjectAdoptionRef.textContent =
+      `${result.adoption.adoption_id} · Project Master handoff candidate`;
+    showFreshProjectPanel("adopted");
+    toast("Fresh project plan adopted");
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+  } finally {
+    elements.adoptCompositionButton.disabled = false;
+  }
+}
+
 async function submitProject(event) {
   event.preventDefault();
   elements.projectFormError.textContent = "";
@@ -1369,6 +1625,12 @@ function bindEvents() {
   document
     .querySelector("#add-project-button")
     .addEventListener("click", () => elements.projectDialog.showModal());
+  document
+    .querySelector("#start-project-button")
+    .addEventListener("click", openFreshProjectWizard);
+  document
+    .querySelector("#start-project-topbar-button")
+    .addEventListener("click", openFreshProjectWizard);
   elements.dispatchForm.addEventListener("submit", submitDispatch);
   elements.prepareProject.addEventListener("click", prepareProjectSeed);
   elements.exitNodeUniverse.addEventListener("click", exitNodeUniverse);
@@ -1386,6 +1648,24 @@ function bindEvents() {
     );
   });
   elements.projectForm.addEventListener("submit", submitProject);
+  elements.freshProjectForm.addEventListener("submit", submitFreshProjectIntent);
+  document
+    .querySelector("#edit-project-intent")
+    .addEventListener("click", () => showFreshProjectPanel("intent"));
+  document
+    .querySelector("#back-to-routes")
+    .addEventListener("click", () => showFreshProjectPanel("routes"));
+  document
+    .querySelector("#back-to-composition")
+    .addEventListener("click", () => showFreshProjectPanel("composition"));
+  elements.prepareRefinementButton.addEventListener(
+    "click",
+    prepareFreshProjectRefinement
+  );
+  elements.adoptCompositionButton.addEventListener(
+    "click",
+    adoptFreshProjectComposition
+  );
   elements.releaseForm.addEventListener("submit", submitRelease);
   for (const button of document.querySelectorAll("[data-close-dialog]")) {
     button.addEventListener("click", () => button.closest("dialog").close());
