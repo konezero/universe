@@ -71,6 +71,9 @@ PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
+SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA = (
+    "universe.skill-observation-publication-approval.v1"
+)
 SKILL_RUN_OBSERVATION_SCHEMA = "universe.skill-run-observation.v1"
 SKILL_OBSERVATION_QUEUE_SCHEMA = "universe.skill-observation-queue-item.v1"
 SKILL_BENCH_SCHEMA = "universe.skill-bench.v1"
@@ -300,6 +303,17 @@ def _required_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise UniverseError("REQUEST_INVALID", f"{field} must be non-empty text")
     return value.strip()
+
+
+def provider_ref_from_model_ref(model_ref: Any) -> str:
+    """Derive an explicit provider dimension from a canonical model reference."""
+
+    normalized = _required_text(model_ref, "model_ref")
+    match = re.fullmatch(
+        r"provider://([A-Za-z0-9][A-Za-z0-9._-]{0,127})/model/.+",
+        normalized,
+    )
+    return match.group(1).upper() if match else "UNKNOWN"
 
 
 def resolve_universe_mode_intent(value: Any) -> str:
@@ -1021,6 +1035,78 @@ def normalize_skill_observation_candidate(
         "candidate_id": _identifier(request["candidate_id"], "candidate_id"),
         "candidate": normalized_candidate,
         "candidate_digest": _json_sha256(normalized_candidate),
+    }
+
+
+def normalize_skill_observation_publication(
+    project_id: str, value: Any
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="skill_observation_publication",
+        required=frozenset({"candidate_id", "candidate", "publication_approval"}),
+    )
+    normalized = normalize_skill_observation_candidate(
+        project_id,
+        {
+            "candidate_id": request["candidate_id"],
+            "candidate": request["candidate"],
+        },
+    )
+    approval = _exact_object_fields(
+        request["publication_approval"],
+        field="publication_approval",
+        required=frozenset(
+            {
+                "schema",
+                "status",
+                "operation_class",
+                "project_ref",
+                "candidate_id",
+                "candidate_digest",
+                "selection_ref",
+                "approver",
+                "evidence_ref",
+            }
+        ),
+    )
+    expected_project_ref = f"project://{_project_id(project_id)}"
+    expected = {
+        "schema": SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA,
+        "status": "APPROVED",
+        "operation_class": "UNIVERSE_OBSERVATION_QUEUE",
+        "project_ref": expected_project_ref,
+        "candidate_id": normalized["candidate_id"],
+        "candidate_digest": normalized["candidate_digest"],
+        "approver": "PROJECT_MASTER",
+    }
+    mismatch = next(
+        (
+            field
+            for field, expected_value in expected.items()
+            if approval.get(field) != expected_value
+        ),
+        None,
+    )
+    if mismatch is not None:
+        raise UniverseError(
+            "SKILL_OBSERVATION_PUBLICATION_APPROVAL_MISMATCH",
+            f"publication_approval.{mismatch} does not match the prepared candidate",
+            HTTPStatus.CONFLICT,
+        )
+    normalized_approval = {
+        **expected,
+        "selection_ref": _required_text(
+            approval["selection_ref"], "publication_approval.selection_ref"
+        ),
+        "evidence_ref": _required_text(
+            approval["evidence_ref"], "publication_approval.evidence_ref"
+        ),
+    }
+    return {
+        **normalized,
+        "publication_approval": normalized_approval,
+        "publication_approval_digest": _json_sha256(normalized_approval),
     }
 
 
@@ -2065,6 +2151,7 @@ class UniverseStore:
                     candidate_id TEXT NOT NULL,
                     candidate_digest TEXT NOT NULL,
                     candidate_json TEXT NOT NULL,
+                    publication_approval_json TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('QUEUED', 'INGESTED')),
                     queued_at TEXT NOT NULL,
                     ingested_at TEXT,
@@ -2408,6 +2495,18 @@ class UniverseStore:
                     "ALTER TABLE project_room_message "
                     "ADD COLUMN delivery_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            observation_queue_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(project_skill_observation_queue)"
+                ).fetchall()
+            }
+            if "publication_approval_json" not in observation_queue_columns:
+                connection.execute(
+                    "ALTER TABLE project_skill_observation_queue "
+                    "ADD COLUMN publication_approval_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO universe_identity(
@@ -2747,12 +2846,15 @@ class UniverseStore:
         """Persist a redacted Project observation before asynchronous ingest."""
 
         project = self.get_project(project_id)
-        request = normalize_skill_observation_candidate(project["project_id"], value)
+        request = normalize_skill_observation_publication(
+            project["project_id"], value
+        )
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
                 """
-                SELECT queue_id, candidate_id, candidate_digest, status, queued_at, ingested_at
+                SELECT queue_id, candidate_id, candidate_digest,
+                       publication_approval_json, status, queued_at, ingested_at
                 FROM project_skill_observation_queue
                 WHERE project_id = ? AND candidate_id = ?
                 """,
@@ -2777,8 +2879,9 @@ class UniverseStore:
                 """
                 INSERT INTO project_skill_observation_queue(
                     queue_id, project_id, candidate_id, candidate_digest,
-                    candidate_json, status, queued_at, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, NULL)
+                    candidate_json, publication_approval_json,
+                    status, queued_at, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, NULL)
                 """,
                 (
                     queue_id,
@@ -2791,6 +2894,7 @@ class UniverseStore:
                             "candidate": request["candidate"],
                         }
                     ),
+                    _canonical_json(request["publication_approval"]),
                     now,
                 ),
             )
@@ -2800,6 +2904,10 @@ class UniverseStore:
             "project_id": project["project_id"],
             "candidate_id": request["candidate_id"],
             "candidate_digest": request["candidate_digest"],
+            "publication_approval": request["publication_approval"],
+            "publication_approval_digest": request[
+                "publication_approval_digest"
+            ],
             "status": "QUEUED",
             "queued_at": now,
             "ingested_at": None,
@@ -2812,7 +2920,8 @@ class UniverseStore:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT queue_id, candidate_id, candidate_digest, status, queued_at, ingested_at
+                SELECT queue_id, candidate_id, candidate_digest,
+                       publication_approval_json, status, queued_at, ingested_at
                 FROM project_skill_observation_queue
                 WHERE project_id = ?
                 ORDER BY queued_at, queue_id
@@ -2873,12 +2982,19 @@ class UniverseStore:
     def _skill_observation_queue_row(
         row: sqlite3.Row, project_id: str
     ) -> dict[str, Any]:
+        publication_approval = json.loads(row["publication_approval_json"])
         return {
             "schema": SKILL_OBSERVATION_QUEUE_SCHEMA,
             "queue_id": row["queue_id"],
             "project_id": project_id,
             "candidate_id": row["candidate_id"],
             "candidate_digest": row["candidate_digest"],
+            "publication_approval": publication_approval,
+            "publication_approval_digest": (
+                _json_sha256(publication_approval)
+                if publication_approval
+                else "UNKNOWN"
+            ),
             "status": row["status"],
             "queued_at": row["queued_at"],
             "ingested_at": row["ingested_at"],
@@ -2913,15 +3029,17 @@ class UniverseStore:
                          observed_at, observation_id
                 """
             ).fetchall()
-        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
         for row in rows:
             item = self._skill_observation_row(row)
             skill = item["skill"]
+            provider_ref = provider_ref_from_model_ref(item["model_ref"])
             key = (
                 skill["skill_id"],
                 skill["skill_version"],
                 skill["operation_class"],
                 item["model_ref"],
+                provider_ref,
             )
             group = grouped.setdefault(
                 key,
@@ -2929,6 +3047,7 @@ class UniverseStore:
                     "schema": SKILL_BENCH_SCHEMA,
                     "skill": skill,
                     "model_ref": item["model_ref"],
+                    "provider_ref": provider_ref,
                     "observation_count": 0,
                     "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
                     "validation_states": {
@@ -3114,15 +3233,17 @@ class UniverseStore:
         project = self.get_project(project_id)
         request = normalize_skill_plan_request(value)
         pack = self.get_context_pack(project["project_id"], request["context_pack_id"])
-        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
         for observation in pack["bench"]["observations"]:
             skill = observation["skill"]
+            provider_ref = provider_ref_from_model_ref(observation["model_ref"])
             key = (
                 skill["skill_id"],
                 skill["skill_version"],
                 skill["operation_class"],
                 skill["context_pack_digest"],
                 observation["model_ref"],
+                provider_ref,
             )
             candidate = grouped.setdefault(
                 key,
@@ -3130,30 +3251,81 @@ class UniverseStore:
                     "candidate_id": "skill_" + _json_sha256(key)[:24],
                     "skill": skill,
                     "model_ref": observation["model_ref"],
+                    "provider_ref": provider_ref,
                     "bench_rationale": {
                         "scope": "PROJECT_LOCAL_ONLY",
                         "observation_count": 0,
+                        "validated_success_count": 0,
+                        "successful_count": 0,
+                        "failed_count": 0,
+                        "duration_observation_count": 0,
+                        "duration_total_ms": 0,
+                        "average_duration_ms": None,
                         "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
                         "validation_states": {
                             state: 0 for state in sorted(SKILL_VALIDATION_STATES)
                         },
+                        "rank_basis": [
+                            "validated_success_count DESC",
+                            "validation_fail_count ASC",
+                            "successful_count DESC",
+                            "observation_count DESC",
+                            "average_duration_ms ASC",
+                            "candidate_id ASC",
+                        ],
                     },
+                    "recommendation_state": "CANDIDATE_ONLY",
                     "selection_state": "USER_SELECTION_REQUIRED",
                     "binding_state": "PROJECT_MASTER_BINDING_REQUIRED",
                 },
             )
-            candidate["bench_rationale"]["observation_count"] += 1
-            candidate["bench_rationale"]["outcomes"][observation["outcome"]] += 1
-            candidate["bench_rationale"]["validation_states"][
+            rationale = candidate["bench_rationale"]
+            rationale["observation_count"] += 1
+            rationale["outcomes"][observation["outcome"]] += 1
+            rationale["validation_states"][
                 observation["validation_state"]
             ] += 1
+            if observation["outcome"] == "SUCCEEDED":
+                rationale["successful_count"] += 1
+            if observation["outcome"] == "FAILED":
+                rationale["failed_count"] += 1
+            if (
+                observation["outcome"] == "SUCCEEDED"
+                and observation["validation_state"] == "PASS"
+            ):
+                rationale["validated_success_count"] += 1
+            duration_ms = observation["metrics"].get("duration_ms")
+            if duration_ms is not None:
+                rationale["duration_observation_count"] += 1
+                rationale["duration_total_ms"] += duration_ms
+        for candidate in grouped.values():
+            rationale = candidate["bench_rationale"]
+            if rationale["duration_observation_count"]:
+                rationale["average_duration_ms"] = round(
+                    rationale["duration_total_ms"]
+                    / rationale["duration_observation_count"],
+                    3,
+                )
+            rationale["validation_fail_count"] = rationale[
+                "validation_states"
+            ]["FAIL"]
         candidates = sorted(
             grouped.values(),
             key=lambda item: (
+                -item["bench_rationale"]["validated_success_count"],
+                item["bench_rationale"]["validation_fail_count"],
+                -item["bench_rationale"]["successful_count"],
                 -item["bench_rationale"]["observation_count"],
+                (
+                    item["bench_rationale"]["average_duration_ms"]
+                    if item["bench_rationale"]["average_duration_ms"] is not None
+                    else math.inf
+                ),
                 item["candidate_id"],
             ),
         )[: request["max_candidates"]]
+        for rank, candidate in enumerate(candidates, start=1):
+            candidate["rank"] = rank
         material = {
             "schema": PROJECT_SKILL_PLAN_SCHEMA,
             "project_id": project["project_id"],
@@ -7144,7 +7316,7 @@ def publish_skill_observation(
     *,
     project_id: str,
     prepared: Any,
-    selection_ref: str,
+    publication_approval: Any,
     endpoint: str,
     token: str,
 ) -> tuple[int, dict[str, Any]]:
@@ -7161,9 +7333,12 @@ def publish_skill_observation(
     envelope = {
         "candidate_id": prepared.get("candidate_id"),
         "candidate": prepared.get("candidate"),
+        "publication_approval": publication_approval,
     }
     normalized_project = _project_id(project_id)
-    normalized = normalize_skill_observation_candidate(normalized_project, envelope)
+    normalized = normalize_skill_observation_publication(
+        normalized_project, envelope
+    )
     _, health = request_json(
         endpoint=endpoint,
         token=token,
@@ -7213,7 +7388,14 @@ def publish_skill_observation(
         ),
         "operation_class": "UNIVERSE_OBSERVATION_QUEUE",
         "provider": "UNIVERSE_LOCAL_HTTP",
-        "selection_ref": _required_text(selection_ref, "selection_ref"),
+        "selection_ref": normalized["publication_approval"]["selection_ref"],
+        "approval_evidence_ref": normalized["publication_approval"][
+            "evidence_ref"
+        ],
+        "publication_approval_digest": normalized[
+            "publication_approval_digest"
+        ],
+        "approved_by": normalized["publication_approval"]["approver"],
         "base_source_ref": normalized["candidate"]["source_ref"],
         "candidate_id": normalized["candidate_id"],
         "candidate_digest": candidate_digest,
@@ -7356,7 +7538,7 @@ def parser() -> argparse.ArgumentParser:
     publish = commands.add_parser("publish-skill-observation")
     publish.add_argument("--project-id", required=True)
     publish.add_argument("--candidate-file", type=Path, required=True)
-    publish.add_argument("--selection-ref", required=True)
+    publish.add_argument("--approval-file", type=Path, required=True)
     publish.add_argument("--endpoint", default="")
     publish.add_argument("--token", default="")
     publish.add_argument("--state-file", type=Path, default=default_state_path())
@@ -7462,7 +7644,9 @@ def main() -> int:
                 status, result = publish_skill_observation(
                     project_id=args.project_id,
                     prepared=load_prepared_skill_observation(args.candidate_file),
-                    selection_ref=args.selection_ref,
+                    publication_approval=load_prepared_skill_observation(
+                        args.approval_file
+                    ),
                     endpoint=endpoint,
                     token=token,
                 )

@@ -38,6 +38,7 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
         self.assertIn("result_receipt_ref", dispatcher)
         self.assertIn("skill_run_observations", dispatcher)
         self.assertIn("validation_state = 'NOT_RUN'", dispatcher)
+        self.assertIn('"provider://$providerSegment/model/$modelSegment"', dispatcher)
         self.assertNotIn("host_invocation_receipt_ref", dispatcher)
         self.assertNotIn("host_result_evidence_ref", dispatcher)
 

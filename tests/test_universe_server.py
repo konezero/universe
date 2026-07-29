@@ -38,6 +38,7 @@ from universe_server import (  # noqa: E402
     create_server,
     interface_profile,
     local_connection_profile,
+    provider_ref_from_model_ref,
     publish_skill_observation,
     prepare_skill_observation_archive,
     require_release_lifecycle_mode,
@@ -374,7 +375,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                             "operation_class": "READ",
                             "context_pack_digest": "c" * 64,
                         },
-                        "model_ref": "gpt-test",
+                        "model_ref": "provider://OPENAI/model/gpt-test",
                         "outcome": "SUCCEEDED",
                         "validation_state": "PASS",
                         "evidence_refs": ["receipt://gcs/test-001"],
@@ -389,6 +390,31 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "target_ref": "universe://local",
                 "redaction_state": "REDACTED",
             },
+        }
+        value.update(overrides)
+        return value
+
+    def skill_observation_publication_approval(
+        self, prepared: JsonObject, **overrides: object
+    ) -> JsonObject:
+        candidate_digest = hashlib.sha256(
+            json.dumps(
+                prepared["candidate"],
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        value: JsonObject = {
+            "schema": "universe.skill-observation-publication-approval.v1",
+            "status": "APPROVED",
+            "operation_class": "UNIVERSE_OBSERVATION_QUEUE",
+            "project_ref": "project://GCS",
+            "candidate_id": prepared["candidate_id"],
+            "candidate_digest": candidate_digest,
+            "selection_ref": "project-master-selection-gcs-001",
+            "approver": "PROJECT_MASTER",
+            "evidence_ref": "project-master://GCS/approval/gcs-001",
         }
         value.update(overrides)
         return value
@@ -803,6 +829,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(bench["bench"]))
         entry = bench["bench"][0]
         self.assertEqual("source-review", entry["skill"]["skill_id"])
+        self.assertEqual("OPENAI", entry["provider_ref"])
         self.assertEqual(1, entry["observation_count"])
         self.assertEqual(1, entry["outcomes"]["SUCCEEDED"])
         self.assertEqual(12, entry["metric_totals"]["duration_ms"])
@@ -840,10 +867,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "command": "SKILL_OBSERVATION",
             **self.skill_observation_candidate(),
         }
+        approval = self.skill_observation_publication_approval(prepared)
         status, receipt = publish_skill_observation(
             project_id="GCS",
             prepared=prepared,
-            selection_ref="user-selection-gcs-001",
+            publication_approval=approval,
             endpoint=self.endpoint,
             token=self.token,
         )
@@ -853,12 +881,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("UNIVERSE_LOCAL_HTTP", receipt["provider"])
         self.assertEqual("NOT_PERFORMED", receipt["project_archive_write"])
         self.assertEqual("QUEUED", receipt["queue_state"])
+        self.assertEqual(
+            approval["evidence_ref"], receipt["approval_evidence_ref"]
+        )
+        self.assertEqual("PROJECT_MASTER", receipt["approved_by"])
         self.assertIn(self.server.store.identity()["universe_id"], receipt["result_ref"])
 
         status, repeated = publish_skill_observation(
             project_id="GCS",
             prepared=prepared,
-            selection_ref="user-selection-gcs-001",
+            publication_approval=approval,
             endpoint=self.endpoint,
             token=self.token,
         )
@@ -870,11 +902,35 @@ class UniverseLocalServiceTests(unittest.TestCase):
             receipt["result_ref"], repeated["result_ref"]
         )
 
+        rejected_approval = dict(approval)
+        rejected_approval["candidate_digest"] = "f" * 64
+        with self.assertRaisesRegex(
+            UniverseError, "does not match the prepared candidate"
+        ):
+            publish_skill_observation(
+                project_id="GCS",
+                prepared=prepared,
+                publication_approval=rejected_approval,
+                endpoint=self.endpoint,
+                token=self.token,
+            )
+
         status, queued = self.request(
             "GET", "/v1/projects/GCS/skill-observation-queue", token=self.token
         )
         self.assertEqual(200, status)
         self.assertEqual(["QUEUED"], [item["status"] for item in queued["items"]])
+        self.assertEqual(
+            approval["evidence_ref"],
+            queued["items"][0]["publication_approval"]["evidence_ref"],
+        )
+        reopened_queue = UniverseStore(self.server.store.database_path)
+        self.assertEqual(
+            approval["evidence_ref"],
+            reopened_queue.list_skill_observation_queue("GCS")[0][
+                "publication_approval"
+            ]["evidence_ref"],
+        )
 
         status, drained = self.request(
             "POST", "/v1/skill-observation-queue/drain", {"limit": 10}, self.token
@@ -1431,6 +1487,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(proposal["candidates"]))
         candidate = proposal["candidates"][0]
         self.assertEqual("source-review", candidate["skill"]["skill_id"])
+        self.assertEqual(1, candidate["rank"])
+        self.assertEqual("OPENAI", candidate["provider_ref"])
+        self.assertEqual("CANDIDATE_ONLY", candidate["recommendation_state"])
         self.assertEqual("PROJECT_MASTER_BINDING_REQUIRED", candidate["binding_state"])
 
         status, adoption_result = self.request(
@@ -1469,6 +1528,116 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(409, status)
         self.assertEqual("CONTEXT_PACK_NODE_UNKNOWN", rejected["error_code"])
+
+    def test_skill_plan_ranks_skill_model_provider_candidates_from_bench(self) -> None:
+        self.assertEqual(
+            "GROK",
+            provider_ref_from_model_ref("provider://GROK/model/grok-build"),
+        )
+        self.assertEqual("UNKNOWN", provider_ref_from_model_ref("legacy-model-ref"))
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
+
+        candidate = self.skill_observation_candidate()
+        candidate["candidate_id"] = "skill-observation-ranking-001"
+        base = candidate["candidate"]["observations"][0]
+
+        def observation(
+            *,
+            marker: str,
+            model_ref: str,
+            outcome: str,
+            validation_state: str,
+            duration_ms: int,
+        ) -> JsonObject:
+            return {
+                **base,
+                "observation_digest": marker * 64,
+                "skill_binding_digest": marker * 64,
+                "model_ref": model_ref,
+                "outcome": outcome,
+                "validation_state": validation_state,
+                "metrics": {"duration_ms": duration_ms},
+            }
+
+        candidate["candidate"]["observations"] = [
+            observation(
+                marker="1",
+                model_ref="provider://GROK/model/grok-build",
+                outcome="SUCCEEDED",
+                validation_state="PASS",
+                duration_ms=80,
+            ),
+            observation(
+                marker="2",
+                model_ref="provider://CODEX/model/gpt-5.6",
+                outcome="SUCCEEDED",
+                validation_state="NOT_RUN",
+                duration_ms=30,
+            ),
+            observation(
+                marker="3",
+                model_ref="provider://CODEX/model/gpt-5.6",
+                outcome="SUCCEEDED",
+                validation_state="NOT_RUN",
+                duration_ms=40,
+            ),
+            observation(
+                marker="4",
+                model_ref="provider://OPENAI/model/gpt-test",
+                outcome="FAILED",
+                validation_state="FAIL",
+                duration_ms=10,
+            ),
+        ]
+        status, _ = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            candidate,
+            self.token,
+        )
+        self.assertEqual(201, status)
+
+        status, context_result = self.request(
+            "POST",
+            "/v1/projects/GCS/context-packs",
+            {
+                "purpose": "Rank source review providers.",
+                "node_ids": ["broker-client"],
+                "bench_limit": 10,
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        status, plan_result = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-plan-proposals",
+            {
+                "context_pack_id": context_result["context_pack"]["context_pack_id"],
+                "purpose": "Rank source review providers.",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        ranked = plan_result["proposal"]["candidates"]
+        self.assertEqual(["GROK", "CODEX", "OPENAI"], [
+            item["provider_ref"] for item in ranked
+        ])
+        self.assertEqual([1, 2, 3], [item["rank"] for item in ranked])
+        self.assertEqual(
+            [1, 0, 0],
+            [
+                item["bench_rationale"]["validated_success_count"]
+                for item in ranked
+            ],
+        )
+        self.assertTrue(
+            all(item["recommendation_state"] == "CANDIDATE_ONLY" for item in ranked)
+        )
+        self.assertEqual(
+            "USER_SELECTION_REQUIRED",
+            plan_result["proposal"]["next_operation"],
+        )
 
     def test_dispatch_delivery_wake_and_result_lifecycle_is_durable(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

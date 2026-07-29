@@ -109,14 +109,17 @@ $claimPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.fr
 $claim = Invoke-HostPost $request.endpoint $request.token '/v1/task-frame/operation' $claimPayload
 if ($claim.status -ne 'TASK_FRAME_OPERATION_APPLIED' -or $claim.output.status -ne 'TURN_CLAIMED') { $claim | ConvertTo-Json -Depth 12; exit 4 }
 $stage = 'TASK_FRAME_RESULT'
-$modelRef = if (
+$modelName = if (
     $null -ne $plannedInvocation.PSObject.Properties['model'] -and
     -not [string]::IsNullOrWhiteSpace([string]$plannedInvocation.model)
 ) {
     [string]$plannedInvocation.model
 } else {
-    "${dispatchProvider}:UNKNOWN"
+    'UNKNOWN'
 }
+$providerSegment = $dispatchProvider.Trim().ToUpperInvariant()
+$modelSegment = [Uri]::EscapeDataString($modelName)
+$modelRef = "provider://$providerSegment/model/$modelSegment"
 $skillRunObservations = @()
 foreach ($binding in $skillBindings) {
     $bindingDigest = [string]$binding.skill_binding_digest

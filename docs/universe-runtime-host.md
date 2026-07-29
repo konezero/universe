@@ -68,6 +68,10 @@ records only the declared binding digest, Runtime-selected model reference,
 terminal result receipt, and measured adapter duration. A completed transport
 maps to `outcome: SUCCEEDED`, while validation remains `NOT_RUN`; the Host does
 not infer task quality from model text. The project Task Frame journal validates
-and owns these observations. Universe persists only their count in the redacted
-invocation timeline. Publishing the reviewed Result Packet through the existing
-Project-to-Universe queue remains a separate operation.
+and owns these observations. The model reference is canonicalized as
+`provider://<PROVIDER>/model/<MODEL>`, allowing Universe Bench queries to expose
+the Provider dimension without changing the installed Task Frame schema.
+Universe persists only the observation count in the redacted invocation
+timeline. Publishing the reviewed Result Packet requires a separate,
+digest-bound Project Master approval before the Project-to-Universe queue
+accepts it.

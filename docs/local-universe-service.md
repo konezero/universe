@@ -172,7 +172,8 @@ create a Project Seed, or grant execution authority.
 ai-career Skill observation candidate. The service rejects raw source,
 prompts, commands, `skill_ref`, and arbitrary extension fields. Replaying the
 same candidate is idempotent; `GET /v1/bench/skills` returns aggregate observed
-counts, validation states, and metric totals without universal rankings.
+counts, validation states, metric totals, and canonical Provider dimensions
+without universal rankings.
 
 ## Publish a prepared Skill observation
 
@@ -183,13 +184,16 @@ without becoming an ai-career Runtime dependency:
 python tools/universe_server.py publish-skill-observation `
   --project-id GCS `
   --candidate-file C:\path\to\skill-observation-prepared.json `
-  --selection-ref user-selection-gcs-001
+  --approval-file C:\path\to\project-master-publication-approval.json
 ```
 
 The command reads the local service state file for its loopback endpoint and
 token, accepts only `PREPARED` `SKILL_OBSERVATION` artifacts, and returns a
-Universe-local SQLite queue receipt. It neither writes the Project repository
-nor starts a Task Frame. A separately scheduled or manually invoked
+Universe-local SQLite queue receipt. The approval file must be
+`universe.skill-observation-publication-approval.v1` with `status: APPROVED`,
+`approver: PROJECT_MASTER`, and exact Project, candidate ID, and candidate
+digest bindings. It neither writes the Project repository nor starts a Task
+Frame. A separately scheduled or manually invoked
 `drain-skill-observation-queue` consumer performs Bench ingest after the queue
 write. Retaining that receipt under a Project `.ai/archive/` path is a later,
 separately approved ai-career `HANDOFF_APPEND` operation; the queue receipt

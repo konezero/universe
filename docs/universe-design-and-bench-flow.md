@@ -157,8 +157,15 @@ purpose and project node
 Skill Catalog records include `skill_id`, version, input/output contract,
 applicable domains and stacks, operation class, evidence requirements, and
 Bench history. A result is conditional on task type, model, context, and Host
-conditions; it is never a universal ranking. A Task Worker runs only Skills
-bound by its Project Master and may request a replacement only as a candidate.
+conditions; it is never a universal ranking. Canonical Host observations encode
+that pair as `provider://<PROVIDER>/model/<MODEL>` in `model_ref`; legacy model
+references keep `provider_ref: UNKNOWN`. A Project-local proposal may order
+compatible candidates by validated success, validation failure, successful
+outcomes, observation count, and average observed duration. The scorecard is
+exposed with the proposal, and every item remains `CANDIDATE_ONLY` with explicit
+user selection and Project Master binding required. A Task Worker runs only
+Skills bound by its Project Master and may request a replacement only as a
+candidate.
 
 ## Project Master Handoff
 
@@ -194,10 +201,12 @@ evidence references and redaction state
 ```
 
 The Project publishes this observation asynchronously. It retains only the
-Task Frame result and a queue publication receipt. Universe accepts only the
-exact redacted surface below, validates it before durable queue storage, and uses
-`project_id + candidate_id + observation_digest` with the candidate digest for
-idempotency and conflict detection.
+Task Frame result and a queue publication receipt. Publication also carries a
+Project Master approval artifact bound to the Project, candidate ID, canonical
+candidate digest, selection reference, and approval evidence reference.
+Universe rejects an unapproved or mismatched artifact before durable queue
+storage. It then uses `project_id + candidate_id + observation_digest` with the
+candidate digest for idempotency and conflict detection.
 
 ```text
 Allowed candidate fields
@@ -215,8 +224,10 @@ Rejected at the Universe boundary
 
 Universe stores accepted observations in its local ingress queue first. Its
 consumer performs the later Bench database insert and exposes only observations
-and aggregate counts, validation states, and metric totals. It does not rank
-Skills universally or turn Bench records into source authority.
+and aggregate counts, validation states, and metric totals. It may produce a
+deterministic Project-local Skill/Model/Provider candidate order with the full
+scorecard, but does not rank Skills universally or turn Bench records into
+source authority.
 
 Bench observations are shareable inputs to common learning, not automatic
 Career policy. Universe may compare compatible redacted observations across
@@ -280,21 +291,24 @@ relations remain distinct from observed evidence. Career adoption is separate.
    Project Master handoff delivery remain follow-ups.
 4. Add Project-side Task Frame SkillRunObservation publication as an
    ai-career/Core Runtime follow-up. The redacted candidate preparation
-   surface is implemented; a provider append adapter remains a follow-up.
+   surface and Boss-bound Result Packet persistence are implemented; a provider
+   append adapter remains a follow-up.
 5. Connect an approved Project publication provider to the Universe ingress
    queue, then use consumed Bench records for Context Pack assembly. The local
-   publisher, queue receipt, and deterministic queue drain are implemented;
-   Project-owned archive retention remains a separate `HANDOFF_APPEND`
-   integration.
+   publisher, digest-bound Project Master approval, durable queue receipt,
+   deterministic queue drain, and Project-local Skill/Model/Provider candidate
+   ordering are implemented; Project-owned archive retention remains a separate
+   `HANDOFF_APPEND` integration.
 6. Hand selected Project Seeds and Skill Plans to Project Masters through the
    existing handoff and Bridge boundaries. Exact-byte Seed asset proposal
    preparation is implemented; receipt-aware Project Master application is
    the next Project Runtime integration.
 7. Add Experience and causal comparison only after observed Skill data exists.
 
-## Explicit Deferred Boundary
+## Runtime Boundary
 
-This document does not change ai-career Core Runtime, Task Frame schemas, or
-Execution Guard behavior. Project-side Skill binding and observation emission
-must be designed and implemented in ai-career first. Universe then consumes
-that published contract without taking ownership of Project execution.
+Universe consumes the installed ai-career Skill binding and observation
+contract without taking ownership of Project execution. The current contract
+uses a canonical provider-bearing `model_ref`; adding an independent
+`provider_ref` field remains an ai-career schema migration and is not inferred
+into existing Project Runtime records.
