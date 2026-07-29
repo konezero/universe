@@ -754,9 +754,6 @@ class AnchorSessionMemoryHostAdapter:
             }
         return runtime.submit_worker_envelope(
             envelope=envelope,
-            host_result_evidence_ref=str(
-                payload.get("host_result_evidence_ref", "")
-            ),
             observed_at=str(payload.get("observed_at", "")),
         )
 

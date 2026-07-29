@@ -388,7 +388,7 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
                 "operation",
                 "turn_id",
                 "worker_id",
-                "host_invocation_receipt_ref",
+                "worker_run_ref",
                 "capability_evidence_ref",
                 "invoker_actor_ref",
                 "observed_at",
@@ -398,8 +398,8 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
         return runtime.claim_turn(
             turn_id=_required_text(payload, "turn_id", context),
             worker_id=_required_text(payload, "worker_id", context),
-            host_invocation_receipt_ref=_optional_text(
-                payload, "host_invocation_receipt_ref", context
+            worker_run_ref=_optional_text(
+                payload, "worker_run_ref", context
             ),
             capability_evidence_ref=_optional_text(
                 payload, "capability_evidence_ref", context
@@ -416,7 +416,7 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
                 "operation",
                 "boss_turn_id",
                 "boss_worker_id",
-                "host_invocation_receipt_ref",
+                "worker_run_ref",
                 "instruction_digests",
                 "worker_allocations",
                 "observed_at",
@@ -439,8 +439,8 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
         return runtime.submit_boss_allocations(
             boss_turn_id=_required_text(payload, "boss_turn_id", context),
             boss_worker_id=_required_text(payload, "boss_worker_id", context),
-            host_invocation_receipt_ref=_required_text(
-                payload, "host_invocation_receipt_ref", context
+            worker_run_ref=_required_text(
+                payload, "worker_run_ref", context
             ),
             instruction_digests=instruction_digests,
             worker_allocations=tuple(
@@ -456,15 +456,15 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
                 "operation",
                 "boss_turn_id",
                 "boss_worker_id",
-                "host_invocation_receipt_ref",
+                "worker_run_ref",
             },
             context,
         )
         return runtime.boss_result_bundle(
             boss_turn_id=_required_text(payload, "boss_turn_id", context),
             boss_worker_id=_required_text(payload, "boss_worker_id", context),
-            host_invocation_receipt_ref=_required_text(
-                payload, "host_invocation_receipt_ref", context
+            worker_run_ref=_required_text(
+                payload, "worker_run_ref", context
             ),
         )
     if operation == "complete_turn":
@@ -478,7 +478,7 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
                 "evidence_refs",
                 "observed_at",
                 "review_decision",
-                "host_invocation_receipt_ref",
+                "worker_run_ref",
             },
             context,
         )
@@ -496,8 +496,8 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
             evidence_refs=tuple(evidence_refs),
             observed_at=_required_text(payload, "observed_at", context),
             review_decision=review_decision,
-            host_invocation_receipt_ref=_optional_text(
-                payload, "host_invocation_receipt_ref", context
+            worker_run_ref=_optional_text(
+                payload, "worker_run_ref", context
             ),
         )
     if operation == "input_bundle":
@@ -1240,7 +1240,9 @@ def _continuity_command(
 ) -> tuple[int, Mapping[str, Any]]:
     operations = {
         "checkpoint": {"prepare", "save", "list", "load"},
-        "memory-sync": {"prepare"},
+        "memory-sync": {"prepare", "node-prepare"},
+        "skill-observation": {"prepare"},
+        "carrier-intake": {"prepare"},
         "handoff-append": {"attest"},
         "resume-save": {"prepare", "save"},
         "resume-restore": {"discover", "load"},
@@ -1349,7 +1351,15 @@ def _help() -> Mapping[str, Any]:
                 "--request <path|->"
             ),
             (
-                "memory-sync prepare --repo-root <path> [--profile <path>] "
+                "memory-sync <prepare|node-prepare> --repo-root <path> [--profile <path>] "
+                "--request <path|->"
+            ),
+            (
+                "skill-observation prepare --repo-root <path> [--profile <path>] "
+                "--request <path|->"
+            ),
+            (
+                "carrier-intake prepare --repo-root <path> [--profile <path>] "
                 "--request <path|->"
             ),
             (
@@ -1428,6 +1438,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif command == "checkpoint":
             code, payload = _continuity_command(command, command_args)
         elif command == "memory-sync":
+            code, payload = _continuity_command(command, command_args)
+        elif command == "skill-observation":
+            code, payload = _continuity_command(command, command_args)
+        elif command == "carrier-intake":
             code, payload = _continuity_command(command, command_args)
         elif command == "handoff-append":
             code, payload = _continuity_command(command, command_args)

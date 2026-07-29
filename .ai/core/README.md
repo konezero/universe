@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: 30c470816640591ceda1ecae2316dfbc724d67ec
+Source Commit: 1d41ecd8265d4f3eab61cf8a8eb8ed97e6630370
 
 ## Entry
 
@@ -20,7 +20,6 @@ Source Commit: 30c470816640591ceda1ecae2316dfbc724d67ec
 - `.ai/adapters/codex/invoke.ps1`
 
 ### contract_template
-- `.ai/templates/carrier_profile/README.md`
 - `.ai/templates/codex_environment_snapshot/README.md`
 - `.ai/templates/handoff_inbox/README.md`
 - `.ai/templates/label_profile/README.md`
@@ -37,6 +36,9 @@ Source Commit: 30c470816640591ceda1ecae2316dfbc724d67ec
 - `.ai/templates/runtime_frame/README.md`
 - `.ai/templates/runtime_state/session.md`
 - `.ai/templates/task_frame_orchestration/README.md`
+- `.ai/templates/universe_connection/README.md`
+- `.ai/templates/universe_node_memory/README.md`
+- `.ai/templates/universe_project_seed/README.md`
 - `.ai/templates/worker_resume_archive/README.md`
 
 ### core_runtime
@@ -134,10 +136,12 @@ Source Commit: 30c470816640591ceda1ecae2316dfbc724d67ec
 - `.ai/skills/common/resume-restore/SKILL.md`
 - `.ai/skills/common/resume-save/SKILL.md`
 - `.ai/skills/common/runtime-status/SKILL.md`
+- `.ai/skills/common/skill-observation/SKILL.md`
 - `.ai/skills/common/source-review/SKILL.md`
 - `.ai/skills/common/task-assignment/SKILL.md`
 - `.ai/skills/common/task-frame-debate/SKILL.md`
 - `.ai/skills/common/task-frame/SKILL.md`
+- `.ai/skills/common/universe-project-seed/SKILL.md`
 
 ## Generated Project Surfaces
 

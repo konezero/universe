@@ -58,8 +58,8 @@ Parent ACCEPT != execution permission
 
 Before invoking a Worker, the Host must obtain a Reference Runtime
 `WORKER_INVOCATION_READY` result for the declared turn and then claim that turn
-for one concrete `worker_id` using the same capability evidence and the Host's
-actual invocation receipt.
+for one concrete `worker_id` using the same capability evidence and a unique
+Host `worker_run_ref`.
 
 For an approval-gated profile, the Host must first generate and display one
 exact Task Frame execution proposal. The proposal binds the Parent actor,
@@ -80,7 +80,7 @@ the Execution Assignment reference is present as declared input;
 the Host capability status is AVAILABLE;
 the exact current execution proposal has user approval;
 the claiming actor is not the Parent actor;
-the Host supplies a concrete invocation receipt for that Worker;
+the Host supplies a concrete, unique `worker_run_ref` for that Worker;
 the turn is successfully claimed by the selected Worker.
 ```
 
@@ -102,10 +102,11 @@ Worker invocation and result-transport surface. When capability is unavailable
 or unverified, submit `UNAVAILABLE` or `UNKNOWN` to `worker_invocation_plan`,
 report `worker_invocation: UNKNOWN`, and do not fabricate a Worker response.
 
-The capability evidence reference and invocation receipt are opaque Host
-evidence. The Reference Runtime checks their presence and continuity across
-plan, claim, and completion; it does not cryptographically prove a vendor's
-internal execution. The Host must not fabricate these references.
+The capability evidence reference is opaque Host evidence. `worker_run_ref` is
+an opaque correlation key that binds plan, claim, and terminal result for one
+Worker run. It is not authority, evidence, or a durable receipt. The Reference
+Runtime does not cryptographically prove a vendor's internal execution, and
+the Host must not fabricate these values.
 
 ```yaml
 parent_actor_ref: <current Parent identity>
@@ -113,7 +114,7 @@ invoker_actor_ref: <Parent for /root/boss; Boss for /root/boss/subN>
 worker_actor_ref: <distinct Host Worker identity>
 worker_path: </root/boss or /root/boss/subN>
 capability_evidence_ref: <bounded Worker capability evidence>
-host_invocation_receipt_ref: <actual Host invocation receipt>
+worker_run_ref: <unique Host run correlation key>
 ```
 
 Using the Parent actor under a Worker-like label is
@@ -148,13 +149,13 @@ Using the Parent actor under a Worker-like label is
 12. The Boss invokes the Sub through the Host's bounded nested-Worker transport.
     The Host supplies physical process or model transport only; the Parent and
     Host must not become the logical Sub caller.
-13. The Boss captures the concrete Sub actor ID and Host invocation receipt,
+13. The Boss captures the concrete Sub actor ID and unique Host run reference,
     then claims the turn with its own actor reference as `invoker_actor_ref`.
 14. Require one JSON-compatible bounded Sub result and source evidence references.
 15. The Host transport submits the unchanged envelope through
-    `/v1/task-frame/worker-result` with the same Worker actor, invocation
-    receipt, and concrete Host result evidence reference. The Parent must not
-    call `complete_turn` or reconstruct this envelope.
+    `/v1/task-frame/worker-result` with the same Worker actor, `worker_run_ref`,
+    and exactly one terminal `result_receipt_ref`. The Parent must not call
+    `complete_turn` or reconstruct this envelope.
 16. The Runtime computes and stores the canonical envelope digest before it
     completes the turn, without adding authority,
     currentness, permission, adoption, or an undeclared next task.
@@ -223,7 +224,8 @@ The Host invocation must yield exactly one JSON-compatible result envelope:
 ```yaml
 turn_id: <declared turn>
 worker_id: <claiming Host Worker>
-host_invocation_receipt_ref: <same receipt used to claim the turn>
+worker_run_ref: <same run correlation key used to claim the turn>
+result_receipt_ref: <one terminal Host result receipt>
 status: COMPLETED | FAILED | UNKNOWN
 evidence_refs:
   - <source-backed evidence reference>
@@ -274,15 +276,16 @@ scope.
 
 The Host binds this envelope to the claimed turn when it constructs the
 dedicated Worker-result request. The Runtime computes `worker_result_digest`
-from that exact envelope and preserves the envelope in execution evidence and
-the Result Packet. Missing fields remain missing or `UNKNOWN`; the Host and
-Parent must not infer them from conversation history.
+from that exact envelope and preserves the envelope, including its one terminal
+`result_receipt_ref`, in execution evidence and the Result Packet. Missing
+fields remain missing or `UNKNOWN`; the Host and Parent must not infer them
+from conversation history.
 
 ```text
 Parent direct complete_turn
   -> WORKER_RESULT_ENVELOPE_REQUIRED
 
-rewritten envelope or missing Host result evidence
+rewritten envelope, missing worker_run_ref, or missing result_receipt_ref
   -> blocked before turn completion
 ```
 
@@ -301,6 +304,38 @@ next_task_id
 
 The Reference Runtime rejects these claims as
 `PROHIBITED_TURN_RESULT_CLAIM`.
+
+## Project-Owned Skill Observation
+
+ai-career does not own a project implementation Skill catalog. The active Boss
+may attach optional project-owned `skill_bindings` to a Sub allocation:
+
+```yaml
+skill_id: <project-defined identifier>
+skill_version: <project-defined version>
+skill_ref: <project-local reference>
+context_pack_digest: <sha256>
+operation_class: READ | PROPOSE | EXECUTE
+```
+
+The Runtime computes and persists each binding digest as part of the allocation
+digest. A Worker may use only those declared bindings. When a completed Worker
+uses a binding, its unchanged envelope must include one bounded observation:
+
+```yaml
+skill_binding_digest: <Runtime-computed binding digest>
+model_ref: <Host-observed reference or UNKNOWN>
+outcome: SUCCEEDED | FAILED | UNKNOWN
+validation_state: PASS | FAIL | NOT_RUN | UNKNOWN
+evidence_refs: [<bounded evidence reference>]
+metrics: {duration_ms: <non-negative number>}
+```
+
+Unbound, substituted, duplicated, incomplete, or malformed observations block
+the Worker envelope before turn completion. The Task Frame SQLite journal stores
+validated observations with the envelope and exposes them only as Result Packet
+and execution evidence. It does not publish to Universe, select a model, score
+a Skill, or create execution authority.
 
 ## Result Rejoin
 
@@ -343,6 +378,10 @@ against the live Task Frame ledger. The Guard receives the Host-verified
 lineage separately, checks that the concrete operation and target are within
 both the Boss allocation and Parent Write Scope, and seals the lineage into the
 one-time receipt. It repeats verification at receipt consumption.
+
+That one-time pre-write receipt is internal to the mutation gateway. It is not
+a Task Frame Worker Result Receipt and must not be surfaced as an additional
+Worker receipt.
 
 ```text
 unverified or forged lineage -> BLOCK

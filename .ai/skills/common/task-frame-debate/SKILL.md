@@ -194,6 +194,14 @@ under `BOUNDED` must be a subset of the Parent operations and targets. This is
 a Task Frame ledger invariant; it does not assert control over unrelated tools
 that the Host may expose outside the Runtime.
 
+An allocation may additionally declare project-owned `skill_bindings`. Each
+binding fixes the project Skill identifier, version, reference, context-pack
+digest, and operation class. The Boss cannot change those bindings after the
+allocation is recorded. A completed Sub returns one bounded observation for
+each declared binding; an unbound or substituted Skill is rejected by the
+ledger. This does not create an ai-career Skill catalog or a Universe publish
+operation.
+
 The Boss must invoke each Sub itself through the Host's nested-Worker
 capability. The Host owns physical process or model transport, but it is not
 the logical invoker. The Parent must not request a Sub invocation plan, claim a

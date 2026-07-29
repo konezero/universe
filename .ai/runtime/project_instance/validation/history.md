@@ -4,6 +4,6 @@ Schema: ai-career.project-runtime-validation-history.v1
 
 | Validation ID | Source Commit | Result | Repository Runtime |
 | --- | --- | --- | --- |
-| 2a542252b4221558f4879a185178cece55ec55c26a56bcb60bd0a8f30b3cf132 | 30c470816640591ceda1ecae2316dfbc724d67ec | PASS | VERIFIED |
+| fd030b4c497cd66be044c139417fdfc5d90cb8eb9dce312731e4ab8b3eba0238 | 1d41ecd8265d4f3eab61cf8a8eb8ed97e6630370 | PASS | VERIFIED |
 
 Evidence: `.ai/runtime/project_instance/validation/latest.md`

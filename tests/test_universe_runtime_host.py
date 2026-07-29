@@ -92,6 +92,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
 
     def test_capability_and_invocation_are_normalized(self) -> None:
         calls: list[list[str]] = []
+        dispatched_request: dict[str, object] = {}
 
         def runner(command: list[str], **_: object) -> SimpleNamespace:
             calls.append(command)
@@ -100,6 +101,10 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                     stdout='{"provider":"GROK","status":"AVAILABLE"}',
                     returncode=0,
                 )
+            request_path = Path(command[command.index("-RequestPath") + 1])
+            dispatched_request.update(
+                json.loads(request_path.read_text(encoding="utf-8"))
+            )
             return SimpleNamespace(
                 stdout=(
                     '{"status":"TASK_FRAME_RESULT_RECORDED",'
@@ -117,6 +122,10 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("result-1", result["result_receipt_ref"])
         self.assertNotIn("worker_run_ref", result)
         self.assertEqual(2, len(calls))
+        self.assertEqual(
+            "universe.task-frame-worker-dispatch-request.v1",
+            dispatched_request["schema"],
+        )
 
     def test_dispatcher_without_json_reports_transport_failure(self) -> None:
         def runner(_: list[str], **__: object) -> SimpleNamespace:

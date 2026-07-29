@@ -45,6 +45,27 @@
       "activation": "FORBIDDEN",
       "result_status": "PREPARED"
     },
+    "memory-sync.node-prepare": {
+      "canonical_command": "MEMORY_SYNC",
+      "content_selection": "USER_CONFIRMED_NODE_ATTACHMENT",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "PREPARED"
+    },
+    "skill-observation.prepare": {
+      "canonical_command": "SKILL_OBSERVATION",
+      "content_selection": "TASK_FRAME_RESULT_PACKET",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "PREPARED"
+    },
+    "carrier-intake.prepare": {
+      "canonical_command": "CARRIER_INTAKE",
+      "content_selection": "UNIVERSE_CAREER_PROMOTION_QUEUE",
+      "durable_write": "FORBIDDEN",
+      "activation": "FORBIDDEN",
+      "result_status": "PREPARED"
+    },
     "handoff-append.attest": {
       "canonical_command": "HANDOFF_APPEND",
       "content_selection": "USER_CONFIRMED",

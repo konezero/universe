@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 
 RUNTIME_WORKER_REQUEST_SCHEMA = "universe.runtime-worker-invocation-request.v1"
+DISPATCH_REQUEST_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
 
 
@@ -219,6 +220,10 @@ class UniverseRuntimeHost:
             or tempfile.gettempdir()
         ) / "Universe" / "runtime-tmp"
         root.mkdir(parents=True, exist_ok=True)
+        dispatch_request = {
+            **request,
+            "schema": DISPATCH_REQUEST_SCHEMA,
+        }
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -227,7 +232,13 @@ class UniverseRuntimeHost:
             dir=root,
             delete=False,
         ) as handle:
-            json.dump(request, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            json.dump(
+                dispatch_request,
+                handle,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             handle.write("\n")
             return _TransientRequestFile(Path(handle.name))
 

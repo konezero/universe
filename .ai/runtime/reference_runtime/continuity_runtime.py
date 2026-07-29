@@ -27,12 +27,16 @@ INSTALLATION_MANIFEST_SCHEMA = "ai-career.project-runtime-installation.v1"
 INSTALLATION_MANIFEST_PATH = ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 IMMUTABLE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+NODE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 SUPPORTED_OPERATIONS = {
     "checkpoint.prepare",
     "checkpoint.save",
     "checkpoint.list",
     "checkpoint.load",
     "memory-sync.prepare",
+    "memory-sync.node-prepare",
+    "skill-observation.prepare",
+    "carrier-intake.prepare",
     "handoff-append.attest",
     "resume-save.prepare",
     "resume-save.save",
@@ -201,6 +205,12 @@ def run_continuity_command(
             result = _load_checkpoint(request, store)
         elif operation == "memory-sync.prepare":
             result = _prepare_memory_sync(request)
+        elif operation == "memory-sync.node-prepare":
+            result = _prepare_node_memory_sync(request)
+        elif operation == "skill-observation.prepare":
+            result = _prepare_skill_observation(request)
+        elif operation == "carrier-intake.prepare":
+            result = _prepare_carrier_intake(request)
         elif operation == "handoff-append.attest":
             result = _attest_handoff_append(request)
         elif operation == "resume-save.prepare":
@@ -402,6 +412,219 @@ def _prepare_memory_sync(request: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _prepare_node_memory_sync(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Prepare one selected Project-local note attached to a published Seed node."""
+
+    _exact_fields(
+        request,
+        {
+            "selection_ref",
+            "node_ref",
+            "memory_id",
+            "state",
+            "body",
+            "source_refs",
+            "observed_at",
+        },
+        "memory-sync node request",
+    )
+    node_ref = _required_mapping(request.get("node_ref"), "node_ref")
+    _exact_fields(
+        node_ref,
+        {"graph", "node_id", "seed_manifest_ref", "seed_id"},
+        "node_ref",
+    )
+    graph = _required_text(node_ref.get("graph"), "node_ref.graph").upper()
+    graph_directory = {
+        "FUNCTIONAL": "functional",
+        "IMPLEMENTATION": "implementation",
+    }.get(graph)
+    if graph_directory is None:
+        raise ContinuityCommandError(
+            "UNIVERSE_NODE_MEMORY_GRAPH_INVALID",
+            "node_ref.graph must be FUNCTIONAL or IMPLEMENTATION",
+        )
+    node_id = _required_text(node_ref.get("node_id"), "node_ref.node_id")
+    memory_id = _required_text(request.get("memory_id"), "memory_id")
+    if (
+        NODE_IDENTIFIER_PATTERN.fullmatch(node_id) is None
+        or NODE_IDENTIFIER_PATTERN.fullmatch(memory_id) is None
+    ):
+        raise ContinuityCommandError(
+            "UNIVERSE_NODE_MEMORY_IDENTIFIER_INVALID",
+            "node_id and memory_id must be normalized identifiers",
+        )
+    state = _required_text(request.get("state"), "state").upper()
+    if state not in {"BRAINSTORM", "OBSERVED", "QUESTION", "DECISION_NOTE"}:
+        raise ContinuityCommandError(
+            "UNIVERSE_NODE_MEMORY_STATE_INVALID", "node memory state is unsupported"
+        )
+    payload = {
+        "schema": "ai-career.universe-node-memory.v1",
+        "memory_id": memory_id,
+        "state": state,
+        "node_ref": {
+            "graph": graph,
+            "node_id": node_id,
+            "seed_manifest_ref": _required_text(
+                node_ref.get("seed_manifest_ref"), "node_ref.seed_manifest_ref"
+            ),
+            "seed_id": _required_text(node_ref.get("seed_id"), "node_ref.seed_id"),
+        },
+        "origin": {
+            "selection_ref": _required_text(request.get("selection_ref"), "selection_ref"),
+            "source_refs": _source_refs(request.get("source_refs")),
+            "observed_at": _timestamp(request.get("observed_at"), "observed_at"),
+        },
+        "body": _required_text(request.get("body"), "body"),
+    }
+    target_path = (
+        f".ai/memory/universe_nodes/{graph_directory}/{node_id}/{memory_id}.json"
+    )
+    return {
+        "status": "PREPARED",
+        "command": "MEMORY_SYNC_NODE",
+        "candidate_id": _stable_id("node-memory", payload),
+        "durability": "UNKNOWN",
+        "persistence_state": "PASSIVE",
+        "execution_host_required": False,
+        "runtime_state_write": False,
+        "target_path": target_path,
+        "candidate": payload,
+        "effects": {
+            "candidate_creation": "NONE",
+            "universe_publish": "NONE",
+            "career_promotion": "NONE",
+            "source_mutation": "NONE",
+        },
+    }
+
+
+def _prepare_carrier_intake(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Prepare, but do not append, Career Carrier artifacts from one Universe candidate."""
+
+    _exact_fields(
+        request,
+        {"repository_kind", "mode", "carrier_ref", "selection_ref", "candidate", "observed_at"},
+        "carrier-intake request",
+    )
+    if _required_text(request.get("repository_kind"), "repository_kind") != "AI_CAREER":
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_REPOSITORY_INVALID",
+            "carrier intake is available only to the AI_CAREER repository",
+        )
+    if _required_text(request.get("mode"), "mode") != "CARRIER":
+        raise ContinuityCommandError(
+            "CARRIER_MODE_REQUIRED", "carrier intake requires CARRIER mode"
+        )
+    candidate = dict(_required_mapping(request.get("candidate"), "candidate"))
+    required = {
+        "schema", "candidate_id", "candidate_digest", "universe_ref", "project_ref",
+        "promotion_kind", "source", "observed_signature", "redaction_state",
+        "evidence_state", "promotion_state", "effects", "next_operation",
+    }
+    if set(candidate) != required:
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID",
+            "candidate must use the exact Universe Career promotion candidate shape",
+        )
+    if candidate["schema"] != "universe.career-promotion-candidate.v1":
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate schema is unsupported"
+        )
+    if candidate["redaction_state"] != "REDACTED" or candidate["evidence_state"] != "OBSERVED_AGGREGATE":
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID",
+            "candidate must be redacted observed aggregate evidence",
+        )
+    if candidate["promotion_state"] != "CANDIDATE_ONLY":
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate must remain candidate-only"
+        )
+    source = _required_mapping(candidate["source"], "candidate.source")
+    if set(source) != {
+        "pattern_proposal_id", "pattern_proposal_digest", "support_case_ids", "support_case_count"
+    }:
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate source shape is invalid"
+        )
+    support_case_ids = _source_refs(source["support_case_ids"])
+    support_case_count = source["support_case_count"]
+    if (
+        isinstance(support_case_count, bool)
+        or not isinstance(support_case_count, int)
+        or support_case_count != len(support_case_ids)
+    ):
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate support case count is invalid"
+        )
+    effects = _required_mapping(candidate["effects"], "candidate.effects")
+    if not effects or any(value != "NONE" for value in effects.values()):
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate effects must all be NONE"
+        )
+    material = {key: value for key, value in candidate.items() if key not in {"candidate_id", "candidate_digest"}}
+    expected_digest = hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    candidate_digest = _required_text(candidate["candidate_digest"], "candidate.candidate_digest")
+    if SHA256_PATTERN.fullmatch(candidate_digest) is None or candidate_digest != expected_digest:
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate digest does not bind candidate content"
+        )
+    candidate_id = _required_text(candidate["candidate_id"], "candidate.candidate_id")
+    if candidate_id != "careerpromotion_" + candidate_digest[:24]:
+        raise ContinuityCommandError(
+            "CARRIER_INTAKE_CANDIDATE_INVALID", "candidate ID does not bind candidate digest"
+        )
+    carrier_ref = _required_text(request.get("carrier_ref"), "carrier_ref")
+    selection_ref = _required_text(request.get("selection_ref"), "selection_ref")
+    observed_at = _timestamp(request.get("observed_at"), "observed_at")
+    memory_event_id = "memory_universe_" + candidate_digest[:20]
+    source_ref = candidate["universe_ref"] + "/career-promotion/" + candidate_id
+    summary = (
+        f"Observed Universe pattern candidate from {support_case_count} supporting cases; "
+        f"source proposal {source['pattern_proposal_id']}."
+    )
+    intake = {
+        "source_candidate": {
+            "candidate_id": candidate_id,
+            "candidate_digest": candidate_digest,
+            "source_ref": source_ref,
+            "project_ref": _required_text(candidate["project_ref"], "candidate.project_ref"),
+        },
+        "memory_event": {
+            "schema": "ai-career.carrier-memory-event-candidate.v1",
+            "memory_event_id": memory_event_id,
+            "target_path": f".ai/memory/inbox/universe/{candidate_id}.json",
+            "state": "CANDIDATE",
+            "summary": summary,
+            "observed_at": observed_at,
+        },
+        "conductor_inbox_item": {
+            "schema": "ai-career.conductor-inbox-item-candidate.v1",
+            "inbox_item_id": "inbox_universe_" + candidate_digest[:20],
+            "target_path": ".ai/inbox/conductor/queue.md",
+            "memory_event_id": memory_event_id,
+            "source_ref": source_ref,
+            "summary": summary,
+            "status": "unread",
+        },
+    }
+    return {
+        "status": "PREPARED",
+        "command": "CARRIER_INTAKE",
+        "candidate_id": _stable_id("carrier-intake", intake),
+        "carrier_ref": carrier_ref,
+        "selection_ref": selection_ref,
+        "durability": "UNKNOWN",
+        "persistence_state": "PASSIVE",
+        "execution_host_required": False,
+        "runtime_state_write": False,
+        "intake": intake,
+    }
+
+
 def _attest_handoff_append(request: Mapping[str, Any]) -> dict[str, Any]:
     """Validate provider evidence after a Host performs an append-only handoff."""
 
@@ -429,8 +652,14 @@ def _attest_handoff_append(request: Mapping[str, Any]) -> dict[str, Any]:
             "HANDOFF_APPEND_PATH_FORBIDDEN",
             f"target_path is not a safe Runtime-owned path: {error.detail}",
         ) from error
-    allowed_prefixes = (".ai/memory/inbox/", ".ai/queue/", ".ai/archive/")
-    if not target_path.startswith(allowed_prefixes):
+    allowed_prefixes = (
+        ".ai/memory/inbox/",
+        ".ai/memory/universe_nodes/",
+        ".ai/queue/",
+        ".ai/archive/",
+    )
+    allowed_exact_paths = {".ai/inbox/conductor/queue.md"}
+    if not target_path.startswith(allowed_prefixes) and target_path not in allowed_exact_paths:
         raise ContinuityCommandError(
             "HANDOFF_APPEND_PATH_FORBIDDEN",
             "target_path is not a Runtime-owned append-only path",
@@ -469,6 +698,178 @@ def _prepare_resume(request: Mapping[str, Any]) -> dict[str, Any]:
         "runtime_state_write": False,
         "candidate": payload,
     }
+
+
+def _prepare_skill_observation(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Package redacted Task Frame Skill observations for later Provider append."""
+
+    _exact_fields(
+        request,
+        {
+            "project_ref",
+            "task_frame_ref",
+            "source_ref",
+            "observations",
+            "observed_at",
+            "target_ref",
+        },
+        "skill-observation request",
+    )
+    raw_observations = request.get("observations")
+    if not isinstance(raw_observations, list) or not raw_observations:
+        raise ContinuityCommandError(
+            "CONTINUITY_REQUEST_INVALID", "observations must be a non-empty array"
+        )
+    observations: list[dict[str, Any]] = []
+    seen_digests: set[str] = set()
+    required_fields = {
+        "observation_digest",
+        "skill_binding_digest",
+        "skill_binding",
+        "model_ref",
+        "outcome",
+        "validation_state",
+        "evidence_refs",
+        "metrics",
+    }
+    for index, raw_observation in enumerate(raw_observations):
+        observation = _required_mapping(raw_observation, f"observations[{index}]")
+        _exact_fields(observation, required_fields, f"observations[{index}]")
+        observation_digest = _required_text(
+            observation.get("observation_digest"),
+            f"observations[{index}].observation_digest",
+        )
+        binding_digest = _required_text(
+            observation.get("skill_binding_digest"),
+            f"observations[{index}].skill_binding_digest",
+        )
+        if (
+            SHA256_PATTERN.fullmatch(observation_digest) is None
+            or SHA256_PATTERN.fullmatch(binding_digest) is None
+            or observation_digest in seen_digests
+        ):
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID", "observation digests must be unique SHA-256 values"
+            )
+        model_ref = _required_text(observation.get("model_ref"), f"observations[{index}].model_ref")
+        skill_binding = _normalize_skill_binding(
+            observation.get("skill_binding"),
+            f"observations[{index}].skill_binding",
+        )
+        if skill_binding["skill_binding_digest"] != binding_digest:
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID",
+                "observation skill binding digest does not match skill_binding",
+            )
+        outcome = _required_text(observation.get("outcome"), f"observations[{index}].outcome").upper()
+        validation_state = _required_text(
+            observation.get("validation_state"),
+            f"observations[{index}].validation_state",
+        ).upper()
+        if outcome not in {"SUCCEEDED", "FAILED", "UNKNOWN"} or validation_state not in {
+            "PASS",
+            "FAIL",
+            "NOT_RUN",
+            "UNKNOWN",
+        }:
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID", "observation outcome or validation_state is invalid"
+            )
+        metrics = _required_mapping(observation.get("metrics"), f"observations[{index}].metrics")
+        if not set(metrics).issubset(
+            {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
+        ) or not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value >= 0
+            for value in metrics.values()
+        ):
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID", "observation metrics are invalid"
+            )
+        observations.append(
+            {
+                "observation_digest": observation_digest,
+                "skill_binding_digest": binding_digest,
+                "skill": {
+                    "skill_id": skill_binding["skill_id"],
+                    "skill_version": skill_binding["skill_version"],
+                    "operation_class": skill_binding["operation_class"],
+                    "context_pack_digest": skill_binding["context_pack_digest"],
+                },
+                "model_ref": model_ref,
+                "outcome": outcome,
+                "validation_state": validation_state,
+                "evidence_refs": _source_refs(observation.get("evidence_refs")),
+                "metrics": dict(sorted(metrics.items())),
+            }
+        )
+        seen_digests.add(observation_digest)
+    payload = {
+        "schema": "ai-career.skill-observation-candidate.v1",
+        "project_ref": _required_text(request.get("project_ref"), "project_ref"),
+        "task_frame_ref": _required_text(request.get("task_frame_ref"), "task_frame_ref"),
+        "source_ref": _required_text(request.get("source_ref"), "source_ref"),
+        "observations": sorted(observations, key=lambda item: item["observation_digest"]),
+        "observed_at": _timestamp(request.get("observed_at"), "observed_at"),
+        "target_ref": _optional_text(request.get("target_ref"), "target_ref"),
+        "redaction_state": "REDACTED",
+    }
+    return {
+        "status": "PREPARED",
+        "command": "SKILL_OBSERVATION",
+        "candidate_id": _stable_id("skill-observation", payload),
+        "durability": "UNKNOWN",
+        "persistence_state": "PASSIVE",
+        "execution_host_required": False,
+        "candidate": payload,
+    }
+
+
+def _normalize_skill_binding(value: Any, context: str) -> dict[str, str]:
+    binding = _required_mapping(value, context)
+    required_fields = {
+        "skill_id",
+        "skill_version",
+        "skill_ref",
+        "context_pack_digest",
+        "operation_class",
+        "skill_binding_digest",
+    }
+    _exact_fields(binding, required_fields, context)
+    canonical = {
+        "skill_id": _required_text(binding.get("skill_id"), f"{context}.skill_id"),
+        "skill_version": _required_text(
+            binding.get("skill_version"), f"{context}.skill_version"
+        ),
+        "skill_ref": _required_text(binding.get("skill_ref"), f"{context}.skill_ref"),
+        "context_pack_digest": _required_text(
+            binding.get("context_pack_digest"), f"{context}.context_pack_digest"
+        ),
+        "operation_class": _required_text(
+            binding.get("operation_class"), f"{context}.operation_class"
+        ).upper(),
+    }
+    if (
+        SHA256_PATTERN.fullmatch(canonical["context_pack_digest"]) is None
+        or canonical["operation_class"] not in {"READ", "PROPOSE", "EXECUTE"}
+    ):
+        raise ContinuityCommandError(
+            "CONTINUITY_REQUEST_INVALID", f"{context} is invalid"
+        )
+    expected_digest = _sha256(
+        json.dumps(
+            canonical, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    )
+    binding_digest = _required_text(
+        binding.get("skill_binding_digest"), f"{context}.skill_binding_digest"
+    )
+    if binding_digest != expected_digest:
+        raise ContinuityCommandError(
+            "CONTINUITY_REQUEST_INVALID", f"{context}.skill_binding_digest is invalid"
+        )
+    return {**canonical, "skill_binding_digest": binding_digest}
 
 
 def _normalize_resume_candidate(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -830,6 +1231,27 @@ def _validate_policy(policy: Mapping[str, Any]) -> None:
         "resume-save.prepare": {
             "canonical_command": "RESUME_SAVE",
             "content_selection": "CALLER_SELECTED",
+            "durable_write": "FORBIDDEN",
+            "activation": "FORBIDDEN",
+            "result_status": "PREPARED",
+        },
+        "memory-sync.node-prepare": {
+            "canonical_command": "MEMORY_SYNC",
+            "content_selection": "USER_CONFIRMED_NODE_ATTACHMENT",
+            "durable_write": "FORBIDDEN",
+            "activation": "FORBIDDEN",
+            "result_status": "PREPARED",
+        },
+        "carrier-intake.prepare": {
+            "canonical_command": "CARRIER_INTAKE",
+            "content_selection": "UNIVERSE_CAREER_PROMOTION_QUEUE",
+            "durable_write": "FORBIDDEN",
+            "activation": "FORBIDDEN",
+            "result_status": "PREPARED",
+        },
+        "skill-observation.prepare": {
+            "canonical_command": "SKILL_OBSERVATION",
+            "content_selection": "TASK_FRAME_RESULT_PACKET",
             "durable_write": "FORBIDDEN",
             "activation": "FORBIDDEN",
             "result_status": "PREPARED",

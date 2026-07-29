@@ -68,7 +68,7 @@ CANONICAL_GROUP_CONTRACTS = {
         "root": ".ai/skills/common",
         "selection_kind": "basename",
         "selection_value": "SKILL.md",
-        "expected_files": 18,
+        "expected_files": 20,
     },
     "adapter": {
         "root": ".ai/adapters/codex",
@@ -1903,6 +1903,10 @@ def _render_generated_surface(
             `RUNTIME STATUS` follows `.ai/skills/common/runtime-status/SKILL.md`.
             `CHECKPOINT` follows `.ai/skills/common/checkpoint/SKILL.md`.
             `MEMORY SYNC` follows `.ai/skills/common/memory-sync/SKILL.md`.
+            `SKILL OBSERVATION` follows
+            `.ai/skills/common/skill-observation/SKILL.md`.
+            `UNIVERSE SEED` follows
+            `.ai/skills/common/universe-project-seed/SKILL.md`.
             `RESUME` follows `.ai/skills/common/resume-restore/SKILL.md`.
             `RESUME SAVE` follows `.ai/skills/common/resume-save/SKILL.md`.
             `CONVERSATION RECALL` follows

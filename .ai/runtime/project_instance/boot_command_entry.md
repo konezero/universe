@@ -57,6 +57,10 @@ Runtime Image documents remain observed references.
 `RUNTIME STATUS` follows `.ai/skills/common/runtime-status/SKILL.md`.
 `CHECKPOINT` follows `.ai/skills/common/checkpoint/SKILL.md`.
 `MEMORY SYNC` follows `.ai/skills/common/memory-sync/SKILL.md`.
+`SKILL OBSERVATION` follows
+`.ai/skills/common/skill-observation/SKILL.md`.
+`UNIVERSE SEED` follows
+`.ai/skills/common/universe-project-seed/SKILL.md`.
 `RESUME` follows `.ai/skills/common/resume-restore/SKILL.md`.
 `RESUME SAVE` follows `.ai/skills/common/resume-save/SKILL.md`.
 `CONVERSATION RECALL` follows

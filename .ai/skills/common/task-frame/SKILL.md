@@ -107,7 +107,8 @@ python .ai/runtime/reference_runtime/cli.py task-frame continue \
 
 The durable journal records a dispatch-time copy of Parent coordinates,
 purpose, raw instruction, constraints, expected output, repository boundary,
-Boss allocation, and returned Worker envelopes. It is not the Mode Current
+Boss allocation, project-owned Skill bindings, bounded Skill-run observations,
+and returned Worker envelopes. It is not the Mode Current
 Anchor and must not be used to refresh or infer that Anchor's currentness. The
 default without `--database` remains disposable `:memory:` behavior.
 
@@ -131,6 +132,29 @@ The Host must follow
 `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md`, claim the turn,
 transport one bounded Worker result, and submit it unchanged through the
 ledger. Missing Host capability evidence leaves `worker_invocation: UNKNOWN`.
+
+When a Boss allocation declares project-owned `skill_bindings`, the Worker may
+use only those bindings. Its returned envelope records one bounded
+`skill_run_observation` for each completed binding. The ledger validates the
+Runtime-computed binding digest and preserves the observation; it does not
+resolve a Skill catalog, choose a model, rank a Skill, or publish to Universe.
+See `docs/TASK_FRAME_SKILL_OBSERVATION_CONTRACT_CANDIDATE.md` for the candidate
+consumer boundary.
+
+After a completed Result Packet has been reviewed, a project may prepare a
+redacted export candidate from its returned `skill_run_observations`:
+
+```text
+Task Frame Result Packet
+  -> skill-observation prepare
+  -> PREPARED passive candidate
+  -> optional project-owned HANDOFF_APPEND
+```
+
+`skill-observation prepare` does not write the project, local continuity
+store, or Universe. A later provider append requires its own approved
+Runtime-owned archive path and provider-native handoff receipt. The Task Frame
+remains complete whether that later export is performed or not.
 
 Parent adoption remains a reasoning decision only. If an adopted Result Packet
 would mutate a repository, file, database, API, Git remote, or external system,

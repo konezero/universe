@@ -1,6 +1,6 @@
 ---
 name: memory-sync
-description: Package only user-selected memory candidates without making memory active or durable.
+description: Prepare user-selected memory notes without creating candidates, authority, or publication.
 ---
 
 # Memory Sync
@@ -11,38 +11,62 @@ Preparation capability: `memory-sync.prepare = AVAILABLE`
 
 Durable handoff capability: `HOST_DEPENDENT`
 
-The reasoning layer may extract candidates, but the user selects what is
-eligible for packaging. Invoke `memory-sync prepare` only with that explicit
-selection and its source references.
+The reasoning layer may identify notes worth preserving, but the user selects
+what is eligible for memory packaging. A selected memory note is not a
+Candidate. Invoke `memory-sync prepare` only with that explicit selection and
+its source references.
 
 ```text
 Conversation
-  -> candidate extraction
-  -> user selection
+  -> optional note identification
+  -> user-selected memory note
   -> memory-sync prepare
   -> PREPARED passive artifact
   -> HANDOFF_APPEND when an approved provider writer is available
 ```
 
-Do not save every conversation, choose candidates for the user, infer a
+```text
+MEMORY_SYNC != Candidate creation != Queue publication
+```
+
+Do not save every conversation, choose Candidates for the user, infer a
 storage provider, or let stored memory override the Current Anchor. Provider
 evidence is required before reporting durable completion. Memory persistence is
 an Execution Guard exception only within declared Runtime memory/inbox paths;
 source or project-owned changes still use the normal guard.
+
+## Node-Scoped Project Memory
+
+When a Project has a published Universe Seed, a selected memory note may carry
+a `node_ref` for one functional or implementation node. Append it only under
+the Project-local path defined by:
+
+```text
+.ai/templates/universe_node_memory/README.md
+```
+
+The node reference improves later recall. It does not modify the Seed graph,
+create a Universe connection, publish to a queue, or promote the note.
+
+Use `memory-sync node-prepare` for this form. It returns one passive
+`ai-career.universe-node-memory.v1` candidate and its exact target under
+`.ai/memory/universe_nodes/`; a separately approved provider
+`HANDOFF_APPEND` is still required to append the record.
 
 ## Handoff Append
 
 `HANDOFF_APPEND` is distinct from `SOURCE_MUTATION`.
 
 It may persist only a selected append-only handoff artifact under a declared
-Runtime-owned path, for example `.ai/memory/inbox/`, `.ai/queue/`, or an
-Archive evidence path. A source-only mobile or web Host may perform it when all
+Runtime-owned path, for example `.ai/memory/inbox/`,
+`.ai/memory/universe_nodes/`, `.ai/queue/`, or an Archive evidence path. A
+source-only mobile or web Host may perform it when all
 of the following are true:
 
 ```text
 provider write capability: AVAILABLE
 exact Runtime-owned append path: approved
-candidate selection or user approval: recorded
+memory selection or user approval: recorded
 provider write result: returned
 ```
 
@@ -54,7 +78,7 @@ schema: ai-career.handoff-append-evidence.v1
 operation_class: HANDOFF_APPEND
 provider: <github|drive|other>
 target_path: <runtime-owned-append-path>
-selection_ref: <approved-candidate-or-user-selection>
+selection_ref: <approved-memory-note-or-user-selection>
 base_source_ref: <immutable-source-or-parent-ref>
 result_ref: <commit|blob|pr|provider-object>
 provider_receipt_ref: <provider-evidence-or-UNKNOWN>

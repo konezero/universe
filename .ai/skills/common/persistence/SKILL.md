@@ -12,7 +12,7 @@ Host storage action: `HOST_DEPENDENT`
 Capability classification: `checkpoint_resume_archive = HOST_DEPENDENT`
 
 This Skill routes `SNAPSHOT_SAVE`, `CHECKPOINT`, `RESUME_SAVE`, `ARCHIVE_SAVE`,
-and `MEMORY_SYNC`. Checkpoint and Resume records use the installed
+`MEMORY_SYNC`, and prepared `SKILL_OBSERVATION` exports. Checkpoint and Resume records use the installed
 project-local continuity store. Archive and Memory routes remain capability
 dependent. This Skill does not select durable content, activate restored state,
 or create authority.
@@ -35,6 +35,13 @@ this Skill.
 Without a bound Execution Host and project filesystem access, local Checkpoint
 and Resume operations are unavailable. A mobile or web Connector with an
 approved Provider writer may continue only through `HANDOFF_APPEND`.
+
+`SKILL_OBSERVATION` begins with a Task Frame Result Packet, not arbitrary
+conversation content. `skill-observation prepare` validates and returns a
+redacted `PREPARED` candidate only. It does not create a local database record
+or publish to Universe. A project may later append that candidate to an
+approved Runtime-owned archive path through `HANDOFF_APPEND`; provider-native
+evidence is required before reporting that export as durable.
 
 Checkpoint, snapshot, memory sync, runtime-owned Inbox/Queue updates,
 `RESUME_SAVE`, and selected `RESUME` restore use the declared Runtime-owned

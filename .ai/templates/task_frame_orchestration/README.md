@@ -137,6 +137,13 @@ does not adopt results;
 does not create authority, currentness, write scope, or a next task.
 ```
 
+When a project binds a project-owned Skill to a Worker allocation, the Worker
+also returns one bounded Skill-run observation per declared binding. The Task
+Frame journal preserves those observations with the Result Packet. A project
+may later prepare a redacted export candidate through
+`.ai/skills/common/skill-observation/SKILL.md`; that preparation and any
+provider handoff are separate from Task Frame completion and Parent adoption.
+
 ## Result Packet
 
 ```yaml

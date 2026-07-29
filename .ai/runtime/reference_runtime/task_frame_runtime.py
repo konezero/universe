@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS boss_allocations (
     task_text TEXT NOT NULL,
     expected_output_json TEXT NOT NULL,
     mutation_scope_json TEXT NOT NULL,
+    skill_bindings_json TEXT NOT NULL DEFAULT '[]',
     allocation_digest TEXT NOT NULL UNIQUE,
     recorded_at TEXT NOT NULL
 );
@@ -148,18 +149,23 @@ CREATE TABLE IF NOT EXISTS worker_execution_state (
     invoker_actor_ref TEXT NOT NULL DEFAULT '',
     worker_path TEXT NOT NULL DEFAULT '',
     worker_actor_ref TEXT NOT NULL DEFAULT '',
-    host_invocation_receipt_ref TEXT NOT NULL DEFAULT '',
+    worker_run_ref TEXT NOT NULL DEFAULT '',
     worker_result_digest TEXT NOT NULL DEFAULT '',
-    host_result_evidence_ref TEXT NOT NULL DEFAULT '',
+    result_receipt_ref TEXT NOT NULL DEFAULT '',
     worker_result_envelope_json TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS skill_run_observations (
+    observation_digest TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL,
+    skill_binding_digest TEXT NOT NULL,
+    observation_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(turn_id, skill_binding_digest)
 );
 
 CREATE INDEX IF NOT EXISTS task_turns_state_lookup
 ON task_turns(state, turn_ordinal);
-
-CREATE UNIQUE INDEX IF NOT EXISTS worker_invocation_receipt_unique
-ON worker_execution_state(host_invocation_receipt_ref)
-WHERE host_invocation_receipt_ref <> '';
 """
 
 
@@ -903,8 +909,10 @@ class TaskFrameRuntime:
         if self.storage_kind == "FILE":
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._ensure_worker_execution_state_schema()
         self._ensure_profile_path_column(profile.profile_path)
         self._ensure_instruction_boundary_columns()
+        self._ensure_boss_skill_bindings_column()
 
         timestamp = self._normalize_timestamp(observed_at)
         if not timestamp:
@@ -928,8 +936,9 @@ class TaskFrameRuntime:
         self.worker_invocation_plans: dict[str, dict[str, str]] = {}
         self.worker_claim_evidence: dict[str, dict[str, str]] = {}
         self.worker_result_envelopes: dict[str, dict[str, Any]] = {}
+        self.worker_skill_run_observations: dict[str, list[dict[str, Any]]] = {}
         self.worker_slot_actors: dict[str, str] = {}
-        self.worker_invocation_receipts: set[str] = set()
+        self.worker_run_refs: set[str] = set()
 
         existing_context = self._context_or_none()
         if existing_context is not None:
@@ -1086,8 +1095,10 @@ class TaskFrameRuntime:
         instance.conn.row_factory = sqlite3.Row
         instance.conn.execute("PRAGMA journal_mode=WAL")
         instance.conn.executescript(SCHEMA)
+        instance._ensure_worker_execution_state_schema()
         instance._ensure_profile_path_column(profile.profile_path)
         instance._ensure_instruction_boundary_columns()
+        instance._ensure_boss_skill_bindings_column()
         context = instance._context_or_none()
         if context is None:
             instance.close()
@@ -1107,8 +1118,9 @@ class TaskFrameRuntime:
         instance.worker_invocation_plans = {}
         instance.worker_claim_evidence = {}
         instance.worker_result_envelopes = {}
+        instance.worker_skill_run_observations = {}
         instance.worker_slot_actors = {}
-        instance.worker_invocation_receipts = set()
+        instance.worker_run_refs = set()
         instance._hydrate_worker_execution_state()
         return instance
 
@@ -1190,6 +1202,117 @@ class TaskFrameRuntime:
                 "ADD COLUMN mutation_scope_json TEXT NOT NULL "
                 "DEFAULT '{\"operations\":[],\"targets\":[]}'"
             )
+
+    def _ensure_boss_skill_bindings_column(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute(
+                "PRAGMA table_info(boss_allocations)"
+            ).fetchall()
+        }
+        if "skill_bindings_json" not in columns:
+            self.conn.execute(
+                "ALTER TABLE boss_allocations "
+                "ADD COLUMN skill_bindings_json TEXT NOT NULL DEFAULT '[]'"
+            )
+
+    def _ensure_worker_execution_state_schema(self) -> None:
+        """Migrate legacy dual-receipt rows without discarding their evidence."""
+
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute(
+                "PRAGMA table_info(worker_execution_state)"
+            ).fetchall()
+        }
+        required = {
+            "turn_id",
+            "worker_slot_ref",
+            "capability_evidence_ref",
+            "invoker_actor_ref",
+            "worker_path",
+            "worker_actor_ref",
+            "worker_run_ref",
+            "worker_result_digest",
+            "result_receipt_ref",
+            "worker_result_envelope_json",
+        }
+        if required.issubset(columns):
+            self.conn.execute("DROP INDEX IF EXISTS worker_invocation_receipt_unique")
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS worker_run_ref_unique
+                ON worker_execution_state(worker_run_ref)
+                WHERE worker_run_ref <> ''
+                """
+            )
+            return
+
+        def existing_column(*names: str) -> str:
+            for name in names:
+                if name in columns:
+                    return name
+            return "''"
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute("DROP INDEX IF EXISTS worker_invocation_receipt_unique")
+            self.conn.execute("DROP INDEX IF EXISTS worker_run_ref_unique")
+            self.conn.execute(
+                "ALTER TABLE worker_execution_state "
+                "RENAME TO worker_execution_state_legacy"
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE worker_execution_state (
+                    turn_id TEXT PRIMARY KEY,
+                    worker_slot_ref TEXT NOT NULL DEFAULT '',
+                    capability_evidence_ref TEXT NOT NULL DEFAULT '',
+                    invoker_actor_ref TEXT NOT NULL DEFAULT '',
+                    worker_path TEXT NOT NULL DEFAULT '',
+                    worker_actor_ref TEXT NOT NULL DEFAULT '',
+                    worker_run_ref TEXT NOT NULL DEFAULT '',
+                    worker_result_digest TEXT NOT NULL DEFAULT '',
+                    result_receipt_ref TEXT NOT NULL DEFAULT '',
+                    worker_result_envelope_json TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            self.conn.execute(
+                f"""
+                INSERT INTO worker_execution_state(
+                    turn_id, worker_slot_ref, capability_evidence_ref,
+                    invoker_actor_ref, worker_path, worker_actor_ref,
+                    worker_run_ref, worker_result_digest,
+                    result_receipt_ref, worker_result_envelope_json
+                )
+                SELECT
+                    {existing_column('turn_id')},
+                    {existing_column('worker_slot_ref')},
+                    {existing_column('capability_evidence_ref')},
+                    {existing_column('invoker_actor_ref')},
+                    {existing_column('worker_path')},
+                    {existing_column('worker_actor_ref')},
+                    {existing_column('worker_run_ref', 'host_invocation_receipt_ref')},
+                    {existing_column('worker_result_digest')},
+                    {existing_column('result_receipt_ref', 'host_result_evidence_ref')},
+                    {existing_column('worker_result_envelope_json')}
+                FROM worker_execution_state_legacy
+                """
+            )
+            self.conn.execute("DROP TABLE worker_execution_state_legacy")
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX worker_run_ref_unique
+                ON worker_execution_state(worker_run_ref)
+                WHERE worker_run_ref <> ''
+                """
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
 
     def _load_context_coordinates(self, context: sqlite3.Row) -> None:
         expected = {
@@ -1348,8 +1471,8 @@ class TaskFrameRuntime:
             """
             SELECT turn_id, worker_slot_ref, capability_evidence_ref,
                    invoker_actor_ref, worker_path, worker_actor_ref,
-                   host_invocation_receipt_ref, worker_result_digest,
-                   host_result_evidence_ref, worker_result_envelope_json
+                   worker_run_ref, worker_result_digest,
+                   result_receipt_ref, worker_result_envelope_json
             FROM worker_execution_state
             """
         ).fetchall()
@@ -1366,23 +1489,66 @@ class TaskFrameRuntime:
                 claim = {
                     "worker_actor_ref": str(row["worker_actor_ref"]),
                     "worker_slot_ref": str(row["worker_slot_ref"]),
-                    "host_invocation_receipt_ref": str(row["host_invocation_receipt_ref"]),
+                    "worker_run_ref": str(row["worker_run_ref"]),
                     "capability_evidence_ref": str(row["capability_evidence_ref"]),
                     "invoker_actor_ref": str(row["invoker_actor_ref"]),
                     "worker_path": str(row["worker_path"]),
                 }
                 if str(row["worker_result_digest"]):
                     claim["worker_result_digest"] = str(row["worker_result_digest"])
-                    claim["host_result_evidence_ref"] = str(row["host_result_evidence_ref"])
+                    claim["result_receipt_ref"] = str(row["result_receipt_ref"])
                 self.worker_claim_evidence[turn_id] = claim
                 self.worker_slot_actors[claim["worker_slot_ref"]] = claim["worker_actor_ref"]
-                self.worker_invocation_receipts.add(claim["host_invocation_receipt_ref"])
+                self.worker_run_refs.add(claim["worker_run_ref"])
             if str(row["worker_result_envelope_json"]):
                 self.worker_result_envelopes[turn_id] = {
                     "worker_result_digest": str(row["worker_result_digest"]),
-                    "host_result_evidence_ref": str(row["host_result_evidence_ref"]),
+                    "result_receipt_ref": str(row["result_receipt_ref"]),
                     "envelope": json.loads(str(row["worker_result_envelope_json"])),
                 }
+        observation_rows = self.conn.execute(
+            """
+            SELECT turn_id, observation_json
+            FROM skill_run_observations
+            ORDER BY turn_id, skill_binding_digest
+            """
+        ).fetchall()
+        for row in observation_rows:
+            turn_id = str(row["turn_id"])
+            self.worker_skill_run_observations.setdefault(turn_id, []).append(
+                json.loads(str(row["observation_json"]))
+            )
+
+    def _record_skill_run_observations(
+        self,
+        *,
+        turn_id: str,
+        observations: list[dict[str, Any]],
+        observed_at: str,
+    ) -> None:
+        for observation in observations:
+            encoded = json.dumps(
+                observation,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            self.conn.execute(
+                """
+                INSERT INTO skill_run_observations(
+                    observation_digest, turn_id, skill_binding_digest,
+                    observation_json, recorded_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    observation["observation_digest"],
+                    turn_id,
+                    observation["skill_binding_digest"],
+                    encoded,
+                    observed_at,
+                ),
+            )
+        self.worker_skill_run_observations[turn_id] = observations
 
     def _persist_worker_execution_state(self, turn_id: str) -> None:
         plan = self.worker_invocation_plans.get(turn_id, {})
@@ -1393,8 +1559,8 @@ class TaskFrameRuntime:
             INSERT INTO worker_execution_state(
                 turn_id, worker_slot_ref, capability_evidence_ref,
                 invoker_actor_ref, worker_path, worker_actor_ref,
-                host_invocation_receipt_ref, worker_result_digest,
-                host_result_evidence_ref, worker_result_envelope_json
+                worker_run_ref, worker_result_digest,
+                result_receipt_ref, worker_result_envelope_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(turn_id) DO UPDATE SET
                 worker_slot_ref = excluded.worker_slot_ref,
@@ -1402,9 +1568,9 @@ class TaskFrameRuntime:
                 invoker_actor_ref = excluded.invoker_actor_ref,
                 worker_path = excluded.worker_path,
                 worker_actor_ref = excluded.worker_actor_ref,
-                host_invocation_receipt_ref = excluded.host_invocation_receipt_ref,
+                worker_run_ref = excluded.worker_run_ref,
                 worker_result_digest = excluded.worker_result_digest,
-                host_result_evidence_ref = excluded.host_result_evidence_ref,
+                result_receipt_ref = excluded.result_receipt_ref,
                 worker_result_envelope_json = excluded.worker_result_envelope_json
             """,
             (
@@ -1414,9 +1580,9 @@ class TaskFrameRuntime:
                 str(claim.get("invoker_actor_ref", plan.get("invoker_actor_ref", ""))),
                 str(claim.get("worker_path", plan.get("worker_path", ""))),
                 str(claim.get("worker_actor_ref", "")),
-                str(claim.get("host_invocation_receipt_ref", "")),
+                str(claim.get("worker_run_ref", "")),
                 str(claim.get("worker_result_digest", envelope.get("worker_result_digest", ""))),
-                str(claim.get("host_result_evidence_ref", envelope.get("host_result_evidence_ref", ""))),
+                str(claim.get("result_receipt_ref", envelope.get("result_receipt_ref", ""))),
                 json.dumps(
                     envelope.get("envelope"),
                     ensure_ascii=True,
@@ -1777,7 +1943,7 @@ class TaskFrameRuntime:
         *,
         turn_id: str,
         worker_id: str,
-        host_invocation_receipt_ref: str = "",
+        worker_run_ref: str = "",
         capability_evidence_ref: str = "",
         invoker_actor_ref: str = "",
         observed_at: str,
@@ -1810,20 +1976,20 @@ class TaskFrameRuntime:
             planned = self.worker_invocation_plans.get(normalized_turn_id)
             if planned is None:
                 return {"status": "WORKER_INVOCATION_PLAN_REQUIRED"}
-            normalized_receipt_ref = host_invocation_receipt_ref.strip()
+            normalized_run_ref = worker_run_ref.strip()
             normalized_capability_ref = capability_evidence_ref.strip()
             normalized_invoker_ref = invoker_actor_ref.strip()
             if (
-                not normalized_receipt_ref
-                or normalized_receipt_ref.upper() == "UNKNOWN"
+                not normalized_run_ref
+                or normalized_run_ref.upper() == "UNKNOWN"
             ):
-                return {"status": "WORKER_INVOCATION_RECEIPT_REQUIRED"}
+                return {"status": "WORKER_RUN_REF_REQUIRED"}
             if normalized_capability_ref != planned["capability_evidence_ref"]:
                 return {"status": "WORKER_CAPABILITY_EVIDENCE_MISMATCH"}
             if normalized_invoker_ref != planned["invoker_actor_ref"]:
                 return {"status": "WORKER_INVOKER_ACTOR_MISMATCH"}
-            if normalized_receipt_ref in self.worker_invocation_receipts:
-                return {"status": "WORKER_INVOCATION_RECEIPT_REUSED"}
+            if normalized_run_ref in self.worker_run_refs:
+                return {"status": "WORKER_RUN_REF_REUSED"}
             worker_slot_ref = planned["worker_slot_ref"]
             bound_actor = self.worker_slot_actors.get(worker_slot_ref)
             if bound_actor is not None and bound_actor != normalized_worker_id:
@@ -1873,7 +2039,7 @@ class TaskFrameRuntime:
             if self.execution_gate is not None:
                 claim_details.update(
                     {
-                        "host_invocation_receipt_ref": host_invocation_receipt_ref.strip(),
+                        "worker_run_ref": worker_run_ref.strip(),
                         "capability_evidence_ref": capability_evidence_ref.strip(),
                         "invoker_actor_ref": invoker_actor_ref.strip(),
                         "worker_path": planned["worker_path"],
@@ -1890,11 +2056,11 @@ class TaskFrameRuntime:
                     "worker_slot_ref"
                 ]
                 self.worker_slot_actors.setdefault(worker_slot_ref, normalized_worker_id)
-                self.worker_invocation_receipts.add(host_invocation_receipt_ref.strip())
+                self.worker_run_refs.add(worker_run_ref.strip())
                 self.worker_claim_evidence[normalized_turn_id] = {
                     "worker_actor_ref": normalized_worker_id,
                     "worker_slot_ref": worker_slot_ref,
-                    "host_invocation_receipt_ref": host_invocation_receipt_ref.strip(),
+                    "worker_run_ref": worker_run_ref.strip(),
                     "capability_evidence_ref": capability_evidence_ref.strip(),
                     "invoker_actor_ref": invoker_actor_ref.strip(),
                     "worker_path": self.worker_invocation_plans[normalized_turn_id][
@@ -1919,7 +2085,7 @@ class TaskFrameRuntime:
         evidence_refs: Iterable[str],
         observed_at: str,
         review_decision: str = "",
-        host_invocation_receipt_ref: str = "",
+        worker_run_ref: str = "",
         _worker_envelope_digest: str = "",
     ) -> dict[str, Any]:
         timestamp = self._normalize_timestamp(observed_at)
@@ -1936,14 +2102,14 @@ class TaskFrameRuntime:
                 return {"status": "WORKER_RESULT_ENVELOPE_REQUIRED"}
             claim_evidence = self.worker_claim_evidence.get(normalized_turn_id)
             if claim_evidence is None:
-                return {"status": "WORKER_INVOCATION_RECEIPT_REQUIRED"}
+                return {"status": "WORKER_RUN_REF_REQUIRED"}
             if claim_evidence["worker_actor_ref"] != normalized_worker_id:
                 return {"status": "WORKER_ACTOR_MISMATCH"}
             if (
-                claim_evidence["host_invocation_receipt_ref"]
-                != host_invocation_receipt_ref.strip()
+                claim_evidence["worker_run_ref"]
+                != worker_run_ref.strip()
             ):
-                return {"status": "WORKER_INVOCATION_RECEIPT_MISMATCH"}
+                return {"status": "WORKER_RUN_REF_MISMATCH"}
             envelope = self.worker_result_envelopes.get(normalized_turn_id)
             if envelope is None:
                 return {"status": "WORKER_RESULT_ENVELOPE_REQUIRED"}
@@ -2059,7 +2225,7 @@ class TaskFrameRuntime:
         *,
         boss_turn_id: str,
         boss_worker_id: str,
-        host_invocation_receipt_ref: str,
+        worker_run_ref: str,
         instruction_digests: Iterable[str],
         worker_allocations: Iterable[Mapping[str, Any]],
         observed_at: str,
@@ -2069,7 +2235,7 @@ class TaskFrameRuntime:
         timestamp = self._normalize_timestamp(observed_at)
         normalized_turn_id = boss_turn_id.strip()
         normalized_worker_id = boss_worker_id.strip()
-        normalized_receipt_ref = host_invocation_receipt_ref.strip()
+        normalized_run_ref = worker_run_ref.strip()
         if not timestamp:
             return {"status": "OBSERVED_AT_INVALID"}
         turn = self.turn_snapshot(normalized_turn_id)
@@ -2081,9 +2247,9 @@ class TaskFrameRuntime:
             return {"status": "BOSS_TURN_NOT_CLAIMED", "turn": turn}
         claim_evidence = self.worker_claim_evidence.get(normalized_turn_id)
         if claim_evidence is None:
-            return {"status": "WORKER_INVOCATION_RECEIPT_REQUIRED"}
-        if claim_evidence["host_invocation_receipt_ref"] != normalized_receipt_ref:
-            return {"status": "WORKER_INVOCATION_RECEIPT_MISMATCH"}
+            return {"status": "WORKER_RUN_REF_REQUIRED"}
+        if claim_evidence["worker_run_ref"] != normalized_run_ref:
+            return {"status": "WORKER_RUN_REF_MISMATCH"}
         normalized_digests = [str(item).strip() for item in instruction_digests]
         normalized_allocations = list(worker_allocations)
         return self._record_boss_allocations(
@@ -2099,7 +2265,7 @@ class TaskFrameRuntime:
         *,
         boss_turn_id: str,
         boss_worker_id: str,
-        host_invocation_receipt_ref: str,
+        worker_run_ref: str,
     ) -> dict[str, Any]:
         """Return recorded child results only to the still-claimed Boss."""
 
@@ -2116,10 +2282,10 @@ class TaskFrameRuntime:
         claim_evidence = self.worker_claim_evidence.get(turn["turn_id"])
         if (
             claim_evidence is None
-            or claim_evidence["host_invocation_receipt_ref"]
-            != host_invocation_receipt_ref.strip()
+            or claim_evidence["worker_run_ref"]
+            != worker_run_ref.strip()
         ):
-            return {"status": "WORKER_INVOCATION_RECEIPT_MISMATCH"}
+            return {"status": "WORKER_RUN_REF_MISMATCH"}
         completion = self._boss_completion_status(turn["turn_id"])
         if completion["status"] != "BOSS_COMPLETION_READY":
             return completion
@@ -2146,7 +2312,6 @@ class TaskFrameRuntime:
         self,
         *,
         envelope: Mapping[str, Any],
-        host_result_evidence_ref: str,
         observed_at: str,
     ) -> dict[str, Any]:
         """Bind and preserve one Host-captured Worker envelope unchanged."""
@@ -2159,27 +2324,32 @@ class TaskFrameRuntime:
         expected = {
             "turn_id",
             "worker_id",
-            "host_invocation_receipt_ref",
+            "worker_run_ref",
             "status",
             "evidence_refs",
             "result",
             "review_decision",
         }
-        if set(envelope) != expected:
+        if not expected.issubset(envelope) or not set(envelope).issubset(
+            expected | {"result_receipt_ref", "skill_run_observations"}
+        ):
             return {"status": "WORKER_RESULT_ENVELOPE_INVALID"}
         turn_id = str(envelope.get("turn_id", "")).strip()
         worker_id = str(envelope.get("worker_id", "")).strip()
-        receipt_ref = str(envelope.get("host_invocation_receipt_ref", "")).strip()
+        worker_run_ref = str(envelope.get("worker_run_ref", "")).strip()
+        result_receipt_ref = str(envelope.get("result_receipt_ref", "")).strip()
         result_status = str(envelope.get("status", "")).strip().upper()
         evidence_refs = envelope.get("evidence_refs")
         result = envelope.get("result")
+        raw_skill_run_observations = envelope.get("skill_run_observations")
         raw_review_decision = envelope.get("review_decision", "")
         if not isinstance(raw_review_decision, str):
             return {"status": "WORKER_RESULT_ENVELOPE_INVALID"}
         review_decision = raw_review_decision
-        normalized_host_evidence = host_result_evidence_ref.strip()
-        if not turn_id or not worker_id or not receipt_ref:
+        if not turn_id or not worker_id or not worker_run_ref:
             return {"status": "WORKER_RESULT_ENVELOPE_INVALID"}
+        if not result_receipt_ref or result_receipt_ref.upper() == "UNKNOWN":
+            return {"status": "RESULT_RECEIPT_REQUIRED"}
         if result_status not in {"COMPLETED", "FAILED", "UNKNOWN"}:
             return {"status": "WORKER_RESULT_STATUS_INVALID"}
         if not isinstance(evidence_refs, list) or not all(
@@ -2193,25 +2363,24 @@ class TaskFrameRuntime:
         normalized_evidence = self._normalize_evidence_refs(evidence_refs)
         if isinstance(normalized_evidence, str):
             return {"status": normalized_evidence}
-        if (
-            not normalized_host_evidence
-            or normalized_host_evidence.upper() == "UNKNOWN"
-        ):
-            return {"status": "HOST_WORKER_RESULT_EVIDENCE_REQUIRED"}
         if turn_id in self.worker_result_envelopes:
             previous = self.worker_result_envelopes[turn_id]
             try:
+                candidate_envelope = {
+                    "turn_id": turn_id,
+                    "worker_id": worker_id,
+                    "worker_run_ref": worker_run_ref,
+                    "result_receipt_ref": result_receipt_ref,
+                    "status": result_status,
+                    "evidence_refs": list(evidence_refs),
+                    "result": dict(result),
+                    "review_decision": review_decision,
+                }
+                if "skill_run_observations" in envelope:
+                    candidate_envelope["skill_run_observations"] = raw_skill_run_observations
                 candidate_digest = hashlib.sha256(
                     json.dumps(
-                        {
-                            "turn_id": turn_id,
-                            "worker_id": worker_id,
-                            "host_invocation_receipt_ref": receipt_ref,
-                            "status": result_status,
-                            "evidence_refs": list(evidence_refs),
-                            "result": dict(result),
-                            "review_decision": review_decision,
-                        },
+                        candidate_envelope,
                         ensure_ascii=True,
                         separators=(",", ":"),
                         sort_keys=True,
@@ -2233,16 +2402,23 @@ class TaskFrameRuntime:
             return {"status": "WORKER_RESULT_ENVELOPE_ALREADY_RECORDED"}
         claim_evidence = self.worker_claim_evidence.get(turn_id)
         if claim_evidence is None:
-            return {"status": "WORKER_INVOCATION_RECEIPT_REQUIRED"}
+            return {"status": "WORKER_RUN_REF_REQUIRED"}
         if claim_evidence["worker_actor_ref"] != worker_id:
             return {"status": "WORKER_ACTOR_MISMATCH"}
-        if claim_evidence["host_invocation_receipt_ref"] != receipt_ref:
-            return {"status": "WORKER_INVOCATION_RECEIPT_MISMATCH"}
+        if claim_evidence["worker_run_ref"] != worker_run_ref:
+            return {"status": "WORKER_RUN_REF_MISMATCH"}
         turn = self.turn_snapshot(turn_id)
         if turn is None:
             return {"status": "TURN_NOT_FOUND"}
         if turn["state"] != "CLAIMED" or turn["claimed_by"] != worker_id:
             return {"status": "TURN_NOT_CLAIMED_BY_WORKER", "turn": turn}
+        skill_observations = self._normalize_skill_run_observations(
+            raw_skill_run_observations,
+            allocation=self.allocation_snapshot(turn_id),
+            result_status=result_status,
+        )
+        if isinstance(skill_observations, str):
+            return {"status": skill_observations}
         decision = review_decision.strip().upper()
         has_routes = bool(
             turn["accept_turn_id"]
@@ -2267,12 +2443,19 @@ class TaskFrameRuntime:
         normalized_envelope = {
             "turn_id": turn_id,
             "worker_id": worker_id,
-            "host_invocation_receipt_ref": receipt_ref,
+            "worker_run_ref": worker_run_ref,
+            "result_receipt_ref": result_receipt_ref,
             "status": result_status,
             "evidence_refs": list(evidence_refs),
             "result": dict(result),
             "review_decision": review_decision,
         }
+        if "skill_run_observations" in envelope:
+            # Preserve Host-captured output verbatim; derived observation digests
+            # live in the ledger table and execution evidence instead.
+            normalized_envelope["skill_run_observations"] = list(
+                raw_skill_run_observations
+            )
         try:
             encoded = json.dumps(
                 normalized_envelope,
@@ -2288,22 +2471,28 @@ class TaskFrameRuntime:
         try:
             self.worker_result_envelopes[turn_id] = {
                 "worker_result_digest": digest,
-                "host_result_evidence_ref": normalized_host_evidence,
+                "result_receipt_ref": result_receipt_ref,
                 "envelope": preserved,
             }
             self.worker_claim_evidence.setdefault(turn_id, {}).update(
                 {
                     "worker_result_digest": digest,
-                    "host_result_evidence_ref": normalized_host_evidence,
+                    "result_receipt_ref": result_receipt_ref,
                 }
             )
             self._persist_worker_execution_state(turn_id)
+            self._record_skill_run_observations(
+                turn_id=turn_id,
+                observations=skill_observations,
+                observed_at=timestamp,
+            )
             self._append_journal(
                 "WORKER_RESULT_ENVELOPE_RECORDED",
                 turn_id,
                 {
                     "worker_result_digest": digest,
-                    "host_result_evidence_ref": normalized_host_evidence,
+                    "result_receipt_ref": result_receipt_ref,
+                    "skill_run_observation_count": len(skill_observations),
                 },
                 timestamp,
             )
@@ -2314,7 +2503,7 @@ class TaskFrameRuntime:
                 evidence_refs=preserved["evidence_refs"],
                 observed_at=timestamp,
                 review_decision=preserved["review_decision"],
-                host_invocation_receipt_ref=receipt_ref,
+                worker_run_ref=worker_run_ref,
                 _worker_envelope_digest=digest,
             )
             if not (
@@ -2329,12 +2518,13 @@ class TaskFrameRuntime:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
             self.worker_result_envelopes.pop(turn_id, None)
+            self.worker_skill_run_observations.pop(turn_id, None)
             self._hydrate_worker_execution_state()
             raise
         return {
             **completed,
             "worker_result_digest": digest,
-            "host_result_evidence_ref": normalized_host_evidence,
+            "result_receipt_ref": result_receipt_ref,
         }
 
     def input_bundle(self, *, turn_id: str) -> dict[str, Any]:
@@ -2437,10 +2627,18 @@ class TaskFrameRuntime:
             "adoption_state": "CANDIDATE",
         }
         if self.execution_gate is not None:
+            binding_index = self._skill_binding_index()
             packet["worker_result_envelopes"] = [
                 self.worker_result_envelopes[turn["turn_id"]]["envelope"]
                 for turn in final_turns
                 if turn["turn_id"] in self.worker_result_envelopes
+            ]
+            packet["skill_run_observations"] = [
+                observation
+                for turn in final_turns
+                for observation in self._skill_observations_with_bindings(
+                    turn["turn_id"], binding_index
+                )
             ]
         return {"status": "RESULT_PACKET_BUILT", "result_packet": packet}
 
@@ -2478,6 +2676,7 @@ class TaskFrameRuntime:
                 "database_path": self.database_path,
             }
         if self.execution_gate is not None:
+            binding_index = self._skill_binding_index()
             worker_invocations = []
             for turn in self.execution_gate["execution_plan"]["turns"]:
                 turn_id = turn["turn_id"]
@@ -2493,18 +2692,21 @@ class TaskFrameRuntime:
                         "invoker_actor_ref": planned.get("invoker_actor_ref"),
                         "worker_path": planned.get("worker_path"),
                         "worker_actor_ref": claimed.get("worker_actor_ref"),
-                        "host_invocation_receipt_ref": claimed.get(
-                            "host_invocation_receipt_ref"
+                        "worker_run_ref": claimed.get(
+                            "worker_run_ref"
                         ),
                         "worker_result_digest": claimed.get(
                             "worker_result_digest"
                         ),
-                        "host_result_evidence_ref": claimed.get(
-                            "host_result_evidence_ref"
+                        "result_receipt_ref": claimed.get(
+                            "result_receipt_ref"
                         ),
                         "worker_result_envelope": self.worker_result_envelopes.get(
                             turn_id, {}
                         ).get("envelope"),
+                        "skill_run_observations": self._skill_observations_with_bindings(
+                            turn_id, binding_index
+                        ),
                     }
                 )
             evidence["execution_gate"] = {
@@ -2515,6 +2717,28 @@ class TaskFrameRuntime:
                 "worker_invocations": worker_invocations,
             }
         return evidence
+
+    def _skill_binding_index(self) -> dict[str, dict[str, str]]:
+        return {
+            str(binding["skill_binding_digest"]): dict(binding)
+            for allocation in self.allocations()
+            for binding in allocation["skill_bindings"]
+        }
+
+    def _skill_observations_with_bindings(
+        self,
+        turn_id: str,
+        binding_index: Mapping[str, Mapping[str, str]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                **observation,
+                "skill_binding": dict(
+                    binding_index[observation["skill_binding_digest"]]
+                ),
+            }
+            for observation in self.worker_skill_run_observations.get(turn_id, [])
+        ]
 
     def runtime_state(self) -> dict[str, Any]:
         """Return a disposable Task Frame-derived view, not an authority object."""
@@ -2638,7 +2862,7 @@ class TaskFrameRuntime:
             """
             SELECT instruction_digest, boss_turn_id, boss_worker_id, turn_id,
                    worker_slot_ref, worker_path, task_text, expected_output_json,
-                   mutation_scope_json, allocation_digest, recorded_at
+                   mutation_scope_json, skill_bindings_json, allocation_digest, recorded_at
             FROM boss_allocations WHERE turn_id = ?
             """,
             (turn_id.strip(),),
@@ -2650,7 +2874,7 @@ class TaskFrameRuntime:
             """
             SELECT instruction_digest, boss_turn_id, boss_worker_id, turn_id,
                    worker_slot_ref, worker_path, task_text, expected_output_json,
-                   mutation_scope_json, allocation_digest, recorded_at
+                   mutation_scope_json, skill_bindings_json, allocation_digest, recorded_at
             FROM boss_allocations ORDER BY allocation_ordinal
             """
         ).fetchall()
@@ -3071,7 +3295,9 @@ class TaskFrameRuntime:
             if (
                 not isinstance(allocation, Mapping)
                 or not required_fields.issubset(allocation)
-                or not set(allocation).issubset(required_fields | {"mutation_scope"})
+                or not set(allocation).issubset(
+                    required_fields | {"mutation_scope", "skill_bindings"}
+                )
             ):
                 return {"status": "BOSS_ALLOCATION_INVALID"}
             target_turn_id = str(allocation.get("turn_id", "")).strip()
@@ -3128,6 +3354,11 @@ class TaskFrameRuntime:
                         "status": "BOSS_ALLOCATION_PARENT_SCOPE_EXCEEDED",
                         "turn_id": target_turn_id,
                     }
+            skill_bindings = self._normalize_skill_bindings(
+                allocation.get("skill_bindings")
+            )
+            if isinstance(skill_bindings, str):
+                return {"status": skill_bindings, "turn_id": target_turn_id}
             normalized.append(
                 {
                     "turn_id": target_turn_id,
@@ -3139,6 +3370,13 @@ class TaskFrameRuntime:
                     "mutation_scope": mutation_scope,
                     "mutation_scope_json": json.dumps(
                         mutation_scope,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "skill_bindings": skill_bindings,
+                    "skill_bindings_json": json.dumps(
+                        skill_bindings,
                         ensure_ascii=True,
                         separators=(",", ":"),
                         sort_keys=True,
@@ -3162,15 +3400,16 @@ class TaskFrameRuntime:
                 "task": allocation["task"],
                 "expected_output": allocation["expected_output"],
                 "mutation_scope": allocation["mutation_scope"],
+                "skill_bindings": allocation["skill_bindings"],
             }
             self.conn.execute(
                 """
                 INSERT INTO boss_allocations(
                     instruction_digest, boss_turn_id, boss_worker_id, turn_id,
                     worker_slot_ref, worker_path, task_text, expected_output_json,
-                    mutation_scope_json, allocation_digest, recorded_at
+                    mutation_scope_json, skill_bindings_json, allocation_digest, recorded_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     latest_digest,
@@ -3182,6 +3421,7 @@ class TaskFrameRuntime:
                     allocation["task"],
                     allocation["expected_output_json"],
                     allocation["mutation_scope_json"],
+                    allocation["skill_bindings_json"],
                     _digest(canonical),
                     observed_at,
                 ),
@@ -3347,6 +3587,7 @@ class TaskFrameRuntime:
             "task": str(row["task_text"]),
             "expected_output": json.loads(str(row["expected_output_json"])),
             "mutation_scope": json.loads(str(row["mutation_scope_json"])),
+            "skill_bindings": json.loads(str(row["skill_bindings_json"])),
             "allocation_id": "allocation_" + allocation_digest[:24],
             "allocation_digest": allocation_digest,
             "recorded_at": str(row["recorded_at"]),
@@ -3363,6 +3604,123 @@ class TaskFrameRuntime:
             )
         except ValueError:
             return None
+
+    @staticmethod
+    def _normalize_skill_bindings(value: Any) -> list[dict[str, str]] | str:
+        """Validate project-owned Skill declarations without selecting Skills."""
+
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return "BOSS_ALLOCATION_SKILL_BINDINGS_INVALID"
+        normalized: list[dict[str, str]] = []
+        seen_digests: set[str] = set()
+        required_fields = {
+            "skill_id",
+            "skill_version",
+            "skill_ref",
+            "context_pack_digest",
+            "operation_class",
+        }
+        for binding in value:
+            if not isinstance(binding, Mapping) or set(binding) != required_fields:
+                return "BOSS_ALLOCATION_SKILL_BINDINGS_INVALID"
+            candidate = {
+                field: str(binding.get(field, "")).strip() for field in required_fields
+            }
+            if not all(candidate.values()):
+                return "BOSS_ALLOCATION_SKILL_BINDINGS_INVALID"
+            candidate["operation_class"] = candidate["operation_class"].upper()
+            if candidate["operation_class"] not in {"READ", "PROPOSE", "EXECUTE"}:
+                return "BOSS_ALLOCATION_SKILL_OPERATION_CLASS_INVALID"
+            if not SHA256_PATTERN.fullmatch(candidate["context_pack_digest"]):
+                return "BOSS_ALLOCATION_CONTEXT_PACK_DIGEST_INVALID"
+            binding_digest = _digest(candidate)
+            if binding_digest in seen_digests:
+                return "BOSS_ALLOCATION_SKILL_BINDING_DUPLICATED"
+            normalized.append({
+                **candidate,
+                "skill_binding_digest": binding_digest,
+            })
+            seen_digests.add(binding_digest)
+        return sorted(normalized, key=lambda binding: binding["skill_binding_digest"])
+
+    @staticmethod
+    def _normalize_skill_run_observations(
+        value: Any,
+        *,
+        allocation: Mapping[str, Any] | None,
+        result_status: str,
+    ) -> list[dict[str, Any]] | str:
+        """Accept observed Skill outcomes only for a declared project binding."""
+
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            return "SKILL_RUN_OBSERVATIONS_INVALID"
+        bindings = {
+            str(binding["skill_binding_digest"]): binding
+            for binding in (allocation or {}).get("skill_bindings", [])
+        }
+        if value and not bindings:
+            return "SKILL_RUN_OBSERVATION_BINDING_REQUIRED"
+        normalized: list[dict[str, Any]] = []
+        seen_bindings: set[str] = set()
+        required_fields = {
+            "skill_binding_digest",
+            "model_ref",
+            "outcome",
+            "validation_state",
+            "evidence_refs",
+            "metrics",
+        }
+        for observation in value:
+            if not isinstance(observation, Mapping) or set(observation) != required_fields:
+                return "SKILL_RUN_OBSERVATIONS_INVALID"
+            binding_digest = str(observation.get("skill_binding_digest", "")).strip()
+            model_ref = str(observation.get("model_ref", "")).strip()
+            outcome = str(observation.get("outcome", "")).strip().upper()
+            validation_state = str(observation.get("validation_state", "")).strip().upper()
+            evidence_refs = observation.get("evidence_refs")
+            metrics = observation.get("metrics")
+            if (
+                binding_digest not in bindings
+                or binding_digest in seen_bindings
+                or not model_ref
+                or outcome not in {"SUCCEEDED", "FAILED", "UNKNOWN"}
+                or validation_state not in {"PASS", "FAIL", "NOT_RUN", "UNKNOWN"}
+                or not isinstance(evidence_refs, list)
+                or not isinstance(metrics, Mapping)
+            ):
+                return "SKILL_RUN_OBSERVATIONS_INVALID"
+            normalized_evidence = TaskFrameRuntime._normalize_evidence_refs(evidence_refs)
+            if isinstance(normalized_evidence, str):
+                return normalized_evidence
+            if not set(metrics).issubset(
+                {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
+            ) or not all(
+                isinstance(metric, (int, float))
+                and not isinstance(metric, bool)
+                and metric >= 0
+                for metric in metrics.values()
+            ):
+                return "SKILL_RUN_OBSERVATION_METRICS_INVALID"
+            canonical = {
+                "skill_binding_digest": binding_digest,
+                "model_ref": model_ref,
+                "outcome": outcome,
+                "validation_state": validation_state,
+                "evidence_refs": list(normalized_evidence),
+                "metrics": dict(sorted(metrics.items())),
+            }
+            normalized.append({
+                **canonical,
+                "observation_digest": _digest(canonical),
+            })
+            seen_bindings.add(binding_digest)
+        if result_status == "COMPLETED" and set(bindings) != seen_bindings:
+            return "SKILL_RUN_OBSERVATION_INCOMPLETE"
+        return sorted(normalized, key=lambda item: item["skill_binding_digest"])
 
     @staticmethod
     def _normalize_timestamp(value: str) -> str:
