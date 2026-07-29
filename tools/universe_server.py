@@ -55,6 +55,7 @@ from universe_runtime_host import (
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
+UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
@@ -69,6 +70,7 @@ AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
 INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
 CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
+CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
@@ -384,6 +386,31 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
                 f"Universe Mode Registry entry does not match the required contract: {mode}",
             )
     return registry
+
+
+def universe_mode_contract(registry: dict[str, Any]) -> dict[str, Any]:
+    definition = registry["modes"][UNIVERSE_MODE]
+    return {
+        "schema": UNIVERSE_MODE_CONTRACT_SCHEMA,
+        "status": "ACTIVE",
+        "mode": UNIVERSE_MODE,
+        "role": definition["role"],
+        "scope": definition["scope"],
+        "mode_profile": definition["mode_profile"],
+        "registry_revision": registry.get("revision", "UNKNOWN"),
+    }
+
+
+def unknown_universe_mode_contract() -> dict[str, Any]:
+    return {
+        "schema": UNIVERSE_MODE_CONTRACT_SCHEMA,
+        "status": "UNKNOWN",
+        "mode": UNIVERSE_MODE,
+        "role": UNIVERSE_ROLE,
+        "scope": UNIVERSE_SCOPE,
+        "mode_profile": UNIVERSE_MODE_PROFILE,
+        "registry_revision": "UNKNOWN",
+    }
 
 
 def require_release_lifecycle_mode(mode: Any) -> None:
@@ -2105,6 +2132,56 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
     return message
 
 
+def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise UniverseError(
+            "REQUEST_INVALID", "conductor room message body must be an object"
+        )
+    kind = _identifier(value.get("kind", "QUESTION"), "kind").upper()
+    if kind not in {"QUESTION", "REVIEW", "STATUS", "TASK_DRAFT", "RESULT"}:
+        raise UniverseError(
+            "CONDUCTOR_ROOM_MESSAGE_KIND_INVALID",
+            "unsupported conductor room message kind",
+        )
+    body = _required_text(value.get("body"), "body")
+    if len(body) > 12000:
+        raise UniverseError("CONDUCTOR_ROOM_MESSAGE_BODY_INVALID", "body is too long")
+    sender = _identifier(value.get("sender", "USER"), "sender").upper()
+    idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
+    in_reply_to = value.get("in_reply_to")
+    if in_reply_to is not None:
+        in_reply_to = _required_text(in_reply_to, "in_reply_to")
+        if len(in_reply_to) > 160:
+            raise UniverseError(
+                "CONDUCTOR_ROOM_MESSAGE_REPLY_INVALID", "in_reply_to is too long"
+            )
+    material = {
+        "room_id": "UNIVERSE_CONDUCTOR",
+        "kind": kind,
+        "sender": sender,
+        "body": body,
+    }
+    if in_reply_to is not None:
+        material["in_reply_to"] = in_reply_to
+    message = {
+        "schema": CONDUCTOR_ROOM_MESSAGE_SCHEMA,
+        "message_id": "conductor_" + uuid.uuid4().hex,
+        "room_id": material["room_id"],
+        "idempotency_key": idempotency_key,
+        "kind": kind,
+        "sender": sender,
+        "body": body,
+        "content_digest": hashlib.sha256(
+            _canonical_json(material).encode("utf-8")
+        ).hexdigest(),
+        "delivery_state": "RECORDED_FOR_CONDUCTOR",
+        "created_at": utc_now(),
+    }
+    if in_reply_to is not None:
+        message["in_reply_to"] = in_reply_to
+    return message
+
+
 def normalize_master_bridge(project_id: str, value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -3123,6 +3200,16 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_room_message_project_time
                 ON project_room_message(project_id, created_at, message_id);
+
+                CREATE TABLE IF NOT EXISTS conductor_room_message (
+                    message_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    message_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS conductor_room_message_time
+                ON conductor_room_message(created_at, message_id);
 
                 CREATE TABLE IF NOT EXISTS project_master_bridge (
                     project_id TEXT PRIMARY KEY
@@ -5869,6 +5956,64 @@ class UniverseStore:
         message["updated_at"] = message["created_at"]
         return message, True
 
+    def create_conductor_room_message(
+        self, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        message = normalize_conductor_room_message(value)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT message_json, created_at
+                FROM conductor_room_message
+                WHERE idempotency_key = ?
+                """,
+                (message["idempotency_key"],),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["message_json"])
+                if stored["content_digest"] != message["content_digest"]:
+                    raise UniverseError(
+                        "CONDUCTOR_ROOM_MESSAGE_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to another conductor message",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO conductor_room_message(
+                    message_id, idempotency_key, message_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    message["message_id"],
+                    message["idempotency_key"],
+                    _canonical_json(message),
+                    message["created_at"],
+                ),
+            )
+        return message, True
+
+    def list_conductor_room_messages(
+        self, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_json, created_at
+                FROM conductor_room_message
+                ORDER BY created_at, message_id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        messages = []
+        for row in rows:
+            message = json.loads(row["message_json"])
+            message["created_at"] = row["created_at"]
+            messages.append(message)
+        return messages
+
     def send_room_message(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -7397,11 +7542,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         store: UniverseStore,
         token: str,
         runtime_host: UniverseRuntimeHost | None = None,
+        mode_contract: dict[str, Any] | None = None,
     ):
         self.store = store
         self.token = token
         self.runtime_host = runtime_host or UniverseRuntimeHost(
             Path(__file__).resolve().parents[1]
+        )
+        self.mode_contract = dict(
+            mode_contract or unknown_universe_mode_contract()
         )
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_lock = threading.RLock()
@@ -7480,6 +7629,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "READY",
                     "universe": self.server.store.identity(),
+                    "mode_contract": self.server.mode_contract,
                     "connection": self.server.connection_profile.as_dict(),
                     "interfaces": [
                         profile.as_dict() for profile in self.server.interface_profiles
@@ -7532,6 +7682,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "PROJECTS_COLLECTED",
                     "projects": self.server.store.list_projects(),
+                },
+            )
+            return
+        if path == "/v1/conductor-room/messages":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "CONDUCTOR_ROOM_MESSAGES_COLLECTED",
+                    "messages": self.server.store.list_conductor_room_messages(),
                 },
             )
             return
@@ -7893,6 +8053,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_REGISTERED" if created else "PROJECT_REFRESHED",
                         "project": project,
+                    },
+                )
+                return
+            if path == "/v1/conductor-room/messages":
+                message, created = self.server.store.create_conductor_room_message(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "CONDUCTOR_ROOM_MESSAGE_RECORDED"
+                            if created
+                            else "CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED"
+                        ),
+                        "message": message,
                     },
                 )
                 return
@@ -8838,6 +9013,7 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 0,
     runtime_host: UniverseRuntimeHost | None = None,
+    mode_contract: dict[str, Any] | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -8852,6 +9028,7 @@ def create_server(
     return UniverseHTTPServer(
         (host, port), UniverseStore(database_path), _required_text(token, "token"),
         runtime_host,
+        mode_contract,
     )
 
 
@@ -9176,9 +9353,14 @@ def main() -> int:
     try:
         if args.command == "serve":
             mode_registry = load_universe_mode_registry(args.mode_registry)
+            mode_contract = universe_mode_contract(mode_registry)
             token = args.token or os.environ.get("UNIVERSE_TOKEN") or secrets.token_urlsafe(32)
             server = create_server(
-                database_path=args.database, token=token, host=args.host, port=args.port
+                database_path=args.database,
+                token=token,
+                host=args.host,
+                port=args.port,
+                mode_contract=mode_contract,
             )
             host, port = server.server_address[:2]
             host_text = host.decode("ascii") if isinstance(host, bytes) else host
@@ -9199,11 +9381,7 @@ def main() -> int:
                         "endpoint": endpoint,
                         "database": str(args.database.expanduser().resolve()),
                         "state_file": str(args.state_file.expanduser().resolve()),
-                        "mode_contract": {
-                            "mode": UNIVERSE_MODE,
-                            "role": UNIVERSE_ROLE,
-                            "registry_revision": mode_registry.get("revision", "UNKNOWN"),
-                        },
+                        "mode_contract": mode_contract,
                     },
                     sort_keys=True,
                 ),

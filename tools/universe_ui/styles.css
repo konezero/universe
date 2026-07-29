@@ -100,6 +100,14 @@ button {
   font-size: 12px;
 }
 
+.mode-label[data-state="active"] {
+  color: var(--teal);
+}
+
+.mode-label[data-state="unknown"] {
+  color: var(--amber);
+}
+
 .topbar-actions {
   gap: 8px;
 }
@@ -523,7 +531,7 @@ button {
   width: min(700px, calc(100vw - 40px));
   transform: translateX(50%);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 44px;
+  grid-template-columns: 40px minmax(0, 1fr) 44px;
   gap: 4px 8px;
   padding: 12px;
   border: 1px solid rgba(166, 190, 231, 0.32);
@@ -534,8 +542,86 @@ button {
 }
 
 .project-room {
-  grid-template-columns: minmax(0, 1fr) 44px;
+  grid-template-columns: 40px minmax(0, 1fr) 44px;
   align-items: center;
+}
+
+.composer-action-wrap {
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+}
+
+.composer-action-button {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  font-size: 27px;
+  font-weight: 300;
+  line-height: 1;
+}
+
+.composer-action-button:hover,
+.composer-action-button:focus-visible,
+.composer-action-button[aria-expanded="true"] {
+  border-color: var(--line-strong);
+  background: var(--surface-quiet);
+}
+
+.composer-action-menu {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 0;
+  width: min(300px, calc(100vw - 48px));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: rgba(11, 16, 27, 0.98);
+  box-shadow: var(--shadow);
+}
+
+.composer-menu-item {
+  display: grid;
+  width: 100%;
+  gap: 3px;
+  padding: 11px 12px;
+  border: 0;
+  border-bottom: 1px solid rgba(64, 83, 110, 0.42);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.composer-menu-item:last-child {
+  border-bottom: 0;
+}
+
+.composer-menu-item:hover,
+.composer-menu-item:focus-visible,
+.composer-menu-item.selected {
+  background: var(--surface-quiet);
+}
+
+.composer-menu-item.selected {
+  box-shadow: inset 2px 0 0 var(--teal);
+}
+
+.composer-menu-item small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.project-master-actions {
+  display: grid;
+  max-height: 230px;
+  overflow-y: auto;
 }
 
 .room-context {
@@ -545,7 +631,7 @@ button {
 
 .room-actions {
   display: flex;
-  grid-column: 1;
+  grid-column: 2 / 4;
   align-items: center;
   justify-content: space-between;
   min-width: 0;
@@ -580,7 +666,8 @@ input {
 }
 
 textarea {
-  grid-column: 1 / -1;
+  grid-column: 2;
+  grid-row: 1;
   min-height: 74px;
   max-height: 150px;
   padding: 10px 12px;
@@ -595,8 +682,8 @@ textarea {
 .send-button {
   display: grid;
   place-items: center;
-  grid-column: 2;
-  grid-row: 2;
+  grid-column: 3;
+  grid-row: 1;
   align-self: center;
   width: 38px;
   min-width: 38px;
@@ -1380,7 +1467,7 @@ dialog label {
   }
 
   .command-composer {
-    grid-template-columns: 1fr 70px;
+    grid-template-columns: 40px minmax(0, 1fr) 44px;
   }
 
   .mobile-project-start {

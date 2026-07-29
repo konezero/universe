@@ -11,7 +11,13 @@ const state = {
   focusedNodeId: null,
   view: "timeline",
   roomMessages: [],
+  conductorMessages: [],
   masterBridge: null,
+  modeContract: null,
+  conversationTarget: {
+    kind: "UNIVERSE_CONDUCTOR",
+    projectId: null,
+  },
   freshProject: {
     intent: null,
     routes: [],
@@ -29,6 +35,7 @@ const state = {
 
 const elements = {
   serviceStatus: document.querySelector("#service-status"),
+  modeStatus: document.querySelector("#mode-status"),
   projectList: document.querySelector("#project-list"),
   workspaceTitle: document.querySelector("#workspace-title"),
   workspaceSubtitle: document.querySelector("#workspace-subtitle"),
@@ -38,6 +45,11 @@ const elements = {
   activity: document.querySelector("#activity-panel"),
   dispatchForm: document.querySelector("#dispatch-form"),
   dispatchSubmit: document.querySelector("#dispatch-submit"),
+  dispatchInstruction: document.querySelector("#dispatch-instruction"),
+  composerActionButton: document.querySelector("#composer-action-button"),
+  composerActionMenu: document.querySelector("#composer-action-menu"),
+  projectMasterActions: document.querySelector("#project-master-actions"),
+  returnToConductor: document.querySelector("#return-to-conductor"),
   prepareProject: document.querySelector("#prepare-project-button"),
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
@@ -80,6 +92,7 @@ const elements = {
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
   roomContext: document.querySelector("#room-context"),
+  roomHint: document.querySelector("#room-hint"),
   closeInspector: document.querySelector("#close-inspector"),
   nodeBreadcrumb: document.querySelector("#node-breadcrumb"),
   nodeBreadcrumbProject: document.querySelector("#node-breadcrumb-project"),
@@ -111,6 +124,125 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function universeModeIsActive() {
+  return (
+    state.modeContract?.status === "ACTIVE" &&
+    state.modeContract?.mode === "UNIVERSE" &&
+    state.modeContract?.role === "CONDUCTOR"
+  );
+}
+
+function renderModeStatus() {
+  const active = universeModeIsActive();
+  elements.modeStatus.dataset.state = active ? "active" : "unknown";
+  elements.modeStatus.textContent = active
+    ? "UNIVERSE / CONDUCTOR"
+    : "MODE / UNKNOWN";
+}
+
+function closeComposerActionMenu() {
+  elements.composerActionMenu.classList.add("hidden");
+  elements.composerActionButton.setAttribute("aria-expanded", "false");
+}
+
+function toggleComposerActionMenu(forceOpen = null) {
+  const shouldOpen =
+    forceOpen === null
+      ? elements.composerActionMenu.classList.contains("hidden")
+      : forceOpen;
+  elements.composerActionMenu.classList.toggle("hidden", !shouldOpen);
+  elements.composerActionButton.setAttribute(
+    "aria-expanded",
+    String(shouldOpen)
+  );
+}
+
+function renderComposerActions() {
+  elements.projectMasterActions.replaceChildren();
+  for (const project of state.projects) {
+    const action = node("button", "composer-menu-item");
+    action.type = "button";
+    action.role = "menuitem";
+    action.dataset.projectId = project.project_id;
+    const isCurrent =
+      state.conversationTarget.kind === "PROJECT_MASTER" &&
+      state.conversationTarget.projectId === project.project_id;
+    action.classList.toggle("selected", isCurrent);
+    const bridgeConnected =
+      state.selectedProject?.project_id === project.project_id &&
+      state.masterBridge?.status === "AVAILABLE";
+    action.append(
+      node("span", "", `Call ${project.project_id} Master`),
+      node(
+        "small",
+        "",
+        bridgeConnected
+          ? "Direct bridge connected"
+          : isCurrent
+            ? "Inbox fallback"
+            : "Open Project Room"
+      )
+    );
+    action.addEventListener("click", async () => {
+      try {
+        await callProjectMaster(project.project_id);
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    elements.projectMasterActions.append(action);
+  }
+  elements.returnToConductor.classList.toggle(
+    "selected",
+    state.conversationTarget.kind === "UNIVERSE_CONDUCTOR"
+  );
+}
+
+function returnToUniverseConductor() {
+  state.conversationTarget = {
+    kind: "UNIVERSE_CONDUCTOR",
+    projectId: null,
+  };
+  closeComposerActionMenu();
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  elements.dispatchInstruction.focus();
+}
+
+async function callProjectMaster(projectId) {
+  closeComposerActionMenu();
+  if (state.selectedProject?.project_id !== projectId) {
+    await selectProject(projectId);
+  }
+  state.conversationTarget = {
+    kind: "PROJECT_MASTER",
+    projectId,
+  };
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  elements.dispatchInstruction.focus();
+}
+
+function renderComposerState() {
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    elements.roomContext.textContent = "Universe Conductor";
+    elements.roomHint.textContent = "Use + to call a Project Master";
+    elements.dispatchInstruction.placeholder = "Message Universe Conductor";
+    return;
+  }
+  const projectId = state.conversationTarget.projectId;
+  const directBridge =
+    state.selectedProject?.project_id === projectId &&
+    state.masterBridge?.status === "AVAILABLE";
+  elements.roomContext.textContent = `${projectId} / Project Master`;
+  elements.roomHint.textContent = directBridge
+    ? "Direct bridge connected"
+    : "Inbox fallback";
+  elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
+}
+
 async function refresh() {
   try {
     const health = await fetch("/health", { cache: "no-store" }).then((response) =>
@@ -119,14 +251,19 @@ async function refresh() {
     elements.serviceStatus.dataset.state = health.status === "READY" ? "ready" : "error";
     elements.serviceStatus.textContent =
       health.status === "READY" ? "Local service" : health.status;
+    state.modeContract = health.mode_contract || null;
+    renderModeStatus();
 
-    const [projectResult, releaseResult] = await Promise.all([
+    const [projectResult, releaseResult, conductorRoomResult] = await Promise.all([
       api("/v1/projects"),
       api("/v1/releases"),
+      api("/v1/conductor-room/messages"),
     ]);
     state.projects = projectResult.projects;
     state.releases = releaseResult.releases;
+    state.conductorMessages = conductorRoomResult.messages || [];
     renderProjects();
+    renderComposerActions();
     renderReleaseCatalog();
     const preferred =
       state.selectedProject &&
@@ -323,9 +460,8 @@ async function selectProject(projectId) {
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
-  elements.roomContext.textContent = state.masterBridge?.status === "AVAILABLE"
-    ? `${project.project_id} · Master bridge connected`
-    : `${project.project_id} · Project Master · Inbox fallback`;
+  renderComposerActions();
+  renderComposerState();
   buildGraph();
   renderDetails();
   renderActivity();
@@ -335,16 +471,42 @@ async function selectProject(projectId) {
 
 function renderRoomMessages() {
   elements.roomMessageList.replaceChildren();
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    if (!state.conductorMessages.length) {
+      const item = node("article", "room-message conductor-message");
+      item.append(
+        node("strong", "", "UNIVERSE / CONDUCTOR"),
+        node("p", "", "Universe control room is active."),
+        node("small", "", "Send a message here or use + to call a Project Master.")
+      );
+      elements.roomMessageList.append(item);
+      return;
+    }
+    for (const message of state.conductorMessages.slice(-8)) {
+      const item = node("article", "room-message conductor-message");
+      item.append(
+        node("strong", "", `${message.sender} / ${message.kind}`),
+        node("p", "", message.body),
+        node("small", "", message.delivery_state)
+      );
+      elements.roomMessageList.append(item);
+    }
+    return;
+  }
   if (!state.roomMessages.length) {
     elements.roomMessageList.append(
-      node("p", "empty-copy", "Messages to the Project Master appear here")
+      node(
+        "p",
+        "empty-copy",
+        `No messages for ${state.conversationTarget.projectId} Master`
+      )
     );
     return;
   }
   for (const message of state.roomMessages.slice(-8)) {
     const item = node("article", "room-message");
     item.append(
-      node("strong", "", `${message.sender} · ${message.kind}`),
+      node("strong", "", `${message.sender} / ${message.kind}`),
       node("p", "", message.body),
       node("small", "", message.delivery_state)
     );
@@ -1260,7 +1422,9 @@ async function deliverDispatch(dispatchId) {
 function renderEmpty() {
   elements.workspaceTitle.textContent = "Project network";
   elements.workspaceSubtitle.textContent = "No project selected";
-  elements.roomContext.textContent = "Project Master";
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
   document.body.classList.remove("inspector-open");
   elements.graphEmpty.classList.remove("hidden");
   state.graph.nodes = [];
@@ -1274,16 +1438,51 @@ function renderEmpty() {
 
 async function submitDispatch(event) {
   event.preventDefault();
-  if (!state.selectedProject) {
-    toast("Select a project", true);
+  const form = new FormData(elements.dispatchForm);
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    elements.dispatchSubmit.disabled = true;
+    try {
+      const result = await api("/v1/conductor-room/messages", {
+        method: "POST",
+        body: {
+          kind: "QUESTION",
+          sender: "USER",
+          body: form.get("instruction"),
+          idempotency_key: crypto.randomUUID(),
+        },
+      });
+      elements.dispatchForm.reset();
+      state.conductorMessages = [
+        ...state.conductorMessages.filter(
+          (message) => message.message_id !== result.message.message_id
+        ),
+        result.message,
+      ];
+      renderComposerState();
+      renderRoomMessages();
+      toast("Message recorded in Universe Conductor room");
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      elements.dispatchSubmit.disabled = false;
+    }
     return;
   }
-  const form = new FormData(elements.dispatchForm);
+  const targetProject = state.projects.find(
+    (project) => project.project_id === state.conversationTarget.projectId
+  );
+  if (!targetProject) {
+    toast("Project Master target is unavailable", true);
+    return;
+  }
+  if (state.selectedProject?.project_id !== targetProject.project_id) {
+    await selectProject(targetProject.project_id);
+  }
   elements.dispatchSubmit.disabled = true;
   try {
     const result = await api(
       `/v1/projects/${encodeURIComponent(
-        state.selectedProject.project_id
+        targetProject.project_id
       )}/room/messages`,
       {
         method: "POST",
@@ -1296,6 +1495,7 @@ async function submitDispatch(event) {
       }
     );
     elements.dispatchForm.reset();
+    renderComposerState();
     toast(
       result.message.delivery_state === "DELIVERED_TO_MASTER"
         ? "Delivered to the registered Project Master"
@@ -1891,6 +2091,24 @@ function bindEvents() {
     .querySelector("#start-project-topbar-button")
     .addEventListener("click", openFreshProjectWizard);
   elements.dispatchForm.addEventListener("submit", submitDispatch);
+  elements.composerActionButton.addEventListener("click", () =>
+    toggleComposerActionMenu()
+  );
+  elements.returnToConductor.addEventListener(
+    "click",
+    returnToUniverseConductor
+  );
+  document.addEventListener("click", (event) => {
+    if (
+      !elements.composerActionMenu.contains(event.target) &&
+      !elements.composerActionButton.contains(event.target)
+    ) {
+      closeComposerActionMenu();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeComposerActionMenu();
+  });
   elements.prepareProject.addEventListener("click", prepareProjectSeed);
   elements.exitNodeUniverse.addEventListener("click", exitNodeUniverse);
   elements.closeInspector.addEventListener("click", closeInspector);

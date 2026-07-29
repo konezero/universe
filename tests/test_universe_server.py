@@ -43,6 +43,7 @@ from universe_server import (  # noqa: E402
     prepare_skill_observation_archive,
     require_release_lifecycle_mode,
     resolve_universe_mode_intent,
+    universe_mode_contract,
     write_server_state,
 )
 
@@ -110,6 +111,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server = create_server(
             database_path=temp_root / "universe.sqlite3",
             token=self.token,
+            mode_contract=universe_mode_contract(
+                {
+                    "owner": "universe",
+                    "policy": "MASTER_MANAGED",
+                    "root_mode": "MASTER",
+                    "revision": 3,
+                    "modes": {
+                        "MASTER": {
+                            "role": "MASTER",
+                            "scope": "architecture/governance",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        },
+                        "UNIVERSE": {
+                            "role": "CONDUCTOR",
+                            "scope": "project-network/navigation/distribution",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        },
+                    },
+                }
+            ),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -424,6 +445,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("READY", result["status"])
         self.assertEqual(
+            {
+                "schema": "universe.mode-contract.v1",
+                "status": "ACTIVE",
+                "mode": "UNIVERSE",
+                "role": "CONDUCTOR",
+                "scope": "project-network/navigation/distribution",
+                "mode_profile": "GOVERNANCE_ONLY",
+                "registry_revision": 3,
+            },
+            result["mode_contract"],
+        )
+        self.assertEqual(
             self.server.store.identity(),
             result["universe"],
         )
@@ -482,6 +515,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="planning-provider"', body)
             self.assertIn('id="execute-planning-proposal"', body)
             self.assertIn('id="refinement-comparison"', body)
+            self.assertIn('id="mode-status"', body)
+            self.assertIn('id="composer-action-button"', body)
+            self.assertIn('id="project-master-actions"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
@@ -490,11 +526,63 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/fresh-project-compositions", script)
             self.assertIn("/v1/fresh-project-refinement-requests", script)
             self.assertIn("/v1/runtime/planning-binding", script)
+            self.assertIn("/v1/conductor-room/messages", script)
             self.assertIn("/v1/fresh-project-refinement-runs", script)
             self.assertIn("/execute", script)
             self.assertIn("/v1/fresh-project-refinement-adoptions", script)
             self.assertIn("/v1/fresh-project-composition-adoptions", script)
+            self.assertIn("UNIVERSE_CONDUCTOR", script)
+            self.assertIn("callProjectMaster", script)
             self.assertNotIn(self.token, script)
+
+    def test_conductor_room_message_is_durable_and_idempotent(self) -> None:
+        request = {
+            "kind": "QUESTION",
+            "sender": "USER",
+            "body": "Show the active project risks.",
+            "idempotency_key": "conductor-question-001",
+        }
+
+        status, result = self.request(
+            "POST",
+            "/v1/conductor-room/messages",
+            request,
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("CONDUCTOR_ROOM_MESSAGE_RECORDED", result["status"])
+        self.assertEqual(
+            "RECORDED_FOR_CONDUCTOR", result["message"]["delivery_state"]
+        )
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/conductor-room/messages",
+            request,
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED", repeated["status"]
+        )
+        self.assertEqual(
+            result["message"]["message_id"], repeated["message"]["message_id"]
+        )
+
+        status, collected = self.request(
+            "GET", "/v1/conductor-room/messages", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("CONDUCTOR_ROOM_MESSAGES_COLLECTED", collected["status"])
+        self.assertEqual([result["message"]["message_id"]], [
+            message["message_id"] for message in collected["messages"]
+        ])
+
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual(
+            result["message"]["message_id"],
+            reopened.list_conductor_room_messages()[0]["message_id"],
+        )
 
     def test_registration_refresh_and_listing_are_idempotent(self) -> None:
         status, result = self.request(
@@ -2590,6 +2678,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         registry = load_universe_mode_registry(registry_path)
         self.assertEqual("CONDUCTOR", registry["modes"]["UNIVERSE"]["role"])
+        self.assertEqual(
+            {
+                "schema": "universe.mode-contract.v1",
+                "status": "ACTIVE",
+                "mode": "UNIVERSE",
+                "role": "CONDUCTOR",
+                "scope": "project-network/navigation/distribution",
+                "mode_profile": "GOVERNANCE_ONLY",
+                "registry_revision": 3,
+            },
+            universe_mode_contract(registry),
+        )
         for intent in (
             "UNIVERSE",
             "Universe mode",

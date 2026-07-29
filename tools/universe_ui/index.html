@@ -12,7 +12,7 @@
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Universe</strong>
-        <span class="mode-label">Navigation</span>
+        <span id="mode-status" class="mode-label" data-state="loading">UNIVERSE / CONDUCTOR</span>
       </div>
       <div class="topbar-actions">
         <span id="service-status" class="status-dot" data-state="loading">
@@ -92,14 +92,26 @@
       </div>
       <form id="dispatch-form" class="command-composer project-room">
         <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
-        <textarea id="dispatch-instruction" name="instruction" rows="3" placeholder="Message the Project Master" required></textarea>
-        <div class="room-actions">
-          <span id="room-context" class="room-context">Project Master</span>
-          <span class="room-hint">Review, design, question, or implementation request</span>
+        <div class="composer-action-wrap">
+          <button id="composer-action-button" class="composer-action-button" type="button" title="Conversation actions" aria-label="Conversation actions" aria-expanded="false">
+            +
+          </button>
+          <div id="composer-action-menu" class="composer-action-menu hidden" role="menu" aria-label="Conversation target">
+            <button id="return-to-conductor" class="composer-menu-item selected" type="button" role="menuitem">
+              <span>Universe Conductor</span>
+              <small>Current control room</small>
+            </button>
+            <div id="project-master-actions" class="project-master-actions"></div>
+          </div>
         </div>
+        <textarea id="dispatch-instruction" name="instruction" rows="3" placeholder="Message Universe Conductor" required></textarea>
         <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send message" aria-label="Send message">
           &#8593;
         </button>
+        <div class="room-actions">
+          <span id="room-context" class="room-context">Universe Conductor</span>
+          <span id="room-hint" class="room-hint">Use + to call a Project Master</span>
+        </div>
       </form>
     </main>
 
