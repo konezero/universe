@@ -14,6 +14,9 @@ const state = {
   conductorMessages: [],
   conductorRuntimeBinding: null,
   conductorRefreshInFlight: false,
+  projectRoomStream: null,
+  projectRoomStreamProjectId: null,
+  projectStreamReplies: {},
   masterBridge: null,
   modeContract: null,
   conversationTarget: {
@@ -206,6 +209,7 @@ function renderComposerActions() {
 }
 
 function returnToUniverseConductor() {
+  closeProjectRoomStream();
   state.conversationTarget = {
     kind: "UNIVERSE_CONDUCTOR",
     projectId: null,
@@ -226,6 +230,7 @@ async function callProjectMaster(projectId) {
     kind: "PROJECT_MASTER",
     projectId,
   };
+  openProjectRoomStream(projectId);
   renderComposerActions();
   renderComposerState();
   renderRoomMessages();
@@ -537,6 +542,16 @@ function renderRoomMessages() {
     );
     elements.roomMessageList.append(item);
   }
+  for (const reply of Object.values(state.projectStreamReplies)) {
+    const item = node("article", "room-message streaming");
+    item.append(
+      node("strong", "", "PROJECT_MASTER / LIVE"),
+      node("p", "", reply.body || "Thinking..."),
+      node("small", "", reply.state)
+    );
+    elements.roomMessageList.append(item);
+  }
+  elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
 }
 
 function conductorDeliveryLabel(deliveryState) {
@@ -571,6 +586,76 @@ async function refreshConductorRoom() {
   } finally {
     state.conductorRefreshInFlight = false;
   }
+}
+
+function closeProjectRoomStream() {
+  if (state.projectRoomStream) {
+    state.projectRoomStream.close();
+  }
+  state.projectRoomStream = null;
+  state.projectRoomStreamProjectId = null;
+  state.projectStreamReplies = {};
+}
+
+function openProjectRoomStream(projectId) {
+  if (
+    state.projectRoomStream &&
+    state.projectRoomStreamProjectId === projectId
+  ) {
+    return;
+  }
+  closeProjectRoomStream();
+  const source = new EventSource(
+    `/v1/projects/${encodeURIComponent(projectId)}/room/stream`
+  );
+  state.projectRoomStream = source;
+  state.projectRoomStreamProjectId = projectId;
+  source.addEventListener("project-room", (event) => {
+    let envelope;
+    try {
+      envelope = JSON.parse(event.data);
+    } catch (error) {
+      console.warn("Project Room stream payload is invalid", error);
+      return;
+    }
+    const payload = envelope.payload || {};
+    if (payload.type === "SNAPSHOT" || payload.type === "ROOM_CHANGED") {
+      state.roomMessages = Array.isArray(payload.messages)
+        ? payload.messages
+        : [];
+      if (payload.type === "ROOM_CHANGED") {
+        state.projectStreamReplies = {};
+      }
+      renderRoomMessages();
+      return;
+    }
+    if (payload.type !== "MASTER_STREAM") return;
+    const key = payload.in_reply_to;
+    if (payload.event === "COMPLETED") {
+      delete state.projectStreamReplies[key];
+    } else if (payload.event === "FAILED") {
+      state.projectStreamReplies[key] = {
+        body: state.projectStreamReplies[key]?.body || "",
+        state: payload.detail || "Failed",
+      };
+    } else {
+      const current = state.projectStreamReplies[key] || {
+        body: "",
+        state: "Thinking",
+      };
+      if (payload.event === "DELTA") {
+        current.body += payload.delta || "";
+        current.state = "Responding";
+      }
+      state.projectStreamReplies[key] = current;
+    }
+    renderRoomMessages();
+  });
+  source.addEventListener("error", () => {
+    if (state.projectRoomStream === source) {
+      elements.roomHint.textContent = "Project Master reconnecting";
+    }
+  });
 }
 
 function buildGraph() {
@@ -1557,13 +1642,19 @@ async function submitDispatch(event) {
       }
     );
     elements.dispatchForm.reset();
+    state.roomMessages = [
+      ...state.roomMessages.filter(
+        (message) => message.message_id !== result.message.message_id
+      ),
+      result.message,
+    ];
     renderComposerState();
+    renderRoomMessages();
     toast(
       result.message.delivery_state === "DELIVERED_TO_MASTER"
         ? "Delivered to the registered Project Master"
         : "Project Room message recorded; Inbox fallback is available"
     );
-    await selectProject(state.selectedProject.project_id);
     showInspectorTab("activity");
   } catch (error) {
     toast(error.message, true);

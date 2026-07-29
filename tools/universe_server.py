@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hmac
 import hashlib
 import ipaddress
@@ -11,9 +12,11 @@ import os
 import queue
 import re
 import secrets
+import socket
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 import webbrowser
 from contextlib import contextmanager
@@ -22,7 +25,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -45,6 +48,10 @@ from project_seed_assets import (
     build_project_seed_asset_proposal,
     load_project_seed_assets,
     project_seed_template,
+)
+from project_master_host import (
+    ProjectMasterHostError,
+    ResidentProjectMasterHostManager,
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
@@ -84,6 +91,8 @@ CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
 CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX"})
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
+PROJECT_MASTER_STREAM_SCHEMA = "universe.project-master-stream-event.v1"
+PROJECT_ROOM_STREAM_SCHEMA = "universe.project-room-stream.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
 SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA = (
     "universe.skill-observation-publication-approval.v1"
@@ -523,6 +532,21 @@ def local_connection_profile(endpoint: str) -> ConnectionProfile:
             durable=True,
         ),
     )
+
+
+def _loopback_endpoint_reachable(endpoint: str) -> bool:
+    parsed = urlsplit(endpoint)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.hostname not in {"127.0.0.1", "::1", "localhost"} or port is None:
+        return False
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
 
 
 def interface_profile(
@@ -2288,6 +2312,61 @@ def normalize_master_bridge_reply(project_id: str, value: Any) -> dict[str, Any]
                 "idempotency_key": request["idempotency_key"],
             },
         ),
+    }
+
+
+def normalize_master_bridge_stream(project_id: str, value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_bridge_stream",
+        required=frozenset(
+            {
+                "bridge_id",
+                "in_reply_to",
+                "event",
+                "sequence",
+                "delta",
+                "detail",
+            }
+        ),
+    )
+    event = _required_text(request["event"], "master_bridge_stream.event").upper()
+    if event not in {"STARTED", "DELTA", "COMPLETED", "FAILED"}:
+        raise UniverseError(
+            "MASTER_STREAM_EVENT_INVALID",
+            "unsupported Project Master stream event",
+        )
+    sequence = request["sequence"]
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise UniverseError(
+            "MASTER_STREAM_SEQUENCE_INVALID",
+            "Project Master stream sequence must be a non-negative integer",
+        )
+    delta = request["delta"]
+    detail = request["detail"]
+    if not isinstance(delta, str) or len(delta.encode("utf-8")) > MAX_BODY_BYTES:
+        raise UniverseError(
+            "MASTER_STREAM_DELTA_INVALID",
+            "Project Master stream delta is invalid",
+        )
+    if not isinstance(detail, str) or len(detail.encode("utf-8")) > 4000:
+        raise UniverseError(
+            "MASTER_STREAM_DETAIL_INVALID",
+            "Project Master stream detail is invalid",
+        )
+    return {
+        "schema": PROJECT_MASTER_STREAM_SCHEMA,
+        "project_id": _project_id(project_id),
+        "bridge_id": _required_text(
+            request["bridge_id"], "master_bridge_stream.bridge_id"
+        ),
+        "in_reply_to": _required_text(
+            request["in_reply_to"], "master_bridge_stream.in_reply_to"
+        ),
+        "event": event,
+        "sequence": sequence,
+        "delta": delta,
+        "detail": detail,
     }
 
 
@@ -6357,26 +6436,11 @@ class UniverseStore:
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
         reply = normalize_master_bridge_reply(project["project_id"], value)
-        bridge = self.get_master_bridge(project["project_id"])
-        expected = os.environ.get(bridge["credential_env"])
-        if not expected:
-            raise UniverseError(
-                "MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE",
-                "registered bridge credential is unavailable on this Host",
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-        if not credential or not hmac.compare_digest(expected, credential):
-            raise UniverseError(
-                "MASTER_BRIDGE_UNAUTHORIZED",
-                "bridge reply credential does not match the registered binding",
-                HTTPStatus.FORBIDDEN,
-            )
-        if reply["bridge_id"] != bridge["bridge_id"]:
-            raise UniverseError(
-                "MASTER_BRIDGE_BINDING_MISMATCH",
-                "reply bridge_id does not match the registered binding",
-                HTTPStatus.CONFLICT,
-            )
+        bridge = self.validate_master_bridge_credential(
+            project["project_id"],
+            reply["bridge_id"],
+            credential,
+        )
         with self._connection() as connection:
             parent = connection.execute(
                 """
@@ -6401,6 +6465,35 @@ class UniverseStore:
             project["project_id"], status="AVAILABLE", last_delivery_at=utc_now()
         )
         return message, created
+
+    def validate_master_bridge_credential(
+        self,
+        project_id: str,
+        bridge_id: str,
+        credential: str | None,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        bridge = self.get_master_bridge(project["project_id"])
+        expected = os.environ.get(bridge["credential_env"])
+        if not expected:
+            raise UniverseError(
+                "MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE",
+                "registered bridge credential is unavailable on this Host",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if not credential or not hmac.compare_digest(expected, credential):
+            raise UniverseError(
+                "MASTER_BRIDGE_UNAUTHORIZED",
+                "bridge reply credential does not match the registered binding",
+                HTTPStatus.FORBIDDEN,
+            )
+        if bridge_id != bridge["bridge_id"]:
+            raise UniverseError(
+                "MASTER_BRIDGE_BINDING_MISMATCH",
+                "reply bridge_id does not match the registered binding",
+                HTTPStatus.CONFLICT,
+            )
+        return bridge
 
     def list_room_messages(
         self, project_id: str, *, limit: int = 200
@@ -7826,6 +7919,60 @@ class UniverseStore:
         }
 
 
+class ProjectRoomEventHub:
+    def __init__(self, *, retained_events: int = 512) -> None:
+        self._condition = threading.Condition()
+        self._sequence = 0
+        self._retained_events = max(32, int(retained_events))
+        self._events: dict[str, deque[dict[str, Any]]] = {}
+
+    def cursor(self) -> int:
+        with self._condition:
+            return self._sequence
+
+    def publish(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        normalized_project = _project_id(project_id)
+        with self._condition:
+            self._sequence += 1
+            event = {
+                "schema": PROJECT_ROOM_STREAM_SCHEMA,
+                "event_id": self._sequence,
+                "project_id": normalized_project,
+                "emitted_at": utc_now(),
+                "payload": dict(payload),
+            }
+            events = self._events.setdefault(
+                normalized_project,
+                deque(maxlen=self._retained_events),
+            )
+            events.append(event)
+            self._condition.notify_all()
+            return dict(event)
+
+    def wait(
+        self,
+        project_id: str,
+        *,
+        after_event_id: int,
+        timeout_seconds: float,
+    ) -> list[dict[str, Any]]:
+        normalized_project = _project_id(project_id)
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        with self._condition:
+            while True:
+                events = [
+                    dict(event)
+                    for event in self._events.get(normalized_project, ())
+                    if int(event["event_id"]) > after_event_id
+                ]
+                if events:
+                    return events
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                self._condition.wait(remaining)
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -7836,6 +7983,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         token: str,
         runtime_host: UniverseRuntimeHost | None = None,
         mode_contract: dict[str, Any] | None = None,
+        *,
+        auto_start_project_masters: bool = True,
+        project_master_provider_factory: Any = None,
     ):
         self.store = store
         self.token = token
@@ -7850,11 +8000,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_queued_ids: set[str] = set()
         self._conductor_queue_lock = threading.RLock()
         self._conductor_stop = threading.Event()
+        self.project_room_events = ProjectRoomEventHub()
         super().__init__(address, UniverseRequestHandler)
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
         self.connection_profile = local_connection_profile(f"http://{host_text}:{port}")
         self.interface_profiles = (local_http_interface_profile(),)
+        self.project_master_hosts = (
+            ResidentProjectMasterHostManager(
+                universe_endpoint=self.connection_profile.endpoint,
+                bridge_registrar=self.store.register_master_bridge,
+                provider_factory=project_master_provider_factory,
+            )
+            if auto_start_project_masters
+            else None
+        )
         self._conductor_worker = threading.Thread(
             target=self._conductor_worker_loop,
             name="universe-conductor-room-worker",
@@ -7922,6 +8082,53 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 return
             self._conductor_queued_ids.add(normalized_id)
         self._conductor_queue.put(normalized_id)
+
+    def ensure_project_master(self, project_id: str) -> dict[str, Any]:
+        if self.project_master_hosts is None:
+            return {"status": "AUTO_START_DISABLED", "project_id": project_id}
+        project = self.store.get_project(project_id)
+        try:
+            bridge = self.store.get_master_bridge(project_id)
+        except UniverseError as error:
+            if error.code != "MASTER_BRIDGE_NOT_REGISTERED":
+                raise
+            bridge = None
+        if bridge is not None:
+            managed = str(bridge.get("binding_evidence_ref") or "").startswith(
+                "universe://resident-project-master/"
+            )
+            if bridge.get("status") in {"REGISTERED", "AVAILABLE"} and (
+                (not managed and _loopback_endpoint_reachable(str(bridge["endpoint"])))
+                or (managed and self.project_master_hosts.is_resident(project_id))
+            ):
+                return {
+                    "status": "EXISTING_BRIDGE",
+                    "project_id": project_id,
+                    "bridge": bridge,
+                }
+        return self.project_master_hosts.ensure(project)
+
+    def send_project_room_message(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        try:
+            self.ensure_project_master(project_id)
+        except (OSError, ProjectMasterHostError):
+            pass
+        message, created = self.store.send_room_message(project_id, value)
+        self.publish_project_room_changed(project_id)
+        return message, created
+
+    def publish_project_room_changed(self, project_id: str) -> None:
+        self.project_room_events.publish(
+            project_id,
+            {
+                "type": "ROOM_CHANGED",
+                "messages": self.store.list_room_messages(project_id),
+            },
+        )
 
     def _conductor_worker_loop(self) -> None:
         while not self._conductor_stop.is_set():
@@ -8039,6 +8246,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._conductor_stop.set()
             self._conductor_queue.put(None)
             self._conductor_worker.join(timeout=5)
+        if self.project_master_hosts is not None:
+            self.project_master_hosts.close()
         super().server_close()
 
 
@@ -8257,6 +8466,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "messages": self.server.store.list_room_messages(project_id),
                     },
                 )
+                return
+            if suffix == "/room/stream":
+                self._stream_project_room(project_id)
                 return
             if suffix == "/skill-observations":
                 self._send(
@@ -8895,7 +9107,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/room/messages":
-                message, created = self.server.store.send_room_message(parts[0], body)
+                message, created = self.server.send_project_room_message(parts[0], body)
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
@@ -8904,6 +9116,30 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         if created
                         else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
                         "message": message,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/master-bridge/stream":
+                credential = self.headers.get("X-Universe-Bridge-Token")
+                stream_event = normalize_master_bridge_stream(parts[0], body)
+                self.server.store.validate_master_bridge_credential(
+                    parts[0],
+                    stream_event["bridge_id"],
+                    credential,
+                )
+                published = self.server.project_room_events.publish(
+                    parts[0],
+                    {
+                        "type": "MASTER_STREAM",
+                        **stream_event,
+                    },
+                )
+                self._send(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MASTER_STREAM_EVENT_ACCEPTED",
+                        "event_id": published["event_id"],
                     },
                 )
                 return
@@ -9080,6 +9316,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 message, created = self.server.store.append_master_bridge_reply(
                     parts[0], body, credential
                 )
+                self.server.publish_project_room_changed(parts[0])
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
@@ -9291,8 +9528,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return None
         remainder = path[len(prefix) :]
         for suffix in (
+            "/master-bridge/stream",
             "/master-bridge/replies",
             "/master-bridge",
+            "/room/stream",
             "/room/messages",
             "/document-incorporation-proposals",
             "/skill-plan-proposals",
@@ -9392,6 +9631,56 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _stream_project_room(self, project_id: str) -> None:
+        self.server.store.get_project(project_id)
+        cursor = self.server.project_room_events.cursor()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self._write_sse(
+                cursor,
+                {
+                    "schema": PROJECT_ROOM_STREAM_SCHEMA,
+                    "event_id": cursor,
+                    "project_id": project_id,
+                    "emitted_at": utc_now(),
+                    "payload": {
+                        "type": "SNAPSHOT",
+                        "messages": self.server.store.list_room_messages(project_id),
+                    },
+                },
+            )
+            while True:
+                events = self.server.project_room_events.wait(
+                    project_id,
+                    after_event_id=cursor,
+                    timeout_seconds=15.0,
+                )
+                if not events:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                for event in events:
+                    cursor = int(event["event_id"])
+                    self._write_sse(cursor, event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
+    def _write_sse(self, event_id: int, payload: Mapping[str, Any]) -> None:
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        frame = f"id: {event_id}\nevent: project-room\ndata: {body}\n\n"
+        self.wfile.write(frame.encode("utf-8"))
+        self.wfile.flush()
+
     def _send(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -9444,6 +9733,8 @@ def create_server(
     port: int = 0,
     runtime_host: UniverseRuntimeHost | None = None,
     mode_contract: dict[str, Any] | None = None,
+    auto_start_project_masters: bool = True,
+    project_master_provider_factory: Any = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -9462,6 +9753,8 @@ def create_server(
         _required_text(token, "token"),
         runtime_host,
         mode_contract,
+        auto_start_project_masters=auto_start_project_masters,
+        project_master_provider_factory=project_master_provider_factory,
     )
 
 

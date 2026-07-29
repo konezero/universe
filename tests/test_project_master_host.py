@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +19,7 @@ from project_master_host import (  # noqa: E402
     LiveProjectMasterBridgeHost,
     ProjectMasterConversationWorker,
     ProjectMasterSessionStore,
+    ResidentProjectMasterHostManager,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
 
@@ -32,6 +35,14 @@ class FakeProvider:
         return "Project Master answer"
 
 
+class StreamingFakeProvider(FakeProvider):
+    def reply_stream(self, message: Mapping[str, Any], on_delta) -> str:
+        self.messages.append(dict(message))
+        on_delta("Project ")
+        on_delta("Master answer")
+        return "Project Master answer"
+
+
 class ProjectMasterHostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -40,6 +51,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.state = ProjectMasterSessionStore(self.root / "state.sqlite", "GCS")
         self.provider = FakeProvider()
         self.replies: list[dict[str, Any]] = []
+        self.streams: list[dict[str, Any]] = []
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -120,10 +132,63 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(self.root.resolve(), requests[0].cwd)
         self.assertIn("read-only", requests[0].arguments)
 
+    def test_streaming_provider_emits_started_deltas_and_completed(self) -> None:
+        self.provider = StreamingFakeProvider()
+        worker = self._worker()
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(
+            ["STARTED", "DELTA", "DELTA", "COMPLETED"],
+            [item["event"] for item in self.streams],
+        )
+        self.assertEqual(
+            ["Project ", "Master answer"],
+            [item["delta"] for item in self.streams if item["event"] == "DELTA"],
+        )
+        self.assertEqual("Project Master answer", self.replies[0]["body"])
+
+    def test_resident_manager_starts_one_host_per_project(self) -> None:
+        registrations: list[dict[str, Any]] = []
+
+        def register(project_id, value):
+            registrations.append({"project_id": project_id, **dict(value)})
+            return {"project_id": project_id, **dict(value)}, len(registrations) == 1
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: FakeProvider(),
+            )
+            try:
+                first = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                second = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                self.assertTrue(manager.is_resident("GCS"))
+            finally:
+                manager.close()
+
+        self.assertEqual("STARTED", first["status"])
+        self.assertEqual("RESIDENT", second["status"])
+        self.assertEqual(1, len(registrations))
+        self.assertNotIn(registrations[0]["credential_env"], os.environ)
+
     def _worker(self) -> ProjectMasterConversationWorker:
         def post_reply(**values):
             self.replies.append(values)
             return {"status": "PROJECT_MASTER_REPLY_RECORDED"}
+
+        def post_stream(**values):
+            self.streams.append(values)
+            return {"status": "PROJECT_MASTER_STREAM_EVENT_ACCEPTED"}
 
         return ProjectMasterConversationWorker(
             provider=self.provider,
@@ -132,6 +197,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             project_id="GCS",
             bridge_token="bridge-token",
             reply_poster=post_reply,
+            stream_poster=post_stream,
         )
 
     @classmethod

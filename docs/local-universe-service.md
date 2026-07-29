@@ -360,6 +360,25 @@ Universe Project Room
   -> Universe Project Room
 ```
 
+The local application also supplies a lazy resident Host route. When a Project
+Room is called without a usable Bridge, Universe starts one read-only Project
+Master Host for that project, registers its loopback Bridge, and keeps the Host
+resident until the Universe service stops. Later messages reuse the same
+provider session ID and durable Host queue. Opening or selecting a project does
+not start its Host; the first actual Project Master message does.
+
+Project Master response text is emitted as process-local stream events and the
+browser subscribes through:
+
+```text
+GET /v1/projects/<project_id>/room/stream
+```
+
+The stream uses Server-Sent Events. Partial text is transient UI state; only
+the completed Project Master reply is appended to durable Project Room history.
+Client disconnect or stream loss therefore does not change the authoritative
+conversation record.
+
 The binding is registered through:
 
 ```text

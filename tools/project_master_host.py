@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
+import hashlib
 import json
 import os
 import queue
+import secrets
 import sqlite3
+import subprocess  # nosec B404
 import tempfile
 import threading
 import time
@@ -18,6 +22,7 @@ from project_master_bridge import (
     ProjectMasterBridgeHttpServer,
     normalize_bridge_envelope,
     post_master_reply,
+    post_master_stream_event,
     utc_now,
 )
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
@@ -40,7 +45,9 @@ class MasterProvider(Protocol):
 
 
 ReplyPoster = Callable[..., dict[str, Any]]
+StreamPoster = Callable[..., dict[str, Any]]
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
+BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 
 
 class ProjectMasterSessionStore:
@@ -297,6 +304,65 @@ class GrokProjectMasterRuntime:
         self.store.mark_provider_session_initialized()
         return text
 
+    def reply_stream(
+        self,
+        message: Mapping[str, Any],
+        on_delta: Callable[[str], None],
+    ) -> str:
+        executable, environment = _resolve_grok()
+        if executable is None:
+            raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
+        prompt_path = _runtime_tmp() / f"project-master-{uuid4().hex}.txt"
+        prompt_path.write_text(self._prompt(message), encoding="utf-8")
+        initialized = self.store.provider_session_initialized()
+        arguments = [
+            "--no-auto-update",
+            "--no-subagents",
+            "--no-memory",
+            "--disable-web-search",
+            "--permission-mode",
+            "plan",
+            "--sandbox",
+            "read-only",
+            "--max-turns",
+            str(self.max_turns),
+            "--cwd",
+            str(self.project_root),
+            "--system-prompt-override",
+            self._system_prompt(),
+        ]
+        if self.model:
+            arguments.extend(["--model", self.model])
+        if initialized:
+            arguments.extend(["--resume", self.session_id])
+        else:
+            arguments.extend(["--session-id", self.session_id])
+        arguments.extend(
+            [
+                "--prompt-file",
+                str(prompt_path),
+                "--output-format",
+                "streaming-json",
+            ]
+        )
+        try:
+            result = _run_streaming_json(
+                executable=executable,
+                arguments=arguments,
+                cwd=self.project_root,
+                environment=environment,
+                timeout_seconds=300,
+                on_delta=on_delta,
+            )
+        finally:
+            prompt_path.unlink(missing_ok=True)
+        if result.session_id != self.session_id:
+            raise ProjectMasterHostError("GROK_SESSION_ID_MISMATCH")
+        if result.stop_reason != "EndTurn":
+            raise ProjectMasterHostError("GROK_TURN_INCOMPLETE")
+        self.store.mark_provider_session_initialized()
+        return result.text
+
     def _system_prompt(self) -> str:
         return (
             f"You are the Project Master for {self.project_id}. "
@@ -333,6 +399,7 @@ class ProjectMasterConversationWorker:
         project_id: str,
         bridge_token: str,
         reply_poster: ReplyPoster = post_master_reply,
+        stream_poster: StreamPoster = post_master_stream_event,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -340,6 +407,7 @@ class ProjectMasterConversationWorker:
         self.project_id = _text(project_id, "project_id")
         self.bridge_token = _text(bridge_token, "bridge_token")
         self.reply_poster = reply_poster
+        self.stream_poster = stream_poster
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._thread = threading.Thread(
             target=self._run,
@@ -390,12 +458,44 @@ class ProjectMasterConversationWorker:
         message_id = _text(message["message_id"], "message_id")
         if not self.store.claim(message_id):
             return
+        bridge_id = _text(envelope["bridge_id"], "bridge_id")
+        sequence = 0
+
+        def emit(event: str, *, delta: str = "", detail: str = "") -> None:
+            nonlocal sequence
+            sequence += 1
+            try:
+                self.stream_poster(
+                    universe_endpoint=self.universe_endpoint,
+                    project_id=self.project_id,
+                    bridge_id=bridge_id,
+                    in_reply_to=message_id,
+                    event=event,
+                    sequence=sequence,
+                    delta=delta,
+                    detail=detail,
+                    bridge_token=self.bridge_token,
+                    timeout_seconds=5.0,
+                )
+            except Exception:
+                # Streaming is process-local UX evidence. Durable final delivery
+                # remains authoritative when a client disconnects.
+                pass
+
         try:
-            body = self.provider.reply(message)
+            emit("STARTED")
+            stream_reply = getattr(self.provider, "reply_stream", None)
+            if callable(stream_reply):
+                body = stream_reply(
+                    message,
+                    lambda delta: emit("DELTA", delta=delta),
+                )
+            else:
+                body = self.provider.reply(message)
             self.reply_poster(
                 universe_endpoint=self.universe_endpoint,
                 project_id=self.project_id,
-                bridge_id=_text(envelope["bridge_id"], "bridge_id"),
+                bridge_id=bridge_id,
                 in_reply_to=message_id,
                 kind="RESULT",
                 body=body,
@@ -404,8 +504,10 @@ class ProjectMasterConversationWorker:
                 timeout_seconds=10.0,
             )
         except Exception as error:
+            emit("FAILED", detail=f"{type(error).__name__}: {error}")
             self.store.fail(message_id, f"{type(error).__name__}: {error}")
             return
+        emit("COMPLETED")
         self.store.complete(message_id)
 
 
@@ -427,6 +529,249 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
         return receipt
 
 
+@dataclass
+class ResidentProjectMasterHandle:
+    project_id: str
+    endpoint: str
+    credential_env: str
+    bridge_server: ProjectMasterBridgeHttpServer
+    worker: ProjectMasterConversationWorker
+    thread: threading.Thread
+
+    def close(self) -> None:
+        self.bridge_server.shutdown()
+        self.bridge_server.server_close()
+        self.worker.close()
+        self.thread.join(timeout=5)
+        os.environ.pop(self.credential_env, None)
+
+
+class ResidentProjectMasterHostManager:
+    def __init__(
+        self,
+        *,
+        universe_endpoint: str,
+        bridge_registrar: BridgeRegistrar,
+        provider_factory: Callable[
+            [Path, str, ProjectMasterSessionStore], MasterProvider
+        ]
+        | None = None,
+    ) -> None:
+        self.universe_endpoint = universe_endpoint.rstrip("/")
+        self.bridge_registrar = bridge_registrar
+        self.provider_factory = provider_factory or self._default_provider
+        self._handles: dict[str, ResidentProjectMasterHandle] = {}
+        self._lock = threading.RLock()
+
+    def ensure(self, project: Mapping[str, Any]) -> dict[str, Any]:
+        project_id = _text(project.get("project_id"), "project.project_id")
+        project_root = (
+            Path(_text(project.get("project_root"), "project.project_root"))
+            .expanduser()
+            .resolve(strict=True)
+        )
+        with self._lock:
+            handle = self._handles.get(project_id)
+            if handle is not None and handle.thread.is_alive():
+                return {
+                    "status": "RESIDENT",
+                    "project_id": project_id,
+                    "endpoint": handle.endpoint,
+                }
+            if handle is not None:
+                handle.close()
+                self._handles.pop(project_id, None)
+
+            inbox_ref = _resolve_master_inbox(project_root)
+            credential_env = _managed_credential_env(project_id)
+            os.environ[credential_env] = secrets.token_urlsafe(32)
+            store = ProjectMasterSessionStore(
+                _default_state_db(project_id),
+                project_id,
+            )
+            provider = self.provider_factory(project_root, project_id, store)
+            worker = ProjectMasterConversationWorker(
+                provider=provider,
+                store=store,
+                universe_endpoint=self.universe_endpoint,
+                project_id=project_id,
+                bridge_token=os.environ[credential_env],
+            )
+            host = LiveProjectMasterBridgeHost(
+                project_root,
+                os.environ[credential_env],
+                inbox_ref,
+                worker,
+            )
+            server = ProjectMasterBridgeHttpServer(("127.0.0.1", 0), host)
+            endpoint = f"http://127.0.0.1:{server.server_port}"
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name=f"resident-project-master-{project_id}",
+                daemon=True,
+            )
+            worker.start()
+            thread.start()
+            handle = ResidentProjectMasterHandle(
+                project_id=project_id,
+                endpoint=endpoint,
+                credential_env=credential_env,
+                bridge_server=server,
+                worker=worker,
+                thread=thread,
+            )
+            self._handles[project_id] = handle
+            try:
+                bridge, _ = self.bridge_registrar(
+                    project_id,
+                    {
+                        "endpoint": endpoint,
+                        "credential_env": credential_env,
+                        "master_session_ref": provider.session_ref,
+                        "binding_evidence_ref": (
+                            f"universe://resident-project-master/{project_id}/"
+                            f"{provider.session_ref}"
+                        ),
+                    },
+                )
+            except Exception:
+                self._handles.pop(project_id, None)
+                handle.close()
+                raise
+            return {
+                "status": "STARTED",
+                "project_id": project_id,
+                "endpoint": endpoint,
+                "bridge": bridge,
+            }
+
+    def is_resident(self, project_id: str) -> bool:
+        with self._lock:
+            handle = self._handles.get(_text(project_id, "project_id"))
+            return handle is not None and handle.thread.is_alive()
+
+    def close(self) -> None:
+        with self._lock:
+            handles = list(self._handles.values())
+            self._handles.clear()
+        for handle in handles:
+            handle.close()
+
+    @staticmethod
+    def _default_provider(
+        project_root: Path,
+        project_id: str,
+        store: ProjectMasterSessionStore,
+    ) -> MasterProvider:
+        return GrokProjectMasterRuntime(project_root, project_id, store)
+
+
+@dataclass(frozen=True)
+class StreamingTurnResult:
+    text: str
+    session_id: str
+    stop_reason: str
+
+
+def _run_streaming_json(
+    *,
+    executable: Path,
+    arguments: list[str],
+    cwd: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+    on_delta: Callable[[str], None],
+) -> StreamingTurnResult:
+    process_environment = os.environ.copy()
+    process_environment.update(
+        {str(key): str(value) for key, value in environment.items()}
+    )
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = subprocess.Popen(  # nosec B603
+        [str(executable), *arguments],
+        cwd=str(cwd),
+        env=process_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=creation_flags,
+    )
+    lines: queue.Queue[str | None] = queue.Queue()
+    stderr_parts: list[str] = []
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        for part in process.stderr:
+            if sum(len(item) for item in stderr_parts) < 20000:
+                stderr_parts.append(part)
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    text_parts: list[str] = []
+    session_id = ""
+    stop_reason = ""
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise ProjectMasterHostError("GROK_CLI_TIMED_OUT")
+            try:
+                line = lines.get(timeout=min(0.25, remaining))
+            except queue.Empty:
+                if process.poll() is not None and not stdout_thread.is_alive():
+                    break
+                continue
+            if line is None:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ProjectMasterHostError("GROK_STREAM_JSON_INVALID") from error
+            if not isinstance(event, Mapping):
+                raise ProjectMasterHostError("GROK_STREAM_EVENT_INVALID")
+            event_type = event.get("type")
+            if event_type == "text":
+                delta = str(event.get("data") or "")
+                if delta:
+                    text_parts.append(delta)
+                    on_delta(delta)
+            elif event_type == "end":
+                session_id = _text(event.get("sessionId"), "event.sessionId")
+                stop_reason = _text(event.get("stopReason"), "event.stopReason")
+        return_code = process.wait(timeout=max(1.0, deadline - time.monotonic()))
+        if return_code != 0:
+            detail = "".join(stderr_parts).strip()
+            raise ProjectMasterHostError(
+                f"GROK_CLI_FAILED{': ' + detail[:500] if detail else ''}"
+            )
+    finally:
+        if process.poll() is None:
+            process.kill()
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+    if not session_id:
+        raise ProjectMasterHostError("GROK_STREAM_END_MISSING")
+    return StreamingTurnResult(
+        text="".join(text_parts),
+        session_id=session_id,
+        stop_reason=stop_reason,
+    )
+
+
 def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
     grok_home = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).resolve()
     executable = grok_home / "bin" / "grok.exe"
@@ -443,6 +788,19 @@ def _runtime_tmp() -> Path:
 def _default_state_db(project_id: str) -> Path:
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
     return Path(base) / "Universe" / "project-master-host" / f"{project_id}.sqlite"
+
+
+def _resolve_master_inbox(project_root: Path) -> str:
+    for relative in (".ai/inbox/MASTER", ".ai/master/inbox"):
+        candidate = project_root / relative
+        if candidate.is_dir() and not candidate.is_symlink():
+            return relative
+    raise ProjectMasterHostError("MASTER_INBOX_UNAVAILABLE")
+
+
+def _managed_credential_env(project_id: str) -> str:
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:16].upper()
+    return f"UNIVERSE_MANAGED_MASTER_{digest}_TOKEN"
 
 
 def _read_token(environment_name: str) -> str:

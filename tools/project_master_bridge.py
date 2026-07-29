@@ -25,6 +25,7 @@ ROOM_MESSAGE_ID_PATTERN = re.compile(r"^room_[0-9a-f]{32}$")
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 BRIDGE_ID_PATTERN = re.compile(r"^bridge_[0-9a-f]{20,64}$")
 REPLY_KINDS = frozenset({"QUESTION", "REVIEW", "STATUS", "TASK_DRAFT", "RESULT"})
+STREAM_EVENT_KINDS = frozenset({"STARTED", "DELTA", "COMPLETED", "FAILED"})
 MAX_BODY_BYTES = 1024 * 1024
 
 
@@ -54,9 +55,9 @@ class ProjectMasterBridgeHost:
         inbox = self._inbox()
         message_id = normalized["message"]["message_id"]
         target = inbox / f"universe-room-{message_id}.json"
-        content = (json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
-            "utf-8"
-        )
+        content = (
+            json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
         digest = hashlib.sha256(content).hexdigest()
         if target.exists():
             if not target.is_file() or target.is_symlink():
@@ -131,10 +132,17 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
                 raise ProjectMasterBridgeError("MASTER_BRIDGE_BODY_INVALID")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             receipt = self.server.bridge_host.record(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ProjectMasterBridgeError) as error:
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            ProjectMasterBridgeError,
+        ) as error:
             self._send_error(HTTPStatus.BAD_REQUEST, str(error))
             return
-        status = HTTPStatus.CREATED if receipt["status"] == "RECORDED" else HTTPStatus.OK
+        status = (
+            HTTPStatus.CREATED if receipt["status"] == "RECORDED" else HTTPStatus.OK
+        )
         self._send_json(status, receipt)
 
     def log_message(self, _format: str, *_args: object) -> None:
@@ -154,7 +162,11 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
 
 def normalize_bridge_envelope(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
-        "schema", "bridge_id", "project_id", "master_session_ref", "message"
+        "schema",
+        "bridge_id",
+        "project_id",
+        "master_session_ref",
+        "message",
     }:
         raise ProjectMasterBridgeError("MASTER_BRIDGE_ENVELOPE_INVALID")
     if value["schema"] != MASTER_BRIDGE_ENVELOPE_SCHEMA:
@@ -206,7 +218,9 @@ def post_master_reply(
     }
     request = Request(
         f"{origin}/v1/projects/{quote(normalized_project, safe='')}/master-bridge/replies",
-        data=json.dumps(request_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        data=json.dumps(request_payload, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        ),
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -226,6 +240,61 @@ def post_master_reply(
     return payload
 
 
+def post_master_stream_event(
+    *,
+    universe_endpoint: str,
+    project_id: str,
+    bridge_id: str,
+    in_reply_to: str,
+    event: str,
+    sequence: int,
+    bridge_token: str,
+    delta: str = "",
+    detail: str = "",
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    origin = loopback_origin(universe_endpoint, label="universe")
+    normalized_project = _project_id(project_id)
+    normalized_event = _text(event, "event").upper()
+    if normalized_event not in STREAM_EVENT_KINDS:
+        raise ProjectMasterBridgeError("MASTER_STREAM_EVENT_INVALID")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise ProjectMasterBridgeError("MASTER_STREAM_SEQUENCE_INVALID")
+    request_payload = {
+        "bridge_id": _text(bridge_id, "bridge_id"),
+        "in_reply_to": _text(in_reply_to, "in_reply_to"),
+        "event": normalized_event,
+        "sequence": sequence,
+        "delta": str(delta),
+        "detail": str(detail),
+    }
+    request = Request(
+        f"{origin}/v1/projects/{quote(normalized_project, safe='')}/master-bridge/stream",
+        data=json.dumps(
+            request_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Universe-Bridge-Token": _text(bridge_token, "bridge_token"),
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
+            payload = json.loads(response.read().decode("utf-8"))
+            status_code = response.status
+    except HTTPError as error:
+        raise ProjectMasterBridgeError(f"UNIVERSE_STREAM_HTTP_{error.code}") from error
+    except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProjectMasterBridgeError("UNIVERSE_STREAM_UNAVAILABLE") from error
+    if not 200 <= status_code < 300 or not isinstance(payload, dict):
+        raise ProjectMasterBridgeError("UNIVERSE_STREAM_REJECTED")
+    return payload
+
+
 def loopback_origin(value: Any, *, label: str) -> str:
     endpoint = _text(value, "endpoint").rstrip("/")
     parsed = urlsplit(endpoint)
@@ -242,14 +311,18 @@ def loopback_origin(value: Any, *, label: str) -> str:
     try:
         address = ipaddress.ip_address(parsed.hostname)
     except ValueError as error:
-        raise ProjectMasterBridgeError(f"{label.upper()}_ENDPOINT_MUST_BE_LOOPBACK") from error
+        raise ProjectMasterBridgeError(
+            f"{label.upper()}_ENDPOINT_MUST_BE_LOOPBACK"
+        ) from error
     if not address.is_loopback:
         raise ProjectMasterBridgeError(f"{label.upper()}_ENDPOINT_MUST_BE_LOOPBACK")
     return endpoint
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def _project_id(value: Any) -> str:
@@ -266,7 +339,9 @@ def _text(value: Any, field: str) -> str:
 
 
 def _create_file(path: Path, content: bytes) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -276,7 +351,10 @@ def _create_file(path: Path, content: bytes) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            if hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(content).hexdigest():
+            if (
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                != hashlib.sha256(content).hexdigest()
+            ):
                 raise ProjectMasterBridgeError("MASTER_INBOX_DELIVERY_CONFLICT")
         finally:
             temporary.unlink(missing_ok=True)

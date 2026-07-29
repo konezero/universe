@@ -106,6 +106,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server = create_server(
             database_path=temp_root / "universe.sqlite3",
             token=self.token,
+            auto_start_project_masters=False,
             mode_contract=universe_mode_contract(
                 {
                     "owner": "universe",
@@ -911,6 +912,85 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("MASTER_BRIDGE_INVALID", result["error_code"])
+
+    def test_master_bridge_stream_event_is_authenticated_and_published(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, registered = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        bridge = registered["bridge"]
+        cursor = self.server.project_room_events.cursor()
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/stream",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": "room_1234567890abcdef1234567890abcdef",
+                    "event": "DELTA",
+                    "sequence": 2,
+                    "delta": "partial answer",
+                    "detail": "",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+
+        self.assertEqual(202, status)
+        self.assertEqual("PROJECT_MASTER_STREAM_EVENT_ACCEPTED", result["status"])
+        events = self.server.project_room_events.wait(
+            "GCS",
+            after_event_id=cursor,
+            timeout_seconds=0.1,
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
+        self.assertEqual("partial answer", events[0]["payload"]["delta"])
+
+    def test_project_room_stream_starts_with_durable_snapshot(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request(
+            "POST",
+            "/v1/projects/GCS/room/messages",
+            {
+                "kind": "QUESTION",
+                "body": "Stream this room.",
+                "idempotency_key": "room-stream-snapshot-001",
+            },
+            self.token,
+        )
+        request = Request(
+            self.endpoint + "/v1/projects/GCS/room/stream",
+            method="GET",
+        )
+        with urlopen(request, timeout=5) as response:
+            lines = []
+            while True:
+                line = response.readline().decode("utf-8").rstrip("\r\n")
+                if not line:
+                    break
+                lines.append(line)
+
+        data_line = next(line for line in lines if line.startswith("data: "))
+        envelope = json.loads(data_line.removeprefix("data: "))
+        self.assertEqual("SNAPSHOT", envelope["payload"]["type"])
+        self.assertEqual(1, len(envelope["payload"]["messages"]))
+        self.assertEqual(
+            "Stream this room.",
+            envelope["payload"]["messages"][0]["body"],
+        )
 
     def test_release_import_and_project_plan_are_durable_and_read_only(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
