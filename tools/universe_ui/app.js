@@ -17,6 +17,11 @@ const state = {
     routes: [],
     composition: null,
     refinementRequest: null,
+    planningBinding: null,
+    providers: [],
+    refinementRun: null,
+    refinementCandidate: null,
+    refinementAdoption: null,
     adoption: null,
   },
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
@@ -48,6 +53,17 @@ const elements = {
   freshProjectCompositionOutput: document.querySelector("#fresh-project-composition-output"),
   freshProjectRefinement: document.querySelector("#fresh-project-refinement"),
   freshProjectRefinementRef: document.querySelector("#fresh-project-refinement-ref"),
+  planningBindingStatus: document.querySelector("#planning-binding-status"),
+  planningProvider: document.querySelector("#planning-provider"),
+  createPlanningProposal: document.querySelector("#create-planning-proposal"),
+  planningProposal: document.querySelector("#planning-proposal"),
+  planningProposalProvider: document.querySelector("#planning-proposal-provider"),
+  planningProposalDetails: document.querySelector("#planning-proposal-details"),
+  executePlanningProposal: document.querySelector("#execute-planning-proposal"),
+  planningRunStatus: document.querySelector("#planning-run-status"),
+  refinementCandidate: document.querySelector("#refinement-candidate"),
+  refinementComparison: document.querySelector("#refinement-comparison"),
+  adoptRefinementButton: document.querySelector("#adopt-refinement-button"),
   freshProjectAdopted: document.querySelector("#fresh-project-adopted"),
   freshProjectAdoptionRef: document.querySelector("#fresh-project-adoption-ref"),
   freshProjectError: document.querySelector("#fresh-project-error"),
@@ -1352,12 +1368,21 @@ function openFreshProjectWizard() {
     routes: [],
     composition: null,
     refinementRequest: null,
+    planningBinding: null,
+    providers: [],
+    refinementRun: null,
+    refinementCandidate: null,
+    refinementAdoption: null,
     adoption: null,
   };
   elements.freshProjectForm.reset();
   elements.freshProjectRouteList.replaceChildren();
   elements.freshProjectCompositionOutput.replaceChildren();
   elements.freshProjectRefinementRef.textContent = "";
+  elements.planningProvider.replaceChildren();
+  elements.planningProposal.classList.add("hidden");
+  elements.refinementCandidate.classList.add("hidden");
+  elements.planningRunStatus.textContent = "";
   showFreshProjectPanel("intent");
   elements.freshProjectDialog.showModal();
 }
@@ -1516,11 +1541,245 @@ async function prepareFreshProjectRefinement() {
     elements.freshProjectRefinementRef.textContent =
       `${result.request.request_id} · structured output only`;
     showFreshProjectPanel("refinement");
-    toast("Assistant refinement request prepared");
+    await loadFreshProjectPlanningOptions();
+    toast("Planning request prepared");
   } catch (error) {
     elements.freshProjectError.textContent = error.message;
   } finally {
     elements.prepareRefinementButton.disabled = false;
+  }
+}
+
+async function loadFreshProjectPlanningOptions() {
+  const [binding, providers] = await Promise.all([
+    api("/v1/runtime/planning-binding"),
+    api("/v1/runtime/providers"),
+  ]);
+  state.freshProject.planningBinding = binding;
+  state.freshProject.providers = providers.providers || [];
+  elements.planningBindingStatus.textContent =
+    binding.status === "BOUND" ? "RUNTIME BOUND" : "RUNTIME UNBOUND";
+  elements.planningBindingStatus.dataset.status =
+    binding.status === "BOUND" ? "READY" : "UNKNOWN";
+  elements.planningProvider.replaceChildren();
+  for (const provider of state.freshProject.providers) {
+    const option = node(
+      "option",
+      "",
+      `${provider.provider} / ${provider.status}`
+    );
+    option.value = provider.provider;
+    option.disabled = provider.status !== "AVAILABLE";
+    elements.planningProvider.append(option);
+  }
+  const available = state.freshProject.providers.find(
+    (provider) => provider.status === "AVAILABLE"
+  );
+  if (available) elements.planningProvider.value = available.provider;
+  elements.createPlanningProposal.disabled =
+    binding.status !== "BOUND" || !available;
+  if (binding.status !== "BOUND") {
+    elements.planningRunStatus.textContent =
+      "Attach a local Runtime Host before creating a Planning Frame proposal.";
+  } else if (!available) {
+    elements.planningRunStatus.textContent =
+      "No planning provider is currently available.";
+  } else {
+    elements.planningRunStatus.textContent =
+      "Ready to create a proposal. No model has been called.";
+  }
+}
+
+function appendProposalDetail(label, value) {
+  elements.planningProposalDetails.append(
+    node("dt", "", label),
+    node("dd", "", String(value))
+  );
+}
+
+function renderPlanningProposal() {
+  const run = state.freshProject.refinementRun;
+  if (!run) {
+    elements.planningProposal.classList.add("hidden");
+    return;
+  }
+  elements.planningProposal.classList.remove("hidden");
+  elements.planningProposalProvider.textContent =
+    `${run.provider} | ${run.model_ref}`;
+  elements.planningProposalDetails.replaceChildren();
+  appendProposalDetail("Frame", run.frame_id);
+  appendProposalDetail("Turn", `${run.turn_id} / BOSS`);
+  appendProposalDetail("Repository write", run.repository_write_scope);
+  appendProposalDetail("Mutation targets", run.mutation_scope.targets.length);
+  appendProposalDetail("Proposal", run.proposal_id);
+  appendProposalDetail("Plan digest", run.plan_digest);
+  elements.executePlanningProposal.disabled = run.state !== "PROPOSED";
+}
+
+async function createFreshProjectPlanningProposal() {
+  const request = state.freshProject.refinementRequest;
+  if (!request) return;
+  elements.createPlanningProposal.disabled = true;
+  elements.freshProjectError.textContent = "";
+  elements.planningRunStatus.textContent = "Creating exact proposal...";
+  try {
+    const result = await api("/v1/fresh-project-refinement-runs", {
+      method: "POST",
+      body: {
+        request_id: request.request_id,
+        provider: elements.planningProvider.value,
+      },
+    });
+    state.freshProject.refinementRun = result.run;
+    state.freshProject.refinementCandidate = null;
+    elements.refinementCandidate.classList.add("hidden");
+    renderPlanningProposal();
+    elements.planningRunStatus.textContent =
+      "Proposal ready. Provider execution still requires approval.";
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+    elements.planningRunStatus.textContent = "Proposal creation failed.";
+  } finally {
+    elements.createPlanningProposal.disabled = false;
+  }
+}
+
+function comparisonText(value) {
+  if (Array.isArray(value)) {
+    if (!value.length) return "None";
+    return value
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item.technology) return `${item.technology}: ${item.rationale}`;
+        if (item.title) return `${item.role}: ${item.title}`;
+        return JSON.stringify(item);
+      })
+      .join("\n");
+  }
+  return String(value || "Not specified");
+}
+
+function appendRefinementComparison(label, baseValue, candidateValue) {
+  const row = node("article", "refinement-comparison-row");
+  row.append(node("strong", "refinement-comparison-label", label));
+  const base = node("div", "refinement-comparison-value");
+  base.append(
+    node("span", "wizard-kicker", "Current"),
+    node("p", "", comparisonText(baseValue))
+  );
+  const proposed = node("div", "refinement-comparison-value proposed");
+  proposed.append(
+    node("span", "wizard-kicker", "Proposed"),
+    node("p", "", comparisonText(candidateValue))
+  );
+  row.append(base, proposed);
+  elements.refinementComparison.append(row);
+}
+
+function renderRefinementCandidate() {
+  const composition = state.freshProject.composition;
+  const candidate = state.freshProject.refinementCandidate;
+  if (!composition || !candidate) {
+    elements.refinementCandidate.classList.add("hidden");
+    return;
+  }
+  const refinement = candidate.refinement;
+  elements.refinementComparison.replaceChildren();
+  appendRefinementComparison(
+    "Problem statement",
+    composition.specification.problem_statement,
+    refinement.problem_statement
+  );
+  appendRefinementComparison(
+    "Target users",
+    composition.specification.target_users,
+    refinement.target_users
+  );
+  appendRefinementComparison(
+    "Constraints",
+    composition.specification.constraints,
+    refinement.constraints
+  );
+  appendRefinementComparison(
+    "Design direction",
+    composition.design.direction,
+    refinement.design_direction
+  );
+  appendRefinementComparison(
+    "Technology",
+    composition.technology.selected_signals,
+    refinement.technology_recommendations
+  );
+  appendRefinementComparison(
+    "Documents",
+    composition.document_plan,
+    refinement.document_additions
+  );
+  appendRefinementComparison(
+    "Risks",
+    composition.risk_conditions,
+    refinement.risk_additions
+  );
+  elements.refinementCandidate.classList.remove("hidden");
+}
+
+async function executeFreshProjectPlanningProposal() {
+  const run = state.freshProject.refinementRun;
+  if (!run) return;
+  elements.executePlanningProposal.disabled = true;
+  elements.createPlanningProposal.disabled = true;
+  elements.freshProjectError.textContent = "";
+  elements.planningRunStatus.textContent =
+    `Running ${run.provider} in the approved read-only Planning Frame...`;
+  try {
+    const result = await api(
+      `/v1/fresh-project-refinement-runs/${encodeURIComponent(run.run_id)}/execute`,
+      {
+        method: "POST",
+        body: {
+          approval: "APPROVED",
+          proposal_id: run.proposal_id,
+          plan_digest: run.plan_digest,
+        },
+      }
+    );
+    state.freshProject.refinementRun = result.run;
+    state.freshProject.refinementCandidate = result.candidate;
+    renderPlanningProposal();
+    renderRefinementCandidate();
+    elements.planningRunStatus.textContent =
+      "Structured candidate returned. Review changes before adoption.";
+    toast("Planning candidate ready");
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+    elements.planningRunStatus.textContent = "Planning run failed.";
+  } finally {
+    elements.createPlanningProposal.disabled = false;
+  }
+}
+
+async function adoptFreshProjectRefinement() {
+  const candidate = state.freshProject.refinementCandidate;
+  if (!candidate) return;
+  elements.adoptRefinementButton.disabled = true;
+  elements.freshProjectError.textContent = "";
+  try {
+    const result = await api("/v1/fresh-project-refinement-adoptions", {
+      method: "POST",
+      body: {
+        candidate_id: candidate.candidate_id,
+        approval: "ADOPTED",
+      },
+    });
+    state.freshProject.refinementAdoption = result.adoption;
+    state.freshProject.composition = result.composition;
+    renderFreshProjectComposition();
+    showFreshProjectPanel("composition");
+    toast("Revision adopted into the composition");
+  } catch (error) {
+    elements.freshProjectError.textContent = error.message;
+  } finally {
+    elements.adoptRefinementButton.disabled = false;
   }
 }
 
@@ -1661,6 +1920,18 @@ function bindEvents() {
   elements.prepareRefinementButton.addEventListener(
     "click",
     prepareFreshProjectRefinement
+  );
+  elements.createPlanningProposal.addEventListener(
+    "click",
+    createFreshProjectPlanningProposal
+  );
+  elements.executePlanningProposal.addEventListener(
+    "click",
+    executeFreshProjectPlanningProposal
+  );
+  elements.adoptRefinementButton.addEventListener(
+    "click",
+    adoptFreshProjectRefinement
   );
   elements.adoptCompositionButton.addEventListener(
     "click",

@@ -15,6 +15,12 @@ function Require-Text([object]$Value, [string]$Name) {
     return [string]$Value
 }
 
+function Convert-StructuredInput([object]$Value, [string]$Name) {
+    if ($null -eq $Value) { throw "$Name is required." }
+    if ($Value -is [string]) { return Require-Text $Value $Name }
+    return ($Value | ConvertTo-Json -Depth 20 -Compress)
+}
+
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
 if ($request.schema -ne 'universe.grok-worker-request.v1') {
     throw 'Unsupported request schema.'
@@ -30,9 +36,18 @@ $runtimeProfile = if ($null -eq $request.runtime_profile) { 'READ_ONLY' } else {
 if ($runtimeProfile -notin @('READ_ONLY', 'TASK_FRAME_RUNTIME')) {
     throw 'Unsupported Grok runtime profile.'
 }
-$contextPack = Require-Text $request.context_pack 'context_pack'
-$outputContract = Require-Text $request.output_contract 'output_contract'
+$contextPack = Convert-StructuredInput $request.context_pack 'context_pack'
+$outputContract = Convert-StructuredInput $request.output_contract 'output_contract'
 $workerRunRef = Require-Text $request.worker_run_ref 'worker_run_ref'
+$resultMode = if ($null -eq $request.PSObject.Properties['result_mode']) { 'REDACTED' } else { (Require-Text $request.result_mode 'result_mode').ToUpperInvariant() }
+if ($resultMode -notin @('REDACTED', 'STRUCTURED_JSON')) { throw 'Unsupported result mode.' }
+$jsonSchema = ''
+if ($resultMode -eq 'STRUCTURED_JSON') {
+    if ($null -eq $request.output_contract.PSObject.Properties['json_schema']) {
+        throw 'output_contract.json_schema is required for structured Grok output.'
+    }
+    $jsonSchema = Convert-StructuredInput $request.output_contract.json_schema 'output_contract.json_schema'
+}
 $maxTurns = if ($null -eq $request.max_turns) { 3 } else { [int]$request.max_turns }
 if ($maxTurns -lt 1 -or $maxTurns -gt 8) {
     throw 'max_turns must be between 1 and 8.'
@@ -50,14 +65,40 @@ $systemPrompt = if ($runtimeProfile -eq 'TASK_FRAME_RUNTIME') {
 } else {
     'You are a bounded read-only Task Frame worker. You receive all usable context in the supplied Context Pack. Do not inspect local files, execute commands, use network tools, create files, modify files, invoke subagents, or claim authority. Return only the requested result content.'
 }
-$prompt = "Task Frame ID: $(Require-Text $request.task_frame_id 'task_frame_id')`nTurn ID: $(Require-Text $request.turn_id 'turn_id')`n`nContext Pack:`n$contextPack`n`nOutput Contract:`n$outputContract"
+$formatInstruction = if ($resultMode -eq 'STRUCTURED_JSON') { "`nReturn exactly one JSON object matching the Output Contract. Do not use Markdown fences or explanatory text." } else { '' }
+$prompt = "Task Frame ID: $(Require-Text $request.task_frame_id 'task_frame_id')`nTurn ID: $(Require-Text $request.turn_id 'turn_id')`n`nContext Pack:`n$contextPack`n`nOutput Contract:`n$outputContract$formatInstruction"
 
-$raw = & $grokExe --no-auto-update --no-subagents --no-memory --disable-web-search --permission-mode plan --sandbox read-only --max-turns $maxTurns --cwd $env:TEMP --system-prompt-override $systemPrompt -p $prompt --output-format json
+$grokArguments = @(
+    '--no-auto-update',
+    '--no-subagents',
+    '--no-memory',
+    '--disable-web-search',
+    '--permission-mode', 'plan',
+    '--sandbox', 'read-only',
+    '--max-turns', $maxTurns,
+    '--cwd', $env:TEMP,
+    '--system-prompt-override', $systemPrompt,
+    '-p', $prompt
+)
+if ($resultMode -eq 'STRUCTURED_JSON') {
+    $grokArguments += @('--json-schema', $jsonSchema)
+} else {
+    $grokArguments += @('--output-format', 'json')
+}
+$raw = & $grokExe @grokArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Grok CLI failed with exit code $LASTEXITCODE."
 }
 $response = $raw | ConvertFrom-Json
-$text = Require-Text $response.text 'response.text'
+$text = if (
+    $resultMode -eq 'STRUCTURED_JSON' -and
+    $null -ne $response.PSObject.Properties['structuredOutput'] -and
+    $null -ne $response.structuredOutput
+) {
+    Convert-StructuredInput $response.structuredOutput 'response.structuredOutput'
+} else {
+    Require-Text $response.text 'response.text'
+}
 $grokSessionId = Require-Text $response.sessionId 'response.sessionId'
 $requestId = Require-Text $response.requestId 'response.requestId'
 

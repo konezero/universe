@@ -96,6 +96,8 @@ requires the local Bearer token from the state file.
 POST   /v1/projects/register
 GET    /v1/projects
 GET    /v1/runtime/providers
+POST   /v1/runtime/planning-binding
+GET    /v1/runtime/planning-binding
 GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
 POST   /v1/future-paths
@@ -105,6 +107,9 @@ POST   /v1/fresh-project-composition-adoptions
 GET    /v1/fresh-project-composition-adoptions
 POST   /v1/fresh-project-refinement-requests
 GET    /v1/fresh-project-refinement-requests
+POST   /v1/fresh-project-refinement-runs
+GET    /v1/fresh-project-refinement-runs
+POST   /v1/fresh-project-refinement-runs/{run_id}/execute
 POST   /v1/fresh-project-refinement-candidates
 GET    /v1/fresh-project-refinement-candidates
 POST   /v1/fresh-project-refinement-adoptions
@@ -175,12 +180,14 @@ candidates. It does not require a registered repository, persist the intent,
 create a Project Seed, or grant execution authority.
 
 The local web UI exposes that boundary as a Fresh Project Wizard: Intent, Seed
-Routes, Composition, optional assistant-refinement preparation, and Adoption.
-The Wizard calls `future-paths`, `fresh-project-compositions`, and
-`fresh-project-composition-adoptions` without creating a repository or
-registering a Project. Adoption records only a Project Master handoff
-candidate. Installing or connecting the Project and delivering that candidate
-remain later explicit operations.
+Routes, Composition, optional Planning Frame refinement, comparison, and
+Adoption. Proposal creation is model-free. A separate `Approve and run` action
+starts one read-only provider turn only when a process-local Planning Runtime
+binding exists. The returned structured candidate is shown beside the base
+Composition. Adopting that revision creates another Composition proposal; the
+normal Composition adoption remains a separate decision. No step creates a
+repository or registers a Project. Final adoption records only a Project
+Master handoff candidate.
 
 `POST /v1/projects/{project_id}/skill-observations` accepts only a redacted
 ai-career Skill observation candidate. The service rejects raw source,
@@ -291,14 +298,17 @@ NONE` with empty mutation operations and targets. Universe records only redacted
 metadata and receipt references. It never stores a Task Frame endpoint, token,
 Context Pack body, or Worker response body.
 
-A Fresh Project refinement request is different: the Wizard prepares a
-composition-bound `universe.fresh-project-refinement-request.v1`, but it does
-not start a provider or create a Task Frame. The request declares a
-`UNIVERSE_PLANNING_FRAME_REQUIRED` boundary and the exact structured output
-contract. A later bound Planning Frame may submit only a matching
-`universe.fresh-project-refinement-candidate.v1`. Universe validates the
-request and composition digests, provider, worker ID, and result receipt before
-storing the candidate. Raw Worker text is rejected and is never stored.
+A Fresh Project refinement request is different: the Wizard first prepares a
+composition-bound `universe.fresh-project-refinement-request.v1` and exact
+`universe.fresh-project-refinement-worker-output.v1` contract. This step does
+not call a provider. A process-local Runtime binding is then required to create
+one durable `universe.fresh-project-refinement-run.v1` proposal. Exact user
+approval starts its single read-only BOSS turn. The dispatcher parses provider
+text into the Worker output object before the Task Frame journal sees it.
+Universe supplies the bound request, Composition, provider, Worker, and receipt
+coordinates, validates the resulting
+`universe.fresh-project-refinement-candidate.v1`, and stores only that
+structured candidate. Raw Worker text is never persisted.
 
 ## Desktop UI
 
@@ -495,14 +505,15 @@ Task Frame, or grant authority. `POST /v1/fresh-project-composition-adoptions`
 requires explicit `ADOPTED` selection and produces only a later Project Master
 handoff candidate.
 
-The current Wizard uses deterministic Official Seed output. It can prepare a
-separately validated structured refinement request, but a browser click never
-starts a model. A bound Universe Planning Frame must return the exact candidate
-schema with the prepared request and composition digests plus one provider
-result receipt. Explicit refinement `ADOPTED` selection creates a new Fresh
+The current Wizard uses deterministic Official Seed output. It prepares a
+structured refinement request and an exact provider execution proposal before
+showing `Approve and run`; only that second action starts a model. The
+process-local Runtime binding is redacted from the browser and absent from
+SQLite. A completed Planning Frame returns one structured refinement object
+plus bounded provider receipt metadata. The UI compares it with the base
+Composition. Explicit refinement `ADOPTED` selection creates a new Fresh
 Project Composition proposal; it still needs the normal explicit Composition
-adoption before any Project Master handoff. Arbitrary Worker text is not
-persisted as a Composition.
+adoption before any Project Master handoff.
 
 A Project Master handoff only accepts an already adopted Fresh Project
 Composition or project-local Skill Plan. It is recorded as `PROPOSAL_ONLY`.

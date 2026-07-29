@@ -284,12 +284,15 @@ relations remain distinct from observed evidence. Career adoption is separate.
 2. Add Fresh Project intent, specification, design, and route proposal
    contracts. Minimum intent to read-only Official Seed route candidates is
    implemented. The local Fresh Project Wizard now exposes route selection,
-   Composition review, optional refinement-request preparation, and explicit
-   adoption without creating a Project or Task Frame. A refinement request is
-   bound to one Composition digest. Only a matching, validated structured
-   candidate with a provider Worker result receipt may be recorded; explicit
-   selection then creates a revised Composition proposal. Browser preparation
-   never invokes a provider, and raw Worker text is never persisted.
+   Composition review, optional Planning Frame refinement, side-by-side
+   candidate comparison, and explicit adoption without creating a Project.
+   A refinement request is bound to one Composition digest. Proposal creation
+   is model-free; provider execution requires a process-local Runtime binding
+   plus exact `proposal_id` and `plan_digest` approval. One read-only BOSS turn
+   returns a strict Worker output object. Universe binds provider receipt
+   coordinates, records the validated candidate, and explicit selection creates
+   a revised Composition proposal. Raw Worker text is discarded before Task
+   Frame or Universe persistence.
 3. Assemble Context Packs and propose Skill Plans from selected routes.
    Initial Project-local Context Pack assembly, Skill Plan proposal, and
    explicit adoption record are implemented. Cross-project applicability and

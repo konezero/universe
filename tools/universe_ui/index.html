@@ -209,19 +209,56 @@
       </section>
 
       <section id="fresh-project-refinement" class="wizard-panel hidden">
-        <div class="wizard-complete">
-          <span class="wizard-complete-mark" aria-hidden="true">&#10022;</span>
-          <span class="wizard-kicker">Structured refinement</span>
-          <h3>Assistant refinement request prepared</h3>
-          <p id="fresh-project-refinement-ref"></p>
-          <p class="boundary-copy">
-            The browser did not start a model. An approved Universe Planning Frame
-            must return the bound structured candidate before you can adopt a revision.
-          </p>
-          <div class="dialog-actions">
-            <button id="back-to-composition" type="button" class="secondary-button">Back to composition</button>
-            <button type="button" class="primary-button" data-close-dialog>Done</button>
+        <header class="wizard-panel-heading">
+          <div>
+            <span class="wizard-kicker">Universe Planning Frame</span>
+            <h3>Refine the project composition</h3>
+            <p id="fresh-project-refinement-ref" class="boundary-copy"></p>
           </div>
+          <span id="planning-binding-status" class="status-badge" data-status="UNKNOWN">CHECKING</span>
+        </header>
+        <section class="planning-control">
+          <label>
+            Planning provider
+            <select id="planning-provider"></select>
+          </label>
+          <button id="create-planning-proposal" type="button" class="secondary-button">
+            Create proposal
+          </button>
+        </section>
+        <p class="boundary-copy">
+          Proposal creation does not call a model. Provider execution starts only
+          after the exact Planning Frame proposal below is approved.
+        </p>
+        <section id="planning-proposal" class="planning-proposal hidden">
+          <div class="planning-proposal-heading">
+            <div>
+              <span class="wizard-kicker">Exact execution proposal</span>
+              <strong id="planning-proposal-provider"></strong>
+            </div>
+            <span class="status-badge" data-status="PROPOSAL">APPROVAL REQUIRED</span>
+          </div>
+          <dl id="planning-proposal-details" class="planning-proposal-details"></dl>
+          <button id="execute-planning-proposal" type="button" class="primary-button">
+            Approve and run
+          </button>
+        </section>
+        <p id="planning-run-status" class="planning-run-status" aria-live="polite"></p>
+        <section id="refinement-candidate" class="refinement-candidate hidden">
+          <header>
+            <span class="wizard-kicker">Candidate comparison</span>
+            <h3>Base composition and proposed revision</h3>
+          </header>
+          <div id="refinement-comparison" class="refinement-comparison"></div>
+          <div class="dialog-actions">
+            <button id="adopt-refinement-button" type="button" class="primary-button">
+              Adopt revision
+            </button>
+          </div>
+        </section>
+        <div class="dialog-actions">
+          <button id="back-to-composition" type="button" class="secondary-button">Back to composition</button>
+          <button type="button" class="secondary-button" data-close-dialog>Close</button>
         </div>
       </section>
 

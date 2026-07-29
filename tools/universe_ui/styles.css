@@ -34,6 +34,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
   letter-spacing: 0;
@@ -1069,6 +1070,126 @@ dialog label {
   font-size: 22px;
 }
 
+.planning-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.planning-control label {
+  min-width: 0;
+}
+
+.planning-control select {
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-quiet);
+  color: var(--text);
+}
+
+.planning-proposal,
+.refinement-candidate {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(17, 24, 39, 0.78);
+}
+
+.planning-proposal.hidden,
+.refinement-candidate.hidden {
+  display: none;
+}
+
+.planning-proposal-heading,
+.refinement-candidate > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.planning-proposal-heading strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.planning-proposal-details {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  margin: 0;
+  border-top: 1px solid var(--line);
+}
+
+.planning-proposal-details dt,
+.planning-proposal-details dd {
+  min-width: 0;
+  margin: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(64, 83, 110, 0.45);
+  font-size: 10px;
+}
+
+.planning-proposal-details dt {
+  color: var(--muted);
+}
+
+.planning-proposal-details dd {
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.planning-run-status {
+  min-height: 18px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.refinement-comparison {
+  display: grid;
+  max-height: min(430px, calc(100vh - 280px));
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+
+.refinement-comparison-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.28fr) repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.refinement-comparison-label {
+  font-size: 11px;
+}
+
+.refinement-comparison-value {
+  min-width: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--line-strong);
+}
+
+.refinement-comparison-value.proposed {
+  border-left-color: var(--teal);
+}
+
+.refinement-comparison-value p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
 .dialog-actions {
   justify-content: flex-end;
   gap: 8px;
@@ -1272,8 +1393,28 @@ dialog label {
 
   .wizard-grid,
   .composition-node-list,
-  .composition-decisions {
+  .composition-decisions,
+  .refinement-comparison-row {
     grid-template-columns: 1fr;
+  }
+
+  .planning-control {
+    grid-template-columns: 1fr;
+  }
+
+  .planning-control button {
+    width: 100%;
+  }
+
+  .refinement-comparison-value {
+    padding: 8px 0 0;
+    border-top: 2px solid var(--line-strong);
+    border-left: 0;
+  }
+
+  .refinement-comparison-value.proposed {
+    border-top-color: var(--teal);
+    border-left: 0;
   }
 
   .route-list,

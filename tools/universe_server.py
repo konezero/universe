@@ -12,6 +12,7 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import threading
 import uuid
 import webbrowser
 from contextlib import contextmanager
@@ -87,6 +88,11 @@ FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA = (
 FRESH_PROJECT_REFINEMENT_REQUEST_SCHEMA = "universe.fresh-project-refinement-request.v1"
 FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA = "universe.fresh-project-refinement-candidate.v1"
 FRESH_PROJECT_REFINEMENT_ADOPTION_SCHEMA = "universe.fresh-project-refinement-adoption.v1"
+FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA = (
+    "universe.fresh-project-refinement-worker-output.v1"
+)
+FRESH_PROJECT_REFINEMENT_RUN_SCHEMA = "universe.fresh-project-refinement-run.v1"
+PLANNING_RUNTIME_BINDING_SCHEMA = "universe.planning-runtime-binding.v1"
 PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
 PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
     "universe.project-archive-receipt-candidate.v1"
@@ -1243,6 +1249,107 @@ def _normalize_fresh_project_refinement_document(
     }
 
 
+def _normalize_fresh_project_refinement(
+    value: Any, field: str
+) -> dict[str, Any]:
+    refinement = _exact_object_fields(
+        value,
+        field=field,
+        required=frozenset(
+            {
+                "problem_statement",
+                "target_users",
+                "constraints",
+                "design_direction",
+                "technology_recommendations",
+                "document_additions",
+                "risk_additions",
+            }
+        ),
+    )
+    constraints = _string_array(refinement["constraints"], f"{field}.constraints")
+    risk_additions = _string_array(
+        refinement["risk_additions"], f"{field}.risk_additions"
+    )
+    if len(constraints) > 32 or len(risk_additions) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
+            "constraints and risk_additions must contain at most 32 entries",
+        )
+    recommendations = []
+    for index, item in enumerate(
+        _array(
+            refinement["technology_recommendations"],
+            f"{field}.technology_recommendations",
+        )
+    ):
+        recommendation = _exact_object_fields(
+            item,
+            field=f"{field}.technology_recommendations[{index}]",
+            required=frozenset({"technology", "rationale"}),
+        )
+        recommendations.append(
+            {
+                "technology": _required_text(
+                    recommendation["technology"],
+                    f"{field}.technology_recommendations[].technology",
+                ),
+                "rationale": _required_text(
+                    recommendation["rationale"],
+                    f"{field}.technology_recommendations[].rationale",
+                ),
+            }
+        )
+    if len(recommendations) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
+            "technology_recommendations must contain at most 32 entries",
+        )
+    if len({item["technology"] for item in recommendations}) != len(
+        recommendations
+    ):
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_DUPLICATE_TECHNOLOGY",
+            "technology_recommendations must not repeat a technology",
+        )
+    document_additions = [
+        _normalize_fresh_project_refinement_document(
+            item,
+            f"{field}.document_additions[{index}]",
+        )
+        for index, item in enumerate(
+            _array(refinement["document_additions"], f"{field}.document_additions")
+        )
+    ]
+    if len(document_additions) > 32:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
+            "document_additions must contain at most 32 entries",
+        )
+    if len({item["document_id"] for item in document_additions}) != len(
+        document_additions
+    ):
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_DUPLICATE_DOCUMENT",
+            "document_additions must not repeat a document_id",
+        )
+    return {
+        "problem_statement": _required_text(
+            refinement["problem_statement"], f"{field}.problem_statement"
+        ),
+        "target_users": _required_text(
+            refinement["target_users"], f"{field}.target_users"
+        ),
+        "constraints": constraints,
+        "design_direction": _required_text(
+            refinement["design_direction"], f"{field}.design_direction"
+        ),
+        "technology_recommendations": recommendations,
+        "document_additions": document_additions,
+        "risk_additions": risk_additions,
+    }
+
+
 def normalize_fresh_project_refinement_candidate(value: Any) -> dict[str, Any]:
     candidate = _exact_object_fields(
         value,
@@ -1279,103 +1386,10 @@ def normalize_fresh_project_refinement_candidate(value: Any) -> dict[str, Any]:
             "FRESH_PROJECT_REFINEMENT_PROVIDER_INVALID",
             "producer.provider must be a supported Runtime Host provider",
         )
-    refinement = _exact_object_fields(
+    refinement = _normalize_fresh_project_refinement(
         candidate["refinement"],
-        field="fresh_project_refinement_candidate.refinement",
-        required=frozenset(
-            {
-                "problem_statement",
-                "target_users",
-                "constraints",
-                "design_direction",
-                "technology_recommendations",
-                "document_additions",
-                "risk_additions",
-            }
-        ),
+        "fresh_project_refinement_candidate.refinement",
     )
-    constraints = _string_array(
-        refinement["constraints"],
-        "fresh_project_refinement_candidate.refinement.constraints",
-    )
-    risk_additions = _string_array(
-        refinement["risk_additions"],
-        "fresh_project_refinement_candidate.refinement.risk_additions",
-    )
-    if len(constraints) > 32 or len(risk_additions) > 32:
-        raise UniverseError(
-            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
-            "constraints and risk_additions must contain at most 32 entries",
-        )
-    technology_recommendations = []
-    for index, item in enumerate(
-        _array(
-            refinement["technology_recommendations"],
-            "fresh_project_refinement_candidate.refinement.technology_recommendations",
-        )
-    ):
-        technology_recommendations.append(
-            _exact_object_fields(
-                item,
-                field=(
-                    "fresh_project_refinement_candidate.refinement."
-                    f"technology_recommendations[{index}]"
-                ),
-                required=frozenset({"technology", "rationale"}),
-            )
-        )
-    if len(technology_recommendations) > 32:
-        raise UniverseError(
-            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
-            "technology_recommendations must contain at most 32 entries",
-        )
-    normalized_recommendations = [
-        {
-            "technology": _required_text(
-                item["technology"],
-                "fresh_project_refinement_candidate.refinement."
-                "technology_recommendations[].technology",
-            ),
-            "rationale": _required_text(
-                item["rationale"],
-                "fresh_project_refinement_candidate.refinement."
-                "technology_recommendations[].rationale",
-            ),
-        }
-        for item in technology_recommendations
-    ]
-    if len({item["technology"] for item in normalized_recommendations}) != len(
-        normalized_recommendations
-    ):
-        raise UniverseError(
-            "FRESH_PROJECT_REFINEMENT_DUPLICATE_TECHNOLOGY",
-            "technology_recommendations must not repeat a technology",
-        )
-    document_additions = [
-        _normalize_fresh_project_refinement_document(
-            item,
-            "fresh_project_refinement_candidate.refinement."
-            f"document_additions[{index}]",
-        )
-        for index, item in enumerate(
-            _array(
-                refinement["document_additions"],
-                "fresh_project_refinement_candidate.refinement.document_additions",
-            )
-        )
-    ]
-    if len(document_additions) > 32:
-        raise UniverseError(
-            "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
-            "document_additions must contain at most 32 entries",
-        )
-    if len({item["document_id"] for item in document_additions}) != len(
-        document_additions
-    ):
-        raise UniverseError(
-            "FRESH_PROJECT_REFINEMENT_DUPLICATE_DOCUMENT",
-            "document_additions must not repeat a document_id",
-        )
     return {
         "schema": FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA,
         "request_id": _identifier(candidate["request_id"], "request_id"),
@@ -1392,24 +1406,133 @@ def normalize_fresh_project_refinement_candidate(value: Any) -> dict[str, Any]:
                 producer["result_receipt_ref"], "producer.result_receipt_ref"
             ),
         },
-        "refinement": {
-            "problem_statement": _required_text(
-                refinement["problem_statement"],
-                "fresh_project_refinement_candidate.refinement.problem_statement",
-            ),
-            "target_users": _required_text(
-                refinement["target_users"],
-                "fresh_project_refinement_candidate.refinement.target_users",
-            ),
-            "constraints": constraints,
-            "design_direction": _required_text(
-                refinement["design_direction"],
-                "fresh_project_refinement_candidate.refinement.design_direction",
-            ),
-            "technology_recommendations": normalized_recommendations,
-            "document_additions": document_additions,
-            "risk_additions": risk_additions,
-        },
+        "refinement": refinement,
+    }
+
+
+def normalize_fresh_project_refinement_worker_output(value: Any) -> dict[str, Any]:
+    output = _exact_object_fields(
+        value,
+        field="fresh_project_refinement_worker_output",
+        required=frozenset({"schema", "refinement"}),
+    )
+    if output["schema"] != FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_WORKER_SCHEMA_INVALID",
+            "Planning Worker output schema is unsupported",
+        )
+    return {
+        "schema": FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA,
+        "refinement": _normalize_fresh_project_refinement(
+            output["refinement"],
+            "fresh_project_refinement_worker_output.refinement",
+        ),
+    }
+
+
+def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
+    binding = _exact_object_fields(
+        value,
+        field="planning_runtime_binding",
+        required=frozenset(
+            {
+                "schema",
+                "endpoint",
+                "token",
+                "session_id",
+                "origin_anchor_ref",
+                "origin_frame_id",
+                "parent_actor_ref",
+                "parent_evidence_ref",
+                "binding_evidence_ref",
+            }
+        ),
+    )
+    if binding["schema"] != PLANNING_RUNTIME_BINDING_SCHEMA:
+        raise UniverseError(
+            "PLANNING_RUNTIME_BINDING_SCHEMA_INVALID",
+            "Planning Runtime binding schema is unsupported",
+        )
+    endpoint = _required_text(binding["endpoint"], "planning_runtime_binding.endpoint")
+    parsed = urlsplit(endpoint)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise UniverseError(
+            "PLANNING_RUNTIME_ENDPOINT_INVALID",
+            "Planning Runtime endpoint must be loopback HTTP",
+        )
+    return {
+        "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
+        "endpoint": endpoint.rstrip("/"),
+        "token": _required_text(binding["token"], "planning_runtime_binding.token"),
+        "session_id": _required_text(
+            binding["session_id"], "planning_runtime_binding.session_id"
+        ),
+        "origin_anchor_ref": _required_text(
+            binding["origin_anchor_ref"],
+            "planning_runtime_binding.origin_anchor_ref",
+        ),
+        "origin_frame_id": _required_text(
+            binding["origin_frame_id"],
+            "planning_runtime_binding.origin_frame_id",
+        ),
+        "parent_actor_ref": _required_text(
+            binding["parent_actor_ref"],
+            "planning_runtime_binding.parent_actor_ref",
+        ),
+        "parent_evidence_ref": _required_text(
+            binding["parent_evidence_ref"],
+            "planning_runtime_binding.parent_evidence_ref",
+        ),
+        "binding_evidence_ref": _required_text(
+            binding["binding_evidence_ref"],
+            "planning_runtime_binding.binding_evidence_ref",
+        ),
+    }
+
+
+def normalize_fresh_project_refinement_run_request(value: Any) -> dict[str, str]:
+    request = _exact_object_fields(
+        value,
+        field="fresh_project_refinement_run_request",
+        required=frozenset({"request_id", "provider"}),
+    )
+    provider = _required_text(
+        request["provider"], "fresh_project_refinement_run_request.provider"
+    ).upper()
+    if provider not in FRESH_PROJECT_REFINEMENT_PROVIDERS:
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_PROVIDER_INVALID",
+            "provider must be GROK or CODEX",
+        )
+    return {
+        "request_id": _identifier(request["request_id"], "request_id"),
+        "provider": provider,
+    }
+
+
+def normalize_fresh_project_refinement_run_approval(
+    value: Any,
+) -> dict[str, str]:
+    approval = _exact_object_fields(
+        value,
+        field="fresh_project_refinement_run_approval",
+        required=frozenset({"approval", "proposal_id", "plan_digest"}),
+    )
+    if approval["approval"] != "APPROVED":
+        raise UniverseError(
+            "FRESH_PROJECT_REFINEMENT_RUN_APPROVAL_REQUIRED",
+            "approval must be APPROVED before provider execution",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        "approval": "APPROVED",
+        "proposal_id": _identifier(approval["proposal_id"], "proposal_id"),
+        "plan_digest": _required_text(approval["plan_digest"], "plan_digest"),
     }
 
 
@@ -1452,7 +1575,7 @@ def normalize_master_handoff_proposal_request(value: Any) -> dict[str, Any]:
             "MASTER_HANDOFF_SOURCE_INVALID",
             "source.kind must be FRESH_PROJECT_COMPOSITION or SKILL_PLAN",
         )
-    normalized = {
+    normalized: dict[str, Any] = {
         "source": {
             "kind": kind,
             "adoption_id": _identifier(source["adoption_id"], "source.adoption_id"),
@@ -1494,7 +1617,7 @@ def normalize_experience_case_request(value: Any) -> dict[str, Any]:
             "EXPERIENCE_CASE_OBSERVATIONS_INVALID",
             "observation_ids must contain 1..64 unique observed records",
         )
-    normalized = {"observation_ids": sorted(observation_ids)}
+    normalized: dict[str, Any] = {"observation_ids": sorted(observation_ids)}
     if "title" in request:
         normalized["title"] = _required_text(request["title"], "title")
     return normalized
@@ -2248,13 +2371,9 @@ def build_fresh_project_refinement_request(
         "purpose": purpose,
         "context": context,
         "output_contract": {
-            "schema": FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA,
+            "schema": FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA,
             "required": [
-                "request_id",
-                "request_digest",
-                "composition_id",
-                "composition_digest",
-                "producer",
+                "schema",
                 "refinement",
             ],
             "refinement_fields": [
@@ -2267,6 +2386,98 @@ def build_fresh_project_refinement_request(
                 "risk_additions",
             ],
             "raw_worker_text": "FORBIDDEN",
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["schema", "refinement"],
+                "properties": {
+                    "schema": {
+                        "type": "string",
+                        "enum": [FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA],
+                    },
+                    "refinement": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "problem_statement",
+                            "target_users",
+                            "constraints",
+                            "design_direction",
+                            "technology_recommendations",
+                            "document_additions",
+                            "risk_additions",
+                        ],
+                        "properties": {
+                            "problem_statement": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                            "target_users": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                            "constraints": {
+                                "type": "array",
+                                "maxItems": 32,
+                                "uniqueItems": True,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "design_direction": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                            "technology_recommendations": {
+                                "type": "array",
+                                "maxItems": 32,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["technology", "rationale"],
+                                    "properties": {
+                                        "technology": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                        "rationale": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                    },
+                                },
+                            },
+                            "document_additions": {
+                                "type": "array",
+                                "maxItems": 32,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["document_id", "role", "title"],
+                                    "properties": {
+                                        "document_id": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                        "role": {
+                                            "type": "string",
+                                            "enum": sorted(DOCUMENT_ROLES),
+                                        },
+                                        "title": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                    },
+                                },
+                            },
+                            "risk_additions": {
+                                "type": "array",
+                                "maxItems": 32,
+                                "uniqueItems": True,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                        },
+                    },
+                },
+            },
         },
         "runtime_boundary": {
             "repository_write_scope": "NONE",
@@ -2286,6 +2497,45 @@ def build_fresh_project_refinement_request(
     material["request_digest"] = _json_sha256(material)
     material["request_id"] = "refinementreq_" + material["request_digest"][:24]
     material["status"] = "FRESH_PROJECT_REFINEMENT_REQUEST_READY"
+    return material
+
+
+def build_fresh_project_refinement_run(
+    request: dict[str, Any],
+    planning: dict[str, Any],
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    proposal = planning["execution_proposal"]
+    material = {
+        "schema": FRESH_PROJECT_REFINEMENT_RUN_SCHEMA,
+        "run_id": run_id,
+        "request_id": request["request_id"],
+        "request_digest": request["request_digest"],
+        "composition_id": request["composition_id"],
+        "composition_digest": request["composition_digest"],
+        "provider": planning["provider"],
+        "model_ref": planning["model_ref"],
+        "frame_id": planning["frame_id"],
+        "turn_id": planning["turn_id"],
+        "task_frame_execution_proposal": proposal,
+        "proposal_id": proposal["proposal_id"],
+        "plan_digest": proposal["plan_digest"],
+        "approval_required": True,
+        "state": "PROPOSED",
+        "runtime_binding": "PROCESS_LOCAL_REQUIRED",
+        "repository_write_scope": "NONE",
+        "mutation_scope": {"operations": [], "targets": []},
+        "raw_worker_text": "FORBIDDEN",
+        "effects": {
+            "project_source_write": "NONE",
+            "project_seed_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+        },
+        "next_operation": "USER_PROVIDER_EXECUTION_APPROVAL",
+    }
+    material["run_digest"] = _json_sha256(material)
     return material
 
 
@@ -2667,6 +2917,26 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS fresh_project_refinement_request_time
                 ON fresh_project_refinement_request(created_at, request_id);
+
+                CREATE TABLE IF NOT EXISTS fresh_project_refinement_run (
+                    run_id TEXT PRIMARY KEY,
+                    request_id TEXT NOT NULL
+                        REFERENCES fresh_project_refinement_request(request_id)
+                        ON DELETE CASCADE,
+                    run_digest TEXT NOT NULL UNIQUE,
+                    proposal_id TEXT NOT NULL UNIQUE,
+                    plan_digest TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('PROPOSED', 'RUNNING', 'COMPLETED', 'FAILED')),
+                    run_json TEXT NOT NULL,
+                    candidate_id TEXT,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS fresh_project_refinement_run_time
+                ON fresh_project_refinement_run(created_at, run_id);
 
                 CREATE TABLE IF NOT EXISTS fresh_project_refinement_candidate (
                     candidate_id TEXT PRIMARY KEY,
@@ -4245,6 +4515,261 @@ class UniverseStore:
             requests.append(request)
         return requests
 
+    def record_fresh_project_refinement_run(
+        self,
+        request: dict[str, Any],
+        planning: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        material = build_fresh_project_refinement_run(
+            request,
+            planning,
+            run_id=run_id,
+        )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO fresh_project_refinement_run(
+                    run_id, request_id, run_digest, proposal_id, plan_digest,
+                    state, run_json, candidate_id, error_code, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'PROPOSED', ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    material["run_id"],
+                    request["request_id"],
+                    material["run_digest"],
+                    material["proposal_id"],
+                    material["plan_digest"],
+                    _canonical_json(material),
+                    now,
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        material["updated_at"] = now
+        return material
+
+    def get_fresh_project_refinement_run(self, run_id: str) -> dict[str, Any]:
+        normalized_id = _identifier(run_id, "run_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT run_json, state, candidate_id, error_code, created_at, updated_at
+                FROM fresh_project_refinement_run
+                WHERE run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "FRESH_PROJECT_REFINEMENT_RUN_NOT_FOUND",
+                "Universe has no matching Fresh Project refinement run",
+                HTTPStatus.NOT_FOUND,
+            )
+        run = json.loads(row["run_json"])
+        run["state"] = row["state"]
+        run["created_at"] = row["created_at"]
+        run["updated_at"] = row["updated_at"]
+        if row["candidate_id"] is not None:
+            run["candidate_id"] = row["candidate_id"]
+        if row["error_code"] is not None:
+            run["error_code"] = row["error_code"]
+        return run
+
+    def list_fresh_project_refinement_runs(
+        self, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_json, state, candidate_id, error_code, created_at, updated_at
+                FROM fresh_project_refinement_run
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        runs = []
+        for row in rows:
+            run = json.loads(row["run_json"])
+            run["state"] = row["state"]
+            run["created_at"] = row["created_at"]
+            run["updated_at"] = row["updated_at"]
+            if row["candidate_id"] is not None:
+                run["candidate_id"] = row["candidate_id"]
+            if row["error_code"] is not None:
+                run["error_code"] = row["error_code"]
+            runs.append(run)
+        return runs
+
+    def claim_fresh_project_refinement_run(
+        self,
+        run_id: str,
+        approval: dict[str, str],
+    ) -> tuple[dict[str, Any], bool]:
+        normalized_id = _identifier(run_id, "run_id")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT run_json, state, candidate_id, created_at, updated_at
+                FROM fresh_project_refinement_run
+                WHERE run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "FRESH_PROJECT_REFINEMENT_RUN_NOT_FOUND",
+                    "Universe has no matching Fresh Project refinement run",
+                    HTTPStatus.NOT_FOUND,
+                )
+            run = json.loads(row["run_json"])
+            if (
+                approval["proposal_id"] != run["proposal_id"]
+                or approval["plan_digest"] != run["plan_digest"]
+            ):
+                raise UniverseError(
+                    "FRESH_PROJECT_REFINEMENT_RUN_APPROVAL_MISMATCH",
+                    "approval must match the exact stored Planning Frame proposal",
+                    HTTPStatus.CONFLICT,
+                )
+            if row["state"] == "COMPLETED":
+                run["state"] = "COMPLETED"
+                run["candidate_id"] = row["candidate_id"]
+                run["created_at"] = row["created_at"]
+                run["updated_at"] = row["updated_at"]
+                return run, False
+            if row["state"] != "PROPOSED":
+                raise UniverseError(
+                    "FRESH_PROJECT_REFINEMENT_RUN_STATE_INVALID",
+                    f"refinement run is already {row['state']}",
+                    HTTPStatus.CONFLICT,
+                )
+            run["state"] = "RUNNING"
+            run["approved_at"] = now
+            run["approval"] = {
+                "status": "APPROVED",
+                "proposal_id": approval["proposal_id"],
+                "plan_digest": approval["plan_digest"],
+            }
+            updated = connection.execute(
+                """
+                UPDATE fresh_project_refinement_run
+                SET state = 'RUNNING', run_json = ?, error_code = NULL, updated_at = ?
+                WHERE run_id = ? AND state = 'PROPOSED'
+                """,
+                (_canonical_json(run), now, normalized_id),
+            )
+            if updated.rowcount != 1:
+                raise UniverseError(
+                    "FRESH_PROJECT_REFINEMENT_RUN_STATE_CHANGED",
+                    "refinement run changed before execution claim",
+                    HTTPStatus.CONFLICT,
+                )
+        run["created_at"] = row["created_at"]
+        run["updated_at"] = now
+        return run, True
+
+    def complete_fresh_project_refinement_run(
+        self,
+        run_id: str,
+        *,
+        candidate: dict[str, Any],
+        result_receipt_ref: str,
+    ) -> dict[str, Any]:
+        normalized_id = _identifier(run_id, "run_id")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT run_json, state, candidate_id, created_at, updated_at
+                FROM fresh_project_refinement_run
+                WHERE run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "FRESH_PROJECT_REFINEMENT_RUN_NOT_FOUND",
+                    "Universe has no matching Fresh Project refinement run",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["state"] == "COMPLETED":
+                if row["candidate_id"] != candidate["candidate_id"]:
+                    raise UniverseError(
+                        "FRESH_PROJECT_REFINEMENT_RUN_RESULT_CONFLICT",
+                        "refinement run already completed with another candidate",
+                        HTTPStatus.CONFLICT,
+                    )
+                run = json.loads(row["run_json"])
+                run["state"] = "COMPLETED"
+                run["candidate_id"] = row["candidate_id"]
+                run["created_at"] = row["created_at"]
+                run["updated_at"] = row["updated_at"]
+                return run
+            if row["state"] != "RUNNING":
+                raise UniverseError(
+                    "FRESH_PROJECT_REFINEMENT_RUN_STATE_INVALID",
+                    "refinement run must be RUNNING before completion",
+                    HTTPStatus.CONFLICT,
+                )
+            run = json.loads(row["run_json"])
+            run["state"] = "COMPLETED"
+            run["candidate_id"] = candidate["candidate_id"]
+            run["candidate_digest"] = candidate["candidate_digest"]
+            run["result_receipt_ref"] = result_receipt_ref
+            run["completed_at"] = now
+            connection.execute(
+                """
+                UPDATE fresh_project_refinement_run
+                SET state = 'COMPLETED', run_json = ?, candidate_id = ?,
+                    error_code = NULL, updated_at = ?
+                WHERE run_id = ? AND state = 'RUNNING'
+                """,
+                (
+                    _canonical_json(run),
+                    candidate["candidate_id"],
+                    now,
+                    normalized_id,
+                ),
+            )
+        run["created_at"] = row["created_at"]
+        run["updated_at"] = now
+        return run
+
+    def fail_fresh_project_refinement_run(
+        self, run_id: str, *, error_code: str
+    ) -> dict[str, Any]:
+        run = self.get_fresh_project_refinement_run(run_id)
+        if run["state"] != "RUNNING":
+            return run
+        now = utc_now()
+        run["state"] = "FAILED"
+        run["error_code"] = _required_text(error_code, "error_code")
+        run["failed_at"] = now
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE fresh_project_refinement_run
+                SET state = 'FAILED', run_json = ?, error_code = ?, updated_at = ?
+                WHERE run_id = ? AND state = 'RUNNING'
+                """,
+                (
+                    _canonical_json(run),
+                    run["error_code"],
+                    now,
+                    run["run_id"],
+                ),
+            )
+        run["updated_at"] = now
+        return run
+
     def record_fresh_project_refinement_candidate(
         self, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -4616,19 +5141,22 @@ class UniverseStore:
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
         request = normalize_experience_case_request(value)
-        placeholders = ", ".join("?" for _ in request["observation_ids"])
         with self._connection() as connection:
             rows = connection.execute(
-                f"""
+                """
                 SELECT observation_id, project_id, candidate_id, candidate_digest, task_frame_ref,
                        source_ref, observation_digest, skill_binding_digest,
                        skill_id, skill_version, operation_class, context_pack_digest,
                        model_ref, outcome, validation_state, evidence_refs_json,
                        metrics_json, observed_at, recorded_at
                 FROM skill_run_observation
-                WHERE project_id = ? AND observation_id IN ({placeholders})
+                WHERE project_id = ?
+                  AND observation_id IN (SELECT value FROM json_each(?))
                 """,
-                (project["project_id"], *request["observation_ids"]),
+                (
+                    project["project_id"],
+                    _canonical_json(request["observation_ids"]),
+                ),
             ).fetchall()
         observations_by_id = {
             row["observation_id"]: self._skill_observation_row(row) for row in rows
@@ -6875,6 +7403,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.runtime_host = runtime_host or UniverseRuntimeHost(
             Path(__file__).resolve().parents[1]
         )
+        self._planning_binding: dict[str, Any] | None = None
+        self._planning_binding_lock = threading.RLock()
+        self.planning_execution_lock = threading.Lock()
         super().__init__(address, UniverseRequestHandler)
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
@@ -6882,6 +7413,55 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             f"http://{host_text}:{port}"
         )
         self.interface_profiles = (local_http_interface_profile(),)
+
+    def bind_planning_runtime(self, value: Any) -> dict[str, Any]:
+        binding = normalize_planning_runtime_binding(value)
+        binding["bound_at"] = utc_now()
+        with self._planning_binding_lock:
+            self._planning_binding = binding
+        return self.planning_binding_status()
+
+    def planning_binding_status(self) -> dict[str, Any]:
+        with self._planning_binding_lock:
+            binding = (
+                dict(self._planning_binding)
+                if self._planning_binding is not None
+                else None
+            )
+        if binding is None:
+            return {
+                "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
+                "status": "UNBOUND",
+                "persistence": "PROCESS_LOCAL",
+                "provider_execution": "BLOCKED",
+            }
+        evidence = {
+            "session_id": binding["session_id"],
+            "origin_anchor_ref": binding["origin_anchor_ref"],
+            "origin_frame_id": binding["origin_frame_id"],
+            "parent_actor_ref": binding["parent_actor_ref"],
+            "parent_evidence_ref": binding["parent_evidence_ref"],
+            "binding_evidence_ref": binding["binding_evidence_ref"],
+        }
+        return {
+            "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
+            "status": "BOUND",
+            "persistence": "PROCESS_LOCAL",
+            "provider_execution": "USER_APPROVAL_REQUIRED",
+            **evidence,
+            "binding_digest": _json_sha256(evidence),
+            "bound_at": binding["bound_at"],
+        }
+
+    def require_planning_binding(self) -> dict[str, Any]:
+        with self._planning_binding_lock:
+            if self._planning_binding is None:
+                raise UniverseError(
+                    "PLANNING_RUNTIME_BINDING_REQUIRED",
+                    "Planning Frame execution requires a process-local Runtime binding",
+                    HTTPStatus.CONFLICT,
+                )
+            return dict(self._planning_binding)
 
 
 class UniverseRequestHandler(BaseHTTPRequestHandler):
@@ -6917,6 +7497,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "status": "RUNTIME_PROVIDER_CAPABILITIES_COLLECTED",
                     "providers": self.server.runtime_host.provider_capabilities(),
                 },
+            )
+            return
+        if path == "/v1/runtime/planning-binding":
+            self._send(
+                HTTPStatus.OK,
+                self.server.planning_binding_status(),
             )
             return
         if path == "/v1/releases":
@@ -6988,6 +7574,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "FRESH_PROJECT_REFINEMENT_REQUESTS_COLLECTED",
                     "requests": self.server.store.list_fresh_project_refinement_requests(),
+                },
+            )
+            return
+        if path == "/v1/fresh-project-refinement-runs":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FRESH_PROJECT_REFINEMENT_RUNS_COLLECTED",
+                    "runs": self.server.store.list_fresh_project_refinement_runs(),
                 },
             )
             return
@@ -7268,6 +7864,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             body = self._read_json()
+            if path == "/v1/runtime/planning-binding":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.bind_planning_runtime(body),
+                )
+                return
             if path == "/v1/releases/import":
                 release, created = self.server.store.import_release(body)
                 self._send(
@@ -7386,6 +7988,168 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "FRESH_PROJECT_REFINEMENT_REQUEST_ALREADY_RECORDED"
                         ),
                         "request": request,
+                    },
+                )
+                return
+            if path == "/v1/fresh-project-refinement-runs":
+                run_request = normalize_fresh_project_refinement_run_request(body)
+                binding = self.server.require_planning_binding()
+                refinement_request = (
+                    self.server.store.get_fresh_project_refinement_request(
+                        run_request["request_id"]
+                    )
+                )
+                run_id = "planningrun_" + uuid.uuid4().hex[:24]
+                try:
+                    planning = self.server.runtime_host.build_planning_proposal(
+                        runtime_binding=binding,
+                        refinement_request=refinement_request,
+                        provider=run_request["provider"],
+                        run_id=run_id,
+                    )
+                except RuntimeHostError as error:
+                    raise UniverseError(
+                        error.code,
+                        error.detail,
+                        HTTPStatus.CONFLICT,
+                    ) from error
+                run = self.server.store.record_fresh_project_refinement_run(
+                    refinement_request,
+                    planning,
+                    run_id=run_id,
+                )
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FRESH_PROJECT_REFINEMENT_RUN_PROPOSED",
+                        "run": run,
+                    },
+                )
+                return
+            refinement_run_id = self._fresh_project_refinement_run_path(path)
+            if refinement_run_id is not None:
+                approval = normalize_fresh_project_refinement_run_approval(body)
+                binding = self.server.require_planning_binding()
+                with self.server.planning_execution_lock:
+                    run, execute = (
+                        self.server.store.claim_fresh_project_refinement_run(
+                            refinement_run_id,
+                            approval,
+                        )
+                    )
+                    if not execute:
+                        candidate = (
+                            self.server.store.get_fresh_project_refinement_candidate(
+                                run["candidate_id"]
+                            )
+                        )
+                        self._send(
+                            HTTPStatus.OK,
+                            {
+                                "schema": API_SCHEMA,
+                                "status": (
+                                    "FRESH_PROJECT_REFINEMENT_RUN_ALREADY_COMPLETED"
+                                ),
+                                "run": run,
+                                "candidate": candidate,
+                            },
+                        )
+                        return
+                    refinement_request = (
+                        self.server.store.get_fresh_project_refinement_request(
+                            run["request_id"]
+                        )
+                    )
+                    runtime_approval = {
+                        "status": "APPROVED",
+                        "proposal_id": run["proposal_id"],
+                        "plan_digest": run["plan_digest"],
+                        "commander_surface": "universe-ui",
+                        "evidence_ref": (
+                            "universe-ui://fresh-project-refinement-runs/"
+                            + run["run_id"]
+                            + "/approval"
+                        ),
+                    }
+                    try:
+                        result = (
+                            self.server.runtime_host.invoke_structured_planning(
+                                runtime_binding=binding,
+                                run=run,
+                                refinement_request=refinement_request,
+                                approval=runtime_approval,
+                            )
+                        )
+                        worker_output = (
+                            normalize_fresh_project_refinement_worker_output(
+                                result.get("structured_result")
+                            )
+                        )
+                        candidate, candidate_created = (
+                            self.server.store.record_fresh_project_refinement_candidate(
+                                {
+                                    "schema": (
+                                        FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA
+                                    ),
+                                    "request_id": refinement_request["request_id"],
+                                    "request_digest": (
+                                        refinement_request["request_digest"]
+                                    ),
+                                    "composition_id": (
+                                        refinement_request["composition_id"]
+                                    ),
+                                    "composition_digest": (
+                                        refinement_request["composition_digest"]
+                                    ),
+                                    "producer": {
+                                        "provider": run["provider"],
+                                        "model_ref": run["model_ref"],
+                                        "worker_id": _required_text(
+                                            result.get("worker_id"),
+                                            "worker result worker_id",
+                                        ),
+                                        "result_receipt_ref": _required_text(
+                                            result.get("result_receipt_ref"),
+                                            "worker result result_receipt_ref",
+                                        ),
+                                    },
+                                    "refinement": worker_output["refinement"],
+                                }
+                            )
+                        )
+                        run = (
+                            self.server.store.complete_fresh_project_refinement_run(
+                                run["run_id"],
+                                candidate=candidate,
+                                result_receipt_ref=candidate["producer"][
+                                    "result_receipt_ref"
+                                ],
+                            )
+                        )
+                    except RuntimeHostError as error:
+                        self.server.store.fail_fresh_project_refinement_run(
+                            run["run_id"],
+                            error_code=error.code,
+                        )
+                        raise UniverseError(
+                            error.code,
+                            error.detail,
+                            HTTPStatus.CONFLICT,
+                        ) from error
+                    except UniverseError as error:
+                        self.server.store.fail_fresh_project_refinement_run(
+                            run["run_id"],
+                            error_code=error.code,
+                        )
+                        raise
+                self._send(
+                    HTTPStatus.CREATED if candidate_created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FRESH_PROJECT_REFINEMENT_RUN_COMPLETED",
+                        "run": run,
+                        "candidate": candidate,
                     },
                 )
                 return
@@ -7967,6 +8731,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         return release_id
 
     @staticmethod
+    def _fresh_project_refinement_run_path(path: str) -> str | None:
+        prefix = "/v1/fresh-project-refinement-runs/"
+        suffix = "/execute"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        run_id = unquote(path[len(prefix) : -len(suffix)])
+        if not run_id or "/" in run_id:
+            return None
+        return run_id
+
+    @staticmethod
     def _dispatch_path(path: str) -> tuple[str, str] | None:
         prefix = "/v1/dispatches/"
         if not path.startswith(prefix):
@@ -8278,7 +9053,7 @@ def prepare_skill_observation_archive(
             "receipt result_ref is not bound to the requested Project",
             HTTPStatus.CONFLICT,
         )
-    material = {
+    material: dict[str, Any] = {
         "schema": PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA,
         "status": "PROJECT_ARCHIVE_RECEIPT_CANDIDATE_READY",
         "operation_class": "HANDOFF_APPEND",
@@ -8452,7 +9227,7 @@ def main() -> int:
                 selection_ref=args.selection_ref,
                 archive_path=args.archive_path,
             )
-            status = HTTPStatus.OK
+            status: int = HTTPStatus.OK
         else:
             endpoint, token = _connection_options(args)
             if args.command == "register":

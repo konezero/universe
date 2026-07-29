@@ -35,6 +35,15 @@ function Get-CodexCapability {
     }
 }
 
+function Convert-StructuredInput([object]$Value, [string]$Name) {
+    if ($null -eq $Value) { throw "$Name is required." }
+    if ($Value -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($Value)) { throw "$Name is required." }
+        return [string]$Value
+    }
+    return ($Value | ConvertTo-Json -Depth 20 -Compress)
+}
+
 $capability = Get-CodexCapability
 if ($CapabilityOnly) { $capability | ConvertTo-Json -Depth 5; exit 0 }
 if ($capability.status -ne 'AVAILABLE') { $capability | ConvertTo-Json -Depth 5; exit 4 }
@@ -43,12 +52,15 @@ $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
 if ($request.schema -ne 'universe.codex-worker-request.v1') { throw 'Unsupported request schema.' }
 if ([string]$request.repository_write_scope -ne 'NONE') { throw 'Codex worker accepts read-only Task Frame work only.' }
 if ($null -eq $request.mutation_scope -or $request.mutation_scope.operations.Count -ne 0 -or $request.mutation_scope.targets.Count -ne 0) { throw 'Codex worker requires an empty mutation scope.' }
-$contextPack = [string]$request.context_pack
-$outputContract = [string]$request.output_contract
+$contextPack = Convert-StructuredInput $request.context_pack 'context_pack'
+$outputContract = Convert-StructuredInput $request.output_contract 'output_contract'
 if ([string]::IsNullOrWhiteSpace($contextPack) -or [string]::IsNullOrWhiteSpace($outputContract)) { throw 'Context Pack and output contract are required.' }
 $workerRunRef = [string]$request.worker_run_ref
 if ([string]::IsNullOrWhiteSpace($workerRunRef)) { throw 'worker_run_ref is required.' }
-$prompt = "Task Frame ID: $($request.task_frame_id)`nTurn ID: $($request.turn_id)`n`nContext Pack:`n$contextPack`n`nOutput Contract:`n$outputContract"
+$resultMode = if ($null -eq $request.PSObject.Properties['result_mode']) { 'REDACTED' } else { ([string]$request.result_mode).Trim().ToUpperInvariant() }
+if ($resultMode -notin @('REDACTED', 'STRUCTURED_JSON')) { throw 'Unsupported result mode.' }
+$formatInstruction = if ($resultMode -eq 'STRUCTURED_JSON') { "`nReturn exactly one JSON object matching the Output Contract. Do not use Markdown fences or explanatory text." } else { '' }
+$prompt = "Task Frame ID: $($request.task_frame_id)`nTurn ID: $($request.turn_id)`n`nContext Pack:`n$contextPack`n`nOutput Contract:`n$outputContract$formatInstruction"
 $raw = & (Get-CodexCli) exec --json --sandbox read-only --skip-git-repo-check -C $env:TEMP $prompt 2>&1
 if ($LASTEXITCODE -ne 0) { throw 'Codex CLI worker execution failed.' }
 $messages = @()

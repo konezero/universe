@@ -479,6 +479,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
             self.assertIn('id="fresh-project-dialog"', body)
             self.assertIn('id="start-project-button"', body)
+            self.assertIn('id="planning-provider"', body)
+            self.assertIn('id="execute-planning-proposal"', body)
+            self.assertIn('id="refinement-comparison"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
@@ -486,6 +489,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/future-paths", script)
             self.assertIn("/v1/fresh-project-compositions", script)
             self.assertIn("/v1/fresh-project-refinement-requests", script)
+            self.assertIn("/v1/runtime/planning-binding", script)
+            self.assertIn("/v1/fresh-project-refinement-runs", script)
+            self.assertIn("/execute", script)
+            self.assertIn("/v1/fresh-project-refinement-adoptions", script)
             self.assertIn("/v1/fresh-project-composition-adoptions", script)
             self.assertNotIn(self.token, script)
 
@@ -1266,6 +1273,255 @@ class UniverseLocalServiceTests(unittest.TestCase):
             [adoption_result["adoption"]["adoption_id"]],
             [item["adoption_id"] for item in adoptions["adoptions"]],
         )
+
+    def test_planning_frame_run_is_bound_proposed_approved_and_redacted(self) -> None:
+        class FakePlanningRuntimeHost:
+            def __init__(self) -> None:
+                self.invocations = 0
+
+            def provider_capabilities(self) -> list[dict[str, str]]:
+                return [{"provider": "GROK", "status": "AVAILABLE"}]
+
+            def build_planning_proposal(
+                self,
+                *,
+                runtime_binding: dict[str, object],
+                refinement_request: dict[str, object],
+                provider: str,
+                run_id: str,
+            ) -> dict[str, object]:
+                self.binding = runtime_binding
+                self.request = refinement_request
+                proposal_id = "task_frame_proposal_" + run_id[-12:]
+                return {
+                    "provider": provider,
+                    "model_ref": "provider://GROK/model/grok-build",
+                    "frame_id": "fresh-project-planning:" + run_id,
+                    "turn_id": "planning-boss",
+                    "execution_proposal": {
+                        "schema": "ai-career.task-frame-execution-proposal.v2",
+                        "status": "TASK_FRAME_EXECUTION_PROPOSED",
+                        "proposal_id": proposal_id,
+                        "plan_digest": "a" * 64,
+                        "approval_required": True,
+                        "execution_plan": {
+                            "repository_write_scope": "NONE",
+                            "mutation_scope": {"operations": [], "targets": []},
+                        },
+                        "authority_created": False,
+                        "task_frame_started": False,
+                    },
+                }
+
+            def invoke_structured_planning(
+                self,
+                *,
+                runtime_binding: dict[str, object],
+                run: dict[str, object],
+                refinement_request: dict[str, object],
+                approval: dict[str, object],
+            ) -> dict[str, object]:
+                self.invocations += 1
+                self.execution = {
+                    "binding": runtime_binding,
+                    "run": run,
+                    "request": refinement_request,
+                    "approval": approval,
+                }
+                return {
+                    "status": "TURN_COMPLETED",
+                    "provider": "GROK",
+                    "worker_id": "grok-cli:planning-001",
+                    "result_receipt_ref": "grok-cli:planning-001:result-001",
+                    "model_ref": "provider://GROK/model/grok-build",
+                    "repository_write": False,
+                    "structured_result": {
+                        "schema": "universe.fresh-project-refinement-worker-output.v1",
+                        "refinement": {
+                            "problem_statement": "Keep local recovery state explicit.",
+                            "target_users": "Individual trading operator",
+                            "constraints": [
+                                "Local-first only.",
+                                "No raw Worker text persistence.",
+                            ],
+                            "design_direction": (
+                                "Place recoverable state beside live observations."
+                            ),
+                            "technology_recommendations": [
+                                {
+                                    "technology": "structured-local-events",
+                                    "rationale": "Keep evidence queryable.",
+                                }
+                            ],
+                            "document_additions": [
+                                {
+                                    "document_id": "project-observability",
+                                    "role": "EVIDENCE",
+                                    "title": "Operational observation boundaries",
+                                }
+                            ],
+                            "risk_additions": [
+                                "Displayed state can diverge from durable state."
+                            ],
+                        },
+                    },
+                }
+
+        fake = FakePlanningRuntimeHost()
+        self.server.runtime_host = fake
+        _, composition_result = self.request(
+            "POST",
+            "/v1/fresh-project-compositions",
+            {
+                "intent": {
+                    "project": "Local trading workstation",
+                    "kind": "desktop-app",
+                    "technologies": ["python", "pyside6", "sqlite"],
+                    "goal": "stable unattended operation with recoverable state",
+                    "constraints": ["Local-first only."],
+                    "target_users": "Individual trading operator",
+                },
+                "route_id": "durable-desktop-state",
+            },
+            self.token,
+        )
+        composition = composition_result["composition"]
+        _, request_result = self.request(
+            "POST",
+            "/v1/fresh-project-refinement-requests",
+            {"composition_id": composition["composition_id"]},
+            self.token,
+        )
+        refinement_request = request_result["request"]
+        self.assertEqual(
+            "universe.fresh-project-refinement-worker-output.v1",
+            refinement_request["output_contract"]["schema"],
+        )
+        json_schema = refinement_request["output_contract"]["json_schema"]
+        self.assertEqual("object", json_schema["type"])
+        self.assertFalse(json_schema["additionalProperties"])
+        self.assertEqual(
+            [
+                "universe.fresh-project-refinement-worker-output.v1",
+            ],
+            json_schema["properties"]["schema"]["enum"],
+        )
+        self.assertEqual(
+            32,
+            json_schema["properties"]["refinement"]["properties"][
+                "technology_recommendations"
+            ]["maxItems"],
+        )
+
+        status, blocked = self.request(
+            "POST",
+            "/v1/fresh-project-refinement-runs",
+            {"request_id": refinement_request["request_id"], "provider": "GROK"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("PLANNING_RUNTIME_BINDING_REQUIRED", blocked["error_code"])
+
+        runtime_token = "runtime-token-never-persist-41aab"
+        runtime_endpoint = "http://127.0.0.1:41991"
+        status, bound = self.request(
+            "POST",
+            "/v1/runtime/planning-binding",
+            {
+                "schema": "universe.planning-runtime-binding.v1",
+                "endpoint": runtime_endpoint,
+                "token": runtime_token,
+                "session_id": "universe-planning-session",
+                "origin_anchor_ref": "universe-anchor",
+                "origin_frame_id": "current",
+                "parent_actor_ref": "universe-conductor",
+                "parent_evidence_ref": "host://parent/current",
+                "binding_evidence_ref": "host://runtime/binding",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("BOUND", bound["status"])
+        self.assertNotIn("token", bound)
+        self.assertNotIn("endpoint", bound)
+        status, observed_binding = self.request(
+            "GET", "/v1/runtime/planning-binding", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(bound["binding_digest"], observed_binding["binding_digest"])
+
+        status, proposed = self.request(
+            "POST",
+            "/v1/fresh-project-refinement-runs",
+            {"request_id": refinement_request["request_id"], "provider": "GROK"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        run = proposed["run"]
+        self.assertEqual("PROPOSED", run["state"])
+        self.assertEqual("NONE", run["repository_write_scope"])
+        self.assertEqual([], run["mutation_scope"]["targets"])
+        self.assertTrue(run["approval_required"])
+
+        status, rejected = self.request(
+            "POST",
+            f"/v1/fresh-project-refinement-runs/{run['run_id']}/execute",
+            {
+                "approval": "APPROVED",
+                "proposal_id": run["proposal_id"],
+                "plan_digest": "b" * 64,
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "FRESH_PROJECT_REFINEMENT_RUN_APPROVAL_MISMATCH",
+            rejected["error_code"],
+        )
+
+        execution_approval = {
+            "approval": "APPROVED",
+            "proposal_id": run["proposal_id"],
+            "plan_digest": run["plan_digest"],
+        }
+        status, completed = self.request(
+            "POST",
+            f"/v1/fresh-project-refinement-runs/{run['run_id']}/execute",
+            execution_approval,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("COMPLETED", completed["run"]["state"])
+        candidate = completed["candidate"]
+        self.assertEqual(
+            "FRESH_PROJECT_REFINEMENT_CANDIDATE_READY",
+            candidate["status"],
+        )
+        self.assertEqual(1, fake.invocations)
+
+        status, repeated = self.request(
+            "POST",
+            f"/v1/fresh-project-refinement-runs/{run['run_id']}/execute",
+            execution_approval,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "FRESH_PROJECT_REFINEMENT_RUN_ALREADY_COMPLETED",
+            repeated["status"],
+        )
+        self.assertEqual(candidate["candidate_id"], repeated["candidate"]["candidate_id"])
+        self.assertEqual(1, fake.invocations)
+
+        database_bytes = self.server.store.database_path.read_bytes()
+        self.assertNotIn(runtime_token.encode("utf-8"), database_bytes)
+        self.assertNotIn(runtime_endpoint.encode("utf-8"), database_bytes)
+        self.assertNotIn(b"raw worker text marker", database_bytes)
+        status, runs = self.request(
+            "GET", "/v1/fresh-project-refinement-runs", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([run["run_id"]], [item["run_id"] for item in runs["runs"]])
 
     def test_master_handoff_is_proposed_then_explicitly_delivered(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

@@ -3,17 +3,30 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
+# Provider workers use fixed argv lists; shell execution is disabled.
+import subprocess  # nosec B404
+import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 
 RUNTIME_WORKER_REQUEST_SCHEMA = "universe.runtime-worker-invocation-request.v1"
 DISPATCH_REQUEST_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
+RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
+PLANNING_PROFILE = Path(
+    ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
+)
+PLANNING_MODELS = {
+    "GROK": "grok-build",
+    "CODEX": "default",
+}
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,33 @@ def _mapping(value: Any, field: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _loopback_endpoint(value: Any, field: str) -> str:
+    endpoint = _required_text(value, field)
+    parsed = urlsplit(endpoint)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeHostError(
+            "RUNTIME_HOST_ENDPOINT_INVALID",
+            f"{field} has an invalid port",
+        ) from error
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeHostError(
+            "RUNTIME_HOST_ENDPOINT_INVALID",
+            f"{field} must be a loopback HTTP origin",
+        )
+    return endpoint.rstrip("/")
+
+
 def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise RuntimeHostError("RUNTIME_WORKER_REQUEST_INVALID", "request must be an object")
@@ -58,12 +98,7 @@ def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
     provider = _required_text(value.get("provider"), "provider").upper()
     if provider not in SUPPORTED_PROVIDERS:
         raise RuntimeHostError("WORKER_PROVIDER_UNSUPPORTED", "provider is unsupported")
-    endpoint = _required_text(value.get("endpoint"), "endpoint")
-    parsed = urlsplit(endpoint)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
-        raise RuntimeHostError(
-            "RUNTIME_HOST_ENDPOINT_INVALID", "endpoint must be loopback HTTP"
-        )
+    endpoint = _loopback_endpoint(value.get("endpoint"), "endpoint")
     mutation_scope = _mapping(value.get("mutation_scope"), "mutation_scope")
     if (
         value.get("repository_write_scope") != "NONE"
@@ -77,6 +112,14 @@ def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
     max_turns = value.get("max_turns", 1)
     if not isinstance(max_turns, int) or isinstance(max_turns, bool) or not 1 <= max_turns <= 4:
         raise RuntimeHostError("RUNTIME_WORKER_REQUEST_INVALID", "max_turns must be 1..4")
+    result_mode = _required_text(
+        value.get("result_mode", "REDACTED"), "result_mode"
+    ).upper()
+    if result_mode not in RESULT_MODES:
+        raise RuntimeHostError(
+            "RUNTIME_WORKER_REQUEST_INVALID",
+            "result_mode must be REDACTED or STRUCTURED_JSON",
+        )
     return {
         "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
         "invocation_id": _required_text(value.get("invocation_id"), "invocation_id"),
@@ -94,6 +137,7 @@ def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
         "context_pack": _mapping(value.get("context_pack"), "context_pack"),
         "output_contract": _mapping(value.get("output_contract"), "output_contract"),
         "max_turns": max_turns,
+        "result_mode": result_mode,
     }
 
 
@@ -112,6 +156,7 @@ def redacted_invocation_record(value: Mapping[str, Any]) -> dict[str, Any]:
         "context_pack_digest": _digest(request["context_pack"]),
         "output_contract_digest": _digest(request["output_contract"]),
         "max_turns": request["max_turns"],
+        "result_mode": request["result_mode"],
     }
     record["request_digest"] = _digest(record)
     return record
@@ -151,8 +196,301 @@ class UniverseRuntimeHost:
 
     def invoke_read_only(self, value: Mapping[str, Any]) -> dict[str, Any]:
         request = normalize_read_only_request(value)
+        if request["result_mode"] != "REDACTED":
+            raise RuntimeHostError(
+                "RUNTIME_WORKER_REQUEST_INVALID",
+                "invoke_read_only requires result_mode REDACTED",
+            )
         with self._transient_request_file(request) as request_path:
             response = self._invoke_dispatch(["-RequestPath", str(request_path)], timeout=180)
+        return self._invocation_result(request, response)
+
+    def invoke_structured(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        request = normalize_read_only_request(value)
+        if request["result_mode"] != "STRUCTURED_JSON":
+            raise RuntimeHostError(
+                "RUNTIME_WORKER_REQUEST_INVALID",
+                "invoke_structured requires result_mode STRUCTURED_JSON",
+            )
+        with self._transient_request_file(request) as request_path:
+            response = self._invoke_dispatch(["-RequestPath", str(request_path)], timeout=180)
+        result = self._invocation_result(request, response)
+        structured = response.get("structured_result")
+        if not isinstance(structured, Mapping):
+            raise RuntimeHostError(
+                "WORKER_STRUCTURED_RESULT_INVALID",
+                "Runtime Host did not return a structured result object",
+            )
+        result["structured_result"] = dict(structured)
+        result["model_ref"] = _text_or(response.get("model_ref"), "UNKNOWN")
+        return result
+
+    def build_planning_proposal(
+        self,
+        *,
+        runtime_binding: Mapping[str, Any],
+        refinement_request: Mapping[str, Any],
+        provider: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        normalized_provider = _required_text(provider, "provider").upper()
+        capability = self.provider_capability(normalized_provider)
+        if capability["status"] != "AVAILABLE":
+            raise RuntimeHostError(
+                "WORKER_PROVIDER_UNAVAILABLE",
+                capability.get("reason", "selected provider is unavailable"),
+            )
+        model = PLANNING_MODELS[normalized_provider]
+        frame_id = f"fresh-project-planning:{_required_text(run_id, 'run_id')}"
+        turn_id = "planning-boss"
+        request_id = _required_text(refinement_request.get("request_id"), "request_id")
+        source_ref = f"universe://fresh-project-refinement/{request_id}"
+        execution_plan: dict[str, Any] = {
+            "profile_id": "task-frame-debate-v1",
+            "requested_shape": "DEBATE",
+            "resolved_shape": "DEBATE",
+            "model_mode": "EXPLICIT",
+            "frame_id": frame_id,
+            "origin_anchor_ref": _required_text(
+                runtime_binding.get("origin_anchor_ref"), "origin_anchor_ref"
+            ),
+            "origin_session_id": _required_text(
+                runtime_binding.get("session_id"), "session_id"
+            ),
+            "origin_frame_id": _required_text(
+                runtime_binding.get("origin_frame_id"), "origin_frame_id"
+            ),
+            "task_summary_ref": source_ref + "#planning",
+            "source_ref": source_ref,
+            "candidate_source_ref": "NONE",
+            "source_review_result": None,
+            "parent_actor_ref": _required_text(
+                runtime_binding.get("parent_actor_ref"), "parent_actor_ref"
+            ),
+            "commander_surface": "universe-ui",
+            "execution_assignment_ref": "UNASSIGNED",
+            "host_worker_capability": "AVAILABLE",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "fallback_reason": "NONE",
+            "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
+            "turns": [
+                {
+                    "turn_id": turn_id,
+                    "role": "BOSS",
+                    "worker_slot_ref": "planning-boss-slot",
+                    "provider": normalized_provider,
+                    "model": model,
+                    "reasoning_effort": "standard",
+                }
+            ],
+        }
+        with self._transient_json_file(
+            {"execution_plan": execution_plan},
+            prefix="planning-proposal-",
+        ) as request_path:
+            response = self._invoke_json_command(
+                [
+                    sys.executable,
+                    str(
+                        self.repository_root
+                        / ".ai"
+                        / "runtime"
+                        / "reference_runtime"
+                        / "cli.py"
+                    ),
+                    "task-frame",
+                    "propose",
+                    "--repo-root",
+                    str(self.repository_root),
+                    "--profile",
+                    str(PLANNING_PROFILE),
+                    "--request",
+                    str(request_path),
+                ],
+                timeout=30,
+            )
+        proposal = response.get("execution_proposal")
+        if not isinstance(proposal, Mapping):
+            raise RuntimeHostError(
+                "TASK_FRAME_PROPOSAL_INVALID",
+                "Task Frame CLI did not return an execution proposal",
+            )
+        return {
+            "provider": normalized_provider,
+            "model_ref": (
+                f"provider://{normalized_provider}/model/{model}"
+            ),
+            "frame_id": frame_id,
+            "turn_id": turn_id,
+            "execution_proposal": dict(proposal),
+        }
+
+    def invoke_structured_planning(
+        self,
+        *,
+        runtime_binding: Mapping[str, Any],
+        run: Mapping[str, Any],
+        refinement_request: Mapping[str, Any],
+        approval: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        endpoint = _loopback_endpoint(runtime_binding.get("endpoint"), "endpoint")
+        token = _required_text(runtime_binding.get("token"), "token")
+        session_id = _required_text(runtime_binding.get("session_id"), "session_id")
+        frame_id = _required_text(run.get("frame_id"), "frame_id")
+        turn_id = _required_text(run.get("turn_id"), "turn_id")
+        execution_proposal = _mapping(
+            run.get("task_frame_execution_proposal"),
+            "task_frame_execution_proposal",
+        )
+        request_id = _required_text(refinement_request.get("request_id"), "request_id")
+        created = False
+        try:
+            created_result = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/create",
+                {
+                    "session_id": session_id,
+                    "profile": str(PLANNING_PROFILE),
+                    "frame": {
+                        "frame_id": frame_id,
+                        "origin_anchor_ref": _required_text(
+                            runtime_binding.get("origin_anchor_ref"),
+                            "origin_anchor_ref",
+                        ),
+                        "origin_session_id": session_id,
+                        "origin_frame_id": _required_text(
+                            runtime_binding.get("origin_frame_id"),
+                            "origin_frame_id",
+                        ),
+                        "task_summary_ref": (
+                            f"universe://fresh-project-refinement/{request_id}#planning"
+                        ),
+                        "source_ref": (
+                            f"universe://fresh-project-refinement/{request_id}"
+                        ),
+                        "execution_assignment_ref": "UNASSIGNED",
+                        "task_frame_execution_proposal": execution_proposal,
+                        "task_frame_execution_approval": dict(approval),
+                        "parent_instruction": {
+                            "instruction_id": f"instruction:{run['run_id']}",
+                            "user_instruction_raw": (
+                                "Refine the prepared Fresh Project composition "
+                                "within the supplied structured contract."
+                            ),
+                            "constraints": [
+                                "READ_ONLY",
+                                "NO_REPOSITORY_ACCESS",
+                                "STRUCTURED_JSON_ONLY",
+                            ],
+                            "expected_output": refinement_request["output_contract"],
+                            "repository_write_scope": "NONE",
+                            "mutation_scope": {"operations": [], "targets": []},
+                        },
+                        "parent_observation": {
+                            "status": "MATCHED",
+                            "evidence_ref": _required_text(
+                                runtime_binding.get("parent_evidence_ref"),
+                                "parent_evidence_ref",
+                            ),
+                        },
+                        "observed_at": _utc_now(),
+                    },
+                },
+            )
+            if created_result.get("status") != "TASK_FRAME_HOST_ACTIVE":
+                raise RuntimeHostError(
+                    "TASK_FRAME_CREATE_FAILED",
+                    _text_or(created_result.get("status"), "Task Frame create failed"),
+                )
+            created = True
+            declared = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/operation",
+                {
+                    "session_id": session_id,
+                    "frame_id": frame_id,
+                    "operation": {
+                        "operation": "declare_turns",
+                        "turns": [{"turn_id": turn_id, "role": "BOSS"}],
+                        "observed_at": _utc_now(),
+                    },
+                },
+            )
+            if (
+                declared.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+                or not isinstance(declared.get("output"), Mapping)
+                or declared["output"].get("status") != "TASK_TURNS_DECLARED"
+            ):
+                raise RuntimeHostError(
+                    "TASK_FRAME_TURN_DECLARATION_FAILED",
+                    "Planning Frame turn declaration failed",
+                )
+            result = self.invoke_structured(
+                {
+                    "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
+                    "invocation_id": f"planning:{run['run_id']}",
+                    "provider": run["provider"],
+                    "endpoint": endpoint,
+                    "token": token,
+                    "session_id": session_id,
+                    "frame_id": frame_id,
+                    "turn_id": turn_id,
+                    "invoker_actor_ref": runtime_binding["parent_actor_ref"],
+                    "repository_write_scope": "NONE",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "context_pack": {
+                        "schema": refinement_request["schema"],
+                        "request_id": request_id,
+                        "request_digest": refinement_request["request_digest"],
+                        "composition_id": refinement_request["composition_id"],
+                        "composition_digest": refinement_request["composition_digest"],
+                        "purpose": refinement_request["purpose"],
+                        "context": refinement_request["context"],
+                    },
+                    "output_contract": refinement_request["output_contract"],
+                    "max_turns": 1,
+                    "result_mode": "STRUCTURED_JSON",
+                }
+            )
+            packet = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/operation",
+                {
+                    "session_id": session_id,
+                    "frame_id": frame_id,
+                    "operation": {"operation": "build_result_packet"},
+                },
+            )
+            if (
+                packet.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+                or not isinstance(packet.get("output"), Mapping)
+                or packet["output"].get("status") != "RESULT_PACKET_BUILT"
+            ):
+                raise RuntimeHostError(
+                    "TASK_FRAME_RESULT_PACKET_FAILED",
+                    "Planning Frame Result Packet was not built",
+                )
+            return result
+        finally:
+            if created:
+                try:
+                    self._post_runtime(
+                        endpoint,
+                        token,
+                        "/v1/task-frame/close",
+                        {"session_id": session_id, "frame_id": frame_id},
+                    )
+                except RuntimeHostError:
+                    pass
+
+    @staticmethod
+    def _invocation_result(
+        request: Mapping[str, Any], response: Mapping[str, Any]
+    ) -> dict[str, Any]:
         observation_count = response.get("skill_run_observation_count", 0)
         if (
             isinstance(observation_count, bool)
@@ -178,17 +516,25 @@ class UniverseRuntimeHost:
         }
 
     def _invoke_dispatch(self, arguments: list[str], *, timeout: int) -> dict[str, Any]:
+        return self._invoke_json_command(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(self.dispatcher),
+                *arguments,
+            ],
+            timeout=timeout,
+        )
+
+    def _invoke_json_command(
+        self, command: list[str], *, timeout: int
+    ) -> dict[str, Any]:
         try:
             completed = self.runner(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(self.dispatcher),
-                    *arguments,
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -220,29 +566,79 @@ class UniverseRuntimeHost:
             raise RuntimeHostError(
                 "RUNTIME_HOST_RESPONSE_INVALID", "Runtime Host JSON must be an object"
             )
+        if returncode:
+            code = _text_or(
+                result.get("status"),
+                "RUNTIME_HOST_TRANSPORT_FAILED",
+            )
+            reason = _text_or(result.get("reason"), code)
+            stage = result.get("stage")
+            detail = (
+                f"{stage}: {reason}"
+                if isinstance(stage, str) and stage
+                else reason
+            )
+            raise RuntimeHostError(code, detail)
         return result
 
+    @staticmethod
+    def _post_runtime(
+        endpoint: str,
+        token: str,
+        path: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        request = Request(
+            endpoint.rstrip("/") + path,
+            data=_canonical_json(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Anchor-Session-Memory-Token": token,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=120) as response:  # nosec B310
+                value = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeHostError("RUNTIME_HOST_UNAVAILABLE", str(error)) from error
+        if not isinstance(value, dict):
+            raise RuntimeHostError(
+                "RUNTIME_HOST_RESPONSE_INVALID",
+                "Runtime Host HTTP response must be an object",
+            )
+        return value
+
     def _transient_request_file(self, request: Mapping[str, Any]) -> "_TransientRequestFile":
+        dispatch_request = {
+            **request,
+            "schema": DISPATCH_REQUEST_SCHEMA,
+        }
+        return self._transient_json_file(
+            dispatch_request,
+            prefix="runtime-worker-",
+        )
+
+    @staticmethod
+    def _transient_json_file(
+        value: Mapping[str, Any], *, prefix: str
+    ) -> "_TransientRequestFile":
         root = Path(
             os.environ.get("LOCALAPPDATA")
             or os.environ.get("TEMP")
             or tempfile.gettempdir()
         ) / "Universe" / "runtime-tmp"
         root.mkdir(parents=True, exist_ok=True)
-        dispatch_request = {
-            **request,
-            "schema": DISPATCH_REQUEST_SCHEMA,
-        }
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             suffix=".json",
-            prefix="runtime-worker-",
+            prefix=prefix,
             dir=root,
             delete=False,
         ) as handle:
             json.dump(
-                dispatch_request,
+                value,
                 handle,
                 ensure_ascii=False,
                 sort_keys=True,
@@ -265,3 +661,7 @@ class _TransientRequestFile:
 
 def _text_or(value: Any, fallback: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()

@@ -50,6 +50,38 @@ The local Universe service can query provider capability through
 `GET /v1/runtime/providers` and invoke one active Task Frame turn through
 `POST /v1/projects/{project_id}/runtime-worker-invocations`.
 
+Fresh Project planning uses a separate process-local binding:
+
+```text
+POST /v1/runtime/planning-binding
+GET  /v1/runtime/planning-binding
+```
+
+The Host supplies the active loopback Session Boot endpoint, token, session,
+Anchor, frame, Parent actor, and evidence references. Universe keeps the full
+binding only in process memory. The GET response is redacted, and SQLite never
+receives the endpoint or token. Restarting Universe returns the binding to
+`UNBOUND`; a Host must attach it again.
+
+`POST /v1/fresh-project-refinement-runs` creates an exact, durable one-turn
+Planning Frame proposal without invoking a model. The proposal fixes the
+provider, model, BOSS turn, read-only repository boundary, request digest, and
+Composition digest. Only
+`POST /v1/fresh-project-refinement-runs/{run_id}/execute` with matching
+`proposal_id` and `plan_digest` starts the provider.
+
+Planning adapters return text only to the dispatcher process. In
+`STRUCTURED_JSON` mode the dispatcher parses that text before submitting the
+Worker envelope, requires one JSON object, and discards the raw text. The Task
+Frame journal and Universe database receive only the validated structured
+object and bounded provider receipt metadata.
+
+Fresh Project requests also carry an explicit JSON Schema. The Grok adapter
+passes it through the CLI `--json-schema` option so the provider is constrained
+before dispatcher validation. A failed adapter response preserves its bounded
+`status`, `stage`, and `reason`; raw response text still does not cross the
+Runtime Host boundary.
+
 The POST body carries a current loopback Task Frame endpoint and token only for
 the duration of that request. Universe persists a redacted invocation timeline:
 provider, session/frame/turn identifiers, request/context/output digests, status,

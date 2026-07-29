@@ -64,6 +64,12 @@ if ([string]::IsNullOrWhiteSpace($RequestPath)) { throw 'RequestPath is required
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
 if ($request.schema -ne 'universe.task-frame-worker-dispatch-request.v1') { throw 'Unsupported dispatch request schema.' }
 $dispatchProvider = [string]$request.provider
+$resultMode = if ($null -eq $request.PSObject.Properties['result_mode']) {
+    'REDACTED'
+} else {
+    ([string]$request.result_mode).Trim().ToUpperInvariant()
+}
+if ($resultMode -notin @('REDACTED', 'STRUCTURED_JSON')) { throw 'Unsupported result mode.' }
 $stage = 'CAPABILITY_CHECK'
 $capability = Get-ProviderCapability $dispatchProvider
 if ($capability.status -ne 'AVAILABLE') { [ordered]@{ status='WORKER_INVOCATION_UNAVAILABLE'; provider=$dispatchProvider; capability=$capability; repository_write=$false } | ConvertTo-Json -Depth 8; exit 4 }
@@ -90,7 +96,7 @@ if ($null -ne $plannedInvocation.PSObject.Properties['input_bundle']) {
 $callId = [guid]::NewGuid().ToString('N')
 $workerRunRef = "universe-runtime-host:$callId"
 $adapterRequestPath = Join-Path $runtimeTmp "worker-dispatch-$callId.json"
-$adapterRequest = [ordered]@{ task_frame_id=$request.frame_id; turn_id=$request.turn_id; worker_run_ref=$workerRunRef; repository_write_scope='NONE'; mutation_scope=[ordered]@{ operations=@(); targets=@() }; context_pack=$request.context_pack; output_contract=$request.output_contract; max_turns=$request.max_turns }
+$adapterRequest = [ordered]@{ task_frame_id=$request.frame_id; turn_id=$request.turn_id; worker_run_ref=$workerRunRef; repository_write_scope='NONE'; mutation_scope=[ordered]@{ operations=@(); targets=@() }; context_pack=$request.context_pack; output_contract=$request.output_contract; max_turns=$request.max_turns; result_mode=$resultMode }
 if ($dispatchProvider.Trim().ToUpperInvariant() -eq 'GROK') { $adapterRequest.schema='universe.grok-worker-request.v1'; $adapterRequest.runtime_profile='TASK_FRAME_RUNTIME'; $adapter = Join-Path $repositoryRoot 'tools\universe_runtime_host_grok_invoke.ps1' } else { $adapterRequest.schema='universe.codex-worker-request.v1'; $adapter = Join-Path $repositoryRoot 'tools\universe_runtime_host_codex_worker.ps1' }
 $stage = 'WORKER_ADAPTER'
 $adapterStopwatch = [Diagnostics.Stopwatch]::StartNew()
@@ -102,8 +108,28 @@ try {
     $adapterStopwatch.Stop()
     Remove-Item -LiteralPath $adapterRequestPath -Force -ErrorAction SilentlyContinue
 }
-if ($worker.status -ne 'COMPLETED') { [ordered]@{ status='WORKER_PROVIDER_FAILED'; provider=$dispatchProvider; worker=$worker; repository_write=$false } | ConvertTo-Json -Depth 12; exit 4 }
+if ($worker.status -ne 'COMPLETED') { [ordered]@{ status='WORKER_PROVIDER_FAILED'; provider=$dispatchProvider; reason='WORKER_DID_NOT_COMPLETE'; repository_write=$false } | ConvertTo-Json -Depth 6; exit 4 }
 if ([string]$worker.worker_run_ref -ne $workerRunRef) { [ordered]@{ status='WORKER_RUN_REF_MISMATCH'; provider=$dispatchProvider; repository_write=$false } | ConvertTo-Json -Depth 6; exit 4 }
+$recordedResult = $worker.result
+$structuredResult = $null
+if ($resultMode -eq 'STRUCTURED_JSON') {
+    $workerText = if ($null -eq $worker.result) { '' } else { [string]$worker.result.text }
+    if ([string]::IsNullOrWhiteSpace($workerText)) {
+        [ordered]@{ status='WORKER_STRUCTURED_RESULT_INVALID'; provider=$dispatchProvider; reason='WORKER_RESULT_TEXT_MISSING'; repository_write=$false } | ConvertTo-Json -Depth 6
+        exit 4
+    }
+    try {
+        $structuredResult = $workerText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        [ordered]@{ status='WORKER_STRUCTURED_RESULT_INVALID'; provider=$dispatchProvider; reason='WORKER_RESULT_JSON_INVALID'; repository_write=$false } | ConvertTo-Json -Depth 6
+        exit 4
+    }
+    if ($null -eq $structuredResult -or $structuredResult -is [Array] -or $structuredResult -is [string] -or $structuredResult -is [ValueType]) {
+        [ordered]@{ status='WORKER_STRUCTURED_RESULT_INVALID'; provider=$dispatchProvider; reason='WORKER_RESULT_OBJECT_REQUIRED'; repository_write=$false } | ConvertTo-Json -Depth 6
+        exit 4
+    }
+    $recordedResult = $structuredResult
+}
 $stage = 'TASK_FRAME_CLAIM'
 $claimPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; operation=[ordered]@{ operation='claim_turn'; turn_id=$request.turn_id; worker_id=$worker.worker_id; worker_run_ref=$workerRunRef; capability_evidence_ref=$capability.capability_evidence_ref; invoker_actor_ref=$request.invoker_actor_ref; observed_at=(Get-Date).ToUniversalTime().ToString('o') } }
 $claim = Invoke-HostPost $request.endpoint $request.token '/v1/task-frame/operation' $claimPayload
@@ -135,10 +161,14 @@ foreach ($binding in $skillBindings) {
         }
     }
 }
-$envelope = [ordered]@{ turn_id=$request.turn_id; worker_id=$worker.worker_id; worker_run_ref=$workerRunRef; result_receipt_ref=$worker.result_receipt_ref; status=$worker.status; evidence_refs=@($worker.result_receipt_ref); result=$worker.result; review_decision='' }
+$envelope = [ordered]@{ turn_id=$request.turn_id; worker_id=$worker.worker_id; worker_run_ref=$workerRunRef; result_receipt_ref=$worker.result_receipt_ref; status=$worker.status; evidence_refs=@($worker.result_receipt_ref); result=$recordedResult; review_decision='' }
 if ($skillRunObservations.Count -gt 0) {
     $envelope['skill_run_observations'] = @($skillRunObservations)
 }
 $resultPayload = [ordered]@{ session_id=$request.session_id; frame_id=$request.frame_id; envelope=$envelope; observed_at=(Get-Date).ToUniversalTime().ToString('o') }
 $result = Invoke-HostPost $request.endpoint $request.token '/v1/task-frame/worker-result' $resultPayload
-[ordered]@{ status=$result.status; provider=$dispatchProvider; worker_id=$worker.worker_id; result_receipt_ref=$worker.result_receipt_ref; skill_run_observation_count=$skillRunObservations.Count; repository_write=$false; runtime_result=$result } | ConvertTo-Json -Depth 16
+$response = [ordered]@{ status=$result.status; provider=$dispatchProvider; model_ref=$modelRef; worker_id=$worker.worker_id; result_receipt_ref=$worker.result_receipt_ref; skill_run_observation_count=$skillRunObservations.Count; repository_write=$false; runtime_result=$result }
+if ($resultMode -eq 'STRUCTURED_JSON') {
+    $response['structured_result'] = $structuredResult
+}
+$response | ConvertTo-Json -Depth 16

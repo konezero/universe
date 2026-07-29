@@ -38,9 +38,15 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
         self.assertIn("result_receipt_ref", dispatcher)
         self.assertIn("skill_run_observations", dispatcher)
         self.assertIn("validation_state = 'NOT_RUN'", dispatcher)
+        self.assertIn("STRUCTURED_JSON", dispatcher)
+        self.assertIn("$recordedResult = $structuredResult", dispatcher)
+        self.assertNotIn("worker=$worker", dispatcher)
         self.assertIn('"provider://$providerSegment/model/$modelSegment"', dispatcher)
         self.assertNotIn("host_invocation_receipt_ref", dispatcher)
         self.assertNotIn("host_result_evidence_ref", dispatcher)
+        grok_worker = (ROOT / expected[2]).read_text(encoding="utf-8")
+        self.assertIn("'--json-schema', $jsonSchema", grok_worker)
+        self.assertIn("response.structuredOutput", grok_worker)
 
     def test_installed_codex_adapter_does_not_declare_universe_worker(self) -> None:
         adapter = json.loads(
@@ -86,6 +92,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1:17777", encoded)
         self.assertNotIn("read only", encoded)
         self.assertIn("context_pack_digest", record)
+        self.assertEqual("REDACTED", record["result_mode"])
 
     def test_write_scope_is_rejected_before_dispatch(self) -> None:
         request = self.request()
@@ -131,6 +138,95 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             "universe.task-frame-worker-dispatch-request.v1",
             dispatched_request["schema"],
         )
+        self.assertEqual("REDACTED", dispatched_request["result_mode"])
+
+    def test_structured_invocation_returns_only_parsed_result(self) -> None:
+        dispatched_request: dict[str, object] = {}
+
+        def runner(command: list[str], **_: object) -> SimpleNamespace:
+            request_path = Path(command[command.index("-RequestPath") + 1])
+            dispatched_request.update(
+                json.loads(request_path.read_text(encoding="utf-8"))
+            )
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "status": "TURN_COMPLETED",
+                        "provider": "GROK",
+                        "model_ref": "provider://GROK/model/grok-build",
+                        "worker_id": "grok-structured-1",
+                        "result_receipt_ref": "result-structured-1",
+                        "structured_result": {
+                            "schema": "example.output.v1",
+                            "value": "bounded",
+                        },
+                    }
+                ),
+                returncode=0,
+            )
+
+        request = self.request()
+        request["result_mode"] = "STRUCTURED_JSON"
+        result = UniverseRuntimeHost(ROOT, runner=runner).invoke_structured(request)
+        self.assertEqual(
+            {"schema": "example.output.v1", "value": "bounded"},
+            result["structured_result"],
+        )
+        self.assertEqual(
+            "provider://GROK/model/grok-build",
+            result["model_ref"],
+        )
+        self.assertEqual("STRUCTURED_JSON", dispatched_request["result_mode"])
+
+    def test_planning_proposal_is_built_by_installed_task_frame_cli(self) -> None:
+        commands: list[list[str]] = []
+
+        def runner(command: list[str], **_: object) -> SimpleNamespace:
+            commands.append(command)
+            if "-CapabilityOnly" in command:
+                return SimpleNamespace(
+                    stdout='{"provider":"GROK","status":"AVAILABLE"}',
+                    returncode=0,
+                )
+            request_path = Path(command[command.index("--request") + 1])
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            proposal = {
+                "schema": "ai-career.task-frame-execution-proposal.v2",
+                "status": "TASK_FRAME_EXECUTION_PROPOSED",
+                "proposal_id": "task_frame_proposal_test",
+                "plan_digest": "a" * 64,
+                "approval_required": True,
+                "execution_plan": request["execution_plan"],
+                "authority_created": False,
+                "task_frame_started": False,
+            }
+            return SimpleNamespace(
+                stdout=json.dumps({"execution_proposal": proposal}),
+                returncode=0,
+            )
+
+        host = UniverseRuntimeHost(ROOT, runner=runner)
+        result = host.build_planning_proposal(
+            runtime_binding={
+                "session_id": "session-001",
+                "origin_anchor_ref": "anchor-001",
+                "origin_frame_id": "current",
+                "parent_actor_ref": "universe-conductor",
+            },
+            refinement_request={"request_id": "refinementreq_001"},
+            provider="GROK",
+            run_id="planningrun_001",
+        )
+        self.assertEqual("GROK", result["provider"])
+        self.assertEqual("planning-boss", result["turn_id"])
+        self.assertEqual(
+            "NONE",
+            result["execution_proposal"]["execution_plan"][
+                "repository_write_scope"
+            ],
+        )
+        self.assertEqual(2, len(commands))
+        self.assertIn("task-frame", commands[1])
 
     def test_dispatcher_without_json_reports_transport_failure(self) -> None:
         def runner(_: list[str], **__: object) -> SimpleNamespace:
@@ -140,6 +236,32 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         with self.assertRaises(RuntimeHostError) as captured:
             host.provider_capability("GROK")
         self.assertEqual("RUNTIME_HOST_TRANSPORT_FAILED", captured.exception.code)
+
+    def test_dispatcher_json_failure_preserves_stage_and_reason(self) -> None:
+        def runner(_: list[str], **__: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "status": "WORKER_STRUCTURED_RESULT_INVALID",
+                        "stage": "WORKER_ADAPTER",
+                        "reason": "WORKER_RESULT_JSON_INVALID",
+                    }
+                ),
+                returncode=4,
+            )
+
+        request = self.request()
+        request["result_mode"] = "STRUCTURED_JSON"
+        with self.assertRaises(RuntimeHostError) as captured:
+            UniverseRuntimeHost(ROOT, runner=runner).invoke_structured(request)
+        self.assertEqual(
+            "WORKER_STRUCTURED_RESULT_INVALID",
+            captured.exception.code,
+        )
+        self.assertEqual(
+            "WORKER_ADAPTER: WORKER_RESULT_JSON_INVALID",
+            captured.exception.detail,
+        )
 
 
 if __name__ == "__main__":
