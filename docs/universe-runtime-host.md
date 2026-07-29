@@ -30,8 +30,43 @@ reference may also appear in `evidence_refs`, but it is not a second receipt.
 
 The Grok adapter resolves `%GROK_HOME%\bin\grok.exe` (or
 `%USERPROFILE%\.grok\bin\grok.exe`) directly. It does not depend on `grok`
-being present in `PATH`, and provider invocation is a PowerShell process rather
-than a Python virtual-environment operation.
+being present in `PATH`.
+
+## Windows Native CLI Boundary
+
+On Windows, every active Runtime Host provider invocation follows
+`universe.windows-native-cli.v1`:
+
+```text
+UniverseRuntimeHost
+  -> RuntimeWorkerDispatcher
+  -> NativeCliRequest(executable, argv[], cwd, environment, timeout)
+  -> subprocess(shell=False)
+  -> provider executable
+```
+
+The executable and every argument remain separate values. PowerShell command
+strings, `Start-Process -ArgumentList`, `cmd /c`, batch shims, and direct
+provider invocation from a `.ps1` adapter are not active execution routes.
+Legacy PowerShell adapter files fail closed with
+`WINDOWS_NATIVE_CLI_ROUTE_REQUIRED`.
+
+Provider capability checks use the same runner as provider work. Grok prompts
+are written as transient UTF-8 files and passed with `--prompt-file`; structured
+JSON schemas remain one explicit argument. Codex prompts remain one explicit
+argument in the runner's argv array. Empty strings, spaces, quotes, JSON,
+newlines, non-ASCII text, timeout status, and separated stdout/stderr are
+covered by Runtime Host regression tests.
+
+The Python interpreter hosting Universe is not discovered through a PowerShell
+shim for provider execution. `grok.exe` and `codex.exe` must resolve to native
+executables; `.bat`, `.cmd`, and `.ps1` entrypoints are rejected.
+
+Other product-owned external CLI paths must satisfy the same contract even when
+they need a specialized transport. The Release Builder's byte-oriented Git
+object reader therefore keeps an explicit argv array, `shell=False`, separated
+stdout/stderr, and a fixed timeout rather than routing binary blob output through
+the text-oriented provider runner.
 
 ## Local State
 

@@ -26,6 +26,13 @@ Project: universe
 
 Report only source-backed fields. Unknown values remain UNKNOWN.
 
+On a Windows Host, follow
+`.ai/skills/common/windows-shell-guard/SKILL.md` before constructing
+commands and `.ai/skills/common/windows-native-cli/SKILL.md` before
+invoking an external executable. Host command routing does not
+replace Assignment, approval, Execution Guard, or source-review
+isolation.
+
 For source-only `OS_STATUS`, repository checkpoint, Resume Archive,
 validation, Runtime Image, and state documents are
 `OBSERVED_REFERENCE` only. Follow

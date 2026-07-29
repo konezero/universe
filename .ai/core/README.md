@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: 1d41ecd8265d4f3eab61cf8a8eb8ed97e6630370
+Source Commit: 7ea2d4b7923f060d6230029cfb76f9f610f90b53
 
 ## Entry
 
@@ -142,6 +142,11 @@ Source Commit: 1d41ecd8265d4f3eab61cf8a8eb8ed97e6630370
 - `.ai/skills/common/task-frame-debate/SKILL.md`
 - `.ai/skills/common/task-frame/SKILL.md`
 - `.ai/skills/common/universe-project-seed/SKILL.md`
+- `.ai/skills/common/windows-native-cli/SKILL.md`
+- `.ai/skills/common/windows-native-cli/scripts/argv_probe.py`
+- `.ai/skills/common/windows-native-cli/scripts/run_native_cli.py`
+- `.ai/skills/common/windows-shell-guard/SKILL.md`
+- `.ai/skills/common/windows-shell-guard/scripts/check_windows_command.py`
 
 ## Generated Project Surfaces
 

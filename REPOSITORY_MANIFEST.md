@@ -38,6 +38,8 @@ Task Frame Entry: `.ai/skills/common/task-frame/SKILL.md`
 Default Debate Entry: `.ai/skills/common/task-frame-debate/SKILL.md`
 Task Worker Contract: `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md`
 Source Review Entry: `.ai/skills/common/source-review/SKILL.md`
+Windows Shell Entry: `.ai/skills/common/windows-shell-guard/SKILL.md`
+Windows Native CLI Entry: `.ai/skills/common/windows-native-cli/SKILL.md`
 
 Runtime Status Entry: `.ai/skills/common/runtime-status/SKILL.md`
 Resume Save Entry: `.ai/skills/common/resume-save/SKILL.md`

@@ -32,6 +32,16 @@ Mode intent must resolve through
 session preparation, or Mode Current Anchor access. The project
 Registry is `MASTER_MANAGED`; MASTER cannot delete itself.
 
+## Host Command Routing
+
+When current Host evidence identifies Windows, follow
+`.ai/skills/common/windows-shell-guard/SKILL.md` before constructing
+a repository, build, test, Git, filesystem, process, adapter, Task
+Frame, or Worker command. Route every external executable through
+`.ai/skills/common/windows-native-cli/SKILL.md`. These Skills define
+syntax and argv transport only; they do not create authority,
+Assignment, approval, or sandbox evidence.
+
 ## Pull Request Review Trust Boundary
 
 For pull request, patch, fork, branch, or other Candidate review,

@@ -168,12 +168,19 @@ class GitObjectReader:
         )
 
     def _run(self, *args: str) -> bytes:
-        completed = subprocess.run(  # nosec B603
-            [self.git, "--no-pager", "-C", str(self.repository), *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(  # nosec B603
+                [self.git, "--no-pager", "-C", str(self.repository), *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                shell=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise CoreReleaseError("Git object read timed out") from error
+        except OSError as error:
+            raise CoreReleaseError(f"Git object reader unavailable: {error}") from error
         if completed.returncode != 0:
             detail = completed.stderr.decode("utf-8", errors="replace").strip()
             raise CoreReleaseError(f"Git object read failed: {detail}")

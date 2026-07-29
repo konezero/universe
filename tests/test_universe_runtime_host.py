@@ -15,6 +15,30 @@ from universe_runtime_host import (  # noqa: E402
     UniverseRuntimeHost,
     redacted_invocation_record,
 )
+from universe_runtime_worker_dispatch import WorkerDispatchError  # noqa: E402
+
+
+class FakeWorkerDispatcher:
+    def __init__(
+        self,
+        *,
+        response: dict[str, object] | None = None,
+        error: WorkerDispatchError | None = None,
+    ) -> None:
+        self.response = response or {}
+        self.error = error
+        self.capability_calls: list[str] = []
+        self.dispatch_calls: list[dict[str, object]] = []
+
+    def provider_capability(self, provider: str) -> dict[str, str]:
+        self.capability_calls.append(provider)
+        return {"provider": provider, "status": "AVAILABLE"}
+
+    def dispatch(self, request: dict[str, object]) -> dict[str, object]:
+        self.dispatch_calls.append(request)
+        if self.error is not None:
+            raise self.error
+        return dict(self.response)
 
 
 class UniverseRuntimeHostLayoutTests(unittest.TestCase):
@@ -24,29 +48,31 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
             "tools/universe_runtime_host_grok_adapter.json",
             "tools/universe_runtime_host_grok_invoke.ps1",
             "tools/universe_runtime_host_codex_worker.ps1",
+            "tools/universe_runtime_worker_dispatch.py",
+            "tools/windows_native_cli.py",
         )
         for relative in expected:
             self.assertTrue((ROOT / relative).is_file(), relative)
 
-        dispatcher = (ROOT / expected[0]).read_text(encoding="utf-8")
-        self.assertIn("Join-Path $PSScriptRoot '..'", dispatcher)
-        self.assertIn("tools\\universe_runtime_host_grok_invoke.ps1", dispatcher)
-        self.assertIn("tools\\universe_runtime_host_codex_worker.ps1", dispatcher)
-        self.assertNotIn("tools\\runtime_host\\", dispatcher)
-        self.assertIn("LOCALAPPDATA", dispatcher)
-        self.assertIn("worker_run_ref", dispatcher)
-        self.assertIn("result_receipt_ref", dispatcher)
+        legacy_dispatcher = (ROOT / expected[0]).read_text(encoding="utf-8")
+        self.assertIn("WINDOWS_NATIVE_CLI_ROUTE_REQUIRED", legacy_dispatcher)
+        self.assertNotIn("powershell.exe", legacy_dispatcher)
+
+        dispatcher = (ROOT / expected[4]).read_text(encoding="utf-8")
+        self.assertIn("RuntimeWorkerDispatcher", dispatcher)
+        self.assertIn('"--prompt-file"', dispatcher)
+        self.assertIn('"--json-schema"', dispatcher)
+        self.assertIn("structuredOutput", dispatcher)
         self.assertIn("skill_run_observations", dispatcher)
-        self.assertIn("validation_state = 'NOT_RUN'", dispatcher)
-        self.assertIn("STRUCTURED_JSON", dispatcher)
-        self.assertIn("$recordedResult = $structuredResult", dispatcher)
-        self.assertNotIn("worker=$worker", dispatcher)
-        self.assertIn('"provider://$providerSegment/model/$modelSegment"', dispatcher)
-        self.assertNotIn("host_invocation_receipt_ref", dispatcher)
-        self.assertNotIn("host_result_evidence_ref", dispatcher)
-        grok_worker = (ROOT / expected[2]).read_text(encoding="utf-8")
-        self.assertIn("'--json-schema', $jsonSchema", grok_worker)
-        self.assertIn("response.structuredOutput", grok_worker)
+        self.assertIn('"validation_state": "NOT_RUN"', dispatcher)
+        self.assertNotIn("shell=True", dispatcher)
+
+        native_runner = (ROOT / expected[5]).read_text(encoding="utf-8")
+        self.assertIn("shell=False", native_runner)
+        self.assertIn("NativeCliRequest", native_runner)
+        host = (ROOT / "tools/universe_runtime_host.py").read_text(encoding="utf-8")
+        self.assertIn("RuntimeWorkerDispatcher", host)
+        self.assertNotIn('"powershell.exe"', host)
 
     def test_installed_codex_adapter_does_not_declare_universe_worker(self) -> None:
         adapter = json.loads(
@@ -101,31 +127,15 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             redacted_invocation_record(request)
 
     def test_capability_and_invocation_are_normalized(self) -> None:
-        calls: list[list[str]] = []
-        dispatched_request: dict[str, object] = {}
-
-        def runner(command: list[str], **_: object) -> SimpleNamespace:
-            calls.append(command)
-            if "-CapabilityOnly" in command:
-                return SimpleNamespace(
-                    stdout='{"provider":"GROK","status":"AVAILABLE"}',
-                    returncode=0,
-                )
-            request_path = Path(command[command.index("-RequestPath") + 1])
-            dispatched_request.update(
-                json.loads(request_path.read_text(encoding="utf-8"))
-            )
-            return SimpleNamespace(
-                stdout=(
-                    '{"status":"TASK_FRAME_RESULT_RECORDED",'
-                    '"worker_id":"grok-1",'
-                    '"result_receipt_ref":"result-1",'
-                    '"skill_run_observation_count":2}'
-                ),
-                returncode=0,
-            )
-
-        host = UniverseRuntimeHost(ROOT, runner=runner)
+        dispatcher = FakeWorkerDispatcher(
+            response={
+                "status": "TASK_FRAME_RESULT_RECORDED",
+                "worker_id": "grok-1",
+                "result_receipt_ref": "result-1",
+                "skill_run_observation_count": 2,
+            }
+        )
+        host = UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher)
         self.assertEqual("AVAILABLE", host.provider_capability("GROK")["status"])
         result = host.invoke_read_only(self.request())
         self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
@@ -133,41 +143,34 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("result-1", result["result_receipt_ref"])
         self.assertEqual(2, result["skill_run_observation_count"])
         self.assertNotIn("worker_run_ref", result)
-        self.assertEqual(2, len(calls))
+        self.assertEqual(["GROK"], dispatcher.capability_calls)
+        self.assertEqual(1, len(dispatcher.dispatch_calls))
         self.assertEqual(
             "universe.task-frame-worker-dispatch-request.v1",
-            dispatched_request["schema"],
+            dispatcher.dispatch_calls[0]["schema"],
         )
-        self.assertEqual("REDACTED", dispatched_request["result_mode"])
+        self.assertEqual("REDACTED", dispatcher.dispatch_calls[0]["result_mode"])
 
     def test_structured_invocation_returns_only_parsed_result(self) -> None:
-        dispatched_request: dict[str, object] = {}
-
-        def runner(command: list[str], **_: object) -> SimpleNamespace:
-            request_path = Path(command[command.index("-RequestPath") + 1])
-            dispatched_request.update(
-                json.loads(request_path.read_text(encoding="utf-8"))
-            )
-            return SimpleNamespace(
-                stdout=json.dumps(
-                    {
-                        "status": "TURN_COMPLETED",
-                        "provider": "GROK",
-                        "model_ref": "provider://GROK/model/grok-build",
-                        "worker_id": "grok-structured-1",
-                        "result_receipt_ref": "result-structured-1",
-                        "structured_result": {
-                            "schema": "example.output.v1",
-                            "value": "bounded",
-                        },
-                    }
-                ),
-                returncode=0,
-            )
+        dispatcher = FakeWorkerDispatcher(
+            response={
+                "status": "TURN_COMPLETED",
+                "provider": "GROK",
+                "model_ref": "provider://GROK/model/grok-build",
+                "worker_id": "grok-structured-1",
+                "result_receipt_ref": "result-structured-1",
+                "structured_result": {
+                    "schema": "example.output.v1",
+                    "value": "bounded",
+                },
+            }
+        )
 
         request = self.request()
         request["result_mode"] = "STRUCTURED_JSON"
-        result = UniverseRuntimeHost(ROOT, runner=runner).invoke_structured(request)
+        result = UniverseRuntimeHost(
+            ROOT, worker_dispatcher=dispatcher
+        ).invoke_structured(request)
         self.assertEqual(
             {"schema": "example.output.v1", "value": "bounded"},
             result["structured_result"],
@@ -176,7 +179,9 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             "provider://GROK/model/grok-build",
             result["model_ref"],
         )
-        self.assertEqual("STRUCTURED_JSON", dispatched_request["result_mode"])
+        self.assertEqual(
+            "STRUCTURED_JSON", dispatcher.dispatch_calls[0]["result_mode"]
+        )
 
     def test_planning_proposal_is_built_by_installed_task_frame_cli(self) -> None:
         commands: list[list[str]] = []
@@ -205,7 +210,11 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                 returncode=0,
             )
 
-        host = UniverseRuntimeHost(ROOT, runner=runner)
+        host = UniverseRuntimeHost(
+            ROOT,
+            runner=runner,
+            worker_dispatcher=FakeWorkerDispatcher(),
+        )
         result = host.build_planning_proposal(
             runtime_binding={
                 "session_id": "session-001",
@@ -225,35 +234,23 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                 "repository_write_scope"
             ],
         )
-        self.assertEqual(2, len(commands))
-        self.assertIn("task-frame", commands[1])
-
-    def test_dispatcher_without_json_reports_transport_failure(self) -> None:
-        def runner(_: list[str], **__: object) -> SimpleNamespace:
-            return SimpleNamespace(stdout="", stderr="adapter failed", returncode=4)
-
-        host = UniverseRuntimeHost(ROOT, runner=runner)
-        with self.assertRaises(RuntimeHostError) as captured:
-            host.provider_capability("GROK")
-        self.assertEqual("RUNTIME_HOST_TRANSPORT_FAILED", captured.exception.code)
+        self.assertEqual(1, len(commands))
+        self.assertIn("task-frame", commands[0])
 
     def test_dispatcher_json_failure_preserves_stage_and_reason(self) -> None:
-        def runner(_: list[str], **__: object) -> SimpleNamespace:
-            return SimpleNamespace(
-                stdout=json.dumps(
-                    {
-                        "status": "WORKER_STRUCTURED_RESULT_INVALID",
-                        "stage": "WORKER_ADAPTER",
-                        "reason": "WORKER_RESULT_JSON_INVALID",
-                    }
-                ),
-                returncode=4,
-            )
-
         request = self.request()
         request["result_mode"] = "STRUCTURED_JSON"
+        dispatcher = FakeWorkerDispatcher(
+            error=WorkerDispatchError(
+                "WORKER_STRUCTURED_RESULT_INVALID",
+                "WORKER_ADAPTER",
+                "WORKER_RESULT_JSON_INVALID",
+            )
+        )
         with self.assertRaises(RuntimeHostError) as captured:
-            UniverseRuntimeHost(ROOT, runner=runner).invoke_structured(request)
+            UniverseRuntimeHost(
+                ROOT, worker_dispatcher=dispatcher
+            ).invoke_structured(request)
         self.assertEqual(
             "WORKER_STRUCTURED_RESULT_INVALID",
             captured.exception.code,

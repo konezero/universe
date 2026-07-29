@@ -66,9 +66,8 @@ CANONICAL_GROUP_CONTRACTS = {
     },
     "skill": {
         "root": ".ai/skills/common",
-        "selection_kind": "basename",
-        "selection_value": "SKILL.md",
-        "expected_files": 20,
+        "selection_kind": "all_files",
+        "minimum_files": 1,
     },
     "adapter": {
         "root": ".ai/adapters/codex",
@@ -224,6 +223,24 @@ def _sha256(data: bytes) -> str:
 
 def _canonical_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _canonical_package_inventory(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for class_name in sorted(CANONICAL_GROUP_CONTRACTS):
+        target_paths = sorted(
+            str(row["target_path"])
+            for row in rows
+            if row.get("class") == class_name
+            and isinstance(row.get("target_path"), str)
+        )
+        result[class_name] = {
+            "managed_count": len(target_paths),
+            "target_paths_sha256": _sha256(_canonical_json_bytes(target_paths)),
+        }
+    return result
 
 
 def _json_from_bytes(data: bytes, label: str) -> dict[str, Any]:
@@ -1711,6 +1728,8 @@ def _render_generated_surface(
             Default Debate Entry: `.ai/skills/common/task-frame-debate/SKILL.md`
             Task Worker Contract: `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md`
             Source Review Entry: `.ai/skills/common/source-review/SKILL.md`
+            Windows Shell Entry: `.ai/skills/common/windows-shell-guard/SKILL.md`
+            Windows Native CLI Entry: `.ai/skills/common/windows-native-cli/SKILL.md`
 
             Runtime Status Entry: `.ai/skills/common/runtime-status/SKILL.md`
             Resume Save Entry: `.ai/skills/common/resume-save/SKILL.md`
@@ -1747,6 +1766,16 @@ def _render_generated_surface(
             `.ai/runtime/project_instance/mode_registry.json` before Role, Scope,
             session preparation, or Mode Current Anchor access. The project
             Registry is `MASTER_MANAGED`; MASTER cannot delete itself.
+
+            ## Host Command Routing
+
+            When current Host evidence identifies Windows, follow
+            `.ai/skills/common/windows-shell-guard/SKILL.md` before constructing
+            a repository, build, test, Git, filesystem, process, adapter, Task
+            Frame, or Worker command. Route every external executable through
+            `.ai/skills/common/windows-native-cli/SKILL.md`. These Skills define
+            syntax and argv transport only; they do not create authority,
+            Assignment, approval, or sandbox evidence.
 
             ## Pull Request Review Trust Boundary
 
@@ -1826,6 +1855,13 @@ def _render_generated_surface(
 
             Report only source-backed fields. Unknown values remain UNKNOWN.
 
+            On a Windows Host, follow
+            `.ai/skills/common/windows-shell-guard/SKILL.md` before constructing
+            commands and `.ai/skills/common/windows-native-cli/SKILL.md` before
+            invoking an external executable. Host command routing does not
+            replace Assignment, approval, Execution Guard, or source-review
+            isolation.
+
             For source-only `OS_STATUS`, repository checkpoint, Resume Archive,
             validation, Runtime Image, and state documents are
             `OBSERVED_REFERENCE` only. Follow
@@ -1893,6 +1929,10 @@ def _render_generated_surface(
             `SOURCE REVIEW` and pull request review follow
             `.ai/skills/common/source-review/SKILL.md` before Candidate policy
             is consumed or Candidate code is executed.
+            Windows command construction follows
+            `.ai/skills/common/windows-shell-guard/SKILL.md`; Windows external
+            CLI transport follows
+            `.ai/skills/common/windows-native-cli/SKILL.md`.
             `TASK ASSIGN` follows `.ai/skills/common/task-assignment/SKILL.md`.
             `EXECUTION BIND` follows `.ai/skills/common/execution-binding/SKILL.md`.
             `DEBATE` follows `.ai/skills/common/task-frame-debate/SKILL.md`.
@@ -2523,6 +2563,7 @@ def _build_installation_manifest(
         "managed_paths": sorted(
             [dict(row) for row in managed_rows], key=lambda row: row["target_path"]
         ),
+        "canonical_package_inventory": _canonical_package_inventory(managed_rows),
         "generated_surface_hashes": dict(sorted(generated_hashes.items())),
         "managed_overlay_hashes": dict(sorted(managed_overlay_hashes.items())),
         "local_reference_validation": {
@@ -3628,6 +3669,13 @@ def _installed_manifest_issues(manifest: Mapping[str, Any]) -> list[str]:
     if len(target_paths) != len(set(target_paths)):
         issues.append("managed target paths are not unique")
 
+    canonical_package_inventory = manifest.get("canonical_package_inventory")
+    expected_package_inventory = _canonical_package_inventory(
+        [row for row in rows if isinstance(row, dict)]
+    )
+    if canonical_package_inventory != expected_package_inventory:
+        issues.append("canonical package inventory does not match managed rows")
+
     row_map = {
         row.get("target_path"): row
         for row in rows
@@ -4025,18 +4073,31 @@ def _validate_target(target_root: Path, *, write_evidence: bool) -> dict[str, An
     missing_set = set(missing) | set(unreadable)
     mismatch_set = {item["path"] for item in mismatches}
 
-    def package_class_check(
-        class_name: str, *, exact_count: int | None = None, minimum_count: int = 1
-    ) -> dict[str, Any]:
+    canonical_package_inventory = manifest.get("canonical_package_inventory")
+
+    def package_class_check(class_name: str, *, minimum_count: int = 1) -> dict[str, Any]:
         class_rows = [row for row in rows if row.get("class") == class_name]
         invalid_paths = sorted(
             str(row.get("target_path"))
             for row in class_rows
             if row.get("target_path") in missing_set | mismatch_set
         )
-        count_ok = len(class_rows) >= minimum_count
-        if exact_count is not None:
-            count_ok = len(class_rows) == exact_count
+        package_summary = (
+            canonical_package_inventory.get(class_name)
+            if isinstance(canonical_package_inventory, dict)
+            else None
+        )
+        exact_count = (
+            package_summary.get("managed_count")
+            if isinstance(package_summary, dict)
+            and isinstance(package_summary.get("managed_count"), int)
+            else None
+        )
+        count_ok = (
+            len(class_rows) == exact_count
+            if exact_count is not None
+            else len(class_rows) >= minimum_count
+        )
         status = "PASS" if count_ok and not invalid_paths else "FAIL"
         return _check(
             f"{class_name}_package",
@@ -4058,12 +4119,7 @@ def _validate_target(target_root: Path, *, write_evidence: bool) -> dict[str, An
         )
 
     checks.append(package_class_check("runtime", minimum_count=1))
-    checks.append(
-        package_class_check(
-            "skill",
-            exact_count=int(CANONICAL_GROUP_CONTRACTS["skill"]["expected_files"]),
-        )
-    )
+    checks.append(package_class_check("skill", minimum_count=1))
     checks.append(package_class_check("adapter", minimum_count=1))
 
     forbidden_managed = sorted(

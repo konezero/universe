@@ -15,9 +15,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from universe_runtime_worker_dispatch import (
+    RuntimeWorkerDispatcher,
+    WorkerDispatchError,
+)
 
 RUNTIME_WORKER_REQUEST_SCHEMA = "universe.runtime-worker-invocation-request.v1"
-DISPATCH_REQUEST_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 PLANNING_PROFILE = Path(
@@ -167,10 +170,13 @@ class UniverseRuntimeHost:
         self,
         repository_root: Path,
         runner: Callable[..., Any] | None = None,
+        worker_dispatcher: RuntimeWorkerDispatcher | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve()
-        self.dispatcher = self.repository_root / "tools" / "universe_runtime_host_dispatch.ps1"
         self.runner = runner or subprocess.run
+        self.worker_dispatcher = worker_dispatcher or RuntimeWorkerDispatcher(
+            self.repository_root
+        )
 
     def provider_capabilities(self) -> list[dict[str, str]]:
         return [self.provider_capability(provider) for provider in sorted(SUPPORTED_PROVIDERS)]
@@ -183,9 +189,7 @@ class UniverseRuntimeHost:
                 "status": "UNAVAILABLE",
                 "reason": "WORKER_PROVIDER_UNSUPPORTED",
             }
-        response = self._invoke_dispatch(
-            ["-Provider", normalized, "-CapabilityOnly"], timeout=20
-        )
+        response = self.worker_dispatcher.provider_capability(normalized)
         result = {
             "provider": normalized,
             "status": "AVAILABLE" if response.get("status") == "AVAILABLE" else "UNAVAILABLE",
@@ -201,8 +205,7 @@ class UniverseRuntimeHost:
                 "RUNTIME_WORKER_REQUEST_INVALID",
                 "invoke_read_only requires result_mode REDACTED",
             )
-        with self._transient_request_file(request) as request_path:
-            response = self._invoke_dispatch(["-RequestPath", str(request_path)], timeout=180)
+        response = self._dispatch_worker(request)
         return self._invocation_result(request, response)
 
     def invoke_structured(self, value: Mapping[str, Any]) -> dict[str, Any]:
@@ -212,8 +215,7 @@ class UniverseRuntimeHost:
                 "RUNTIME_WORKER_REQUEST_INVALID",
                 "invoke_structured requires result_mode STRUCTURED_JSON",
             )
-        with self._transient_request_file(request) as request_path:
-            response = self._invoke_dispatch(["-RequestPath", str(request_path)], timeout=180)
+        response = self._dispatch_worker(request)
         result = self._invocation_result(request, response)
         structured = response.get("structured_result")
         if not isinstance(structured, Mapping):
@@ -515,19 +517,18 @@ class UniverseRuntimeHost:
             **optional_details,
         }
 
-    def _invoke_dispatch(self, arguments: list[str], *, timeout: int) -> dict[str, Any]:
-        return self._invoke_json_command(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(self.dispatcher),
-                *arguments,
-            ],
-            timeout=timeout,
-        )
+    def _dispatch_worker(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        dispatch_request = {
+            **request,
+            "schema": "universe.task-frame-worker-dispatch-request.v1",
+        }
+        try:
+            return self.worker_dispatcher.dispatch(dispatch_request)
+        except WorkerDispatchError as error:
+            raise RuntimeHostError(
+                error.code,
+                f"{error.stage}: {error.reason}",
+            ) from error
 
     def _invoke_json_command(
         self, command: list[str], *, timeout: int
@@ -540,6 +541,7 @@ class UniverseRuntimeHost:
                 encoding="utf-8",
                 timeout=timeout,
                 check=False,
+                shell=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise RuntimeHostError("RUNTIME_HOST_UNAVAILABLE", str(error)) from error
@@ -608,16 +610,6 @@ class UniverseRuntimeHost:
                 "Runtime Host HTTP response must be an object",
             )
         return value
-
-    def _transient_request_file(self, request: Mapping[str, Any]) -> "_TransientRequestFile":
-        dispatch_request = {
-            **request,
-            "schema": DISPATCH_REQUEST_SCHEMA,
-        }
-        return self._transient_json_file(
-            dispatch_request,
-            prefix="runtime-worker-",
-        )
 
     @staticmethod
     def _transient_json_file(

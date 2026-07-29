@@ -12,6 +12,8 @@
     "durable_task_proposal_journal": "AVAILABLE",
     "runtime_status_collection": "AVAILABLE",
     "source_only_os_status": "AVAILABLE",
+    "windows_shell_command_preflight": "AVAILABLE",
+    "windows_native_cli_transport": "AVAILABLE",
     "execution_guard": "AVAILABLE",
     "file_mutation_gateway": "AVAILABLE",
     "persistent_task_frame_journal": "AVAILABLE",

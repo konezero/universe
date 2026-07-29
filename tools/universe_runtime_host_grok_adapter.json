@@ -1,9 +1,13 @@
 {
   "schema": "universe.grok-cli-runtime-adapter.v2",
   "adapter_id": "universe-runtime-host-grok-cli-read-only",
-  "entrypoint": "tools/universe_runtime_host_grok_invoke.ps1",
+  "entrypoint": "tools/universe_runtime_worker_dispatch.py",
   "transport": {
-    "kind": "local-process",
+    "kind": "python-native-process",
+    "native_cli_contract": "universe.windows-native-cli.v1",
+    "shell": false,
+    "argument_transport": "explicit-argv-array",
+    "prompt_transport": "utf8-file",
     "input_schema": "universe.grok-worker-request.v1",
     "output_schema": "universe.grok-worker-result.v1",
     "context_source": "caller-supplied-context-pack-only",

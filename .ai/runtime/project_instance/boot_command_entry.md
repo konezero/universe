@@ -47,6 +47,10 @@ Session Boot Executor when Host capability is available.
 `SOURCE REVIEW` and pull request review follow
 `.ai/skills/common/source-review/SKILL.md` before Candidate policy
 is consumed or Candidate code is executed.
+Windows command construction follows
+`.ai/skills/common/windows-shell-guard/SKILL.md`; Windows external
+CLI transport follows
+`.ai/skills/common/windows-native-cli/SKILL.md`.
 `TASK ASSIGN` follows `.ai/skills/common/task-assignment/SKILL.md`.
 `EXECUTION BIND` follows `.ai/skills/common/execution-binding/SKILL.md`.
 `DEBATE` follows `.ai/skills/common/task-frame-debate/SKILL.md`.
