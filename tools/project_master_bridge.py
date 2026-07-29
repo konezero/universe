@@ -43,6 +43,7 @@ class ProjectMasterBridgeHost:
 
     project_root: Path
     token: str
+    inbox_ref: str = ".ai/inbox/MASTER"
 
     def __post_init__(self) -> None:
         _text(self.token, "token")
@@ -82,7 +83,10 @@ class ProjectMasterBridgeHost:
         root = self.project_root.expanduser().resolve(strict=True)
         if not root.is_dir():
             raise ProjectMasterBridgeError("PROJECT_ROOT_UNAVAILABLE")
-        inbox = root / ".ai" / "inbox" / "MASTER"
+        relative = Path(_text(self.inbox_ref, "inbox_ref").replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ProjectMasterBridgeError("MASTER_INBOX_REF_INVALID")
+        inbox = root / relative
         try:
             resolved = inbox.resolve(strict=True)
         except OSError as error:
@@ -294,6 +298,7 @@ def main() -> int:
     serve = commands.add_parser("serve")
     serve.add_argument("--project-root", required=True, type=Path)
     serve.add_argument("--token-env", required=True)
+    serve.add_argument("--inbox-ref", default=".ai/inbox/MASTER")
     serve.add_argument("--port", default=0, type=int)
     reply = commands.add_parser("reply")
     reply.add_argument("--universe-endpoint", required=True)
@@ -308,9 +313,21 @@ def main() -> int:
     if args.command == "serve":
         server = ProjectMasterBridgeHttpServer(
             ("127.0.0.1", args.port),
-            ProjectMasterBridgeHost(args.project_root, _read_token(args.token_env)),
+            ProjectMasterBridgeHost(
+                args.project_root,
+                _read_token(args.token_env),
+                args.inbox_ref,
+            ),
         )
-        print(json.dumps({"endpoint": f"http://127.0.0.1:{server.server_port}", "status": "LISTENING"}))
+        print(
+            json.dumps(
+                {
+                    "endpoint": f"http://127.0.0.1:{server.server_port}",
+                    "status": "LISTENING",
+                }
+            ),
+            flush=True,
+        )
         server.serve_forever()
         return 0
     print(

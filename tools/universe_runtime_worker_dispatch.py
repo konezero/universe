@@ -144,13 +144,9 @@ def post_json(
 
 
 def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
-    grok_home = Path(
-        os.environ.get("GROK_HOME") or (Path.home() / ".grok")
-    ).resolve()
+    grok_home = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).resolve()
     executable = grok_home / "bin" / "grok.exe"
-    return (executable if executable.is_file() else None), {
-        "GROK_HOME": str(grok_home)
-    }
+    return (executable if executable.is_file() else None), {"GROK_HOME": str(grok_home)}
 
 
 def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
@@ -218,9 +214,7 @@ class RuntimeWorkerDispatcher:
                 "provider": normalized,
                 "reason": f"{normalized}_CLI_LAUNCH_FAILED",
             }
-        encoded_path = base64.b64encode(
-            str(executable).encode("utf-8")
-        ).decode("ascii")
+        encoded_path = base64.b64encode(str(executable).encode("utf-8")).decode("ascii")
         return {
             "status": "AVAILABLE",
             "provider": normalized,
@@ -251,9 +245,7 @@ class RuntimeWorkerDispatcher:
                     "operation": "worker_invocation_plan",
                     "turn_id": request["turn_id"],
                     "host_capability_status": "AVAILABLE",
-                    "capability_evidence_ref": capability[
-                        "capability_evidence_ref"
-                    ],
+                    "capability_evidence_ref": capability["capability_evidence_ref"],
                     "invoker_actor_ref": request["invoker_actor_ref"],
                     "observed_at": _utc_now(),
                 },
@@ -351,9 +343,7 @@ class RuntimeWorkerDispatcher:
                     "turn_id": request["turn_id"],
                     "worker_id": worker["worker_id"],
                     "worker_run_ref": worker_run_ref,
-                    "capability_evidence_ref": capability[
-                        "capability_evidence_ref"
-                    ],
+                    "capability_evidence_ref": capability["capability_evidence_ref"],
                     "invoker_actor_ref": request["invoker_actor_ref"],
                     "observed_at": _utc_now(),
                 },
@@ -370,9 +360,7 @@ class RuntimeWorkerDispatcher:
                 "TURN_CLAIM_REJECTED",
             )
 
-        model = str(
-            planned_invocation.get("model") or PROVIDER_MODELS[provider]
-        )
+        model = str(planned_invocation.get("model") or PROVIDER_MODELS[provider])
         model_ref = f"provider://{provider}/model/{quote(model, safe='')}"
         observations = [
             {
@@ -417,6 +405,7 @@ class RuntimeWorkerDispatcher:
             "model_ref": model_ref,
             "worker_id": worker["worker_id"],
             "result_receipt_ref": worker["result_receipt_ref"],
+            "result": recorded_result,
             "skill_run_observation_count": len(observations),
             "repository_write": False,
             "runtime_result": result,
@@ -479,9 +468,7 @@ class RuntimeWorkerDispatcher:
                 raw.get("invoker_actor_ref"), "invoker_actor_ref"
             ),
             "context_pack": _mapping(raw.get("context_pack"), "context_pack"),
-            "output_contract": _mapping(
-                raw.get("output_contract"), "output_contract"
-            ),
+            "output_contract": _mapping(raw.get("output_contract"), "output_contract"),
             "max_turns": max_turns,
             "result_mode": result_mode,
         }
@@ -524,9 +511,7 @@ class RuntimeWorkerDispatcher:
                 "WORKER_ADAPTER",
                 "GROK_CLI_UNAVAILABLE",
             )
-        runtime_profile = str(
-            request.get("runtime_profile", "READ_ONLY")
-        ).upper()
+        runtime_profile = str(request.get("runtime_profile", "READ_ONLY")).upper()
         if runtime_profile not in {"READ_ONLY", "TASK_FRAME_RUNTIME"}:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_FAILED",
@@ -545,8 +530,7 @@ class RuntimeWorkerDispatcher:
             "authority. Source mutation is Host-gateway-only. Return only the "
             "requested result content."
             if runtime_profile == "TASK_FRAME_RUNTIME"
-            else
-            "You are a bounded read-only Task Frame worker. You receive all "
+            else "You are a bounded read-only Task Frame worker. You receive all "
             "usable context in the supplied Context Pack. Do not inspect local "
             "files, execute commands, use network tools, create files, modify "
             "files, invoke subagents, or claim authority. Return only the "
@@ -673,8 +657,7 @@ class RuntimeWorkerDispatcher:
         format_instruction = (
             "\nReturn exactly one JSON object matching the Output Contract. "
             "Do not use Markdown fences or explanatory text."
-            if str(request.get("result_mode", "REDACTED")).upper()
-            == "STRUCTURED_JSON"
+            if str(request.get("result_mode", "REDACTED")).upper() == "STRUCTURED_JSON"
             else ""
         )
         prompt = (

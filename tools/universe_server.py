@@ -8,6 +8,7 @@ import json
 import math
 import mimetypes
 import os
+import queue
 import re
 import secrets
 import sqlite3
@@ -71,6 +72,16 @@ INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
 CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
+CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
+    {
+        "QUEUED",
+        "WAITING_FOR_RUNTIME_BINDING",
+        "PROCESSING",
+        "ANSWERED",
+        "FAILED",
+    }
+)
+CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX"})
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
@@ -88,8 +99,12 @@ FRESH_PROJECT_COMPOSITION_ADOPTION_SCHEMA = (
     "universe.fresh-project-composition-adoption.v1"
 )
 FRESH_PROJECT_REFINEMENT_REQUEST_SCHEMA = "universe.fresh-project-refinement-request.v1"
-FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA = "universe.fresh-project-refinement-candidate.v1"
-FRESH_PROJECT_REFINEMENT_ADOPTION_SCHEMA = "universe.fresh-project-refinement-adoption.v1"
+FRESH_PROJECT_REFINEMENT_CANDIDATE_SCHEMA = (
+    "universe.fresh-project-refinement-candidate.v1"
+)
+FRESH_PROJECT_REFINEMENT_ADOPTION_SCHEMA = (
+    "universe.fresh-project-refinement-adoption.v1"
+)
 FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA = (
     "universe.fresh-project-refinement-worker-output.v1"
 )
@@ -293,7 +308,9 @@ class LocalTokenAuthProvider:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def default_data_dir() -> Path:
@@ -434,9 +451,7 @@ def connection_profile(
 ) -> ConnectionProfile:
     normalized_id = _required_text(connection_id, "connection_id")
     normalized_kind = _required_text(kind, "connection_kind").upper()
-    normalized_transport = _required_text(
-        transport_kind, "transport_kind"
-    ).upper()
+    normalized_transport = _required_text(transport_kind, "transport_kind").upper()
     normalized_auth = _required_text(auth_type, "auth_type").upper()
     normalized_endpoint = _required_text(endpoint, "endpoint").rstrip("/")
     if normalized_kind not in CONNECTION_KINDS:
@@ -901,8 +916,10 @@ def _observed_at(value: Any, field: str) -> str:
             "OBSERVATION_TIME_INVALID",
             f"{field} must include a timezone",
         )
-    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -1014,7 +1031,9 @@ def normalize_skill_observation_candidate(
             )
         outcome = _required_text(observation["outcome"], f"{field}.outcome").upper()
         if outcome not in SKILL_OUTCOMES:
-            raise UniverseError("SKILL_OUTCOME_INVALID", f"{field}.outcome is unsupported")
+            raise UniverseError(
+                "SKILL_OUTCOME_INVALID", f"{field}.outcome is unsupported"
+            )
         validation_state = _required_text(
             observation["validation_state"], f"{field}.validation_state"
         ).upper()
@@ -1039,7 +1058,9 @@ def normalize_skill_observation_candidate(
                     observation["skill_binding_digest"], f"{field}.skill_binding_digest"
                 ),
                 "skill": {
-                    "skill_id": _identifier(skill["skill_id"], f"{field}.skill.skill_id"),
+                    "skill_id": _identifier(
+                        skill["skill_id"], f"{field}.skill.skill_id"
+                    ),
                     "skill_version": _required_text(
                         skill["skill_version"], f"{field}.skill.skill_version"
                     ),
@@ -1049,7 +1070,9 @@ def normalize_skill_observation_candidate(
                         f"{field}.skill.context_pack_digest",
                     ),
                 },
-                "model_ref": _required_text(observation["model_ref"], f"{field}.model_ref"),
+                "model_ref": _required_text(
+                    observation["model_ref"], f"{field}.model_ref"
+                ),
                 "outcome": outcome,
                 "validation_state": validation_state,
                 "evidence_refs": _string_array(
@@ -1061,7 +1084,9 @@ def normalize_skill_observation_candidate(
     normalized_candidate = {
         "schema": SKILL_OBSERVATION_CANDIDATE_SCHEMA,
         "project_ref": expected_project_ref,
-        "task_frame_ref": _required_text(candidate["task_frame_ref"], "candidate.task_frame_ref"),
+        "task_frame_ref": _required_text(
+            candidate["task_frame_ref"], "candidate.task_frame_ref"
+        ),
         "source_ref": _required_text(candidate["source_ref"], "candidate.source_ref"),
         "observations": normalized_observations,
         "observed_at": _observed_at(candidate["observed_at"], "candidate.observed_at"),
@@ -1276,9 +1301,7 @@ def _normalize_fresh_project_refinement_document(
     }
 
 
-def _normalize_fresh_project_refinement(
-    value: Any, field: str
-) -> dict[str, Any]:
+def _normalize_fresh_project_refinement(value: Any, field: str) -> dict[str, Any]:
     refinement = _exact_object_fields(
         value,
         field=field,
@@ -1332,9 +1355,7 @@ def _normalize_fresh_project_refinement(
             "FRESH_PROJECT_REFINEMENT_LIST_LIMIT_EXCEEDED",
             "technology_recommendations must contain at most 32 entries",
         )
-    if len({item["technology"] for item in recommendations}) != len(
-        recommendations
-    ):
+    if len({item["technology"] for item in recommendations}) != len(recommendations):
         raise UniverseError(
             "FRESH_PROJECT_REFINEMENT_DUPLICATE_TECHNOLOGY",
             "technology_recommendations must not repeat a technology",
@@ -1576,9 +1597,7 @@ def normalize_fresh_project_refinement_adoption_request(value: Any) -> dict[str,
             "approval must be ADOPTED before recording a refinement selection",
             HTTPStatus.CONFLICT,
         )
-    normalized = {
-        "candidate_id": _identifier(request["candidate_id"], "candidate_id")
-    }
+    normalized = {"candidate_id": _identifier(request["candidate_id"], "candidate_id")}
     if "user_notes" in request:
         normalized["user_notes"] = _required_text(request["user_notes"], "user_notes")
     return normalized
@@ -1639,7 +1658,11 @@ def normalize_experience_case_request(value: Any) -> dict[str, Any]:
         _identifier(item, "observation_ids[]")
         for item in _array(request["observation_ids"], "observation_ids")
     ]
-    if not observation_ids or len(observation_ids) > 64 or len(set(observation_ids)) != len(observation_ids):
+    if (
+        not observation_ids
+        or len(observation_ids) > 64
+        or len(set(observation_ids)) != len(observation_ids)
+    ):
         raise UniverseError(
             "EXPERIENCE_CASE_OBSERVATIONS_INVALID",
             "observation_ids must contain 1..64 unique observed records",
@@ -1699,7 +1722,10 @@ def normalize_context_pack_request(value: Any) -> dict[str, Any]:
         required=frozenset({"purpose", "node_ids"}),
         optional=frozenset({"bench_limit"}),
     )
-    node_ids = [_identifier(item, "node_ids[]") for item in _array(request["node_ids"], "node_ids")]
+    node_ids = [
+        _identifier(item, "node_ids[]")
+        for item in _array(request["node_ids"], "node_ids")
+    ]
     if not node_ids or len(node_ids) > 32 or len(set(node_ids)) != len(node_ids):
         raise UniverseError(
             "CONTEXT_PACK_NODES_INVALID",
@@ -1773,9 +1799,7 @@ def normalize_skill_plan_adoption_request(value: Any) -> dict[str, Any]:
     }
 
 
-def normalize_project_seed(
-    project: dict[str, Any], value: Any
-) -> dict[str, Any]:
+def normalize_project_seed(project: dict[str, Any], value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
         field="project_seed",
@@ -1828,7 +1852,9 @@ def normalize_project_seed(
         )
         node_id = _identifier(node["node_id"], f"{field}.node_id")
         if node_id in node_ids:
-            raise UniverseError("PROJECT_SEED_NODE_DUPLICATE", f"duplicate node: {node_id}")
+            raise UniverseError(
+                "PROJECT_SEED_NODE_DUPLICATE", f"duplicate node: {node_id}"
+            )
         node_ids.add(node_id)
         normalized_node: dict[str, Any] = {
             "node_id": node_id,
@@ -1859,7 +1885,9 @@ def normalize_project_seed(
         )
         edge_id = _identifier(edge["edge_id"], f"{field}.edge_id")
         if edge_id in edge_ids:
-            raise UniverseError("PROJECT_SEED_EDGE_DUPLICATE", f"duplicate edge: {edge_id}")
+            raise UniverseError(
+                "PROJECT_SEED_EDGE_DUPLICATE", f"duplicate edge: {edge_id}"
+            )
         edge_ids.add(edge_id)
         from_node = _identifier(edge["from_node"], f"{field}.from_node")
         to_node = _identifier(edge["to_node"], f"{field}.to_node")
@@ -1998,9 +2026,7 @@ def normalize_project_seed(
             required=frozenset({"document_id", "path", "sha256", "role"}),
             optional=frozenset({"node_ids", "project_wide", "title"}),
         )
-        document_id = _identifier(
-            document["document_id"], f"{field}.document_id"
-        )
+        document_id = _identifier(document["document_id"], f"{field}.document_id")
         if document_id in document_ids:
             raise UniverseError(
                 "PROJECT_SEED_DOCUMENT_DUPLICATE",
@@ -2095,7 +2121,9 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
         raise UniverseError("REQUEST_INVALID", "room message body must be an object")
     kind = _identifier(value.get("kind", "QUESTION"), "kind").upper()
     if kind not in {"QUESTION", "REVIEW", "STATUS", "TASK_DRAFT", "RESULT"}:
-        raise UniverseError("ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind")
+        raise UniverseError(
+            "ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind"
+        )
     body = _required_text(value.get("body"), "body")
     if len(body) > 12000:
         raise UniverseError("ROOM_MESSAGE_BODY_INVALID", "body is too long")
@@ -2147,6 +2175,12 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
     if len(body) > 12000:
         raise UniverseError("CONDUCTOR_ROOM_MESSAGE_BODY_INVALID", "body is too long")
     sender = _identifier(value.get("sender", "USER"), "sender").upper()
+    requested_provider = _identifier(value.get("provider", "AUTO"), "provider").upper()
+    if requested_provider not in CONDUCTOR_ROOM_PROVIDERS:
+        raise UniverseError(
+            "CONDUCTOR_ROOM_PROVIDER_INVALID",
+            "provider must be AUTO, GROK, or CODEX",
+        )
     idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
     in_reply_to = value.get("in_reply_to")
     if in_reply_to is not None:
@@ -2160,6 +2194,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
         "kind": kind,
         "sender": sender,
         "body": body,
+        "requested_provider": requested_provider,
     }
     if in_reply_to is not None:
         material["in_reply_to"] = in_reply_to
@@ -2174,7 +2209,8 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
         "content_digest": hashlib.sha256(
             _canonical_json(material).encode("utf-8")
         ).hexdigest(),
-        "delivery_state": "RECORDED_FOR_CONDUCTOR",
+        "requested_provider": requested_provider,
+        "delivery_state": "QUEUED",
         "created_at": utc_now(),
     }
     if in_reply_to is not None:
@@ -2239,7 +2275,9 @@ def normalize_master_bridge_reply(project_id: str, value: Any) -> dict[str, Any]
     )
     return {
         "schema": PROJECT_MASTER_BRIDGE_REPLY_SCHEMA,
-        "bridge_id": _required_text(request["bridge_id"], "master_bridge_reply.bridge_id"),
+        "bridge_id": _required_text(
+            request["bridge_id"], "master_bridge_reply.bridge_id"
+        ),
         "message": normalize_room_message(
             project_id,
             {
@@ -2355,9 +2393,7 @@ def build_fresh_project_composition(
     ]
     material = {
         "schema": FRESH_PROJECT_COMPOSITION_SCHEMA,
-        "intent": {
-            key: value for key, value in intent.items() if key != "limit"
-        },
+        "intent": {key: value for key, value in intent.items() if key != "limit"},
         "seed": seed_result["seed"],
         "selected_route": {
             "route_id": route["route_id"],
@@ -2371,9 +2407,7 @@ def build_fresh_project_composition(
             "target_users": intent.get("target_users", "USER_SELECTION_REQUIRED"),
             "constraints": intent["constraints"],
             "functional_nodes": functional_nodes,
-            "completion_conditions": [
-                step["exit_evidence"] for step in route["steps"]
-            ],
+            "completion_conditions": [step["exit_evidence"] for step in route["steps"]],
         },
         "design": {
             "direction": route["description"],
@@ -2617,7 +2651,7 @@ def build_fresh_project_refinement_run(
 
 
 def build_fresh_project_refinement_candidate(
-    normalized: dict[str, Any]
+    normalized: dict[str, Any],
 ) -> dict[str, Any]:
     material = {
         **normalized,
@@ -2756,9 +2790,7 @@ def _document_target(document: dict[str, Any]) -> str:
     return f".ai/universe/documents/reference/{stable_name}"
 
 
-def build_document_incorporation_proposal(
-    projection: dict[str, Any]
-) -> dict[str, Any]:
+def build_document_incorporation_proposal(projection: dict[str, Any]) -> dict[str, Any]:
     operations = []
     for document in projection["documents"]:
         already_incorporated = document["path"].startswith(".ai/universe/")
@@ -3377,7 +3409,10 @@ class UniverseStore:
                 "SELECT project_root FROM project_connection WHERE project_id = ?",
                 (project["project_id"],),
             ).fetchone()
-            if existing is not None and existing["project_root"] != project["project_root"]:
+            if (
+                existing is not None
+                and existing["project_root"] != project["project_root"]
+            ):
                 raise UniverseError(
                     "PROJECT_ID_ALREADY_BOUND",
                     "project_id is already attached to another root",
@@ -3387,7 +3422,10 @@ class UniverseStore:
                 "SELECT project_id FROM project_connection WHERE project_root = ?",
                 (project["project_root"],),
             ).fetchone()
-            if root_owner is not None and root_owner["project_id"] != project["project_id"]:
+            if (
+                root_owner is not None
+                and root_owner["project_id"] != project["project_id"]
+            ):
                 raise UniverseError(
                     "PROJECT_ROOT_ALREADY_BOUND",
                     "project_root is already attached to another project",
@@ -3410,7 +3448,9 @@ class UniverseStore:
                     project["project_id"],
                     project["project_root"],
                     json.dumps(project["refs"], sort_keys=True, separators=(",", ":")),
-                    json.dumps(project["metadata"], sort_keys=True, separators=(",", ":")),
+                    json.dumps(
+                        project["metadata"], sort_keys=True, separators=(",", ":")
+                    ),
                     now,
                     now,
                 ),
@@ -3466,7 +3506,9 @@ class UniverseStore:
     def append_event(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
         event = normalize_event(project_id, value)
         self.get_project(event["project_id"])
-        payload_json = json.dumps(event["payload"], sort_keys=True, separators=(",", ":"))
+        payload_json = json.dumps(
+            event["payload"], sort_keys=True, separators=(",", ":")
+        )
         with self._connection() as connection:
             existing = connection.execute(
                 """
@@ -3496,8 +3538,11 @@ class UniverseStore:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    event["event_id"], event["project_id"], event["event_type"],
-                    payload_json, event["created_at"],
+                    event["event_id"],
+                    event["project_id"],
+                    event["event_type"],
+                    payload_json,
+                    event["created_at"],
                 ),
             )
         return event, True
@@ -3574,13 +3619,16 @@ class UniverseStore:
                     rows.append(self._skill_observation_row(existing))
                     continue
                 skill = observation["skill"]
-                observation_id = "skillrun_" + _json_sha256(
-                    {
-                        "project_id": project["project_id"],
-                        "candidate_id": request["candidate_id"],
-                        "observation_digest": observation["observation_digest"],
-                    }
-                )[:24]
+                observation_id = (
+                    "skillrun_"
+                    + _json_sha256(
+                        {
+                            "project_id": project["project_id"],
+                            "candidate_id": request["candidate_id"],
+                            "observation_digest": observation["observation_digest"],
+                        }
+                    )[:24]
+                )
                 connection.execute(
                     """
                     INSERT INTO skill_run_observation(
@@ -3668,9 +3716,7 @@ class UniverseStore:
         """Persist a redacted Project observation before asynchronous ingest."""
 
         project = self.get_project(project_id)
-        request = normalize_skill_observation_publication(
-            project["project_id"], value
-        )
+        request = normalize_skill_observation_publication(project["project_id"], value)
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
@@ -3689,14 +3735,19 @@ class UniverseStore:
                         "candidate_id already refers to different redacted content",
                         HTTPStatus.CONFLICT,
                     )
-                return self._skill_observation_queue_row(existing, project["project_id"]), False
-            queue_id = "observation_queue_" + _json_sha256(
-                {
-                    "project_id": project["project_id"],
-                    "candidate_id": request["candidate_id"],
-                    "candidate_digest": request["candidate_digest"],
-                }
-            )[:24]
+                return self._skill_observation_queue_row(
+                    existing, project["project_id"]
+                ), False
+            queue_id = (
+                "observation_queue_"
+                + _json_sha256(
+                    {
+                        "project_id": project["project_id"],
+                        "candidate_id": request["candidate_id"],
+                        "candidate_digest": request["candidate_digest"],
+                    }
+                )[:24]
+            )
             connection.execute(
                 """
                 INSERT INTO project_skill_observation_queue(
@@ -3727,9 +3778,7 @@ class UniverseStore:
             "candidate_id": request["candidate_id"],
             "candidate_digest": request["candidate_digest"],
             "publication_approval": request["publication_approval"],
-            "publication_approval_digest": request[
-                "publication_approval_digest"
-            ],
+            "publication_approval_digest": request["publication_approval_digest"],
             "status": "QUEUED",
             "queued_at": now,
             "ingested_at": None,
@@ -3751,7 +3800,10 @@ class UniverseStore:
                 """,
                 (project["project_id"], max(1, min(int(limit), 500))),
             ).fetchall()
-        return [self._skill_observation_queue_row(row, project["project_id"]) for row in rows]
+        return [
+            self._skill_observation_queue_row(row, project["project_id"])
+            for row in rows
+        ]
 
     def drain_skill_observation_queue(self, *, limit: int = 100) -> dict[str, Any]:
         """Consume Universe-owned queue items without touching Project files."""
@@ -3771,7 +3823,9 @@ class UniverseStore:
         ingested: list[dict[str, Any]] = []
         for row in rows:
             envelope = json.loads(row["candidate_json"])
-            result, created = self.ingest_skill_observations(row["project_id"], envelope)
+            result, created = self.ingest_skill_observations(
+                row["project_id"], envelope
+            )
             now = utc_now()
             with self._connection() as connection:
                 connection.execute(
@@ -3936,9 +3990,13 @@ class UniverseStore:
             for item in seed.get("implementation", {}).get("nodes", [])
             if item["implementation_id"] in selected_implementation_ids
         ]
-        bench_observations = self.list_skill_observations(
-            project["project_id"], limit=request["bench_limit"]
-        ) if request["bench_limit"] else []
+        bench_observations = (
+            self.list_skill_observations(
+                project["project_id"], limit=request["bench_limit"]
+            )
+            if request["bench_limit"]
+            else []
+        )
         material = {
             "schema": PROJECT_CONTEXT_PACK_SCHEMA,
             "project_id": project["project_id"],
@@ -4104,9 +4162,7 @@ class UniverseStore:
             rationale = candidate["bench_rationale"]
             rationale["observation_count"] += 1
             rationale["outcomes"][observation["outcome"]] += 1
-            rationale["validation_states"][
-                observation["validation_state"]
-            ] += 1
+            rationale["validation_states"][observation["validation_state"]] += 1
             if observation["outcome"] == "SUCCEEDED":
                 rationale["successful_count"] += 1
             if observation["outcome"] == "FAILED":
@@ -4128,9 +4184,7 @@ class UniverseStore:
                     / rationale["duration_observation_count"],
                     3,
                 )
-            rationale["validation_fail_count"] = rationale[
-                "validation_states"
-            ]["FAIL"]
+            rationale["validation_fail_count"] = rationale["validation_states"]["FAIL"]
         candidates = sorted(
             grouped.values(),
             key=lambda item: (
@@ -4259,7 +4313,9 @@ class UniverseStore:
                     f"candidate_ids are not in the Skill Plan proposal: {', '.join(sorted(unknown))}",
                     HTTPStatus.CONFLICT,
                 )
-            selected = [candidates[candidate_id] for candidate_id in request["candidate_ids"]]
+            selected = [
+                candidates[candidate_id] for candidate_id in request["candidate_ids"]
+            ]
             material = {
                 "schema": PROJECT_SKILL_PLAN_ADOPTION_SCHEMA,
                 "project_id": project["project_id"],
@@ -4463,7 +4519,9 @@ class UniverseStore:
         if "user_notes" in request:
             material["user_notes"] = request["user_notes"]
         material["selection_digest"] = _json_sha256(material)
-        material["adoption_id"] = "compositionadopt_" + material["selection_digest"][:24]
+        material["adoption_id"] = (
+            "compositionadopt_" + material["selection_digest"][:24]
+        )
         material["status"] = "FRESH_PROJECT_COMPOSITION_ADOPTED"
         with self._connection() as connection:
             existing = connection.execute(
@@ -4911,7 +4969,9 @@ class UniverseStore:
         material["created_at"] = now
         return material, True
 
-    def get_fresh_project_refinement_candidate(self, candidate_id: str) -> dict[str, Any]:
+    def get_fresh_project_refinement_candidate(
+        self, candidate_id: str
+    ) -> dict[str, Any]:
         normalized_id = _identifier(candidate_id, "candidate_id")
         with self._connection() as connection:
             row = connection.execute(
@@ -4957,7 +5017,9 @@ class UniverseStore:
         self, value: Any
     ) -> tuple[dict[str, Any], dict[str, Any], bool]:
         selection = normalize_fresh_project_refinement_adoption_request(value)
-        candidate = self.get_fresh_project_refinement_candidate(selection["candidate_id"])
+        candidate = self.get_fresh_project_refinement_candidate(
+            selection["candidate_id"]
+        )
         request = self.get_fresh_project_refinement_request(candidate["request_id"])
         composition = self.get_fresh_project_composition(candidate["composition_id"])
         refined = build_refined_fresh_project_composition(composition, candidate)
@@ -4981,7 +5043,9 @@ class UniverseStore:
                 stored["adopted_at"] = existing["adopted_at"]
                 return (
                     stored,
-                    self.get_fresh_project_composition(existing["refined_composition_id"]),
+                    self.get_fresh_project_composition(
+                        existing["refined_composition_id"]
+                    ),
                     False,
                 )
             now = utc_now()
@@ -5252,7 +5316,8 @@ class UniverseStore:
         if missing:
             raise UniverseError(
                 "EXPERIENCE_CASE_OBSERVATION_NOT_FOUND",
-                "observation_ids are not recorded for this Project: " + ", ".join(missing),
+                "observation_ids are not recorded for this Project: "
+                + ", ".join(missing),
                 HTTPStatus.CONFLICT,
             )
         observations = [
@@ -5386,7 +5451,9 @@ class UniverseStore:
             )
             for observation in subject_observations
         }
-        subject_outcomes = {observation["outcome"] for observation in subject_observations}
+        subject_outcomes = {
+            observation["outcome"] for observation in subject_observations
+        }
         subject_validation = {
             observation["validation_state"] for observation in subject_observations
         }
@@ -5549,7 +5616,9 @@ class UniverseStore:
             "support_case_count": len(supporting_ids),
             "observed_signature": {
                 "skill_binding_digests": common_bindings,
-                "skills": [json.loads(signature) for signature in sorted(common_skills)],
+                "skills": [
+                    json.loads(signature) for signature in sorted(common_skills)
+                ],
                 "outcomes": common_outcomes,
                 "validation_states": common_validation_states,
             },
@@ -5632,9 +5701,7 @@ class UniverseStore:
             field="career_promotion_request",
             required=frozenset({"pattern_proposal_id"}),
         )
-        proposal_id = _identifier(
-            request["pattern_proposal_id"], "pattern_proposal_id"
-        )
+        proposal_id = _identifier(request["pattern_proposal_id"], "pattern_proposal_id")
         with self._connection() as connection:
             row = connection.execute(
                 """
@@ -5945,9 +6012,13 @@ class UniverseStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    message["message_id"], message["project_id"],
-                    message["idempotency_key"], _canonical_json(message),
-                    delivery_state, delivery_json, message["created_at"],
+                    message["message_id"],
+                    message["project_id"],
+                    message["idempotency_key"],
+                    _canonical_json(message),
+                    delivery_state,
+                    delivery_json,
+                    message["created_at"],
                     message["created_at"],
                 ),
             )
@@ -5956,9 +6027,7 @@ class UniverseStore:
         message["updated_at"] = message["created_at"]
         return message, True
 
-    def create_conductor_room_message(
-        self, value: Any
-    ) -> tuple[dict[str, Any], bool]:
+    def create_conductor_room_message(self, value: Any) -> tuple[dict[str, Any], bool]:
         message = normalize_conductor_room_message(value)
         with self._connection() as connection:
             existing = connection.execute(
@@ -5994,9 +6063,7 @@ class UniverseStore:
             )
         return message, True
 
-    def list_conductor_room_messages(
-        self, *, limit: int = 200
-    ) -> list[dict[str, Any]]:
+    def list_conductor_room_messages(self, *, limit: int = 200) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -6013,6 +6080,231 @@ class UniverseStore:
             message["created_at"] = row["created_at"]
             messages.append(message)
         return messages
+
+    def get_conductor_room_message(self, message_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT message_json, created_at
+                FROM conductor_room_message
+                WHERE message_id = ?
+                """,
+                (_required_text(message_id, "message_id"),),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "CONDUCTOR_ROOM_MESSAGE_NOT_FOUND",
+                "conductor room message is not registered",
+                HTTPStatus.NOT_FOUND,
+            )
+        message = json.loads(row["message_json"])
+        message["created_at"] = row["created_at"]
+        return message
+
+    def recover_conductor_room_messages(self) -> list[str]:
+        pending: list[str] = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_id, message_json
+                FROM conductor_room_message
+                ORDER BY created_at, message_id
+                """
+            ).fetchall()
+            for row in rows:
+                message = json.loads(row["message_json"])
+                state = message.get("delivery_state")
+                if state == "PROCESSING":
+                    message["delivery_state"] = "QUEUED"
+                    message["updated_at"] = utc_now()
+                    message.pop("failure", None)
+                    connection.execute(
+                        """
+                        UPDATE conductor_room_message
+                        SET message_json = ?
+                        WHERE message_id = ?
+                        """,
+                        (_canonical_json(message), row["message_id"]),
+                    )
+                    state = "QUEUED"
+                if state in {"QUEUED", "WAITING_FOR_RUNTIME_BINDING"}:
+                    pending.append(row["message_id"])
+        return pending
+
+    def wait_conductor_room_message(self, message_id: str) -> None:
+        self._transition_conductor_room_message(
+            message_id,
+            expected_states={"QUEUED", "WAITING_FOR_RUNTIME_BINDING"},
+            delivery_state="WAITING_FOR_RUNTIME_BINDING",
+        )
+
+    def claim_conductor_room_message(
+        self, message_id: str, *, provider: str
+    ) -> dict[str, Any] | None:
+        return self._transition_conductor_room_message(
+            message_id,
+            expected_states={"QUEUED", "WAITING_FOR_RUNTIME_BINDING"},
+            delivery_state="PROCESSING",
+            updates={"provider": provider, "started_at": utc_now()},
+            required=False,
+        )
+
+    def fail_conductor_room_message(
+        self, message_id: str, *, code: str, reason: str
+    ) -> None:
+        self._transition_conductor_room_message(
+            message_id,
+            expected_states={
+                "QUEUED",
+                "WAITING_FOR_RUNTIME_BINDING",
+                "PROCESSING",
+            },
+            delivery_state="FAILED",
+            updates={
+                "failure": {
+                    "code": _required_text(code, "failure.code")[:160],
+                    "reason": _required_text(reason, "failure.reason")[:1000],
+                },
+                "completed_at": utc_now(),
+            },
+        )
+
+    def complete_conductor_room_message(
+        self,
+        message_id: str,
+        *,
+        provider: str,
+        body: str,
+        result_receipt_ref: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        reply = normalize_conductor_room_message(
+            {
+                "kind": "RESULT",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": _required_text(body, "reply.body")[:20000],
+                "provider": provider,
+                "idempotency_key": f"conductor-reply:{message_id}",
+                "in_reply_to": message_id,
+            }
+        )
+        completed_at = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT message_json
+                FROM conductor_room_message
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "CONDUCTOR_ROOM_MESSAGE_NOT_FOUND",
+                    "conductor room message is not registered",
+                    HTTPStatus.NOT_FOUND,
+                )
+            original = json.loads(row["message_json"])
+            if original.get("delivery_state") != "PROCESSING":
+                raise UniverseError(
+                    "CONDUCTOR_ROOM_STATE_CONFLICT",
+                    "conductor room message is not processing",
+                    HTTPStatus.CONFLICT,
+                )
+            original.update(
+                {
+                    "delivery_state": "ANSWERED",
+                    "provider": provider,
+                    "result_receipt_ref": result_receipt_ref,
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                }
+            )
+            reply.update(
+                {
+                    "delivery_state": "ANSWERED",
+                    "provider": provider,
+                    "result_receipt_ref": result_receipt_ref,
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                }
+            )
+            connection.execute(
+                """
+                UPDATE conductor_room_message
+                SET message_json = ?
+                WHERE message_id = ?
+                """,
+                (_canonical_json(original), message_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO conductor_room_message(
+                    message_id, idempotency_key, message_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    reply["message_id"],
+                    reply["idempotency_key"],
+                    _canonical_json(reply),
+                    reply["created_at"],
+                ),
+            )
+        return original, reply
+
+    def _transition_conductor_room_message(
+        self,
+        message_id: str,
+        *,
+        expected_states: set[str],
+        delivery_state: str,
+        updates: dict[str, Any] | None = None,
+        required: bool = True,
+    ) -> dict[str, Any] | None:
+        if delivery_state not in CONDUCTOR_ROOM_DELIVERY_STATES:
+            raise UniverseError(
+                "CONDUCTOR_ROOM_STATE_INVALID",
+                "unsupported conductor room delivery state",
+            )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT message_json
+                FROM conductor_room_message
+                WHERE message_id = ?
+                """,
+                (_required_text(message_id, "message_id"),),
+            ).fetchone()
+            if row is None:
+                if not required:
+                    return None
+                raise UniverseError(
+                    "CONDUCTOR_ROOM_MESSAGE_NOT_FOUND",
+                    "conductor room message is not registered",
+                    HTTPStatus.NOT_FOUND,
+                )
+            message = json.loads(row["message_json"])
+            if message.get("delivery_state") not in expected_states:
+                if not required:
+                    return None
+                raise UniverseError(
+                    "CONDUCTOR_ROOM_STATE_CONFLICT",
+                    "conductor room message state transition is not allowed",
+                    HTTPStatus.CONFLICT,
+                )
+            message["delivery_state"] = delivery_state
+            message["updated_at"] = utc_now()
+            if updates:
+                message.update(updates)
+            connection.execute(
+                """
+                UPDATE conductor_room_message
+                SET message_json = ?
+                WHERE message_id = ?
+                """,
+                (_canonical_json(message), message_id),
+            )
+        return message
 
     def send_room_message(
         self, project_id: str, value: Any
@@ -6110,7 +6402,9 @@ class UniverseStore:
         )
         return message, created
 
-    def list_room_messages(self, project_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+    def list_room_messages(
+        self, project_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
         with self._connection() as connection:
             rows = connection.execute(
@@ -6289,7 +6583,9 @@ class UniverseStore:
         try:
             seed_input = load_project_seed_assets(Path(project["project_root"]))
         except ProjectSeedAssetError as error:
-            raise UniverseError(error.args[0], error.args[0], HTTPStatus.CONFLICT) from error
+            raise UniverseError(
+                error.args[0], error.args[0], HTTPStatus.CONFLICT
+            ) from error
         seed, seed_created = self.record_project_seed(project["project_id"], seed_input)
         projection, projection_created = self.build_project_projection(
             project["project_id"],
@@ -6309,9 +6605,7 @@ class UniverseStore:
             "asset_root": ".ai/universe",
         }
 
-    def get_project_seed(
-        self, project_id: str, seed_id: str = ""
-    ) -> dict[str, Any]:
+    def get_project_seed(self, project_id: str, seed_id: str = "") -> dict[str, Any]:
         normalized_project = _project_id(project_id)
         self.get_project(normalized_project)
         with self._connection() as connection:
@@ -6381,9 +6675,10 @@ class UniverseStore:
                 HTTPStatus.CONFLICT,
             )
         expected_digest = request.get("expected_seed_digest")
-        if expected_digest is not None and _sha256(
-            expected_digest, "expected_seed_digest"
-        ) != seed["seed_digest"]:
+        if (
+            expected_digest is not None
+            and _sha256(expected_digest, "expected_seed_digest") != seed["seed_digest"]
+        ):
             raise UniverseError(
                 "PROJECT_SEED_DIGEST_MISMATCH",
                 "expected_seed_digest does not match the current Project Seed",
@@ -6485,9 +6780,11 @@ class UniverseStore:
                 HTTPStatus.CONFLICT,
             )
         expected = request.get("expected_projection_digest")
-        if expected is not None and _sha256(
-            expected, "expected_projection_digest"
-        ) != projection["projection_digest"]:
+        if (
+            expected is not None
+            and _sha256(expected, "expected_projection_digest")
+            != projection["projection_digest"]
+        ):
             raise UniverseError(
                 "PROJECT_PROJECTION_DIGEST_MISMATCH",
                 "expected_projection_digest does not match the current projection",
@@ -6535,12 +6832,16 @@ class UniverseStore:
         )
         require_release_lifecycle_mode(request["mode"])
         try:
-            source_database = Path(
-                _required_text(request["database_path"], "database_path")
-            ).expanduser().resolve(strict=True)
-            source_manifest = Path(
-                _required_text(request["manifest_path"], "manifest_path")
-            ).expanduser().resolve(strict=True)
+            source_database = (
+                Path(_required_text(request["database_path"], "database_path"))
+                .expanduser()
+                .resolve(strict=True)
+            )
+            source_manifest = (
+                Path(_required_text(request["manifest_path"], "manifest_path"))
+                .expanduser()
+                .resolve(strict=True)
+            )
         except OSError as error:
             raise UniverseError("RELEASE_ARTIFACT_UNAVAILABLE", str(error)) from error
         if not source_database.is_file() or not source_manifest.is_file():
@@ -6579,9 +6880,7 @@ class UniverseStore:
             )
         artifact_directory = self.release_artifact_root / database_sha256
         stored_database = artifact_directory / database_name
-        stored_manifest = artifact_directory / (
-            manifest_sha256 + ".manifest.json"
-        )
+        stored_manifest = artifact_directory / (manifest_sha256 + ".manifest.json")
         for stored_path, expected_sha256, content in (
             (stored_database, database_sha256, database_content),
             (stored_manifest, manifest_sha256, manifest_content),
@@ -6593,7 +6892,10 @@ class UniverseStore:
                         f"stored release artifact is not a regular file: {stored_path}",
                         HTTPStatus.CONFLICT,
                     )
-                if hashlib.sha256(stored_path.read_bytes()).hexdigest() != expected_sha256:
+                if (
+                    hashlib.sha256(stored_path.read_bytes()).hexdigest()
+                    != expected_sha256
+                ):
                     raise UniverseError(
                         "RELEASE_CATALOG_CORRUPT",
                         f"stored release artifact digest mismatch: {stored_path}",
@@ -6743,9 +7045,7 @@ class UniverseStore:
                 database_path=Path(artifact["database_path"]),
                 manifest_path=Path(artifact["manifest_path"]),
             ) as runtime:
-                plan = runtime.plan_project_install(
-                    Path(project["project_root"])
-                )
+                plan = runtime.plan_project_install(Path(project["project_root"]))
         except (
             CoreReleaseError,
             ReleaseRuntimeError,
@@ -6777,9 +7077,7 @@ class UniverseStore:
             ),
         }
         material["proposal_digest"] = _json_sha256(material)
-        material["proposal_id"] = "release_proposal_" + material[
-            "proposal_digest"
-        ][:20]
+        material["proposal_id"] = "release_proposal_" + material["proposal_digest"][:20]
         material["status"] = (
             "PROJECT_RELEASE_PROPOSAL_BLOCKED"
             if plan["collisions"]
@@ -6942,9 +7240,7 @@ class UniverseStore:
             "status": _required_text(result.get("status"), "runtime result status"),
             "provider": redacted["provider"],
             "worker_id": str(result.get("worker_id") or "UNKNOWN"),
-            "result_receipt_ref": str(
-                result.get("result_receipt_ref") or "UNKNOWN"
-            ),
+            "result_receipt_ref": str(result.get("result_receipt_ref") or "UNKNOWN"),
             "skill_run_observation_count": observation_count,
             "repository_write": False,
         }
@@ -7103,10 +7399,7 @@ class UniverseStore:
                 """,
                 (project["project_id"], bounded_limit),
             ).fetchall()
-        return [
-            self._dispatch_summary(row)
-            for row in rows
-        ]
+        return [self._dispatch_summary(row) for row in rows]
 
     def get_dispatch(self, dispatch_id: str) -> dict[str, Any]:
         normalized = _required_text(dispatch_id, "dispatch_id")
@@ -7549,25 +7842,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.runtime_host = runtime_host or UniverseRuntimeHost(
             Path(__file__).resolve().parents[1]
         )
-        self.mode_contract = dict(
-            mode_contract or unknown_universe_mode_contract()
-        )
+        self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_lock = threading.RLock()
         self.planning_execution_lock = threading.Lock()
+        self._conductor_queue: queue.Queue[str | None] = queue.Queue()
+        self._conductor_queued_ids: set[str] = set()
+        self._conductor_queue_lock = threading.RLock()
+        self._conductor_stop = threading.Event()
         super().__init__(address, UniverseRequestHandler)
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
-        self.connection_profile = local_connection_profile(
-            f"http://{host_text}:{port}"
-        )
+        self.connection_profile = local_connection_profile(f"http://{host_text}:{port}")
         self.interface_profiles = (local_http_interface_profile(),)
+        self._conductor_worker = threading.Thread(
+            target=self._conductor_worker_loop,
+            name="universe-conductor-room-worker",
+            daemon=True,
+        )
+        self._conductor_worker.start()
+        for message_id in self.store.recover_conductor_room_messages():
+            self.enqueue_conductor_message(message_id)
 
     def bind_planning_runtime(self, value: Any) -> dict[str, Any]:
         binding = normalize_planning_runtime_binding(value)
         binding["bound_at"] = utc_now()
         with self._planning_binding_lock:
             self._planning_binding = binding
+        for message_id in self.store.recover_conductor_room_messages():
+            self.enqueue_conductor_message(message_id)
         return self.planning_binding_status()
 
     def planning_binding_status(self) -> dict[str, Any]:
@@ -7611,6 +7914,132 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     HTTPStatus.CONFLICT,
                 )
             return dict(self._planning_binding)
+
+    def enqueue_conductor_message(self, message_id: str) -> None:
+        normalized_id = _required_text(message_id, "message_id")
+        with self._conductor_queue_lock:
+            if normalized_id in self._conductor_queued_ids:
+                return
+            self._conductor_queued_ids.add(normalized_id)
+        self._conductor_queue.put(normalized_id)
+
+    def _conductor_worker_loop(self) -> None:
+        while not self._conductor_stop.is_set():
+            message_id = self._conductor_queue.get()
+            try:
+                if message_id is None:
+                    return
+                try:
+                    self._process_conductor_message(message_id)
+                except (RuntimeHostError, UniverseError) as error:
+                    self._record_conductor_worker_failure(message_id, error)
+                except Exception as error:
+                    self._record_conductor_worker_failure(message_id, error)
+            finally:
+                if message_id is not None:
+                    with self._conductor_queue_lock:
+                        self._conductor_queued_ids.discard(message_id)
+                self._conductor_queue.task_done()
+
+    def _record_conductor_worker_failure(
+        self, message_id: str, error: Exception
+    ) -> None:
+        try:
+            self.store.fail_conductor_room_message(
+                message_id,
+                code=getattr(error, "code", "CONDUCTOR_WORKER_FAILED"),
+                reason=f"{type(error).__name__}: {error}",
+            )
+        except UniverseError:
+            pass
+
+    def _process_conductor_message(self, message_id: str) -> None:
+        with self._planning_binding_lock:
+            binding = (
+                dict(self._planning_binding)
+                if self._planning_binding is not None
+                else None
+            )
+        if binding is None:
+            self.store.wait_conductor_room_message(message_id)
+            return
+        message = self.store.get_conductor_room_message(message_id)
+        provider = self._resolve_conductor_provider(message)
+        claimed = self.store.claim_conductor_room_message(message_id, provider=provider)
+        if claimed is None:
+            return
+        history = [
+            item
+            for item in self.store.list_conductor_room_messages(limit=200)
+            if item.get("message_id") != message_id
+        ]
+        try:
+            invocation = self.runtime_host.invoke_conductor_message(
+                runtime_binding=binding,
+                message=claimed,
+                history=history,
+                provider=provider,
+            )
+            returned = invocation.get("result")
+            if not isinstance(returned, dict):
+                raise RuntimeHostError(
+                    "WORKER_RESULT_INVALID",
+                    "Conductor Worker did not return a result object",
+                )
+            reply_text = returned.get("text")
+            if not isinstance(reply_text, str) or not reply_text.strip():
+                raise RuntimeHostError(
+                    "WORKER_RESULT_INVALID",
+                    "Conductor Worker did not return bounded response text",
+                )
+            self.store.complete_conductor_room_message(
+                message_id,
+                provider=provider,
+                body=reply_text.strip()[:12000],
+                result_receipt_ref=str(
+                    invocation.get("result_receipt_ref") or "UNKNOWN"
+                ),
+            )
+        except (RuntimeHostError, UniverseError) as error:
+            self.store.fail_conductor_room_message(
+                message_id,
+                code=getattr(error, "code", type(error).__name__),
+                reason=str(error),
+            )
+        except Exception as error:
+            self.store.fail_conductor_room_message(
+                message_id,
+                code="CONDUCTOR_WORKER_FAILED",
+                reason=f"{type(error).__name__}: {error}",
+            )
+
+    def _resolve_conductor_provider(self, message: dict[str, Any]) -> str:
+        requested = str(message.get("requested_provider") or "AUTO").upper()
+        configured = os.environ.get("UNIVERSE_CONDUCTOR_PROVIDER", "AUTO").upper()
+        candidates = (
+            [requested]
+            if requested in {"GROK", "CODEX"}
+            else (
+                [configured] if configured in {"GROK", "CODEX"} else ["GROK", "CODEX"]
+            )
+        )
+        unavailable: list[str] = []
+        for provider in candidates:
+            capability = self.runtime_host.provider_capability(provider)
+            if capability.get("status") == "AVAILABLE":
+                return provider
+            unavailable.append(f"{provider}:{capability.get('reason', 'UNAVAILABLE')}")
+        raise RuntimeHostError(
+            "WORKER_PROVIDER_UNAVAILABLE",
+            "; ".join(unavailable) or "no Conductor provider is available",
+        )
+
+    def server_close(self) -> None:
+        if not self._conductor_stop.is_set():
+            self._conductor_stop.set()
+            self._conductor_queue.put(None)
+            self._conductor_worker.join(timeout=5)
+        super().server_close()
 
 
 class UniverseRequestHandler(BaseHTTPRequestHandler):
@@ -7692,6 +8121,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "CONDUCTOR_ROOM_MESSAGES_COLLECTED",
                     "messages": self.server.store.list_conductor_room_messages(),
+                    "runtime_binding": self.server.planning_binding_status(),
                 },
             )
             return
@@ -7958,9 +8388,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_DISPATCHES_COLLECTED",
                         "project_id": project_id,
-                        "dispatches": self.server.store.list_dispatches(
-                            project_id
-                        ),
+                        "dispatches": self.server.store.list_dispatches(project_id),
                     },
                 )
                 return
@@ -7972,9 +8400,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "PROJECT_RELEASE_PROPOSALS_COLLECTED",
                         "project_id": project_id,
                         "proposals": (
-                            self.server.store.list_project_release_proposals(
-                                project_id
-                            )
+                            self.server.store.list_project_release_proposals(project_id)
                         ),
                     },
                 )
@@ -8051,13 +8477,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
-                        "status": "PROJECT_REGISTERED" if created else "PROJECT_REFRESHED",
+                        "status": "PROJECT_REGISTERED"
+                        if created
+                        else "PROJECT_REFRESHED",
                         "project": project,
                     },
                 )
                 return
             if path == "/v1/conductor-room/messages":
                 message, created = self.server.store.create_conductor_room_message(body)
+                if created:
+                    self.server.enqueue_conductor_message(message["message_id"])
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
@@ -8068,6 +8498,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED"
                         ),
                         "message": message,
+                        "runtime_binding": self.server.planning_binding_status(),
                     },
                 )
                 return
@@ -8104,7 +8535,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         limit=intent["limit"],
                     )
                 except SeedError as error:
-                    raise UniverseError("FRESH_PROJECT_INTENT_INVALID", str(error)) from error
+                    raise UniverseError(
+                        "FRESH_PROJECT_INTENT_INVALID", str(error)
+                    ) from error
                 self._send(
                     HTTPStatus.OK,
                     {
@@ -8116,8 +8549,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/v1/fresh-project-compositions":
-                composition, created = self.server.store.create_fresh_project_composition(
-                    body
+                composition, created = (
+                    self.server.store.create_fresh_project_composition(body)
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8150,8 +8583,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/v1/fresh-project-refinement-requests":
-                request, created = self.server.store.create_fresh_project_refinement_request(
-                    body
+                request, created = (
+                    self.server.store.create_fresh_project_refinement_request(body)
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8207,11 +8640,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 approval = normalize_fresh_project_refinement_run_approval(body)
                 binding = self.server.require_planning_binding()
                 with self.server.planning_execution_lock:
-                    run, execute = (
-                        self.server.store.claim_fresh_project_refinement_run(
-                            refinement_run_id,
-                            approval,
-                        )
+                    run, execute = self.server.store.claim_fresh_project_refinement_run(
+                        refinement_run_id,
+                        approval,
                     )
                     if not execute:
                         candidate = (
@@ -8248,13 +8679,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         ),
                     }
                     try:
-                        result = (
-                            self.server.runtime_host.invoke_structured_planning(
-                                runtime_binding=binding,
-                                run=run,
-                                refinement_request=refinement_request,
-                                approval=runtime_approval,
-                            )
+                        result = self.server.runtime_host.invoke_structured_planning(
+                            runtime_binding=binding,
+                            run=run,
+                            refinement_request=refinement_request,
+                            approval=runtime_approval,
                         )
                         worker_output = (
                             normalize_fresh_project_refinement_worker_output(
@@ -8293,14 +8722,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                                 }
                             )
                         )
-                        run = (
-                            self.server.store.complete_fresh_project_refinement_run(
-                                run["run_id"],
-                                candidate=candidate,
-                                result_receipt_ref=candidate["producer"][
-                                    "result_receipt_ref"
-                                ],
-                            )
+                        run = self.server.store.complete_fresh_project_refinement_run(
+                            run["run_id"],
+                            candidate=candidate,
+                            result_receipt_ref=candidate["producer"][
+                                "result_receipt_ref"
+                            ],
                         )
                     except RuntimeHostError as error:
                         self.server.store.fail_fresh_project_refinement_run(
@@ -8329,8 +8756,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/v1/fresh-project-refinement-candidates":
-                candidate, created = self.server.store.record_fresh_project_refinement_candidate(
-                    body
+                candidate, created = (
+                    self.server.store.record_fresh_project_refinement_candidate(body)
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8346,8 +8773,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/v1/fresh-project-refinement-adoptions":
-                adoption, composition, created = self.server.store.adopt_fresh_project_refinement(
-                    body
+                adoption, composition, created = (
+                    self.server.store.adopt_fresh_project_refinement(body)
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8383,11 +8810,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             parts = self._project_path(path)
             if parts is not None and parts[1] == "/release-proposals":
-                proposal, created = (
-                    self.server.store.create_project_release_proposal(
-                        parts[0],
-                        body,
-                    )
+                proposal, created = self.server.store.create_project_release_proposal(
+                    parts[0],
+                    body,
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8403,8 +8828,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/discovery-dispatch":
-                dispatch, created = self.server.store.create_project_seed_discovery_dispatch(
-                    parts[0]
+                dispatch, created = (
+                    self.server.store.create_project_seed_discovery_dispatch(parts[0])
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8450,9 +8875,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     {
                         "schema": API_SCHEMA,
                         "status": (
-                            "DISPATCH_QUEUED"
-                            if created
-                            else "DISPATCH_ALREADY_QUEUED"
+                            "DISPATCH_QUEUED" if created else "DISPATCH_ALREADY_QUEUED"
                         ),
                         **dispatch,
                     },
@@ -8464,7 +8887,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
-                        "status": "PROJECT_EVENT_APPENDED" if created else "PROJECT_EVENT_ALREADY_RECORDED",
+                        "status": "PROJECT_EVENT_APPENDED"
+                        if created
+                        else "PROJECT_EVENT_ALREADY_RECORDED",
                         "event": event,
                     },
                 )
@@ -8475,7 +8900,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
-                        "status": "PROJECT_ROOM_MESSAGE_RECORDED" if created else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
+                        "status": "PROJECT_ROOM_MESSAGE_RECORDED"
+                        if created
+                        else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
                         "message": message,
                     },
                 )
@@ -8598,8 +9025,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 return
             if parts is not None and parts[1] == "/experience-pattern-proposals":
-                proposal, created = self.server.store.create_experience_pattern_proposal(
-                    parts[0], body
+                proposal, created = (
+                    self.server.store.create_experience_pattern_proposal(parts[0], body)
                 )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
@@ -8700,10 +9127,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            if (
-                parts is not None
-                and parts[1] == "/document-incorporation-proposals"
-            ):
+            if parts is not None and parts[1] == "/document-incorporation-proposals":
                 proposal, created = (
                     self.server.store.create_document_incorporation_proposal(
                         parts[0], body
@@ -8865,7 +9289,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         prefix = "/v1/projects/"
         if not path.startswith(prefix):
             return None
-        remainder = path[len(prefix):]
+        remainder = path[len(prefix) :]
         for suffix in (
             "/master-bridge/replies",
             "/master-bridge",
@@ -8892,7 +9316,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/sync",
         ):
             if remainder.endswith(suffix):
-                return unquote(remainder[:-len(suffix)]), suffix
+                return unquote(remainder[: -len(suffix)]), suffix
         return unquote(remainder), ""
 
     @staticmethod
@@ -8900,7 +9324,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         prefix = "/v1/releases/"
         if not path.startswith(prefix):
             return None
-        release_id = unquote(path[len(prefix):])
+        release_id = unquote(path[len(prefix) :])
         if not release_id or "/" in release_id:
             return None
         return release_id
@@ -8921,7 +9345,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         prefix = "/v1/dispatches/"
         if not path.startswith(prefix):
             return None
-        remainder = path[len(prefix):]
+        remainder = path[len(prefix) :]
         for suffix in (
             "/acknowledge",
             "/deliver",
@@ -8930,7 +9354,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/wake",
         ):
             if remainder.endswith(suffix):
-                return unquote(remainder[:-len(suffix)]), suffix
+                return unquote(remainder[: -len(suffix)]), suffix
         return unquote(remainder), ""
 
     @staticmethod
@@ -8939,7 +9363,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         suffix = "/master-handoffs/"
         if not path.startswith(prefix) or suffix not in path:
             return None
-        project_id, remainder = path[len(prefix):].split(suffix, 1)
+        project_id, remainder = path[len(prefix) :].split(suffix, 1)
         if not project_id or not remainder.endswith("/deliver"):
             return None
         handoff_id = remainder[: -len("/deliver")]
@@ -8950,7 +9374,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
     def _not_found(self) -> None:
         self._send(
             HTTPStatus.NOT_FOUND,
-            {"schema": API_SCHEMA, "status": "NOT_FOUND", "error_code": "ROUTE_NOT_FOUND"},
+            {
+                "schema": API_SCHEMA,
+                "status": "NOT_FOUND",
+                "error_code": "ROUTE_NOT_FOUND",
+            },
         )
 
     def _send_error(self, error: UniverseError) -> None:
@@ -8986,7 +9414,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             self._not_found()
             return
         body = target.read_bytes()
-        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        content_type = (
+            mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        )
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -9023,10 +9453,13 @@ def create_server(
         ) from error
     if not address.is_loopback:
         raise UniverseError(
-            "SERVER_HOST_FORBIDDEN", "Universe local service may listen only on loopback"
+            "SERVER_HOST_FORBIDDEN",
+            "Universe local service may listen only on loopback",
         )
     return UniverseHTTPServer(
-        (host, port), UniverseStore(database_path), _required_text(token, "token"),
+        (host, port),
+        UniverseStore(database_path),
+        _required_text(token, "token"),
         runtime_host,
         mode_contract,
     )
@@ -9080,7 +9513,11 @@ def load_server_state(path: Path) -> dict[str, Any]:
 
 
 def request_json(
-    *, endpoint: str, token: str, method: str, path: str,
+    *,
+    endpoint: str,
+    token: str,
+    method: str,
+    path: str,
     payload: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     profile = local_connection_profile(endpoint)
@@ -9104,7 +9541,10 @@ def publish_skill_observation(
             "SKILL_OBSERVATION_PREPARED_INVALID",
             "prepared Skill observation must be an object",
         )
-    if prepared.get("status") != "PREPARED" or prepared.get("command") != "SKILL_OBSERVATION":
+    if (
+        prepared.get("status") != "PREPARED"
+        or prepared.get("command") != "SKILL_OBSERVATION"
+    ):
         raise UniverseError(
             "SKILL_OBSERVATION_PREPARED_INVALID",
             "candidate must be a PREPARED SKILL_OBSERVATION artifact",
@@ -9115,9 +9555,7 @@ def publish_skill_observation(
         "publication_approval": publication_approval,
     }
     normalized_project = _project_id(project_id)
-    normalized = normalize_skill_observation_publication(
-        normalized_project, envelope
-    )
+    normalized = normalize_skill_observation_publication(normalized_project, envelope)
     _, health = request_json(
         endpoint=endpoint,
         token=token,
@@ -9168,12 +9606,8 @@ def publish_skill_observation(
         "operation_class": "UNIVERSE_OBSERVATION_QUEUE",
         "provider": "UNIVERSE_LOCAL_HTTP",
         "selection_ref": normalized["publication_approval"]["selection_ref"],
-        "approval_evidence_ref": normalized["publication_approval"][
-            "evidence_ref"
-        ],
-        "publication_approval_digest": normalized[
-            "publication_approval_digest"
-        ],
+        "approval_evidence_ref": normalized["publication_approval"]["evidence_ref"],
+        "publication_approval_digest": normalized["publication_approval_digest"],
         "approved_by": normalized["publication_approval"]["approver"],
         "base_source_ref": normalized["candidate"]["source_ref"],
         "candidate_id": normalized["candidate_id"],
@@ -9242,7 +9676,9 @@ def prepare_skill_observation_archive(
             "universe_provider_receipt_ref": _required_text(
                 receipt.get("provider_receipt_ref"), "receipt.provider_receipt_ref"
             ),
-            "candidate_id": _identifier(receipt.get("candidate_id"), "receipt.candidate_id"),
+            "candidate_id": _identifier(
+                receipt.get("candidate_id"), "receipt.candidate_id"
+            ),
             "candidate_digest": _sha256(
                 receipt.get("candidate_digest"), "receipt.candidate_digest"
             ),
@@ -9268,7 +9704,9 @@ def load_prepared_skill_observation(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.expanduser().read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise UniverseError("SKILL_OBSERVATION_PREPARED_UNAVAILABLE", str(error)) from error
+        raise UniverseError(
+            "SKILL_OBSERVATION_PREPARED_UNAVAILABLE", str(error)
+        ) from error
     if not isinstance(value, dict):
         raise UniverseError(
             "SKILL_OBSERVATION_PREPARED_INVALID",
@@ -9354,7 +9792,11 @@ def main() -> int:
         if args.command == "serve":
             mode_registry = load_universe_mode_registry(args.mode_registry)
             mode_contract = universe_mode_contract(mode_registry)
-            token = args.token or os.environ.get("UNIVERSE_TOKEN") or secrets.token_urlsafe(32)
+            token = (
+                args.token
+                or os.environ.get("UNIVERSE_TOKEN")
+                or secrets.token_urlsafe(32)
+            )
             server = create_server(
                 database_path=args.database,
                 token=token,

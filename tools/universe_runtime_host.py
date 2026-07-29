@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+
 # Provider workers use fixed argv lists; shell execution is disabled.
 import subprocess  # nosec B404
 import sys
@@ -95,9 +96,13 @@ def _loopback_endpoint(value: Any, field: str) -> str:
 
 def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise RuntimeHostError("RUNTIME_WORKER_REQUEST_INVALID", "request must be an object")
+        raise RuntimeHostError(
+            "RUNTIME_WORKER_REQUEST_INVALID", "request must be an object"
+        )
     if value.get("schema") not in {None, RUNTIME_WORKER_REQUEST_SCHEMA}:
-        raise RuntimeHostError("RUNTIME_WORKER_REQUEST_INVALID", "request schema is unsupported")
+        raise RuntimeHostError(
+            "RUNTIME_WORKER_REQUEST_INVALID", "request schema is unsupported"
+        )
     provider = _required_text(value.get("provider"), "provider").upper()
     if provider not in SUPPORTED_PROVIDERS:
         raise RuntimeHostError("WORKER_PROVIDER_UNSUPPORTED", "provider is unsupported")
@@ -113,8 +118,14 @@ def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
             "Runtime Host accepts read-only Task Frame turns only",
         )
     max_turns = value.get("max_turns", 1)
-    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or not 1 <= max_turns <= 4:
-        raise RuntimeHostError("RUNTIME_WORKER_REQUEST_INVALID", "max_turns must be 1..4")
+    if (
+        not isinstance(max_turns, int)
+        or isinstance(max_turns, bool)
+        or not 1 <= max_turns <= 4
+    ):
+        raise RuntimeHostError(
+            "RUNTIME_WORKER_REQUEST_INVALID", "max_turns must be 1..4"
+        )
     result_mode = _required_text(
         value.get("result_mode", "REDACTED"), "result_mode"
     ).upper()
@@ -179,7 +190,10 @@ class UniverseRuntimeHost:
         )
 
     def provider_capabilities(self) -> list[dict[str, str]]:
-        return [self.provider_capability(provider) for provider in sorted(SUPPORTED_PROVIDERS)]
+        return [
+            self.provider_capability(provider)
+            for provider in sorted(SUPPORTED_PROVIDERS)
+        ]
 
     def provider_capability(self, provider: str) -> dict[str, str]:
         normalized = _required_text(provider, "provider").upper()
@@ -192,7 +206,9 @@ class UniverseRuntimeHost:
         response = self.worker_dispatcher.provider_capability(normalized)
         result = {
             "provider": normalized,
-            "status": "AVAILABLE" if response.get("status") == "AVAILABLE" else "UNAVAILABLE",
+            "status": "AVAILABLE"
+            if response.get("status") == "AVAILABLE"
+            else "UNAVAILABLE",
         }
         if isinstance(response.get("reason"), str) and response["reason"]:
             result["reason"] = response["reason"]
@@ -320,9 +336,7 @@ class UniverseRuntimeHost:
             )
         return {
             "provider": normalized_provider,
-            "model_ref": (
-                f"provider://{normalized_provider}/model/{model}"
-            ),
+            "model_ref": (f"provider://{normalized_provider}/model/{model}"),
             "frame_id": frame_id,
             "turn_id": turn_id,
             "execution_proposal": dict(proposal),
@@ -489,6 +503,238 @@ class UniverseRuntimeHost:
                 except RuntimeHostError:
                     pass
 
+    def invoke_conductor_message(
+        self,
+        *,
+        runtime_binding: Mapping[str, Any],
+        message: Mapping[str, Any],
+        history: list[Mapping[str, Any]],
+        provider: str,
+    ) -> dict[str, Any]:
+        normalized_provider = _required_text(provider, "provider").upper()
+        capability = self.provider_capability(normalized_provider)
+        if capability["status"] != "AVAILABLE":
+            raise RuntimeHostError(
+                "WORKER_PROVIDER_UNAVAILABLE",
+                capability.get("reason", "selected provider is unavailable"),
+            )
+        message_id = _required_text(message.get("message_id"), "message_id")
+        body = message.get("body")
+        if not isinstance(body, str) or not body.strip() or len(body.strip()) > 12000:
+            raise RuntimeHostError(
+                "RUNTIME_WORKER_REQUEST_INVALID",
+                "message.body must be bounded non-empty text",
+            )
+        endpoint = _loopback_endpoint(runtime_binding.get("endpoint"), "endpoint")
+        token = _required_text(runtime_binding.get("token"), "token")
+        session_id = _required_text(runtime_binding.get("session_id"), "session_id")
+        frame_id = f"conductor-chat:{message_id}"
+        turn_id = "conductor"
+        source_ref = f"universe://conductor-room/messages/{message_id}"
+        model = PLANNING_MODELS[normalized_provider]
+        execution_plan = {
+            "profile_id": "task-frame-debate-v1",
+            "requested_shape": "DEBATE",
+            "resolved_shape": "DEBATE",
+            "model_mode": "EXPLICIT",
+            "frame_id": frame_id,
+            "origin_anchor_ref": _required_text(
+                runtime_binding.get("origin_anchor_ref"), "origin_anchor_ref"
+            ),
+            "origin_session_id": session_id,
+            "origin_frame_id": _required_text(
+                runtime_binding.get("origin_frame_id"), "origin_frame_id"
+            ),
+            "task_summary_ref": source_ref,
+            "source_ref": source_ref,
+            "candidate_source_ref": "NONE",
+            "source_review_result": None,
+            "parent_actor_ref": _required_text(
+                runtime_binding.get("parent_actor_ref"), "parent_actor_ref"
+            ),
+            "commander_surface": "universe-ui",
+            "execution_assignment_ref": "UNASSIGNED",
+            "host_worker_capability": "AVAILABLE",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "fallback_reason": "NONE",
+            "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
+            "turns": [
+                {
+                    "turn_id": turn_id,
+                    "role": "BOSS",
+                    "worker_slot_ref": "conductor-chat-slot",
+                    "provider": normalized_provider,
+                    "model": model,
+                    "reasoning_effort": "standard",
+                }
+            ],
+        }
+        proposal = self._build_task_frame_proposal(
+            execution_plan, prefix="conductor-chat-proposal-"
+        )
+        approval = {
+            "status": "APPROVED",
+            "proposal_id": proposal["proposal_id"],
+            "plan_digest": proposal["plan_digest"],
+            "commander_surface": "universe-ui",
+            "evidence_ref": source_ref,
+        }
+        bounded_history = [
+            {
+                "sender": str(item.get("sender") or "UNKNOWN"),
+                "kind": str(item.get("kind") or "QUESTION"),
+                "body": str(item.get("body") or "")[:12000],
+            }
+            for item in history[-12:]
+            if isinstance(item, Mapping) and str(item.get("body") or "").strip()
+        ]
+        output_contract = {
+            "schema": "universe.conductor-chat-output-contract.v1",
+            "format": "PLAIN_TEXT",
+            "language_policy": "MATCH_LATEST_USER_MESSAGE",
+            "instruction": (
+                "Answer the latest user message as the Universe Conductor. "
+                "Use only the supplied bounded conversation context. "
+                "Do not claim repository access, execution authority, or completed work."
+            ),
+        }
+        created = False
+        try:
+            created_result = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/create",
+                {
+                    "session_id": session_id,
+                    "profile": str(PLANNING_PROFILE),
+                    "frame": {
+                        "frame_id": frame_id,
+                        "origin_anchor_ref": execution_plan["origin_anchor_ref"],
+                        "origin_session_id": session_id,
+                        "origin_frame_id": execution_plan["origin_frame_id"],
+                        "task_summary_ref": source_ref,
+                        "source_ref": source_ref,
+                        "execution_assignment_ref": "UNASSIGNED",
+                        "task_frame_execution_proposal": proposal,
+                        "task_frame_execution_approval": approval,
+                        "parent_instruction": {
+                            "instruction_id": f"instruction:{message_id}",
+                            "user_instruction_raw": body.strip(),
+                            "constraints": [
+                                "READ_ONLY",
+                                "NO_REPOSITORY_ACCESS",
+                                "NO_SOURCE_MUTATION",
+                                "NO_SUBAGENTS",
+                            ],
+                            "expected_output": output_contract,
+                            "repository_write_scope": "NONE",
+                            "mutation_scope": {"operations": [], "targets": []},
+                        },
+                        "parent_observation": {
+                            "status": "MATCHED",
+                            "evidence_ref": _required_text(
+                                runtime_binding.get("parent_evidence_ref"),
+                                "parent_evidence_ref",
+                            ),
+                        },
+                        "observed_at": _utc_now(),
+                    },
+                },
+            )
+            if created_result.get("status") != "TASK_FRAME_HOST_ACTIVE":
+                raise RuntimeHostError(
+                    "TASK_FRAME_CREATE_FAILED",
+                    _text_or(
+                        created_result.get("status"),
+                        "Conductor chat Task Frame create failed",
+                    ),
+                )
+            created = True
+            declared = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/operation",
+                {
+                    "session_id": session_id,
+                    "frame_id": frame_id,
+                    "operation": {
+                        "operation": "declare_turns",
+                        "turns": [{"turn_id": turn_id, "role": "BOSS"}],
+                        "observed_at": _utc_now(),
+                    },
+                },
+            )
+            if (
+                declared.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+                or not isinstance(declared.get("output"), Mapping)
+                or declared["output"].get("status") != "TASK_TURNS_DECLARED"
+            ):
+                raise RuntimeHostError(
+                    "TASK_FRAME_TURN_DECLARATION_FAILED",
+                    "Conductor chat turn declaration failed",
+                )
+            result = self.invoke_read_only(
+                {
+                    "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
+                    "invocation_id": f"conductor-chat:{message_id}",
+                    "provider": normalized_provider,
+                    "endpoint": endpoint,
+                    "token": token,
+                    "session_id": session_id,
+                    "frame_id": frame_id,
+                    "turn_id": turn_id,
+                    "invoker_actor_ref": runtime_binding["parent_actor_ref"],
+                    "repository_write_scope": "NONE",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "context_pack": {
+                        "schema": "universe.conductor-chat-context.v1",
+                        "mode": "UNIVERSE",
+                        "role": "CONDUCTOR",
+                        "room_id": "UNIVERSE_CONDUCTOR",
+                        "history": bounded_history,
+                        "latest_message": {
+                            "message_id": message_id,
+                            "body": body.strip(),
+                        },
+                    },
+                    "output_contract": output_contract,
+                    "max_turns": 1,
+                    "result_mode": "REDACTED",
+                }
+            )
+            packet = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/operation",
+                {
+                    "session_id": session_id,
+                    "frame_id": frame_id,
+                    "operation": {"operation": "build_result_packet"},
+                },
+            )
+            if (
+                packet.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+                or not isinstance(packet.get("output"), Mapping)
+                or packet["output"].get("status") != "RESULT_PACKET_BUILT"
+            ):
+                raise RuntimeHostError(
+                    "TASK_FRAME_RESULT_PACKET_FAILED",
+                    "Conductor chat Result Packet was not built",
+                )
+            return result
+        finally:
+            if created:
+                try:
+                    self._post_runtime(
+                        endpoint,
+                        token,
+                        "/v1/task-frame/close",
+                        {"session_id": session_id, "frame_id": frame_id},
+                    )
+                except RuntimeHostError:
+                    pass
+
     @staticmethod
     def _invocation_result(
         request: Mapping[str, Any], response: Mapping[str, Any]
@@ -505,7 +751,7 @@ class UniverseRuntimeHost:
             detail = response.get(key)
             if isinstance(detail, str) and detail:
                 optional_details[key] = detail
-        return {
+        result = {
             "status": _text_or(response.get("status"), "WORKER_PROVIDER_FAILED"),
             "provider": request["provider"],
             "worker_id": _text_or(response.get("worker_id"), "UNKNOWN"),
@@ -516,6 +762,49 @@ class UniverseRuntimeHost:
             "repository_write": False,
             **optional_details,
         }
+        returned = response.get("result")
+        if isinstance(returned, Mapping):
+            result["result"] = dict(returned)
+        return result
+
+    def _build_task_frame_proposal(
+        self,
+        execution_plan: Mapping[str, Any],
+        *,
+        prefix: str,
+    ) -> dict[str, Any]:
+        with self._transient_json_file(
+            {"execution_plan": dict(execution_plan)},
+            prefix=prefix,
+        ) as request_path:
+            response = self._invoke_json_command(
+                [
+                    sys.executable,
+                    str(
+                        self.repository_root
+                        / ".ai"
+                        / "runtime"
+                        / "reference_runtime"
+                        / "cli.py"
+                    ),
+                    "task-frame",
+                    "propose",
+                    "--repo-root",
+                    str(self.repository_root),
+                    "--profile",
+                    str(PLANNING_PROFILE),
+                    "--request",
+                    str(request_path),
+                ],
+                timeout=30,
+            )
+        proposal = response.get("execution_proposal")
+        if not isinstance(proposal, Mapping):
+            raise RuntimeHostError(
+                "TASK_FRAME_PROPOSAL_INVALID",
+                "Task Frame CLI did not return an execution proposal",
+            )
+        return dict(proposal)
 
     def _dispatch_worker(self, request: Mapping[str, Any]) -> dict[str, Any]:
         dispatch_request = {
@@ -576,9 +865,7 @@ class UniverseRuntimeHost:
             reason = _text_or(result.get("reason"), code)
             stage = result.get("stage")
             detail = (
-                f"{stage}: {reason}"
-                if isinstance(stage, str) and stage
-                else reason
+                f"{stage}: {reason}" if isinstance(stage, str) and stage else reason
             )
             raise RuntimeHostError(code, detail)
         return result
@@ -615,11 +902,15 @@ class UniverseRuntimeHost:
     def _transient_json_file(
         value: Mapping[str, Any], *, prefix: str
     ) -> "_TransientRequestFile":
-        root = Path(
-            os.environ.get("LOCALAPPDATA")
-            or os.environ.get("TEMP")
-            or tempfile.gettempdir()
-        ) / "Universe" / "runtime-tmp"
+        root = (
+            Path(
+                os.environ.get("LOCALAPPDATA")
+                or os.environ.get("TEMP")
+                or tempfile.gettempdir()
+            )
+            / "Universe"
+            / "runtime-tmp"
+        )
         root.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from dataclasses import replace
@@ -97,15 +98,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.viewer_source.write_text(
             "class StrategyViewer:\n    pass\n", encoding="utf-8"
         )
-        self.architecture_doc.write_text(
-            "# GCS Architecture\n", encoding="utf-8"
-        )
-        self.contract_doc.write_text(
-            "# Broker Contract\n", encoding="utf-8"
-        )
-        self.orphan_doc.write_text(
-            "# Operations\n", encoding="utf-8"
-        )
+        self.architecture_doc.write_text("# GCS Architecture\n", encoding="utf-8")
+        self.contract_doc.write_text("# Broker Contract\n", encoding="utf-8")
+        self.orphan_doc.write_text("# Operations\n", encoding="utf-8")
 
         self.token = "test-token"
         self.server = create_server(
@@ -278,9 +273,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                             ],
                         }
                     ],
-                    "skill_bindings": [
-                        {"skill_id": "boot", "profile_id": "BOOT_CORE"}
-                    ],
+                    "skill_bindings": [{"skill_id": "boot", "profile_id": "BOOT_CORE"}],
                     "mode_profiles": [
                         {
                             "mode_profile_id": "MASTER_BASE",
@@ -551,9 +544,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(201, status)
         self.assertEqual("CONDUCTOR_ROOM_MESSAGE_RECORDED", result["status"])
-        self.assertEqual(
-            "RECORDED_FOR_CONDUCTOR", result["message"]["delivery_state"]
-        )
+        self.assertEqual("QUEUED", result["message"]["delivery_state"])
 
         status, repeated = self.request(
             "POST",
@@ -562,9 +553,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(200, status)
-        self.assertEqual(
-            "CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED", repeated["status"]
-        )
+        self.assertEqual("CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED", repeated["status"])
         self.assertEqual(
             result["message"]["message_id"], repeated["message"]["message_id"]
         )
@@ -574,15 +563,184 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("CONDUCTOR_ROOM_MESSAGES_COLLECTED", collected["status"])
-        self.assertEqual([result["message"]["message_id"]], [
-            message["message_id"] for message in collected["messages"]
-        ])
+        self.assertEqual(
+            [result["message"]["message_id"]],
+            [message["message_id"] for message in collected["messages"]],
+        )
+        self.assertIn(
+            collected["messages"][0]["delivery_state"],
+            {"QUEUED", "WAITING_FOR_RUNTIME_BINDING"},
+        )
+        self.assertEqual("UNBOUND", collected["runtime_binding"]["status"])
 
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(
             result["message"]["message_id"],
             reopened.list_conductor_room_messages()[0]["message_id"],
         )
+
+    def test_conductor_room_invokes_bound_runtime_asynchronously(self) -> None:
+        class FakeConductorRuntimeHost:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            @staticmethod
+            def provider_capability(provider: str) -> dict[str, object]:
+                return {
+                    "provider": provider,
+                    "status": "AVAILABLE" if provider == "GROK" else "UNAVAILABLE",
+                    "reason": "test capability",
+                }
+
+            def invoke_conductor_message(
+                self,
+                *,
+                runtime_binding: dict[str, object],
+                message: dict[str, object],
+                history: list[dict[str, object]],
+                provider: str,
+            ) -> dict[str, object]:
+                self.calls.append(
+                    {
+                        "binding": runtime_binding,
+                        "message": message,
+                        "history": history,
+                        "provider": provider,
+                    }
+                )
+                return {
+                    "status": "TURN_COMPLETED",
+                    "provider": provider,
+                    "worker_id": "grok-cli:conductor-001",
+                    "result_receipt_ref": "grok-cli:conductor-001:result-001",
+                    "repository_write": False,
+                    "result": {"text": "현재 프로젝트 위험을 정리했습니다."},
+                }
+
+        fake = FakeConductorRuntimeHost()
+        self.server.runtime_host = fake
+        status, bound = self.request(
+            "POST",
+            "/v1/runtime/planning-binding",
+            {
+                "schema": "universe.planning-runtime-binding.v1",
+                "endpoint": "http://127.0.0.1:41991",
+                "token": "runtime-token",
+                "session_id": "universe-conductor-session",
+                "origin_anchor_ref": "universe-anchor",
+                "origin_frame_id": "current",
+                "parent_actor_ref": "universe-conductor",
+                "parent_evidence_ref": "host://parent/current",
+                "binding_evidence_ref": "host://runtime/binding",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("BOUND", bound["status"])
+
+        status, queued = self.request(
+            "POST",
+            "/v1/conductor-room/messages",
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "현재 프로젝트 위험을 보여줘.",
+                "provider": "AUTO",
+                "idempotency_key": "conductor-async-001",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        message_id = queued["message"]["message_id"]
+
+        messages: list[dict[str, object]] = []
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            _, collected = self.request(
+                "GET", "/v1/conductor-room/messages", token=self.token
+            )
+            messages = collected["messages"]
+            if any(message.get("in_reply_to") == message_id for message in messages):
+                break
+            time.sleep(0.02)
+
+        original = next(
+            message for message in messages if message["message_id"] == message_id
+        )
+        reply = next(
+            message for message in messages if message.get("in_reply_to") == message_id
+        )
+        self.assertEqual("ANSWERED", original["delivery_state"])
+        self.assertEqual("GROK", original["provider"])
+        self.assertEqual("UNIVERSE_CONDUCTOR", reply["sender"])
+        self.assertEqual("현재 프로젝트 위험을 정리했습니다.", reply["body"])
+        self.assertEqual(
+            "grok-cli:conductor-001:result-001",
+            reply["result_receipt_ref"],
+        )
+        self.assertEqual(1, len(fake.calls))
+        self.assertEqual("GROK", fake.calls[0]["provider"])
+
+    def test_conductor_worker_survives_unavailable_provider(self) -> None:
+        class UnavailableRuntimeHost:
+            @staticmethod
+            def provider_capability(provider: str) -> dict[str, object]:
+                return {
+                    "provider": provider,
+                    "status": "UNAVAILABLE",
+                    "reason": "provider disabled for test",
+                }
+
+        self.server.runtime_host = UnavailableRuntimeHost()
+        self.request(
+            "POST",
+            "/v1/runtime/planning-binding",
+            {
+                "schema": "universe.planning-runtime-binding.v1",
+                "endpoint": "http://127.0.0.1:41991",
+                "token": "runtime-token",
+                "session_id": "universe-conductor-session",
+                "origin_anchor_ref": "universe-anchor",
+                "origin_frame_id": "current",
+                "parent_actor_ref": "universe-conductor",
+                "parent_evidence_ref": "host://parent/current",
+                "binding_evidence_ref": "host://runtime/binding",
+            },
+            self.token,
+        )
+        _, queued = self.request(
+            "POST",
+            "/v1/conductor-room/messages",
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "This provider is unavailable.",
+                "provider": "AUTO",
+                "idempotency_key": "conductor-unavailable-001",
+            },
+            self.token,
+        )
+        message_id = queued["message"]["message_id"]
+        deadline = time.monotonic() + 3
+        state = ""
+        failure: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            _, collected = self.request(
+                "GET", "/v1/conductor-room/messages", token=self.token
+            )
+            original = next(
+                message
+                for message in collected["messages"]
+                if message["message_id"] == message_id
+            )
+            state = str(original["delivery_state"])
+            failure = original.get("failure", {})
+            if state == "FAILED":
+                break
+            time.sleep(0.02)
+        self.assertEqual("FAILED", state)
+        self.assertEqual("WORKER_PROVIDER_UNAVAILABLE", failure["code"])
+        self.assertTrue(self.server._conductor_worker.is_alive())
 
     def test_registration_refresh_and_listing_are_idempotent(self) -> None:
         status, result = self.request(
@@ -624,7 +782,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual("INBOX_FALLBACK_AVAILABLE", result["message"]["delivery_state"])
+        self.assertEqual(
+            "INBOX_FALLBACK_AVAILABLE", result["message"]["delivery_state"]
+        )
         self.assertEqual({}, result["message"]["delivery"])
 
     def test_master_bridge_delivers_room_message_and_accepts_bound_reply(self) -> None:
@@ -641,9 +801,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(201, status)
         bridge = registered["bridge"]
         self.assertEqual("REGISTERED", bridge["status"])
-        self.assertEqual(
-            "opaque-project-master-session", bridge["master_session_ref"]
-        )
+        self.assertEqual("opaque-project-master-session", bridge["master_session_ref"])
 
         receipt = {
             "status": "DELIVERED",
@@ -670,7 +828,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         message = delivered["message"]
         self.assertEqual("DELIVERED_TO_MASTER", message["delivery_state"])
         self.assertEqual("DELIVERED", message["delivery"]["status"])
-        self.assertEqual(bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"])
+        self.assertEqual(
+            bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"]
+        )
         self.assertEqual(
             "opaque-project-master-session",
             deliver.call_args.kwargs["bridge"]["master_session_ref"],
@@ -795,9 +955,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             token=self.token,
         )
         self.assertEqual(200, status)
-        self.assertEqual([release["release_id"]], [
-            item["release_id"] for item in listed["releases"]
-        ])
+        self.assertEqual(
+            [release["release_id"]], [item["release_id"] for item in listed["releases"]]
+        )
 
         status, proposed = self.request(
             "POST",
@@ -881,9 +1041,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("PROJECT_EVENT_ALREADY_RECORDED", result["status"])
 
-        status, result = self.request("GET", "/v1/projects/GCS/events", token=self.token)
+        status, result = self.request(
+            "GET", "/v1/projects/GCS/events", token=self.token
+        )
         self.assertEqual(200, status)
-        self.assertEqual(["gcs-status-001"], [item["event_id"] for item in result["events"]])
+        self.assertEqual(
+            ["gcs-status-001"], [item["event_id"] for item in result["events"]]
+        )
 
         status, result = self.request("DELETE", "/v1/projects/GCS", token=self.token)
         self.assertEqual(200, status)
@@ -982,11 +1146,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("UNIVERSE_LOCAL_HTTP", receipt["provider"])
         self.assertEqual("NOT_PERFORMED", receipt["project_archive_write"])
         self.assertEqual("QUEUED", receipt["queue_state"])
-        self.assertEqual(
-            approval["evidence_ref"], receipt["approval_evidence_ref"]
-        )
+        self.assertEqual(approval["evidence_ref"], receipt["approval_evidence_ref"])
         self.assertEqual("PROJECT_MASTER", receipt["approved_by"])
-        self.assertIn(self.server.store.identity()["universe_id"], receipt["result_ref"])
+        self.assertIn(
+            self.server.store.identity()["universe_id"], receipt["result_ref"]
+        )
 
         status, repeated = publish_skill_observation(
             project_id="GCS",
@@ -999,9 +1163,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "UNIVERSE_SKILL_OBSERVATION_ALREADY_QUEUED", repeated["status"]
         )
-        self.assertEqual(
-            receipt["result_ref"], repeated["result_ref"]
-        )
+        self.assertEqual(receipt["result_ref"], repeated["result_ref"])
 
         rejected_approval = dict(approval)
         rejected_approval["candidate_digest"] = "f" * 64
@@ -1069,9 +1231,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("HANDOFF_APPEND", archive_candidate["operation_class"])
         self.assertEqual("NOT_PERFORMED", archive_candidate["project_archive_write"])
-        self.assertEqual(
-            "NOT_OBSERVED", archive_candidate["provider_write_evidence"]
-        )
+        self.assertEqual("NOT_OBSERVED", archive_candidate["provider_write_evidence"])
         self.assertEqual(
             "PROJECT_OWNED_HANDOFF_APPEND", archive_candidate["next_operation"]
         )
@@ -1090,7 +1250,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 archive_path=".ai/archive/../core/forbidden.json",
             )
 
-    def test_fresh_project_intent_returns_seed_routes_without_project_state(self) -> None:
+    def test_fresh_project_intent_returns_seed_routes_without_project_state(
+        self,
+    ) -> None:
         status, result = self.request(
             "POST",
             "/v1/future-paths",
@@ -1110,9 +1272,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("FUTURE_PATH_CANDIDATES", proposal["status"])
         self.assertEqual("NOT_AVAILABLE", proposal["probabilities"])
         self.assertEqual("USER_SELECTION_REQUIRED", proposal["next_operation"])
-        self.assertEqual(
-            "durable-desktop-state", proposal["candidates"][0]["route_id"]
-        )
+        self.assertEqual("durable-desktop-state", proposal["candidates"][0]["route_id"])
         self.assertEqual("NONE", proposal["effects"]["execution"])
 
         status, rejected = self.request(
@@ -1186,9 +1346,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(201, status)
         self.assertEqual("FRESH_PROJECT_COMPOSITION_ADOPTED", adopted["status"])
         adoption = adopted["adoption"]
-        self.assertEqual(
-            "PROJECT_MASTER_HANDOFF_CANDIDATE", adoption["next_operation"]
-        )
+        self.assertEqual("PROJECT_MASTER_HANDOFF_CANDIDATE", adoption["next_operation"])
         self.assertTrue(all(value == "NONE" for value in adoption["effects"].values()))
         self.assertEqual([], self.server.store.list_projects())
 
@@ -1217,7 +1375,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("FRESH_PROJECT_ROUTE_NOT_SELECTABLE", rejected["error_code"])
 
-    def test_fresh_project_refinement_requires_bound_candidate_and_user_adoption(self) -> None:
+    def test_fresh_project_refinement_requires_bound_candidate_and_user_adoption(
+        self,
+    ) -> None:
         status, created = self.request(
             "POST",
             "/v1/fresh-project-compositions",
@@ -1245,9 +1405,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.CREATED, status)
         refinement_request = prepared["request"]
-        self.assertEqual(
-            "FRESH_PROJECT_REFINEMENT_REQUEST_READY", prepared["status"]
-        )
+        self.assertEqual("FRESH_PROJECT_REFINEMENT_REQUEST_READY", prepared["status"])
         self.assertEqual(
             "UNIVERSE_PLANNING_FRAME_REQUIRED",
             refinement_request["runtime_boundary"]["task_frame"],
@@ -1256,7 +1414,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "NOT_REQUESTED",
             refinement_request["runtime_boundary"]["provider_invocation"],
         )
-        self.assertEqual("FORBIDDEN", refinement_request["output_contract"]["raw_worker_text"])
+        self.assertEqual(
+            "FORBIDDEN", refinement_request["output_contract"]["raw_worker_text"]
+        )
         self.assertTrue(
             all(value == "NONE" for value in refinement_request["effects"].values())
         )
@@ -1276,7 +1436,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "refinement": {
                 "problem_statement": "Provide a recoverable local trading workspace.",
                 "target_users": "Individual trading operator",
-                "constraints": ["Local-first only.", "No order mutation during discovery."],
+                "constraints": [
+                    "Local-first only.",
+                    "No order mutation during discovery.",
+                ],
                 "design_direction": "Keep recovery state visible beside live observations.",
                 "technology_recommendations": [
                     {
@@ -1310,9 +1473,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         refinement_candidate = recorded["candidate"]
         self.assertNotIn("raw_text", json.dumps(refinement_candidate, sort_keys=True))
-        self.assertEqual(
-            "FRESH_PROJECT_REFINEMENT_CANDIDATE_READY", recorded["status"]
-        )
+        self.assertEqual("FRESH_PROJECT_REFINEMENT_CANDIDATE_READY", recorded["status"])
 
         status, adoption_result = self.request(
             "POST",
@@ -1347,12 +1508,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GET", "/v1/fresh-project-refinement-requests", token=self.token
         )
         self.assertEqual(HTTPStatus.OK, status)
-        self.assertEqual([refinement_request["request_id"]], [item["request_id"] for item in requests["requests"]])
+        self.assertEqual(
+            [refinement_request["request_id"]],
+            [item["request_id"] for item in requests["requests"]],
+        )
         status, candidates = self.request(
             "GET", "/v1/fresh-project-refinement-candidates", token=self.token
         )
         self.assertEqual(HTTPStatus.OK, status)
-        self.assertEqual([refinement_candidate["candidate_id"]], [item["candidate_id"] for item in candidates["candidates"]])
+        self.assertEqual(
+            [refinement_candidate["candidate_id"]],
+            [item["candidate_id"] for item in candidates["candidates"]],
+        )
         status, adoptions = self.request(
             "GET", "/v1/fresh-project-refinement-adoptions", token=self.token
         )
@@ -1598,7 +1765,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "FRESH_PROJECT_REFINEMENT_RUN_ALREADY_COMPLETED",
             repeated["status"],
         )
-        self.assertEqual(candidate["candidate_id"], repeated["candidate"]["candidate_id"])
+        self.assertEqual(
+            candidate["candidate_id"], repeated["candidate"]["candidate_id"]
+        )
         self.assertEqual(1, fake.invocations)
 
         database_bytes = self.server.store.database_path.read_bytes()
@@ -1709,7 +1878,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PROJECT_MASTER_HANDOFF_DELIVERED", delivered["status"])
         self.assertEqual("DELIVERED_TO_MASTER", delivered["handoff"]["delivery_state"])
         self.assertIsNotNone(delivered["handoff"]["room_message_id"])
-        self.assertEqual(bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"])
+        self.assertEqual(
+            bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"]
+        )
 
         status, repeated = self.request(
             "POST",
@@ -1724,7 +1895,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GET", "/v1/projects/GCS/master-handoffs", token=self.token
         )
         self.assertEqual(200, status)
-        self.assertEqual([handoff["handoff_id"]], [item["handoff_id"] for item in listed["handoffs"]])
+        self.assertEqual(
+            [handoff["handoff_id"]], [item["handoff_id"] for item in listed["handoffs"]]
+        )
         after = {
             path.relative_to(self.project_root).as_posix(): self.digest(path)
             for path in self.project_root.rglob("*")
@@ -1762,7 +1935,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("NOT_INFERRED", case["causal_state"])
         self.assertEqual("NOT_EVALUATED", case["pattern_state"])
         self.assertEqual([observation["observation_id"]], case["observation_ids"])
-        self.assertEqual(observation["evidence_refs"], case["observations"][0]["evidence_refs"])
+        self.assertEqual(
+            observation["evidence_refs"], case["observations"][0]["evidence_refs"]
+        )
         self.assertTrue(all(value == "NONE" for value in case["effects"].values()))
 
         status, repeated = self.request(
@@ -1781,7 +1956,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GET", "/v1/projects/GCS/experience-cases", token=self.token
         )
         self.assertEqual(200, status)
-        self.assertEqual([case["case_id"]], [item["case_id"] for item in listed["cases"]])
+        self.assertEqual(
+            [case["case_id"]], [item["case_id"] for item in listed["cases"]]
+        )
 
         status, rejected = self.request(
             "POST",
@@ -1790,7 +1967,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(409, status)
-        self.assertEqual("EXPERIENCE_CASE_OBSERVATION_NOT_FOUND", rejected["error_code"])
+        self.assertEqual(
+            "EXPERIENCE_CASE_OBSERVATION_NOT_FOUND", rejected["error_code"]
+        )
         after = {
             path.relative_to(self.project_root).as_posix(): self.digest(path)
             for path in self.project_root.rglob("*")
@@ -1844,7 +2023,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("EXPERIENCE_CASE_MATCHES_COLLECTED", result["status"])
         self.assertEqual("PROJECT_LOCAL_OBSERVED_CASES", result["match_scope"])
-        self.assertEqual([second_case["case_id"]], [item["case_id"] for item in result["matches"]])
+        self.assertEqual(
+            [second_case["case_id"]], [item["case_id"] for item in result["matches"]]
+        )
         match = result["matches"][0]
         self.assertEqual("OBSERVED_SIMILARITY", match["relation"])
         self.assertEqual("NOT_INFERRED", match["causal_state"])
@@ -1866,7 +2047,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PROPOSAL_ONLY", proposal["promotion_state"])
         self.assertEqual("NOT_INFERRED", proposal["causal_state"])
         self.assertEqual("NOT_EVALUATED", proposal["predictive_state"])
-        self.assertEqual("source-review", proposal["observed_signature"]["skills"][0]["skill_id"])
+        self.assertEqual(
+            "source-review", proposal["observed_signature"]["skills"][0]["skill_id"]
+        )
         self.assertTrue(all(value == "NONE" for value in proposal["effects"].values()))
 
         status, collected = self.request(
@@ -1891,9 +2074,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         item = queued["item"]
         candidate = item["candidate"]
         self.assertEqual("QUEUED", item["status"])
-        self.assertEqual(
-            "universe.career-promotion-candidate.v1", candidate["schema"]
-        )
+        self.assertEqual("universe.career-promotion-candidate.v1", candidate["schema"])
         self.assertEqual("CANDIDATE_ONLY", candidate["promotion_state"])
         self.assertEqual("REDACTED", candidate["redaction_state"])
         self.assertEqual(
@@ -1908,13 +2089,17 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(200, status)
-        self.assertEqual("CAREER_PROMOTION_CANDIDATE_ALREADY_QUEUED", repeated["status"])
+        self.assertEqual(
+            "CAREER_PROMOTION_CANDIDATE_ALREADY_QUEUED", repeated["status"]
+        )
 
         status, queue = self.request(
             "GET", "/v1/career-promotion-queue", token=self.token
         )
         self.assertEqual(200, status)
-        self.assertEqual([item["queue_id"]], [entry["queue_id"] for entry in queue["items"]])
+        self.assertEqual(
+            [item["queue_id"]], [entry["queue_id"] for entry in queue["items"]]
+        )
 
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
@@ -2007,7 +2192,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GET", "/v1/projects/GCS/skill-plan-adoptions", token=self.token
         )
         self.assertEqual(200, status)
-        self.assertEqual([adoption["adoption_id"]], [item["adoption_id"] for item in collected["adoptions"]])
+        self.assertEqual(
+            [adoption["adoption_id"]],
+            [item["adoption_id"] for item in collected["adoptions"]],
+        )
         after = {
             path.relative_to(self.project_root).as_posix(): self.digest(path)
             for path in self.project_root.rglob("*")
@@ -2115,16 +2303,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(201, status)
         ranked = plan_result["proposal"]["candidates"]
-        self.assertEqual(["GROK", "CODEX", "OPENAI"], [
-            item["provider_ref"] for item in ranked
-        ])
+        self.assertEqual(
+            ["GROK", "CODEX", "OPENAI"], [item["provider_ref"] for item in ranked]
+        )
         self.assertEqual([1, 2, 3], [item["rank"] for item in ranked])
         self.assertEqual(
             [1, 0, 0],
-            [
-                item["bench_rationale"]["validated_success_count"]
-                for item in ranked
-            ],
+            [item["bench_rationale"]["validated_success_count"] for item in ranked],
         )
         self.assertTrue(
             all(item["recommendation_state"] == "CANDIDATE_ONLY" for item in ranked)
@@ -2184,11 +2369,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("DISPATCH_DELIVERED", delivered["status"])
         inbox_file = (
-            self.project_root
-            / ".ai"
-            / "inbox"
-            / "MASTER"
-            / f"{dispatch_id}.json"
+            self.project_root / ".ai" / "inbox" / "MASTER" / f"{dispatch_id}.json"
         )
         self.assertTrue(inbox_file.is_file())
 
@@ -2334,10 +2515,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             {"node:broker-client", "node:strategy-viewer", "document:operations"},
-            {
-                item["subject_ref"]
-                for item in projection["missing_connections"]
-            },
+            {item["subject_ref"] for item in projection["missing_connections"]},
         )
         self.assertEqual("NONE", projection["effects"]["project_source_write"])
 
@@ -2386,7 +2564,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_project_seed_preserves_reference_context_and_document_roles(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         seed_input = self.project_seed()
-        seed_input["project"]["summary"] = "Trading system architecture and work context"
+        seed_input["project"]["summary"] = (
+            "Trading system architecture and work context"
+        )
         seed_input["project"]["working_rules"] = [
             "Keep source mutations inside an approved Project scope.",
             "Use linked design and contract documents before implementation.",
@@ -2453,9 +2633,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(".ai/universe", materialized["asset_root"])
 
-        status, synced = self.request(
-            "POST", "/v1/projects/GCS/sync", {}, self.token
-        )
+        status, synced = self.request("POST", "/v1/projects/GCS/sync", {}, self.token)
         self.assertEqual(200, status)
         self.assertEqual("PROJECT_SEED_ASSETS_SYNCED", synced["status"])
         projection = synced["projection"]
@@ -2516,7 +2694,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.assertEqual(before, after)
 
-    def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(self) -> None:
+    def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(
+        self,
+    ) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, result = self.request(
             "POST", "/v1/projects/GCS/discovery-dispatch", {}, self.token
@@ -2539,9 +2719,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "POST", "/v1/projects/GCS/seed", invalid_digest, self.token
         )
         self.assertEqual(409, status)
-        self.assertEqual(
-            "PROJECT_FILE_REF_DIGEST_MISMATCH", result["error_code"]
-        )
+        self.assertEqual("PROJECT_FILE_REF_DIGEST_MISMATCH", result["error_code"])
 
         escaping = self.project_seed()
         escaping["documents"][0]["path"] = "../outside.md"
@@ -2583,16 +2761,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "POST", "/v1/projects/GCS/seed", updated, self.token
         )
         self.assertEqual(201, status)
-        self.assertNotEqual(
-            first["seed"]["seed_digest"], second["seed"]["seed_digest"]
-        )
+        self.assertNotEqual(first["seed"]["seed_digest"], second["seed"]["seed_digest"])
         status, result = self.request(
             "GET", "/v1/projects/GCS/projection", token=self.token
         )
         self.assertEqual(409, status)
-        self.assertEqual(
-            "PROJECT_PROJECTION_REBUILD_REQUIRED", result["error_code"]
-        )
+        self.assertEqual("PROJECT_PROJECTION_REBUILD_REQUIRED", result["error_code"])
 
         status, result = self.request(
             "POST",
@@ -2614,7 +2788,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PROJECT_REF_INVALID", result["error_code"])
 
         registry_path = (
-            self.project_root / ".ai" / "runtime" / "project_instance" / "mode_registry.json"
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "project_instance"
+            / "mode_registry.json"
         )
         registry = json.loads(registry_path.read_text(encoding="utf-8"))
         registry["owner"] = "OTHER"
@@ -2712,7 +2890,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(UniverseError, "UNIVERSE"):
             load_universe_mode_registry(registry_path)
 
-    def test_remote_auth_types_are_reserved_without_runtime_implementation(self) -> None:
+    def test_remote_auth_types_are_reserved_without_runtime_implementation(
+        self,
+    ) -> None:
         profile = connection_profile(
             connection_id="personal-cloud",
             kind="REMOTE",
@@ -2855,7 +3035,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertNotIn("worker_run_ref", created["invocation"]["result"])
         status, repeated = self.request("POST", path, payload)
         self.assertEqual(HTTPStatus.OK, status)
-        self.assertEqual("RUNTIME_WORKER_INVOCATION_ALREADY_RECORDED", repeated["status"])
+        self.assertEqual(
+            "RUNTIME_WORKER_INVOCATION_ALREADY_RECORDED", repeated["status"]
+        )
         status, listed = self.request("GET", path)
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(1, len(listed["invocations"]))

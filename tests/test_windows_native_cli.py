@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,27 @@ def completed(stdout: str) -> NativeCliResult:
 
 
 class WindowsNativeCliTests(unittest.TestCase):
+    def test_windows_runner_hides_console_processes(self) -> None:
+        observed: dict[str, object] = {}
+
+        def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            observed.update(kwargs)
+            return subprocess.CompletedProcess(command, 0, b"ok", b"")
+
+        result = run_native_cli(
+            NativeCliRequest(
+                executable=Path(sys.executable),
+                arguments=("--version",),
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual("COMPLETED", result.status)
+        self.assertEqual(
+            subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            observed["creationflags"],
+        )
+
     def test_exact_argv_boundaries_survive_native_runner(self) -> None:
         expected = [
             "plain",

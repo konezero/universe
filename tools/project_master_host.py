@@ -1,0 +1,526 @@
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import json
+import os
+import queue
+import sqlite3
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping, Protocol
+from uuid import UUID, uuid4
+
+from project_master_bridge import (
+    ProjectMasterBridgeHost,
+    ProjectMasterBridgeHttpServer,
+    normalize_bridge_envelope,
+    post_master_reply,
+    utc_now,
+)
+from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
+
+
+PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
+PROJECT_MASTER_SESSION_SCHEMA = "universe.project-master-session.v1"
+SUPPORTED_PROVIDERS = frozenset({"GROK"})
+
+
+class ProjectMasterHostError(RuntimeError):
+    pass
+
+
+class MasterProvider(Protocol):
+    @property
+    def session_ref(self) -> str: ...
+
+    def reply(self, message: Mapping[str, Any]) -> str: ...
+
+
+ReplyPoster = Callable[..., dict[str, Any]]
+NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
+
+
+class ProjectMasterSessionStore:
+    def __init__(self, database_path: Path, project_id: str) -> None:
+        self.database_path = database_path.expanduser().resolve()
+        self.project_id = _text(project_id, "project_id")
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._initialize()
+
+    def provider_session_id(self) -> str:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = 'provider_session_id'"
+            ).fetchone()
+            if row is not None:
+                return str(row["value"])
+            session_id = str(uuid4())
+            connection.execute(
+                "INSERT INTO host_metadata(key, value) VALUES(?, ?)",
+                ("provider_session_id", session_id),
+            )
+            return session_id
+
+    def provider_session_initialized(self) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = 'provider_session_initialized'"
+            ).fetchone()
+        return row is not None and str(row["value"]) == "true"
+
+    def mark_provider_session_initialized(self) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO host_metadata(key, value)
+                VALUES('provider_session_initialized', 'true')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            )
+
+    def register(self, envelope: Mapping[str, Any]) -> bool:
+        normalized = normalize_bridge_envelope(envelope)
+        message_id = normalized["message"]["message_id"]
+        envelope_json = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT state FROM inbox_message WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is not None and row["state"] in {
+                "PENDING",
+                "PROCESSING",
+                "COMPLETE",
+            }:
+                return False
+            connection.execute(
+                """
+                INSERT INTO inbox_message(
+                    message_id, envelope_json, state, attempts, last_error, updated_at
+                ) VALUES(?, ?, 'PENDING', 0, '', ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    envelope_json = excluded.envelope_json,
+                    state = 'PENDING',
+                    last_error = '',
+                    updated_at = excluded.updated_at
+                """,
+                (message_id, envelope_json, utc_now()),
+            )
+        return True
+
+    def recover(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE inbox_message
+                SET state = 'PENDING', updated_at = ?
+                WHERE state = 'PROCESSING'
+                """,
+                (utc_now(),),
+            )
+            rows = connection.execute(
+                """
+                SELECT envelope_json
+                FROM inbox_message
+                WHERE state IN ('PENDING', 'FAILED')
+                ORDER BY updated_at, message_id
+                """
+            ).fetchall()
+        return [json.loads(str(row["envelope_json"])) for row in rows]
+
+    def claim(self, message_id: str) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE inbox_message
+                SET state = 'PROCESSING', attempts = attempts + 1,
+                    last_error = '', updated_at = ?
+                WHERE message_id = ? AND state IN ('PENDING', 'FAILED')
+                """,
+                (utc_now(), message_id),
+            )
+        return cursor.rowcount == 1
+
+    def complete(self, message_id: str) -> None:
+        self._transition(message_id, "COMPLETE", "")
+
+    def fail(self, message_id: str, error: str) -> None:
+        self._transition(message_id, "FAILED", error[:1000])
+
+    def state(self, message_id: str) -> str:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT state FROM inbox_message WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return str(row["state"]) if row is not None else "UNKNOWN"
+
+    def _transition(self, message_id: str, state: str, error: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE inbox_message
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE message_id = ?
+                """,
+                (state, error, utc_now(), message_id),
+            )
+
+    def _initialize(self) -> None:
+        with self._connection() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS host_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS inbox_message (
+                    message_id TEXT PRIMARY KEY,
+                    envelope_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    last_error TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+
+class GrokProjectMasterRuntime:
+    def __init__(
+        self,
+        project_root: Path,
+        project_id: str,
+        store: ProjectMasterSessionStore,
+        *,
+        native_runner: NativeRunner = run_native_cli,
+        model: str = "",
+        max_turns: int = 8,
+    ) -> None:
+        self.project_root = project_root.expanduser().resolve(strict=True)
+        self.project_id = _text(project_id, "project_id")
+        self.store = store
+        self.native_runner = native_runner
+        self.model = model.strip()
+        self.max_turns = max(1, int(max_turns))
+        self.session_id = store.provider_session_id()
+        UUID(self.session_id)
+
+    @property
+    def session_ref(self) -> str:
+        return f"grok-cli:{self.session_id}"
+
+    def reply(self, message: Mapping[str, Any]) -> str:
+        executable, environment = _resolve_grok()
+        if executable is None:
+            raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
+        prompt_path = _runtime_tmp() / f"project-master-{uuid4().hex}.txt"
+        prompt_path.write_text(self._prompt(message), encoding="utf-8")
+        initialized = self.store.provider_session_initialized()
+        arguments = [
+            "--no-auto-update",
+            "--no-subagents",
+            "--no-memory",
+            "--disable-web-search",
+            "--permission-mode",
+            "plan",
+            "--sandbox",
+            "read-only",
+            "--max-turns",
+            str(self.max_turns),
+            "--cwd",
+            str(self.project_root),
+            "--system-prompt-override",
+            self._system_prompt(),
+        ]
+        if self.model:
+            arguments.extend(["--model", self.model])
+        if initialized:
+            arguments.extend(["--resume", self.session_id])
+        else:
+            arguments.extend(["--session-id", self.session_id])
+        arguments.extend(
+            [
+                "--prompt-file",
+                str(prompt_path),
+                "--output-format",
+                "json",
+            ]
+        )
+        try:
+            result = self.native_runner(
+                NativeCliRequest(
+                    executable=executable,
+                    arguments=tuple(arguments),
+                    cwd=self.project_root,
+                    timeout_seconds=300,
+                    environment=environment,
+                )
+            )
+        finally:
+            prompt_path.unlink(missing_ok=True)
+        if result.status != "COMPLETED":
+            raise ProjectMasterHostError(f"GROK_CLI_{result.status}")
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ProjectMasterHostError("GROK_RESULT_JSON_INVALID") from error
+        if not isinstance(response, Mapping):
+            raise ProjectMasterHostError("GROK_RESULT_OBJECT_REQUIRED")
+        response_session = _text(response.get("sessionId"), "response.sessionId")
+        if response_session != self.session_id:
+            raise ProjectMasterHostError("GROK_SESSION_ID_MISMATCH")
+        text = _text(response.get("text"), "response.text")
+        if response.get("stopReason") != "EndTurn":
+            raise ProjectMasterHostError("GROK_TURN_INCOMPLETE")
+        self.store.mark_provider_session_initialized()
+        return text
+
+    def _system_prompt(self) -> str:
+        return (
+            f"You are the Project Master for {self.project_id}. "
+            "This is a persistent, read-only conversation Host connected to the "
+            "Universe Conductor. Work from the repository at the configured cwd. "
+            "At the start of the session, follow the repository entry order and "
+            "prepare MASTER Mode from source-backed evidence. Never claim that "
+            "Mode, Role, BOOT, or a chat message grants mutation authority. "
+            "You may inspect source, review, explain, audit, and propose bounded "
+            "work. Do not create, edit, delete, move, commit, push, execute project "
+            "code, start subagents, or invoke network tools. For implementation "
+            "requests, return a concise proposal suitable for a separate guarded "
+            "execution queue. Mark unavailable facts UNKNOWN. Reply in the user's "
+            "language and keep ordinary conversation direct."
+        )
+
+    def _prompt(self, message: Mapping[str, Any]) -> str:
+        return (
+            "Universe Project Room message\n"
+            f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
+            f"kind: {_text(message.get('kind'), 'message.kind')}\n"
+            f"sender: {_text(message.get('sender'), 'message.sender')}\n\n"
+            f"{_text(message.get('body'), 'message.body')}"
+        )
+
+
+class ProjectMasterConversationWorker:
+    def __init__(
+        self,
+        *,
+        provider: MasterProvider,
+        store: ProjectMasterSessionStore,
+        universe_endpoint: str,
+        project_id: str,
+        bridge_token: str,
+        reply_poster: ReplyPoster = post_master_reply,
+    ) -> None:
+        self.provider = provider
+        self.store = store
+        self.universe_endpoint = universe_endpoint
+        self.project_id = _text(project_id, "project_id")
+        self.bridge_token = _text(bridge_token, "bridge_token")
+        self.reply_poster = reply_poster
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"project-master-{self.project_id}",
+            daemon=True,
+        )
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._thread.start()
+        for envelope in self.store.recover():
+            self._queue.put(envelope)
+
+    def submit(self, envelope: Mapping[str, Any]) -> bool:
+        normalized = normalize_bridge_envelope(envelope)
+        if not self.store.register(normalized):
+            return False
+        self._queue.put(normalized)
+        return True
+
+    def wait_idle(self, timeout_seconds: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while self._queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self._queue.unfinished_tasks == 0
+
+    def close(self) -> None:
+        if not self._started:
+            return
+        self._queue.put(None)
+        self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        while True:
+            envelope = self._queue.get()
+            try:
+                if envelope is None:
+                    return
+                self._process(envelope)
+            finally:
+                self._queue.task_done()
+
+    def _process(self, envelope: Mapping[str, Any]) -> None:
+        message = envelope["message"]
+        message_id = _text(message["message_id"], "message_id")
+        if not self.store.claim(message_id):
+            return
+        try:
+            body = self.provider.reply(message)
+            self.reply_poster(
+                universe_endpoint=self.universe_endpoint,
+                project_id=self.project_id,
+                bridge_id=_text(envelope["bridge_id"], "bridge_id"),
+                in_reply_to=message_id,
+                kind="RESULT",
+                body=body,
+                idempotency_key=f"project-master-live-{message_id}",
+                bridge_token=self.bridge_token,
+                timeout_seconds=10.0,
+            )
+        except Exception as error:
+            self.store.fail(message_id, f"{type(error).__name__}: {error}")
+            return
+        self.store.complete(message_id)
+
+
+class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
+    def __init__(
+        self,
+        project_root: Path,
+        token: str,
+        inbox_ref: str,
+        worker: ProjectMasterConversationWorker,
+    ) -> None:
+        super().__init__(project_root, token, inbox_ref)
+        object.__setattr__(self, "_worker", worker)
+
+    def record(self, envelope: Any) -> dict[str, Any]:
+        normalized = normalize_bridge_envelope(envelope)
+        receipt = super().record(normalized)
+        self._worker.submit(normalized)
+        return receipt
+
+
+def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
+    grok_home = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).resolve()
+    executable = grok_home / "bin" / "grok.exe"
+    return (executable if executable.is_file() else None), {"GROK_HOME": str(grok_home)}
+
+
+def _runtime_tmp() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    root = Path(base) / "Universe" / "runtime-tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _default_state_db(project_id: str) -> Path:
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return Path(base) / "Universe" / "project-master-host" / f"{project_id}.sqlite"
+
+
+def _read_token(environment_name: str) -> str:
+    token = os.environ.get(_text(environment_name, "token_env"))
+    if not token:
+        raise ProjectMasterHostError("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE")
+    return token
+
+
+def _text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ProjectMasterHostError(f"{field} must be non-empty text")
+    return value.strip()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Live local Project Master Host")
+    parser.add_argument("--project-root", required=True, type=Path)
+    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--universe-endpoint", required=True)
+    parser.add_argument("--token-env", required=True)
+    parser.add_argument("--inbox-ref", default=".ai/inbox/MASTER")
+    parser.add_argument(
+        "--provider", default="GROK", choices=sorted(SUPPORTED_PROVIDERS)
+    )
+    parser.add_argument("--model", default="")
+    parser.add_argument("--max-turns", default=8, type=int)
+    parser.add_argument("--state-db", type=Path)
+    parser.add_argument("--port", default=0, type=int)
+    args = parser.parse_args()
+
+    token = _read_token(args.token_env)
+    state_db = args.state_db or _default_state_db(args.project_id)
+    store = ProjectMasterSessionStore(state_db, args.project_id)
+    provider = GrokProjectMasterRuntime(
+        args.project_root,
+        args.project_id,
+        store,
+        model=args.model,
+        max_turns=args.max_turns,
+    )
+    worker = ProjectMasterConversationWorker(
+        provider=provider,
+        store=store,
+        universe_endpoint=args.universe_endpoint,
+        project_id=args.project_id,
+        bridge_token=token,
+    )
+    host = LiveProjectMasterBridgeHost(
+        args.project_root,
+        token,
+        args.inbox_ref,
+        worker,
+    )
+    server = ProjectMasterBridgeHttpServer(("127.0.0.1", args.port), host)
+    worker.start()
+    print(
+        json.dumps(
+            {
+                "schema": PROJECT_MASTER_HOST_SCHEMA,
+                "endpoint": f"http://127.0.0.1:{server.server_port}",
+                "master_session_ref": provider.session_ref,
+                "project_id": args.project_id,
+                "provider": args.provider,
+                "state_db": str(state_db),
+                "status": "LISTENING",
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        worker.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

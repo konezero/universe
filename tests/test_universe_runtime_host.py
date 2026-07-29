@@ -133,6 +133,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                 "worker_id": "grok-1",
                 "result_receipt_ref": "result-1",
                 "skill_run_observation_count": 2,
+                "result": {"text": "bounded reply"},
             }
         )
         host = UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher)
@@ -142,6 +143,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertFalse(result["repository_write"])
         self.assertEqual("result-1", result["result_receipt_ref"])
         self.assertEqual(2, result["skill_run_observation_count"])
+        self.assertEqual({"text": "bounded reply"}, result["result"])
         self.assertNotIn("worker_run_ref", result)
         self.assertEqual(["GROK"], dispatcher.capability_calls)
         self.assertEqual(1, len(dispatcher.dispatch_calls))
@@ -179,9 +181,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             "provider://GROK/model/grok-build",
             result["model_ref"],
         )
-        self.assertEqual(
-            "STRUCTURED_JSON", dispatcher.dispatch_calls[0]["result_mode"]
-        )
+        self.assertEqual("STRUCTURED_JSON", dispatcher.dispatch_calls[0]["result_mode"])
 
     def test_planning_proposal_is_built_by_installed_task_frame_cli(self) -> None:
         commands: list[list[str]] = []
@@ -230,12 +230,103 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("planning-boss", result["turn_id"])
         self.assertEqual(
             "NONE",
-            result["execution_proposal"]["execution_plan"][
-                "repository_write_scope"
-            ],
+            result["execution_proposal"]["execution_plan"]["repository_write_scope"],
         )
         self.assertEqual(1, len(commands))
         self.assertIn("task-frame", commands[0])
+
+    def test_conductor_message_uses_read_only_task_frame(self) -> None:
+        def runner(command: list[str], **_: object) -> SimpleNamespace:
+            request_path = Path(command[command.index("--request") + 1])
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            proposal = {
+                "schema": "ai-career.task-frame-execution-proposal.v2",
+                "status": "TASK_FRAME_EXECUTION_PROPOSED",
+                "proposal_id": "task_frame_proposal_conductor",
+                "plan_digest": "b" * 64,
+                "approval_required": True,
+                "execution_plan": request["execution_plan"],
+                "authority_created": False,
+                "task_frame_started": False,
+            }
+            return SimpleNamespace(
+                stdout=json.dumps({"execution_proposal": proposal}),
+                returncode=0,
+            )
+
+        dispatcher = FakeWorkerDispatcher(
+            response={
+                "status": "TURN_COMPLETED",
+                "worker_id": "grok-conductor-1",
+                "result_receipt_ref": "result-conductor-1",
+                "result": {"text": "유니버스 응답"},
+            }
+        )
+        host = UniverseRuntimeHost(
+            ROOT,
+            runner=runner,
+            worker_dispatcher=dispatcher,
+        )
+        operations: list[dict[str, object]] = []
+
+        def post_runtime(
+            _: str, __: str, path: str, payload: dict[str, object]
+        ) -> dict[str, object]:
+            operations.append({"path": path, "payload": payload})
+            if path == "/v1/task-frame/create":
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            if path == "/v1/task-frame/close":
+                return {"status": "TASK_FRAME_CLOSED"}
+            operation = payload["operation"]
+            if operation["operation"] == "declare_turns":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {"status": "TASK_TURNS_DECLARED"},
+                }
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "RESULT_PACKET_BUILT"},
+            }
+
+        host._post_runtime = post_runtime  # type: ignore[method-assign]
+        result = host.invoke_conductor_message(
+            runtime_binding={
+                "endpoint": "http://127.0.0.1:17777",
+                "token": "transient-token",
+                "session_id": "session-001",
+                "origin_anchor_ref": "anchor-001",
+                "origin_frame_id": "current",
+                "parent_actor_ref": "universe-conductor",
+                "parent_evidence_ref": "host://parent/current",
+            },
+            message={
+                "message_id": "conductor_001",
+                "body": "현재 위험을 알려줘.",
+            },
+            history=[
+                {
+                    "sender": "USER",
+                    "kind": "QUESTION",
+                    "body": "이전 질문",
+                }
+            ],
+            provider="GROK",
+        )
+        self.assertEqual({"text": "유니버스 응답"}, result["result"])
+        self.assertEqual(1, len(dispatcher.dispatch_calls))
+        request = dispatcher.dispatch_calls[0]
+        self.assertEqual("NONE", request["repository_write_scope"])
+        self.assertEqual([], request["mutation_scope"]["operations"])
+        self.assertEqual("UNIVERSE", request["context_pack"]["mode"])
+        self.assertEqual(
+            [
+                "/v1/task-frame/create",
+                "/v1/task-frame/operation",
+                "/v1/task-frame/operation",
+                "/v1/task-frame/close",
+            ],
+            [operation["path"] for operation in operations],
+        )
 
     def test_dispatcher_json_failure_preserves_stage_and_reason(self) -> None:
         request = self.request()
@@ -248,9 +339,9 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             )
         )
         with self.assertRaises(RuntimeHostError) as captured:
-            UniverseRuntimeHost(
-                ROOT, worker_dispatcher=dispatcher
-            ).invoke_structured(request)
+            UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher).invoke_structured(
+                request
+            )
         self.assertEqual(
             "WORKER_STRUCTURED_RESULT_INVALID",
             captured.exception.code,

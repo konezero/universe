@@ -80,6 +80,34 @@ class ProjectMasterBridgeTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_REQUEST, rejected.exception.code)
         rejected.exception.close()
 
+    def test_host_accepts_project_specific_master_inbox(self) -> None:
+        alternate = self.root / ".ai" / "master" / "inbox"
+        alternate.mkdir(parents=True)
+        host = ProjectMasterBridgeHost(
+            self.root,
+            self.token,
+            ".ai/master/inbox",
+        )
+
+        receipt = host.record(self._envelope())
+
+        self.assertEqual("RECORDED", receipt["status"])
+        self.assertEqual(
+            alternate / f"universe-room-{receipt['message_id']}.json",
+            self.root / receipt["target_ref"],
+        )
+
+    def test_host_rejects_inbox_ref_outside_project(self) -> None:
+        with self.assertRaisesRegex(
+            ProjectMasterBridgeError,
+            "MASTER_INBOX_REF_INVALID",
+        ):
+            ProjectMasterBridgeHost(
+                self.root,
+                self.token,
+                "../outside",
+            )
+
     def test_reply_posts_bound_payload_to_loopback_universe_endpoint(self) -> None:
         captured: dict[str, Any] = {}
 

@@ -32,6 +32,26 @@ grants authority or permission to mutate an attached project. See
 
 Universe Runtime Host provider processes remain outside the installed project Runtime. They can return a bounded read-only Worker result, but cannot create project authority, write scope, or mutation permission. See `docs/universe-runtime-host.md`.
 
+The Universe Conductor Room persists each user message before execution. A
+single service-owned queue dispatches the message through the existing
+read-only Task Frame Runtime Host after a process-local Runtime binding exists:
+
+```text
+Universe UI
+  -> durable Conductor Room message
+  -> QUEUED or WAITING_FOR_RUNTIME_BINDING
+  -> one read-only Task Frame Worker
+  -> bounded reply plus provider Result Receipt
+  -> durable Conductor Room reply
+```
+
+The HTTP request does not wait for the provider. The UI polls the durable room
+for `PROCESSING`, `ANSWERED`, or `FAILED`. Restart recovery returns interrupted
+`PROCESSING` messages to `QUEUED`; a missing Runtime binding leaves messages in
+`WAITING_FOR_RUNTIME_BINDING` until the Host binds again. Raw CLI transcripts,
+tokens, endpoint credentials, and repository contents are not Conductor Room
+records.
+
 Each attached project remains responsible for its own source mutation,
 validation, Execution Guard, and evidence. Universe stores project roots and
 evidence references; it does not merge or rewrite project Runtime databases.

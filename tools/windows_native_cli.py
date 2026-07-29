@@ -111,6 +111,11 @@ def run_native_cli(
                 shell=False,
                 timeout=normalized.timeout_seconds,
                 check=False,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW
+                    if os.name == "nt"
+                    else 0
+                ),
             )
         except subprocess.TimeoutExpired as error:
             stdout_raw = error.stdout if isinstance(error.stdout, bytes) else b""

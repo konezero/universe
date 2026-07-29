@@ -12,6 +12,8 @@ const state = {
   view: "timeline",
   roomMessages: [],
   conductorMessages: [],
+  conductorRuntimeBinding: null,
+  conductorRefreshInFlight: false,
   masterBridge: null,
   modeContract: null,
   conversationTarget: {
@@ -171,6 +173,9 @@ function renderComposerActions() {
     const bridgeConnected =
       state.selectedProject?.project_id === project.project_id &&
       state.masterBridge?.status === "AVAILABLE";
+    const bridgeRegistered =
+      state.selectedProject?.project_id === project.project_id &&
+      state.masterBridge?.status === "REGISTERED";
     action.append(
       node("span", "", `Call ${project.project_id} Master`),
       node(
@@ -178,6 +183,8 @@ function renderComposerActions() {
         "",
         bridgeConnected
           ? "Direct bridge connected"
+          : bridgeRegistered
+            ? "Bridge registered / awaiting delivery"
           : isCurrent
             ? "Inbox fallback"
             : "Open Project Room"
@@ -228,7 +235,10 @@ async function callProjectMaster(projectId) {
 function renderComposerState() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     elements.roomContext.textContent = "Universe Conductor";
-    elements.roomHint.textContent = "Use + to call a Project Master";
+    elements.roomHint.textContent =
+      state.conductorRuntimeBinding?.status === "BOUND"
+        ? "LLM connected / use + to call a Project Master"
+        : "Waiting for Runtime binding";
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";
     return;
   }
@@ -236,10 +246,15 @@ function renderComposerState() {
   const directBridge =
     state.selectedProject?.project_id === projectId &&
     state.masterBridge?.status === "AVAILABLE";
+  const registeredBridge =
+    state.selectedProject?.project_id === projectId &&
+    state.masterBridge?.status === "REGISTERED";
   elements.roomContext.textContent = `${projectId} / Project Master`;
   elements.roomHint.textContent = directBridge
     ? "Direct bridge connected"
-    : "Inbox fallback";
+    : registeredBridge
+      ? "Bridge registered / awaiting first delivery"
+      : "Inbox fallback";
   elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
 }
 
@@ -262,6 +277,8 @@ async function refresh() {
     state.projects = projectResult.projects;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];
+    state.conductorRuntimeBinding =
+      conductorRoomResult.runtime_binding || null;
     renderProjects();
     renderComposerActions();
     renderReleaseCatalog();
@@ -484,10 +501,18 @@ function renderRoomMessages() {
     }
     for (const message of state.conductorMessages.slice(-8)) {
       const item = node("article", "room-message conductor-message");
+      const failure = message.failure?.reason
+        ? ` / ${message.failure.reason}`
+        : "";
+      const provider = message.provider ? ` / ${message.provider}` : "";
       item.append(
         node("strong", "", `${message.sender} / ${message.kind}`),
         node("p", "", message.body),
-        node("small", "", message.delivery_state)
+        node(
+          "small",
+          "",
+          `${conductorDeliveryLabel(message.delivery_state)}${provider}${failure}`
+        )
       );
       elements.roomMessageList.append(item);
     }
@@ -511,6 +536,40 @@ function renderRoomMessages() {
       node("small", "", message.delivery_state)
     );
     elements.roomMessageList.append(item);
+  }
+}
+
+function conductorDeliveryLabel(deliveryState) {
+  return (
+    {
+      QUEUED: "Queued",
+      WAITING_FOR_RUNTIME_BINDING: "Waiting for Runtime",
+      PROCESSING: "Thinking",
+      ANSWERED: "Answered",
+      FAILED: "Failed",
+      RECORDED_FOR_CONDUCTOR: "Recorded before LLM connection",
+    }[deliveryState] || deliveryState || "Unknown"
+  );
+}
+
+async function refreshConductorRoom() {
+  if (
+    state.conductorRefreshInFlight ||
+    state.conversationTarget.kind !== "UNIVERSE_CONDUCTOR"
+  ) {
+    return;
+  }
+  state.conductorRefreshInFlight = true;
+  try {
+    const result = await api("/v1/conductor-room/messages");
+    state.conductorMessages = result.messages || [];
+    state.conductorRuntimeBinding = result.runtime_binding || null;
+    renderComposerState();
+    renderRoomMessages();
+  } catch (error) {
+    console.warn("Conductor room refresh failed", error);
+  } finally {
+    state.conductorRefreshInFlight = false;
   }
 }
 
@@ -1448,6 +1507,7 @@ async function submitDispatch(event) {
           kind: "QUESTION",
           sender: "USER",
           body: form.get("instruction"),
+          provider: "AUTO",
           idempotency_key: crypto.randomUUID(),
         },
       });
@@ -1458,9 +1518,11 @@ async function submitDispatch(event) {
         ),
         result.message,
       ];
+      state.conductorRuntimeBinding = result.runtime_binding || null;
       renderComposerState();
       renderRoomMessages();
-      toast("Message recorded in Universe Conductor room");
+      toast("Message queued for Universe Conductor");
+      window.setTimeout(refreshConductorRoom, 100);
     } catch (error) {
       toast(error.message, true);
     } finally {
@@ -2195,3 +2257,4 @@ function bindEvents() {
 
 bindEvents();
 refresh();
+window.setInterval(refreshConductorRoom, 1200);

@@ -312,6 +312,17 @@ relations remain distinct from observed evidence. Career adoption is separate.
    preparation is implemented; receipt-aware Project Master application is
    the next Project Runtime integration.
 7. Add Experience and causal comparison only after observed Skill data exists.
+8. Add display-language localization for the Universe UI. Localization is a
+   presentation-layer follow-up: canonical Mode, Role, state, schema, provider,
+   and evidence identifiers remain stable English values in APIs and storage.
+9. Add Universe Conductor provider-routing settings. The settings surface must
+   cover a default provider, ordered `AUTO` preference, per-room or per-task
+   override, capability visibility, and explicit unavailable-provider fallback.
+   A provider failure after invocation must not silently retry another provider
+   because that can duplicate work or billing. Every answer must expose the
+   provider, model reference when available, and Result Receipt reference.
+   Provider credentials remain in each provider credential store and must not
+   be persisted in Universe settings.
 
 ## Runtime Boundary
 
