@@ -2,6 +2,7 @@
 
 const state = {
   projects: [],
+  todos: [],
   selectedProject: null,
   projection: null,
   dispatches: [],
@@ -117,6 +118,19 @@ const elements = {
   nodeBreadcrumbNode: document.querySelector("#node-breadcrumb-node"),
   exitNodeUniverse: document.querySelector("#exit-node-universe"),
   toasts: document.querySelector("#toast-region"),
+  todoButton: document.querySelector("#todo-button"),
+  todoDialog: document.querySelector("#todo-dialog"),
+  todoForm: document.querySelector("#todo-form"),
+  todoTitle: document.querySelector("#todo-title"),
+  todoDetail: document.querySelector("#todo-detail"),
+  todoScope: document.querySelector("#todo-scope"),
+  todoProject: document.querySelector("#todo-project"),
+  todoNode: document.querySelector("#todo-node"),
+  todoScopeFilter: document.querySelector("#todo-scope-filter"),
+  todoStateFilter: document.querySelector("#todo-state-filter"),
+  todoList: document.querySelector("#todo-list"),
+  todoCount: document.querySelector("#todo-count"),
+  todoFormError: document.querySelector("#todo-form-error"),
 };
 
 function node(tag, className, text) {
@@ -302,6 +316,7 @@ async function refresh() {
 
     const [
       projectResult,
+      todoResult,
       releaseResult,
       conductorRoomResult,
       providerSettings,
@@ -309,12 +324,14 @@ async function refresh() {
     ] =
       await Promise.all([
       api("/v1/projects"),
+      api("/v1/todos"),
       api("/v1/releases"),
       api("/v1/conductor-room/messages"),
       api("/v1/settings/providers"),
       api("/v1/settings/host-tools"),
     ]);
     state.projects = projectResult.projects;
+    state.todos = todoResult.todos;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];
     state.conductorRuntimeBinding =
@@ -366,12 +383,18 @@ function renderProjects() {
       project.project_id.slice(0, 2)
     );
     const copy = node("span", "project-copy");
+    const openTodoCount = state.todos.filter(
+      (todo) =>
+        todo.project_id === project.project_id && todo.state !== "DONE"
+    ).length;
     copy.append(
       node("span", "project-name", project.project_id),
       node(
         "span",
         "project-meta",
-        project.metadata.label || project.refs.mode_registry
+        `${project.metadata.label || project.refs.mode_registry}${
+          openTodoCount ? ` / ${openTodoCount} open` : ""
+        }`
       )
     );
     button.append(avatar, copy);
@@ -537,6 +560,9 @@ async function selectProject(projectId) {
   renderActivity();
   renderRoomMessages();
   renderReleaseCatalog();
+  elements.todoProject.value = projectId;
+  renderTodoScopeControls();
+  renderTodos();
 }
 
 function renderRoomMessages() {
@@ -1627,6 +1653,22 @@ function drawGraph() {
       item.y,
       widthValue - 12
     );
+    const todoCount = openTodosForGraphNode(item).length;
+    if (todoCount) {
+      context.fillStyle = "#f6c76a";
+      context.beginPath();
+      context.arc(
+        item.x + widthValue / 2 - 4,
+        item.y - heightValue / 2 + 4,
+        9,
+        0,
+        Math.PI * 2
+      );
+      context.fill();
+      context.fillStyle = "#111827";
+      context.font = "700 9px Segoe UI";
+      context.fillText(String(Math.min(todoCount, 99)), item.x + widthValue / 2 - 4, item.y - heightValue / 2 + 4);
+    }
   }
   context.restore();
 }
@@ -1721,6 +1763,34 @@ function renderDetails() {
   }
   heading.append(grid);
   elements.details.append(heading);
+
+  const matchingTodos = todosForSelectedContext().filter(
+    (todo) => todo.state !== "DONE"
+  );
+  const todoGroup = node("div", "detail-group");
+  const todoHeading = node("div", "detail-heading-row");
+  todoHeading.append(
+    node("h3", "", `Todo (${matchingTodos.length})`)
+  );
+  const addTodo = node("button", "icon-button compact", "+");
+  addTodo.type = "button";
+  addTodo.title = "Add Todo for this context";
+  addTodo.setAttribute("aria-label", addTodo.title);
+  addTodo.addEventListener("click", () => openTodoDialog(true));
+  todoHeading.append(addTodo);
+  todoGroup.append(todoHeading);
+  if (!matchingTodos.length) {
+    todoGroup.append(node("p", "empty-copy", "No open Todo for this context"));
+  } else {
+    const list = node("ul", "context-list todo-context-list");
+    for (const todo of matchingTodos.slice(0, 6)) {
+      list.append(
+        node("li", "", `${todo.priority} / ${todo.state} / ${todo.title}`)
+      );
+    }
+    todoGroup.append(list);
+  }
+  elements.details.append(todoGroup);
 
   const isProjectContext = !selected || selected.kind === "project";
   const relatedDocuments = (state.projection?.documents || []).filter((item) =>
@@ -1990,6 +2060,343 @@ async function prepareProjectSeed() {
     toast(error.message, true);
   } finally {
     elements.prepareProject.disabled = false;
+  }
+}
+
+function selectedNodeRef() {
+  const selected = state.selectedNode;
+  if (!selected || !["system", "related", "focus"].includes(selected.kind)) {
+    return null;
+  }
+  return selected.data?.node_id || null;
+}
+
+function todosForSelectedContext() {
+  const nodeRef = selectedNodeRef();
+  if (nodeRef && state.selectedProject) {
+    return state.todos.filter(
+      (todo) =>
+        todo.scope_kind === "NODE" &&
+        todo.project_id === state.selectedProject.project_id &&
+        todo.node_ref === nodeRef
+    );
+  }
+  if (state.selectedProject) {
+    return state.todos.filter(
+      (todo) =>
+        todo.project_id === state.selectedProject.project_id &&
+        todo.scope_kind !== "UNIVERSE"
+    );
+  }
+  return state.todos.filter((todo) => todo.scope_kind === "UNIVERSE");
+}
+
+function openTodosForGraphNode(graphNode) {
+  if (!state.selectedProject) return [];
+  if (graphNode.kind === "project") {
+    return state.todos.filter(
+      (todo) =>
+        todo.project_id === state.selectedProject.project_id &&
+        todo.state !== "DONE"
+    );
+  }
+  const nodeRef = graphNode.data?.node_id;
+  if (!nodeRef) return [];
+  return state.todos.filter(
+    (todo) =>
+      todo.scope_kind === "NODE" &&
+      todo.project_id === state.selectedProject.project_id &&
+      todo.node_ref === nodeRef &&
+      todo.state !== "DONE"
+  );
+}
+
+function todoNodeOptions(projectId) {
+  if (!projectId || state.selectedProject?.project_id !== projectId) return [];
+  const seen = new Set();
+  return state.graph.nodes
+    .filter(
+      (item) =>
+        ["system", "related", "focus"].includes(item.kind) &&
+        item.data?.node_id
+    )
+    .filter((item) => {
+      if (seen.has(item.data.node_id)) return false;
+      seen.add(item.data.node_id);
+      return true;
+    })
+    .map((item) => ({
+      node_ref: item.data.node_id,
+      label: item.label,
+    }));
+}
+
+function replaceSelectOptions(select, options, emptyLabel) {
+  const previous = select.value;
+  select.replaceChildren();
+  if (emptyLabel) {
+    const option = node("option", "", emptyLabel);
+    option.value = "";
+    select.append(option);
+  }
+  for (const item of options) {
+    const option = node("option", "", item.label);
+    option.value = item.value;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === previous)) {
+    select.value = previous;
+  }
+}
+
+function renderTodoScopeControls() {
+  const previousProject = elements.todoProject.value;
+  replaceSelectOptions(
+    elements.todoProject,
+    state.projects.map((project) => ({
+      value: project.project_id,
+      label: project.project_id,
+    })),
+    "Select project"
+  );
+  if (
+    !previousProject &&
+    state.selectedProject
+  ) {
+    elements.todoProject.value = state.selectedProject.project_id;
+  }
+  const projectId = elements.todoProject.value;
+  replaceSelectOptions(
+    elements.todoNode,
+    todoNodeOptions(projectId).map((item) => ({
+      value: item.node_ref,
+      label: item.label,
+    })),
+    "Select node"
+  );
+  const nodeRef = selectedNodeRef();
+  if (!elements.todoNode.value && nodeRef) elements.todoNode.value = nodeRef;
+  const scope = elements.todoScope.value;
+  elements.todoProject.disabled = scope === "UNIVERSE";
+  elements.todoNode.disabled = scope !== "NODE";
+}
+
+function prefillTodoScope() {
+  if (selectedNodeRef() && state.selectedProject) {
+    elements.todoScope.value = "NODE";
+  } else if (state.selectedProject) {
+    elements.todoScope.value = "PROJECT";
+  } else {
+    elements.todoScope.value = "UNIVERSE";
+  }
+  renderTodoScopeControls();
+}
+
+function openTodoDialog(prefill = false) {
+  elements.todoFormError.textContent = "";
+  if (prefill) prefillTodoScope();
+  else renderTodoScopeControls();
+  renderTodos();
+  elements.todoDialog.showModal();
+  elements.todoTitle.focus();
+}
+
+function todoScopeLabel(todo) {
+  if (todo.scope_kind === "UNIVERSE") return "Universe";
+  if (todo.scope_kind === "PROJECT") return todo.project_id;
+  return `${todo.project_id} / ${todo.node_ref}`;
+}
+
+function visibleTodos() {
+  const scope = elements.todoScopeFilter.value;
+  const stateFilter = elements.todoStateFilter.value;
+  return state.todos.filter((todo) => {
+    if (stateFilter === "OPEN" && todo.state === "DONE") return false;
+    if (stateFilter === "DONE" && todo.state !== "DONE") return false;
+    if (scope === "UNIVERSE" && todo.scope_kind !== "UNIVERSE") return false;
+    if (
+      scope === "PROJECT" &&
+      (!state.selectedProject ||
+        todo.project_id !== state.selectedProject.project_id)
+    ) {
+      return false;
+    }
+    if (
+      scope === "NODE" &&
+      (!state.selectedProject ||
+        !selectedNodeRef() ||
+        todo.scope_kind !== "NODE" ||
+        todo.project_id !== state.selectedProject.project_id ||
+        todo.node_ref !== selectedNodeRef())
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function todoSelect(values, selectedValue, className) {
+  const select = node("select", className);
+  for (const [value, label] of values) {
+    const option = node("option", "", label);
+    option.value = value;
+    option.selected = value === selectedValue;
+    select.append(option);
+  }
+  return select;
+}
+
+function renderTodos() {
+  if (!elements.todoList) return;
+  const todos = visibleTodos();
+  elements.todoList.replaceChildren();
+  elements.todoCount.textContent = `${todos.length} item${
+    todos.length === 1 ? "" : "s"
+  }`;
+  if (!todos.length) {
+    elements.todoList.append(
+      node("p", "empty-copy todo-empty", "No Todo matches this view")
+    );
+    return;
+  }
+  for (const todo of todos) {
+    const item = node("article", "todo-item");
+    item.dataset.todoId = todo.todo_id;
+    const header = node("div", "todo-item-header");
+    header.append(
+      node("span", `todo-priority ${todo.priority.toLowerCase()}`, todo.priority),
+      node("span", "todo-location", todoScopeLabel(todo)),
+      node("small", "", `r${todo.revision}`)
+    );
+    const title = node("input", "todo-item-title");
+    title.value = todo.title;
+    title.maxLength = 160;
+    title.setAttribute("aria-label", "Todo title");
+    const detail = node("textarea", "todo-item-detail");
+    detail.value = todo.detail;
+    detail.maxLength = 4000;
+    detail.rows = 2;
+    detail.setAttribute("aria-label", "Todo detail");
+    const controls = node("div", "todo-item-controls");
+    const priority = todoSelect(
+      [["P0", "P0"], ["P1", "P1"], ["P2", "P2"], ["P3", "P3"]],
+      todo.priority,
+      "todo-item-priority"
+    );
+    const todoState = todoSelect(
+      [
+        ["BACKLOG", "Backlog"],
+        ["READY", "Ready"],
+        ["IN_PROGRESS", "In progress"],
+        ["BLOCKED", "Blocked"],
+        ["DONE", "Done"],
+      ],
+      todo.state,
+      "todo-item-state"
+    );
+    const save = node("button", "secondary-button todo-save", "Save");
+    save.type = "button";
+    save.addEventListener("click", () =>
+      updateTodo(todo, {
+        title: title.value,
+        detail: detail.value,
+        priority: priority.value,
+        state: todoState.value,
+      })
+    );
+    const remove = node("button", "icon-button compact todo-delete", "\u00d7");
+    remove.type = "button";
+    remove.title = "Delete Todo";
+    remove.setAttribute("aria-label", remove.title);
+    remove.addEventListener("click", () => deleteTodo(todo));
+    controls.append(priority, todoState, save, remove);
+    item.append(header, title, detail, controls);
+    elements.todoList.append(item);
+  }
+}
+
+async function submitTodo(event) {
+  event.preventDefault();
+  elements.todoFormError.textContent = "";
+  const form = new FormData(elements.todoForm);
+  const scopeKind = String(form.get("scope_kind"));
+  const body = {
+    scope_kind: scopeKind,
+    title: String(form.get("title") || "").trim(),
+    detail: String(form.get("detail") || ""),
+    priority: String(form.get("priority")),
+    state: String(form.get("state")),
+    source_kind: "USER",
+    sort_order: state.todos.length,
+  };
+  if (scopeKind !== "UNIVERSE") {
+    body.project_id = elements.todoProject.value;
+  }
+  if (scopeKind === "NODE") {
+    body.node_ref = elements.todoNode.value;
+  }
+  try {
+    const result = await api("/v1/todos", { method: "POST", body });
+    state.todos = [result.todo, ...state.todos];
+    elements.todoTitle.value = "";
+    elements.todoDetail.value = "";
+    renderProjects();
+    renderTodos();
+    renderDetails();
+    drawGraph();
+    toast("Todo recorded");
+  } catch (error) {
+    elements.todoFormError.textContent = error.message;
+  }
+}
+
+async function updateTodo(todo, changes) {
+  const body = {
+    scope_kind: todo.scope_kind,
+    project_id: todo.project_id,
+    node_ref: todo.node_ref,
+    title: changes.title.trim(),
+    detail: changes.detail,
+    priority: changes.priority,
+    state: changes.state,
+    source_kind: todo.source_kind,
+    sort_order: todo.sort_order,
+    revision: todo.revision,
+  };
+  if (body.project_id === null) delete body.project_id;
+  if (body.node_ref === null) delete body.node_ref;
+  try {
+    const result = await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}`, {
+      method: "PATCH",
+      body,
+    });
+    state.todos = state.todos.map((item) =>
+      item.todo_id === todo.todo_id ? result.todo : item
+    );
+    renderProjects();
+    renderTodos();
+    renderDetails();
+    drawGraph();
+    toast("Todo updated");
+  } catch (error) {
+    elements.todoFormError.textContent = error.message;
+  }
+}
+
+async function deleteTodo(todo) {
+  if (!window.confirm(`Delete Todo: ${todo.title}?`)) return;
+  try {
+    await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}`, {
+      method: "DELETE",
+    });
+    state.todos = state.todos.filter((item) => item.todo_id !== todo.todo_id);
+    renderProjects();
+    renderTodos();
+    renderDetails();
+    drawGraph();
+    toast("Todo deleted");
+  } catch (error) {
+    elements.todoFormError.textContent = error.message;
   }
 }
 
@@ -2533,6 +2940,12 @@ function bindEvents() {
   document
     .querySelector("#refresh-button")
     .addEventListener("click", refresh);
+  elements.todoButton.addEventListener("click", () => openTodoDialog(false));
+  elements.todoForm.addEventListener("submit", submitTodo);
+  elements.todoScope.addEventListener("change", renderTodoScopeControls);
+  elements.todoProject.addEventListener("change", renderTodoScopeControls);
+  elements.todoScopeFilter.addEventListener("change", renderTodos);
+  elements.todoStateFilter.addEventListener("change", renderTodos);
 
   document
     .querySelector("#release-button")

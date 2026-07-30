@@ -495,6 +495,128 @@ class UniverseLocalServiceTests(unittest.TestCase):
             other.identity()["universe_id"],
         )
 
+    def test_todo_work_map_is_editable_prioritized_and_execution_neutral(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+
+        status, universe_result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "UNIVERSE",
+                "title": "Review nightly seed extraction",
+                "detail": "Keep this as planning state until explicitly dispatched.",
+                "priority": "P2",
+                "state": "BACKLOG",
+                "source_kind": "CONDUCTOR",
+                "sort_order": 20,
+            },
+        )
+        self.assertEqual(201, status)
+        self.assertFalse(universe_result["task_frame_created"])
+        self.assertFalse(universe_result["execution_assignment_created"])
+
+        status, project_result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Confirm broker contract",
+                "detail": "",
+                "priority": "P1",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 10,
+            },
+        )
+        self.assertEqual(201, status)
+        project_todo = project_result["todo"]
+        self.assertEqual(1, project_todo["revision"])
+
+        status, node_result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "NODE",
+                "project_id": "GCS",
+                "node_ref": "risk-engine",
+                "title": "Add boundary test",
+                "detail": "Cover the rejected order path.",
+                "priority": "P0",
+                "state": "IN_PROGRESS",
+                "source_kind": "MASTER",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("NODE", node_result["todo"]["scope_kind"])
+
+        status, list_result = self.request("GET", "/v1/todos")
+        self.assertEqual(200, status)
+        self.assertEqual("TODOS_COLLECTED", list_result["status"])
+        self.assertEqual(
+            ["Add boundary test", "Confirm broker contract", "Review nightly seed extraction"],
+            [item["title"] for item in list_result["todos"]],
+        )
+        self.assertFalse(list_result["task_frame_created"])
+        self.assertFalse(list_result["execution_assignment_created"])
+
+        update = {
+            "scope_kind": project_todo["scope_kind"],
+            "project_id": project_todo["project_id"],
+            "title": "Confirm broker contract and examples",
+            "detail": "Review the request and response examples.",
+            "priority": "P0",
+            "state": "IN_PROGRESS",
+            "source_kind": project_todo["source_kind"],
+            "sort_order": project_todo["sort_order"],
+            "revision": project_todo["revision"],
+        }
+        status, update_result = self.request(
+            "PATCH",
+            f"/v1/todos/{project_todo['todo_id']}",
+            update,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, update_result["todo"]["revision"])
+        self.assertEqual("P0", update_result["todo"]["priority"])
+        self.assertFalse(update_result["task_frame_created"])
+
+        status, conflict = self.request(
+            "PATCH",
+            f"/v1/todos/{project_todo['todo_id']}",
+            update,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("TODO_REVISION_CONFLICT", conflict["error_code"])
+
+        status, delete_result = self.request(
+            "DELETE",
+            f"/v1/todos/{universe_result['todo']['todo_id']}",
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(delete_result["deleted"])
+        self.assertFalse(delete_result["task_frame_created"])
+
+        status, invalid = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "UNIVERSE",
+                "project_id": "GCS",
+                "title": "Invalid coordinate",
+                "detail": "",
+                "priority": "P3",
+                "state": "BACKLOG",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("TODO_SCOPE_COORDINATE_INVALID", invalid["error_code"])
+
     def test_server_state_carries_the_database_universe_identity(self) -> None:
         identity = self.server.store.identity()
         state_path = self.temp_root / "server.json"

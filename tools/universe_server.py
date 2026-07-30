@@ -88,6 +88,7 @@ UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
+TODO_SCHEMA = "universe.todo.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
 PROJECT_SEED_ASSET_PROPOSAL_SCHEMA = "universe.project-seed-asset-proposal.v1"
 PROJECT_PROJECTION_SCHEMA = "universe.project-projection.v1"
@@ -169,6 +170,12 @@ AUTH_TYPES = frozenset({"NONE", "LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 SKILL_OPERATION_CLASSES = frozenset({"READ", "PROPOSE", "EXECUTE"})
 SKILL_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "UNKNOWN"})
 SKILL_VALIDATION_STATES = frozenset({"PASS", "FAIL", "NOT_RUN", "UNKNOWN"})
+TODO_SCOPE_KINDS = frozenset({"UNIVERSE", "PROJECT", "NODE"})
+TODO_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
+TODO_STATES = frozenset(
+    {"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"}
+)
+TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
@@ -938,6 +945,107 @@ def normalize_event(project_id: str, value: Any) -> dict[str, Any]:
         "payload": payload,
         "created_at": utc_now(),
     }
+
+
+def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
+    required = {
+        "scope_kind",
+        "title",
+        "detail",
+        "priority",
+        "state",
+        "source_kind",
+        "sort_order",
+    }
+    if updating:
+        required.add("revision")
+    request = _exact_object_fields(
+        value,
+        field="todo",
+        required=frozenset(required),
+        optional=frozenset({"todo_id", "project_id", "node_ref"}),
+    )
+    scope_kind = _required_text(request["scope_kind"], "scope_kind").upper()
+    if scope_kind not in TODO_SCOPE_KINDS:
+        raise UniverseError(
+            "TODO_SCOPE_INVALID",
+            "scope_kind must be UNIVERSE, PROJECT, or NODE",
+        )
+    title = _required_text(request["title"], "title")
+    if len(title) > 160:
+        raise UniverseError("TODO_TITLE_INVALID", "title is too long")
+    detail = request["detail"]
+    if not isinstance(detail, str) or len(detail) > 4000:
+        raise UniverseError(
+            "TODO_DETAIL_INVALID",
+            "detail must be a string no longer than 4000 characters",
+        )
+    priority = _required_text(request["priority"], "priority").upper()
+    if priority not in TODO_PRIORITIES:
+        raise UniverseError(
+            "TODO_PRIORITY_INVALID",
+            "priority must be P0, P1, P2, or P3",
+        )
+    state = _required_text(request["state"], "state").upper()
+    if state not in TODO_STATES:
+        raise UniverseError(
+            "TODO_STATE_INVALID",
+            "state must be BACKLOG, READY, IN_PROGRESS, BLOCKED, or DONE",
+        )
+    source_kind = _required_text(request["source_kind"], "source_kind").upper()
+    if source_kind not in TODO_SOURCE_KINDS:
+        raise UniverseError(
+            "TODO_SOURCE_INVALID",
+            "source_kind must be USER, CONDUCTOR, or MASTER",
+        )
+    sort_order = request["sort_order"]
+    if isinstance(sort_order, bool) or not isinstance(sort_order, int):
+        raise UniverseError("TODO_SORT_ORDER_INVALID", "sort_order must be an integer")
+
+    project_id = request.get("project_id")
+    node_ref = request.get("node_ref")
+    if scope_kind == "UNIVERSE":
+        if project_id is not None or node_ref is not None:
+            raise UniverseError(
+                "TODO_SCOPE_COORDINATE_INVALID",
+                "UNIVERSE Todo cannot bind a project or node",
+            )
+        normalized_project = None
+        normalized_node = None
+    elif scope_kind == "PROJECT":
+        normalized_project = _project_id(project_id)
+        if node_ref is not None:
+            raise UniverseError(
+                "TODO_SCOPE_COORDINATE_INVALID",
+                "PROJECT Todo cannot bind a node",
+            )
+        normalized_node = None
+    else:
+        normalized_project = _project_id(project_id)
+        normalized_node = _identifier(node_ref, "node_ref")
+
+    normalized = {
+        "scope_kind": scope_kind,
+        "project_id": normalized_project,
+        "node_ref": normalized_node,
+        "title": title,
+        "detail": detail,
+        "priority": priority,
+        "state": state,
+        "source_kind": source_kind,
+        "sort_order": sort_order,
+    }
+    if "todo_id" in request:
+        normalized["todo_id"] = _identifier(request["todo_id"], "todo_id")
+    if updating:
+        revision = request["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise UniverseError(
+                "TODO_REVISION_INVALID",
+                "revision must be a positive integer",
+            )
+        normalized["revision"] = revision
+    return normalized
 
 
 def _array(value: Any, field: str) -> list[Any]:
@@ -3067,6 +3175,39 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_event_project_time
                 ON project_event(project_id, created_at, event_id);
 
+                CREATE TABLE IF NOT EXISTS project_todo (
+                    todo_id TEXT PRIMARY KEY,
+                    scope_kind TEXT NOT NULL,
+                    project_id TEXT
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    node_ref TEXT,
+                    title TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    priority TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK(scope_kind IN ('UNIVERSE', 'PROJECT', 'NODE')),
+                    CHECK(priority IN ('P0', 'P1', 'P2', 'P3')),
+                    CHECK(state IN ('BACKLOG', 'READY', 'IN_PROGRESS', 'BLOCKED', 'DONE')),
+                    CHECK(source_kind IN ('USER', 'CONDUCTOR', 'MASTER')),
+                    CHECK(
+                        (scope_kind = 'UNIVERSE' AND project_id IS NULL AND node_ref IS NULL)
+                        OR (scope_kind = 'PROJECT' AND project_id IS NOT NULL AND node_ref IS NULL)
+                        OR (scope_kind = 'NODE' AND project_id IS NOT NULL AND node_ref IS NOT NULL)
+                    )
+                );
+
+                CREATE INDEX IF NOT EXISTS project_todo_scope_order
+                ON project_todo(
+                    scope_kind, project_id, node_ref, state, priority,
+                    sort_order, updated_at, todo_id
+                );
+
                 CREATE TABLE IF NOT EXISTS skill_catalog (
                     skill_id TEXT NOT NULL,
                     skill_version TEXT NOT NULL,
@@ -3912,6 +4053,152 @@ class UniverseStore:
             }
             for row in rows
         ]
+
+    def create_todo(self, value: Any) -> dict[str, Any]:
+        todo = normalize_todo(value)
+        if todo["project_id"] is not None:
+            self.get_project(todo["project_id"])
+        todo_id = todo.get("todo_id") or "todo_" + uuid.uuid4().hex
+        now = utc_now()
+        with self._connection() as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO project_todo(
+                        todo_id, scope_kind, project_id, node_ref, title, detail,
+                        priority, state, source_kind, sort_order, revision,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        todo_id,
+                        todo["scope_kind"],
+                        todo["project_id"],
+                        todo["node_ref"],
+                        todo["title"],
+                        todo["detail"],
+                        todo["priority"],
+                        todo["state"],
+                        todo["source_kind"],
+                        todo["sort_order"],
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise UniverseError(
+                    "TODO_ID_CONFLICT",
+                    "todo_id already exists",
+                    HTTPStatus.CONFLICT,
+                ) from error
+        return self.get_todo(todo_id)
+
+    def list_todos(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT todo_id, scope_kind, project_id, node_ref, title, detail,
+                       priority, state, source_kind, sort_order, revision,
+                       created_at, updated_at
+                FROM project_todo
+                ORDER BY
+                    CASE state
+                        WHEN 'IN_PROGRESS' THEN 0
+                        WHEN 'READY' THEN 1
+                        WHEN 'BLOCKED' THEN 2
+                        WHEN 'BACKLOG' THEN 3
+                        ELSE 4
+                    END,
+                    CASE priority
+                        WHEN 'P0' THEN 0
+                        WHEN 'P1' THEN 1
+                        WHEN 'P2' THEN 2
+                        ELSE 3
+                    END,
+                    sort_order, updated_at DESC, todo_id
+                """
+            ).fetchall()
+        return [self._todo_row(row) for row in rows]
+
+    def get_todo(self, todo_id: str) -> dict[str, Any]:
+        normalized = _identifier(todo_id, "todo_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT todo_id, scope_kind, project_id, node_ref, title, detail,
+                       priority, state, source_kind, sort_order, revision,
+                       created_at, updated_at
+                FROM project_todo
+                WHERE todo_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "TODO_NOT_FOUND",
+                f"Todo does not exist: {normalized}",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._todo_row(row)
+
+    def update_todo(self, todo_id: str, value: Any) -> dict[str, Any]:
+        normalized_id = _identifier(todo_id, "todo_id")
+        todo = normalize_todo(value, updating=True)
+        if "todo_id" in todo and todo["todo_id"] != normalized_id:
+            raise UniverseError(
+                "TODO_ID_MISMATCH",
+                "body todo_id does not match request path",
+            )
+        if todo["project_id"] is not None:
+            self.get_project(todo["project_id"])
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE project_todo
+                SET scope_kind = ?, project_id = ?, node_ref = ?, title = ?,
+                    detail = ?, priority = ?, state = ?, source_kind = ?,
+                    sort_order = ?, revision = revision + 1, updated_at = ?
+                WHERE todo_id = ? AND revision = ?
+                """,
+                (
+                    todo["scope_kind"],
+                    todo["project_id"],
+                    todo["node_ref"],
+                    todo["title"],
+                    todo["detail"],
+                    todo["priority"],
+                    todo["state"],
+                    todo["source_kind"],
+                    todo["sort_order"],
+                    now,
+                    normalized_id,
+                    todo["revision"],
+                ),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def delete_todo(self, todo_id: str) -> dict[str, Any]:
+        normalized = _identifier(todo_id, "todo_id")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM project_todo WHERE todo_id = ?",
+                (normalized,),
+            )
+        if cursor.rowcount != 1:
+            raise UniverseError(
+                "TODO_NOT_FOUND",
+                f"Todo does not exist: {normalized}",
+                HTTPStatus.NOT_FOUND,
+            )
+        return {"todo_id": normalized, "deleted": True}
 
     def ingest_skill_observations(
         self, project_id: str, value: Any
@@ -8626,6 +8913,25 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _todo_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": TODO_SCHEMA,
+            "todo_id": row["todo_id"],
+            "scope_kind": row["scope_kind"],
+            "project_id": row["project_id"],
+            "node_ref": row["node_ref"],
+            "title": row["title"],
+            "detail": row["detail"],
+            "priority": row["priority"],
+            "state": row["state"],
+            "source_kind": row["source_kind"],
+            "sort_order": row["sort_order"],
+            "revision": row["revision"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
     def _master_bridge_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "schema": PROJECT_MASTER_BRIDGE_SCHEMA,
@@ -9541,6 +9847,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/todos":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "TODOS_COLLECTED",
+                    "todos": self.server.store.list_todos(),
+                    "task_frame_created": False,
+                    "execution_assignment_created": False,
+                },
+            )
+            return
         if path == "/v1/conductor-room/messages":
             self._send(
                 HTTPStatus.OK,
@@ -9964,6 +10282,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         if created
                         else "PROJECT_REFRESHED",
                         "project": project,
+                    },
+                )
+                return
+            if path == "/v1/todos":
+                todo = self.server.store.create_todo(body)
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_RECORDED",
+                        "todo": todo,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
                     },
                 )
                 return
@@ -10813,10 +11144,60 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
 
+    def do_PATCH(self) -> None:
+        if not self._authorize():
+            return
+        todo_id = self._todo_path(urlsplit(self.path).path)
+        if todo_id is None:
+            self._not_found()
+            return
+        try:
+            todo = self.server.store.update_todo(todo_id, self._read_json())
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "TODO_UPDATED",
+                    "todo": todo,
+                    "task_frame_created": False,
+                    "execution_assignment_created": False,
+                },
+            )
+        except UniverseError as error:
+            self._send_error(error)
+        except (OSError, sqlite3.Error) as error:
+            self._send(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "ERROR",
+                    "error_code": "SERVICE_FAILURE",
+                    "detail": str(error),
+                },
+            )
+
     def do_DELETE(self) -> None:
         if not self._authorize():
             return
-        parts = self._project_path(urlsplit(self.path).path)
+        path = urlsplit(self.path).path
+        todo_id = self._todo_path(path)
+        if todo_id is not None:
+            try:
+                result = self.server.store.delete_todo(todo_id)
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_DELETED",
+                        **result,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        parts = self._project_path(path)
         if parts is None or parts[1] != "":
             self._not_found()
             return
@@ -10929,6 +11310,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not release_id or "/" in release_id:
             return None
         return release_id
+
+    @staticmethod
+    def _todo_path(path: str) -> str | None:
+        prefix = "/v1/todos/"
+        if not path.startswith(prefix):
+            return None
+        todo_id = unquote(path[len(prefix) :])
+        if not todo_id or "/" in todo_id:
+            return None
+        return todo_id
 
     @staticmethod
     def _fresh_project_refinement_run_path(path: str) -> str | None:

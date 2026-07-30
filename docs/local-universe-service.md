@@ -20,6 +20,7 @@ grants authority or permission to mutate an attached project. See
 - listen only on a loopback address;
 - own local Task Frame provider adapters and dispatcher under `tools/`;
 - maintain the Universe project registry in SQLite;
+- maintain an editable prioritized Todo work map across Universe, Project, and Node scopes;
 - accept one-time project registration and later refreshes;
 - retain append-only project observation events;
 - queue Master-owned Project Seed discovery and verify published `.ai/universe` Seed assets;
@@ -141,6 +142,10 @@ requires the local Bearer token from the state file.
 ```text
 POST   /v1/projects/register
 GET    /v1/projects
+GET    /v1/todos
+POST   /v1/todos
+PATCH  /v1/todos/{todo_id}
+DELETE /v1/todos/{todo_id}
 GET    /v1/runtime/providers
 GET    /v1/settings/providers
 POST   /v1/settings/providers/universe
@@ -214,6 +219,26 @@ POST   /v1/dispatches/{dispatch_id}/acknowledge
 POST   /v1/dispatches/{dispatch_id}/start
 POST   /v1/dispatches/{dispatch_id}/result
 ```
+
+## Todo work map
+
+Todo is durable planning state owned by Universe. It is not a Dispatch, Task
+Frame, execution assignment, approval, or permission. Creating, editing, or
+deleting a Todo never starts a provider or writes an attached project.
+
+Each Todo has one explicit scope:
+
+- `UNIVERSE`: no project or node coordinate;
+- `PROJECT`: one attached `project_id`;
+- `NODE`: one attached `project_id` plus an opaque `node_ref`.
+
+Priority is `P0` through `P3`. State is `BACKLOG`, `READY`, `IN_PROGRESS`,
+`BLOCKED`, or `DONE`. Updates use the current integer `revision`; stale updates
+fail with `TODO_REVISION_CONFLICT` instead of overwriting a newer edit.
+
+The UI can use the selected project or graph node to prefill these coordinates.
+Moving work into execution remains a separate explicit Dispatch or Task Frame
+operation.
 
 An event body has this shape:
 

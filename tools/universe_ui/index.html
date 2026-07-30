@@ -18,6 +18,9 @@
         <span id="service-status" class="status-dot" data-state="loading">
           Connecting
         </span>
+        <button id="todo-button" class="icon-button" type="button" title="Open Todo work map" aria-label="Open Todo work map">
+          &#9745;
+        </button>
         <button id="start-project-topbar-button" class="icon-button mobile-project-start" type="button" title="Start fresh project" aria-label="Start fresh project">
           &#10022;
         </button>
@@ -331,6 +334,89 @@
         </div>
       </section>
       <p id="fresh-project-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <dialog id="todo-dialog" class="wide-dialog todo-dialog">
+    <form id="todo-form" method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <span class="dialog-kicker">Planning only</span>
+          <h2>Todo work map</h2>
+          <p>Organize Universe, project, and node work without creating a Task Frame or execution assignment.</p>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+
+      <section class="todo-create" aria-label="Create Todo">
+        <label class="todo-title-field">
+          Title
+          <input id="todo-title" name="title" maxlength="160" autocomplete="off" required>
+        </label>
+        <label>
+          Scope
+          <select id="todo-scope" name="scope_kind">
+            <option value="UNIVERSE">Universe</option>
+            <option value="PROJECT">Project</option>
+            <option value="NODE">Node</option>
+          </select>
+        </label>
+        <label>
+          Project
+          <select id="todo-project" name="project_id"></select>
+        </label>
+        <label>
+          Node
+          <select id="todo-node" name="node_ref"></select>
+        </label>
+        <label>
+          Priority
+          <select name="priority">
+            <option value="P0">P0 Critical</option>
+            <option value="P1" selected>P1 High</option>
+            <option value="P2">P2 Normal</option>
+            <option value="P3">P3 Low</option>
+          </select>
+        </label>
+        <label>
+          State
+          <select name="state">
+            <option value="BACKLOG">Backlog</option>
+            <option value="READY" selected>Ready</option>
+            <option value="IN_PROGRESS">In progress</option>
+            <option value="BLOCKED">Blocked</option>
+            <option value="DONE">Done</option>
+          </select>
+        </label>
+        <label class="todo-detail-field">
+          Detail
+          <textarea id="todo-detail" name="detail" rows="2" maxlength="4000" placeholder="Decision, acceptance boundary, or next action"></textarea>
+        </label>
+        <button class="primary-button todo-add-button" type="submit">Add Todo</button>
+      </section>
+
+      <div class="todo-toolbar">
+        <label>
+          Show
+          <select id="todo-scope-filter">
+            <option value="ALL">All scopes</option>
+            <option value="UNIVERSE">Universe</option>
+            <option value="PROJECT">Selected project</option>
+            <option value="NODE">Selected node</option>
+          </select>
+        </label>
+        <label>
+          State
+          <select id="todo-state-filter">
+            <option value="OPEN">Open</option>
+            <option value="ALL">All</option>
+            <option value="DONE">Done</option>
+          </select>
+        </label>
+        <span id="todo-count" class="todo-count">0 items</span>
+      </div>
+      <div id="todo-list" class="todo-list" aria-live="polite"></div>
+      <p id="todo-form-error" class="form-error" role="alert"></p>
     </form>
   </dialog>
 
