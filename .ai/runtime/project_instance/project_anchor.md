@@ -12,7 +12,7 @@ Schema: ai-career.project-runtime-anchor.v1
 Project: universe
 Node: universe
 Anchor ID: UNIVERSE_PROJECT_RUNTIME
-Source Commit: 7ea2d4b7923f060d6230029cfb76f9f610f90b53
+Source Commit: bfbe6a56346e927fd3e253eef39c77ca1d5b3048
 State Source: `.ai/runtime/state/session.md`
 Frame Source: `.ai/runtime/state/current_anchor_frame.md`
 Validation Source: `.ai/runtime/project_instance/validation/latest.md`

@@ -8,8 +8,10 @@ import json
 import os
 import queue
 import secrets
+import shutil
 import sqlite3
 import subprocess  # nosec B404
+import sys
 import tempfile
 import threading
 import time
@@ -48,6 +50,177 @@ ReplyPoster = Callable[..., dict[str, Any]]
 StreamPoster = Callable[..., dict[str, Any]]
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
+SourceCommitResolver = Callable[[Path], str]
+
+
+class CommanderSurfaceObserver(Protocol):
+    def prepare(self) -> Mapping[str, Any]: ...
+
+    def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+class ProjectModeCoordinator:
+    """Invoke the installed project Runtime for Mode and surface ownership."""
+
+    def __init__(
+        self,
+        project_root: Path,
+        project_id: str,
+        host_session_ref: str,
+        *,
+        native_runner: NativeRunner = run_native_cli,
+        source_commit_resolver: SourceCommitResolver | None = None,
+    ) -> None:
+        self.project_root = project_root.expanduser().resolve(strict=True)
+        self.project_id = _text(project_id, "project_id")
+        self.host_session_ref = _text(host_session_ref, "host_session_ref")
+        self.native_runner = native_runner
+        self.source_commit_resolver = source_commit_resolver or self._git_head
+        self.runtime_cli = (
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "reference_runtime"
+            / "cli.py"
+        )
+        if not self.runtime_cli.is_file():
+            raise ProjectMasterHostError("PROJECT_RUNTIME_CLI_UNAVAILABLE")
+
+    def prepare(self) -> Mapping[str, Any]:
+        definition = self._master_definition()
+        source_commit = self.source_commit_resolver(self.project_root)
+        request = {
+            "command": "BOOT",
+            "source_state": "SOURCE_READY",
+            "source_ref": (
+                f"git-object-database://{self.project_id}@{source_commit}"
+            ),
+            "source_commit": source_commit,
+            "source_repository": str(self.project_root),
+            "mode": "MASTER",
+            "role": definition["role"],
+            "scope": definition["scope"],
+            "host_session_ref": self.host_session_ref,
+            "anchor_snapshot_ref": "UNKNOWN",
+            "host_executable_capability": "AVAILABLE",
+            "mode_profile": definition["mode_profile"],
+            "task_requirement": "NONE",
+            "evidence_profile": "NONE",
+        }
+        result = self._invoke(
+            ("prepare-session", "--repo-root", str(self.project_root)),
+            request,
+        )
+        anchor = result.get("mode_current_anchor")
+        anchor_status = anchor.get("status") if isinstance(anchor, Mapping) else None
+        if result.get("status") != "SESSION_PREPARED" or anchor_status not in {
+            "MODE_CURRENT_ANCHOR_CREATED",
+            "MODE_CURRENT_ANCHOR_OBSERVED",
+        }:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_PREPARATION_FAILED")
+        return result
+
+    def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
+        message_id = _text(message.get("message_id"), "message.message_id")
+        result = self._invoke(
+            (
+                "mode-anchor",
+                "observe-commander-input",
+                "--repo-root",
+                str(self.project_root),
+            ),
+            {
+                "mode": "MASTER",
+                "commander_surface": "UNIVERSE_UI",
+                "evidence_ref": (
+                    f"universe://project-room/messages/{message_id}"
+                ),
+            },
+        )
+        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
+            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
+        return result
+
+    def _master_definition(self) -> Mapping[str, str]:
+        registry_path = (
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "project_instance"
+            / "mode_registry.json"
+        )
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            definition = registry["modes"]["MASTER"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ProjectMasterHostError("PROJECT_MASTER_MODE_UNAVAILABLE") from error
+        if not isinstance(definition, Mapping):
+            raise ProjectMasterHostError("PROJECT_MASTER_MODE_UNAVAILABLE")
+        return {
+            "role": _text(definition.get("role"), "MASTER.role"),
+            "scope": _text(definition.get("scope"), "MASTER.scope"),
+            "mode_profile": _text(
+                definition.get("mode_profile"), "MASTER.mode_profile"
+            ),
+        }
+
+    def _invoke(
+        self,
+        arguments: tuple[str, ...],
+        request: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        request_path = _runtime_tmp() / f"project-runtime-{uuid4().hex}.json"
+        request_path.write_text(
+            json.dumps(dict(request), ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        try:
+            result = self.native_runner(
+                NativeCliRequest(
+                    executable=Path(sys.executable),
+                    arguments=(
+                        str(self.runtime_cli),
+                        *arguments,
+                        "--request",
+                        str(request_path),
+                    ),
+                    cwd=self.project_root,
+                    timeout_seconds=30,
+                )
+            )
+        finally:
+            request_path.unlink(missing_ok=True)
+        if result.status != "COMPLETED" or result.return_code != 0:
+            raise ProjectMasterHostError("PROJECT_RUNTIME_COMMAND_FAILED")
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ProjectMasterHostError("PROJECT_RUNTIME_RESULT_INVALID") from error
+        if not isinstance(payload, Mapping):
+            raise ProjectMasterHostError("PROJECT_RUNTIME_RESULT_INVALID")
+        return payload
+
+    def _git_head(self, project_root: Path) -> str:
+        executable = shutil.which("git")
+        if executable is None:
+            raise ProjectMasterHostError("PROJECT_GIT_UNAVAILABLE")
+        result = self.native_runner(
+            NativeCliRequest(
+                executable=Path(executable),
+                arguments=("rev-parse", "HEAD"),
+                cwd=project_root,
+                timeout_seconds=15,
+            )
+        )
+        source_commit = result.stdout.strip()
+        if (
+            result.status != "COMPLETED"
+            or result.return_code != 0
+            or len(source_commit) != 40
+            or any(character not in "0123456789abcdefABCDEF" for character in source_commit)
+        ):
+            raise ProjectMasterHostError("PROJECT_SOURCE_COMMIT_UNAVAILABLE")
+        return source_commit.lower()
 
 
 class ProjectMasterSessionStore:
@@ -375,16 +548,30 @@ class GrokProjectMasterRuntime:
             "work. Do not create, edit, delete, move, commit, push, execute project "
             "code, start subagents, or invoke network tools. For implementation "
             "requests, return a concise proposal suitable for a separate guarded "
-            "execution queue. Mark unavailable facts UNKNOWN. Reply in the user's "
-            "language and keep ordinary conversation direct."
+            "execution queue. Each Project Room message includes a Host-observed "
+            "Project Runtime context. Use that context for current Mode Anchor and "
+            "Commander Surface answers; static state files may be older. Mark "
+            "unavailable facts UNKNOWN. Reply in the user's language and keep "
+            "ordinary conversation direct."
         )
 
     def _prompt(self, message: Mapping[str, Any]) -> str:
+        runtime_context = message.get("runtime_context")
+        context_text = (
+            json.dumps(
+                dict(runtime_context),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if isinstance(runtime_context, Mapping)
+            else "{}"
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
             f"kind: {_text(message.get('kind'), 'message.kind')}\n"
-            f"sender: {_text(message.get('sender'), 'message.sender')}\n\n"
+            f"sender: {_text(message.get('sender'), 'message.sender')}\n"
+            f"project_runtime_context: {context_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -398,6 +585,7 @@ class ProjectMasterConversationWorker:
         universe_endpoint: str,
         project_id: str,
         bridge_token: str,
+        surface_observer: CommanderSurfaceObserver,
         reply_poster: ReplyPoster = post_master_reply,
         stream_poster: StreamPoster = post_master_stream_event,
     ) -> None:
@@ -406,6 +594,7 @@ class ProjectMasterConversationWorker:
         self.universe_endpoint = universe_endpoint
         self.project_id = _text(project_id, "project_id")
         self.bridge_token = _text(bridge_token, "bridge_token")
+        self.surface_observer = surface_observer
         self.reply_poster = reply_poster
         self.stream_poster = stream_poster
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -484,14 +673,19 @@ class ProjectMasterConversationWorker:
 
         try:
             emit("STARTED")
+            surface_observation = self.surface_observer.observe(message)
+            provider_message = dict(message)
+            provider_message["runtime_context"] = _runtime_context(
+                surface_observation
+            )
             stream_reply = getattr(self.provider, "reply_stream", None)
             if callable(stream_reply):
                 body = stream_reply(
-                    message,
+                    provider_message,
                     lambda delta: emit("DELTA", delta=delta),
                 )
             else:
-                body = self.provider.reply(message)
+                body = self.provider.reply(provider_message)
             self.reply_poster(
                 universe_endpoint=self.universe_endpoint,
                 project_id=self.project_id,
@@ -556,10 +750,15 @@ class ResidentProjectMasterHostManager:
             [Path, str, ProjectMasterSessionStore], MasterProvider
         ]
         | None = None,
+        coordinator_factory: Callable[
+            [Path, str, str], CommanderSurfaceObserver
+        ]
+        | None = None,
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
         self.bridge_registrar = bridge_registrar
         self.provider_factory = provider_factory or self._default_provider
+        self.coordinator_factory = coordinator_factory or self._default_coordinator
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
         self._lock = threading.RLock()
 
@@ -590,12 +789,23 @@ class ResidentProjectMasterHostManager:
                 project_id,
             )
             provider = self.provider_factory(project_root, project_id, store)
+            try:
+                coordinator = self.coordinator_factory(
+                    project_root,
+                    project_id,
+                    provider.session_ref,
+                )
+                preparation = coordinator.prepare()
+            except Exception:
+                os.environ.pop(credential_env, None)
+                raise
             worker = ProjectMasterConversationWorker(
                 provider=provider,
                 store=store,
                 universe_endpoint=self.universe_endpoint,
                 project_id=project_id,
                 bridge_token=os.environ[credential_env],
+                surface_observer=coordinator,
             )
             host = LiveProjectMasterBridgeHost(
                 project_root,
@@ -643,6 +853,7 @@ class ResidentProjectMasterHostManager:
                 "project_id": project_id,
                 "endpoint": endpoint,
                 "bridge": bridge,
+                "session_preparation": preparation,
             }
 
     def is_resident(self, project_id: str) -> bool:
@@ -664,6 +875,18 @@ class ResidentProjectMasterHostManager:
         store: ProjectMasterSessionStore,
     ) -> MasterProvider:
         return GrokProjectMasterRuntime(project_root, project_id, store)
+
+    @staticmethod
+    def _default_coordinator(
+        project_root: Path,
+        project_id: str,
+        host_session_ref: str,
+    ) -> CommanderSurfaceObserver:
+        return ProjectModeCoordinator(
+            project_root,
+            project_id,
+            host_session_ref,
+        )
 
 
 @dataclass(frozen=True)
@@ -810,6 +1033,42 @@ def _read_token(environment_name: str) -> str:
     return token
 
 
+def _runtime_context(observation: Mapping[str, Any]) -> dict[str, str]:
+    stored = observation.get("snapshot")
+    snapshot = (
+        stored.get("snapshot")
+        if isinstance(stored, Mapping)
+        and isinstance(stored.get("snapshot"), Mapping)
+        else {}
+    )
+    coordinates = (
+        snapshot.get("coordinates")
+        if isinstance(snapshot.get("coordinates"), Mapping)
+        else {}
+    )
+    return {
+        "surface_observation_status": str(
+            observation.get("status", "UNKNOWN")
+        ),
+        "mode": str(
+            observation.get("anchor_mode", coordinates.get("mode", "UNKNOWN"))
+        ),
+        "mode_current_anchor": str(
+            stored.get("anchor_id", "UNKNOWN")
+            if isinstance(stored, Mapping)
+            else "UNKNOWN"
+        ),
+        "commander_surface": str(
+            coordinates.get("commander_surface", "UNKNOWN")
+        ),
+        "observed_at": str(
+            stored.get("observed_at", "UNKNOWN")
+            if isinstance(stored, Mapping)
+            else "UNKNOWN"
+        ),
+    }
+
+
 def _text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProjectMasterHostError(f"{field} must be non-empty text")
@@ -842,12 +1101,19 @@ def main() -> int:
         model=args.model,
         max_turns=args.max_turns,
     )
+    coordinator = ProjectModeCoordinator(
+        args.project_root,
+        args.project_id,
+        provider.session_ref,
+    )
+    preparation = coordinator.prepare()
     worker = ProjectMasterConversationWorker(
         provider=provider,
         store=store,
         universe_endpoint=args.universe_endpoint,
         project_id=args.project_id,
         bridge_token=token,
+        surface_observer=coordinator,
     )
     host = LiveProjectMasterBridgeHost(
         args.project_root,
@@ -866,6 +1132,7 @@ def main() -> int:
                 "project_id": args.project_id,
                 "provider": args.provider,
                 "state_db": str(state_db),
+                "session_preparation": preparation["status"],
                 "status": "LISTENING",
             },
             sort_keys=True,

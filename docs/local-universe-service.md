@@ -367,6 +367,22 @@ resident until the Universe service stops. Later messages reuse the same
 provider session ID and durable Host queue. Opening or selecting a project does
 not start its Host; the first actual Project Master message does.
 
+Before registration, the resident Host invokes the installed project's
+`prepare-session` command for registered `MASTER` Mode from inside the project
+root. Universe does not open or rewrite the project Anchor database itself.
+For every accepted Project Room user message, the Project Host invokes:
+
+```text
+mode-anchor observe-commander-input
+  -> commander_surface: UNIVERSE_UI
+  -> evidence_ref: universe://project-room/messages/<message-id>
+```
+
+Only `coordinates.commander_surface` and `observed_at` may change. Mode,
+Anchor identity, execution coordinates, authority, and assignment remain
+project-owned and unchanged. A failed preparation or Commander Surface
+observation blocks the provider turn.
+
 Project Master response text is emitted as process-local stream events and the
 browser subscribes through:
 

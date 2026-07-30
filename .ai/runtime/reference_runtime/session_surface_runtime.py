@@ -107,7 +107,7 @@ def observe_commander_input(
     updated = copy.deepcopy(current)
     updated_coordinates = dict(updated["coordinates"])
     previous_surface = _required_text(
-        updated_coordinates.get("commander_surface"),
+        updated_coordinates.get("commander_surface", "UNKNOWN"),
         "snapshot.coordinates.commander_surface",
     )
     updated_coordinates["commander_surface"] = commander_surface

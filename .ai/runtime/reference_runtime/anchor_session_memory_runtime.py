@@ -14,6 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .session_surface_runtime import observe_commander_input
+else:
+    from session_surface_runtime import observe_commander_input
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS anchor_snapshot (
@@ -352,6 +357,81 @@ class AnchorSessionMemoryRuntime:
             "event": event,
             "authority_created": False,
             "assignment_created": False,
+            "repository_write": False,
+        }
+
+    def observe_commander_surface(
+        self,
+        *,
+        commander_surface: str,
+        input_at: str,
+        evidence_ref: str,
+    ) -> dict[str, Any]:
+        """Record one Commander input without changing Anchor identity."""
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            stored = self.stored_snapshot()
+            if stored is None:
+                self.conn.execute("ROLLBACK")
+                return {"status": "SNAPSHOT_NOT_FOUND"}
+            transition = observe_commander_input(
+                snapshot=stored["snapshot"],
+                observation={
+                    "commander_surface": commander_surface,
+                    "input_at": input_at,
+                    "evidence_ref": evidence_ref,
+                },
+            )
+            if transition["status"] != "COMMANDER_INPUT_OBSERVED":
+                self.conn.execute("ROLLBACK")
+                return transition
+            raw_snapshot = dict(transition["snapshot"])
+            snapshot_json = self._json_object(raw_snapshot)
+            if snapshot_json is None:
+                self.conn.execute("ROLLBACK")
+                return {"status": "SNAPSHOT_NOT_JSON_SERIALIZABLE"}
+            cursor = self.conn.execute(
+                """
+                UPDATE anchor_snapshot
+                SET revision = revision + 1, observed_at = ?, snapshot_json = ?
+                WHERE singleton = 1 AND revision = ?
+                """,
+                (
+                    raw_snapshot["observed_at"],
+                    snapshot_json,
+                    self._current_revision(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.OperationalError("anchor revision conflict")
+            transition_event = transition["event"]
+            event = self._append_event(
+                event_id=self._generated_snapshot_event_id(),
+                event_type="COMMANDER_INPUT_OBSERVED",
+                frame_id=stored["frame_id"],
+                action="USER_INPUT",
+                details={
+                    "anchor_id": stored["anchor_id"],
+                    "commander_surface": transition_event["commander_surface"],
+                    "previous_commander_surface": transition_event[
+                        "previous_commander_surface"
+                    ],
+                    "evidence_ref": transition_event["evidence_ref"],
+                    "changed_fields": transition["changed_snapshot_fields"],
+                },
+                source_ref=stored["source_ref"],
+                observed_at=raw_snapshot["observed_at"],
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+        return {
+            **transition,
+            "snapshot": self.stored_snapshot(),
+            "event": event,
             "repository_write": False,
         }
 

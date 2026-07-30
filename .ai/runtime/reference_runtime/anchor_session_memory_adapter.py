@@ -189,7 +189,10 @@ class AnchorSessionMemoryHostAdapter:
                 "anchor_id": f"{normalized_mode}-CURRENT-{secrets.token_hex(8).upper()}",
                 "state": "CURRENT",
                 "observed_at": observed_at,
-                "coordinates": {"mode": normalized_mode},
+                "coordinates": {
+                    "mode": normalized_mode,
+                    "commander_surface": "UNKNOWN",
+                },
                 "observer_session_ref": observer_ref,
                 "mode_registry_revision": registry_revision,
                 "mode_definition_digest": definition_digest,
@@ -221,6 +224,49 @@ class AnchorSessionMemoryHostAdapter:
                 "definition_digest": definition_digest,
                 "registry_digest": registry_digest,
             },
+        }
+
+    def observe_mode_commander_input(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Apply one user-input surface observation to a selected Mode Anchor."""
+
+        if self._repository_root is None:
+            return {"status": "MODE_ANCHOR_STORE_UNBOUND"}
+        mode = self._required_text(payload, "mode", "ANCHOR_MODE_REQUIRED")
+        if isinstance(mode, dict):
+            return mode
+        commander_surface = self._required_text(
+            payload, "commander_surface", "COMMANDER_SURFACE_REQUIRED"
+        )
+        if isinstance(commander_surface, dict):
+            return commander_surface
+        evidence_ref = self._required_text(
+            payload, "evidence_ref", "EVIDENCE_REF_REQUIRED"
+        )
+        if isinstance(evidence_ref, dict):
+            return evidence_ref
+        normalized_mode = self._normalize_anchor_mode(mode)
+        if normalized_mode is None:
+            return {"status": "ANCHOR_MODE_INVALID"}
+        registered_mode = self._registered_anchor_mode(normalized_mode)
+        if isinstance(registered_mode, dict):
+            return registered_mode
+        runtime = self._mode_runtime(registered_mode)
+        if runtime.stored_snapshot() is None:
+            return {
+                "status": "MODE_CURRENT_ANCHOR_UNKNOWN",
+                "anchor_mode": registered_mode,
+            }
+        outcome = runtime.observe_commander_surface(
+            commander_surface=commander_surface,
+            input_at=_physical_time(),
+            evidence_ref=evidence_ref,
+        )
+        return {
+            "anchor_mode": registered_mode,
+            "storage_scope": FILE_STORAGE_SCOPE,
+            **outcome,
         }
 
     def record_observation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1113,6 +1159,9 @@ class AnchorSessionMemoryHostServer:
                     return
                 if parsed.path == "/v1/mode-anchor/prepare":
                     self._send(200, adapter.prepare_mode_current_anchor(payload))
+                    return
+                if parsed.path == "/v1/mode-anchor/commander-input":
+                    self._send(200, adapter.observe_mode_commander_input(payload))
                     return
                 if parsed.path == "/v1/anchor-session-memory/observe":
                     self._send(200, adapter.record_observation(payload))

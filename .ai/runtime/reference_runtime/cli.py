@@ -1012,6 +1012,32 @@ def _mode_registry(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
         raise CliFailure(error.error_code, error.detail, 4) from error
 
 
+def _mode_anchor(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
+    if not args or args[0] != "observe-commander-input":
+        raise CliFailure(
+            "CLI_USAGE_ERROR",
+            "mode-anchor requires the observe-commander-input operation",
+        )
+    options = _parse_options(
+        args[1:],
+        required=frozenset({"--repo-root", "--request"}),
+    )
+    request = _load_request(options["--request"])
+    _exact_fields(
+        request,
+        {"mode", "commander_surface", "evidence_ref"},
+        "request",
+    )
+    adapter = AnchorSessionMemoryHostAdapter(
+        repository_root=Path(options["--repo-root"])
+    )
+    try:
+        result = adapter.observe_mode_commander_input(request)
+    finally:
+        adapter.close()
+    return 0, result
+
+
 def _execution_binding(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
     if not args or args[0] not in {
         "propose",
@@ -1308,6 +1334,10 @@ def _help() -> Mapping[str, Any]:
             "mode-registry list --repo-root <path>",
             "mode-registry show --repo-root <path> --mode <MODE>",
             "mode-registry plan --repo-root <path> --request <path|->",
+            (
+                "mode-anchor observe-commander-input --repo-root <path> "
+                "--request <path|->"
+            ),
             "task-frame propose --repo-root <path> --profile <path> --request <path|->",
             "task-frame run --repo-root <path> --profile <path> [--database <path>] --request <path|->",
             "task-frame continue --repo-root <path> --profile <path> --database <path> --request <path|->",
@@ -1411,6 +1441,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             code, payload = _prepare_session(command_args)
         elif command == "mode-registry":
             code, payload = _mode_registry(command_args)
+        elif command == "mode-anchor":
+            code, payload = _mode_anchor(command_args)
         elif command == "anchor-memory":
             if command_args and command_args[0] == "serve":
                 return _anchor_serve(command_args[1:])

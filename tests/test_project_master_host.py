@@ -17,7 +17,9 @@ from project_master_bridge import MASTER_BRIDGE_ENVELOPE_SCHEMA  # noqa: E402
 from project_master_host import (  # noqa: E402
     GrokProjectMasterRuntime,
     LiveProjectMasterBridgeHost,
+    ProjectMasterHostError,
     ProjectMasterConversationWorker,
+    ProjectModeCoordinator,
     ProjectMasterSessionStore,
     ResidentProjectMasterHostManager,
 )
@@ -43,6 +45,38 @@ class StreamingFakeProvider(FakeProvider):
         return "Project Master answer"
 
 
+class FakeSurfaceObserver:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.messages: list[dict[str, Any]] = []
+        self.prepare_count = 0
+
+    def prepare(self) -> Mapping[str, Any]:
+        self.prepare_count += 1
+        return {"status": "SESSION_PREPARED"}
+
+    def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
+        self.messages.append(dict(message))
+        if self.fail:
+            raise ProjectMasterHostError(
+                "PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED"
+            )
+        return {
+            "status": "COMMANDER_INPUT_OBSERVED",
+            "anchor_mode": "MASTER",
+            "snapshot": {
+                "anchor_id": "MASTER-CURRENT-TEST",
+                "observed_at": "2026-07-30T00:00:01Z",
+                "snapshot": {
+                    "coordinates": {
+                        "mode": "MASTER",
+                        "commander_surface": "UNIVERSE_UI",
+                    }
+                },
+            },
+        }
+
+
 class ProjectMasterHostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -50,6 +84,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         (self.root / ".ai" / "master" / "inbox").mkdir(parents=True)
         self.state = ProjectMasterSessionStore(self.root / "state.sqlite", "GCS")
         self.provider = FakeProvider()
+        self.surface_observer = FakeSurfaceObserver()
         self.replies: list[dict[str, Any]] = []
         self.streams: list[dict[str, Any]] = []
 
@@ -75,6 +110,15 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("RECORDED", first["status"])
         self.assertEqual("ALREADY_RECORDED", repeated["status"])
         self.assertEqual(1, len(self.provider.messages))
+        self.assertEqual(1, len(self.surface_observer.messages))
+        self.assertEqual(
+            "UNIVERSE_UI",
+            self.provider.messages[0]["runtime_context"]["commander_surface"],
+        )
+        self.assertEqual(
+            "MASTER-CURRENT-TEST",
+            self.provider.messages[0]["runtime_context"]["mode_current_anchor"],
+        )
         self.assertEqual(1, len(self.replies))
         self.assertEqual("Project Master answer", self.replies[0]["body"])
         self.assertEqual("COMPLETE", self.state.state(first["message_id"]))
@@ -152,6 +196,95 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertEqual("Project Master answer", self.replies[0]["body"])
 
+    def test_surface_observation_failure_blocks_provider_call(self) -> None:
+        self.surface_observer = FakeSurfaceObserver(fail=True)
+        worker = self._worker()
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual([], self.provider.messages)
+        self.assertEqual("FAILED", self.state.state(self._message_id()))
+        self.assertEqual(
+            ["STARTED", "FAILED"],
+            [item["event"] for item in self.streams],
+        )
+
+    def test_project_mode_coordinator_prepares_and_observes_universe_surface(
+        self,
+    ) -> None:
+        runtime_cli = (
+            self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        )
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        registry = (
+            self.root / ".ai" / "runtime" / "project_instance" / "mode_registry.json"
+        )
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "modes": {
+                        "MASTER": {
+                            "role": "MASTER",
+                            "scope": "architecture/governance",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        requests: list[dict[str, Any]] = []
+
+        def runner(request):
+            request_path = Path(
+                request.arguments[request.arguments.index("--request") + 1]
+            )
+            requests.append(json.loads(request_path.read_text(encoding="utf-8")))
+            payload = (
+                {
+                    "status": "SESSION_PREPARED",
+                    "mode_current_anchor": {
+                        "status": "MODE_CURRENT_ANCHOR_OBSERVED"
+                    },
+                }
+                if "prepare-session" in request.arguments
+                else {"status": "COMMANDER_INPUT_OBSERVED"}
+            )
+            return NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(payload),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "grok-cli:session-001",
+            native_runner=runner,
+            source_commit_resolver=lambda _root: "a" * 40,
+        )
+        coordinator.prepare()
+        coordinator.observe(self._envelope()["message"])
+
+        self.assertEqual("MASTER", requests[0]["mode"])
+        self.assertEqual("grok-cli:session-001", requests[0]["host_session_ref"])
+        self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
+        self.assertEqual(
+            f"universe://project-room/messages/{self._message_id()}",
+            requests[1]["evidence_ref"],
+        )
+
     def test_resident_manager_starts_one_host_per_project(self) -> None:
         registrations: list[dict[str, Any]] = []
 
@@ -164,6 +297,9 @@ class ProjectMasterHostTests(unittest.TestCase):
                 universe_endpoint="http://127.0.0.1:52973",
                 bridge_registrar=register,
                 provider_factory=lambda _root, _project_id, _store: FakeProvider(),
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
             )
             try:
                 first = manager.ensure(
@@ -179,6 +315,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("STARTED", first["status"])
         self.assertEqual("RESIDENT", second["status"])
         self.assertEqual(1, len(registrations))
+        self.assertEqual(1, self.surface_observer.prepare_count)
         self.assertNotIn(registrations[0]["credential_env"], os.environ)
 
     def _worker(self) -> ProjectMasterConversationWorker:
@@ -196,6 +333,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             universe_endpoint="http://127.0.0.1:52973",
             project_id="GCS",
             bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
             reply_poster=post_reply,
             stream_poster=post_stream,
         )
