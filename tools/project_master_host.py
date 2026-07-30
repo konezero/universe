@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
@@ -21,12 +23,15 @@ from uuid import UUID, uuid4
 
 from project_master_bridge import (
     ProjectMasterBridgeHost,
+    ProjectMasterBridgeError,
     ProjectMasterBridgeHttpServer,
     normalize_bridge_envelope,
     post_master_reply,
     post_master_stream_event,
     utc_now,
 )
+from project_seed_apply import apply_project_seed_asset_proposal
+from project_seed_assets import ProjectSeedAssetError
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -85,6 +90,11 @@ class ProjectModeCoordinator:
         )
         if not self.runtime_cli.is_file():
             raise ProjectMasterHostError("PROJECT_RUNTIME_CLI_UNAVAILABLE")
+        self._prepared: dict[str, Any] | None = None
+        self._runtime_process: subprocess.Popen[str] | None = None
+        self._runtime_binding: dict[str, str] | None = None
+        self._runtime_stderr: deque[str] = deque(maxlen=40)
+        self._runtime_lock = threading.RLock()
 
     def prepare(self) -> Mapping[str, Any]:
         definition = self._master_definition()
@@ -118,6 +128,7 @@ class ProjectModeCoordinator:
             "MODE_CURRENT_ANCHOR_OBSERVED",
         }:
             raise ProjectMasterHostError("PROJECT_MASTER_SESSION_PREPARATION_FAILED")
+        self._prepared = dict(result)
         return result
 
     def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -140,6 +151,295 @@ class ProjectModeCoordinator:
         if result.get("status") != "COMMANDER_INPUT_OBSERVED":
             raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
         return result
+
+    def apply_file(
+        self,
+        *,
+        target: Path,
+        content: bytes,
+        operation: str,
+        boundary: str,
+        approval_evidence_ref: str,
+        request_ref: str,
+    ) -> Mapping[str, Any]:
+        binding = self._ensure_runtime()
+        normalized_operation = _text(operation, "operation").upper()
+        normalized_target = target.expanduser().resolve(strict=target.exists())
+        target_preimage = (
+            {
+                "status": "PRESENT",
+                "sha256": hashlib.sha256(normalized_target.read_bytes()).hexdigest(),
+            }
+            if normalized_target.exists()
+            else {"status": "ABSENT", "sha256": "NONE"}
+        )
+        proposal = self._invoke(
+            (
+                "execution-binding",
+                "propose",
+                "--endpoint",
+                binding["endpoint"],
+                "--token",
+                binding["token"],
+            ),
+            {
+                "session_id": binding["session_id"],
+                "request": {
+                    "operation": normalized_operation,
+                    "target": str(normalized_target),
+                    "boundary": boundary,
+                    "write_roots": [str(self.project_root / ".ai" / "universe")],
+                    "write_operations": ["CREATE", "MODIFY"],
+                    "task_summary": "Apply one approved Universe Project Seed asset",
+                    "request_ref": request_ref,
+                },
+            },
+        )
+        if proposal.get("status") != "EXECUTION_ASSIGNMENT_PROPOSED":
+            raise ProjectMasterHostError("PROJECT_SEED_ASSIGNMENT_PROPOSAL_FAILED")
+        approval = {
+            "status": "APPROVED",
+            "proposal_id": proposal["proposal_id"],
+            "commander_surface": "UNIVERSE_UI",
+            "operation": normalized_operation,
+            "target": str(normalized_target),
+            "boundary": boundary,
+            "evidence_ref": approval_evidence_ref,
+            "authority_source_ref": approval_evidence_ref,
+        }
+        applied_binding = self._invoke(
+            (
+                "execution-binding",
+                "apply",
+                "--endpoint",
+                binding["endpoint"],
+                "--token",
+                binding["token"],
+            ),
+            {
+                "session_id": binding["session_id"],
+                "proposal": proposal,
+                "approval": approval,
+            },
+        )
+        if applied_binding.get("status") != "EXECUTION_BINDING_APPLIED":
+            raise ProjectMasterHostError("PROJECT_SEED_EXECUTION_BINDING_FAILED")
+        guard_request = {
+            "session_id": binding["session_id"],
+            "frame_id": binding["frame_id"],
+            "anchor_id": binding["anchor_id"],
+            "operation": normalized_operation,
+            "target": str(normalized_target),
+            "boundary": boundary,
+            "source_commit": proposal["source_commit"],
+            "validation_ref": proposal["validation_ref"],
+            "payload_sha256": hashlib.sha256(content).hexdigest(),
+            "target_preimage": target_preimage,
+            "host_capability": {
+                "filesystem_write": "AVAILABLE",
+                "pre_write_hook": "AVAILABLE",
+                "evidence_ref": (
+                    "project-master://"
+                    + self.project_id
+                    + "/receipt-aware-mutation-gateway"
+                ),
+            },
+            "approval": approval,
+        }
+        permit = self._invoke(
+            (
+                "execution-guard",
+                "check",
+                "--endpoint",
+                binding["endpoint"],
+                "--token",
+                binding["token"],
+            ),
+            {
+                "session_id": binding["session_id"],
+                "observed_at": utc_now(),
+                "request": guard_request,
+            },
+        )
+        if permit.get("status") != "EXECUTION_GUARD_PERMITTED":
+            return permit
+        result = self._invoke(
+            (
+                "mutation-gateway",
+                "apply-file",
+                "--endpoint",
+                binding["endpoint"],
+                "--token",
+                binding["token"],
+            ),
+            {
+                "session_id": binding["session_id"],
+                "observed_at": utc_now(),
+                "request": guard_request,
+                "receipt_id": permit["permit_receipt"]["receipt_id"],
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            },
+        )
+        return result
+
+    def close(self) -> None:
+        with self._runtime_lock:
+            process = self._runtime_process
+            self._runtime_process = None
+            self._runtime_binding = None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def _ensure_runtime(self) -> dict[str, str]:
+        with self._runtime_lock:
+            if (
+                self._runtime_binding is not None
+                and self._runtime_process is not None
+                and self._runtime_process.poll() is None
+            ):
+                return dict(self._runtime_binding)
+            prepared = self._prepared or dict(self.prepare())
+            anchor = prepared.get("mode_current_anchor")
+            snapshot = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
+            payload = snapshot.get("snapshot") if isinstance(snapshot, Mapping) else None
+            anchor_id = (
+                _text(payload.get("anchor_id"), "mode_current_anchor.anchor_id")
+                if isinstance(payload, Mapping)
+                else ""
+            )
+            if not anchor_id:
+                raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
+            session_id = f"project-master-{uuid4().hex}"
+            frame_id = "master"
+            token = secrets.token_urlsafe(32)
+            command = [
+                sys.executable,
+                str(self.runtime_cli),
+                "session-boot",
+                "serve",
+                "--repo-root",
+                str(self.project_root),
+                "--session-id",
+                session_id,
+                "--frame-id",
+                frame_id,
+                "--anchor-id",
+                anchor_id,
+                "--host-action",
+                "PROJECT_MASTER_SEED_APPLY",
+                "--session-location",
+                "PROJECT_MASTER_HOST",
+                "--commander-surface",
+                "UNIVERSE_UI",
+                "--execution-surface",
+                "LOCAL_RUNTIME",
+                "--repository-location",
+                str(self.project_root),
+                "--port",
+                "0",
+                "--token",
+                token,
+            ]
+            options: dict[str, Any] = {
+                "cwd": str(self.project_root),
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "shell": False,
+            }
+            if os.name == "nt":
+                options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            try:
+                process = subprocess.Popen(command, **options)  # nosec B603
+                startup = self._read_runtime_startup(process)
+                host_adapter = startup.get("host_adapter")
+                runtime_state = startup.get("runtime_state")
+                if (
+                    startup.get("status") != "SESSION_BOOT_IMAGE_CREATED"
+                    or not isinstance(host_adapter, Mapping)
+                    or not isinstance(runtime_state, Mapping)
+                    or runtime_state.get("anchor_id") != anchor_id
+                    or runtime_state.get("executable_runtime_currentness")
+                    != "CURRENT"
+                ):
+                    raise ProjectMasterHostError(
+                        "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
+                    )
+                endpoint = _text(
+                    host_adapter.get("endpoint"), "host_adapter.endpoint"
+                )
+                if _text(host_adapter.get("token"), "host_adapter.token") != token:
+                    raise ProjectMasterHostError(
+                        "PROJECT_MASTER_RUNTIME_TOKEN_MISMATCH"
+                    )
+            except Exception:
+                if "process" in locals() and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+                raise
+            self._runtime_process = process
+            self._runtime_binding = {
+                "endpoint": endpoint,
+                "token": token,
+                "session_id": session_id,
+                "frame_id": frame_id,
+                "anchor_id": anchor_id,
+            }
+            return dict(self._runtime_binding)
+
+    def _read_runtime_startup(
+        self, process: subprocess.Popen[str]
+    ) -> Mapping[str, Any]:
+        if process.stdout is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_STDOUT_UNAVAILABLE")
+        output: queue.Queue[str] = queue.Queue(maxsize=1)
+
+        def read_line() -> None:
+            try:
+                output.put(process.stdout.readline())
+            except (OSError, UnicodeError):
+                output.put("")
+
+        threading.Thread(target=read_line, daemon=True).start()
+        if process.stderr is not None:
+            threading.Thread(
+                target=self._drain_runtime_stderr,
+                args=(process.stderr,),
+                daemon=True,
+            ).start()
+        try:
+            raw = output.get(timeout=30)
+        except queue.Empty as error:
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_RUNTIME_START_TIMEOUT"
+            ) from error
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
+            ) from error
+        if not isinstance(payload, Mapping):
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
+            )
+        return payload
+
+    def _drain_runtime_stderr(self, stream: Any) -> None:
+        try:
+            for line in stream:
+                self._runtime_stderr.append(line.rstrip())
+        except (OSError, UnicodeError):
+            return
 
     def _master_definition(self) -> Mapping[str, str]:
         registry_path = (
@@ -881,21 +1181,51 @@ class ProjectMasterConversationWorker:
 
 
 class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
+    _worker: ProjectMasterConversationWorker
+    _coordinator: CommanderSurfaceObserver
+
     def __init__(
         self,
         project_root: Path,
         token: str,
         inbox_ref: str,
         worker: ProjectMasterConversationWorker,
+        coordinator: CommanderSurfaceObserver,
     ) -> None:
         super().__init__(project_root, token, inbox_ref)
         object.__setattr__(self, "_worker", worker)
+        object.__setattr__(self, "_coordinator", coordinator)
 
     def record(self, envelope: Any) -> dict[str, Any]:
         normalized = normalize_bridge_envelope(envelope)
         receipt = super().record(normalized)
         self._worker.submit(normalized)
         return receipt
+
+    def apply_seed_assets(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "project_id",
+            "proposal",
+            "approval",
+        }:
+            raise ProjectMasterBridgeError(
+                "PROJECT_SEED_ASSET_APPLY_REQUEST_INVALID"
+            )
+        gateway = self._coordinator
+        if not callable(getattr(gateway, "apply_file", None)):
+            raise ProjectMasterBridgeError(
+                "PROJECT_SEED_ASSET_MUTATION_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return apply_project_seed_asset_proposal(
+                project_root=self.project_root,
+                project_id=_text(request.get("project_id"), "project_id"),
+                proposal=request.get("proposal"),
+                approval=request.get("approval"),
+                mutation_gateway=gateway,
+            )
+        except (ProjectSeedAssetError, ProjectMasterHostError) as error:
+            raise ProjectMasterBridgeError(str(error)) from error
 
 
 @dataclass
@@ -906,12 +1236,16 @@ class ResidentProjectMasterHandle:
     credential_env: str
     bridge_server: ProjectMasterBridgeHttpServer
     worker: ProjectMasterConversationWorker
+    coordinator: CommanderSurfaceObserver
     thread: threading.Thread
 
     def close(self) -> None:
         self.bridge_server.shutdown()
         self.bridge_server.server_close()
         self.worker.close()
+        close_coordinator = getattr(self.coordinator, "close", None)
+        if callable(close_coordinator):
+            close_coordinator()
         self.thread.join(timeout=5)
         os.environ.pop(self.credential_env, None)
 
@@ -1005,6 +1339,7 @@ class ResidentProjectMasterHostManager:
                 os.environ[credential_env],
                 inbox_ref,
                 worker,
+                coordinator,
             )
             server = ProjectMasterBridgeHttpServer(("127.0.0.1", 0), host)
             endpoint = f"http://127.0.0.1:{server.server_port}"
@@ -1022,6 +1357,7 @@ class ResidentProjectMasterHostManager:
                 credential_env=credential_env,
                 bridge_server=server,
                 worker=worker,
+                coordinator=coordinator,
                 thread=thread,
             )
             self._handles[project_id] = handle
@@ -1354,6 +1690,7 @@ def main() -> int:
         token,
         args.inbox_ref,
         worker,
+        coordinator,
     )
     server = ProjectMasterBridgeHttpServer(("127.0.0.1", args.port), host)
     worker.start()
@@ -1378,6 +1715,7 @@ def main() -> int:
     finally:
         server.server_close()
         worker.close()
+        coordinator.close()
     return 0
 
 

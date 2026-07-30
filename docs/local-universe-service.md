@@ -189,6 +189,8 @@ GET    /v1/releases/{release_id}
 POST   /v1/releases/import
 GET    /v1/projects/{project_id}/release-proposals
 POST   /v1/projects/{project_id}/release-proposals
+GET    /v1/projects/{project_id}/seed-asset-proposal
+POST   /v1/projects/{project_id}/seed-asset-proposal/apply
 GET    /v1/projects/{project_id}/runtime-worker-invocations
 POST   /v1/projects/{project_id}/runtime-worker-invocations
 GET    /v1/projects/{project_id}/dispatches
@@ -513,10 +515,18 @@ reconstructs the Seed, and stores no raw project source content.
 
 For a recorded current Seed, Universe can return a read-only
 `universe.project-seed-asset-proposal.v1` containing the exact five target
-paths, encoded bytes, and per-asset SHA-256 values. It is a preparation aid
-for the Project Master, not a project mutation API: the Project Master still
-requires exact user approval, receipt-aware Project Runtime state writes, and
-post-write manifest validation before `.ai/universe/` exists or changes.
+paths, encoded bytes, and per-asset SHA-256 values. The apply route accepts only
+`APPROVED` plus that current proposal ID and digest. Universe forwards the
+unchanged proposal and a Host-observed approval reference to the resident
+Project Master; Universe never writes the Project itself.
+
+The Project Host lazily starts the installed executable Runtime, creates one
+exact Execution Binding per changed asset, obtains and consumes one Guard
+receipt through `mutation-gateway apply-file`, writes `manifest.json` last, and
+then validates every published digest. A repeated apply with identical bytes
+is read-only. The installed Project must already expose a real
+`.ai/universe/` Runtime-state root; the Host does not create that directory
+through raw filesystem access.
 
 Building a Projection returns the current node/edge/document map, structural
 gaps, and user-selectable predicted paths. The UI places component documents

@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from project_master_bridge import MASTER_BRIDGE_ENVELOPE_SCHEMA  # noqa: E402
+from project_seed_apply import build_project_seed_asset_approval  # noqa: E402
+from project_seed_assets import build_project_seed_asset_proposal  # noqa: E402
 from project_master_host import (  # noqa: E402
     CodexProjectMasterRuntime,
     GrokProjectMasterRuntime,
@@ -51,6 +53,7 @@ class FakeSurfaceObserver:
         self.fail = fail
         self.messages: list[dict[str, Any]] = []
         self.prepare_count = 0
+        self.mutations: list[dict[str, Any]] = []
 
     def prepare(self) -> Mapping[str, Any]:
         self.prepare_count += 1
@@ -77,6 +80,31 @@ class FakeSurfaceObserver:
             },
         }
 
+    def apply_file(
+        self,
+        *,
+        target: Path,
+        content: bytes,
+        operation: str,
+        boundary: str,
+        approval_evidence_ref: str,
+        request_ref: str,
+    ) -> Mapping[str, Any]:
+        self.mutations.append(
+            {
+                "target": target,
+                "operation": operation,
+                "boundary": boundary,
+                "approval_evidence_ref": approval_evidence_ref,
+                "request_ref": request_ref,
+            }
+        )
+        target.write_bytes(content)
+        return {
+            "status": "FILE_MUTATION_APPLIED",
+            "receipt_id": f"permit-{len(self.mutations)}",
+        }
+
 
 class ProjectMasterHostTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -99,6 +127,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "bridge-token",
             ".ai/master/inbox",
             worker,
+            self.surface_observer,
         )
         worker.start()
         try:
@@ -123,6 +152,47 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(self.replies))
         self.assertEqual("Project Master answer", self.replies[0]["body"])
         self.assertEqual("COMPLETE", self.state.state(first["message_id"]))
+
+    def test_live_bridge_applies_seed_assets_through_coordinator_gateway(self) -> None:
+        worker = self._worker()
+        host = LiveProjectMasterBridgeHost(
+            self.root,
+            "bridge-token",
+            ".ai/master/inbox",
+            worker,
+            self.surface_observer,
+        )
+        (self.root / ".ai" / "universe").mkdir()
+        proposal = build_project_seed_asset_proposal(
+            {
+                "project_id": "GCS",
+                "seed_id": "seed-host-001",
+                "seed_digest": "a" * 64,
+                "source": {"kind": "TEST", "ref": "test://seed"},
+                "project": {"name": "GCS"},
+                "nodes": [],
+                "edges": [],
+                "implementation": {"nodes": []},
+                "implementation_bindings": [],
+                "documents": [],
+            }
+        )
+        approval = build_project_seed_asset_approval(
+            project_id="GCS",
+            proposal=proposal,
+            evidence_ref="universe://approval/seed-host-001",
+        )
+
+        receipt = host.apply_seed_assets(
+            {
+                "project_id": "GCS",
+                "proposal": proposal,
+                "approval": approval,
+            }
+        )
+
+        self.assertEqual("PROJECT_SEED_ASSETS_APPLIED", receipt["status"])
+        self.assertEqual(5, len(self.surface_observer.mutations))
 
     def test_pending_message_is_recovered_after_host_restart(self) -> None:
         self.assertTrue(self.state.register(self._envelope()))

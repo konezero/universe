@@ -80,6 +80,11 @@ class ProjectMasterBridgeHost:
             "recorded_at": utc_now(),
         }
 
+    def apply_seed_assets(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError(
+            "PROJECT_SEED_ASSET_MUTATION_GATEWAY_UNAVAILABLE"
+        )
+
     def _inbox(self) -> Path:
         root = self.project_root.expanduser().resolve(strict=True)
         if not root.is_dir():
@@ -118,7 +123,14 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
     server: ProjectMasterBridgeHttpServer
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/v1/project-master/messages":
+        routes = {
+            "/v1/project-master/messages": self.server.bridge_host.record,
+            (
+                "/v1/project-master/seed-assets/apply"
+            ): self.server.bridge_host.apply_seed_assets,
+        }
+        operation = routes.get(self.path)
+        if operation is None:
             self._send_error(HTTPStatus.NOT_FOUND, "ROUTE_NOT_FOUND")
             return
         expected = f"Bearer {self.server.bridge_host.token}"
@@ -131,7 +143,7 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             if length <= 0 or length > MAX_BODY_BYTES:
                 raise ProjectMasterBridgeError("MASTER_BRIDGE_BODY_INVALID")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            receipt = self.server.bridge_host.record(payload)
+            receipt = operation(payload)
         except (
             UnicodeDecodeError,
             json.JSONDecodeError,
@@ -141,7 +153,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.BAD_REQUEST, str(error))
             return
         status = (
-            HTTPStatus.CREATED if receipt["status"] == "RECORDED" else HTTPStatus.OK
+            HTTPStatus.CREATED
+            if receipt["status"] in {"RECORDED", "PROJECT_SEED_ASSETS_APPLIED"}
+            else HTTPStatus.OK
         )
         self._send_json(status, receipt)
 

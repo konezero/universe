@@ -49,6 +49,7 @@ from project_seed_assets import (
     load_project_seed_assets,
     project_seed_template,
 )
+from project_seed_apply import build_project_seed_asset_approval
 from project_master_host import (
     ProjectMasterHostError,
     ResidentProjectMasterHostManager,
@@ -1632,6 +1633,27 @@ def normalize_fresh_project_refinement_adoption_request(value: Any) -> dict[str,
     if "user_notes" in request:
         normalized["user_notes"] = _required_text(request["user_notes"], "user_notes")
     return normalized
+
+
+def normalize_project_seed_asset_apply_request(value: Any) -> dict[str, str]:
+    request = _exact_object_fields(
+        value,
+        field="project_seed_asset_apply_request",
+        required=frozenset({"approval", "proposal_id", "proposal_digest"}),
+    )
+    if request["approval"] != "APPROVED":
+        raise UniverseError(
+            "PROJECT_SEED_ASSET_APPROVAL_REQUIRED",
+            "approval must be APPROVED before Project Host application",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        "approval": "APPROVED",
+        "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
+        "proposal_digest": _sha256(
+            request["proposal_digest"], "proposal_digest"
+        ),
+    }
 
 
 def normalize_master_handoff_proposal_request(value: Any) -> dict[str, Any]:
@@ -8247,6 +8269,63 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
         return self.project_master_hosts.ensure(project)
 
+    def apply_project_seed_assets(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = normalize_project_seed_asset_apply_request(value)
+        proposal = self.store.prepare_project_seed_asset_proposal(project_id)
+        if (
+            request["proposal_id"] != proposal["proposal_id"]
+            or request["proposal_digest"] != proposal["proposal_digest"]
+        ):
+            raise UniverseError(
+                "PROJECT_SEED_ASSET_APPROVAL_STALE",
+                "approval does not match the current Project Seed asset proposal",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            self.ensure_project_master(project_id)
+            bridge = self.store.get_master_bridge(project_id)
+            approval_evidence_ref = (
+                "universe://projects/"
+                + quote(project_id, safe="")
+                + "/seed-asset-proposals/"
+                + quote(proposal["proposal_id"], safe="")
+                + "/approvals/"
+                + _json_sha256(request)[:24]
+            )
+            approval = build_project_seed_asset_approval(
+                project_id=project_id,
+                proposal=proposal,
+                evidence_ref=approval_evidence_ref,
+            )
+            delivery = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+                timeout_seconds=60,
+            ).apply_seed_assets(
+                bridge=bridge,
+                proposal=proposal,
+                approval=approval,
+            )
+        except (DispatchError, OSError, ProjectMasterHostError) as error:
+            raise UniverseError(
+                "PROJECT_SEED_ASSET_APPLICATION_BLOCKED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_SEED_ASSET_APPLICATION_DELIVERED",
+            "project_id": project_id,
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "approval": approval,
+            "delivery": delivery,
+        }
+
     def provider_settings(self) -> dict[str, Any]:
         settings = self.store.list_provider_settings()
         capabilities = {
@@ -9303,6 +9382,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.set_project_provider_setting(parts[0], body),
                 )
                 return
+            if (
+                parts is not None
+                and parts[1] == "/seed-asset-proposal/apply"
+            ):
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.apply_project_seed_assets(parts[0], body),
+                )
+                return
             if parts is not None and parts[1] == "/release-proposals":
                 proposal, created = self.server.store.create_project_release_proposal(
                     parts[0],
@@ -9833,6 +9921,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/events",
             "/skill-observations",
             "/skill-observation-queue",
+            "/seed-asset-proposal/apply",
             "/seed-asset-proposal",
             "/seed",
             "/sync",

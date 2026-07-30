@@ -309,8 +309,9 @@ relations remain distinct from observed evidence. Career adoption is separate.
    `HANDOFF_APPEND` integration.
 6. Hand selected Project Seeds and Skill Plans to Project Masters through the
    existing handoff and Bridge boundaries. Exact-byte Seed asset proposal
-   preparation is implemented; receipt-aware Project Master application is
-   the next Project Runtime integration.
+   preparation and receipt-aware Project Master application are implemented.
+   Release DB `OS_INSTALL`/`OS_UPDATE` application and selected Skill Plan
+   application remain separate Project Host integrations.
 7. Add Experience and causal comparison only after observed Skill data exists.
 8. Add display-language localization for the Universe UI. Localization is a
    presentation-layer follow-up: canonical Mode, Role, state, schema, provider,

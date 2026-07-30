@@ -2878,6 +2878,93 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.assertEqual(before, after)
 
+    def test_seed_asset_apply_routes_exact_approval_to_project_master(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request(
+            "POST", "/v1/projects/GCS/seed", self.project_seed(), self.token
+        )
+        _, prepared = self.request(
+            "GET", "/v1/projects/GCS/seed-asset-proposal", token=self.token
+        )
+        proposal = prepared["proposal"]
+        bridge = {
+            "project_id": "GCS",
+            "endpoint": "http://127.0.0.1:19091",
+            "credential_env": "UNIVERSE_TEST_MASTER_TOKEN",
+        }
+        host_receipt = {
+            "schema": "universe.project-master-seed-apply-delivery-receipt.v1",
+            "status": "DELIVERED",
+            "project_id": "GCS",
+            "proposal_id": proposal["proposal_id"],
+            "host_response": {
+                "status": "PROJECT_SEED_ASSETS_APPLIED",
+                "manifest_ref": ".ai/universe/manifest.json",
+            },
+        }
+
+        with (
+            patch.object(
+                self.server,
+                "ensure_project_master",
+                return_value={"status": "EXISTING_BRIDGE"},
+            ),
+            patch.object(
+                self.server.store,
+                "get_master_bridge",
+                return_value=bridge,
+            ),
+            patch(
+                "universe_server.HttpProjectMasterBridge.apply_seed_assets",
+                return_value=host_receipt,
+            ) as apply_seed_assets,
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/seed-asset-proposal/apply",
+                {
+                    "approval": "APPROVED",
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                },
+                self.token,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "PROJECT_SEED_ASSET_APPLICATION_DELIVERED", result["status"]
+        )
+        self.assertEqual("APPROVED", result["approval"]["status"])
+        self.assertEqual(proposal["proposal_id"], result["approval"]["proposal_id"])
+        self.assertTrue(
+            result["approval"]["evidence_ref"].startswith(
+                "universe://projects/GCS/seed-asset-proposals/"
+            )
+        )
+        apply_seed_assets.assert_called_once()
+
+    def test_seed_asset_apply_rejects_stale_proposal_before_host_call(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request(
+            "POST", "/v1/projects/GCS/seed", self.project_seed(), self.token
+        )
+
+        with patch.object(self.server, "ensure_project_master") as ensure:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/seed-asset-proposal/apply",
+                {
+                    "approval": "APPROVED",
+                    "proposal_id": "seed_assets_stale",
+                    "proposal_digest": "f" * 64,
+                },
+                self.token,
+            )
+
+        self.assertEqual(409, status)
+        self.assertEqual("PROJECT_SEED_ASSET_APPROVAL_STALE", result["error_code"])
+        ensure.assert_not_called()
+
     def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(
         self,
     ) -> None:
