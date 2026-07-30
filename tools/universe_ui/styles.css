@@ -481,6 +481,48 @@ button {
   white-space: pre-wrap;
 }
 
+.permission-request {
+  border: 1px solid rgba(255, 184, 82, 0.55);
+  border-left: 3px solid var(--amber);
+  background: rgba(42, 27, 8, 0.72);
+}
+
+.permission-request .permission-title {
+  max-height: 76px;
+  overflow: auto;
+  color: #fff4d8;
+  font-family: var(--mono);
+}
+
+.permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.permission-option {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid rgba(126, 162, 213, 0.42);
+  border-radius: 5px;
+  background: rgba(14, 21, 34, 0.94);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.permission-option.allow_once,
+.permission-option.allow_always {
+  border-color: rgba(73, 214, 180, 0.68);
+  color: #adffea;
+}
+
+.permission-option.reject_once,
+.permission-option.reject_always {
+  border-color: rgba(255, 117, 117, 0.58);
+  color: #ffc2c2;
+}
+
 .graph-legend {
   display: none;
   display: flex;

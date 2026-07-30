@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -323,6 +323,57 @@ def post_master_stream_event(
         raise ProjectMasterBridgeError("UNIVERSE_STREAM_UNAVAILABLE") from error
     if not 200 <= status_code < 300 or not isinstance(payload, dict):
         raise ProjectMasterBridgeError("UNIVERSE_STREAM_REJECTED")
+    return payload
+
+
+def post_agent_permission_request(
+    *,
+    universe_endpoint: str,
+    project_id: str,
+    bridge_id: str,
+    in_reply_to: str,
+    permission: Mapping[str, Any],
+    bridge_token: str,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    origin = loopback_origin(universe_endpoint, label="universe")
+    normalized_project = _project_id(project_id)
+    if not isinstance(permission, Mapping):
+        raise ProjectMasterBridgeError("AGENT_PERMISSION_REQUEST_INVALID")
+    request_payload = {
+        "bridge_id": _text(bridge_id, "bridge_id"),
+        "in_reply_to": _text(in_reply_to, "in_reply_to"),
+        "permission": dict(permission),
+    }
+    request = Request(
+        (
+            f"{origin}/v1/projects/{quote(normalized_project, safe='')}"
+            "/master-bridge/permissions"
+        ),
+        data=json.dumps(
+            request_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Universe-Bridge-Token": _text(bridge_token, "bridge_token"),
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
+            payload = json.loads(response.read().decode("utf-8"))
+            status_code = response.status
+    except HTTPError as error:
+        raise ProjectMasterBridgeError(
+            f"UNIVERSE_PERMISSION_HTTP_{error.code}"
+        ) from error
+    except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProjectMasterBridgeError("UNIVERSE_PERMISSION_UNAVAILABLE") from error
+    if not 200 <= status_code < 300 or not isinstance(payload, dict):
+        raise ProjectMasterBridgeError("UNIVERSE_PERMISSION_REJECTED")
     return payload
 
 

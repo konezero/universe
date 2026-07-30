@@ -31,6 +31,12 @@ from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from core_release import CoreReleaseError, verify_release
+from agent_session_gateway import (
+    PERMISSION_DECISION_SCHEMA,
+    PERMISSION_REQUEST_SCHEMA,
+    AgentSessionError,
+    normalize_permission_request,
+)
 from host_profile import HostProfileError, HostProfileStore
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
 from universe_dispatch import (
@@ -2430,6 +2436,48 @@ def normalize_master_bridge_stream(project_id: str, value: Any) -> dict[str, Any
     }
 
 
+def normalize_master_bridge_permission(
+    project_id: str,
+    value: Any,
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_bridge_permission",
+        required=frozenset({"bridge_id", "in_reply_to", "permission"}),
+    )
+    try:
+        permission = normalize_permission_request(request["permission"])
+    except AgentSessionError as error:
+        raise UniverseError(
+            "AGENT_PERMISSION_REQUEST_INVALID",
+            str(error),
+        ) from error
+    return {
+        "project_id": _project_id(project_id),
+        "bridge_id": _required_text(
+            request["bridge_id"], "master_bridge_permission.bridge_id"
+        ),
+        "in_reply_to": _required_text(
+            request["in_reply_to"], "master_bridge_permission.in_reply_to"
+        ),
+        "permission": permission,
+    }
+
+
+def normalize_permission_decision(value: Any) -> dict[str, str]:
+    request = _exact_object_fields(
+        value,
+        field="agent_permission_decision",
+        required=frozenset({"option_id"}),
+    )
+    return {
+        "schema": PERMISSION_DECISION_SCHEMA,
+        "option_id": _required_text(
+            request["option_id"], "agent_permission_decision.option_id"
+        ),
+    }
+
+
 def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
     degree = {node["node_id"]: 0 for node in seed["nodes"]}
     missing_connections: list[dict[str, Any]] = []
@@ -3390,6 +3438,26 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_room_message_project_time
                 ON project_room_message(project_id, created_at, message_id);
+
+                CREATE TABLE IF NOT EXISTS agent_permission_request (
+                    request_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    in_reply_to TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    tool_call_json TEXT NOT NULL,
+                    options_json TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('PENDING', 'RESOLVED', 'CANCELLED')),
+                    selected_option_id TEXT,
+                    requested_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS agent_permission_project_time
+                ON agent_permission_request(project_id, requested_at, request_id);
 
                 CREATE TABLE IF NOT EXISTS conductor_room_message (
                     message_id TEXT PRIMARY KEY,
@@ -6839,6 +6907,206 @@ class UniverseStore:
             messages.append(message)
         return messages
 
+    def record_agent_permission(
+        self,
+        project_id: str,
+        in_reply_to: str,
+        permission: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            request = normalize_permission_request(permission)
+        except AgentSessionError as error:
+            raise UniverseError(
+                "AGENT_PERMISSION_REQUEST_INVALID",
+                str(error),
+            ) from error
+        with self._connection() as connection:
+            parent = connection.execute(
+                """
+                SELECT 1 FROM project_room_message
+                WHERE project_id = ? AND message_id = ?
+                """,
+                (project["project_id"], in_reply_to),
+            ).fetchone()
+            if parent is None:
+                raise UniverseError(
+                    "ROOM_MESSAGE_NOT_FOUND",
+                    "permission request target does not exist in this project room",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = connection.execute(
+                """
+                SELECT project_id, in_reply_to, provider, session_id,
+                       tool_call_json, options_json, state,
+                       selected_option_id, requested_at, resolved_at
+                FROM agent_permission_request
+                WHERE request_id = ?
+                """,
+                (request["request_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = self._agent_permission_row(existing, request["request_id"])
+                comparable = {
+                    key: current[key]
+                    for key in (
+                        "project_id",
+                        "in_reply_to",
+                        "provider",
+                        "session_id",
+                        "tool_call",
+                        "options",
+                    )
+                }
+                expected = {
+                    "project_id": project["project_id"],
+                    "in_reply_to": in_reply_to,
+                    "provider": request["provider"],
+                    "session_id": request["session_id"],
+                    "tool_call": request["tool_call"],
+                    "options": request["options"],
+                }
+                if comparable != expected:
+                    raise UniverseError(
+                        "AGENT_PERMISSION_REQUEST_CONFLICT",
+                        "permission request id is already bound to another request",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO agent_permission_request(
+                    request_id, project_id, in_reply_to, provider, session_id,
+                    tool_call_json, options_json, state, selected_option_id,
+                    requested_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, ?, NULL)
+                """,
+                (
+                    request["request_id"],
+                    project["project_id"],
+                    in_reply_to,
+                    request["provider"],
+                    request["session_id"],
+                    _canonical_json(request["tool_call"]),
+                    _canonical_json(request["options"]),
+                    now,
+                ),
+            )
+        return self.get_agent_permission(
+            project["project_id"], request["request_id"]
+        ), True
+
+    def get_agent_permission(
+        self,
+        project_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT project_id, in_reply_to, provider, session_id,
+                       tool_call_json, options_json, state,
+                       selected_option_id, requested_at, resolved_at
+                FROM agent_permission_request
+                WHERE project_id = ? AND request_id = ?
+                """,
+                (project["project_id"], _required_text(request_id, "request_id")),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "AGENT_PERMISSION_NOT_FOUND",
+                "agent permission request does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._agent_permission_row(row, request_id)
+
+    def list_agent_permissions(
+        self,
+        project_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT request_id, project_id, in_reply_to, provider, session_id,
+                       tool_call_json, options_json, state,
+                       selected_option_id, requested_at, resolved_at
+                FROM agent_permission_request
+                WHERE project_id = ?
+                ORDER BY requested_at, request_id
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [self._agent_permission_row(row, row["request_id"]) for row in rows]
+
+    def resolve_agent_permission(
+        self,
+        project_id: str,
+        request_id: str,
+        option_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        current = self.get_agent_permission(project_id, request_id)
+        normalized_option = _required_text(option_id, "option_id")
+        if normalized_option not in {
+            option["optionId"] for option in current["options"]
+        }:
+            raise UniverseError(
+                "AGENT_PERMISSION_OPTION_UNKNOWN",
+                "selected option is not offered by this request",
+                HTTPStatus.CONFLICT,
+            )
+        if current["state"] != "PENDING":
+            if current["selected_option_id"] != normalized_option:
+                raise UniverseError(
+                    "AGENT_PERMISSION_ALREADY_RESOLVED",
+                    "permission request already has another decision",
+                    HTTPStatus.CONFLICT,
+                )
+            return current, False
+        resolved_at = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_permission_request
+                SET state = 'RESOLVED', selected_option_id = ?, resolved_at = ?
+                WHERE project_id = ? AND request_id = ? AND state = 'PENDING'
+                """,
+                (
+                    normalized_option,
+                    resolved_at,
+                    _project_id(project_id),
+                    _required_text(request_id, "request_id"),
+                ),
+            )
+        if cursor.rowcount != 1:
+            return self.get_agent_permission(project_id, request_id), False
+        return self.get_agent_permission(project_id, request_id), True
+
+    @staticmethod
+    def _agent_permission_row(
+        row: sqlite3.Row,
+        request_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema": PERMISSION_REQUEST_SCHEMA,
+            "request_id": request_id,
+            "project_id": row["project_id"],
+            "in_reply_to": row["in_reply_to"],
+            "provider": row["provider"],
+            "session_id": row["session_id"],
+            "tool_call": json.loads(row["tool_call_json"]),
+            "options": json.loads(row["options_json"]),
+            "state": row["state"],
+            "selected_option_id": row["selected_option_id"],
+            "requested_at": row["requested_at"],
+            "resolved_at": row["resolved_at"],
+        }
+
     def _update_room_delivery(
         self,
         message: dict[str, Any],
@@ -8967,8 +9235,58 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             {
                 "type": "ROOM_CHANGED",
                 "messages": self.store.list_room_messages(project_id),
+                "permissions": self.store.list_agent_permissions(project_id),
             },
         )
+
+    def publish_agent_permission(
+        self,
+        project_id: str,
+        permission: Mapping[str, Any],
+    ) -> None:
+        self.project_room_events.publish(
+            project_id,
+            {
+                "type": "AGENT_PERMISSION",
+                "permission": dict(permission),
+            },
+        )
+
+    def resolve_agent_permission(
+        self,
+        project_id: str,
+        request_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        decision = normalize_permission_decision(value)
+        current = self.store.get_agent_permission(project_id, request_id)
+        if current["state"] != "PENDING":
+            if current["selected_option_id"] == decision["option_id"]:
+                return current, False
+            raise UniverseError(
+                "AGENT_PERMISSION_ALREADY_RESOLVED",
+                "permission request already has another decision",
+                HTTPStatus.CONFLICT,
+            )
+        if self.project_master_hosts is None or not (
+            self.project_master_hosts.resolve_permission(
+                project_id,
+                request_id,
+                decision["option_id"],
+            )
+        ):
+            raise UniverseError(
+                "AGENT_PERMISSION_SESSION_UNAVAILABLE",
+                "resident agent session cannot accept this permission decision",
+                HTTPStatus.CONFLICT,
+            )
+        permission, changed = self.store.resolve_agent_permission(
+            project_id,
+            request_id,
+            decision["option_id"],
+        )
+        self.publish_agent_permission(project_id, permission)
+        return permission, changed
 
     def _conductor_worker_loop(self) -> None:
         while not self._conductor_stop.is_set():
@@ -9369,6 +9687,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             if suffix == "/room/stream":
                 self._stream_project_room(project_id)
+                return
+            if suffix == "/agent-session/permissions":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "AGENT_PERMISSIONS_COLLECTED",
+                        "project_id": project_id,
+                        "permissions": self.server.store.list_agent_permissions(
+                            project_id
+                        ),
+                    },
+                )
                 return
             if suffix == "/skill-observations":
                 self._send(
@@ -9963,6 +10294,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     result,
                 )
                 return
+            permission_parts = self._agent_permission_path(path)
+            if permission_parts is not None:
+                permission, changed = self.server.resolve_agent_permission(
+                    permission_parts[0],
+                    permission_parts[1],
+                    body,
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "AGENT_PERMISSION_RESOLVED"
+                            if changed
+                            else "AGENT_PERMISSION_ALREADY_RESOLVED"
+                        ),
+                        "permission": permission,
+                    },
+                )
+                return
             parts = self._project_path(path)
             if parts is not None and parts[1] == "/provider-setting":
                 self._send(
@@ -10101,6 +10452,33 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROJECT_MASTER_STREAM_EVENT_ACCEPTED",
                         "event_id": published["event_id"],
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/master-bridge/permissions":
+                credential = self.headers.get("X-Universe-Bridge-Token")
+                request = normalize_master_bridge_permission(parts[0], body)
+                self.server.store.validate_master_bridge_credential(
+                    parts[0],
+                    request["bridge_id"],
+                    credential,
+                )
+                permission, created = self.server.store.record_agent_permission(
+                    parts[0],
+                    request["in_reply_to"],
+                    request["permission"],
+                )
+                self.server.publish_agent_permission(parts[0], permission)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "AGENT_PERMISSION_REQUESTED"
+                            if created
+                            else "AGENT_PERMISSION_ALREADY_REQUESTED"
+                        ),
+                        "permission": permission,
                     },
                 )
                 return
@@ -10489,9 +10867,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return None
         remainder = path[len(prefix) :]
         for suffix in (
+            "/master-bridge/permissions",
             "/master-bridge/stream",
             "/master-bridge/replies",
             "/master-bridge",
+            "/agent-session/permissions",
             "/provider-setting",
             "/room/stream",
             "/room/messages",
@@ -10521,6 +10901,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if remainder.endswith(suffix):
                 return unquote(remainder[: -len(suffix)]), suffix
         return unquote(remainder), ""
+
+    @staticmethod
+    def _agent_permission_path(path: str) -> tuple[str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/agent-session/permissions/"
+        suffix = "/decision"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, request_path = remainder.split(marker, 1)
+        request_id = request_path[: -len(suffix)]
+        if not project_id or "/" in project_id or not request_id or "/" in request_id:
+            return None
+        return unquote(project_id), unquote(request_id)
 
     @staticmethod
     def _release_path(path: str) -> str | None:
@@ -10615,6 +11013,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "payload": {
                         "type": "SNAPSHOT",
                         "messages": self.server.store.list_room_messages(project_id),
+                        "permissions": self.server.store.list_agent_permissions(
+                            project_id
+                        ),
                     },
                 },
             )

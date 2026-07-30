@@ -222,6 +222,8 @@ class UniverseRuntimeHost:
         }
         if isinstance(response.get("reason"), str) and response["reason"]:
             result["reason"] = response["reason"]
+        if response.get("cli_auto_approve") in {"ON", "OFF", "UNKNOWN"}:
+            result["cli_auto_approve"] = response["cli_auto_approve"]
         return result
 
     def invoke_read_only(self, value: Mapping[str, Any]) -> dict[str, Any]:

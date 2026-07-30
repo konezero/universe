@@ -4,7 +4,6 @@ import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import tempfile
 import time
@@ -13,6 +12,13 @@ from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from agent_session_gateway import (
+    AgentSessionError,
+    CodexAppServerSession,
+    GrokAcpSession,
+    UniverseAcpGateway,
+    cli_auto_approve_status,
+)
 from host_profile import resolve_host_tool
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
@@ -71,13 +77,6 @@ def _structured_text(value: Any, field: str) -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _runtime_tmp() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-    root = Path(base) / "Universe" / "runtime-tmp"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def _loopback_endpoint(value: Any) -> str:
@@ -212,6 +211,7 @@ class RuntimeWorkerDispatcher:
         return {
             "status": "AVAILABLE",
             "provider": normalized,
+            "cli_auto_approve": cli_auto_approve_status(normalized),
             "capability_evidence_ref": (
                 f"{normalized.lower()}-cli:{encoded_path}:{version}"
             ),
@@ -512,125 +512,46 @@ class RuntimeWorkerDispatcher:
                 "WORKER_ADAPTER",
                 "GROK_RUNTIME_PROFILE_INVALID",
             )
-        context_pack = _structured_text(request.get("context_pack"), "context_pack")
-        output_contract = _structured_text(
-            request.get("output_contract"), "output_contract"
-        )
-        result_mode = str(request.get("result_mode", "REDACTED")).upper()
-        system_prompt = (
-            "You are a bounded Task Frame Runtime provider. You receive all "
-            "usable context in the supplied Context Pack. Do not inspect local "
-            "files, create files, modify files, invoke subagents, or claim "
-            "authority. Source mutation is Host-gateway-only. Return only the "
-            "requested result content."
-            if runtime_profile == "TASK_FRAME_RUNTIME"
-            else "You are a bounded read-only Task Frame worker. You receive all "
-            "usable context in the supplied Context Pack. Do not inspect local "
-            "files, execute commands, use network tools, create files, modify "
-            "files, invoke subagents, or claim authority. Return only the "
-            "requested result content."
-        )
-        format_instruction = (
-            "\nReturn exactly one JSON object matching the Output Contract. "
-            "Do not use Markdown fences or explanatory text."
-            if result_mode == "STRUCTURED_JSON"
-            else ""
-        )
-        prompt = (
-            f"Task Frame ID: {_required_text(request.get('task_frame_id'), 'task_frame_id')}\n"
-            f"Turn ID: {_required_text(request.get('turn_id'), 'turn_id')}\n\n"
-            f"Context Pack:\n{context_pack}\n\n"
-            f"Output Contract:\n{output_contract}{format_instruction}"
-        )
-        prompt_path = _runtime_tmp() / f"grok-prompt-{uuid4().hex}.txt"
-        prompt_path.write_text(prompt, encoding="utf-8")
+        session_ids: list[str] = []
         try:
-            arguments = [
-                "--no-auto-update",
-                "--no-subagents",
-                "--no-memory",
-                "--disable-web-search",
-                "--permission-mode",
-                "plan",
-                "--sandbox",
-                "read-only",
-                "--max-turns",
-                str(request.get("max_turns", 3)),
-                "--cwd",
-                tempfile.gettempdir(),
-                "--system-prompt-override",
-                system_prompt,
-                "--prompt-file",
-                str(prompt_path),
-            ]
-            if result_mode == "STRUCTURED_JSON":
-                output = _mapping(request.get("output_contract"), "output_contract")
-                schema = output.get("json_schema")
-                if not isinstance(schema, Mapping):
-                    raise WorkerDispatchError(
-                        "WORKER_PROVIDER_FAILED",
-                        "WORKER_ADAPTER",
-                        "OUTPUT_JSON_SCHEMA_REQUIRED",
-                    )
-                arguments.extend(
-                    [
-                        "--json-schema",
-                        json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
-                    ]
-                )
-            else:
-                arguments.extend(["--output-format", "json"])
-            result = self.native_runner(
-                NativeCliRequest(
+            gateway = UniverseAcpGateway(
+                GrokAcpSession(
                     executable=executable,
-                    arguments=tuple(arguments),
                     cwd=Path(tempfile.gettempdir()),
-                    timeout_seconds=180,
                     environment=environment,
+                    system_prompt=self._system_prompt(runtime_profile),
+                    session_id=None,
+                    permission_requester=self._reject_task_frame_permission,
+                    session_observer=session_ids.append,
                 )
             )
-        finally:
-            prompt_path.unlink(missing_ok=True)
-        if result.status != "COMPLETED":
+            try:
+                text = gateway.reply_stream(
+                    self._worker_prompt(request),
+                    lambda _delta: None,
+                )
+                session_ref = gateway.session_ref
+            finally:
+                gateway.close()
+        except AgentSessionError as error:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_FAILED",
                 "WORKER_ADAPTER",
-                f"GROK_CLI_{result.status}",
-            )
-        try:
-            response = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise WorkerDispatchError(
-                "WORKER_PROVIDER_FAILED",
-                "WORKER_ADAPTER",
-                "GROK_RESULT_JSON_INVALID",
+                f"GROK_ACP_{error}",
             ) from error
-        if not isinstance(response, Mapping):
-            raise WorkerDispatchError(
-                "WORKER_PROVIDER_FAILED",
-                "WORKER_ADAPTER",
-                "GROK_RESULT_OBJECT_REQUIRED",
-            )
-        structured = response.get("structuredOutput")
-        text = (
-            _structured_text(structured, "response.structuredOutput")
-            if result_mode == "STRUCTURED_JSON" and structured is not None
-            else _required_text(response.get("text"), "response.text")
-        )
-        session_id = _required_text(response.get("sessionId"), "response.sessionId")
-        request_id = _required_text(response.get("requestId"), "response.requestId")
+        session_id = session_ids[-1] if session_ids else session_ref.split(":", 1)[-1]
         return {
             "schema": "universe.grok-worker-result.v1",
-            "status": (
-                "COMPLETED" if response.get("stopReason") == "EndTurn" else "UNKNOWN"
-            ),
-            "runtime_provider": "GROK_CLI",
+            "status": "COMPLETED",
+            "runtime_provider": "GROK_ACP",
             "runtime_profile": runtime_profile,
             "source_mutation": "HOST_GATEWAY_ONLY",
-            "worker_id": f"grok-cli:{session_id}",
+            "worker_id": f"grok-acp:{session_id}",
             "worker_run_ref": request["worker_run_ref"],
-            "result_receipt_ref": f"grok-cli:{session_id}:{request_id}",
-            "result": {"text": text, "stop_reason": response.get("stopReason")},
+            "result_receipt_ref": (
+                f"grok-acp:{session_id}:{request['worker_run_ref']}"
+            ),
+            "result": {"text": text, "stop_reason": "COMPLETED"},
             "sandbox_profile": "read-only",
             "permission_mode": "plan",
             "repository_write_scope": "NONE",
@@ -644,6 +565,69 @@ class RuntimeWorkerDispatcher:
                 "WORKER_ADAPTER",
                 "CODEX_CLI_UNAVAILABLE",
             )
+        session_ids: list[str] = []
+        try:
+            gateway = UniverseAcpGateway(
+                CodexAppServerSession(
+                    executable=executable,
+                    cwd=Path(tempfile.gettempdir()),
+                    environment=environment,
+                    system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
+                    session_id=None,
+                    permission_requester=self._reject_task_frame_permission,
+                    session_observer=session_ids.append,
+                )
+            )
+            try:
+                text = gateway.reply_stream(
+                    self._worker_prompt(request),
+                    lambda _delta: None,
+                )
+                session_ref = gateway.session_ref
+            finally:
+                gateway.close()
+        except AgentSessionError as error:
+            raise WorkerDispatchError(
+                "WORKER_PROVIDER_FAILED",
+                "WORKER_ADAPTER",
+                f"CODEX_APP_SERVER_{error}",
+            ) from error
+        session_id = session_ids[-1] if session_ids else session_ref.split(":", 1)[-1]
+        return {
+            "schema": "universe.codex-worker-result.v1",
+            "status": "COMPLETED",
+            "runtime_provider": "CODEX_APP_SERVER_ACP_ADAPTER",
+            "runtime_profile": "TASK_FRAME_RUNTIME",
+            "source_mutation": "HOST_GATEWAY_ONLY",
+            "worker_id": f"codex-app-server:{session_id}",
+            "worker_run_ref": request["worker_run_ref"],
+            "result_receipt_ref": (
+                f"codex-app-server:{session_id}:{request['worker_run_ref']}"
+            ),
+            "result": {"text": text, "stop_reason": "COMPLETED"},
+            "repository_write_scope": "NONE",
+        }
+
+    @staticmethod
+    def _system_prompt(runtime_profile: str) -> str:
+        if runtime_profile == "TASK_FRAME_RUNTIME":
+            return (
+                "You are a bounded Task Frame Runtime provider. You receive all "
+                "usable context in the supplied Context Pack. Do not inspect local "
+                "files, create files, modify files, invoke subagents, or claim "
+                "authority. Source mutation is Host-gateway-only. Return only the "
+                "requested result content."
+            )
+        return (
+            "You are a bounded read-only Task Frame worker. You receive all "
+            "usable context in the supplied Context Pack. Do not inspect local "
+            "files, execute commands, use network tools, create files, modify "
+            "files, invoke subagents, or claim authority. Return only the "
+            "requested result content."
+        )
+
+    @staticmethod
+    def _worker_prompt(request: Mapping[str, Any]) -> str:
         context_pack = _structured_text(request.get("context_pack"), "context_pack")
         output_contract = _structured_text(
             request.get("output_contract"), "output_contract"
@@ -654,75 +638,21 @@ class RuntimeWorkerDispatcher:
             if str(request.get("result_mode", "REDACTED")).upper() == "STRUCTURED_JSON"
             else ""
         )
-        prompt = (
-            f"Task Frame ID: {_required_text(request.get('task_frame_id'), 'task_frame_id')}\n"
+        return (
+            f"Task Frame ID: "
+            f"{_required_text(request.get('task_frame_id'), 'task_frame_id')}\n"
             f"Turn ID: {_required_text(request.get('turn_id'), 'turn_id')}\n\n"
             f"Context Pack:\n{context_pack}\n\n"
             f"Output Contract:\n{output_contract}{format_instruction}"
         )
-        result = self.native_runner(
-            NativeCliRequest(
-                executable=executable,
-                arguments=(
-                    "exec",
-                    "--json",
-                    "--sandbox",
-                    "read-only",
-                    "--skip-git-repo-check",
-                    "-C",
-                    tempfile.gettempdir(),
-                    prompt,
-                ),
-                cwd=Path(tempfile.gettempdir()),
-                timeout_seconds=180,
-                environment=environment,
-            )
-        )
-        if result.status != "COMPLETED":
-            raise WorkerDispatchError(
-                "WORKER_PROVIDER_FAILED",
-                "WORKER_ADAPTER",
-                f"CODEX_CLI_{result.status}",
-            )
-        messages: list[str] = []
-        for line in result.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, Mapping):
-                continue
-            item = event.get("item")
+
+    @staticmethod
+    def _reject_task_frame_permission(request: Mapping[str, Any]) -> str | None:
+        for option in request.get("options", []):
             if (
-                event.get("type") == "item.completed"
-                and isinstance(item, Mapping)
-                and item.get("type") == "agent_message"
-                and isinstance(item.get("text"), str)
-                and item["text"].strip()
+                isinstance(option, Mapping)
+                and option.get("kind") in {"reject_once", "reject_always"}
+                and isinstance(option.get("optionId"), str)
             ):
-                messages.append(item["text"])
-            elif (
-                event.get("type") == "agent_message"
-                and isinstance(event.get("text"), str)
-                and event["text"].strip()
-            ):
-                messages.append(event["text"])
-        if not messages:
-            raise WorkerDispatchError(
-                "WORKER_PROVIDER_FAILED",
-                "WORKER_ADAPTER",
-                "CODEX_RESULT_MESSAGE_MISSING",
-            )
-        run_id = uuid4().hex
-        return {
-            "schema": "universe.codex-worker-result.v1",
-            "status": "COMPLETED",
-            "runtime_provider": "CODEX_CLI",
-            "runtime_profile": "TASK_FRAME_RUNTIME",
-            "source_mutation": "HOST_GATEWAY_ONLY",
-            "worker_id": f"codex-cli:{run_id}",
-            "worker_run_ref": request["worker_run_ref"],
-            "result_receipt_ref": f"codex-cli:{run_id}",
-            "result": {"text": "\n".join(messages), "stop_reason": "COMPLETED"},
-            "repository_write_scope": "NONE",
-        }
+                return option["optionId"]
+        return None

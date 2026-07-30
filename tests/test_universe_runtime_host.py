@@ -32,7 +32,11 @@ class FakeWorkerDispatcher:
 
     def provider_capability(self, provider: str) -> dict[str, str]:
         self.capability_calls.append(provider)
-        return {"provider": provider, "status": "AVAILABLE"}
+        return {
+            "provider": provider,
+            "status": "AVAILABLE",
+            "cli_auto_approve": "ON",
+        }
 
     def dispatch(self, request: dict[str, object]) -> dict[str, object]:
         self.dispatch_calls.append(request)
@@ -48,6 +52,7 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
             "tools/universe_runtime_host_grok_adapter.json",
             "tools/universe_runtime_host_grok_invoke.ps1",
             "tools/universe_runtime_host_codex_worker.ps1",
+            "tools/agent_session_gateway.py",
             "tools/universe_runtime_worker_dispatch.py",
             "tools/windows_native_cli.py",
         )
@@ -58,16 +63,22 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
         self.assertIn("WINDOWS_NATIVE_CLI_ROUTE_REQUIRED", legacy_dispatcher)
         self.assertNotIn("powershell.exe", legacy_dispatcher)
 
-        dispatcher = (ROOT / expected[4]).read_text(encoding="utf-8")
+        gateway = (ROOT / expected[4]).read_text(encoding="utf-8")
+        self.assertIn("class UniverseAcpGateway", gateway)
+        self.assertIn("class GrokAcpSession", gateway)
+        self.assertIn("class CodexAppServerSession", gateway)
+
+        dispatcher = (ROOT / expected[5]).read_text(encoding="utf-8")
         self.assertIn("RuntimeWorkerDispatcher", dispatcher)
-        self.assertIn('"--prompt-file"', dispatcher)
-        self.assertIn('"--json-schema"', dispatcher)
-        self.assertIn("structuredOutput", dispatcher)
+        self.assertIn("GrokAcpSession", dispatcher)
+        self.assertIn("CodexAppServerSession", dispatcher)
+        self.assertNotIn('"--prompt-file"', dispatcher)
+        self.assertNotIn('"exec",', dispatcher)
         self.assertIn("skill_run_observations", dispatcher)
         self.assertIn('"validation_state": "NOT_RUN"', dispatcher)
         self.assertNotIn("shell=True", dispatcher)
 
-        native_runner = (ROOT / expected[5]).read_text(encoding="utf-8")
+        native_runner = (ROOT / expected[6]).read_text(encoding="utf-8")
         self.assertIn("shell=False", native_runner)
         self.assertIn("NativeCliRequest", native_runner)
         host = (ROOT / "tools/universe_runtime_host.py").read_text(encoding="utf-8")
@@ -137,7 +148,9 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             }
         )
         host = UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher)
-        self.assertEqual("AVAILABLE", host.provider_capability("GROK")["status"])
+        capability = host.provider_capability("GROK")
+        self.assertEqual("AVAILABLE", capability["status"])
+        self.assertEqual("ON", capability["cli_auto_approve"])
         result = host.invoke_read_only(self.request())
         self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
         self.assertFalse(result["repository_write"])

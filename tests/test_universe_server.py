@@ -1114,6 +1114,106 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
         self.assertEqual("partial answer", events[0]["payload"]["delta"])
 
+    def test_agent_permission_round_trip_uses_project_room_stream(self) -> None:
+        class PermissionHost:
+            def resolve_permission(
+                self,
+                project_id: str,
+                request_id: str,
+                option_id: str,
+            ) -> bool:
+                return (
+                    project_id,
+                    request_id,
+                    option_id,
+                ) == ("GCS", "permission_test_001", "allow-once")
+
+            def close(self) -> None:
+                return
+
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        _, room_result = self.request(
+            "POST",
+            "/v1/projects/GCS/room/messages",
+            {
+                "kind": "QUESTION",
+                "body": "Run the guarded check.",
+                "idempotency_key": "permission-room-001",
+            },
+            self.token,
+        )
+        _, registered = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "grok-acp:session-001",
+                "binding_evidence_ref": "project-host://GCS/acp/session-001",
+            },
+            self.token,
+        )
+        bridge = registered["bridge"]
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        cursor = self.server.project_room_events.cursor()
+        try:
+            status, requested = self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/permissions",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": room_result["message"]["message_id"],
+                    "permission": {
+                        "request_id": "permission_test_001",
+                        "provider": "GROK",
+                        "session_id": "session-001",
+                        "tool_call": {
+                            "toolCallId": "tool-001",
+                            "title": "Read repository status",
+                        },
+                        "options": [
+                            {
+                                "optionId": "allow-once",
+                                "name": "Allow once",
+                                "kind": "allow_once",
+                            },
+                            {
+                                "optionId": "reject-once",
+                                "name": "Reject",
+                                "kind": "reject_once",
+                            },
+                        ],
+                    },
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+
+        self.assertEqual(201, status)
+        self.assertEqual("PENDING", requested["permission"]["state"])
+        events = self.server.project_room_events.wait(
+            "GCS",
+            after_event_id=cursor,
+            timeout_seconds=0.1,
+        )
+        self.assertEqual("AGENT_PERMISSION", events[0]["payload"]["type"])
+
+        self.server.project_master_hosts = PermissionHost()
+        status, resolved = self.request(
+            "POST",
+            ("/v1/projects/GCS/agent-session/permissions/permission_test_001/decision"),
+            {"option_id": "allow-once"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("RESOLVED", resolved["permission"]["state"])
+        self.assertEqual(
+            "allow-once",
+            resolved["permission"]["selected_option_id"],
+        )
+
     def test_project_room_stream_starts_with_durable_snapshot(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.request(
@@ -1142,6 +1242,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         envelope = json.loads(data_line.removeprefix("data: "))
         self.assertEqual("SNAPSHOT", envelope["payload"]["type"])
         self.assertEqual(1, len(envelope["payload"]["messages"]))
+        self.assertEqual([], envelope["payload"]["permissions"])
         self.assertEqual(
             "Stream this room.",
             envelope["payload"]["messages"][0]["body"],

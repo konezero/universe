@@ -19,12 +19,19 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 from uuid import UUID, uuid4
 
+from agent_session_gateway import (
+    AgentSessionError,
+    CodexAppServerSession,
+    GrokAcpSession,
+    UniverseAcpGateway,
+)
 from host_profile import resolve_host_tool
 from project_master_bridge import (
     ProjectMasterBridgeHost,
     ProjectMasterBridgeError,
     ProjectMasterBridgeHttpServer,
     normalize_bridge_envelope,
+    post_agent_permission_request,
     post_master_reply,
     post_master_stream_event,
     utc_now,
@@ -61,6 +68,7 @@ class MasterProvider(Protocol):
 
 ReplyPoster = Callable[..., dict[str, Any]]
 StreamPoster = Callable[..., dict[str, Any]]
+PermissionPoster = Callable[..., dict[str, Any]]
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceCommitResolver = Callable[[Path], str]
@@ -903,135 +911,72 @@ class GrokProjectMasterRuntime:
         if self.session_id is None:
             raise ProjectMasterHostError("GROK_SESSION_ID_UNAVAILABLE")
         UUID(self.session_id)
+        self._permission_requester: Callable[[Mapping[str, Any]], str | None] | None = (
+            None
+        )
+        self._gateway: UniverseAcpGateway | None = None
 
     @property
     def session_ref(self) -> str:
-        return f"grok-cli:{self.session_id}"
+        return f"grok-acp:{self.session_id}"
 
     def reply(self, message: Mapping[str, Any]) -> str:
-        executable, environment = _resolve_grok()
-        if executable is None:
-            raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
-        prompt_path = _runtime_tmp() / f"project-master-{uuid4().hex}.txt"
-        prompt_path.write_text(self._prompt(message), encoding="utf-8")
-        initialized = self.store.provider_session_initialized("GROK")
-        arguments = [
-            "--no-auto-update",
-            "--no-subagents",
-            "--no-memory",
-            "--disable-web-search",
-            "--permission-mode",
-            "plan",
-            "--sandbox",
-            "read-only",
-            "--max-turns",
-            str(self.max_turns),
-            "--cwd",
-            str(self.project_root),
-            "--system-prompt-override",
-            self._system_prompt(),
-        ]
-        if self.model:
-            arguments.extend(["--model", self.model])
-        if initialized:
-            arguments.extend(["--resume", self.session_id])
-        else:
-            arguments.extend(["--session-id", self.session_id])
-        arguments.extend(
-            [
-                "--prompt-file",
-                str(prompt_path),
-                "--output-format",
-                "json",
-            ]
-        )
-        try:
-            result = self.native_runner(
-                NativeCliRequest(
-                    executable=executable,
-                    arguments=tuple(arguments),
-                    cwd=self.project_root,
-                    timeout_seconds=300,
-                    environment=environment,
-                )
-            )
-        finally:
-            prompt_path.unlink(missing_ok=True)
-        if result.status != "COMPLETED":
-            raise ProjectMasterHostError(f"GROK_CLI_{result.status}")
-        try:
-            response = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise ProjectMasterHostError("GROK_RESULT_JSON_INVALID") from error
-        if not isinstance(response, Mapping):
-            raise ProjectMasterHostError("GROK_RESULT_OBJECT_REQUIRED")
-        response_session = _text(response.get("sessionId"), "response.sessionId")
-        if response_session != self.session_id:
-            raise ProjectMasterHostError("GROK_SESSION_ID_MISMATCH")
-        text = _text(response.get("text"), "response.text")
-        if response.get("stopReason") != "EndTurn":
-            raise ProjectMasterHostError("GROK_TURN_INCOMPLETE")
-        self.store.mark_provider_session_initialized("GROK")
-        return text
+        return self.reply_stream(message, lambda _delta: None)
 
     def reply_stream(
         self,
         message: Mapping[str, Any],
         on_delta: Callable[[str], None],
     ) -> str:
+        try:
+            return self._acp_gateway().reply_stream(self._prompt(message), on_delta)
+        except AgentSessionError as error:
+            raise ProjectMasterHostError(str(error)) from error
+
+    def set_permission_requester(
+        self,
+        requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> None:
+        self._permission_requester = requester
+
+    def prepare_session(self) -> str:
+        try:
+            self._acp_gateway()
+        except AgentSessionError as error:
+            raise ProjectMasterHostError(str(error)) from error
+        return self.session_ref
+
+    def close(self) -> None:
+        if self._gateway is not None:
+            self._gateway.close()
+            self._gateway = None
+
+    def _acp_gateway(self) -> UniverseAcpGateway:
+        if self._gateway is not None:
+            return self._gateway
+        if self._permission_requester is None:
+            raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
         executable, environment = _resolve_grok()
         if executable is None:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
-        prompt_path = _runtime_tmp() / f"project-master-{uuid4().hex}.txt"
-        prompt_path.write_text(self._prompt(message), encoding="utf-8")
-        initialized = self.store.provider_session_initialized("GROK")
-        arguments = [
-            "--no-auto-update",
-            "--no-subagents",
-            "--no-memory",
-            "--disable-web-search",
-            "--permission-mode",
-            "plan",
-            "--sandbox",
-            "read-only",
-            "--max-turns",
-            str(self.max_turns),
-            "--cwd",
-            str(self.project_root),
-            "--system-prompt-override",
-            self._system_prompt(),
-        ]
-        if self.model:
-            arguments.extend(["--model", self.model])
-        if initialized:
-            arguments.extend(["--resume", self.session_id])
-        else:
-            arguments.extend(["--session-id", self.session_id])
-        arguments.extend(
-            [
-                "--prompt-file",
-                str(prompt_path),
-                "--output-format",
-                "streaming-json",
-            ]
-        )
-        try:
-            result = _run_streaming_json(
+
+        def observe_session(session_id: str) -> None:
+            self.session_id = session_id
+            self.store.set_provider_session_id("GROK", session_id)
+            self.store.mark_provider_session_initialized("GROK")
+
+        self._gateway = UniverseAcpGateway(
+            GrokAcpSession(
                 executable=executable,
-                arguments=arguments,
                 cwd=self.project_root,
                 environment=environment,
-                timeout_seconds=300,
-                on_delta=on_delta,
+                system_prompt=self._system_prompt(),
+                session_id=self.session_id,
+                permission_requester=self._permission_requester,
+                session_observer=observe_session,
             )
-        finally:
-            prompt_path.unlink(missing_ok=True)
-        if result.session_id != self.session_id:
-            raise ProjectMasterHostError("GROK_SESSION_ID_MISMATCH")
-        if result.stop_reason != "EndTurn":
-            raise ProjectMasterHostError("GROK_TURN_INCOMPLETE")
-        self.store.mark_provider_session_initialized("GROK")
-        return result.text
+        )
+        return self._gateway
 
     def _system_prompt(self) -> str:
         return (
@@ -1099,90 +1044,76 @@ class CodexProjectMasterRuntime:
         self.store = store
         self.native_runner = native_runner
         self.session_id = store.provider_session_id("CODEX", create=False)
+        self._permission_requester: Callable[[Mapping[str, Any]], str | None] | None = (
+            None
+        )
+        self._gateway: UniverseAcpGateway | None = None
 
     @property
     def session_ref(self) -> str:
         return (
-            f"codex-cli:{self.session_id}"
+            f"codex-app-server:{self.session_id}"
             if self.session_id
-            else f"codex-cli:pending:{self.project_id}"
+            else f"codex-app-server:pending:{self.project_id}"
         )
 
     def reply(self, message: Mapping[str, Any]) -> str:
+        return self.reply_stream(message, lambda _delta: None)
+
+    def reply_stream(
+        self,
+        message: Mapping[str, Any],
+        on_delta: Callable[[str], None],
+    ) -> str:
+        try:
+            return self._acp_gateway().reply_stream(self._prompt(message), on_delta)
+        except AgentSessionError as error:
+            raise ProjectMasterHostError(str(error)) from error
+
+    def set_permission_requester(
+        self,
+        requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> None:
+        self._permission_requester = requester
+
+    def prepare_session(self) -> str:
+        try:
+            self._acp_gateway()
+        except AgentSessionError as error:
+            raise ProjectMasterHostError(str(error)) from error
+        return self.session_ref
+
+    def close(self) -> None:
+        if self._gateway is not None:
+            self._gateway.close()
+            self._gateway = None
+
+    def _acp_gateway(self) -> UniverseAcpGateway:
+        if self._gateway is not None:
+            return self._gateway
+        if self._permission_requester is None:
+            raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
         executable, environment = _resolve_codex()
         if executable is None:
             raise ProjectMasterHostError("CODEX_CLI_UNAVAILABLE")
-        prompt = f"{self._system_prompt()}\n\n{self._prompt(message)}"
-        if self.session_id:
-            arguments = (
-                "exec",
-                "resume",
-                "--json",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "-C",
-                str(self.project_root),
-                self.session_id,
-                prompt,
-            )
-        else:
-            arguments = (
-                "exec",
-                "--json",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "-C",
-                str(self.project_root),
-                prompt,
-            )
-        result = self.native_runner(
-            NativeCliRequest(
+
+        def observe_session(session_id: str) -> None:
+            self.session_id = session_id
+            self.store.set_provider_session_id("CODEX", session_id)
+            self.store.mark_provider_session_initialized("CODEX")
+
+        self._gateway = UniverseAcpGateway(
+            CodexAppServerSession(
                 executable=executable,
-                arguments=arguments,
                 cwd=self.project_root,
-                timeout_seconds=300,
                 environment=environment,
+                system_prompt=self._system_prompt(),
+                session_id=self.session_id,
+                permission_requester=self._permission_requester,
+                session_observer=observe_session,
             )
         )
-        if result.status != "COMPLETED" or result.return_code != 0:
-            raise ProjectMasterHostError(f"CODEX_CLI_{result.status}")
-        messages: list[str] = []
-        observed_session = self.session_id
-        for line in result.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, Mapping):
-                continue
-            if event.get("type") in {"thread.started", "session.started"}:
-                candidate = event.get("thread_id") or event.get("session_id")
-                if isinstance(candidate, str) and candidate.strip():
-                    observed_session = candidate.strip()
-            item = event.get("item")
-            if (
-                event.get("type") == "item.completed"
-                and isinstance(item, Mapping)
-                and item.get("type") == "agent_message"
-                and isinstance(item.get("text"), str)
-                and item["text"].strip()
-            ):
-                messages.append(item["text"].strip())
-            elif (
-                event.get("type") == "agent_message"
-                and isinstance(event.get("text"), str)
-                and event["text"].strip()
-            ):
-                messages.append(event["text"].strip())
-        if not messages:
-            raise ProjectMasterHostError("CODEX_RESULT_MESSAGE_MISSING")
-        if observed_session:
-            self.session_id = observed_session
-            self.store.set_provider_session_id("CODEX", observed_session)
-            self.store.mark_provider_session_initialized("CODEX")
-        return "\n".join(messages)
+        return self._gateway
 
     def _system_prompt(self) -> str:
         return (
@@ -1242,6 +1173,7 @@ class ProjectMasterConversationWorker:
         surface_observer: CommanderSurfaceObserver,
         reply_poster: ReplyPoster = post_master_reply,
         stream_poster: StreamPoster = post_master_stream_event,
+        permission_poster: PermissionPoster = post_agent_permission_request,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -1251,13 +1183,21 @@ class ProjectMasterConversationWorker:
         self.surface_observer = surface_observer
         self.reply_poster = reply_poster
         self.stream_poster = stream_poster
+        self.permission_poster = permission_poster
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._permission_lock = threading.RLock()
+        self._permission_waiters: dict[str, dict[str, Any]] = {}
+        self._active_bridge_id = ""
+        self._active_message_id = ""
         self._thread = threading.Thread(
             target=self._run,
             name=f"project-master-{self.project_id}",
             daemon=True,
         )
         self._started = False
+        bind_permission = getattr(self.provider, "set_permission_requester", None)
+        if callable(bind_permission):
+            bind_permission(self._request_permission)
 
     def start(self) -> None:
         if self._started:
@@ -1282,9 +1222,31 @@ class ProjectMasterConversationWorker:
 
     def close(self) -> None:
         if not self._started:
+            close_provider = getattr(self.provider, "close", None)
+            if callable(close_provider):
+                close_provider()
             return
+        with self._permission_lock:
+            waiters = list(self._permission_waiters.values())
+            self._permission_waiters.clear()
+        for waiter in waiters:
+            waiter["event"].set()
         self._queue.put(None)
         self._thread.join(timeout=10)
+        close_provider = getattr(self.provider, "close", None)
+        if callable(close_provider):
+            close_provider()
+
+    def resolve_permission(self, request_id: str, option_id: str) -> bool:
+        normalized_request = _text(request_id, "request_id")
+        normalized_option = _text(option_id, "option_id")
+        with self._permission_lock:
+            waiter = self._permission_waiters.get(normalized_request)
+            if waiter is None or normalized_option not in waiter["options"]:
+                return False
+            waiter["option_id"] = normalized_option
+            waiter["event"].set()
+            return True
 
     def _run(self) -> None:
         while True:
@@ -1302,6 +1264,8 @@ class ProjectMasterConversationWorker:
         if not self.store.claim(message_id):
             return
         bridge_id = _text(envelope["bridge_id"], "bridge_id")
+        self._active_bridge_id = bridge_id
+        self._active_message_id = message_id
         sequence = 0
 
         def emit(event: str, *, delta: str = "", detail: str = "") -> None:
@@ -1356,9 +1320,54 @@ class ProjectMasterConversationWorker:
         except Exception as error:
             emit("FAILED", detail=f"{type(error).__name__}: {error}")
             self.store.fail(message_id, f"{type(error).__name__}: {error}")
+            self._active_bridge_id = ""
+            self._active_message_id = ""
             return
         emit("COMPLETED")
         self.store.complete(message_id)
+        self._active_bridge_id = ""
+        self._active_message_id = ""
+
+    def _request_permission(self, request: Mapping[str, Any]) -> str | None:
+        request_id = _text(request.get("request_id"), "request_id")
+        options = request.get("options")
+        if (
+            not self._active_bridge_id
+            or not self._active_message_id
+            or not isinstance(options, list)
+        ):
+            raise ProjectMasterHostError("AGENT_PERMISSION_CONTEXT_UNAVAILABLE")
+        option_ids = {
+            _text(option.get("optionId"), "option.optionId")
+            for option in options
+            if isinstance(option, Mapping)
+        }
+        waiter = {
+            "event": threading.Event(),
+            "options": option_ids,
+            "option_id": None,
+        }
+        with self._permission_lock:
+            if request_id in self._permission_waiters:
+                raise ProjectMasterHostError("AGENT_PERMISSION_REQUEST_DUPLICATE")
+            self._permission_waiters[request_id] = waiter
+        try:
+            self.permission_poster(
+                universe_endpoint=self.universe_endpoint,
+                project_id=self.project_id,
+                bridge_id=self._active_bridge_id,
+                in_reply_to=self._active_message_id,
+                permission=request,
+                bridge_token=self.bridge_token,
+                timeout_seconds=5.0,
+            )
+            if not waiter["event"].wait(600):
+                return None
+            selected = waiter["option_id"]
+            return str(selected) if selected else None
+        finally:
+            with self._permission_lock:
+                self._permission_waiters.pop(request_id, None)
 
 
 class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
@@ -1535,6 +1544,12 @@ class ResidentProjectMasterHostManager:
                 )
             )
             try:
+                bind_permission = getattr(provider, "set_permission_requester", None)
+                if callable(bind_permission):
+                    bind_permission(self._permission_before_worker)
+                prepare_provider = getattr(provider, "prepare_session", None)
+                if callable(prepare_provider):
+                    prepare_provider()
                 coordinator = self.coordinator_factory(
                     project_root,
                     project_id,
@@ -1542,6 +1557,9 @@ class ResidentProjectMasterHostManager:
                 )
                 preparation = coordinator.prepare()
             except Exception:
+                close_provider = getattr(provider, "close", None)
+                if callable(close_provider):
+                    close_provider()
                 os.environ.pop(credential_env, None)
                 raise
             worker = ProjectMasterConversationWorker(
@@ -1626,6 +1644,19 @@ class ResidentProjectMasterHostManager:
         handle.close()
         return True
 
+    def resolve_permission(
+        self,
+        project_id: str,
+        request_id: str,
+        option_id: str,
+    ) -> bool:
+        normalized = _text(project_id, "project_id")
+        with self._lock:
+            handle = self._handles.get(normalized)
+        if handle is None or not handle.thread.is_alive():
+            return False
+        return handle.worker.resolve_permission(request_id, option_id)
+
     def close(self) -> None:
         with self._lock:
             handles = list(self._handles.values())
@@ -1658,111 +1689,9 @@ class ResidentProjectMasterHostManager:
             host_session_ref,
         )
 
-
-@dataclass(frozen=True)
-class StreamingTurnResult:
-    text: str
-    session_id: str
-    stop_reason: str
-
-
-def _run_streaming_json(
-    *,
-    executable: Path,
-    arguments: list[str],
-    cwd: Path,
-    environment: Mapping[str, str],
-    timeout_seconds: float,
-    on_delta: Callable[[str], None],
-) -> StreamingTurnResult:
-    process_environment = os.environ.copy()
-    process_environment.update(
-        {str(key): str(value) for key, value in environment.items()}
-    )
-    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    process = subprocess.Popen(  # nosec B603
-        [str(executable), *arguments],
-        cwd=str(cwd),
-        env=process_environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        creationflags=creation_flags,
-    )
-    lines: queue.Queue[str | None] = queue.Queue()
-    stderr_parts: list[str] = []
-
-    def read_stdout() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            lines.put(line)
-        lines.put(None)
-
-    def read_stderr() -> None:
-        assert process.stderr is not None
-        for part in process.stderr:
-            if sum(len(item) for item in stderr_parts) < 20000:
-                stderr_parts.append(part)
-
-    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
-    text_parts: list[str] = []
-    session_id = ""
-    stop_reason = ""
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                process.kill()
-                raise ProjectMasterHostError("GROK_CLI_TIMED_OUT")
-            try:
-                line = lines.get(timeout=min(0.25, remaining))
-            except queue.Empty:
-                if process.poll() is not None and not stdout_thread.is_alive():
-                    break
-                continue
-            if line is None:
-                break
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ProjectMasterHostError("GROK_STREAM_JSON_INVALID") from error
-            if not isinstance(event, Mapping):
-                raise ProjectMasterHostError("GROK_STREAM_EVENT_INVALID")
-            event_type = event.get("type")
-            if event_type == "text":
-                delta = str(event.get("data") or "")
-                if delta:
-                    text_parts.append(delta)
-                    on_delta(delta)
-            elif event_type == "end":
-                session_id = _text(event.get("sessionId"), "event.sessionId")
-                stop_reason = _text(event.get("stopReason"), "event.stopReason")
-        return_code = process.wait(timeout=max(1.0, deadline - time.monotonic()))
-        if return_code != 0:
-            detail = "".join(stderr_parts).strip()
-            raise ProjectMasterHostError(
-                f"GROK_CLI_FAILED{': ' + detail[:500] if detail else ''}"
-            )
-    finally:
-        if process.poll() is None:
-            process.kill()
-        stdout_thread.join(timeout=1)
-        stderr_thread.join(timeout=1)
-    if not session_id:
-        raise ProjectMasterHostError("GROK_STREAM_END_MISSING")
-    return StreamingTurnResult(
-        text="".join(text_parts),
-        session_id=session_id,
-        stop_reason=stop_reason,
-    )
+    @staticmethod
+    def _permission_before_worker(_request: Mapping[str, Any]) -> str | None:
+        raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_NOT_READY")
 
 
 def _resolve_grok() -> tuple[Path | None, dict[str, str]]:

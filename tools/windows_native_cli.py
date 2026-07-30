@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
 # The runner uses an explicit argv sequence and disables shell execution.
 import subprocess  # nosec B404
 import time
@@ -43,6 +44,7 @@ class NativeCliResult:
 
 
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
+ProcessOpener = Callable[..., subprocess.Popen[str]]
 
 
 def _validated_request(request: NativeCliRequest) -> NativeCliRequest:
@@ -50,7 +52,9 @@ def _validated_request(request: NativeCliRequest) -> NativeCliRequest:
     if not executable.is_file():
         raise NativeCliError("native CLI executable does not exist")
     if executable.suffix.lower() in {".bat", ".cmd", ".ps1"}:
-        raise NativeCliError("shell and batch entrypoints are not native CLI executables")
+        raise NativeCliError(
+            "shell and batch entrypoints are not native CLI executables"
+        )
     if any(not isinstance(argument, str) for argument in request.arguments):
         raise NativeCliError("native CLI arguments must be strings")
     if request.cwd is not None and not request.cwd.resolve().is_dir():
@@ -99,11 +103,7 @@ def run_native_cli(
         try:
             completed = runner(
                 command,
-                cwd=(
-                    str(normalized.cwd)
-                    if normalized.cwd is not None
-                    else None
-                ),
+                cwd=(str(normalized.cwd) if normalized.cwd is not None else None),
                 env=environment,
                 stdin=stdin_handle if stdin_handle is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -111,11 +111,7 @@ def run_native_cli(
                 shell=False,
                 timeout=normalized.timeout_seconds,
                 check=False,
-                creationflags=(
-                    subprocess.CREATE_NO_WINDOW
-                    if os.name == "nt"
-                    else 0
-                ),
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
         except subprocess.TimeoutExpired as error:
             stdout_raw = error.stdout if isinstance(error.stdout, bytes) else b""
@@ -170,4 +166,30 @@ def run_native_cli(
         stderr=stderr,
         stdout_truncated=stdout_truncated,
         stderr_truncated=stderr_truncated,
+    )
+
+
+def open_native_cli(
+    request: NativeCliRequest,
+    *,
+    opener: ProcessOpener = subprocess.Popen,
+) -> subprocess.Popen[str]:
+    normalized = _validated_request(request)
+    environment = dict(os.environ)
+    if normalized.environment is not None:
+        environment.update(normalized.environment)
+    command = [str(normalized.executable), *normalized.arguments]
+    return opener(  # nosec B603
+        command,
+        cwd=str(normalized.cwd) if normalized.cwd is not None else None,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        text=True,
+        encoding=normalized.output_encoding,
+        errors="replace",
+        bufsize=1,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )

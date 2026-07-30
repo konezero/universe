@@ -344,7 +344,12 @@ relations remain distinct from observed evidence. Career adoption is separate.
    Project Room message. Per-task provider selection remains part of the
    separate Task Frame proposal. Provider credentials remain in each provider
    credential store and are never persisted in Universe settings.
-10. Productize the desktop-first Universe UI as the canonical responsive Web
+10. Use one Universe-owned ACP session gateway for Conductor Task Frame Workers
+    and resident Project Master conversation sessions. Grok uses native ACP.
+    Codex app-server callbacks are normalized to ACP updates and permission
+    options. HTTP/SSE remains the Web UI adapter and does not become provider
+    authority or a Task Frame bypass.
+11. Productize the desktop-first Universe UI as the canonical responsive Web
     SPA. Keep the persistent conversation surface and its + control scoped to
     Project Master, Skill, and context invocation; explicit management remains
     available through ordinary UI controls. Structured Wizards must support both
@@ -354,7 +359,7 @@ relations remain distinct from observed evidence. Career adoption is separate.
     Package the stable Web UI later in a Tauri desktop shell with the Python
     Universe service as a sidecar, tray, and autostart; mobile and remote clients
     reuse the same responsive UI as a later delivery surface.
-11. Central Host Profile resolution for Python, Git, Codex, and Grok is
+12. Central Host Profile resolution for Python, Git, Codex, and Grok is
     implemented. The local Universe service initializes and verifies one
     machine-local Profile, and all product Runtime callers consume it instead
     of independently searching process state. Runtime Settings exposes

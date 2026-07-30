@@ -8,7 +8,7 @@ dispatcher. They live under `tools/`, not under `.ai/`.
 ```text
 Career Release DB -> installed project Runtime
 Universe Project Lifecycle Host -> OS_INSTALL / OS_UPDATE -> validate/status
-Universe Runtime Host -> provider CLI / local process -> Task Frame result
+Universe Runtime Host -> Universe ACP Gateway -> provider process -> Task Frame result
 Project Runtime -> Execution Guard / source mutation gateway
 ```
 
@@ -52,29 +52,35 @@ tool is `UNAVAILABLE`.
 
 ## Windows Native CLI Boundary
 
-On Windows, every active Runtime Host provider invocation follows
-`universe.windows-native-cli.v1`:
+On Windows, every active Runtime Host provider process follows the native
+executable and argv validation of `universe.windows-native-cli.v1`:
 
 ```text
 UniverseRuntimeHost
   -> RuntimeWorkerDispatcher
-  -> NativeCliRequest(executable, argv[], cwd, environment, timeout)
-  -> subprocess(shell=False)
-  -> provider executable
+  -> UniverseAcpGateway
+  -> NativeCliRequest(executable, argv[], cwd, environment)
+  -> open_native_cli(shell=False, stdin/stdout pipes)
+  -> provider ACP or app-server process
 ```
 
-The executable and every argument remain separate values. PowerShell command
-strings, `Start-Process -ArgumentList`, `cmd /c`, batch shims, and direct
-provider invocation from a `.ps1` adapter are not active execution routes.
-Legacy PowerShell adapter files fail closed with
+The executable and every process-start argument remain separate values.
+PowerShell command strings, `Start-Process -ArgumentList`, `cmd /c`, batch
+shims, and direct provider invocation from a `.ps1` adapter are not active
+execution routes. Legacy PowerShell adapter files fail closed with
 `WINDOWS_NATIVE_CLI_ROUTE_REQUIRED`.
 
-Provider capability checks use the same runner as provider work. Grok prompts
-are written as transient UTF-8 files and passed with `--prompt-file`; structured
-JSON schemas remain one explicit argument. Codex prompts remain one explicit
-argument in the runner's argv array. Empty strings, spaces, quotes, JSON,
-newlines, non-ASCII text, timeout status, and separated stdout/stderr are
-covered by Runtime Host regression tests.
+Provider capability checks use the bounded one-shot runner. Provider turns use
+the persistent native process opener because ACP and app-server are JSON-RPC
+stdio sessions. Grok messages use native ACP `session/prompt`; Codex app-server
+turns are normalized to the same Universe ACP update and permission contract.
+Grok is launched with `--permission-mode default` and Codex with
+`approvalPolicy: on-request`; both Universe-owned sessions therefore request
+tool approval independently of user-global provider defaults.
+Context Pack and Output Contract text travel inside protocol messages, not shell
+arguments or prompt files. Exact argv boundaries, non-ASCII protocol text,
+structured results, and provider permission normalization are covered by
+Runtime Host regression tests.
 
 Python, Git, Grok, and Codex must resolve to native executables. `.bat`, `.cmd`,
 and `.ps1` entrypoints are rejected. The Profile stores only executable paths,
@@ -90,7 +96,7 @@ the text-oriented provider runner.
 
 ## Local State
 
-Temporary dispatcher request files are stored under:
+Temporary Runtime lifecycle and Task Frame request files are stored under:
 
 ```text
 %LOCALAPPDATA%\Universe\runtime-tmp
@@ -98,6 +104,7 @@ Temporary dispatcher request files are stored under:
 
 If `LOCALAPPDATA` is unavailable, the Host uses `%TEMP%\Universe\runtime-tmp`.
 Those files are transient Host transport data and are not project evidence.
+Provider prompts no longer create a separate transient prompt file.
 
 ## Universe Service Integration
 

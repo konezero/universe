@@ -17,6 +17,7 @@ const state = {
   projectRoomStream: null,
   projectRoomStreamProjectId: null,
   projectStreamReplies: {},
+  projectPermissions: [],
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
@@ -251,7 +252,12 @@ async function callProjectMaster(projectId) {
 
 function renderComposerState() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    elements.roomContext.textContent = "Universe Conductor";
+    const setting = state.providerSettings?.universe_conductor || null;
+    const provider = setting?.resolved_provider || "UNAVAILABLE";
+    const autoApprove =
+      providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
+    elements.roomContext.textContent =
+      `Universe Conductor / Auto-approve ${autoApprove}`;
     elements.roomHint.textContent =
       state.conductorRuntimeBinding?.status === "BOUND"
         ? "LLM connected / use + to call a Project Master"
@@ -266,7 +272,15 @@ function renderComposerState() {
   const registeredBridge =
     state.selectedProject?.project_id === projectId &&
     state.masterBridge?.status === "REGISTERED";
-  elements.roomContext.textContent = `${projectId} / Project Master`;
+  const setting =
+    state.providerSettings?.project_masters?.find(
+      (item) => item.scope_id === projectId
+    ) || null;
+  const provider = setting?.resolved_provider || "UNAVAILABLE";
+  const autoApprove =
+    providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
+  elements.roomContext.textContent =
+    `${projectId} / Project Master / Auto-approve ${autoApprove}`;
   elements.roomHint.textContent = directBridge
     ? "Direct bridge connected"
     : registeredBridge
@@ -482,7 +496,14 @@ async function selectProject(projectId) {
     method: "POST",
     body: {},
   }).catch(() => null);
-  const [projectionResult, dispatchResult, proposalResult, roomResult, bridgeResult] = await Promise.all([
+  const [
+    projectionResult,
+    dispatchResult,
+    proposalResult,
+    roomResult,
+    bridgeResult,
+    permissionResult,
+  ] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
     ),
@@ -490,6 +511,9 @@ async function selectProject(projectId) {
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
     api(`/v1/projects/${encodeURIComponent(projectId)}/master-bridge`).catch(() => ({ bridge: null })),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/agent-session/permissions`).catch(
+      () => ({ permissions: [] })
+    ),
   ]);
   state.projection = projectionResult?.projection || null;
   state.dispatches = await Promise.all(
@@ -502,6 +526,7 @@ async function selectProject(projectId) {
   state.releaseProposals = proposalResult.proposals;
   state.roomMessages = roomResult.messages || [];
   state.masterBridge = bridgeResult.bridge || null;
+  state.projectPermissions = permissionResult.permissions || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -546,6 +571,11 @@ function renderRoomMessages() {
     }
     return;
   }
+  for (const permission of state.projectPermissions.filter(
+    (item) => item.state === "PENDING"
+  )) {
+    elements.roomMessageList.append(renderPermissionCard(permission));
+  }
   if (!state.roomMessages.length) {
     elements.roomMessageList.append(
       node(
@@ -575,6 +605,59 @@ function renderRoomMessages() {
     elements.roomMessageList.append(item);
   }
   elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+}
+
+function renderPermissionCard(permission) {
+  const item = node("article", "room-message permission-request");
+  const toolCall = permission.tool_call || {};
+  const title =
+    toolCall.command ||
+    toolCall.title ||
+    toolCall.toolCallId ||
+    "Agent tool request";
+  item.append(
+    node("strong", "", `${permission.provider} / APPROVAL REQUIRED`),
+    node("p", "permission-title", String(title)),
+    node(
+      "small",
+      "",
+      toolCall.reason || "The agent is waiting for your decision."
+    )
+  );
+  const actions = node("div", "permission-actions");
+  for (const option of permission.options || []) {
+    const button = node("button", `permission-option ${option.kind}`, option.name);
+    button.type = "button";
+    button.addEventListener("click", () =>
+      resolveAgentPermission(permission, option.optionId)
+    );
+    actions.append(button);
+  }
+  item.append(actions);
+  return item;
+}
+
+async function resolveAgentPermission(permission, optionId) {
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(
+        permission.project_id
+      )}/agent-session/permissions/${encodeURIComponent(
+        permission.request_id
+      )}/decision`,
+      {
+        method: "POST",
+        body: { option_id: optionId },
+      }
+    );
+    state.projectPermissions = state.projectPermissions.map((item) =>
+      item.request_id === permission.request_id ? result.permission : item
+    );
+    renderRoomMessages();
+    toast("Agent permission decision delivered");
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function providerCapability(provider) {
@@ -752,6 +835,7 @@ async function submitProviderSettings(event) {
     await Promise.all(requests);
     state.providerSettings = await api("/v1/settings/providers");
     renderProviderSettings();
+    renderComposerState();
     elements.settingsDialog.close();
     toast("CLI provider settings saved");
   } catch (error) {
@@ -830,10 +914,26 @@ function openProjectRoomStream(projectId) {
       state.roomMessages = Array.isArray(payload.messages)
         ? payload.messages
         : [];
+      state.projectPermissions = Array.isArray(payload.permissions)
+        ? payload.permissions
+        : state.projectPermissions;
       if (payload.type === "ROOM_CHANGED") {
         state.projectStreamReplies = {};
       }
       renderRoomMessages();
+      return;
+    }
+    if (payload.type === "AGENT_PERMISSION") {
+      const permission = payload.permission;
+      if (permission?.request_id) {
+        state.projectPermissions = [
+          ...state.projectPermissions.filter(
+            (item) => item.request_id !== permission.request_id
+          ),
+          permission,
+        ];
+        renderRoomMessages();
+      }
       return;
     }
     if (payload.type !== "MASTER_STREAM") return;

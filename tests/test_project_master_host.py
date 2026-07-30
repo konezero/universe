@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
@@ -114,6 +115,81 @@ class StreamingFakeProvider(FakeProvider):
         on_delta("Project ")
         on_delta("Master answer")
         return "Project Master answer"
+
+
+class PermissionFakeProvider(StreamingFakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requester = None
+        self.selected_option = None
+
+    def set_permission_requester(self, requester) -> None:
+        self.requester = requester
+
+    def reply_stream(self, message: Mapping[str, Any], on_delta) -> str:
+        self.messages.append(dict(message))
+        assert self.requester is not None
+        self.selected_option = self.requester(
+            {
+                "schema": "universe.agent-permission-request.v1",
+                "request_id": "permission_worker_001",
+                "provider": "GROK",
+                "session_id": "session-001",
+                "tool_call": {"toolCallId": "tool-001"},
+                "options": [
+                    {
+                        "optionId": "allow-once",
+                        "name": "Allow once",
+                        "kind": "allow_once",
+                    },
+                    {
+                        "optionId": "reject-once",
+                        "name": "Reject",
+                        "kind": "reject_once",
+                    },
+                ],
+            }
+        )
+        on_delta("Approved answer")
+        return "Approved answer"
+
+
+class PreparedFakeProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_ref = "fake-provider:pending"
+        self.prepare_count = 0
+        self.permission_requester = None
+        self.closed = False
+
+    def set_permission_requester(self, requester) -> None:
+        self.permission_requester = requester
+
+    def prepare_session(self) -> None:
+        self.prepare_count += 1
+        self.session_ref = "fake-provider:actual-session"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeAgentGateway:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.prompts: list[str] = []
+        self.closed = False
+
+    @property
+    def session_ref(self) -> str:
+        return "fake-acp:session"
+
+    def reply_stream(self, prompt: str, on_delta) -> str:
+        self.prompts.append(prompt)
+        on_delta(self.answer)
+        return self.answer
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeSurfaceObserver:
@@ -370,109 +446,35 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(self.provider.messages))
         self.assertEqual("COMPLETE", self.state.state(self._message_id()))
 
-    def test_grok_runtime_creates_then_resumes_the_same_session(self) -> None:
-        requests = []
-
-        def runner(request):
-            requests.append(request)
-            return NativeCliResult(
-                contract="universe.windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout=json.dumps(
-                    {
-                        "sessionId": runtime.session_id,
-                        "requestId": f"request-{len(requests)}",
-                        "stopReason": "EndTurn",
-                        "text": f"answer-{len(requests)}",
-                    }
-                ),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
-
+    def test_grok_runtime_routes_project_message_through_acp_gateway(self) -> None:
         runtime = GrokProjectMasterRuntime(
             self.root,
             "GCS",
             self.state,
-            native_runner=runner,
         )
-        with patch(
-            "project_master_host._resolve_grok",
-            return_value=(self.root / "grok.exe", {}),
-        ):
-            first = runtime.reply(self._envelope()["message"])
-            second = runtime.reply(self._envelope()["message"])
+        gateway = FakeAgentGateway("grok-answer")
+        runtime._gateway = gateway
 
-        self.assertEqual("answer-1", first)
-        self.assertEqual("answer-2", second)
-        self.assertIn("--session-id", requests[0].arguments)
-        self.assertNotIn("--resume", requests[0].arguments)
-        self.assertIn("--resume", requests[1].arguments)
-        self.assertNotIn("--session-id", requests[1].arguments)
-        self.assertEqual(self.root.resolve(), requests[0].cwd)
-        self.assertIn("read-only", requests[0].arguments)
+        answer = runtime.reply(self._envelope()["message"])
 
-    def test_codex_runtime_creates_then_resumes_the_same_thread(self) -> None:
-        requests = []
+        self.assertEqual("grok-answer", answer)
+        self.assertIn("Universe Project Room message", gateway.prompts[0])
+        self.assertTrue(runtime.session_ref.startswith("grok-acp:"))
 
-        def runner(request):
-            requests.append(request)
-            turn = len(requests)
-            return NativeCliResult(
-                contract="universe.windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout="\n".join(
-                    (
-                        json.dumps(
-                            {
-                                "type": "thread.started",
-                                "thread_id": "codex-thread-001",
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "item.completed",
-                                "item": {
-                                    "type": "agent_message",
-                                    "text": f"codex-answer-{turn}",
-                                },
-                            }
-                        ),
-                    )
-                ),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
-
-        with patch(
-            "project_master_host._resolve_codex",
-            return_value=(self.root / "codex.exe", {}),
-        ):
-            runtime = CodexProjectMasterRuntime(
-                self.root,
-                "GCS",
-                self.state,
-                native_runner=runner,
-            )
-            first = runtime.reply(self._envelope()["message"])
-            second = runtime.reply(self._envelope()["message"])
-
-        self.assertEqual("codex-answer-1", first)
-        self.assertEqual("codex-answer-2", second)
-        self.assertNotIn("resume", requests[0].arguments)
-        self.assertIn("resume", requests[1].arguments)
-        self.assertIn("codex-thread-001", requests[1].arguments)
-        self.assertIn("read-only", requests[0].arguments)
-        self.assertEqual(
-            "codex-thread-001",
-            self.state.provider_session_id("CODEX", create=False),
+    def test_codex_runtime_routes_project_message_through_app_server(self) -> None:
+        runtime = CodexProjectMasterRuntime(
+            self.root,
+            "GCS",
+            self.state,
         )
+        gateway = FakeAgentGateway("codex-answer")
+        runtime._gateway = gateway
+
+        answer = runtime.reply(self._envelope()["message"])
+
+        self.assertEqual("codex-answer", answer)
+        self.assertIn("Universe Project Room message", gateway.prompts[0])
+        self.assertTrue(runtime.session_ref.startswith("codex-app-server:"))
 
     def test_streaming_provider_emits_started_deltas_and_completed(self) -> None:
         self.provider = StreamingFakeProvider()
@@ -493,6 +495,48 @@ class ProjectMasterHostTests(unittest.TestCase):
             [item["delta"] for item in self.streams if item["event"] == "DELTA"],
         )
         self.assertEqual("Project Master answer", self.replies[0]["body"])
+
+    def test_permission_request_blocks_until_ui_decision_is_delivered(self) -> None:
+        provider = PermissionFakeProvider()
+        permission_posted = threading.Event()
+        permissions: list[dict[str, Any]] = []
+
+        def post_permission(**values):
+            permissions.append(values)
+            permission_posted.set()
+            return {"status": "AGENT_PERMISSION_REQUESTED"}
+
+        worker = ProjectMasterConversationWorker(
+            provider=provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            permission_poster=post_permission,
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(permission_posted.wait(2))
+            self.assertTrue(
+                worker.resolve_permission(
+                    "permission_worker_001",
+                    "allow-once",
+                )
+            )
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual("allow-once", provider.selected_option)
+        self.assertEqual(
+            "permission_worker_001",
+            permissions[0]["permission"]["request_id"],
+        )
+        self.assertEqual("COMPLETE", self.state.state(self._message_id()))
 
     def test_surface_observation_failure_blocks_provider_call(self) -> None:
         self.surface_observer = FakeSurfaceObserver(fail=True)
@@ -615,6 +659,39 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(registrations))
         self.assertEqual(1, self.surface_observer.prepare_count)
         self.assertNotIn(registrations[0]["credential_env"], os.environ)
+
+    def test_resident_manager_registers_prepared_agent_session_ref(self) -> None:
+        registrations: list[dict[str, Any]] = []
+        provider = PreparedFakeProvider()
+        coordinator_sessions: list[str] = []
+
+        def register(project_id, value):
+            registrations.append({"project_id": project_id, **dict(value)})
+            return {"project_id": project_id, **dict(value)}, True
+
+        def coordinator(_root, _project_id, session_ref):
+            coordinator_sessions.append(session_ref)
+            return self.surface_observer
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: provider,
+                coordinator_factory=coordinator,
+            )
+            try:
+                manager.ensure({"project_id": "GCS", "project_root": str(self.root)})
+            finally:
+                manager.close()
+
+        self.assertEqual(1, provider.prepare_count)
+        self.assertEqual(["fake-provider:actual-session"], coordinator_sessions)
+        self.assertEqual(
+            "fake-provider:actual-session",
+            registrations[0]["master_session_ref"],
+        )
+        self.assertTrue(provider.closed)
 
     def test_resident_manager_restarts_when_provider_selection_changes(self) -> None:
         registrations: list[dict[str, Any]] = []

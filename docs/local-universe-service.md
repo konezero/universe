@@ -420,6 +420,53 @@ resident Host and is applied on the next Project Room message. Provider session
 references are provider-scoped so a Grok session is never resumed as Codex, or
 the reverse.
 
+### Universe ACP Gateway
+
+Universe owns the agent-session boundary. The browser is an HTTP/SSE client of
+that boundary; it does not connect to a provider CLI directly.
+
+```text
+Universe UI
+  -> Universe ACP Gateway
+     -> Universe Conductor Task Frame Worker session
+     -> resident Project Master session
+     -> Grok ACP over JSON-RPC stdio
+     -> Codex app-server adapter normalized to ACP events
+```
+
+The implemented common session vocabulary is `session/new` or provider resume,
+`session/prompt`, `session/update`, and `session/request_permission`. The
+Universe Conductor keeps its governed Task Frame create, claim, result, and
+close path, but its bounded provider Worker now runs through the same ACP
+Gateway instead of raw one-shot provider CLI execution. Project Master sessions
+remain resident for conversation continuity. ACP is the client/session protocol
+and does not bypass Task Frame, Mode, authority, or execution-assignment rules.
+
+Grok runs through its native ACP `agent stdio` interface. Codex currently
+exposes approval callbacks through `app-server`; the adapter maps those
+callbacks into the same ACP permission option contract. Provider-specific
+request or decision values are preserved inside the adapter and do not leak
+into the browser API.
+
+Universe pins both provider sessions to request approval. Grok starts with
+`--permission-mode default`, so a user-level `always-approve` setting is not
+inherited by the Universe-owned ACP session. Codex starts with
+`approvalPolicy: on-request`. The Project Room reports this session-effective
+auto-approve state rather than the provider's unrelated interactive CLI
+default.
+
+Permission requests are stored in the Universe database and published through
+the Project Room SSE stream. A Project Room displays only options supplied by
+the active provider session. The selected option is delivered back to that
+exact resident session and request ID. A missing resident session, unknown
+option, repeated conflicting decision, or stale request is rejected. An ACP
+permission decision is not ai-career authority, an Execution Assignment, or a
+repository mutation receipt.
+
+The current web service is the UI transport adapter for the Universe-owned ACP
+Gateway. It is not advertised as a general external ACP stdio or socket endpoint
+and does not claim an unimplemented `session/cancel` surface in this slice.
+
 Before registration, the resident Host invokes the installed project's
 `prepare-session` command for registered `MASTER` Mode from inside the project
 root. Universe does not open or rewrite the project Anchor database itself.

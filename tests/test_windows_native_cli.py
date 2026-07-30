@@ -18,6 +18,7 @@ from windows_native_cli import (  # noqa: E402
     NativeCliError,
     NativeCliRequest,
     NativeCliResult,
+    open_native_cli,
     run_native_cli,
 )
 
@@ -39,7 +40,9 @@ class WindowsNativeCliTests(unittest.TestCase):
     def test_windows_runner_hides_console_processes(self) -> None:
         observed: dict[str, object] = {}
 
-        def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        def runner(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
             observed.update(kwargs)
             return subprocess.CompletedProcess(command, 0, b"ok", b"")
 
@@ -83,6 +86,38 @@ class WindowsNativeCliTests(unittest.TestCase):
         self.assertEqual("COMPLETED", result.status)
         self.assertEqual(expected, json.loads(result.stdout))
 
+    def test_persistent_process_uses_same_native_argv_boundary(self) -> None:
+        observed: dict[str, object] = {}
+        sentinel = object()
+
+        def opener(command: list[str], **kwargs: object):
+            observed["command"] = command
+            observed.update(kwargs)
+            return sentinel
+
+        process = open_native_cli(
+            NativeCliRequest(
+                executable=Path(sys.executable),
+                arguments=("app-server", "--listen", "stdio://"),
+                cwd=ROOT,
+                environment={"UNIVERSE_TEST": "1"},
+            ),
+            opener=opener,
+        )
+
+        self.assertIs(sentinel, process)
+        self.assertEqual(
+            [
+                str(Path(sys.executable).resolve()),
+                "app-server",
+                "--listen",
+                "stdio://",
+            ],
+            observed["command"],
+        )
+        self.assertFalse(observed["shell"])
+        self.assertEqual("1", observed["env"]["UNIVERSE_TEST"])
+
     def test_shell_entrypoints_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             command = Path(temp) / "unsafe.cmd"
@@ -90,34 +125,34 @@ class WindowsNativeCliTests(unittest.TestCase):
             with self.assertRaisesRegex(NativeCliError, "shell and batch"):
                 run_native_cli(NativeCliRequest(executable=command))
 
-    def test_grok_dispatch_uses_prompt_file_and_structured_argv(self) -> None:
+    def test_grok_dispatch_uses_acp_inside_task_frame(self) -> None:
         native_requests: list[NativeCliRequest] = []
         task_frame_payloads: list[tuple[str, dict[str, object]]] = []
         observed_prompt = ""
 
         def native_runner(request: NativeCliRequest) -> NativeCliResult:
-            nonlocal observed_prompt
             native_requests.append(request)
             if request.arguments == ("--version",):
                 return completed("grok 0.2.112")
-            arguments = list(request.arguments)
-            prompt_path = Path(arguments[arguments.index("--prompt-file") + 1])
-            observed_prompt = prompt_path.read_text(encoding="utf-8")
-            self.assertNotIn("-p", arguments)
-            self.assertIn("--json-schema", arguments)
-            return completed(
-                json.dumps(
+            raise AssertionError("provider execution must use ACP, not native CLI")
+
+        class FakeGrokAcpSession:
+            def __init__(self, *, session_observer, **_kwargs) -> None:
+                self.session_ref = "grok-acp:grok-session"
+                session_observer("grok-session")
+
+            def prompt(self, text: str, _on_delta) -> str:
+                nonlocal observed_prompt
+                observed_prompt = text
+                return json.dumps(
                     {
-                        "structuredOutput": {
-                            "schema": "example.output.v1",
-                            "value": "bounded",
-                        },
-                        "sessionId": "grok-session",
-                        "requestId": "grok-request",
-                        "stopReason": "EndTurn",
+                        "schema": "example.output.v1",
+                        "value": "bounded",
                     }
                 )
-            )
+
+            def close(self) -> None:
+                return None
 
         def post(
             _: str,
@@ -177,9 +212,15 @@ class WindowsNativeCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             executable = Path(temp) / "grok.exe"
             executable.write_bytes(b"MZ")
-            with patch(
-                "universe_runtime_worker_dispatch._resolve_grok",
-                return_value=(executable, {"GROK_HOME": temp}),
+            with (
+                patch(
+                    "universe_runtime_worker_dispatch._resolve_grok",
+                    return_value=(executable, {"GROK_HOME": temp}),
+                ),
+                patch(
+                    "universe_runtime_worker_dispatch.GrokAcpSession",
+                    FakeGrokAcpSession,
+                ),
             ):
                 result = RuntimeWorkerDispatcher(
                     ROOT,
@@ -193,7 +234,7 @@ class WindowsNativeCliTests(unittest.TestCase):
             result["structured_result"],
         )
         self.assertIn('"summary":"첫 줄\\nsecond line"', observed_prompt)
-        self.assertEqual(2, len(native_requests))
+        self.assertEqual(1, len(native_requests))
         worker_result = next(
             payload
             for path, payload in task_frame_payloads
