@@ -2478,6 +2478,176 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("CONTEXT_PACK_NODE_UNKNOWN", rejected["error_code"])
 
+    def test_selected_skill_plan_is_bound_to_master_context_once(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
+        self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            self.skill_observation_candidate(),
+            self.token,
+        )
+        _, pack_result = self.request(
+            "POST",
+            "/v1/projects/GCS/context-packs",
+            {
+                "purpose": "Review the broker integration contract.",
+                "node_ids": ["broker-client"],
+            },
+            self.token,
+        )
+        _, plan_result = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-plan-proposals",
+            {
+                "context_pack_id": pack_result["context_pack"]["context_pack_id"],
+                "purpose": "Review the broker integration contract.",
+            },
+            self.token,
+        )
+        proposal = plan_result["proposal"]
+        candidate = proposal["candidates"][0]
+        _, adoption_result = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-plan-adoptions",
+            {
+                "proposal_id": proposal["proposal_id"],
+                "candidate_ids": [candidate["candidate_id"]],
+                "approval": "ADOPTED",
+            },
+            self.token,
+        )
+        adoption = adoption_result["adoption"]
+        _, handoff_result = self.request(
+            "POST",
+            "/v1/projects/GCS/master-handoffs",
+            {
+                "source": {
+                    "kind": "SKILL_PLAN",
+                    "adoption_id": adoption["adoption_id"],
+                }
+            },
+            self.token,
+        )
+        handoff = handoff_result["handoff"]
+        _, bridge_result = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        bridge = bridge_result["bridge"]
+        application_delivery = {
+            "schema": "universe.project-master-skill-plan-apply-delivery-receipt.v1",
+            "status": "DELIVERED",
+            "project_id": "GCS",
+            "handoff_id": handoff["handoff_id"],
+            "endpoint": bridge["endpoint"],
+            "host_response": {
+                "schema": "universe.project-skill-plan-master-receipt.v1",
+                "status": "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
+                "project_id": "GCS",
+                "handoff_id": handoff["handoff_id"],
+                "adoption_id": adoption["adoption_id"],
+                "selection_digest": adoption["selection_digest"],
+                "context_digest": "3" * 64,
+                "binding_state": "PROJECT_MASTER_CONTEXT_BOUND",
+                "skill_ref_resolution": "REQUIRED",
+                "task_frame_binding": "NOT_CREATED",
+                "repository_write": False,
+                "receipt_digest": "4" * 64,
+                "binding_proposal": {
+                    "schema": "universe.project-master-skill-binding-proposal.v1",
+                    "status": "PROJECT_SKILL_BINDING_PROPOSAL_READY",
+                    "project_id": "GCS",
+                    "handoff_id": handoff["handoff_id"],
+                    "adoption_id": adoption["adoption_id"],
+                    "context_digest": "3" * 64,
+                    "binding_state": "PROJECT_MASTER_BINDING_PROPOSED",
+                    "skill_bindings": [
+                        {
+                            "skill_id": "source-review",
+                            "skill_version": "1.0.0",
+                            "skill_ref": ".ai/skills/common/source-review/SKILL.md",
+                            "context_pack_digest": "c" * 64,
+                            "operation_class": "READ",
+                        }
+                    ],
+                    "resolution_evidence": [],
+                    "approval_required": True,
+                    "task_frame_started": False,
+                    "authority_created": False,
+                    "execution_assignment_created": False,
+                    "repository_write": False,
+                    "next_operation": "TASK_FRAME_PROPOSAL_REQUIRED",
+                    "proposal_digest": "5" * 64,
+                    "proposal_id": "skillbind_" + "5" * 24,
+                },
+            },
+            "delivered_at": "2026-07-30T10:00:00Z",
+        }
+        message_delivery = {
+            "status": "DELIVERED",
+            "bridge_id": bridge["bridge_id"],
+            "project_id": "GCS",
+            "message_id": "bridge-created-placeholder",
+            "delivered_at": "2026-07-30T10:00:01Z",
+        }
+
+        with (
+            patch(
+                "universe_server.HttpProjectMasterBridge.apply_skill_plan",
+                return_value=application_delivery,
+            ) as apply_skill_plan,
+            patch(
+                "universe_server.HttpProjectMasterBridge.deliver",
+                return_value=message_delivery,
+            ) as deliver,
+        ):
+            status, first = self.request(
+                "POST",
+                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}/deliver",
+                {"approval": "DELIVER"},
+                self.token,
+            )
+            status_repeated, repeated = self.request(
+                "POST",
+                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}/deliver",
+                {"approval": "DELIVER"},
+                self.token,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual(200, status_repeated)
+        self.assertEqual("PROJECT_MASTER_HANDOFF_DELIVERED", first["status"])
+        self.assertEqual(
+            "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
+            first["skill_plan_application"]["status"],
+        )
+        self.assertEqual(
+            "PROJECT_MASTER_HANDOFF_ALREADY_DELIVERED",
+            repeated["status"],
+        )
+        self.assertEqual(
+            first["skill_plan_application"]["application_digest"],
+            repeated["skill_plan_application"]["application_digest"],
+        )
+        self.assertEqual(1, apply_skill_plan.call_count)
+        self.assertEqual(1, deliver.call_count)
+        approval = apply_skill_plan.call_args.kwargs["approval"]
+        self.assertEqual(handoff["handoff_digest"], approval["handoff_digest"])
+        self.assertEqual(adoption["selection_digest"], approval["selection_digest"])
+        stored = self.server.store.get_skill_plan_master_application(
+            "GCS",
+            handoff["handoff_id"],
+        )
+        self.assertIsNotNone(stored)
+
     def test_skill_plan_ranks_skill_model_provider_candidates_from_bench(self) -> None:
         self.assertEqual(
             "GROK",
@@ -2962,9 +3132,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
     def test_seed_asset_apply_routes_exact_approval_to_project_master(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
-        self.request(
-            "POST", "/v1/projects/GCS/seed", self.project_seed(), self.token
-        )
+        self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
         _, prepared = self.request(
             "GET", "/v1/projects/GCS/seed-asset-proposal", token=self.token
         )
@@ -3013,9 +3181,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(200, status)
-        self.assertEqual(
-            "PROJECT_SEED_ASSET_APPLICATION_DELIVERED", result["status"]
-        )
+        self.assertEqual("PROJECT_SEED_ASSET_APPLICATION_DELIVERED", result["status"])
         self.assertEqual("APPROVED", result["approval"]["status"])
         self.assertEqual(proposal["proposal_id"], result["approval"]["proposal_id"])
         self.assertTrue(
@@ -3027,9 +3193,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
     def test_seed_asset_apply_rejects_stale_proposal_before_host_call(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
-        self.request(
-            "POST", "/v1/projects/GCS/seed", self.project_seed(), self.token
-        )
+        self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
 
         with patch.object(self.server, "ensure_project_master") as ensure:
             status, result = self.request(

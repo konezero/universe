@@ -151,7 +151,8 @@ an LLM may propose a bounded Skill Plan from the Context Pack.
 purpose and project node
   -> candidate Skills with contracts and Bench rationale
   -> user adopts or changes the plan
-  -> Project Master binds selected Skills to Task Frames
+  -> Universe binds the adopted plan to Project Master planning context
+  -> Project Master resolves local Skill refs and proposes Task Frame bindings
 ```
 
 Skill Catalog records include `skill_id`, version, input/output contract,
@@ -166,6 +167,17 @@ exposed with the proposal, and every item remains `CANDIDATE_ONLY` with explicit
 user selection and Project Master binding required. A Task Worker runs only
 Skills bound by its Project Master and may request a replacement only as a
 candidate.
+
+Explicit handoff delivery stores the adopted plan in the resident Project
+Master's file-backed session database. The stored context preserves Skill,
+model, provider, operation-class, and Context Pack coordinates. It deliberately
+records the incoming project-local `skill_ref` as `UNRESOLVED`, then the
+Project Master resolves each Skill against exactly one installed
+`.ai/skills/**/<skill_id>/SKILL.md`. The resulting passive binding proposal
+contains the project-relative Skill ref and file digest. Missing or duplicate
+installed refs block application. This step creates no Task Frame, authority,
+assignment, repository write, or execution permission. Delivery is digest-bound
+and idempotent across Universe and Project Master stores.
 
 ## Project Master Handoff
 
@@ -295,8 +307,10 @@ relations remain distinct from observed evidence. Career adoption is separate.
    Frame or Universe persistence.
 3. Assemble Context Packs and propose Skill Plans from selected routes.
    Initial Project-local Context Pack assembly, Skill Plan proposal, and
-   explicit adoption record are implemented. Cross-project applicability and
-   Project Master handoff delivery remain follow-ups.
+   explicit adoption record are implemented. Adopted plans can be delivered
+   once into durable Project Master planning context, where installed
+   project-local Skill refs are resolved into a passive binding proposal.
+   Cross-project applicability remains a follow-up.
 4. Add Project-side Task Frame SkillRunObservation publication as an
    ai-career/Core Runtime follow-up. The redacted candidate preparation
    surface and Boss-bound Result Packet persistence are implemented; a provider
@@ -312,8 +326,11 @@ relations remain distinct from observed evidence. Career adoption is separate.
    preparation and receipt-aware Project Master application are implemented.
    Release DB `OS_INSTALL`/`OS_UPDATE` planning, exact approval, independent
    Project Lifecycle Host application, and durable idempotent receipts are
-   implemented. Selected Skill Plan application remains a separate Project
-   Host integration.
+   implemented. Selected Skill Plan delivery to Project Master planning context
+   and project-local Skill ref resolution are implemented. Creating the actual
+   ai-career Task Frame execution proposal remains a later Master action because
+   it requires current Anchor, Session, Frame, Assignment, and Host capability
+   coordinates.
 7. Add Experience and causal comparison only after observed Skill data exists.
 8. Add display-language localization for the Universe UI. Localization is a
    presentation-layer follow-up: canonical Mode, Role, state, schema, provider,

@@ -310,6 +310,16 @@ only the observations contained in that Context Pack. Explicit `ADOPTED`
 selection records a handoff candidate for the Project Master, but does not bind
 a Skill, start a Task Frame, create authority, or deliver a dispatch.
 
+When the user later sends the handoff with explicit `DELIVER`, Universe first
+applies the exact adopted plan to the registered resident Project Master. The
+Project Master stores it in its file-backed session database as planning
+context. It resolves every candidate against exactly one installed
+`.ai/skills/**/<skill_id>/SKILL.md` and stores a passive binding proposal with
+the project-relative ref and Skill file digest. Universe then stores the
+matching application receipt and sends the visible Project Room message.
+Repeating the same delivery reuses all records and does not apply the plan or
+send the message again.
+
 ## Release and dispatch boundary
 
 Release import verifies both database and manifest, then copies the immutable
@@ -621,5 +631,8 @@ adoption before any Project Master handoff.
 A Project Master handoff only accepts an already adopted Fresh Project
 Composition or project-local Skill Plan. It is recorded as `PROPOSAL_ONLY`.
 An explicit `DELIVER` request is required before Universe writes a room message
-to the registered Master bridge. Delivery creates neither a Task Frame nor
-project write authority; the Project Master must make any later proposal.
+to the registered Master bridge. For a Skill Plan, the same request first binds
+the exact adopted plan to durable Project Master planning context. Delivery
+creates neither a Task Frame nor project write authority; the Project Master
+must use current Runtime coordinates and explicit approval for any later Task
+Frame proposal.

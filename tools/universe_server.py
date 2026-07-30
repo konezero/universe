@@ -50,6 +50,10 @@ from project_seed_assets import (
     project_seed_template,
 )
 from project_seed_apply import build_project_seed_asset_approval
+from project_skill_plan_apply import (
+    ProjectSkillPlanApplyError,
+    build_project_skill_plan_approval,
+)
 from project_release_apply import (
     ProjectReleaseApplyError,
     apply_project_release_proposal,
@@ -134,6 +138,9 @@ FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA = (
 FRESH_PROJECT_REFINEMENT_RUN_SCHEMA = "universe.fresh-project-refinement-run.v1"
 PLANNING_RUNTIME_BINDING_SCHEMA = "universe.planning-runtime-binding.v1"
 PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
+PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA = (
+    "universe.project-skill-plan-master-application.v1"
+)
 PROJECT_ARCHIVE_RECEIPT_CANDIDATE_SCHEMA = (
     "universe.project-archive-receipt-candidate.v1"
 )
@@ -1656,9 +1663,7 @@ def normalize_project_seed_asset_apply_request(value: Any) -> dict[str, str]:
     return {
         "approval": "APPROVED",
         "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
-        "proposal_digest": _sha256(
-            request["proposal_digest"], "proposal_digest"
-        ),
+        "proposal_digest": _sha256(request["proposal_digest"], "proposal_digest"),
     }
 
 
@@ -1677,9 +1682,7 @@ def normalize_project_release_apply_request(value: Any) -> dict[str, str]:
     return {
         "approval": "APPROVED",
         "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
-        "proposal_digest": _sha256(
-            request["proposal_digest"], "proposal_digest"
-        ),
+        "proposal_digest": _sha256(request["proposal_digest"], "proposal_digest"),
     }
 
 
@@ -3231,6 +3234,25 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_master_handoff_project_time
                 ON project_master_handoff(project_id, created_at, handoff_id);
+
+                CREATE TABLE IF NOT EXISTS project_skill_plan_master_application (
+                    handoff_id TEXT PRIMARY KEY
+                        REFERENCES project_master_handoff(handoff_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE,
+                    approval_digest TEXT NOT NULL,
+                    application_digest TEXT NOT NULL UNIQUE,
+                    application_json TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_skill_plan_application_project_time
+                ON project_skill_plan_master_application(
+                    project_id, applied_at, handoff_id
+                );
 
                 CREATE TABLE IF NOT EXISTS experience_case (
                     case_id TEXT PRIMARY KEY,
@@ -5535,6 +5557,133 @@ class UniverseStore:
             ).fetchall()
         return [self._master_handoff_row(row) for row in rows]
 
+    def get_skill_plan_master_application(
+        self,
+        project_id: str,
+        handoff_id: str,
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        normalized_handoff_id = _identifier(handoff_id, "handoff_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT application_json, applied_at
+                FROM project_skill_plan_master_application
+                WHERE project_id = ? AND handoff_id = ?
+                """,
+                (project["project_id"], normalized_handoff_id),
+            ).fetchone()
+        if row is None:
+            return None
+        application = json.loads(row["application_json"])
+        application["applied_at"] = row["applied_at"]
+        return application
+
+    def record_skill_plan_master_application(
+        self,
+        *,
+        project_id: str,
+        handoff: Mapping[str, Any],
+        approval: Mapping[str, Any],
+        delivery: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        source = handoff.get("source")
+        if (
+            not isinstance(source, Mapping)
+            or source.get("kind") != "SKILL_PLAN"
+            or handoff.get("project_id") != project["project_id"]
+        ):
+            raise UniverseError(
+                "PROJECT_SKILL_PLAN_APPLICATION_INVALID",
+                "handoff is not an adopted Skill Plan for this Project",
+                HTTPStatus.CONFLICT,
+            )
+        adoption = source.get("adoption")
+        if not isinstance(adoption, Mapping):
+            raise UniverseError(
+                "PROJECT_SKILL_PLAN_APPLICATION_INVALID",
+                "handoff has no adopted Skill Plan payload",
+                HTTPStatus.CONFLICT,
+            )
+        host_response = delivery.get("host_response")
+        binding_proposal = (
+            host_response.get("binding_proposal")
+            if isinstance(host_response, Mapping)
+            else None
+        )
+        if (
+            not isinstance(host_response, Mapping)
+            or host_response.get("status")
+            != "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT"
+            or host_response.get("project_id") != project["project_id"]
+            or host_response.get("handoff_id") != handoff.get("handoff_id")
+            or host_response.get("adoption_id") != adoption.get("adoption_id")
+            or not isinstance(binding_proposal, Mapping)
+            or binding_proposal.get("status") != "PROJECT_SKILL_BINDING_PROPOSAL_READY"
+            or binding_proposal.get("project_id") != project["project_id"]
+            or binding_proposal.get("handoff_id") != handoff.get("handoff_id")
+            or binding_proposal.get("adoption_id") != adoption.get("adoption_id")
+            or binding_proposal.get("task_frame_started") is not False
+        ):
+            raise UniverseError(
+                "PROJECT_SKILL_PLAN_APPLICATION_RECEIPT_INVALID",
+                "Project Master did not return a matching Skill Plan receipt",
+                HTTPStatus.CONFLICT,
+            )
+        approval_digest = _json_sha256(dict(approval))
+        material = {
+            "schema": PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA,
+            "project_id": project["project_id"],
+            "handoff_id": handoff["handoff_id"],
+            "handoff_digest": handoff["handoff_digest"],
+            "adoption_id": adoption["adoption_id"],
+            "selection_digest": adoption["selection_digest"],
+            "approval_digest": approval_digest,
+            "delivery": dict(delivery),
+            "status": "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
+        }
+        material["application_digest"] = _json_sha256(material)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT application_json, application_digest, applied_at
+                FROM project_skill_plan_master_application
+                WHERE handoff_id = ?
+                """,
+                (handoff["handoff_id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["application_digest"] != material["application_digest"]:
+                    raise UniverseError(
+                        "PROJECT_SKILL_PLAN_APPLICATION_CONFLICT",
+                        "handoff already has a different Master application",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored = json.loads(existing["application_json"])
+                stored["applied_at"] = existing["applied_at"]
+                return stored, False
+            applied_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO project_skill_plan_master_application(
+                    handoff_id, project_id, adoption_id, approval_digest,
+                    application_digest, application_json, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    handoff["handoff_id"],
+                    project["project_id"],
+                    adoption["adoption_id"],
+                    approval_digest,
+                    material["application_digest"],
+                    _canonical_json(material),
+                    applied_at,
+                ),
+            )
+        material["applied_at"] = applied_at
+        return material, True
+
     def create_experience_case(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -7464,12 +7613,15 @@ class UniverseStore:
         proposal_id = _identifier(proposal.get("proposal_id"), "proposal_id")
         release_id = _identifier(proposal.get("release_id"), "release_id")
         normalized_approval = _sha256(approval_digest, "approval_digest")
-        application_id = "release_application_" + _json_sha256(
-            {
-                "proposal_id": proposal_id,
-                "approval_digest": normalized_approval,
-            }
-        )[:24]
+        application_id = (
+            "release_application_"
+            + _json_sha256(
+                {
+                    "proposal_id": proposal_id,
+                    "approval_digest": normalized_approval,
+                }
+            )[:24]
+        )
         applied_at = utc_now()
         stored_receipt = dict(receipt)
         with self._connection() as connection:
@@ -8302,6 +8454,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._planning_binding_lock = threading.RLock()
         self.planning_execution_lock = threading.Lock()
         self.project_release_application_lock = threading.Lock()
+        self.project_skill_plan_application_lock = threading.Lock()
         self._conductor_queue: queue.Queue[str | None] = queue.Queue()
         self._conductor_queued_ids: set[str] = set()
         self._conductor_queue_lock = threading.RLock()
@@ -8312,9 +8465,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if auto_start_conductor_runtime:
             factory = conductor_runtime_factory or UniverseConductorRuntime
             try:
-                self.conductor_runtime = factory(
-                    Path(__file__).resolve().parents[1]
-                )
+                self.conductor_runtime = factory(Path(__file__).resolve().parents[1])
                 self._planning_binding = normalize_planning_runtime_binding(
                     self.conductor_runtime.start()
                 )
@@ -8505,6 +8656,74 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "delivery": delivery,
         }
 
+    def deliver_master_handoff(
+        self,
+        project_id: str,
+        handoff_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
+        request = normalize_master_handoff_delivery_request(value)
+        with self.project_skill_plan_application_lock:
+            handoff = self.store.get_master_handoff(project_id, handoff_id)
+            application = None
+            source = handoff.get("source")
+            if isinstance(source, Mapping) and source.get("kind") == "SKILL_PLAN":
+                application = self.store.get_skill_plan_master_application(
+                    project_id,
+                    handoff_id,
+                )
+                if application is None:
+                    try:
+                        self.ensure_project_master(project_id)
+                        bridge = self.store.get_master_bridge(project_id)
+                        approval_evidence_ref = (
+                            "universe://projects/"
+                            + quote(project_id, safe="")
+                            + "/master-handoffs/"
+                            + quote(handoff_id, safe="")
+                            + "/approvals/"
+                            + _json_sha256(request)[:24]
+                        )
+                        approval = build_project_skill_plan_approval(
+                            project_id=project_id,
+                            handoff=handoff,
+                            evidence_ref=approval_evidence_ref,
+                        )
+                        delivery = HttpProjectMasterBridge(
+                            endpoint=bridge["endpoint"],
+                            credential_env=bridge["credential_env"],
+                            timeout_seconds=60,
+                        ).apply_skill_plan(
+                            bridge=bridge,
+                            handoff=handoff,
+                            approval=approval,
+                        )
+                        application, _ = (
+                            self.store.record_skill_plan_master_application(
+                                project_id=project_id,
+                                handoff=handoff,
+                                approval=approval,
+                                delivery=delivery,
+                            )
+                        )
+                    except (
+                        DispatchError,
+                        OSError,
+                        ProjectMasterHostError,
+                        ProjectSkillPlanApplyError,
+                    ) as error:
+                        raise UniverseError(
+                            "PROJECT_SKILL_PLAN_APPLICATION_BLOCKED",
+                            str(error),
+                            HTTPStatus.CONFLICT,
+                        ) from error
+            delivered_handoff, delivered = self.store.deliver_master_handoff(
+                project_id,
+                handoff_id,
+                request,
+            )
+        return delivered_handoff, delivered, application
+
     def apply_project_release(
         self,
         project_id: str,
@@ -8550,9 +8769,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             ) from error
         approval_digest = _json_sha256(approval)
-        existing = self.store.get_project_release_application(
-            proposal["proposal_id"]
-        )
+        existing = self.store.get_project_release_application(proposal["proposal_id"])
         if existing is not None:
             if existing["approval_digest"] != approval_digest:
                 raise UniverseError(
@@ -8570,9 +8787,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }
 
         project = self.store.get_project(project_id)
-        artifact = self.store.get_release_artifact_binding(
-            proposal["release_id"]
-        )
+        artifact = self.store.get_release_artifact_binding(proposal["release_id"])
         resident_stopped = False
         if self.project_master_hosts is not None:
             resident_stopped = self.project_master_hosts.stop(project_id)
@@ -8844,9 +9059,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     ) -> str:
         normalized = str(selected or "AUTO").strip().upper()
         candidates = (
-            [normalized]
-            if normalized in {"GROK", "CODEX"}
-            else ["GROK", "CODEX"]
+            [normalized] if normalized in {"GROK", "CODEX"} else ["GROK", "CODEX"]
         )
         unavailable: list[str] = []
         for provider in candidates:
@@ -9661,20 +9874,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             handoff_parts = self._master_handoff_path(path)
             if handoff_parts is not None and handoff_parts[1] == "/deliver":
-                handoff, delivered = self.server.store.deliver_master_handoff(
+                handoff, delivered, application = self.server.deliver_master_handoff(
                     handoff_parts[0], handoff_parts[1 + 1], body
                 )
+                result = {
+                    "schema": API_SCHEMA,
+                    "status": (
+                        "PROJECT_MASTER_HANDOFF_DELIVERED"
+                        if delivered
+                        else "PROJECT_MASTER_HANDOFF_ALREADY_DELIVERED"
+                    ),
+                    "handoff": handoff,
+                }
+                if application is not None:
+                    result["skill_plan_application"] = application
                 self._send(
                     HTTPStatus.OK,
-                    {
-                        "schema": API_SCHEMA,
-                        "status": (
-                            "PROJECT_MASTER_HANDOFF_DELIVERED"
-                            if delivered
-                            else "PROJECT_MASTER_HANDOFF_ALREADY_DELIVERED"
-                        ),
-                        "handoff": handoff,
-                    },
+                    result,
                 )
                 return
             parts = self._project_path(path)
@@ -9684,19 +9900,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.set_project_provider_setting(parts[0], body),
                 )
                 return
-            if (
-                parts is not None
-                and parts[1] == "/seed-asset-proposal/apply"
-            ):
+            if parts is not None and parts[1] == "/seed-asset-proposal/apply":
                 self._send(
                     HTTPStatus.OK,
                     self.server.apply_project_seed_assets(parts[0], body),
                 )
                 return
-            if (
-                parts is not None
-                and parts[1] == "/release-proposals/apply"
-            ):
+            if parts is not None and parts[1] == "/release-proposals/apply":
                 self._send(
                     HTTPStatus.OK,
                     self.server.apply_project_release(parts[0], body),

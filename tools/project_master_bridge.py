@@ -85,6 +85,9 @@ class ProjectMasterBridgeHost:
             "PROJECT_SEED_ASSET_MUTATION_GATEWAY_UNAVAILABLE"
         )
 
+    def apply_skill_plan(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError("PROJECT_SKILL_PLAN_CONTEXT_GATEWAY_UNAVAILABLE")
+
     def _inbox(self) -> Path:
         root = self.project_root.expanduser().resolve(strict=True)
         if not root.is_dir():
@@ -128,6 +131,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             (
                 "/v1/project-master/seed-assets/apply"
             ): self.server.bridge_host.apply_seed_assets,
+            (
+                "/v1/project-master/skill-plans/apply"
+            ): self.server.bridge_host.apply_skill_plan,
         }
         operation = routes.get(self.path)
         if operation is None:
@@ -152,11 +158,12 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
         ) as error:
             self._send_error(HTTPStatus.BAD_REQUEST, str(error))
             return
-        status = (
-            HTTPStatus.CREATED
-            if receipt["status"] in {"RECORDED", "PROJECT_SEED_ASSETS_APPLIED"}
-            else HTTPStatus.OK
-        )
+        created = receipt["status"] in {
+            "RECORDED",
+            "PROJECT_SEED_ASSETS_APPLIED",
+            "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
+        } and not receipt.get("idempotent_replay", False)
+        status = HTTPStatus.CREATED if created else HTTPStatus.OK
         self._send_json(status, receipt)
 
     def log_message(self, _format: str, *_args: object) -> None:

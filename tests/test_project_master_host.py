@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -13,9 +14,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from project_master_bridge import MASTER_BRIDGE_ENVELOPE_SCHEMA  # noqa: E402
+from project_master_bridge import (  # noqa: E402
+    MASTER_BRIDGE_ENVELOPE_SCHEMA,
+    ProjectMasterBridgeError,
+)
 from project_seed_apply import build_project_seed_asset_approval  # noqa: E402
 from project_seed_assets import build_project_seed_asset_proposal  # noqa: E402
+from project_skill_plan_apply import build_project_skill_plan_approval  # noqa: E402
 from project_master_host import (  # noqa: E402
     CodexProjectMasterRuntime,
     GrokProjectMasterRuntime,
@@ -27,6 +32,69 @@ from project_master_host import (  # noqa: E402
     ResidentProjectMasterHostManager,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _skill_plan_handoff() -> dict[str, Any]:
+    adoption: dict[str, Any] = {
+        "schema": "universe.project-skill-plan-adoption.v1",
+        "project_id": "GCS",
+        "proposal_id": "skillplan_host_test",
+        "proposal_digest": "1" * 64,
+        "context_pack_id": "context_host_test",
+        "selected_candidates": [
+            {
+                "candidate_id": "skill_candidate_host_test",
+                "skill": {
+                    "skill_id": "source-review",
+                    "skill_version": "1.0.0",
+                    "operation_class": "READ",
+                    "context_pack_digest": "2" * 64,
+                },
+                "model_ref": "provider://OPENAI/model/gpt-test",
+                "provider_ref": "OPENAI",
+            }
+        ],
+        "binding_state": "PROJECT_MASTER_BINDING_REQUIRED",
+        "effects": {
+            "project_source_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame": "NONE",
+        },
+        "next_operation": "PROJECT_MASTER_HANDOFF_CANDIDATE",
+    }
+    adoption["selection_digest"] = _digest(adoption)
+    adoption["adoption_id"] = "skilladopt_" + adoption["selection_digest"][:24]
+    adoption["status"] = "SKILL_PLAN_ADOPTED"
+    handoff: dict[str, Any] = {
+        "schema": "universe.project-master-handoff.v1",
+        "project_id": "GCS",
+        "source": {"kind": "SKILL_PLAN", "adoption": adoption},
+        "delivery_state": "PROPOSAL_ONLY",
+        "effects": {
+            "project_source_write": "NONE",
+            "project_runtime_write": "NONE",
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame": "NONE",
+        },
+        "next_operation": "USER_APPROVAL_REQUIRED_FOR_MASTER_DELIVERY",
+    }
+    handoff["handoff_digest"] = _digest(handoff)
+    handoff["handoff_id"] = "handoff_" + handoff["handoff_digest"][:24]
+    handoff["status"] = "PROJECT_MASTER_HANDOFF_PROPOSAL_READY"
+    return handoff
 
 
 class FakeProvider:
@@ -62,9 +130,7 @@ class FakeSurfaceObserver:
     def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
         self.messages.append(dict(message))
         if self.fail:
-            raise ProjectMasterHostError(
-                "PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED"
-            )
+            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
         return {
             "status": "COMMANDER_INPUT_OBSERVED",
             "anchor_mode": "MASTER",
@@ -193,6 +259,99 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         self.assertEqual("PROJECT_SEED_ASSETS_APPLIED", receipt["status"])
         self.assertEqual(5, len(self.surface_observer.mutations))
+
+    def test_live_bridge_binds_skill_plan_context_idempotently(self) -> None:
+        skill = self.root / ".ai" / "skills" / "common" / "source-review" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            "---\nname: source-review\n---\n\n# Source Review\n",
+            encoding="utf-8",
+        )
+        worker = self._worker()
+        host = LiveProjectMasterBridgeHost(
+            self.root,
+            "bridge-token",
+            ".ai/master/inbox",
+            worker,
+            self.surface_observer,
+        )
+        handoff = _skill_plan_handoff()
+        approval = build_project_skill_plan_approval(
+            project_id="GCS",
+            handoff=handoff,
+            evidence_ref="universe://projects/GCS/skill-plan-approval/host-test",
+        )
+        request = {
+            "project_id": "GCS",
+            "handoff": handoff,
+            "approval": approval,
+        }
+
+        first = host.apply_skill_plan(request)
+        repeated = host.apply_skill_plan(request)
+        worker.start()
+        try:
+            host.record(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(
+            "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
+            first["status"],
+        )
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(repeated["idempotent_replay"])
+        self.assertEqual(1, len(self.state.skill_plan_contexts()))
+        context = self.provider.messages[0]["skill_plan_context"][0]
+        self.assertEqual("PROJECT_MASTER_CONTEXT_BOUND", context["binding_state"])
+        self.assertEqual("UNRESOLVED", context["binding_candidates"][0]["skill_ref"])
+        self.assertEqual("NOT_CREATED", context["task_frame_binding"])
+        proposal = self.provider.messages[0]["skill_binding_proposals"][0]
+        self.assertEqual(
+            "PROJECT_SKILL_BINDING_PROPOSAL_READY",
+            proposal["status"],
+        )
+        self.assertEqual(
+            ".ai/skills/common/source-review/SKILL.md",
+            proposal["skill_bindings"][0]["skill_ref"],
+        )
+        self.assertFalse(proposal["task_frame_started"])
+        self.assertEqual(
+            proposal["proposal_id"],
+            first["binding_proposal"]["proposal_id"],
+        )
+
+    def test_skill_plan_is_not_stored_when_local_skill_is_unavailable(self) -> None:
+        worker = self._worker()
+        host = LiveProjectMasterBridgeHost(
+            self.root,
+            "bridge-token",
+            ".ai/master/inbox",
+            worker,
+            self.surface_observer,
+        )
+        handoff = _skill_plan_handoff()
+        approval = build_project_skill_plan_approval(
+            project_id="GCS",
+            handoff=handoff,
+            evidence_ref="universe://projects/GCS/skill-plan-approval/missing-skill",
+        )
+
+        with self.assertRaisesRegex(
+            ProjectMasterBridgeError,
+            "installed Project Skill root is unavailable",
+        ):
+            host.apply_skill_plan(
+                {
+                    "project_id": "GCS",
+                    "handoff": handoff,
+                    "approval": approval,
+                }
+            )
+
+        self.assertEqual([], self.state.skill_plan_contexts())
+        self.assertEqual([], self.state.skill_binding_proposals())
 
     def test_pending_message_is_recovered_after_host_restart(self) -> None:
         self.assertTrue(self.state.register(self._envelope()))
@@ -346,9 +505,7 @@ class ProjectMasterHostTests(unittest.TestCase):
     def test_project_mode_coordinator_prepares_and_observes_universe_surface(
         self,
     ) -> None:
-        runtime_cli = (
-            self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
-        )
+        runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
         registry = (
@@ -379,9 +536,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             payload = (
                 {
                     "status": "SESSION_PREPARED",
-                    "mode_current_anchor": {
-                        "status": "MODE_CURRENT_ANCHOR_OBSERVED"
-                    },
+                    "mode_current_anchor": {"status": "MODE_CURRENT_ANCHOR_OBSERVED"},
                 }
                 if "prepare-session" in request.arguments
                 else {"status": "COMMANDER_INPUT_OBSERVED"}

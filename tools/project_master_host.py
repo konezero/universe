@@ -32,6 +32,15 @@ from project_master_bridge import (
 )
 from project_seed_apply import apply_project_seed_asset_proposal
 from project_seed_assets import ProjectSeedAssetError
+from project_skill_binding import (
+    ProjectSkillBindingError,
+    build_project_skill_binding_proposal,
+)
+from project_skill_plan_apply import (
+    ProjectSkillPlanApplyError,
+    build_project_skill_plan_context,
+    project_skill_plan_receipt,
+)
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -82,11 +91,7 @@ class ProjectModeCoordinator:
         self.native_runner = native_runner
         self.source_commit_resolver = source_commit_resolver or self._git_head
         self.runtime_cli = (
-            self.project_root
-            / ".ai"
-            / "runtime"
-            / "reference_runtime"
-            / "cli.py"
+            self.project_root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         )
         if not self.runtime_cli.is_file():
             raise ProjectMasterHostError("PROJECT_RUNTIME_CLI_UNAVAILABLE")
@@ -102,9 +107,7 @@ class ProjectModeCoordinator:
         request = {
             "command": "BOOT",
             "source_state": "SOURCE_READY",
-            "source_ref": (
-                f"git-object-database://{self.project_id}@{source_commit}"
-            ),
+            "source_ref": (f"git-object-database://{self.project_id}@{source_commit}"),
             "source_commit": source_commit,
             "source_repository": str(self.project_root),
             "mode": "MASTER",
@@ -143,9 +146,7 @@ class ProjectModeCoordinator:
             {
                 "mode": "MASTER",
                 "commander_surface": "UNIVERSE_UI",
-                "evidence_ref": (
-                    f"universe://project-room/messages/{message_id}"
-                ),
+                "evidence_ref": (f"universe://project-room/messages/{message_id}"),
             },
         )
         if result.get("status") != "COMMANDER_INPUT_OBSERVED":
@@ -307,7 +308,9 @@ class ProjectModeCoordinator:
             prepared = self._prepared or dict(self.prepare())
             anchor = prepared.get("mode_current_anchor")
             snapshot = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
-            payload = snapshot.get("snapshot") if isinstance(snapshot, Mapping) else None
+            payload = (
+                snapshot.get("snapshot") if isinstance(snapshot, Mapping) else None
+            )
             anchor_id = (
                 _text(payload.get("anchor_id"), "mode_current_anchor.anchor_id")
                 if isinstance(payload, Mapping)
@@ -368,15 +371,12 @@ class ProjectModeCoordinator:
                     or not isinstance(host_adapter, Mapping)
                     or not isinstance(runtime_state, Mapping)
                     or runtime_state.get("anchor_id") != anchor_id
-                    or runtime_state.get("executable_runtime_currentness")
-                    != "CURRENT"
+                    or runtime_state.get("executable_runtime_currentness") != "CURRENT"
                 ):
                     raise ProjectMasterHostError(
                         "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
                     )
-                endpoint = _text(
-                    host_adapter.get("endpoint"), "host_adapter.endpoint"
-                )
+                endpoint = _text(host_adapter.get("endpoint"), "host_adapter.endpoint")
                 if _text(host_adapter.get("token"), "host_adapter.token") != token:
                     raise ProjectMasterHostError(
                         "PROJECT_MASTER_RUNTIME_TOKEN_MISMATCH"
@@ -429,9 +429,7 @@ class ProjectModeCoordinator:
                 "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
             ) from error
         if not isinstance(payload, Mapping):
-            raise ProjectMasterHostError(
-                "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
-            )
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_START_RESULT_INVALID")
         return payload
 
     def _drain_runtime_stderr(self, stream: Any) -> None:
@@ -517,7 +515,9 @@ class ProjectModeCoordinator:
             result.status != "COMPLETED"
             or result.return_code != 0
             or len(source_commit) != 40
-            or any(character not in "0123456789abcdefABCDEF" for character in source_commit)
+            or any(
+                character not in "0123456789abcdefABCDEF" for character in source_commit
+            )
         ):
             raise ProjectMasterHostError("PROJECT_SOURCE_COMMIT_UNAVAILABLE")
         return source_commit.lower()
@@ -684,6 +684,147 @@ class ProjectMasterSessionStore:
             ).fetchone()
         return str(row["state"]) if row is not None else "UNKNOWN"
 
+    def apply_skill_plan_context(
+        self,
+        context: Mapping[str, Any],
+        binding_proposal: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        handoff_id = _text(context.get("handoff_id"), "handoff_id")
+        context_digest = _text(context.get("context_digest"), "context_digest")
+        proposal_digest = _text(
+            binding_proposal.get("proposal_digest"),
+            "proposal_digest",
+        )
+        encoded = json.dumps(
+            dict(context),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT context_json, context_digest, applied_at
+                FROM skill_plan_context
+                WHERE handoff_id = ?
+                """,
+                (handoff_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["context_digest"] != context_digest:
+                    raise ProjectMasterHostError("PROJECT_SKILL_PLAN_CONTEXT_CONFLICT")
+            proposal_row = connection.execute(
+                """
+                SELECT proposal_json, proposal_digest, resolved_at
+                FROM skill_binding_proposal
+                WHERE handoff_id = ?
+                """,
+                (handoff_id,),
+            ).fetchone()
+            if (
+                proposal_row is not None
+                and proposal_row["proposal_digest"] != proposal_digest
+            ):
+                raise ProjectMasterHostError("PROJECT_SKILL_BINDING_PROPOSAL_CONFLICT")
+            applied_at = (
+                str(existing["applied_at"]) if existing is not None else utc_now()
+            )
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO skill_plan_context(
+                        handoff_id, adoption_id, context_digest,
+                        context_json, applied_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        handoff_id,
+                        _text(context.get("adoption_id"), "adoption_id"),
+                        context_digest,
+                        encoded,
+                        applied_at,
+                    ),
+                )
+            if proposal_row is None:
+                connection.execute(
+                    """
+                    INSERT INTO skill_binding_proposal(
+                        handoff_id, proposal_id, proposal_digest,
+                        proposal_json, resolved_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        handoff_id,
+                        _text(binding_proposal.get("proposal_id"), "proposal_id"),
+                        proposal_digest,
+                        json.dumps(
+                            dict(binding_proposal),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        applied_at,
+                    ),
+                )
+            stored_context = (
+                json.loads(str(existing["context_json"]))
+                if existing is not None
+                else dict(context)
+            )
+            stored_proposal = (
+                json.loads(str(proposal_row["proposal_json"]))
+                if proposal_row is not None
+                else dict(binding_proposal)
+            )
+            resolved_at = (
+                str(proposal_row["resolved_at"])
+                if proposal_row is not None
+                else applied_at
+            )
+        stored_context["applied_at"] = applied_at
+        stored_proposal["resolved_at"] = resolved_at
+        return (
+            stored_context,
+            stored_proposal,
+            existing is None or proposal_row is None,
+        )
+
+    def skill_plan_contexts(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT context_json, applied_at
+                FROM skill_plan_context
+                ORDER BY applied_at DESC, handoff_id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
+        contexts = []
+        for row in reversed(rows):
+            context = json.loads(str(row["context_json"]))
+            context["applied_at"] = row["applied_at"]
+            contexts.append(context)
+        return contexts
+
+    def skill_binding_proposals(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, resolved_at
+                FROM skill_binding_proposal
+                ORDER BY resolved_at DESC, handoff_id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
+        proposals = []
+        for row in reversed(rows):
+            proposal = json.loads(str(row["proposal_json"]))
+            proposal["resolved_at"] = row["resolved_at"]
+            proposals.append(proposal)
+        return proposals
+
     def _transition(self, message_id: str, state: str, error: str) -> None:
         with self._connection() as connection:
             connection.execute(
@@ -711,6 +852,22 @@ class ProjectMasterSessionStore:
                     last_error TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS skill_plan_context (
+                    handoff_id TEXT PRIMARY KEY,
+                    adoption_id TEXT NOT NULL UNIQUE,
+                    context_digest TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS skill_binding_proposal (
+                    handoff_id TEXT PRIMARY KEY
+                        REFERENCES skill_plan_context(handoff_id)
+                        ON DELETE CASCADE,
+                    proposal_id TEXT NOT NULL UNIQUE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    proposal_json TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -718,6 +875,7 @@ class ProjectMasterSessionStore:
     def _connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         try:
@@ -908,12 +1066,24 @@ class GrokProjectMasterRuntime:
             if isinstance(runtime_context, Mapping)
             else "{}"
         )
+        skill_plan_text = json.dumps(
+            message.get("skill_plan_context", []),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        skill_binding_text = json.dumps(
+            message.get("skill_binding_proposals", []),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
             f"kind: {_text(message.get('kind'), 'message.kind')}\n"
             f"sender: {_text(message.get('sender'), 'message.sender')}\n"
             f"project_runtime_context: {context_text}\n\n"
+            f"project_skill_plan_context: {skill_plan_text}\n\n"
+            f"project_skill_binding_proposals: {skill_binding_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -1041,12 +1211,24 @@ class CodexProjectMasterRuntime:
             if isinstance(runtime_context, Mapping)
             else "{}"
         )
+        skill_plan_text = json.dumps(
+            message.get("skill_plan_context", []),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        skill_binding_text = json.dumps(
+            message.get("skill_binding_proposals", []),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
             f"kind: {_text(message.get('kind'), 'message.kind')}\n"
             f"sender: {_text(message.get('sender'), 'message.sender')}\n"
             f"project_runtime_context: {context_text}\n\n"
+            f"project_skill_plan_context: {skill_plan_text}\n\n"
+            f"project_skill_binding_proposals: {skill_binding_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -1150,8 +1332,10 @@ class ProjectMasterConversationWorker:
             emit("STARTED")
             surface_observation = self.surface_observer.observe(message)
             provider_message = dict(message)
-            provider_message["runtime_context"] = _runtime_context(
-                surface_observation
+            provider_message["runtime_context"] = _runtime_context(surface_observation)
+            provider_message["skill_plan_context"] = self.store.skill_plan_contexts()
+            provider_message["skill_binding_proposals"] = (
+                self.store.skill_binding_proposals()
             )
             stream_reply = getattr(self.provider, "reply_stream", None)
             if callable(stream_reply):
@@ -1208,9 +1392,7 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
             "proposal",
             "approval",
         }:
-            raise ProjectMasterBridgeError(
-                "PROJECT_SEED_ASSET_APPLY_REQUEST_INVALID"
-            )
+            raise ProjectMasterBridgeError("PROJECT_SEED_ASSET_APPLY_REQUEST_INVALID")
         gateway = self._coordinator
         if not callable(getattr(gateway, "apply_file", None)):
             raise ProjectMasterBridgeError(
@@ -1225,6 +1407,40 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
                 mutation_gateway=gateway,
             )
         except (ProjectSeedAssetError, ProjectMasterHostError) as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
+    def apply_skill_plan(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "project_id",
+            "handoff",
+            "approval",
+        }:
+            raise ProjectMasterBridgeError("PROJECT_SKILL_PLAN_APPLY_REQUEST_INVALID")
+        try:
+            context = build_project_skill_plan_context(
+                project_id=_text(request.get("project_id"), "project_id"),
+                handoff=request.get("handoff"),
+                approval=request.get("approval"),
+            )
+            binding_proposal = build_project_skill_binding_proposal(
+                project_root=self.project_root,
+                context=context,
+            )
+            stored, stored_proposal, created = (
+                self._worker.store.apply_skill_plan_context(
+                    context,
+                    binding_proposal,
+                )
+            )
+            receipt = project_skill_plan_receipt(stored)
+            receipt["binding_proposal"] = stored_proposal
+            receipt["idempotent_replay"] = not created
+            return receipt
+        except (
+            ProjectSkillBindingError,
+            ProjectSkillPlanApplyError,
+            ProjectMasterHostError,
+        ) as error:
             raise ProjectMasterBridgeError(str(error)) from error
 
 
@@ -1261,9 +1477,7 @@ class ResidentProjectMasterHostManager:
         ]
         | None = None,
         provider_resolver: Callable[[str], str] | None = None,
-        coordinator_factory: Callable[
-            [Path, str, str], CommanderSurfaceObserver
-        ]
+        coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
@@ -1601,8 +1815,7 @@ def _runtime_context(observation: Mapping[str, Any]) -> dict[str, str]:
     stored = observation.get("snapshot")
     snapshot = (
         stored.get("snapshot")
-        if isinstance(stored, Mapping)
-        and isinstance(stored.get("snapshot"), Mapping)
+        if isinstance(stored, Mapping) and isinstance(stored.get("snapshot"), Mapping)
         else {}
     )
     coordinates = (
@@ -1611,20 +1824,14 @@ def _runtime_context(observation: Mapping[str, Any]) -> dict[str, str]:
         else {}
     )
     return {
-        "surface_observation_status": str(
-            observation.get("status", "UNKNOWN")
-        ),
-        "mode": str(
-            observation.get("anchor_mode", coordinates.get("mode", "UNKNOWN"))
-        ),
+        "surface_observation_status": str(observation.get("status", "UNKNOWN")),
+        "mode": str(observation.get("anchor_mode", coordinates.get("mode", "UNKNOWN"))),
         "mode_current_anchor": str(
             stored.get("anchor_id", "UNKNOWN")
             if isinstance(stored, Mapping)
             else "UNKNOWN"
         ),
-        "commander_surface": str(
-            coordinates.get("commander_surface", "UNKNOWN")
-        ),
+        "commander_surface": str(coordinates.get("commander_surface", "UNKNOWN")),
         "observed_at": str(
             stored.get("observed_at", "UNKNOWN")
             if isinstance(stored, Mapping)

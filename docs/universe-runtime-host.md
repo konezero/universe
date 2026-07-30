@@ -151,3 +151,22 @@ Universe persists only the observation count in the redacted invocation
 timeline. Publishing the reviewed Result Packet requires a separate,
 digest-bound Project Master approval before the Project-to-Universe queue
 accepts it.
+
+## Project Master Skill Plan context
+
+An adopted Universe Skill Plan crosses the Project Master Bridge through
+`POST /v1/project-master/skill-plans/apply`. The request carries one exact
+handoff plus its digest-bound Universe approval. The resident Host verifies the
+adoption and handoff digests, then stores the selected plan in its file-backed
+session database.
+
+The Host then resolves each Skill ID against exactly one installed
+`.ai/skills/**/<skill_id>/SKILL.md` under the Project root. It records a passive
+binding proposal with the project-relative `skill_ref` and file digest. Missing,
+ambiguous, or out-of-root Skill refs block application.
+
+This is planning context, not Task Frame execution. The Host creates no Task
+Frame and grants no authority, assignment, write scope, or repository mutation
+permission. The operation is idempotent by `handoff_id`; a conflicting digest
+is rejected. The durable store retains every applied context and binding
+proposal while provider prompts receive only the latest bounded set.

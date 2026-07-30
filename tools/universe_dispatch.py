@@ -26,6 +26,9 @@ MASTER_BRIDGE_RECEIPT_SCHEMA = "universe.project-master-bridge-receipt.v1"
 MASTER_SEED_APPLY_RECEIPT_SCHEMA = (
     "universe.project-master-seed-apply-delivery-receipt.v1"
 )
+MASTER_SKILL_PLAN_APPLY_RECEIPT_SCHEMA = (
+    "universe.project-master-skill-plan-apply-delivery-receipt.v1"
+)
 DISPATCH_ID_PATTERN = re.compile(r"^dispatch_[0-9a-f]{20,64}$")
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -300,6 +303,62 @@ class HttpProjectMasterBridge:
             "delivered_at": utc_now(),
         }
 
+    def apply_skill_plan(
+        self,
+        *,
+        bridge: dict[str, Any],
+        handoff: dict[str, Any],
+        approval: dict[str, Any],
+    ) -> dict[str, Any]:
+        endpoint = self.validate()
+        credential_env = _environment_name(self.credential_env)
+        token = os.environ.get(credential_env)
+        if not token:
+            raise DispatchError("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE")
+        project_id = _project_id(bridge.get("project_id"))
+        body = json.dumps(
+            {
+                "project_id": project_id,
+                "handoff": handoff,
+                "approval": approval,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        request = Request(
+            endpoint + "/v1/project-master/skill-plans/apply",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=max(self.timeout_seconds, 30.0)) as response:  # nosec B310
+                payload = json.loads(response.read().decode("utf-8"))
+                status_code = response.status
+        except HTTPError as error:
+            try:
+                detail = json.loads(error.read().decode("utf-8"))
+                code = str(detail.get("error_code") or f"HTTP_{error.code}")
+            except (UnicodeError, json.JSONDecodeError):
+                code = f"HTTP_{error.code}"
+            raise DispatchError("MASTER_SKILL_PLAN_APPLY_" + code) from error
+        except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise DispatchError("MASTER_SKILL_PLAN_APPLY_UNAVAILABLE") from error
+        if not 200 <= status_code < 300 or not isinstance(payload, dict):
+            raise DispatchError("MASTER_SKILL_PLAN_APPLY_REJECTED")
+        return {
+            "schema": MASTER_SKILL_PLAN_APPLY_RECEIPT_SCHEMA,
+            "status": "DELIVERED",
+            "project_id": project_id,
+            "handoff_id": handoff.get("handoff_id", "UNKNOWN"),
+            "endpoint": endpoint,
+            "host_response": payload,
+            "delivered_at": utc_now(),
+        }
+
 
 def normalize_dispatch_request(project_id: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -337,9 +396,7 @@ def normalize_dispatch_request(project_id: str, value: Any) -> dict[str, Any]:
     ).upper()
     if MODE_PATTERN.fullmatch(requested_mode) is None:
         raise DispatchError("requested_mode is invalid")
-    inbox_ref = _relative_inbox_ref(
-        value.get("inbox_ref", ".ai/inbox/MASTER")
-    )
+    inbox_ref = _relative_inbox_ref(value.get("inbox_ref", ".ai/inbox/MASTER"))
     idempotency_key = _text(
         value.get("idempotency_key", uuid.uuid4().hex),
         "idempotency_key",
@@ -385,7 +442,10 @@ def normalize_dispatch_envelope(value: Any) -> dict[str, Any]:
     }
     if set(value) != required:
         raise DispatchError("dispatch envelope fields are invalid")
-    if DISPATCH_ID_PATTERN.fullmatch(_text(value["dispatch_id"], "dispatch_id")) is None:
+    if (
+        DISPATCH_ID_PATTERN.fullmatch(_text(value["dispatch_id"], "dispatch_id"))
+        is None
+    ):
         raise DispatchError("dispatch_id is invalid")
     if value["status"] not in DISPATCH_TRANSITIONS:
         raise DispatchError("dispatch status is invalid")
@@ -482,9 +542,9 @@ def normalize_result_packet(
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(
-        timespec="seconds"
-    ).replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def _project_id(value: Any) -> str:
@@ -550,7 +610,9 @@ def _loopback_endpoint(value: Any, *, label: str = "wake") -> str:
     try:
         address = ipaddress.ip_address(parsed.hostname)
     except ValueError as error:
-        raise DispatchError(f"{label} endpoint must use a literal loopback IP") from error
+        raise DispatchError(
+            f"{label} endpoint must use a literal loopback IP"
+        ) from error
     if not address.is_loopback:
         raise DispatchError(f"{label} endpoint must remain on loopback")
     return endpoint
@@ -570,9 +632,10 @@ def _create_file(path: Path, content: bytes) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            if hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(
-                content
-            ).hexdigest():
+            if (
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                != hashlib.sha256(content).hexdigest()
+            ):
                 raise DispatchError("DISPATCH_DELIVERY_CONFLICT")
         finally:
             temporary.unlink(missing_ok=True)
