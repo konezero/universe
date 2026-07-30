@@ -168,7 +168,11 @@ block mutation.
 
 Only a raw `EXECUTION_GUARD_PERMITTED` result carries a receipt. For bounded
 file `CREATE`, `MODIFY`, or `DELETE`, use the installed receipt-aware gateway
-instead of a raw editor or shell write. Submit the unchanged request, its
+instead of a raw editor or shell write. For one exact, single-occurrence text
+replacement on an existing UTF-8 file, prefer
+`.ai/skills/common/receipt-aware-text-edit/SKILL.md`; that Skill calculates
+preimage and payload SHA-256, checks once, and immediately consumes the
+receipt through apply-file. Submit the unchanged request, its
 `receipt_id`, and Base64 content for create/modify:
 
 ```text

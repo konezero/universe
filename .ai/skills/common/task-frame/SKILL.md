@@ -17,6 +17,17 @@ This Skill invokes the canonical Task Frame ledger. It does not choose a
 profile, model, provider, Worker, turn route, Parent attachment, or adoption
 outcome.
 
+Any agent or model invoked subordinate to the active Parent must use this Task
+Frame route. Platform sub-agents, provider CLIs, model APIs, MCP-backed agents,
+and local agent processes are equivalent at this boundary. Do not invoke one
+directly from the repository working directory and later label it a Worker.
+
+The active Parent loads repository startup and governance policy, then records
+the bounded instruction and context in the Task Frame. A Boss or Worker must
+not read `AGENTS.md`, execute BOOT, or reinterpret Mode and governance policy;
+it consumes only its Runtime-validated input bundle and declared source
+references.
+
 For the installed default Boss/reviewer discussion route, use
 `.ai/skills/common/task-frame-debate/SKILL.md`. This generic Skill remains the
 lower-level caller-selected profile surface.
@@ -54,7 +65,9 @@ worker_invocation: UNKNOWN
 ```
 
 Then stop before Host Worker invocation. Do not infer a capability or fabricate
-a Worker result from conversation history.
+a Worker result from conversation history. Do not fall back to raw platform
+sub-agent spawn, direct provider CLI, model API, or another unframed agent
+call.
 
 ## Invoke
 

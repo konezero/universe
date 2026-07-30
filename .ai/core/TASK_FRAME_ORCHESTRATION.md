@@ -58,11 +58,26 @@ Current Anchor rule.
 
 ## Optional Activation
 
-Task Frame orchestration is optional.
+Task Frame orchestration is optional while the active Parent performs the work
+without invoking a subordinate agent. Once the Parent or an active Boss
+delegates work to another agent or model, Task Frame orchestration is
+mandatory. A platform sub-agent, provider CLI, model API, MCP-backed agent, or
+local agent process does not bypass this boundary.
 
-It may be selected when work is long-running, divisible, review-oriented,
-debate-oriented, or better isolated from the Parent conversation. Availability
-of multiple models or Workers alone is not sufficient reason to activate it.
+It may also be selected when Parent-only work is long-running, divisible,
+review-oriented, debate-oriented, or better isolated from the Parent
+conversation.
+
+```text
+Parent-only work
+  -> Task Frame optional
+
+subordinate agent invocation
+  -> Task Frame required
+
+raw subordinate spawn without a Task Frame
+  -> forbidden
+```
 
 If a Host lacks bounded Worker invocation, result transport, or concurrent task
 capability:
@@ -166,6 +181,13 @@ A simple one-Worker Task Frame may omit the Boss.
 ### Worker
 
 A Worker executes only its declared Turn and returns a bounded result envelope.
+A Boss and every Sub Worker receive only the Runtime-validated input bundle for
+their declared turns. They must not re-enter repository startup, read
+`AGENTS.md`, execute BOOT, or reinterpret Mode and governance policy. The
+Parent or Boss must supply exact source references required by the bounded
+turn; missing context is returned as a bounded result rather than recovered by
+repository-wide policy discovery.
+
 A Worker must not create or claim:
 
 ```text

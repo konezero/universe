@@ -42,6 +42,24 @@ Frame, or Worker command. Route every external executable through
 syntax and argv transport only; they do not create authority,
 Assignment, approval, or sandbox evidence.
 
+## Sub-Agent Routing
+
+Any agent or model invoked subordinate to the active Parent must run
+as a declared Task Frame Worker. Platform sub-agents, provider CLIs,
+model APIs, MCP-backed agents, and local agent processes do not bypass
+this rule.
+
+The active Parent prepares the bounded instruction and context and
+invokes only the declared root Boss or single Worker. A Task Frame
+Boss may invoke only its declared Sub Workers. Raw collaboration
+spawn, direct provider CLI, or equivalent unframed delegation is
+forbidden and must not be used as fallback when capability is
+unavailable.
+
+A Task Frame Boss or Worker consumes its Runtime-validated input
+bundle. It must not re-enter repository startup, read `AGENTS.md`,
+execute BOOT, or reinterpret Mode and governance policy.
+
 ## Pull Request Review Trust Boundary
 
 For pull request, patch, fork, branch, or other Candidate review,

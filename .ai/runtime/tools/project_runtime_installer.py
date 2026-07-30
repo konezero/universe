@@ -48,6 +48,7 @@ SOURCE_BUNDLE_MAX_BYTES = 256 * 1024 * 1024
 SOURCE_BUNDLE_PROVIDER_POLICIES = {
     "github-connector": "github-connector-immutable-source-bundle",
     "github-cli": "github-cli-immutable-source-bundle",
+    "universe-release-db": "universe-content-addressed-release-db",
 }
 INSTALLER_TARGET_PATH = ".ai/runtime/tools/project_runtime_installer.py"
 INSTALLATION_MANIFEST_PATH = (
@@ -1720,6 +1721,7 @@ def _render_generated_surface(
 
             Mutation Entry: `.ai/skills/common/execution-guard/SKILL.md`
             Mutation Rule: Guard check before every raw write tool
+            Exact Text Edit Entry: `.ai/skills/common/receipt-aware-text-edit/SKILL.md`
 
             Task Assignment Entry: `.ai/skills/common/task-assignment/SKILL.md`
             Execution Binding Entry: `.ai/skills/common/execution-binding/SKILL.md`
@@ -1776,6 +1778,24 @@ def _render_generated_surface(
             `.ai/skills/common/windows-native-cli/SKILL.md`. These Skills define
             syntax and argv transport only; they do not create authority,
             Assignment, approval, or sandbox evidence.
+
+            ## Sub-Agent Routing
+
+            Any agent or model invoked subordinate to the active Parent must run
+            as a declared Task Frame Worker. Platform sub-agents, provider CLIs,
+            model APIs, MCP-backed agents, and local agent processes do not bypass
+            this rule.
+
+            The active Parent prepares the bounded instruction and context and
+            invokes only the declared root Boss or single Worker. A Task Frame
+            Boss may invoke only its declared Sub Workers. Raw collaboration
+            spawn, direct provider CLI, or equivalent unframed delegation is
+            forbidden and must not be used as fallback when capability is
+            unavailable.
+
+            A Task Frame Boss or Worker consumes its Runtime-validated input
+            bundle. It must not re-enter repository startup, read `AGENTS.md`,
+            execute BOOT, or reinterpret Mode and governance policy.
 
             ## Pull Request Review Trust Boundary
 
@@ -1874,6 +1894,11 @@ def _render_generated_surface(
             Before every durable mutation, execute
             `.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
             Current Anchor do not replace the required Guard result and receipt.
+            For one exact, single-occurrence repository text replacement on an
+            existing file, prefer
+            `.ai/skills/common/receipt-aware-text-edit/SKILL.md`; that Skill
+            calculates preimage and payload hashes, checks once, and immediately
+            consumes the one-time receipt through mutation-gateway apply-file.
             Ordinary local Git staging, commit, and push after completed,
             validated work remain outside the Runtime. Their immutable commit SHA
             may be appended to the approved Task Proposal's Result Receipt and
@@ -1890,6 +1915,10 @@ def _render_generated_surface(
             `.ai/skills/common/task-frame/SKILL.md`. That Skill must load
             `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md` and
             preserve unverified Host capability as `UNKNOWN`.
+
+            Every subordinate agent invocation uses this route. A raw platform
+            sub-agent, provider CLI, model API, MCP-backed agent, or local agent
+            process must not substitute for an accepted Task Frame Worker plan.
 
             The default bounded discussion route is
             `.ai/skills/common/task-frame-debate/SKILL.md`. Combined repository and
@@ -1957,6 +1986,8 @@ def _render_generated_surface(
             follow `.ai/skills/common/master-mode-registry/SKILL.md`.
             Any mutation follows `.ai/skills/common/execution-guard/SKILL.md`
             before a file, shell, API, database, Git, or external write tool runs.
+            Exact single-occurrence text replacement on an existing file follows
+            `.ai/skills/common/receipt-aware-text-edit/SKILL.md`.
             `STATUS` reads `.ai/runtime/project_instance/status.md`.
             `OS_VALIDATE` runs `.ai/runtime/tools/project_runtime_installer.py validate`.
 

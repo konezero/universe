@@ -56,6 +56,17 @@ Worker completion != Parent adoption
 Parent ACCEPT != execution permission
 ```
 
+Any agent or model invoked subordinate to the active Parent is a Task Frame
+Worker for routing purposes. This includes platform-native sub-agents,
+provider CLIs, model APIs, MCP-backed agents, and local agent processes. The
+transport does not create an exception.
+
+The Host must not invoke such an agent before a Task Frame has accepted the
+declared turn and returned `WORKER_INVOCATION_READY`. A raw collaboration
+spawn, direct provider CLI call, or equivalent model invocation is not a
+bounded Worker capability and must not be used as fallback when Task Frame
+setup or Host capability is unavailable.
+
 Before invoking a Worker, the Host must obtain a Reference Runtime
 `WORKER_INVOCATION_READY` result for the declared turn and then claim that turn
 for one concrete `worker_id` using the same capability evidence and a unique
@@ -139,6 +150,9 @@ Using the Parent actor under a Worker-like label is
 8. Invoke exactly one Boss at `/root/boss` with that bundle unchanged. The Boss
    stays active until every declared Sub result has been reviewed and the final
    synthesis has been returned.
+   The Boss must not re-enter repository startup, read `AGENTS.md`, execute
+   BOOT, or reinterpret Mode and governance policy. Exact source references
+   needed for the turn must already be present in the bounded input bundle.
 9. The active Boss acknowledges every current instruction digest and calls
    `submit_boss_allocations` with one allocation and one `/root/boss/subN` path
    for every declared Sub turn. The Boss is not completed at this point.
@@ -149,6 +163,8 @@ Using the Parent actor under a Worker-like label is
 12. The Boss invokes the Sub through the Host's bounded nested-Worker transport.
     The Host supplies physical process or model transport only; the Parent and
     Host must not become the logical Sub caller.
+    The Sub receives only its Runtime-validated allocation and bounded context;
+    it must not discover repository control-plane instructions independently.
 13. The Boss captures the concrete Sub actor ID and unique Host run reference,
     then claims the turn with its own actor reference as `invoker_actor_ref`.
 14. Require one JSON-compatible bounded Sub result and source evidence references.

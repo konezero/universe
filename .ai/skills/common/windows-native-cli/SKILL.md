@@ -41,6 +41,10 @@ If Host operating-system evidence is unavailable, keep the route `UNKNOWN`.
 8. A timeout does not prove descendant termination.
 9. Correct argv transport does not make untrusted code safe. Candidate code
    still requires the source-review execution boundary.
+10. When the executable is an agent provider acting subordinate to the active
+    Parent, invoke it only through an accepted Task Frame Worker plan. A direct
+    provider CLI call from the repository working directory must not substitute
+    for Task Frame setup, bounded context, or Host Worker evidence.
 
 ## Request
 

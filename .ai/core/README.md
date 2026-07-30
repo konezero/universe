@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: bfbe6a56346e927fd3e253eef39c77ca1d5b3048
+Source Commit: 2045648041f86c8b0258a08e0c10104f4bfad7c9
 
 ## Entry
 
@@ -40,6 +40,7 @@ Source Commit: bfbe6a56346e927fd3e253eef39c77ca1d5b3048
 - `.ai/templates/universe_node_memory/README.md`
 - `.ai/templates/universe_project_seed/README.md`
 - `.ai/templates/worker_resume_archive/README.md`
+- `.ai/universe/README.md`
 
 ### core_runtime
 - `.ai/core/AI_CORE.md`
@@ -133,6 +134,8 @@ Source Commit: bfbe6a56346e927fd3e253eef39c77ca1d5b3048
 - `.ai/skills/common/mode-change/SKILL.md`
 - `.ai/skills/common/os-management/SKILL.md`
 - `.ai/skills/common/persistence/SKILL.md`
+- `.ai/skills/common/receipt-aware-text-edit/SKILL.md`
+- `.ai/skills/common/receipt-aware-text-edit/scripts/receipt_aware_text_edit.py`
 - `.ai/skills/common/resume-restore/SKILL.md`
 - `.ai/skills/common/resume-save/SKILL.md`
 - `.ai/skills/common/runtime-status/SKILL.md`

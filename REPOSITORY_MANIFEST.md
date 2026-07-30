@@ -30,6 +30,7 @@ Validation: `.ai/runtime/project_instance/validation/latest.md`
 
 Mutation Entry: `.ai/skills/common/execution-guard/SKILL.md`
 Mutation Rule: Guard check before every raw write tool
+Exact Text Edit Entry: `.ai/skills/common/receipt-aware-text-edit/SKILL.md`
 
 Task Assignment Entry: `.ai/skills/common/task-assignment/SKILL.md`
 Execution Binding Entry: `.ai/skills/common/execution-binding/SKILL.md`

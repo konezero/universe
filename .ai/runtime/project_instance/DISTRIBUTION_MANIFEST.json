@@ -9,8 +9,8 @@
       "target_paths_sha256": "6fe718fc6dc96e0e80ac3f73ecf4214009da473ee12e5f4c20b70f50070de7f8"
     },
     "skill": {
-      "managed_count": 25,
-      "target_paths_sha256": "6c34accf0f1287648dc312c1adcfdb192d7839cb7a92c7ca42a19a9c1f3c4f32"
+      "managed_count": 27,
+      "target_paths_sha256": "9125a01588b4f20a8f0665f3ba0c648c2ff2ddbc39286575f40dc2ee67be515b"
     }
   },
   "excluded_roots": [
@@ -34,13 +34,13 @@
     "conductor"
   ],
   "generated_surface_hashes": {
-    ".ai/core/README.md": "b30307a632417c8fe91f34c7a4c1e688e83c26e179510ca68791615055327d3a",
+    ".ai/core/README.md": "68f515b71a95d04750299fc3ee5e9463264de4b95ab6c3eae6508881b034f8e2",
     ".ai/runtime/continuity/.gitignore": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d",
-    ".ai/runtime/project_instance/VERSION_MANIFEST.md": "91ae0999e686bbf917016b5af8f195a552af9f6c460f0dc6531e4a3f89c7092d",
+    ".ai/runtime/project_instance/VERSION_MANIFEST.md": "b2b2a143f80aed2426c462e87fdbe0ed05f86756172fcf9a0378af9a1a25fb4c",
     ".ai/runtime/project_instance/scope_policy.md": "85c338d4cdc2778392ebc8c204189a85f95ef84297f3543821d5b303131f89da",
     ".ai/runtime/project_instance/status.md": "1ed1d1e41472a0f94d9380cab606744764bd46029ff50f2a291bf46b01a74f9c",
-    ".ai/runtime/project_instance/validation/history.md": "1136cfb079f8fadcb3907ac7e4a68fff42be3f6861e559f015f62546825cee3f",
-    ".ai/runtime/project_instance/validation/latest.md": "e2ed19e7fb689c9a70941232dd2cf52844b6d12821beb7b600f452fcab8c90e5",
+    ".ai/runtime/project_instance/validation/history.md": "b66ea5b24b82e973288e78ce448cfff4e6b17259e8d52b4fe3f44a95245bb37f",
+    ".ai/runtime/project_instance/validation/latest.md": "25fbcfa92ca80bd7cf4fa7ea2db51b966db0580662ad9a6a4a94f8db27d2ac7d",
     ".ai/runtime/task_frames/.gitignore": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d",
     ".ai/runtime/tmp/.gitignore": "240a3e0d37d2e86b614063f5347eb02d4f99ca6c254de6b82871ff8d95532a7d"
   },
@@ -253,20 +253,20 @@
     ]
   },
   "managed_overlay_hashes": {
-    ".ai/START_HERE.md": "84e4bbdf8e4f785a69e9b7e7943c7ab68d7073dec64b5d775063ebe64d1ea48c",
-    ".ai/runtime/project_instance/boot_command_entry.md": "db3b615382233eddee037b55668da89cbf593540304286e47b9158546d85ec8e",
-    ".ai/runtime/project_instance/os_install.md": "a6db10fc12bea0b31fc8f2bad4d5f8bf08b378a7cb664443b66b122bfae15e9f",
-    ".ai/runtime/project_instance/project_anchor.md": "7fcef79bb2bc19f208466890bb283610cf0f5449a2f97da22ba6469b8ad2f523",
+    ".ai/START_HERE.md": "506ed5b5a8ab038b74d594d6ae8915d174870563ada5d6935c434809246c6c37",
+    ".ai/runtime/project_instance/boot_command_entry.md": "b97c9476b6e248fc1047407d49040e64a91ef870bb6e4fe88f5959d16ab23a87",
+    ".ai/runtime/project_instance/os_install.md": "ce7c56512019ca88eb3b31aef83bd3f37287cf58599586c4875ea1bbb6cdb764",
+    ".ai/runtime/project_instance/project_anchor.md": "1e74a413ed8bcc064d521a77e78284ce8d87e061a85ef783641549fbbea8c274",
     ".ai/runtime/project_instance/role_selection_gate.md": "a1e70a97d5c761e12a92e8d84f33fdf0a721d7508cecad218a293b6df8c4167d",
     ".ai/runtime/project_instance/runtime_anchor_frame.md": "507a9ad418aea1fc9b750dd4bfc554d0c956c783da87d7757ac0396058f118ae",
-    "AGENTS.md": "181d265ea045d30aa1a30e2a6701cd8c2ffe4b03ad1bc0650381d7784feea330",
-    "REPOSITORY_MANIFEST.md": "560b86411c1b3e05f6f832d67502dcfe4051daa64ecaf77f7c65b9fa6e589695"
+    "AGENTS.md": "6bf5650f31aecd6edda07ed39789a2397b239229923f74c2ef41926e0a8dae81",
+    "REPOSITORY_MANIFEST.md": "2d6404e5a1b2fd9c472f24661b186cd568731fda99097ac1aac58eab9bab44e9"
   },
   "managed_paths": [
     {
       "class": "generated_router",
       "integrity_policy": "semantic",
-      "local_sha256": "04179add5600f5c908f89f62ba225f99aae9d386d9d9137b7fee6409eee65a75",
+      "local_sha256": "5d38f0c82b81ac5685339387c3827ef3d360595a43ba959958d20d1ee25b76bd",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -566,7 +566,7 @@
     {
       "class": "generated_core_index",
       "integrity_policy": "exact",
-      "local_sha256": "b30307a632417c8fe91f34c7a4c1e688e83c26e179510ca68791615055327d3a",
+      "local_sha256": "68f515b71a95d04750299fc3ee5e9463264de4b95ab6c3eae6508881b034f8e2",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -842,12 +842,12 @@
     {
       "class": "core_runtime",
       "integrity_policy": "exact",
-      "local_sha256": "e1ffbc6e925dd50637dc084f33b580969d0c59c81389171600d874f63ecb46ba",
+      "local_sha256": "e4e24923101667dc8acf0f85e1546a530f99be920011fbb669fca19e1406f935",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "b6398f62402dbabc32aa786143caad82080c5b65",
+      "source_blob_oid": "bb284c31bc91fb84a5bb1c92bb7c7c3aa5d2e2f5",
       "source_path": ".ai/core/TASK_FRAME_ORCHESTRATION.md",
-      "source_sha256": "e1ffbc6e925dd50637dc084f33b580969d0c59c81389171600d874f63ecb46ba",
+      "source_sha256": "e4e24923101667dc8acf0f85e1546a530f99be920011fbb669fca19e1406f935",
       "target_path": ".ai/core/TASK_FRAME_ORCHESTRATION.md",
       "update_policy": "replace_if_owned"
     },
@@ -890,7 +890,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "exact",
-      "local_sha256": "91ae0999e686bbf917016b5af8f195a552af9f6c460f0dc6531e4a3f89c7092d",
+      "local_sha256": "b2b2a143f80aed2426c462e87fdbe0ed05f86756172fcf9a0378af9a1a25fb4c",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -902,7 +902,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "semantic",
-      "local_sha256": "e460b80d1d18512f6d1dac78b9e91be6ab93ea7ca633e6a4a2d64c8441274f69",
+      "local_sha256": "8a94b15622422df786f4c9b04b41ffcb3061abd20570b9236ec127826b6af9fc",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -926,7 +926,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "semantic",
-      "local_sha256": "7d8138c38fc30e95f42cb459abe04c717a43c178273b5f0c5cc315a6f9270fb3",
+      "local_sha256": "3dbffc551975b0d1b62ef2eea608b8e9ce3541c4ae827c1c64f882ddbaeeeddd",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -938,7 +938,7 @@
     {
       "class": "generated_project_instance",
       "integrity_policy": "semantic",
-      "local_sha256": "41c3da8b4c44e84726418ab3a9d7bf39926c8e1958d13178c43b9e5d2e9e7767",
+      "local_sha256": "751d19d6c3087a44c7e5603f79c37e40716185cfef5202fe12c556d88731a033",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -998,7 +998,7 @@
     {
       "class": "validation_evidence",
       "integrity_policy": "exact",
-      "local_sha256": "1136cfb079f8fadcb3907ac7e4a68fff42be3f6861e559f015f62546825cee3f",
+      "local_sha256": "b66ea5b24b82e973288e78ce448cfff4e6b17259e8d52b4fe3f44a95245bb37f",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -1010,7 +1010,7 @@
     {
       "class": "validation_evidence",
       "integrity_policy": "exact",
-      "local_sha256": "e2ed19e7fb689c9a70941232dd2cf52844b6d12821beb7b600f452fcab8c90e5",
+      "local_sha256": "25fbcfa92ca80bd7cf4fa7ea2db51b966db0580662ad9a6a4a94f8db27d2ac7d",
       "ownership": "project-runtime-installer",
       "required": true,
       "source_blob_oid": null,
@@ -1034,12 +1034,12 @@
     {
       "class": "runtime",
       "integrity_policy": "exact",
-      "local_sha256": "48761731ef1dcfb689043c77cc1394d0f432e6d3448ec6435f7485e4b329485d",
+      "local_sha256": "44168a5cf06d824013f9bd731ca56e69d832185c56f1d7064b2ff865d782ee76",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "66ad21a081c92dca699c0e791482912c12332fc9",
+      "source_blob_oid": "99c8d1fbb63da1d999ed0016cca81a1206d62ae4",
       "source_path": ".ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md",
-      "source_sha256": "48761731ef1dcfb689043c77cc1394d0f432e6d3448ec6435f7485e4b329485d",
+      "source_sha256": "44168a5cf06d824013f9bd731ca56e69d832185c56f1d7064b2ff865d782ee76",
       "target_path": ".ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md",
       "update_policy": "replace_if_owned"
     },
@@ -1382,12 +1382,12 @@
     {
       "class": "installer",
       "integrity_policy": "exact",
-      "local_sha256": "f22efb0f008b5a52f5cc8e8ca0da1d2e3613ab0b7be785e8a84bac1508ff77f3",
+      "local_sha256": "0bfa91336f389466f270e1c91ee3c873b5d36bba2440e1bdffa4f7e731bc0b14",
       "ownership": "ai-career-project-runtime-installer",
       "required": true,
-      "source_blob_oid": "813b2ff9cf63eb89e7200fd573a7b686b1803e08",
+      "source_blob_oid": "34e52cf880edb1b52f4133f5a6f56565a4fb9864",
       "source_path": ".ai/distribution/context_management_runtime_pack/project_runtime_installer.py",
-      "source_sha256": "f22efb0f008b5a52f5cc8e8ca0da1d2e3613ab0b7be785e8a84bac1508ff77f3",
+      "source_sha256": "0bfa91336f389466f270e1c91ee3c873b5d36bba2440e1bdffa4f7e731bc0b14",
       "target_path": ".ai/runtime/tools/project_runtime_installer.py",
       "update_policy": "replace_if_owned"
     },
@@ -1454,12 +1454,12 @@
     {
       "class": "skill",
       "integrity_policy": "exact",
-      "local_sha256": "0370997ce4421015dd338accffbb291ddfdc70568e98417717d5a66ee8b6d968",
+      "local_sha256": "76c61a793051b9f722f1d8ae2651e2a403d38521ea6bfff5c78eafddcf3afbb1",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "be4a861b9cb445d53f99b998f7ec5aa2b975e23b",
+      "source_blob_oid": "910bdcff6287824ffcca3fa0766c190f25630fd7",
       "source_path": ".ai/skills/common/execution-guard/SKILL.md",
-      "source_sha256": "0370997ce4421015dd338accffbb291ddfdc70568e98417717d5a66ee8b6d968",
+      "source_sha256": "76c61a793051b9f722f1d8ae2651e2a403d38521ea6bfff5c78eafddcf3afbb1",
       "target_path": ".ai/skills/common/execution-guard/SKILL.md",
       "update_policy": "replace_if_owned"
     },
@@ -1521,6 +1521,30 @@
       "source_path": ".ai/skills/common/persistence/SKILL.md",
       "source_sha256": "455efac06b9be851e6fa717f5ceb77c0e253ac88dfd9a0af151e402c82ce6dca",
       "target_path": ".ai/skills/common/persistence/SKILL.md",
+      "update_policy": "replace_if_owned"
+    },
+    {
+      "class": "skill",
+      "integrity_policy": "exact",
+      "local_sha256": "8682b4276e0e066bf4a650c5ef8e3062d4a0050a9b706322ca03d8529d9eabf8",
+      "ownership": "ai-career-project-runtime",
+      "required": true,
+      "source_blob_oid": "9afe4f7d12f90b67a6417d036f9679e292a1c80c",
+      "source_path": ".ai/skills/common/receipt-aware-text-edit/SKILL.md",
+      "source_sha256": "8682b4276e0e066bf4a650c5ef8e3062d4a0050a9b706322ca03d8529d9eabf8",
+      "target_path": ".ai/skills/common/receipt-aware-text-edit/SKILL.md",
+      "update_policy": "replace_if_owned"
+    },
+    {
+      "class": "skill",
+      "integrity_policy": "exact",
+      "local_sha256": "7b72506d40d8a53154a843ba07baad1d1be218020717911ceb2f72ce8e0e91d5",
+      "ownership": "ai-career-project-runtime",
+      "required": true,
+      "source_blob_oid": "ca879b8e46ca1feee70ebf0ce89253099a13be2b",
+      "source_path": ".ai/skills/common/receipt-aware-text-edit/scripts/receipt_aware_text_edit.py",
+      "source_sha256": "7b72506d40d8a53154a843ba07baad1d1be218020717911ceb2f72ce8e0e91d5",
+      "target_path": ".ai/skills/common/receipt-aware-text-edit/scripts/receipt_aware_text_edit.py",
       "update_policy": "replace_if_owned"
     },
     {
@@ -1610,12 +1634,12 @@
     {
       "class": "skill",
       "integrity_policy": "exact",
-      "local_sha256": "f502a9f292b8daa56e249ec474bf7b5eff8ca7c19646d33c0fb6150f2ba4caf0",
+      "local_sha256": "0c7593cc5489f828ca520f929cff53efda83321fc840823b5580dc64d0c8d1bd",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "9c3edd42d8a23b80fd13956dc4b4e130788c2c24",
+      "source_blob_oid": "73069f4b165f5fa509eb9f28c896774053ebbfd7",
       "source_path": ".ai/skills/common/task-frame/SKILL.md",
-      "source_sha256": "f502a9f292b8daa56e249ec474bf7b5eff8ca7c19646d33c0fb6150f2ba4caf0",
+      "source_sha256": "0c7593cc5489f828ca520f929cff53efda83321fc840823b5580dc64d0c8d1bd",
       "target_path": ".ai/skills/common/task-frame/SKILL.md",
       "update_policy": "replace_if_owned"
     },
@@ -1634,12 +1658,12 @@
     {
       "class": "skill",
       "integrity_policy": "exact",
-      "local_sha256": "1148b5f1ca52b612a1170d99f1ebb4c423b6e9cdced3af3244432057cfa14be9",
+      "local_sha256": "2ca6a968434a5d3c7eecf0924149032232dc90b86b5d693c66ce8463e439cf08",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "4be0364b75eb0d5dfa6023110e017f171458f469",
+      "source_blob_oid": "5d82543a0bf5f9948e3eee046ebc0ee0b6757862",
       "source_path": ".ai/skills/common/windows-native-cli/SKILL.md",
-      "source_sha256": "1148b5f1ca52b612a1170d99f1ebb4c423b6e9cdced3af3244432057cfa14be9",
+      "source_sha256": "2ca6a968434a5d3c7eecf0924149032232dc90b86b5d693c66ce8463e439cf08",
       "target_path": ".ai/skills/common/windows-native-cli/SKILL.md",
       "update_policy": "replace_if_owned"
     },
@@ -1910,12 +1934,12 @@
     {
       "class": "contract_template",
       "integrity_policy": "exact",
-      "local_sha256": "136210979e9199ebdcea619185ce261f3d008219eca15335a9803e407f7e7de4",
+      "local_sha256": "d2b1ac5ca943f976be44bd46a18967b5a485721378709b7b334e54eecb066bc2",
       "ownership": "ai-career-project-runtime",
       "required": true,
-      "source_blob_oid": "3627b7aa06e088d595b85ae0653d44bdec38bb72",
+      "source_blob_oid": "c8a17472a288168b95537743c3a4da09775c14e2",
       "source_path": ".ai/templates/universe_project_seed/README.md",
-      "source_sha256": "136210979e9199ebdcea619185ce261f3d008219eca15335a9803e407f7e7de4",
+      "source_sha256": "d2b1ac5ca943f976be44bd46a18967b5a485721378709b7b334e54eecb066bc2",
       "target_path": ".ai/templates/universe_project_seed/README.md",
       "update_policy": "replace_if_owned"
     },
@@ -1932,9 +1956,21 @@
       "update_policy": "replace_if_owned"
     },
     {
+      "class": "contract_template",
+      "integrity_policy": "exact",
+      "local_sha256": "0d2b7374f59da5c1ebcdbd85d5dcb3b8eb9e0c97fdfe0681562ad48fb3107ae7",
+      "ownership": "ai-career-project-runtime",
+      "required": true,
+      "source_blob_oid": "f2c1ef0b07256edf31f268e8902cbee660fda096",
+      "source_path": ".ai/universe/README.md",
+      "source_sha256": "0d2b7374f59da5c1ebcdbd85d5dcb3b8eb9e0c97fdfe0681562ad48fb3107ae7",
+      "target_path": ".ai/universe/README.md",
+      "update_policy": "replace_if_owned"
+    },
+    {
       "class": "generated_router",
       "integrity_policy": "semantic",
-      "local_sha256": "d5721d46153189552aa0a056bdf0e513ea19a011c54f64a484bf9e1eeb53d569",
+      "local_sha256": "e6bd70ca62556142d56b24bf79544711b533dc683b6bb60071167e83d9ac1284",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -1946,7 +1982,7 @@
     {
       "class": "generated_router",
       "integrity_policy": "semantic",
-      "local_sha256": "0e6e41ba701f10f3f53b684ff6f7a7f3da0e548a3fad25e3c3bc464a85cc3ac1",
+      "local_sha256": "f2dd8deb431612d7b1632e3ae12f91fcc069a2bbc4330f4e0352f1efebc40c9a",
       "ownership": "project-runtime-overlay",
       "required": true,
       "source_blob_oid": null,
@@ -2142,6 +2178,7 @@
           ".ai/templates/label_profile/README.md",
           ".ai/templates/project_master_automation/README.md",
           ".ai/templates/universe_project_seed/README.md",
+          ".ai/universe/README.md",
           ".ai/templates/universe_connection/README.md",
           ".ai/templates/universe_node_memory/README.md",
           ".ai/templates/task_frame_orchestration/README.md",
@@ -2155,8 +2192,8 @@
         "required": true
       }
     ],
-    "source_blob_oid": "00c2f70eae903e19c9f102e9a3a4e3af5be725a3",
-    "source_sha256": "89c2e2963e3fa794d2a9f20587c57ba2d38ec305ed77f99569b3faa46ccebf44"
+    "source_blob_oid": "0fe6699563ac825a6f0e216ead8c7f5feebb9fa1",
+    "source_sha256": "fc6d607b3520f0e6105da546f48d357ecfcadeba83009808babc4590da90bc7e"
   },
   "schema": "ai-career.project-runtime-installation.v1",
   "source": {
@@ -2164,7 +2201,7 @@
     "bundle_manifest_sha256": "NOT_APPLICABLE",
     "capability_evidence_ref": "NOT_APPLICABLE",
     "cleanliness": "CLEAN",
-    "commit": "bfbe6a56346e927fd3e253eef39c77ca1d5b3048",
+    "commit": "2045648041f86c8b0258a08e0c10104f4bfad7c9",
     "commit_date": "2026-07-30",
     "provider": "local-git",
     "read_policy": "git-show-single-immutable-commit",
@@ -2172,8 +2209,8 @@
     "requested_ref": "HEAD",
     "source_index": {
       "path": ".ai/distribution/context_management_runtime_pack/project_runtime_source_index.json",
-      "source_blob_oid": "f39d483e4212b9fcf74d49c7940f2bb735b5ed94",
-      "source_sha256": "e0b2966f0215baff7b05633c838f53ee12f1f88ffbfaf8a2deb2b136b24e65cf"
+      "source_blob_oid": "56642e15eab16d8b25e2bbcfd0238687099c5f8d",
+      "source_sha256": "4805eea385baea6dbeafd2ffbed0176c62d0aca3cf1a4a427f916fe87e28773b"
     }
   },
   "validation": {

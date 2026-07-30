@@ -45,6 +45,11 @@ gate, authority, or assignment state.
 Before every durable mutation, execute
 `.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
 Current Anchor do not replace the required Guard result and receipt.
+For one exact, single-occurrence repository text replacement on an
+existing file, prefer
+`.ai/skills/common/receipt-aware-text-edit/SKILL.md`; that Skill
+calculates preimage and payload hashes, checks once, and immediately
+consumes the one-time receipt through mutation-gateway apply-file.
 Ordinary local Git staging, commit, and push after completed,
 validated work remain outside the Runtime. Their immutable commit SHA
 may be appended to the approved Task Proposal's Result Receipt and
@@ -61,6 +66,10 @@ Before any Host Worker invocation, follow
 `.ai/skills/common/task-frame/SKILL.md`. That Skill must load
 `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md` and
 preserve unverified Host capability as `UNKNOWN`.
+
+Every subordinate agent invocation uses this route. A raw platform
+sub-agent, provider CLI, model API, MCP-backed agent, or local agent
+process must not substitute for an accepted Task Frame Worker plan.
 
 The default bounded discussion route is
 `.ai/skills/common/task-frame-debate/SKILL.md`. Combined repository and

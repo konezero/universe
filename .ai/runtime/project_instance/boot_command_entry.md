@@ -75,6 +75,8 @@ Runtime Image documents remain observed references.
 follow `.ai/skills/common/master-mode-registry/SKILL.md`.
 Any mutation follows `.ai/skills/common/execution-guard/SKILL.md`
 before a file, shell, API, database, Git, or external write tool runs.
+Exact single-occurrence text replacement on an existing file follows
+`.ai/skills/common/receipt-aware-text-edit/SKILL.md`.
 `STATUS` reads `.ai/runtime/project_instance/status.md`.
 `OS_VALIDATE` runs `.ai/runtime/tools/project_runtime_installer.py validate`.
 

@@ -10,9 +10,10 @@ read a Project's functional structure, implementation structure, evidence
 bindings, and document catalog without collecting arbitrary repository files.
 
 The assets are assembled only after an approved Project Master handoff or an
-approved Project-local discovery task. Installing this template does not create
-`.ai/universe/`, scan source, connect a Universe, publish observations, or
-grant write authority.
+approved Project-local discovery task. `OS_INSTALL` creates only the managed
+`.ai/universe/README.md` root marker. Installing this template does not create
+Seed assets, scan source, connect a Universe, publish observations, or grant
+write authority.
 
 ## Target Asset Set
 
