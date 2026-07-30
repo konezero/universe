@@ -272,7 +272,14 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                 "status": "TURN_COMPLETED",
                 "worker_id": "grok-conductor-1",
                 "result_receipt_ref": "result-conductor-1",
-                "result": {"text": "유니버스 응답"},
+                "result": {
+                    "reply": "유니버스 응답",
+                    "action": {"kind": "NONE"},
+                },
+                "structured_result": {
+                    "reply": "유니버스 응답",
+                    "action": {"kind": "NONE"},
+                },
             }
         )
         host = UniverseRuntimeHost(
@@ -315,6 +322,8 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             message={
                 "message_id": "conductor_001",
                 "body": "현재 위험을 알려줘.",
+                "ui_context": {"selected_project_id": "GCS"},
+                "available_projects": [{"project_id": "GCS", "summary": "Trading"}],
             },
             history=[
                 {
@@ -325,12 +334,22 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             ],
             provider="GROK",
         )
-        self.assertEqual({"text": "유니버스 응답"}, result["result"])
+        self.assertEqual(
+            {"reply": "유니버스 응답", "action": {"kind": "NONE"}},
+            result["structured_result"],
+        )
         self.assertEqual(1, len(dispatcher.dispatch_calls))
         request = dispatcher.dispatch_calls[0]
         self.assertEqual("NONE", request["repository_write_scope"])
         self.assertEqual([], request["mutation_scope"]["operations"])
         self.assertEqual("UNIVERSE", request["context_pack"]["mode"])
+        self.assertEqual("STRUCTURED_JSON", request["result_mode"])
+        self.assertEqual(
+            "GCS", request["context_pack"]["ui_context"]["selected_project_id"]
+        )
+        self.assertEqual(
+            "GCS", request["context_pack"]["available_projects"][0]["project_id"]
+        )
         self.assertEqual(
             [
                 "/v1/task-frame/create",

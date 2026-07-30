@@ -887,11 +887,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "worker_id": "grok-cli:conductor-001",
                     "result_receipt_ref": "grok-cli:conductor-001:result-001",
                     "repository_write": False,
-                    "result": {"text": "현재 프로젝트 위험을 정리했습니다."},
+                    "structured_result": {
+                        "reply": "현재 프로젝트 위험을 정리했습니다.",
+                        "action": {
+                            "kind": "TODO_DRAFT",
+                            "todo": {
+                                "scope_kind": "PROJECT",
+                                "project_id": "GCS",
+                                "node_ref": "strategy-model",
+                                "title": "Review project risks",
+                                "detail": "Confirm the current risk boundaries.",
+                                "priority": "P1",
+                                "state": "BACKLOG",
+                            },
+                        },
+                    },
                 }
 
         fake = FakeConductorRuntimeHost()
         self.server.runtime_host = fake
+        project_status, _ = self.request(
+            "POST", "/v1/projects/register", self.registration(), self.token
+        )
+        self.assertEqual(HTTPStatus.CREATED, project_status)
         status, bound = self.request(
             "POST",
             "/v1/runtime/planning-binding",
@@ -921,6 +939,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "sender": "USER",
                 "body": "현재 프로젝트 위험을 보여줘.",
                 "provider": "AUTO",
+                "ui_context": {"selected_project_id": "GCS"},
                 "idempotency_key": "conductor-async-001",
             },
             self.token,
@@ -949,12 +968,21 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("GROK", original["provider"])
         self.assertEqual("UNIVERSE_CONDUCTOR", reply["sender"])
         self.assertEqual("현재 프로젝트 위험을 정리했습니다.", reply["body"])
+        self.assertEqual("TODO_DRAFT", reply["ui_action"]["kind"])
+        self.assertEqual("GCS", reply["ui_action"]["todo"]["project_id"])
+        self.assertIsNone(reply["ui_action"]["todo"]["node_ref"])
+        self.assertEqual("CONDUCTOR", reply["ui_action"]["todo"]["source_kind"])
+        self.assertEqual([], self.server.store.list_todos())
         self.assertEqual(
             "grok-cli:conductor-001:result-001",
             reply["result_receipt_ref"],
         )
         self.assertEqual(1, len(fake.calls))
         self.assertEqual("GROK", fake.calls[0]["provider"])
+        self.assertEqual(
+            "GCS",
+            fake.calls[0]["message"]["available_projects"][0]["project_id"],
+        )
         self.assertEqual([message_id], coordinator.observed)
         self.assertEqual(
             f"universe://conductor-room/messages/{message_id}",

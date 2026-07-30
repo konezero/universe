@@ -102,6 +102,7 @@ INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
 CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
+CONDUCTOR_ROOM_UI_ACTION_SCHEMA = "universe.conductor-room-ui-action.v1"
 CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
     {
         "QUEUED",
@@ -2358,6 +2359,98 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
     return message
 
 
+def normalize_conductor_ui_context(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    request = _exact_object_fields(
+        value,
+        field="ui_context",
+        required=frozenset(),
+        optional=frozenset(
+            {"selected_project_id", "selected_node_ref", "selected_node_label"}
+        ),
+    )
+    project_id = request.get("selected_project_id")
+    node_ref = request.get("selected_node_ref")
+    node_label = request.get("selected_node_label")
+    normalized: dict[str, Any] = {}
+    if project_id is not None:
+        normalized["selected_project_id"] = _project_id(project_id)
+    if node_ref is not None:
+        if project_id is None:
+            raise UniverseError(
+                "CONDUCTOR_UI_CONTEXT_INVALID",
+                "selected_node_ref requires selected_project_id",
+            )
+        normalized["selected_node_ref"] = _identifier(node_ref, "selected_node_ref")
+    if node_label is not None:
+        if not isinstance(node_label, str) or len(node_label) > 160:
+            raise UniverseError(
+                "CONDUCTOR_UI_CONTEXT_INVALID",
+                "selected_node_label must be a string no longer than 160 characters",
+            )
+        normalized["selected_node_label"] = node_label
+    return normalized
+
+
+def normalize_conductor_ui_action(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="conductor_ui_action",
+        required=frozenset({"kind"}),
+        optional=frozenset({"todo"}),
+    )
+    kind = _required_text(request["kind"], "conductor_ui_action.kind").upper()
+    if kind == "NONE":
+        if request.get("todo") is not None:
+            raise UniverseError(
+                "CONDUCTOR_UI_ACTION_INVALID",
+                "NONE action cannot include a Todo draft",
+            )
+        return {"schema": CONDUCTOR_ROOM_UI_ACTION_SCHEMA, "kind": "NONE"}
+    if kind != "TODO_DRAFT":
+        raise UniverseError(
+            "CONDUCTOR_UI_ACTION_INVALID",
+            "action kind must be NONE or TODO_DRAFT",
+        )
+    todo_value = request.get("todo")
+    if not isinstance(todo_value, dict):
+        raise UniverseError(
+            "CONDUCTOR_TODO_DRAFT_INVALID",
+            "TODO_DRAFT requires a Todo object",
+        )
+    draft_request = _exact_object_fields(
+        todo_value,
+        field="conductor_todo_draft",
+        required=frozenset(
+            {"scope_kind", "title", "detail", "priority", "state"}
+        ),
+        optional=frozenset({"project_id", "node_ref"}),
+    )
+    scope_kind = _required_text(
+        draft_request["scope_kind"],
+        "conductor_todo_draft.scope_kind",
+    ).upper()
+    canonical_draft = dict(draft_request)
+    if scope_kind == "UNIVERSE":
+        canonical_draft.pop("project_id", None)
+        canonical_draft.pop("node_ref", None)
+    elif scope_kind == "PROJECT":
+        canonical_draft.pop("node_ref", None)
+    todo = normalize_todo(
+        {
+            **canonical_draft,
+            "source_kind": "CONDUCTOR",
+            "sort_order": 0,
+        }
+    )
+    return {
+        "schema": CONDUCTOR_ROOM_UI_ACTION_SCHEMA,
+        "kind": "TODO_DRAFT",
+        "todo": todo,
+    }
+
+
 def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UniverseError(
@@ -2380,6 +2473,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
             "provider must be AUTO, GROK, or CODEX",
         )
     idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
+    ui_context = normalize_conductor_ui_context(value.get("ui_context"))
     in_reply_to = value.get("in_reply_to")
     if in_reply_to is not None:
         in_reply_to = _required_text(in_reply_to, "in_reply_to")
@@ -2393,6 +2487,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
         "sender": sender,
         "body": body,
         "requested_provider": requested_provider,
+        "ui_context": ui_context,
     }
     if in_reply_to is not None:
         material["in_reply_to"] = in_reply_to
@@ -2408,6 +2503,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
             _canonical_json(material).encode("utf-8")
         ).hexdigest(),
         "requested_provider": requested_provider,
+        "ui_context": ui_context,
         "delivery_state": "QUEUED",
         "created_at": utc_now(),
     }
@@ -6929,6 +7025,7 @@ class UniverseStore:
         provider: str,
         body: str,
         result_receipt_ref: str,
+        ui_action: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         reply = normalize_conductor_room_message(
             {
@@ -6981,6 +7078,8 @@ class UniverseStore:
                     "updated_at": completed_at,
                 }
             )
+            if ui_action is not None and ui_action.get("kind") == "TODO_DRAFT":
+                reply["ui_action"] = dict(ui_action)
             connection.execute(
                 """
                 UPDATE conductor_room_message
@@ -9657,24 +9756,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if item.get("message_id") != message_id
         ]
         try:
+            worker_message = dict(claimed)
+            worker_message["available_projects"] = [
+                {
+                    "project_id": project["project_id"],
+                    "summary": str(
+                        project.get("metadata", {}).get("summary")
+                        or project.get("metadata", {}).get("goal")
+                        or ""
+                    )[:500],
+                }
+                for project in self.store.list_projects()[:50]
+            ]
             invocation = self.runtime_host.invoke_conductor_message(
                 runtime_binding=binding,
-                message=claimed,
+                message=worker_message,
                 history=history,
                 provider=provider,
             )
-            returned = invocation.get("result")
+            returned = invocation.get("structured_result")
             if not isinstance(returned, dict):
                 raise RuntimeHostError(
                     "WORKER_RESULT_INVALID",
-                    "Conductor Worker did not return a result object",
+                    "Conductor Worker did not return a structured result object",
                 )
-            reply_text = returned.get("text")
+            reply_text = returned.get("reply")
             if not isinstance(reply_text, str) or not reply_text.strip():
                 raise RuntimeHostError(
                     "WORKER_RESULT_INVALID",
                     "Conductor Worker did not return bounded response text",
                 )
+            ui_action = normalize_conductor_ui_action(returned.get("action"))
+            if ui_action["kind"] == "TODO_DRAFT":
+                todo = ui_action["todo"]
+                if todo["project_id"] is not None:
+                    self.store.get_project(todo["project_id"])
+                if todo["scope_kind"] == "NODE":
+                    ui_context = claimed.get("ui_context")
+                    if (
+                        not isinstance(ui_context, dict)
+                        or todo["project_id"] != ui_context.get("selected_project_id")
+                        or todo["node_ref"] != ui_context.get("selected_node_ref")
+                    ):
+                        raise RuntimeHostError(
+                            "CONDUCTOR_TODO_DRAFT_SCOPE_INVALID",
+                            "Node Todo draft must match the selected UI node",
+                        )
             self.store.complete_conductor_room_message(
                 message_id,
                 provider=provider,
@@ -9682,6 +9809,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 result_receipt_ref=str(
                     invocation.get("result_receipt_ref") or "UNKNOWN"
                 ),
+                ui_action=ui_action,
             )
         except (RuntimeHostError, UniverseError) as error:
             self.store.fail_conductor_room_message(

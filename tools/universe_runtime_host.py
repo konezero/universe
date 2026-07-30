@@ -602,13 +602,43 @@ class UniverseRuntimeHost:
             if isinstance(item, Mapping) and str(item.get("body") or "").strip()
         ]
         output_contract = {
-            "schema": "universe.conductor-chat-output-contract.v1",
-            "format": "PLAIN_TEXT",
+            "schema": "universe.conductor-chat-output-contract.v2",
+            "format": "STRUCTURED_JSON",
             "language_policy": "MATCH_LATEST_USER_MESSAGE",
+            "required": ["reply", "action"],
+            "action_kinds": ["NONE", "TODO_DRAFT"],
+            "todo_contract": {
+                "required": [
+                    "scope_kind",
+                    "project_id",
+                    "node_ref",
+                    "title",
+                    "detail",
+                    "priority",
+                    "state",
+                ],
+                "scope_kind": ["UNIVERSE", "PROJECT", "NODE"],
+                "priority": ["P0", "P1", "P2", "P3"],
+                "state": [
+                    "BACKLOG",
+                    "READY",
+                    "IN_PROGRESS",
+                    "BLOCKED",
+                    "DONE",
+                ],
+            },
             "instruction": (
                 "Answer the latest user message as the Universe Conductor. "
-                "Use only the supplied bounded conversation context. "
-                "Do not claim repository access, execution authority, or completed work."
+                "Return action kind TODO_DRAFT only when the user explicitly asks "
+                "to add, create, register, or capture a Todo or work item. "
+                "A Todo draft is review-only: never claim it was saved, dispatched, "
+                "or executed. Prefer the selected UI node, then selected Project, "
+                "then Universe scope unless the user explicitly names another "
+                "available Project. Use P2 and BACKLOG when priority or state is "
+                "not supplied. For NONE, return action as {\"kind\":\"NONE\"}. "
+                "For TODO_DRAFT, return action with kind and one todo object. "
+                "Use only supplied context. Do not claim repository access, "
+                "execution authority, or completed work."
             ),
         }
         created = False
@@ -686,7 +716,7 @@ class UniverseRuntimeHost:
                     "TASK_FRAME_TURN_DECLARATION_FAILED",
                     "Conductor chat turn declaration failed",
                 )
-            result = self.invoke_read_only(
+            result = self.invoke_structured(
                 {
                     "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
                     "invocation_id": f"conductor-chat:{message_id}",
@@ -709,10 +739,24 @@ class UniverseRuntimeHost:
                             "message_id": message_id,
                             "body": body.strip(),
                         },
+                        "ui_context": (
+                            dict(message["ui_context"])
+                            if isinstance(message.get("ui_context"), Mapping)
+                            else {}
+                        ),
+                        "available_projects": [
+                            {
+                                "project_id": str(item.get("project_id") or "")[:128],
+                                "summary": str(item.get("summary") or "")[:500],
+                            }
+                            for item in message.get("available_projects", [])[:50]
+                            if isinstance(item, Mapping)
+                            and str(item.get("project_id") or "").strip()
+                        ],
                     },
                     "output_contract": output_contract,
                     "max_turns": 1,
-                    "result_mode": "REDACTED",
+                    "result_mode": "STRUCTURED_JSON",
                 }
             )
             packet = self._post_runtime(

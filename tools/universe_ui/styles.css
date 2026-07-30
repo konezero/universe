@@ -494,6 +494,17 @@ button {
   font-family: var(--mono);
 }
 
+.room-message-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.room-message-actions .secondary-button {
+  min-height: 32px;
+  padding: 6px 10px;
+}
+
 .permission-actions {
   display: flex;
   flex-wrap: wrap;

@@ -15,6 +15,7 @@ const state = {
   conductorMessages: [],
   conductorRuntimeBinding: null,
   conductorRefreshInFlight: false,
+  todoDraftSourceKind: "USER",
   projectRoomStream: null,
   projectRoomStreamProjectId: null,
   projectStreamReplies: {},
@@ -593,6 +594,16 @@ function renderRoomMessages() {
           `${conductorDeliveryLabel(message.delivery_state)}${provider}${failure}`
         )
       );
+      if (message.ui_action?.kind === "TODO_DRAFT") {
+        const actions = node("div", "room-message-actions");
+        const review = node("button", "secondary-button", "Review Todo draft");
+        review.type = "button";
+        review.addEventListener("click", () =>
+          openConductorTodoDraft(message.ui_action)
+        );
+        actions.append(review);
+        item.append(actions);
+      }
       elements.roomMessageList.append(item);
     }
     return;
@@ -1970,6 +1981,7 @@ async function submitDispatch(event) {
           sender: "USER",
           body: form.get("instruction"),
           provider: "AUTO",
+          ui_context: conductorUiContext(),
           idempotency_key: crypto.randomUUID(),
         },
       });
@@ -2070,6 +2082,21 @@ function selectedNodeRef() {
   }
   return selected.data?.node_id || null;
 }
+
+function conductorUiContext() {
+  const context = {};
+  if (state.selectedProject) {
+    context.selected_project_id = state.selectedProject.project_id;
+  }
+  const nodeRef = selectedNodeRef();
+  if (state.selectedProject && nodeRef) {
+    context.selected_node_ref = nodeRef;
+    context.selected_node_label =
+      state.selectedNode?.label || state.focusedNodeId || nodeRef;
+  }
+  return context;
+}
+
 
 function todosForSelectedContext() {
   const nodeRef = selectedNodeRef();
@@ -2193,9 +2220,37 @@ function prefillTodoScope() {
 }
 
 function openTodoDialog(prefill = false) {
+  state.todoDraftSourceKind = "USER";
   elements.todoFormError.textContent = "";
   if (prefill) prefillTodoScope();
   else renderTodoScopeControls();
+  renderTodos();
+  elements.todoDialog.showModal();
+  elements.todoTitle.focus();
+}
+
+
+function openConductorTodoDraft(action) {
+  const todo = action?.todo;
+  if (!todo) {
+    toast("Conductor Todo draft is unavailable", true);
+    return;
+  }
+  state.todoDraftSourceKind = "CONDUCTOR";
+  elements.todoFormError.textContent = "";
+  elements.todoScope.value = todo.scope_kind;
+  renderTodoScopeControls();
+  if (todo.project_id) {
+    elements.todoProject.value = todo.project_id;
+    renderTodoScopeControls();
+  }
+  if (todo.node_ref) {
+    elements.todoNode.value = todo.node_ref;
+  }
+  elements.todoTitle.value = todo.title;
+  elements.todoDetail.value = todo.detail;
+  elements.todoForm.elements.priority.value = todo.priority;
+  elements.todoForm.elements.state.value = todo.state;
   renderTodos();
   elements.todoDialog.showModal();
   elements.todoTitle.focus();
@@ -2326,7 +2381,7 @@ async function submitTodo(event) {
     detail: String(form.get("detail") || ""),
     priority: String(form.get("priority")),
     state: String(form.get("state")),
-    source_kind: "USER",
+    source_kind: state.todoDraftSourceKind,
     sort_order: state.todos.length,
   };
   if (scopeKind !== "UNIVERSE") {
@@ -2340,6 +2395,7 @@ async function submitTodo(event) {
     state.todos = [result.todo, ...state.todos];
     elements.todoTitle.value = "";
     elements.todoDetail.value = "";
+    state.todoDraftSourceKind = "USER";
     renderProjects();
     renderTodos();
     renderDetails();
