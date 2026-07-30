@@ -114,9 +114,15 @@ def parse_release_profile_catalog(
     mode_profiles = _mode_profiles(value.get("mode_profiles"), profile_ids)
     return ReleaseProfileCatalog(
         owner=owner,
-        load_profiles=tuple(load_profiles),
-        skill_bindings=tuple(skill_bindings),
-        mode_profiles=tuple(mode_profiles),
+        load_profiles=tuple(
+            sorted(load_profiles, key=lambda profile: profile.profile_id)
+        ),
+        skill_bindings=tuple(
+            sorted(skill_bindings, key=lambda binding: binding.skill_id)
+        ),
+        mode_profiles=tuple(
+            sorted(mode_profiles, key=lambda profile: profile.mode_profile_id)
+        ),
     )
 
 

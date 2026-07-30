@@ -50,6 +50,12 @@ from project_seed_assets import (
     project_seed_template,
 )
 from project_seed_apply import build_project_seed_asset_approval
+from project_release_apply import (
+    ProjectReleaseApplyError,
+    apply_project_release_proposal,
+    build_project_release_approval,
+    plan_project_release_lifecycle,
+)
 from project_master_host import (
     ProjectMasterHostError,
     ResidentProjectMasterHostManager,
@@ -1645,6 +1651,27 @@ def normalize_project_seed_asset_apply_request(value: Any) -> dict[str, str]:
         raise UniverseError(
             "PROJECT_SEED_ASSET_APPROVAL_REQUIRED",
             "approval must be APPROVED before Project Host application",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        "approval": "APPROVED",
+        "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
+        "proposal_digest": _sha256(
+            request["proposal_digest"], "proposal_digest"
+        ),
+    }
+
+
+def normalize_project_release_apply_request(value: Any) -> dict[str, str]:
+    request = _exact_object_fields(
+        value,
+        field="project_release_apply_request",
+        required=frozenset({"approval", "proposal_id", "proposal_digest"}),
+    )
+    if request["approval"] != "APPROVED":
+        raise UniverseError(
+            "PROJECT_RELEASE_APPROVAL_REQUIRED",
+            "approval must be APPROVED before Project Runtime lifecycle application",
             HTTPStatus.CONFLICT,
         )
     return {
@@ -3438,6 +3465,24 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_release_proposal_project_time
                 ON project_release_proposal(project_id, created_at, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS project_release_application (
+                    application_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL UNIQUE
+                        REFERENCES project_release_proposal(proposal_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    release_id TEXT NOT NULL
+                        REFERENCES release_artifact(release_id),
+                    approval_digest TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_release_application_project_time
+                ON project_release_application(project_id, applied_at, application_id);
 
                 CREATE TABLE IF NOT EXISTS universe_identity (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -7262,9 +7307,15 @@ class UniverseStore:
                 database_path=Path(artifact["database_path"]),
                 manifest_path=Path(artifact["manifest_path"]),
             ) as runtime:
-                plan = runtime.plan_project_install(Path(project["project_root"]))
+                plan = plan_project_release_lifecycle(
+                    project_root=Path(project["project_root"]),
+                    project_id=project["project_id"],
+                    release_id=runtime.release_id,
+                    source_commit=runtime.metadata["source_commit"],
+                )
         except (
             CoreReleaseError,
+            ProjectReleaseApplyError,
             ReleaseRuntimeError,
             OSError,
             sqlite3.Error,
@@ -7287,19 +7338,11 @@ class UniverseStore:
                 "project_write": "NONE",
                 "files_changed": 0,
             },
-            "next_operation": (
-                "RESOLVE_COLLISIONS"
-                if plan["collisions"]
-                else "USER_APPROVAL_AND_PROJECT_HOST_APPLY"
-            ),
+            "next_operation": "USER_APPROVAL_AND_PROJECT_HOST_APPLY",
         }
         material["proposal_digest"] = _json_sha256(material)
         material["proposal_id"] = "release_proposal_" + material["proposal_digest"][:20]
-        material["status"] = (
-            "PROJECT_RELEASE_PROPOSAL_BLOCKED"
-            if plan["collisions"]
-            else "PROJECT_RELEASE_PROPOSAL_READY"
-        )
+        material["status"] = "PROJECT_RELEASE_PROPOSAL_READY"
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
@@ -7336,6 +7379,141 @@ class UniverseStore:
             )
         material["created_at"] = now
         return material, True
+
+    def get_project_release_proposal(
+        self,
+        project_id: str,
+        proposal_id: str,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_proposal = _identifier(proposal_id, "proposal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM project_release_proposal
+                WHERE project_id = ? AND proposal_id = ?
+                """,
+                (project["project_id"], normalized_proposal),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "PROJECT_RELEASE_PROPOSAL_NOT_FOUND",
+                f"release proposal is not recorded: {normalized_proposal}",
+                HTTPStatus.NOT_FOUND,
+            )
+        proposal = json.loads(row["proposal_json"])
+        proposal["created_at"] = row["created_at"]
+        return proposal
+
+    def get_release_artifact_binding(self, release_id: str) -> dict[str, Any]:
+        normalized = _identifier(release_id, "release_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT release_id, database_path, manifest_path, database_sha256
+                FROM release_artifact
+                WHERE release_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "RELEASE_NOT_FOUND",
+                f"release is not imported: {normalized}",
+                HTTPStatus.NOT_FOUND,
+            )
+        return {
+            "release_id": row["release_id"],
+            "database_path": row["database_path"],
+            "manifest_path": row["manifest_path"],
+            "database_sha256": row["database_sha256"],
+        }
+
+    def get_project_release_application(
+        self,
+        proposal_id: str,
+    ) -> dict[str, Any] | None:
+        normalized = _identifier(proposal_id, "proposal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT application_id, approval_digest, receipt_json, applied_at
+                FROM project_release_application
+                WHERE proposal_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return None
+        receipt = json.loads(row["receipt_json"])
+        receipt["application_id"] = row["application_id"]
+        receipt["approval_digest"] = row["approval_digest"]
+        receipt["applied_at"] = row["applied_at"]
+        return receipt
+
+    def record_project_release_application(
+        self,
+        *,
+        project_id: str,
+        proposal: Mapping[str, Any],
+        approval_digest: str,
+        receipt: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        proposal_id = _identifier(proposal.get("proposal_id"), "proposal_id")
+        release_id = _identifier(proposal.get("release_id"), "release_id")
+        normalized_approval = _sha256(approval_digest, "approval_digest")
+        application_id = "release_application_" + _json_sha256(
+            {
+                "proposal_id": proposal_id,
+                "approval_digest": normalized_approval,
+            }
+        )[:24]
+        applied_at = utc_now()
+        stored_receipt = dict(receipt)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT application_id, approval_digest, receipt_json, applied_at
+                FROM project_release_application
+                WHERE proposal_id = ?
+                """,
+                (proposal_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["approval_digest"] != normalized_approval:
+                    raise UniverseError(
+                        "PROJECT_RELEASE_ALREADY_APPLIED",
+                        "release proposal already has a different durable approval",
+                        HTTPStatus.CONFLICT,
+                    )
+                existing_receipt = json.loads(existing["receipt_json"])
+                existing_receipt["application_id"] = existing["application_id"]
+                existing_receipt["approval_digest"] = existing["approval_digest"]
+                existing_receipt["applied_at"] = existing["applied_at"]
+                return existing_receipt, False
+            connection.execute(
+                """
+                INSERT INTO project_release_application(
+                    application_id, proposal_id, project_id, release_id,
+                    approval_digest, receipt_json, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    application_id,
+                    proposal_id,
+                    project["project_id"],
+                    release_id,
+                    normalized_approval,
+                    _canonical_json(stored_receipt),
+                    applied_at,
+                ),
+            )
+        stored_receipt["application_id"] = application_id
+        stored_receipt["approval_digest"] = normalized_approval
+        stored_receipt["applied_at"] = applied_at
+        return stored_receipt, True
 
     def list_project_release_proposals(
         self,
@@ -8123,6 +8301,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._planning_binding_error: dict[str, str] | None = None
         self._planning_binding_lock = threading.RLock()
         self.planning_execution_lock = threading.Lock()
+        self.project_release_application_lock = threading.Lock()
         self._conductor_queue: queue.Queue[str | None] = queue.Queue()
         self._conductor_queued_ids: set[str] = set()
         self._conductor_queue_lock = threading.RLock()
@@ -8324,6 +8503,129 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "proposal_digest": proposal["proposal_digest"],
             "approval": approval,
             "delivery": delivery,
+        }
+
+    def apply_project_release(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = normalize_project_release_apply_request(value)
+        with self.project_release_application_lock:
+            return self._apply_project_release(project_id, request)
+
+    def _apply_project_release(
+        self,
+        project_id: str,
+        request: Mapping[str, str],
+    ) -> dict[str, Any]:
+        proposal = self.store.get_project_release_proposal(
+            project_id,
+            request["proposal_id"],
+        )
+        if request["proposal_digest"] != proposal["proposal_digest"]:
+            raise UniverseError(
+                "PROJECT_RELEASE_APPROVAL_STALE",
+                "approval does not match the recorded Project Release proposal",
+                HTTPStatus.CONFLICT,
+            )
+        approval_evidence_ref = (
+            "universe://projects/"
+            + quote(project_id, safe="")
+            + "/release-proposals/"
+            + quote(proposal["proposal_id"], safe="")
+            + "/approvals/"
+            + _json_sha256(request)[:24]
+        )
+        try:
+            approval = build_project_release_approval(
+                project_id=project_id,
+                proposal=proposal,
+                evidence_ref=approval_evidence_ref,
+            )
+        except ProjectReleaseApplyError as error:
+            raise UniverseError(
+                error.code,
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        approval_digest = _json_sha256(approval)
+        existing = self.store.get_project_release_application(
+            proposal["proposal_id"]
+        )
+        if existing is not None:
+            if existing["approval_digest"] != approval_digest:
+                raise UniverseError(
+                    "PROJECT_RELEASE_ALREADY_APPLIED",
+                    "release proposal already has a different durable approval",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "PROJECT_RELEASE_APPLICATION_ALREADY_COMPLETED",
+                "project_id": project_id,
+                "proposal_id": proposal["proposal_id"],
+                "approval": approval,
+                "receipt": existing,
+            }
+
+        project = self.store.get_project(project_id)
+        artifact = self.store.get_release_artifact_binding(
+            proposal["release_id"]
+        )
+        resident_stopped = False
+        if self.project_master_hosts is not None:
+            resident_stopped = self.project_master_hosts.stop(project_id)
+        try:
+            receipt = apply_project_release_proposal(
+                project_root=Path(project["project_root"]),
+                project_id=project_id,
+                proposal=proposal,
+                approval=approval,
+                database_path=Path(artifact["database_path"]),
+                manifest_path=Path(artifact["manifest_path"]),
+            )
+        except ProjectReleaseApplyError as error:
+            master_host = {"status": "NOT_RESTARTED"}
+            if resident_stopped:
+                try:
+                    master_host = self.ensure_project_master(project_id)
+                except (OSError, ProjectMasterHostError, UniverseError) as restart:
+                    master_host = {
+                        "status": "PROJECT_MASTER_RESTART_FAILED",
+                        "detail": str(restart),
+                    }
+            raise UniverseError(
+                error.code,
+                f"{error}; master_host={master_host['status']}",
+                HTTPStatus.CONFLICT,
+            ) from error
+
+        stored_receipt, created = self.store.record_project_release_application(
+            project_id=project_id,
+            proposal=proposal,
+            approval_digest=approval_digest,
+            receipt=receipt,
+        )
+        try:
+            master_host = self.ensure_project_master(project_id)
+        except (OSError, ProjectMasterHostError, UniverseError) as error:
+            master_host = {
+                "status": "PROJECT_MASTER_START_FAILED",
+                "detail": str(error),
+            }
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "PROJECT_RELEASE_APPLICATION_COMPLETED"
+                if created
+                else "PROJECT_RELEASE_APPLICATION_ALREADY_COMPLETED"
+            ),
+            "project_id": project_id,
+            "proposal_id": proposal["proposal_id"],
+            "approval": approval,
+            "receipt": stored_receipt,
+            "master_host": master_host,
         }
 
     def provider_settings(self) -> dict[str, Any]:
@@ -9391,6 +9693,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.apply_project_seed_assets(parts[0], body),
                 )
                 return
+            if (
+                parts is not None
+                and parts[1] == "/release-proposals/apply"
+            ):
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.apply_project_release(parts[0], body),
+                )
+                return
             if parts is not None and parts[1] == "/release-proposals":
                 proposal, created = self.server.store.create_project_release_proposal(
                     parts[0],
@@ -9913,6 +10224,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/experience-pattern-proposals",
             "/career-promotion-queue",
             "/context-packs",
+            "/release-proposals/apply",
             "/release-proposals",
             "/runtime-worker-invocations",
             "/dispatches",

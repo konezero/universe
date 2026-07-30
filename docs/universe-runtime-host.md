@@ -7,9 +7,18 @@ dispatcher. They live under `tools/`, not under `.ai/`.
 
 ```text
 Career Release DB -> installed project Runtime
+Universe Project Lifecycle Host -> OS_INSTALL / OS_UPDATE -> validate/status
 Universe Runtime Host -> provider CLI / local process -> Task Frame result
 Project Runtime -> Execution Guard / source mutation gateway
 ```
+
+The Project Lifecycle Host is separate from the provider Worker Host and the
+resident Project Master. It consumes an exact approved Release proposal,
+re-verifies the immutable artifact and current installation state, materializes
+the `universe-release-db` source bundle, and invokes the pinned ai-career Host
+lifecycle entry. It accepts only matching `PASS`, `VERIFIED`, and
+`READY_FOR_BOOT` evidence, then records one idempotent application receipt.
+Fresh install therefore does not require a resident Master to exist first.
 
 The Host can invoke a declared read-only Task Frame turn only after the Task
 Frame Runtime returns `WORKER_INVOCATION_READY`. Provider configuration never

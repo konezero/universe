@@ -263,6 +263,59 @@ class CoreReleaseTests(unittest.TestCase):
         self.assertEqual(("BOOT_CORE",), skill)
         self.assertEqual([("BOOT_CORE",)], mode)
 
+    def test_profile_catalog_digest_is_independent_of_top_level_input_order(
+        self,
+    ) -> None:
+        self._write_fixture(with_profiles=True)
+        catalog_path = (
+            self.repo
+            / ".ai"
+            / "distribution"
+            / "context_management_runtime_pack"
+            / "release_profile_catalog.json"
+        )
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["load_profiles"].append(
+            {
+                "profile_id": "AUX_CORE",
+                "description": "Auxiliary surfaces.",
+                "surfaces": [
+                    {
+                        "path": ".ai/core/CORE_SURFACE_REGISTRY.md",
+                        "required": True,
+                    }
+                ],
+            }
+        )
+        catalog["skill_bindings"].append(
+            {"skill_id": "auxiliary", "profile_id": "AUX_CORE"}
+        )
+        catalog["mode_profiles"].append(
+            {
+                "mode_profile_id": "AUX_MODE",
+                "overlay_policy": "NONE",
+                "load_profiles": ["AUX_CORE"],
+            }
+        )
+        catalog_path.write_text(
+            json.dumps(catalog, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.commit = self._commit("multi-profile-catalog")
+
+        manifest = self._build()
+        verified = verify_release(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+
+        self.assertEqual("PRESENT", verified["profile_catalog"]["status"])
+        self.assertEqual(2, verified["profile_catalog"]["load_profile_count"])
+        self.assertEqual(
+            manifest["profile_catalog"]["catalog_digest"],
+            verified["profile_catalog"]["catalog_digest"],
+        )
+
     def test_profile_catalog_cannot_reference_an_unpacked_surface(self) -> None:
         self._write_fixture(
             with_profiles=True,

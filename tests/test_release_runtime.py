@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -257,6 +258,35 @@ class ReleaseRuntimeTests(unittest.TestCase):
                     approved_plan_digest="0" * 64,
                 )
         self.assertEqual([], list(self.target.iterdir()))
+
+    def test_materializes_provider_attested_source_bundle(self) -> None:
+        bundle = self.root / "bundle"
+        with ReleaseRuntime(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        ) as runtime:
+            evidence = runtime.materialize_source_bundle(bundle)
+            expected_files = list(runtime.iter_release_files())
+
+        manifest_path = bundle / "SOURCE_BUNDLE.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual("universe-release-db", evidence["provider"])
+        self.assertEqual("provider-attested", evidence["binding"])
+        self.assertEqual(self.commit, evidence["source_commit"])
+        self.assertEqual(
+            hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            evidence["bundle_manifest_sha256"],
+        )
+        self.assertEqual(
+            [item.path for item in expected_files],
+            [item["path"] for item in manifest["files"]],
+        )
+        for source, entry in zip(expected_files, manifest["files"], strict=True):
+            self.assertEqual(source.git_object_id, entry["blob_oid"])
+            self.assertEqual(
+                source.content,
+                (bundle / "objects" / "sha256" / entry["sha256"]).read_bytes(),
+            )
 
 
 if __name__ == "__main__":

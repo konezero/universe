@@ -1153,6 +1153,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         proposal = proposed["proposal"]
         self.assertEqual("PROJECT_HOST", proposal["execution_owner"])
         self.assertEqual("NONE", proposal["effects"]["project_write"])
+        self.assertEqual("FRESH_INSTALL", proposal["plan"]["operation"])
+        self.assertEqual("OS_INSTALL", proposal["plan"]["user_command"])
         self.assertEqual(
             "PROJECT_RELEASE_PROPOSAL_READY",
             proposal["status"],
@@ -1174,6 +1176,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
             if path.is_file()
         }
         self.assertEqual(before, after)
+
+    def test_project_release_apply_is_approved_durable_and_idempotent(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        database, manifest = self.build_release_fixture()
+        _, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        _, proposed = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals",
+            {
+                "release_id": imported["release"]["release_id"],
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        proposal = proposed["proposal"]
+        receipt = {
+            "schema": "universe.project-release-apply-receipt.v1",
+            "status": "PROJECT_RELEASE_APPLIED",
+            "project_id": "GCS",
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "release_id": proposal["release_id"],
+            "receipt_digest": "a" * 64,
+        }
+        request = {
+            "approval": "APPROVED",
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+        }
+        with patch(
+            "universe_server.apply_project_release_proposal",
+            return_value=receipt,
+        ) as apply_release:
+            status, applied = self.request(
+                "POST",
+                "/v1/projects/GCS/release-proposals/apply",
+                request,
+                self.token,
+            )
+            status_repeated, repeated = self.request(
+                "POST",
+                "/v1/projects/GCS/release-proposals/apply",
+                request,
+                self.token,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_RELEASE_APPLICATION_COMPLETED", applied["status"])
+        self.assertEqual(200, status_repeated)
+        self.assertEqual(
+            "PROJECT_RELEASE_APPLICATION_ALREADY_COMPLETED",
+            repeated["status"],
+        )
+        self.assertEqual(
+            applied["receipt"]["application_id"],
+            repeated["receipt"]["application_id"],
+        )
+        apply_release.assert_called_once()
+        call = apply_release.call_args.kwargs
+        self.assertEqual(self.project_root, call["project_root"])
+        self.assertEqual("APPROVED", call["approval"]["status"])
+
+        stale_request = {**request, "proposal_digest": "0" * 64}
+        stale_status, stale = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals/apply",
+            stale_request,
+            self.token,
+        )
+        self.assertEqual(409, stale_status)
+        self.assertEqual("PROJECT_RELEASE_APPROVAL_STALE", stale["error_code"])
 
     def test_release_lifecycle_requires_master_and_rejects_tampering(self) -> None:
         database, manifest = self.build_release_fixture()

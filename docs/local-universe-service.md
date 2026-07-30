@@ -189,6 +189,7 @@ GET    /v1/releases/{release_id}
 POST   /v1/releases/import
 GET    /v1/projects/{project_id}/release-proposals
 POST   /v1/projects/{project_id}/release-proposals
+POST   /v1/projects/{project_id}/release-proposals/apply
 GET    /v1/projects/{project_id}/seed-asset-proposal
 POST   /v1/projects/{project_id}/seed-asset-proposal/apply
 GET    /v1/projects/{project_id}/runtime-worker-invocations
@@ -501,9 +502,17 @@ Neither receipt starts Task Frames, grants Execution Guard permission, or
 executes a room instruction. Those remain Project Master decisions through the
 Project Runtime.
 
-Release proposals never apply project files from the browser. The proposal
-digest and plan are handed to the Project Host for approval, guarded writes,
-validate/status, and completion evidence.
+Release proposal creation never applies Project files. After explicit approval,
+the apply route passes the exact proposal to the independent local Project
+Lifecycle Host. It rebuilds a provider-attested source bundle from the imported
+Release DB, executes ai-career's `OS_INSTALL` or `OS_UPDATE` Host lifecycle, and
+accepts completion only with matching source/target evidence, `VERIFIED`
+validate/status, and `READY_FOR_BOOT`. The application receipt is durable and
+idempotent. The browser does not receive a filesystem write primitive.
+
+The lifecycle Host does not depend on an already installed resident Project
+Master. If one is active during `OS_UPDATE`, Universe stops it first and
+reconnects it after successful lifecycle completion.
 
 ## Project Seed and Projection
 

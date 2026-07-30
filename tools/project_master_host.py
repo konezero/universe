@@ -1399,6 +1399,15 @@ class ResidentProjectMasterHostManager:
         if handle is not None:
             handle.close()
 
+    def stop(self, project_id: str) -> bool:
+        normalized = _text(project_id, "project_id")
+        with self._lock:
+            handle = self._handles.pop(normalized, None)
+        if handle is None:
+            return False
+        handle.close()
+        return True
+
     def close(self) -> None:
         with self._lock:
             handles = list(self._handles.values())

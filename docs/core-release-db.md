@@ -54,14 +54,16 @@ Implemented:
 - ordered Skill Load Profiles and Mode Profiles in Release DB v2;
 - legacy Release DB v1 verification without profile claims;
 - content-addressed Universe Catalog import;
-- read-only Project install/update planning with collision detection;
-- Project Host-owned application after exact plan approval.
+- read-only Project `OS_INSTALL`/`OS_UPDATE` lifecycle planning;
+- provider-attested source-bundle materialization from immutable Release DB
+  bytes;
+- receipt-aware Project Lifecycle Host application after exact plan approval;
+- durable, idempotent application receipts.
 
 Not implemented yet:
 
 - signed release promotion;
 - release channel selection;
-- receipt-aware Project Host apply adapter;
 - rollback and project fleet update orchestration.
 
 ## Catalog and Project boundary
@@ -77,13 +79,30 @@ GET  /v1/releases
 GET  /v1/releases/{release_id}
 POST /v1/projects/{project_id}/release-proposals
 GET  /v1/projects/{project_id}/release-proposals
+POST /v1/projects/{project_id}/release-proposals/apply
 ```
 
-A proposal computes `FRESH_INSTALL` or `UPDATE`, exact actions, collisions, and
-the plan digest. The service persists the proposal with `project_write: NONE`.
-The attached Project Host remains responsible for user approval, Execution
-Guard, receipt-aware writes, validate/status, and the final install receipt.
-Universe deliberately exposes no HTTP apply endpoint.
+A proposal resolves the current Project lifecycle as `OS_INSTALL` or
+`OS_UPDATE` and binds the target root, Project identity, Release DB identity,
+source commit, installed manifest digest, and plan digest. Proposal creation is
+read-only and persists `project_write: NONE`.
+
+The apply route accepts only `APPROVED` plus the exact proposal ID and digest.
+The Universe-owned Project Lifecycle Host then:
+
+1. re-verifies the imported Release DB and current Project lifecycle state;
+2. materializes a temporary `universe-release-db` provider-attested source
+   bundle from content-addressed Release DB bytes;
+3. runs the pinned ai-career Host lifecycle entry from the same artifact;
+4. requires `PASS`, `VERIFIED`, matching target/source/operation, and
+   `READY_FOR_BOOT`;
+5. stores one durable application receipt keyed by proposal and approval.
+
+This Host is independent of the resident Project Master, so a Fresh Project can
+be installed before its Master Runtime exists. A resident Master is stopped
+before update and started or reconnected after a successful lifecycle. Repeating
+the same approved request returns the stored receipt without running the
+lifecycle again.
 
 A v2 artifact may still report `profile_catalog.status: ABSENT` when its pinned
 source commit has no catalog surface. The artifact remains verifiable and

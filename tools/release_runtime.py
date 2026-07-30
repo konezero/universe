@@ -29,6 +29,7 @@ class ReleaseRuntimeError(ValueError):
 @dataclass(frozen=True)
 class ReleaseFile:
     path: str
+    git_object_id: str
     size: int
     sha256: str
     content: bytes
@@ -224,7 +225,7 @@ class ReleaseRuntime:
         normalized = _release_path(path)
         row = self._connection.execute(
             """
-            SELECT path, size, sha256, content
+            SELECT path, git_object_id, size, sha256, content
             FROM release_file
             WHERE path = ?
             """,
@@ -237,6 +238,7 @@ class ReleaseRuntime:
             raise ReleaseRuntimeError(f"release file content is invalid: {normalized}")
         return ReleaseFile(
             path=row["path"],
+            git_object_id=row["git_object_id"],
             size=row["size"],
             sha256=row["sha256"],
             content=content,
@@ -245,7 +247,7 @@ class ReleaseRuntime:
     def iter_release_files(self) -> Iterable[ReleaseFile]:
         for row in self._connection.execute(
             """
-            SELECT path, size, sha256, content
+            SELECT path, git_object_id, size, sha256, content
             FROM release_file
             ORDER BY path
             """
@@ -257,10 +259,98 @@ class ReleaseRuntime:
                 )
             yield ReleaseFile(
                 path=row["path"],
+                git_object_id=row["git_object_id"],
                 size=row["size"],
                 sha256=row["sha256"],
                 content=content,
             )
+
+    def materialize_source_bundle(self, bundle_root: Path) -> dict[str, Any]:
+        """Rebuild the installer's canonical provider-attested source bundle."""
+
+        root = bundle_root.expanduser().resolve()
+        if root.exists():
+            if not root.is_dir() or root.is_symlink() or any(root.iterdir()):
+                raise ReleaseRuntimeError("source bundle target must be an empty real directory")
+        else:
+            root.mkdir(parents=True)
+        object_root = root / "objects" / "sha256"
+        object_root.mkdir(parents=True)
+
+        rows: list[dict[str, Any]] = []
+        for item in self.iter_release_files():
+            object_path = object_root / item.sha256
+            if object_path.exists():
+                if (
+                    not object_path.is_file()
+                    or object_path.is_symlink()
+                    or hashlib.sha256(object_path.read_bytes()).hexdigest()
+                    != item.sha256
+                ):
+                    raise ReleaseRuntimeError("source bundle object collision")
+            else:
+                _replace_file(object_path, item.content)
+            rows.append(
+                {
+                    "path": item.path,
+                    "blob_oid": item.git_object_id,
+                    "sha256": item.sha256,
+                    "size": item.size,
+                }
+            )
+
+        committed_at = _required_text(
+            self.metadata.get("source_committed_at"),
+            "source_committed_at",
+        )
+        commit_date = committed_at[:10]
+        if len(commit_date) != 10:
+            raise ReleaseRuntimeError("source_committed_at is invalid")
+        capability_ref = (
+            "universe-release-db://"
+            + self.release_id
+            + "@"
+            + self.verification["database_sha256"]
+        )
+        source_commit = _required_text(
+            self.metadata.get("source_commit"),
+            "source_commit",
+        )
+        manifest = {
+            "schema": "ai-career.project-runtime-source-bundle.v1",
+            "source": {
+                "provider": "universe-release-db",
+                "repository": _required_text(
+                    self.metadata.get("source_repository"),
+                    "source_repository",
+                ),
+                "requested_ref": _required_text(
+                    self.metadata.get("source_ref"),
+                    "source_ref",
+                ),
+                "resolved_commit": source_commit,
+                "commit_date": commit_date,
+                "source_binding": "provider-attested",
+                "capability_evidence_ref": capability_ref,
+            },
+            "files": rows,
+        }
+        manifest_bytes = (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        manifest_path = root / "SOURCE_BUNDLE.json"
+        _replace_file(manifest_path, manifest_bytes)
+        return {
+            "schema": manifest["schema"],
+            "provider": "universe-release-db",
+            "binding": "provider-attested",
+            "release_id": self.release_id,
+            "source_commit": source_commit,
+            "bundle_root": str(root),
+            "bundle_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "file_count": len(rows),
+            "capability_evidence_ref": capability_ref,
+        }
 
     def plan_project_install(self, target_root: Path) -> dict[str, Any]:
         root = _project_root(target_root)
