@@ -32,14 +32,18 @@ grants authority or permission to mutate an attached project. See
 
 Universe Runtime Host provider processes remain outside the installed project Runtime. They can return a bounded read-only Worker result, but cannot create project authority, write scope, or mutation permission. See `docs/universe-runtime-host.md`.
 
-The Universe Conductor Room persists each user message before execution. A
-single service-owned queue dispatches the message through the existing
-read-only Task Frame Runtime Host after a process-local Runtime binding exists:
+The Universe Conductor Room persists each user message before execution. The
+local service prepares the `UNIVERSE / CONDUCTOR` Mode, starts one owned
+internal Skill Router Session Runtime, and binds its loopback endpoint in
+process memory before it accepts Conductor work. The executable Runtime does
+not select or create the active Mode; the prepared `UNIVERSE` Mode Current
+Anchor remains the governance coordinate. A single service-owned queue then
+dispatches the message through the read-only Task Frame Runtime Host:
 
 ```text
 Universe UI
   -> durable Conductor Room message
-  -> QUEUED or WAITING_FOR_RUNTIME_BINDING
+  -> QUEUED
   -> one read-only Task Frame Worker
   -> bounded reply plus provider Result Receipt
   -> durable Conductor Room reply
@@ -47,10 +51,19 @@ Universe UI
 
 The HTTP request does not wait for the provider. The UI polls the durable room
 for `PROCESSING`, `ANSWERED`, or `FAILED`. Restart recovery returns interrupted
-`PROCESSING` messages to `QUEUED`; a missing Runtime binding leaves messages in
-`WAITING_FOR_RUNTIME_BINDING` until the Host binds again. Raw CLI transcripts,
-tokens, endpoint credentials, and repository contents are not Conductor Room
-records.
+`PROCESSING` messages to `QUEUED` and the service creates a new process-local
+binding before replay. `WAITING_FOR_RUNTIME_BINDING` remains a compatibility
+state for manually constructed or test servers that explicitly disable owned
+Runtime startup. A failed owned Runtime startup is reported as `START_FAILED`;
+messages must not wait indefinitely. Raw CLI transcripts, tokens, endpoint
+credentials, and repository contents are not Conductor Room records.
+
+Before each Conductor provider turn, the service asks the installed Universe
+Runtime to observe the input with `commander_surface: UNIVERSE_UI`. This updates
+the Mode Current Anchor observation without changing Anchor identity,
+authority, or execution assignment. The Session Runtime token and endpoint
+remain process-local and are never persisted to the Universe database or
+browser state.
 
 Each attached project remains responsible for its own source mutation,
 validation, Execution Guard, and evidence. Universe stores project roots and

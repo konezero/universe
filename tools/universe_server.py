@@ -60,6 +60,10 @@ from universe_runtime_host import (
     UniverseRuntimeHost,
     redacted_invocation_record,
 )
+from universe_conductor_runtime import (
+    UniverseConductorRuntime,
+    UniverseConductorRuntimeError,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -7984,6 +7988,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         runtime_host: UniverseRuntimeHost | None = None,
         mode_contract: dict[str, Any] | None = None,
         *,
+        auto_start_conductor_runtime: bool = False,
+        conductor_runtime_factory: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
     ):
@@ -7994,6 +8000,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
         self._planning_binding: dict[str, Any] | None = None
+        self._planning_binding_error: dict[str, str] | None = None
         self._planning_binding_lock = threading.RLock()
         self.planning_execution_lock = threading.Lock()
         self._conductor_queue: queue.Queue[str | None] = queue.Queue()
@@ -8002,6 +8009,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_stop = threading.Event()
         self.project_room_events = ProjectRoomEventHub()
         super().__init__(address, UniverseRequestHandler)
+        self.conductor_runtime: UniverseConductorRuntime | None = None
+        if auto_start_conductor_runtime:
+            factory = conductor_runtime_factory or UniverseConductorRuntime
+            try:
+                self.conductor_runtime = factory(
+                    Path(__file__).resolve().parents[1]
+                )
+                self._planning_binding = normalize_planning_runtime_binding(
+                    self.conductor_runtime.start()
+                )
+                self._planning_binding["bound_at"] = utc_now()
+            except (OSError, UniverseConductorRuntimeError, UniverseError) as error:
+                self.conductor_runtime = None
+                self._planning_binding_error = {
+                    "error_code": getattr(
+                        error,
+                        "code",
+                        str(error) or type(error).__name__,
+                    ),
+                    "reason": f"{type(error).__name__}: {error}",
+                }
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
         self.connection_profile = local_connection_profile(f"http://{host_text}:{port}")
@@ -8028,7 +8056,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         binding = normalize_planning_runtime_binding(value)
         binding["bound_at"] = utc_now()
         with self._planning_binding_lock:
+            if self.conductor_runtime is not None:
+                self.conductor_runtime.stop()
+                self.conductor_runtime = None
             self._planning_binding = binding
+            self._planning_binding_error = None
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
         return self.planning_binding_status()
@@ -8041,12 +8073,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 else None
             )
         if binding is None:
-            return {
+            result: dict[str, Any] = {
                 "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
                 "status": "UNBOUND",
                 "persistence": "PROCESS_LOCAL",
                 "provider_execution": "BLOCKED",
             }
+            if self._planning_binding_error is not None:
+                result.update(
+                    {
+                        "status": "START_FAILED",
+                        **self._planning_binding_error,
+                    }
+                )
+            return result
         evidence = {
             "session_id": binding["session_id"],
             "origin_anchor_ref": binding["origin_anchor_ref"],
@@ -8168,6 +8208,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 else None
             )
         if binding is None:
+            if self._planning_binding_error is not None:
+                self.store.fail_conductor_room_message(
+                    message_id,
+                    code=self._planning_binding_error["error_code"],
+                    reason=self._planning_binding_error["reason"],
+                )
+                return
             self.store.wait_conductor_room_message(message_id)
             return
         message = self.store.get_conductor_room_message(message_id)
@@ -8175,6 +8222,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         claimed = self.store.claim_conductor_room_message(message_id, provider=provider)
         if claimed is None:
             return
+        if self.conductor_runtime is not None:
+            self.conductor_runtime.observe(message_id)
+            binding["parent_evidence_ref"] = (
+                f"universe://conductor-room/messages/{message_id}"
+            )
         history = [
             item
             for item in self.store.list_conductor_room_messages(limit=200)
@@ -8248,6 +8300,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._conductor_worker.join(timeout=5)
         if self.project_master_hosts is not None:
             self.project_master_hosts.close()
+        if self.conductor_runtime is not None:
+            self.conductor_runtime.stop()
+            self.conductor_runtime = None
         super().server_close()
 
 
@@ -9733,6 +9788,8 @@ def create_server(
     port: int = 0,
     runtime_host: UniverseRuntimeHost | None = None,
     mode_contract: dict[str, Any] | None = None,
+    auto_start_conductor_runtime: bool = False,
+    conductor_runtime_factory: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
 ) -> UniverseHTTPServer:
@@ -9753,6 +9810,8 @@ def create_server(
         _required_text(token, "token"),
         runtime_host,
         mode_contract,
+        auto_start_conductor_runtime=auto_start_conductor_runtime,
+        conductor_runtime_factory=conductor_runtime_factory,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
     )
@@ -10096,6 +10155,7 @@ def main() -> int:
                 host=args.host,
                 port=args.port,
                 mode_contract=mode_contract,
+                auto_start_conductor_runtime=True,
             )
             host, port = server.server_address[:2]
             host_text = host.decode("ascii") if isinstance(host, bytes) else host

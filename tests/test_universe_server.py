@@ -581,6 +581,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
     def test_conductor_room_invokes_bound_runtime_asynchronously(self) -> None:
+        class FakeConductorCoordinator:
+            def __init__(self) -> None:
+                self.observed: list[str] = []
+                self.stopped = False
+
+            def observe(self, message_id: str) -> dict[str, str]:
+                self.observed.append(message_id)
+                return {"status": "COMMANDER_INPUT_OBSERVED"}
+
+            def stop(self) -> None:
+                self.stopped = True
+
         class FakeConductorRuntimeHost:
             def __init__(self) -> None:
                 self.calls: list[dict[str, object]] = []
@@ -638,6 +650,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("BOUND", bound["status"])
+        coordinator = FakeConductorCoordinator()
+        self.server.conductor_runtime = coordinator
 
         status, queued = self.request(
             "POST",
@@ -681,6 +695,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(1, len(fake.calls))
         self.assertEqual("GROK", fake.calls[0]["provider"])
+        self.assertEqual([message_id], coordinator.observed)
+        self.assertEqual(
+            f"universe://conductor-room/messages/{message_id}",
+            fake.calls[0]["binding"]["parent_evidence_ref"],
+        )
 
     def test_conductor_worker_survives_unavailable_provider(self) -> None:
         class UnavailableRuntimeHost:
