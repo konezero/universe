@@ -19,6 +19,7 @@ const state = {
   projectStreamReplies: {},
   masterBridge: null,
   modeContract: null,
+  providerSettings: null,
   conversationTarget: {
     kind: "UNIVERSE_CONDUCTOR",
     projectId: null,
@@ -59,6 +60,13 @@ const elements = {
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
+  settingsButton: document.querySelector("#settings-button"),
+  settingsDialog: document.querySelector("#settings-dialog"),
+  settingsForm: document.querySelector("#settings-form"),
+  settingsError: document.querySelector("#settings-error"),
+  universeProviderSetting: document.querySelector("#universe-provider-setting"),
+  universeProviderStatus: document.querySelector("#universe-provider-status"),
+  projectProviderSettings: document.querySelector("#project-provider-settings"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
@@ -274,16 +282,19 @@ async function refresh() {
     state.modeContract = health.mode_contract || null;
     renderModeStatus();
 
-    const [projectResult, releaseResult, conductorRoomResult] = await Promise.all([
+    const [projectResult, releaseResult, conductorRoomResult, providerSettings] =
+      await Promise.all([
       api("/v1/projects"),
       api("/v1/releases"),
       api("/v1/conductor-room/messages"),
+      api("/v1/settings/providers"),
     ]);
     state.projects = projectResult.projects;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];
     state.conductorRuntimeBinding =
       conductorRoomResult.runtime_binding || null;
+    state.providerSettings = providerSettings;
     renderProjects();
     renderComposerActions();
     renderReleaseCatalog();
@@ -552,6 +563,110 @@ function renderRoomMessages() {
     elements.roomMessageList.append(item);
   }
   elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+}
+
+function providerCapability(provider) {
+  return (
+    state.providerSettings?.available_providers?.find(
+      (item) => item.provider === provider
+    ) || null
+  );
+}
+
+function providerStatusText(setting) {
+  const configured = setting?.provider || "AUTO";
+  const resolved = setting?.resolved_provider || "UNAVAILABLE";
+  if (configured === "AUTO") {
+    return resolved === "UNAVAILABLE"
+      ? "Auto / no CLI available"
+      : `Auto / currently ${resolved}`;
+  }
+  const capability = providerCapability(configured);
+  return capability?.status === "AVAILABLE"
+    ? `${configured} available`
+    : `${configured} unavailable / ${capability?.reason || "CLI unavailable"}`;
+}
+
+function renderProviderSettings() {
+  const settings = state.providerSettings;
+  if (!settings) return;
+  const conductor = settings.universe_conductor;
+  elements.universeProviderSetting.value = conductor?.provider || "AUTO";
+  elements.universeProviderStatus.textContent = providerStatusText(conductor);
+  elements.projectProviderSettings.replaceChildren();
+  for (const project of state.projects) {
+    const setting =
+      settings.project_masters?.find(
+        (item) => item.scope_id === project.project_id
+      ) || { provider: "AUTO", resolved_provider: "UNAVAILABLE" };
+    const row = node("label", "project-provider-row");
+    row.dataset.projectId = project.project_id;
+    const copy = node("span", "project-provider-copy");
+    copy.append(
+      node("strong", "", `${project.project_id} Master`),
+      node("small", "", providerStatusText(setting))
+    );
+    const select = node("select", "project-provider-select");
+    select.name = `project_provider_${project.project_id}`;
+    select.dataset.projectId = project.project_id;
+    for (const [value, label] of [
+      ["AUTO", "Auto"],
+      ["GROK", "Grok"],
+      ["CODEX", "Codex"],
+    ]) {
+      const option = node("option", "", label);
+      option.value = value;
+      select.append(option);
+    }
+    select.value = setting.provider || "AUTO";
+    row.append(copy, select);
+    elements.projectProviderSettings.append(row);
+  }
+  if (!state.projects.length) {
+    elements.projectProviderSettings.append(
+      node("p", "empty-copy", "Connect a project to configure its Master CLI.")
+    );
+  }
+}
+
+async function openProviderSettings() {
+  elements.settingsError.textContent = "";
+  state.providerSettings = await api("/v1/settings/providers");
+  renderProviderSettings();
+  elements.settingsDialog.showModal();
+}
+
+async function submitProviderSettings(event) {
+  event.preventDefault();
+  elements.settingsError.textContent = "";
+  elements.settingsForm.querySelector("button[type='submit']").disabled = true;
+  try {
+    const requests = [
+      api("/v1/settings/providers/universe", {
+        method: "POST",
+        body: { provider: elements.universeProviderSetting.value },
+      }),
+    ];
+    for (const select of elements.projectProviderSettings.querySelectorAll(
+      ".project-provider-select"
+    )) {
+      requests.push(
+        api(`/v1/projects/${encodeURIComponent(select.dataset.projectId)}/provider-setting`, {
+          method: "POST",
+          body: { provider: select.value },
+        })
+      );
+    }
+    await Promise.all(requests);
+    state.providerSettings = await api("/v1/settings/providers");
+    renderProviderSettings();
+    elements.settingsDialog.close();
+    toast("CLI provider settings saved");
+  } catch (error) {
+    elements.settingsError.textContent = error.message;
+  } finally {
+    elements.settingsForm.querySelector("button[type='submit']").disabled = false;
+  }
 }
 
 function conductorDeliveryLabel(deliveryState) {
@@ -2234,6 +2349,9 @@ function bindEvents() {
       renderReleaseCatalog();
       elements.releaseDialog.showModal();
     });
+  elements.settingsButton.addEventListener("click", () => {
+    openProviderSettings().catch((error) => toast(error.message, true));
+  });
   document
     .querySelector("#add-project-button")
     .addEventListener("click", () => elements.projectDialog.showModal());
@@ -2278,6 +2396,7 @@ function bindEvents() {
     );
   });
   elements.projectForm.addEventListener("submit", submitProject);
+  elements.settingsForm.addEventListener("submit", submitProviderSettings);
   elements.freshProjectForm.addEventListener("submit", submitFreshProjectIntent);
   document
     .querySelector("#edit-project-intent")

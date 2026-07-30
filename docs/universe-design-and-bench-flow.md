@@ -315,14 +315,15 @@ relations remain distinct from observed evidence. Career adoption is separate.
 8. Add display-language localization for the Universe UI. Localization is a
    presentation-layer follow-up: canonical Mode, Role, state, schema, provider,
    and evidence identifiers remain stable English values in APIs and storage.
-9. Add Universe Conductor provider-routing settings. The settings surface must
-   cover a default provider, ordered `AUTO` preference, per-room or per-task
-   override, capability visibility, and explicit unavailable-provider fallback.
-   A provider failure after invocation must not silently retry another provider
-   because that can duplicate work or billing. Every answer must expose the
-   provider, model reference when available, and Result Receipt reference.
-   Provider credentials remain in each provider credential store and must not
-   be persisted in Universe settings.
+9. Universe Conductor and per-Project Master CLI provider settings are
+   implemented as local SQLite configuration. The default is `AUTO`, with the
+   current ordered preference `GROK` then `CODEX`; explicit `GROK` or `CODEX`
+   selection never falls back silently when unavailable. Capability and
+   resolution state are visible in the settings UI. Changing a Project Master
+   setting stops its resident Host and applies the new selection on the next
+   Project Room message. Per-task provider selection remains part of the
+   separate Task Frame proposal. Provider credentials remain in each provider
+   credential store and are never persisted in Universe settings.
 
 ## Runtime Boundary
 

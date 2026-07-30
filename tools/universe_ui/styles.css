@@ -943,6 +943,58 @@ dialog {
   overflow: auto;
 }
 
+.settings-dialog {
+  width: min(560px, calc(100vw - 28px));
+}
+
+.settings-dialog .dialog-heading {
+  align-items: flex-start;
+}
+
+.settings-dialog .dialog-heading p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.settings-section-heading,
+.project-provider-row,
+.project-provider-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-section-heading small,
+.project-provider-copy small,
+.provider-setting-status {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.project-provider-settings {
+  display: grid;
+  gap: 8px;
+  max-height: min(360px, calc(100vh - 330px));
+  overflow-y: auto;
+}
+
+.project-provider-row {
+  grid-template-columns: minmax(0, 1fr) 130px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+}
+
 dialog::backdrop {
   background: rgba(32, 38, 45, 0.38);
 }

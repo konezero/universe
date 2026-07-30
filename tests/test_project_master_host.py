@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from project_master_bridge import MASTER_BRIDGE_ENVELOPE_SCHEMA  # noqa: E402
 from project_master_host import (  # noqa: E402
+    CodexProjectMasterRuntime,
     GrokProjectMasterRuntime,
     LiveProjectMasterBridgeHost,
     ProjectMasterHostError,
@@ -176,6 +177,65 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(self.root.resolve(), requests[0].cwd)
         self.assertIn("read-only", requests[0].arguments)
 
+    def test_codex_runtime_creates_then_resumes_the_same_thread(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            turn = len(requests)
+            return NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout="\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "thread.started",
+                                "thread_id": "codex-thread-001",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": f"codex-answer-{turn}",
+                                },
+                            }
+                        ),
+                    )
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        with patch(
+            "project_master_host._resolve_codex",
+            return_value=(self.root / "codex.exe", {}),
+        ):
+            runtime = CodexProjectMasterRuntime(
+                self.root,
+                "GCS",
+                self.state,
+                native_runner=runner,
+            )
+            first = runtime.reply(self._envelope()["message"])
+            second = runtime.reply(self._envelope()["message"])
+
+        self.assertEqual("codex-answer-1", first)
+        self.assertEqual("codex-answer-2", second)
+        self.assertNotIn("resume", requests[0].arguments)
+        self.assertIn("resume", requests[1].arguments)
+        self.assertIn("codex-thread-001", requests[1].arguments)
+        self.assertIn("read-only", requests[0].arguments)
+        self.assertEqual(
+            "codex-thread-001",
+            self.state.provider_session_id("CODEX", create=False),
+        )
+
     def test_streaming_provider_emits_started_deltas_and_completed(self) -> None:
         self.provider = StreamingFakeProvider()
         worker = self._worker()
@@ -317,6 +377,39 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(registrations))
         self.assertEqual(1, self.surface_observer.prepare_count)
         self.assertNotIn(registrations[0]["credential_env"], os.environ)
+
+    def test_resident_manager_restarts_when_provider_selection_changes(self) -> None:
+        registrations: list[dict[str, Any]] = []
+        selected = {"provider": "GROK"}
+
+        def register(project_id, value):
+            registrations.append({"project_id": project_id, **dict(value)})
+            return {"project_id": project_id, **dict(value)}, True
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: FakeProvider(),
+                provider_resolver=lambda _project_id: selected["provider"],
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
+            )
+            try:
+                first = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                selected["provider"] = "CODEX"
+                second = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+            finally:
+                manager.close()
+
+        self.assertEqual("GROK", first["provider"])
+        self.assertEqual("CODEX", second["provider"])
+        self.assertEqual(2, len(registrations))
 
     def _worker(self) -> ProjectMasterConversationWorker:
         def post_reply(**values):

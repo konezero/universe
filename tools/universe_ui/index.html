@@ -24,6 +24,9 @@
         <button id="release-button" class="icon-button" type="button" title="Release catalog">
           &#9638;
         </button>
+        <button id="settings-button" class="icon-button" type="button" title="CLI provider settings" aria-label="CLI provider settings">
+          &#9881;
+        </button>
         <button id="refresh-button" class="icon-button" type="button" title="Refresh">
           &#8635;
         </button>
@@ -145,6 +148,39 @@
         <button type="submit" class="primary-button">Connect</button>
       </div>
       <p id="project-form-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="settings-dialog">
+    <form id="settings-form" method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <h2>CLI providers</h2>
+          <p>Choose which local CLI answers each control room.</p>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <section class="settings-section">
+        <label for="universe-provider-setting">Universe Conductor</label>
+        <select id="universe-provider-setting" name="universe_provider">
+          <option value="AUTO">Auto</option>
+          <option value="GROK">Grok</option>
+          <option value="CODEX">Codex</option>
+        </select>
+        <small id="universe-provider-status" class="provider-setting-status"></small>
+      </section>
+      <section class="settings-section">
+        <div class="settings-section-heading">
+          <strong>Project Masters</strong>
+          <small>Overrides apply when the Project Master is next called.</small>
+        </div>
+        <div id="project-provider-settings" class="project-provider-settings"></div>
+      </section>
+      <p id="settings-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
+        <button type="submit" class="primary-button">Save</button>
+      </div>
     </form>
   </dialog>
 

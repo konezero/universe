@@ -512,6 +512,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="mode-status"', body)
             self.assertIn('id="composer-action-button"', body)
             self.assertIn('id="project-master-actions"', body)
+            self.assertIn('id="settings-dialog"', body)
+            self.assertIn('id="universe-provider-setting"', body)
+            self.assertIn('id="project-provider-settings"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
@@ -527,7 +530,89 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/fresh-project-composition-adoptions", script)
             self.assertIn("UNIVERSE_CONDUCTOR", script)
             self.assertIn("callProjectMaster", script)
+            self.assertIn("/v1/settings/providers", script)
+            self.assertIn("/provider-setting", script)
             self.assertNotIn(self.token, script)
+
+    def test_cli_provider_settings_default_to_auto_and_persist(self) -> None:
+        class FakeRuntimeHost:
+            @staticmethod
+            def provider_capabilities() -> list[dict[str, str]]:
+                return [
+                    {"provider": "GROK", "status": "AVAILABLE"},
+                    {
+                        "provider": "CODEX",
+                        "status": "UNAVAILABLE",
+                        "reason": "CODEX_CLI_LAUNCH_FAILED",
+                    },
+                ]
+
+            @staticmethod
+            def provider_capability(provider: str) -> dict[str, str]:
+                return next(
+                    item
+                    for item in FakeRuntimeHost.provider_capabilities()
+                    if item["provider"] == provider
+                )
+
+        self.server.runtime_host = FakeRuntimeHost()
+        self.request("POST", "/v1/projects/register", self.registration())
+
+        status, defaults = self.request("GET", "/v1/settings/providers")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AUTO", defaults["universe_conductor"]["provider"])
+        self.assertEqual(
+            "AUTO",
+            defaults["project_masters"][0]["provider"],
+        )
+        self.assertEqual("GROK", defaults["universe_conductor"]["resolved_provider"])
+
+        status, universe = self.request(
+            "POST",
+            "/v1/settings/providers/universe",
+            {"provider": "CODEX"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("CODEX", universe["setting"]["provider"])
+        status, project = self.request(
+            "POST",
+            "/v1/projects/GCS/provider-setting",
+            {"provider": "GROK"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GROK", project["setting"]["provider"])
+
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual(
+            "CODEX",
+            reopened.provider_setting(
+                "UNIVERSE_CONDUCTOR",
+                "CONDUCTOR",
+            )["provider"],
+        )
+        self.assertEqual(
+            "GROK",
+            reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
+        )
+
+    def test_explicit_unavailable_provider_does_not_fall_back(self) -> None:
+        class FakeRuntimeHost:
+            @staticmethod
+            def provider_capability(provider: str) -> dict[str, str]:
+                return {
+                    "provider": provider,
+                    "status": "AVAILABLE" if provider == "GROK" else "UNAVAILABLE",
+                    "reason": "CODEX_CLI_LAUNCH_FAILED",
+                }
+
+        self.server.runtime_host = FakeRuntimeHost()
+        self.server.store.set_provider_setting(
+            "UNIVERSE_CONDUCTOR",
+            "CONDUCTOR",
+            {"provider": "CODEX"},
+        )
+        with self.assertRaisesRegex(Exception, "CODEX_CLI_LAUNCH_FAILED"):
+            self.server._resolve_conductor_provider({"requested_provider": "AUTO"})
 
     def test_conductor_room_message_is_durable_and_idempotent(self) -> None:
         request = {

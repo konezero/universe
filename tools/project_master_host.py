@@ -32,7 +32,7 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
 PROJECT_MASTER_SESSION_SCHEMA = "universe.project-master-session.v1"
-SUPPORTED_PROVIDERS = frozenset({"GROK"})
+SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
 
 
 class ProjectMasterHostError(RuntimeError):
@@ -231,35 +231,75 @@ class ProjectMasterSessionStore:
         self._lock = threading.Lock()
         self._initialize()
 
-    def provider_session_id(self) -> str:
+    def provider_session_id(
+        self,
+        provider: str = "GROK",
+        *,
+        create: bool = True,
+    ) -> str | None:
+        normalized_provider = _provider(provider)
+        key = f"provider_session_id:{normalized_provider}"
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT value FROM host_metadata WHERE key = 'provider_session_id'"
+                "SELECT value FROM host_metadata WHERE key = ?",
+                (key,),
             ).fetchone()
+            if row is None and normalized_provider == "GROK":
+                row = connection.execute(
+                    "SELECT value FROM host_metadata WHERE key = 'provider_session_id'"
+                ).fetchone()
             if row is not None:
                 return str(row["value"])
+            if not create:
+                return None
             session_id = str(uuid4())
             connection.execute(
                 "INSERT INTO host_metadata(key, value) VALUES(?, ?)",
-                ("provider_session_id", session_id),
+                (key, session_id),
             )
             return session_id
 
-    def provider_session_initialized(self) -> bool:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT value FROM host_metadata WHERE key = 'provider_session_initialized'"
-            ).fetchone()
-        return row is not None and str(row["value"]) == "true"
-
-    def mark_provider_session_initialized(self) -> None:
+    def set_provider_session_id(self, provider: str, session_id: str) -> None:
+        normalized_provider = _provider(provider)
+        normalized_session = _text(session_id, "session_id")
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO host_metadata(key, value)
-                VALUES('provider_session_initialized', 'true')
+                VALUES(?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (
+                    f"provider_session_id:{normalized_provider}",
+                    normalized_session,
+                ),
+            )
+
+    def provider_session_initialized(self, provider: str = "GROK") -> bool:
+        normalized_provider = _provider(provider)
+        key = f"provider_session_initialized:{normalized_provider}"
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row is None and normalized_provider == "GROK":
+                row = connection.execute(
+                    "SELECT value FROM host_metadata "
+                    "WHERE key = 'provider_session_initialized'"
+                ).fetchone()
+        return row is not None and str(row["value"]) == "true"
+
+    def mark_provider_session_initialized(self, provider: str = "GROK") -> None:
+        normalized_provider = _provider(provider)
+        with self._connection() as connection:
+            connection.execute(
                 """
+                INSERT INTO host_metadata(key, value)
+                VALUES(?, 'true')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (f"provider_session_initialized:{normalized_provider}",),
             )
 
     def register(self, envelope: Mapping[str, Any]) -> bool:
@@ -404,7 +444,9 @@ class GrokProjectMasterRuntime:
         self.native_runner = native_runner
         self.model = model.strip()
         self.max_turns = max(1, int(max_turns))
-        self.session_id = store.provider_session_id()
+        self.session_id = store.provider_session_id("GROK")
+        if self.session_id is None:
+            raise ProjectMasterHostError("GROK_SESSION_ID_UNAVAILABLE")
         UUID(self.session_id)
 
     @property
@@ -417,7 +459,7 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
         prompt_path = _runtime_tmp() / f"project-master-{uuid4().hex}.txt"
         prompt_path.write_text(self._prompt(message), encoding="utf-8")
-        initialized = self.store.provider_session_initialized()
+        initialized = self.store.provider_session_initialized("GROK")
         arguments = [
             "--no-auto-update",
             "--no-subagents",
@@ -474,7 +516,7 @@ class GrokProjectMasterRuntime:
         text = _text(response.get("text"), "response.text")
         if response.get("stopReason") != "EndTurn":
             raise ProjectMasterHostError("GROK_TURN_INCOMPLETE")
-        self.store.mark_provider_session_initialized()
+        self.store.mark_provider_session_initialized("GROK")
         return text
 
     def reply_stream(
@@ -487,7 +529,7 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
         prompt_path = _runtime_tmp() / f"project-master-{uuid4().hex}.txt"
         prompt_path.write_text(self._prompt(message), encoding="utf-8")
-        initialized = self.store.provider_session_initialized()
+        initialized = self.store.provider_session_initialized("GROK")
         arguments = [
             "--no-auto-update",
             "--no-subagents",
@@ -533,7 +575,7 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError("GROK_SESSION_ID_MISMATCH")
         if result.stop_reason != "EndTurn":
             raise ProjectMasterHostError("GROK_TURN_INCOMPLETE")
-        self.store.mark_provider_session_initialized()
+        self.store.mark_provider_session_initialized("GROK")
         return result.text
 
     def _system_prompt(self) -> str:
@@ -556,6 +598,139 @@ class GrokProjectMasterRuntime:
         )
 
     def _prompt(self, message: Mapping[str, Any]) -> str:
+        runtime_context = message.get("runtime_context")
+        context_text = (
+            json.dumps(
+                dict(runtime_context),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if isinstance(runtime_context, Mapping)
+            else "{}"
+        )
+        return (
+            "Universe Project Room message\n"
+            f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
+            f"kind: {_text(message.get('kind'), 'message.kind')}\n"
+            f"sender: {_text(message.get('sender'), 'message.sender')}\n"
+            f"project_runtime_context: {context_text}\n\n"
+            f"{_text(message.get('body'), 'message.body')}"
+        )
+
+
+class CodexProjectMasterRuntime:
+    def __init__(
+        self,
+        project_root: Path,
+        project_id: str,
+        store: ProjectMasterSessionStore,
+        *,
+        native_runner: NativeRunner = run_native_cli,
+    ) -> None:
+        self.project_root = project_root.expanduser().resolve(strict=True)
+        self.project_id = _text(project_id, "project_id")
+        self.store = store
+        self.native_runner = native_runner
+        self.session_id = store.provider_session_id("CODEX", create=False)
+
+    @property
+    def session_ref(self) -> str:
+        return (
+            f"codex-cli:{self.session_id}"
+            if self.session_id
+            else f"codex-cli:pending:{self.project_id}"
+        )
+
+    def reply(self, message: Mapping[str, Any]) -> str:
+        executable, environment = _resolve_codex()
+        if executable is None:
+            raise ProjectMasterHostError("CODEX_CLI_UNAVAILABLE")
+        prompt = f"{self._system_prompt()}\n\n{self._prompt(message)}"
+        if self.session_id:
+            arguments = (
+                "exec",
+                "resume",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "-C",
+                str(self.project_root),
+                self.session_id,
+                prompt,
+            )
+        else:
+            arguments = (
+                "exec",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "-C",
+                str(self.project_root),
+                prompt,
+            )
+        result = self.native_runner(
+            NativeCliRequest(
+                executable=executable,
+                arguments=arguments,
+                cwd=self.project_root,
+                timeout_seconds=300,
+                environment=environment,
+            )
+        )
+        if result.status != "COMPLETED" or result.return_code != 0:
+            raise ProjectMasterHostError(f"CODEX_CLI_{result.status}")
+        messages: list[str] = []
+        observed_session = self.session_id
+        for line in result.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, Mapping):
+                continue
+            if event.get("type") in {"thread.started", "session.started"}:
+                candidate = event.get("thread_id") or event.get("session_id")
+                if isinstance(candidate, str) and candidate.strip():
+                    observed_session = candidate.strip()
+            item = event.get("item")
+            if (
+                event.get("type") == "item.completed"
+                and isinstance(item, Mapping)
+                and item.get("type") == "agent_message"
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+            ):
+                messages.append(item["text"].strip())
+            elif (
+                event.get("type") == "agent_message"
+                and isinstance(event.get("text"), str)
+                and event["text"].strip()
+            ):
+                messages.append(event["text"].strip())
+        if not messages:
+            raise ProjectMasterHostError("CODEX_RESULT_MESSAGE_MISSING")
+        if observed_session:
+            self.session_id = observed_session
+            self.store.set_provider_session_id("CODEX", observed_session)
+            self.store.mark_provider_session_initialized("CODEX")
+        return "\n".join(messages)
+
+    def _system_prompt(self) -> str:
+        return (
+            f"You are the Project Master for {self.project_id}. "
+            "This is a persistent, read-only conversation Host connected to the "
+            "Universe Conductor. Follow the repository entry order and prepare "
+            "MASTER Mode from source-backed evidence. Do not create, edit, delete, "
+            "move, commit, push, execute project code, invoke subagents, or use "
+            "network tools. Mode and Role do not create mutation authority. "
+            "Inspect, review, explain, audit, and propose bounded work only. "
+            "Reply in the user's language."
+        )
+
+    @staticmethod
+    def _prompt(message: Mapping[str, Any]) -> str:
         runtime_context = message.get("runtime_context")
         context_text = (
             json.dumps(
@@ -726,6 +901,7 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
 @dataclass
 class ResidentProjectMasterHandle:
     project_id: str
+    provider: str
     endpoint: str
     credential_env: str
     bridge_server: ProjectMasterBridgeHttpServer
@@ -750,6 +926,7 @@ class ResidentProjectMasterHostManager:
             [Path, str, ProjectMasterSessionStore], MasterProvider
         ]
         | None = None,
+        provider_resolver: Callable[[str], str] | None = None,
         coordinator_factory: Callable[
             [Path, str, str], CommanderSurfaceObserver
         ]
@@ -757,7 +934,8 @@ class ResidentProjectMasterHostManager:
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
         self.bridge_registrar = bridge_registrar
-        self.provider_factory = provider_factory or self._default_provider
+        self.provider_factory = provider_factory
+        self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
         self._lock = threading.RLock()
@@ -769,12 +947,18 @@ class ResidentProjectMasterHostManager:
             .expanduser()
             .resolve(strict=True)
         )
+        selected_provider = _provider(self.provider_resolver(project_id))
         with self._lock:
             handle = self._handles.get(project_id)
-            if handle is not None and handle.thread.is_alive():
+            if (
+                handle is not None
+                and handle.thread.is_alive()
+                and handle.provider == selected_provider
+            ):
                 return {
                     "status": "RESIDENT",
                     "project_id": project_id,
+                    "provider": selected_provider,
                     "endpoint": handle.endpoint,
                 }
             if handle is not None:
@@ -788,7 +972,16 @@ class ResidentProjectMasterHostManager:
                 _default_state_db(project_id),
                 project_id,
             )
-            provider = self.provider_factory(project_root, project_id, store)
+            provider = (
+                self.provider_factory(project_root, project_id, store)
+                if self.provider_factory is not None
+                else self._default_provider(
+                    selected_provider,
+                    project_root,
+                    project_id,
+                    store,
+                )
+            )
             try:
                 coordinator = self.coordinator_factory(
                     project_root,
@@ -824,6 +1017,7 @@ class ResidentProjectMasterHostManager:
             thread.start()
             handle = ResidentProjectMasterHandle(
                 project_id=project_id,
+                provider=selected_provider,
                 endpoint=endpoint,
                 credential_env=credential_env,
                 bridge_server=server,
@@ -851,6 +1045,7 @@ class ResidentProjectMasterHostManager:
             return {
                 "status": "STARTED",
                 "project_id": project_id,
+                "provider": selected_provider,
                 "endpoint": endpoint,
                 "bridge": bridge,
                 "session_preparation": preparation,
@@ -861,6 +1056,13 @@ class ResidentProjectMasterHostManager:
             handle = self._handles.get(_text(project_id, "project_id"))
             return handle is not None and handle.thread.is_alive()
 
+    def invalidate(self, project_id: str) -> None:
+        normalized = _text(project_id, "project_id")
+        with self._lock:
+            handle = self._handles.pop(normalized, None)
+        if handle is not None:
+            handle.close()
+
     def close(self) -> None:
         with self._lock:
             handles = list(self._handles.values())
@@ -870,11 +1072,16 @@ class ResidentProjectMasterHostManager:
 
     @staticmethod
     def _default_provider(
+        provider: str,
         project_root: Path,
         project_id: str,
         store: ProjectMasterSessionStore,
     ) -> MasterProvider:
-        return GrokProjectMasterRuntime(project_root, project_id, store)
+        if provider == "GROK":
+            return GrokProjectMasterRuntime(project_root, project_id, store)
+        if provider == "CODEX":
+            return CodexProjectMasterRuntime(project_root, project_id, store)
+        raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 
     @staticmethod
     def _default_coordinator(
@@ -1001,6 +1208,18 @@ def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
     return (executable if executable.is_file() else None), {"GROK_HOME": str(grok_home)}
 
 
+def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
+    configured = os.environ.get("CODEX_CLI_PATH")
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        return (candidate if candidate.is_file() else None), {}
+    resolved = shutil.which("codex.exe") or shutil.which("codex")
+    if not resolved:
+        return None, {}
+    candidate = Path(resolved).resolve()
+    return (candidate if candidate.suffix.lower() == ".exe" else None), {}
+
+
 def _runtime_tmp() -> Path:
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
     root = Path(base) / "Universe" / "runtime-tmp"
@@ -1075,6 +1294,13 @@ def _text(value: Any, field: str) -> str:
     return value.strip()
 
 
+def _provider(value: Any) -> str:
+    normalized = _text(value, "provider").upper()
+    if normalized not in SUPPORTED_PROVIDERS:
+        raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
+    return normalized
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Live local Project Master Host")
     parser.add_argument("--project-root", required=True, type=Path)
@@ -1094,12 +1320,20 @@ def main() -> int:
     token = _read_token(args.token_env)
     state_db = args.state_db or _default_state_db(args.project_id)
     store = ProjectMasterSessionStore(state_db, args.project_id)
-    provider = GrokProjectMasterRuntime(
-        args.project_root,
-        args.project_id,
-        store,
-        model=args.model,
-        max_turns=args.max_turns,
+    provider = (
+        GrokProjectMasterRuntime(
+            args.project_root,
+            args.project_id,
+            store,
+            model=args.model,
+            max_turns=args.max_turns,
+        )
+        if args.provider == "GROK"
+        else CodexProjectMasterRuntime(
+            args.project_root,
+            args.project_id,
+            store,
+        )
     )
     coordinator = ProjectModeCoordinator(
         args.project_root,

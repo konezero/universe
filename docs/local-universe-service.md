@@ -65,6 +65,12 @@ authority, or execution assignment. The Session Runtime token and endpoint
 remain process-local and are never persisted to the Universe database or
 browser state.
 
+The Conductor CLI selection is local application configuration. Its persisted
+value is `AUTO`, `GROK`, or `CODEX`; absence is equivalent to `AUTO`. `AUTO`
+chooses the first available provider in the configured order. An explicit
+provider that is unavailable fails visibly and is never replaced after the
+request has started.
+
 Each attached project remains responsible for its own source mutation,
 validation, Execution Guard, and evidence. Universe stores project roots and
 evidence references; it does not merge or rewrite project Runtime databases.
@@ -129,10 +135,14 @@ requires the local Bearer token from the state file.
 POST   /v1/projects/register
 GET    /v1/projects
 GET    /v1/runtime/providers
+GET    /v1/settings/providers
+POST   /v1/settings/providers/universe
 POST   /v1/runtime/planning-binding
 GET    /v1/runtime/planning-binding
 GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
+GET    /v1/projects/{project_id}/provider-setting
+POST   /v1/projects/{project_id}/provider-setting
 POST   /v1/future-paths
 POST   /v1/fresh-project-compositions
 GET    /v1/fresh-project-compositions
@@ -379,6 +389,12 @@ Master Host for that project, registers its loopback Bridge, and keeps the Host
 resident until the Universe service stops. Later messages reuse the same
 provider session ID and durable Host queue. Opening or selecting a project does
 not start its Host; the first actual Project Master message does.
+
+Each Project Master has an independent persisted CLI selection with the same
+`AUTO`, `GROK`, and `CODEX` values. A changed selection closes the existing
+resident Host and is applied on the next Project Room message. Provider session
+references are provider-scoped so a Grok session is never resumed as Codex, or
+the reverse.
 
 Before registration, the resident Host invokes the installed project's
 `prepare-session` command for registered `MASTER` Mode from inside the project

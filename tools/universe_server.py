@@ -93,6 +93,9 @@ CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
     }
 )
 CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX"})
+PROVIDER_SETTING_SCHEMA = "universe.cli-provider-setting.v1"
+PROVIDER_SETTING_CHOICES = frozenset({"AUTO", "GROK", "CODEX"})
+PROVIDER_SETTING_SCOPES = frozenset({"UNIVERSE_CONDUCTOR", "PROJECT_MASTER"})
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 PROJECT_MASTER_STREAM_SCHEMA = "universe.project-master-stream-event.v1"
@@ -3419,6 +3422,16 @@ class UniverseStore:
                     universe_id TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS cli_provider_setting (
+                    scope_kind TEXT NOT NULL
+                        CHECK(scope_kind IN ('UNIVERSE_CONDUCTOR', 'PROJECT_MASTER')),
+                    scope_id TEXT NOT NULL,
+                    provider TEXT NOT NULL
+                        CHECK(provider IN ('AUTO', 'GROK', 'CODEX')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope_kind, scope_id)
+                );
                 """
             )
             room_columns = {
@@ -3482,6 +3495,91 @@ class UniverseStore:
             "schema": UNIVERSE_IDENTITY_SCHEMA,
             "universe_id": universe_id,
             "created_at": str(row["created_at"]),
+        }
+
+    def provider_setting(self, scope_kind: str, scope_id: str) -> dict[str, Any]:
+        normalized_scope = str(scope_kind).strip().upper()
+        if normalized_scope not in PROVIDER_SETTING_SCOPES:
+            raise UniverseError(
+                "PROVIDER_SETTING_SCOPE_INVALID",
+                f"unsupported provider setting scope: {normalized_scope}",
+            )
+        normalized_id = _required_text(scope_id, "scope_id")
+        if normalized_scope == "PROJECT_MASTER":
+            normalized_id = _project_id(normalized_id)
+            self.get_project(normalized_id)
+        elif normalized_id != "CONDUCTOR":
+            raise UniverseError(
+                "PROVIDER_SETTING_SCOPE_INVALID",
+                "Universe Conductor setting scope_id must be CONDUCTOR",
+            )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT provider, updated_at
+                FROM cli_provider_setting
+                WHERE scope_kind = ? AND scope_id = ?
+                """,
+                (normalized_scope, normalized_id),
+            ).fetchone()
+        return {
+            "schema": PROVIDER_SETTING_SCHEMA,
+            "scope_kind": normalized_scope,
+            "scope_id": normalized_id,
+            "provider": str(row["provider"]) if row is not None else "AUTO",
+            "updated_at": str(row["updated_at"]) if row is not None else None,
+        }
+
+    def set_provider_setting(
+        self,
+        scope_kind: str,
+        scope_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="provider_setting",
+            required=frozenset({"provider"}),
+            optional=frozenset(),
+        )
+        provider = _required_text(request["provider"], "provider").upper()
+        if provider not in PROVIDER_SETTING_CHOICES:
+            raise UniverseError(
+                "PROVIDER_SETTING_INVALID",
+                "provider must be AUTO, GROK, or CODEX",
+            )
+        current = self.provider_setting(scope_kind, scope_id)
+        updated_at = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO cli_provider_setting(
+                    scope_kind, scope_id, provider, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(scope_kind, scope_id) DO UPDATE SET
+                    provider = excluded.provider,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    current["scope_kind"],
+                    current["scope_id"],
+                    provider,
+                    updated_at,
+                ),
+            )
+        return self.provider_setting(current["scope_kind"], current["scope_id"])
+
+    def list_provider_settings(self) -> dict[str, Any]:
+        return {
+            "schema": PROVIDER_SETTING_SCHEMA,
+            "universe_conductor": self.provider_setting(
+                "UNIVERSE_CONDUCTOR",
+                "CONDUCTOR",
+            ),
+            "project_masters": [
+                self.provider_setting("PROJECT_MASTER", project["project_id"])
+                for project in self.list_projects()
+            ],
         }
 
     def register_project(self, value: Any) -> tuple[dict[str, Any], bool]:
@@ -8039,6 +8137,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 universe_endpoint=self.connection_profile.endpoint,
                 bridge_registrar=self.store.register_master_bridge,
                 provider_factory=project_master_provider_factory,
+                provider_resolver=self._resolve_project_master_provider,
             )
             if auto_start_project_masters
             else None
@@ -8147,6 +8246,71 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "bridge": bridge,
                 }
         return self.project_master_hosts.ensure(project)
+
+    def provider_settings(self) -> dict[str, Any]:
+        settings = self.store.list_provider_settings()
+        capabilities = {
+            item["provider"]: item
+            for item in self.runtime_host.provider_capabilities()
+            if isinstance(item, Mapping) and isinstance(item.get("provider"), str)
+        }
+        settings["available_providers"] = [
+            capabilities.get(
+                provider,
+                {
+                    "provider": provider,
+                    "status": "UNAVAILABLE",
+                    "reason": f"{provider}_CLI_UNAVAILABLE",
+                },
+            )
+            for provider in ("GROK", "CODEX")
+        ]
+        settings["universe_conductor"]["resolved_provider"] = (
+            self._resolve_configured_provider(
+                settings["universe_conductor"]["provider"],
+                capabilities=capabilities,
+                strict=False,
+            )
+        )
+        for project in settings["project_masters"]:
+            project["resolved_provider"] = self._resolve_configured_provider(
+                project["provider"],
+                capabilities=capabilities,
+                strict=False,
+            )
+        settings["status"] = "CLI_PROVIDER_SETTINGS_COLLECTED"
+        return settings
+
+    def set_universe_provider_setting(self, value: Any) -> dict[str, Any]:
+        setting = self.store.set_provider_setting(
+            "UNIVERSE_CONDUCTOR",
+            "CONDUCTOR",
+            value,
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "CLI_PROVIDER_SETTING_UPDATED",
+            "setting": setting,
+        }
+
+    def set_project_provider_setting(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        setting = self.store.set_provider_setting(
+            "PROJECT_MASTER",
+            project_id,
+            value,
+        )
+        if self.project_master_hosts is not None:
+            self.project_master_hosts.invalidate(project_id)
+        return {
+            "schema": API_SCHEMA,
+            "status": "CLI_PROVIDER_SETTING_UPDATED",
+            "setting": setting,
+            "resident_host": "RESTART_ON_NEXT_MESSAGE",
+        }
 
     def send_project_room_message(
         self,
@@ -8274,20 +8438,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def _resolve_conductor_provider(self, message: dict[str, Any]) -> str:
         requested = str(message.get("requested_provider") or "AUTO").upper()
-        configured = os.environ.get("UNIVERSE_CONDUCTOR_PROVIDER", "AUTO").upper()
+        configured = self.store.provider_setting(
+            "UNIVERSE_CONDUCTOR",
+            "CONDUCTOR",
+        )["provider"]
+        if configured == "AUTO":
+            configured = os.environ.get("UNIVERSE_CONDUCTOR_PROVIDER", "AUTO").upper()
+        selected = requested if requested in {"GROK", "CODEX"} else configured
+        return self._resolve_configured_provider(selected, strict=True)
+
+    def _resolve_project_master_provider(self, project_id: str) -> str:
+        selected = self.store.provider_setting(
+            "PROJECT_MASTER",
+            project_id,
+        )["provider"]
+        return self._resolve_configured_provider(selected, strict=True)
+
+    def _resolve_configured_provider(
+        self,
+        selected: str,
+        *,
+        capabilities: Mapping[str, Mapping[str, Any]] | None = None,
+        strict: bool,
+    ) -> str:
+        normalized = str(selected or "AUTO").strip().upper()
         candidates = (
-            [requested]
-            if requested in {"GROK", "CODEX"}
-            else (
-                [configured] if configured in {"GROK", "CODEX"} else ["GROK", "CODEX"]
-            )
+            [normalized]
+            if normalized in {"GROK", "CODEX"}
+            else ["GROK", "CODEX"]
         )
         unavailable: list[str] = []
         for provider in candidates:
-            capability = self.runtime_host.provider_capability(provider)
+            capability = (
+                capabilities.get(provider)
+                if capabilities is not None
+                else self.runtime_host.provider_capability(provider)
+            )
+            if capability is None:
+                capability = {
+                    "status": "UNAVAILABLE",
+                    "reason": f"{provider}_CLI_UNAVAILABLE",
+                }
             if capability.get("status") == "AVAILABLE":
                 return provider
             unavailable.append(f"{provider}:{capability.get('reason', 'UNAVAILABLE')}")
+        if not strict:
+            return "UNAVAILABLE"
         raise RuntimeHostError(
             "WORKER_PROVIDER_UNAVAILABLE",
             "; ".join(unavailable) or "no Conductor provider is available",
@@ -8340,6 +8536,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "status": "RUNTIME_PROVIDER_CAPABILITIES_COLLECTED",
                     "providers": self.server.runtime_host.provider_capabilities(),
                 },
+            )
+            return
+        if path == "/v1/settings/providers":
+            self._send(
+                HTTPStatus.OK,
+                self.server.provider_settings(),
             )
             return
         if path == "/v1/runtime/planning-binding":
@@ -8635,6 +8837,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/provider-setting":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "CLI_PROVIDER_SETTING_COLLECTED",
+                        "setting": self.server.store.provider_setting(
+                            "PROJECT_MASTER",
+                            project_id,
+                        ),
+                    },
+                )
+                return
             if suffix == "/runtime-worker-invocations":
                 self._send(
                     HTTPStatus.OK,
@@ -8717,6 +8932,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             body = self._read_json()
+            if path == "/v1/settings/providers/universe":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.set_universe_provider_setting(body),
+                )
+                return
             if path == "/v1/runtime/planning-binding":
                 self._send(
                     HTTPStatus.OK,
@@ -9076,6 +9297,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             parts = self._project_path(path)
+            if parts is not None and parts[1] == "/provider-setting":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.set_project_provider_setting(parts[0], body),
+                )
+                return
             if parts is not None and parts[1] == "/release-proposals":
                 proposal, created = self.server.store.create_project_release_proposal(
                     parts[0],
@@ -9586,6 +9813,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-bridge/stream",
             "/master-bridge/replies",
             "/master-bridge",
+            "/provider-setting",
             "/room/stream",
             "/room/messages",
             "/document-incorporation-proposals",
