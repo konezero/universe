@@ -201,7 +201,7 @@ function renderComposerActions() {
           : bridgeRegistered
             ? "Bridge registered / awaiting delivery"
           : isCurrent
-            ? "Inbox fallback"
+            ? "Project Room only"
             : "Open Project Room"
       )
     );
@@ -271,7 +271,7 @@ function renderComposerState() {
     ? "Direct bridge connected"
     : registeredBridge
       ? "Bridge registered / awaiting first delivery"
-      : "Inbox fallback";
+      : "Project Room only";
   elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
 }
 
@@ -1860,7 +1860,7 @@ async function submitDispatch(event) {
     toast(
       result.message.delivery_state === "DELIVERED_TO_MASTER"
         ? "Delivered to the registered Project Master"
-        : "Project Room message recorded; Inbox fallback is available"
+        : "Message saved in the Project Room; no Inbox item was created"
     );
     showInspectorTab("activity");
   } catch (error) {

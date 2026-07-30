@@ -2236,7 +2236,7 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
         "sender": sender,
         "body": body,
         "content_digest": digest,
-        "delivery_state": "INBOX_FALLBACK_AVAILABLE",
+        "delivery_state": "RECORDED",
         "created_at": utc_now(),
     }
     if in_reply_to is not None:
@@ -6374,7 +6374,7 @@ class UniverseStore:
         project_id: str,
         value: Any,
         *,
-        delivery_state: str = "INBOX_FALLBACK_AVAILABLE",
+        delivery_state: str = "RECORDED",
         delivery: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
@@ -6710,7 +6710,7 @@ class UniverseStore:
         message, created = self.create_room_message(
             project_id,
             value,
-            delivery_state="INBOX_FALLBACK_AVAILABLE",
+            delivery_state="RECORDED",
         )
         if not created:
             return message, False
@@ -6733,8 +6733,8 @@ class UniverseStore:
             )
             return self._update_room_delivery(
                 message,
-                delivery_state="INBOX_FALLBACK_AVAILABLE",
-                delivery={"status": "FALLBACK", "reason": str(error)},
+                delivery_state="DELIVERY_FAILED",
+                delivery={"status": "FAILED", "reason": str(error)},
             ), True
         self._set_master_bridge_status(
             project_id,

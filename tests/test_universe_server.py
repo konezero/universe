@@ -925,7 +925,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(result["projects"]))
         self.assertEqual("Trading", result["projects"][0]["metadata"]["label"])
 
-    def test_room_message_uses_inbox_fallback_without_a_master_bridge(self) -> None:
+    def test_room_message_stays_in_room_without_a_master_bridge(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
 
         status, result = self.request(
@@ -940,9 +940,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual(
-            "INBOX_FALLBACK_AVAILABLE", result["message"]["delivery_state"]
-        )
+        self.assertEqual("RECORDED", result["message"]["delivery_state"])
         self.assertEqual({}, result["message"]["delivery"])
 
     def test_master_bridge_delivers_room_message_and_accepts_bound_reply(self) -> None:

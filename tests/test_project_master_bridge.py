@@ -56,6 +56,26 @@ class ProjectMasterBridgeTests(unittest.TestCase):
         target = self.root / first["target_ref"]
         self.assertEqual(envelope, json.loads(target.read_text(encoding="utf-8")))
 
+    def test_plain_host_rejects_live_conversation_delivery(self) -> None:
+        with self.assertRaises(HTTPError) as rejected:
+            self._post_to_host(
+                self._envelope(),
+                self.token,
+                path="/v1/project-master/messages",
+            )
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, rejected.exception.code)
+        payload = json.loads(rejected.exception.read().decode("utf-8"))
+        rejected.exception.close()
+        self.assertEqual(
+            "MASTER_CONVERSATION_HANDLER_UNAVAILABLE",
+            payload["error_code"],
+        )
+        self.assertEqual(
+            [],
+            list((self.root / ".ai" / "inbox" / "MASTER").glob("*.json")),
+        )
+
     def test_host_rejects_bad_auth_and_path_like_message_id(self) -> None:
         with self.assertRaises(HTTPError) as denied:
             self._post_to_host(self._envelope(), "wrong-token")
@@ -89,7 +109,7 @@ class ProjectMasterBridgeTests(unittest.TestCase):
             ".ai/master/inbox",
         )
 
-        receipt = host.record(self._envelope())
+        receipt = host.record_inbox_dispatch(self._envelope())
 
         self.assertEqual("RECORDED", receipt["status"])
         self.assertEqual(
@@ -167,10 +187,14 @@ class ProjectMasterBridgeTests(unittest.TestCase):
             )
 
     def _post_to_host(
-        self, envelope: dict[str, Any], token: str
+        self,
+        envelope: dict[str, Any],
+        token: str,
+        *,
+        path: str = "/v1/project-master/inbox-dispatches",
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         request = Request(
-            self.endpoint + "/v1/project-master/messages",
+            self.endpoint + path,
             data=json.dumps(envelope).encode("utf-8"),
             method="POST",
             headers={
@@ -197,7 +221,7 @@ class ProjectMasterBridgeTests(unittest.TestCase):
                 "sender": "UNIVERSE_CONDUCTOR",
                 "body": "What should the Master review next?",
                 "content_digest": "0" * 64,
-                "delivery_state": "INBOX_FALLBACK_AVAILABLE",
+                "delivery_state": "RECORDED",
                 "created_at": "2026-07-28T00:00:00Z",
             },
         }

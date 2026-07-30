@@ -191,7 +191,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         host = LiveProjectMasterBridgeHost(
             self.root,
             "bridge-token",
-            ".ai/master/inbox",
+            ".ai/missing-live-inbox",
             worker,
             self.surface_observer,
         )
@@ -203,8 +203,13 @@ class ProjectMasterHostTests(unittest.TestCase):
         finally:
             worker.close()
 
-        self.assertEqual("RECORDED", first["status"])
-        self.assertEqual("ALREADY_RECORDED", repeated["status"])
+        self.assertEqual("ACCEPTED", first["status"])
+        self.assertEqual("ALREADY_ACCEPTED", repeated["status"])
+        self.assertFalse(first["repository_write"])
+        self.assertEqual(
+            [],
+            list((self.root / ".ai" / "master" / "inbox").glob("universe-room-*.json")),
+        )
         self.assertEqual(1, len(self.provider.messages))
         self.assertEqual(1, len(self.surface_observer.messages))
         self.assertEqual(

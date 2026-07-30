@@ -476,17 +476,21 @@ It appends a `PROJECT_MASTER` message only; it cannot create execution
 authority, write source files, start a Task Frame, or control a vendor chat
 application.
 
-When no bridge is registered, its credential is unavailable, or the local Host
-does not respond, the original room message remains durable with
-`INBOX_FALLBACK_AVAILABLE`. Existing Master Inbox dispatch remains a separate,
-explicit operation and is not silently created by a conversation message.
+When no bridge is registered, the original room message remains durable in the
+Universe room database with `RECORDED`. If a registered local Host cannot
+accept the message, it remains durable with `DELIVERY_FAILED` and the failure
+reason. Neither state creates a Project Inbox file. Existing Master Inbox
+dispatch remains a separate, explicit operation.
 
 ### Project Master Bridge Host
 
-`tools/project_master_bridge.py` is the supplied deterministic receiver for a
-separately running local Project Master Host. It does not start, restore, or
-control a vendor chat session. It only writes authenticated Universe room
-envelopes to the project's existing `.ai/inbox/MASTER` directory.
+`tools/project_master_bridge.py` supplies the authenticated loopback transport.
+The resident Project Master Host accepts ordinary conversation at
+`/v1/project-master/messages`, queues it in the local session store, and returns
+`repository_write: false`; it does not copy room messages into the Project
+Inbox. A standalone receiver rejects that conversation route. Its separate
+`/v1/project-master/inbox-dispatches` route is reserved for an explicitly
+selected asynchronous Inbox operation.
 
 Set one shared credential in the same local environment as both services, then
 start the receiver for the attached project:
@@ -498,10 +502,10 @@ python tools/project_master_bridge.py serve `
   --token-env UNIVERSE_GCS_MASTER_BRIDGE_TOKEN
 ```
 
-Register the returned literal loopback endpoint with the Universe service using
-that same environment-variable name. The opaque `master_session_ref` belongs
-to the Project Host integration; it is an identifier only, not proof that a
-chat session is live or authorized.
+Do not register this standalone Inbox receiver as a live Project Master bridge.
+The live bridge is owned by the resident Project Master Host. The opaque
+`master_session_ref` belongs to that Host integration; it is an identifier
+only, not proof that a chat session is live or authorized.
 
 The separately running Master reads the recorded envelope and replies only by
 an explicit callback. The reply client keeps the credential out of command

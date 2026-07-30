@@ -1373,15 +1373,23 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
         worker: ProjectMasterConversationWorker,
         coordinator: CommanderSurfaceObserver,
     ) -> None:
-        super().__init__(project_root, token, inbox_ref)
+        super().__init__(project_root, token, inbox_ref, require_inbox=False)
         object.__setattr__(self, "_worker", worker)
         object.__setattr__(self, "_coordinator", coordinator)
 
     def record(self, envelope: Any) -> dict[str, Any]:
         normalized = normalize_bridge_envelope(envelope)
-        receipt = super().record(normalized)
-        self._worker.submit(normalized)
-        return receipt
+        accepted = self._worker.submit(normalized)
+        return {
+            "schema": PROJECT_MASTER_HOST_SCHEMA,
+            "status": "ACCEPTED" if accepted else "ALREADY_ACCEPTED",
+            "bridge_id": normalized["bridge_id"],
+            "project_id": normalized["project_id"],
+            "message_id": normalized["message"]["message_id"],
+            "master_session_ref": normalized["master_session_ref"],
+            "accepted_at": utc_now(),
+            "repository_write": False,
+        }
 
     def apply_seed_assets(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping) or set(request) != {
@@ -1510,7 +1518,6 @@ class ResidentProjectMasterHostManager:
                 handle.close()
                 self._handles.pop(project_id, None)
 
-            inbox_ref = _resolve_master_inbox(project_root)
             credential_env = _managed_credential_env(project_id)
             os.environ[credential_env] = secrets.token_urlsafe(32)
             store = ProjectMasterSessionStore(
@@ -1548,7 +1555,7 @@ class ResidentProjectMasterHostManager:
             host = LiveProjectMasterBridgeHost(
                 project_root,
                 os.environ[credential_env],
-                inbox_ref,
+                ".ai/inbox/MASTER",
                 worker,
                 coordinator,
             )
@@ -1789,14 +1796,6 @@ def _runtime_tmp() -> Path:
 def _default_state_db(project_id: str) -> Path:
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
     return Path(base) / "Universe" / "project-master-host" / f"{project_id}.sqlite"
-
-
-def _resolve_master_inbox(project_root: Path) -> str:
-    for relative in (".ai/inbox/MASTER", ".ai/master/inbox"):
-        candidate = project_root / relative
-        if candidate.is_dir() and not candidate.is_symlink():
-            return relative
-    raise ProjectMasterHostError("MASTER_INBOX_UNAVAILABLE")
 
 
 def _managed_credential_env(project_id: str) -> str:

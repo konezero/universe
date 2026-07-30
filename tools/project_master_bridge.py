@@ -45,12 +45,18 @@ class ProjectMasterBridgeHost:
     project_root: Path
     token: str
     inbox_ref: str = ".ai/inbox/MASTER"
+    require_inbox: bool = True
 
     def __post_init__(self) -> None:
         _text(self.token, "token")
-        self._inbox()
+        if self.require_inbox:
+            self._inbox()
 
     def record(self, envelope: Any) -> dict[str, Any]:
+        normalize_bridge_envelope(envelope)
+        raise ProjectMasterBridgeError("MASTER_CONVERSATION_HANDLER_UNAVAILABLE")
+
+    def record_inbox_dispatch(self, envelope: Any) -> dict[str, Any]:
         normalized = normalize_bridge_envelope(envelope)
         inbox = self._inbox()
         message_id = normalized["message"]["message_id"]
@@ -129,6 +135,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
         routes = {
             "/v1/project-master/messages": self.server.bridge_host.record,
             (
+                "/v1/project-master/inbox-dispatches"
+            ): self.server.bridge_host.record_inbox_dispatch,
+            (
                 "/v1/project-master/seed-assets/apply"
             ): self.server.bridge_host.apply_seed_assets,
             (
@@ -160,6 +169,7 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             return
         created = receipt["status"] in {
             "RECORDED",
+            "ACCEPTED",
             "PROJECT_SEED_ASSETS_APPLIED",
             "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
         } and not receipt.get("idempotent_replay", False)
