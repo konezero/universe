@@ -6,7 +6,6 @@ import os
 
 # Provider workers use fixed argv lists; shell execution is disabled.
 import subprocess  # nosec B404
-import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from host_profile import resolve_host_tool
 from universe_runtime_worker_dispatch import (
     RuntimeWorkerDispatcher,
     WorkerDispatchError,
@@ -40,6 +40,16 @@ class RuntimeHostError(Exception):
 
     def __str__(self) -> str:
         return self.detail
+
+
+def _required_host_executable(tool: str) -> Path:
+    resolved = resolve_host_tool(tool)
+    if resolved is None:
+        raise RuntimeHostError(
+            "HOST_TOOL_UNAVAILABLE",
+            f"{tool.upper()}_HOST_TOOL_UNAVAILABLE",
+        )
+    return resolved.executable
 
 
 def _canonical_json(value: Any) -> str:
@@ -309,7 +319,7 @@ class UniverseRuntimeHost:
         ) as request_path:
             response = self._invoke_json_command(
                 [
-                    sys.executable,
+                    str(_required_host_executable("python")),
                     str(
                         self.repository_root
                         / ".ai"
@@ -779,7 +789,7 @@ class UniverseRuntimeHost:
         ) as request_path:
             response = self._invoke_json_command(
                 [
-                    sys.executable,
+                    str(_required_host_executable("python")),
                     str(
                         self.repository_root
                         / ".ai"

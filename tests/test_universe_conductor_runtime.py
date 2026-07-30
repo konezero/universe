@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -128,8 +129,12 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 source_commit_resolver=lambda _: "a" * 40,
                 process_factory=process_factory,
             )
-            binding = runtime.start()
-            observed = runtime.observe("message-001")
+            with patch(
+                "universe_conductor_runtime._required_host_executable",
+                return_value=Path(sys.executable),
+            ):
+                binding = runtime.start()
+                observed = runtime.observe("message-001")
 
             self.assertEqual("UNIVERSE-CURRENT-001", binding["origin_anchor_ref"])
             self.assertEqual("http://127.0.0.1:41991", binding["endpoint"])

@@ -394,8 +394,12 @@ class ProjectMasterHostTests(unittest.TestCase):
             self.state,
             native_runner=runner,
         )
-        first = runtime.reply(self._envelope()["message"])
-        second = runtime.reply(self._envelope()["message"])
+        with patch(
+            "project_master_host._resolve_grok",
+            return_value=(self.root / "grok.exe", {}),
+        ):
+            first = runtime.reply(self._envelope()["message"])
+            second = runtime.reply(self._envelope()["message"])
 
         self.assertEqual("answer-1", first)
         self.assertEqual("answer-2", second)
@@ -559,8 +563,12 @@ class ProjectMasterHostTests(unittest.TestCase):
             native_runner=runner,
             source_commit_resolver=lambda _root: "a" * 40,
         )
-        coordinator.prepare()
-        coordinator.observe(self._envelope()["message"])
+        with patch(
+            "project_master_host._required_host_executable",
+            return_value=Path(sys.executable),
+        ):
+            coordinator.prepare()
+            coordinator.observe(self._envelope()["message"])
 
         self.assertEqual("MASTER", requests[0]["mode"])
         self.assertEqual("grok-cli:session-001", requests[0]["host_session_ref"])

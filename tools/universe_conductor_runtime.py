@@ -5,14 +5,13 @@ import json
 import os
 import queue
 import secrets
-import shutil
 import subprocess  # nosec B404
-import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TextIO
 from uuid import uuid4
 
+from host_profile import resolve_host_tool
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -109,7 +108,7 @@ class UniverseConductorRuntime:
         frame_id = "conductor"
         token = secrets.token_urlsafe(32)
         command = [
-            sys.executable,
+            str(_required_host_executable("python")),
             str(self.runtime_cli),
             "session-boot",
             "serve",
@@ -300,7 +299,7 @@ class UniverseConductorRuntime:
         try:
             result = self.native_runner(
                 NativeCliRequest(
-                    executable=Path(sys.executable),
+                    executable=_required_host_executable("python"),
                     arguments=(
                         str(self.runtime_cli),
                         *arguments,
@@ -375,12 +374,9 @@ class UniverseConductorRuntime:
         return _text(anchor_id, "mode_current_anchor.anchor_id")
 
     def _git_head(self, repository_root: Path) -> str:
-        executable = shutil.which("git")
-        if executable is None:
-            raise UniverseConductorRuntimeError("UNIVERSE_GIT_UNAVAILABLE")
         result = self.native_runner(
             NativeCliRequest(
-                executable=Path(executable),
+                executable=_required_host_executable("git"),
                 arguments=("rev-parse", "HEAD"),
                 cwd=repository_root,
                 timeout_seconds=15,
@@ -400,6 +396,15 @@ class UniverseConductorRuntime:
                 "UNIVERSE_SOURCE_COMMIT_UNAVAILABLE"
             )
         return source_commit.lower()
+
+
+def _required_host_executable(tool: str) -> Path:
+    resolved = resolve_host_tool(tool)
+    if resolved is None:
+        raise UniverseConductorRuntimeError(
+            f"{tool.upper()}_HOST_TOOL_UNAVAILABLE"
+        )
+    return resolved.executable
 
 
 def _text(value: Any, field: str) -> str:

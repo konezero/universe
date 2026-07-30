@@ -20,6 +20,7 @@ const state = {
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
+  hostTools: null,
   conversationTarget: {
     kind: "UNIVERSE_CONDUCTOR",
     projectId: null,
@@ -67,6 +68,9 @@ const elements = {
   universeProviderSetting: document.querySelector("#universe-provider-setting"),
   universeProviderStatus: document.querySelector("#universe-provider-status"),
   projectProviderSettings: document.querySelector("#project-provider-settings"),
+  hostProfilePath: document.querySelector("#host-profile-path"),
+  hostToolSettings: document.querySelector("#host-tool-settings"),
+  discoverHostTools: document.querySelector("#discover-host-tools-button"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
@@ -282,12 +286,19 @@ async function refresh() {
     state.modeContract = health.mode_contract || null;
     renderModeStatus();
 
-    const [projectResult, releaseResult, conductorRoomResult, providerSettings] =
+    const [
+      projectResult,
+      releaseResult,
+      conductorRoomResult,
+      providerSettings,
+      hostTools,
+    ] =
       await Promise.all([
       api("/v1/projects"),
       api("/v1/releases"),
       api("/v1/conductor-room/messages"),
       api("/v1/settings/providers"),
+      api("/v1/settings/host-tools"),
     ]);
     state.projects = projectResult.projects;
     state.releases = releaseResult.releases;
@@ -295,6 +306,7 @@ async function refresh() {
     state.conductorRuntimeBinding =
       conductorRoomResult.runtime_binding || null;
     state.providerSettings = providerSettings;
+    state.hostTools = hostTools;
     renderProjects();
     renderComposerActions();
     renderReleaseCatalog();
@@ -629,10 +641,90 @@ function renderProviderSettings() {
   }
 }
 
+function renderHostToolSettings() {
+  const profile = state.hostTools;
+  if (!profile) return;
+  elements.hostProfilePath.textContent = profile.profile_path || "Profile unavailable";
+  elements.hostToolSettings.replaceChildren();
+  for (const tool of ["python", "git", "codex", "grok"]) {
+    const setting = profile.tools?.[tool] || {};
+    const row = node("div", "host-tool-row");
+    row.dataset.tool = tool;
+    const heading = node("div", "host-tool-heading");
+    heading.append(
+      node("strong", "", tool === "python" ? "Python" : tool[0].toUpperCase() + tool.slice(1)),
+      node(
+        "small",
+        setting.status === "AVAILABLE" ? "host-tool-available" : "host-tool-unavailable",
+        setting.status === "AVAILABLE"
+          ? `${setting.version || "Version unknown"} / ${setting.discovery_source || "Host Profile"}`
+          : setting.reason || "Not configured"
+      )
+    );
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "host-tool-path";
+    input.dataset.tool = tool;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = `Path to ${tool}.exe`;
+    input.value = setting.executable === "UNKNOWN" ? "" : setting.executable || "";
+    const actions = node("div", "host-tool-actions");
+    const setButton = node("button", "secondary-button host-tool-set", "Set");
+    setButton.type = "button";
+    setButton.dataset.tool = tool;
+    const verifyButton = node("button", "icon-button host-tool-verify", "✓");
+    verifyButton.type = "button";
+    verifyButton.dataset.tool = tool;
+    verifyButton.title = `Verify ${tool}`;
+    actions.append(setButton, verifyButton);
+    row.append(heading, input, actions);
+    elements.hostToolSettings.append(row);
+  }
+}
+
+async function discoverHostTools() {
+  elements.settingsError.textContent = "";
+  elements.discoverHostTools.disabled = true;
+  try {
+    state.hostTools = await api("/v1/settings/host-tools/discover", {
+      method: "POST",
+      body: {},
+    });
+    renderHostToolSettings();
+    toast("Host tools discovered");
+  } catch (error) {
+    elements.settingsError.textContent = error.message;
+  } finally {
+    elements.discoverHostTools.disabled = false;
+  }
+}
+
+async function updateHostTool(tool, operation) {
+  elements.settingsError.textContent = "";
+  const input = elements.hostToolSettings.querySelector(
+    `.host-tool-path[data-tool="${tool}"]`
+  );
+  const options =
+    operation === "select"
+      ? { method: "POST", body: { executable: input?.value.trim() || "" } }
+      : { method: "POST", body: {} };
+  state.hostTools = await api(
+    `/v1/settings/host-tools/${encodeURIComponent(tool)}/${operation}`,
+    options
+  );
+  renderHostToolSettings();
+  toast(`${tool} ${operation === "select" ? "saved" : "verified"}`);
+}
+
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
-  state.providerSettings = await api("/v1/settings/providers");
+  [state.providerSettings, state.hostTools] = await Promise.all([
+    api("/v1/settings/providers"),
+    api("/v1/settings/host-tools"),
+  ]);
   renderProviderSettings();
+  renderHostToolSettings();
   elements.settingsDialog.showModal();
 }
 
@@ -2351,6 +2443,24 @@ function bindEvents() {
     });
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
+  });
+  elements.discoverHostTools.addEventListener("click", () => {
+    discoverHostTools().catch((error) => toast(error.message, true));
+  });
+  elements.hostToolSettings.addEventListener("click", (event) => {
+    const action = event.target.closest(".host-tool-set, .host-tool-verify");
+    if (!action) return;
+    const operation = action.classList.contains("host-tool-set")
+      ? "select"
+      : "verify";
+    action.disabled = true;
+    updateHostTool(action.dataset.tool, operation)
+      .catch((error) => {
+        elements.settingsError.textContent = error.message;
+      })
+      .finally(() => {
+        action.disabled = false;
+      });
   });
   document
     .querySelector("#add-project-button")

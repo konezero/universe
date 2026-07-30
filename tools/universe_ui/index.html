@@ -155,11 +155,23 @@
     <form id="settings-form" method="dialog">
       <div class="dialog-heading">
         <div>
-          <h2>CLI providers</h2>
-          <p>Choose which local CLI answers each control room.</p>
+          <h2>Runtime settings</h2>
+          <p>Choose control-room providers and verify local Host tools.</p>
         </div>
         <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
       </div>
+      <section class="settings-section">
+        <div class="settings-section-heading">
+          <div>
+            <strong>Host tools</strong>
+            <small id="host-profile-path"></small>
+          </div>
+          <button id="discover-host-tools-button" type="button" class="secondary-button">
+            Discover
+          </button>
+        </div>
+        <div id="host-tool-settings" class="host-tool-settings"></div>
+      </section>
       <section class="settings-section">
         <label for="universe-provider-setting">Universe Conductor</label>
         <select id="universe-provider-setting" name="universe_provider">

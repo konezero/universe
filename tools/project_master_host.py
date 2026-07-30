@@ -10,10 +10,8 @@ import json
 import os
 import queue
 import secrets
-import shutil
 import sqlite3
 import subprocess  # nosec B404
-import sys
 import tempfile
 import threading
 import time
@@ -21,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 from uuid import UUID, uuid4
 
+from host_profile import resolve_host_tool
 from project_master_bridge import (
     ProjectMasterBridgeHost,
     ProjectMasterBridgeError,
@@ -321,8 +320,9 @@ class ProjectModeCoordinator:
             session_id = f"project-master-{uuid4().hex}"
             frame_id = "master"
             token = secrets.token_urlsafe(32)
+            python = _required_host_executable("python")
             command = [
-                sys.executable,
+                str(python),
                 str(self.runtime_cli),
                 "session-boot",
                 "serve",
@@ -475,7 +475,7 @@ class ProjectModeCoordinator:
         try:
             result = self.native_runner(
                 NativeCliRequest(
-                    executable=Path(sys.executable),
+                    executable=_required_host_executable("python"),
                     arguments=(
                         str(self.runtime_cli),
                         *arguments,
@@ -499,12 +499,9 @@ class ProjectModeCoordinator:
         return payload
 
     def _git_head(self, project_root: Path) -> str:
-        executable = shutil.which("git")
-        if executable is None:
-            raise ProjectMasterHostError("PROJECT_GIT_UNAVAILABLE")
         result = self.native_runner(
             NativeCliRequest(
-                executable=Path(executable),
+                executable=_required_host_executable("git"),
                 arguments=("rev-parse", "HEAD"),
                 cwd=project_root,
                 timeout_seconds=15,
@@ -1762,21 +1759,24 @@ def _run_streaming_json(
 
 
 def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
-    grok_home = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).resolve()
-    executable = grok_home / "bin" / "grok.exe"
-    return (executable if executable.is_file() else None), {"GROK_HOME": str(grok_home)}
+    resolved = resolve_host_tool("grok")
+    if resolved is None:
+        return None, {}
+    return resolved.executable, dict(resolved.environment)
 
 
 def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
-    configured = os.environ.get("CODEX_CLI_PATH")
-    if configured:
-        candidate = Path(configured).expanduser().resolve()
-        return (candidate if candidate.is_file() else None), {}
-    resolved = shutil.which("codex.exe") or shutil.which("codex")
-    if not resolved:
+    resolved = resolve_host_tool("codex")
+    if resolved is None:
         return None, {}
-    candidate = Path(resolved).resolve()
-    return (candidate if candidate.suffix.lower() == ".exe" else None), {}
+    return resolved.executable, dict(resolved.environment)
+
+
+def _required_host_executable(tool: str) -> Path:
+    resolved = resolve_host_tool(tool)
+    if resolved is None:
+        raise ProjectMasterHostError(f"{tool.upper()}_HOST_TOOL_UNAVAILABLE")
+    return resolved.executable
 
 
 def _runtime_tmp() -> Path:

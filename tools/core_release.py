@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess  # nosec B404
 import tempfile
@@ -13,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from host_profile import resolve_host_tool
 from release_profile_catalog import (
     ReleaseProfileCatalog,
     ReleaseProfileError,
@@ -112,10 +112,10 @@ class GitBlob:
 class GitObjectReader:
     def __init__(self, repository: Path) -> None:
         self.repository = repository.expanduser().resolve(strict=True)
-        git = shutil.which("git")
+        git = resolve_host_tool("git")
         if git is None:
             raise CoreReleaseError("git executable is unavailable")
-        self.git = git
+        self.git = str(git.executable)
         if self._run("rev-parse", "--is-inside-work-tree").strip() != b"true":
             raise CoreReleaseError("source repository is not a Git work tree")
 

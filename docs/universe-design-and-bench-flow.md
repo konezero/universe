@@ -354,6 +354,12 @@ relations remain distinct from observed evidence. Career adoption is separate.
     Package the stable Web UI later in a Tauri desktop shell with the Python
     Universe service as a sidecar, tray, and autostart; mobile and remote clients
     reuse the same responsive UI as a later delivery surface.
+11. Central Host Profile resolution for Python, Git, Codex, and Grok is
+    implemented. The local Universe service initializes and verifies one
+    machine-local Profile, and all product Runtime callers consume it instead
+    of independently searching process state. Runtime Settings exposes
+    discovery, exact executable selection, and verification. Installer and tray
+    packaging will set the Profile pointer and reuse this same settings surface.
 
 ## Runtime Boundary
 

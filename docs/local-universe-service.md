@@ -71,6 +71,13 @@ chooses the first available provider in the configured order. An explicit
 provider that is unavailable fails visibly and is never replaced after the
 request has started.
 
+Provider selection is separate from Host executable resolution. Runtime
+Settings exposes the central Host Profile for Python, Git, Codex, and Grok.
+The service initializes this Profile before Runtime providers or resident
+Project Masters start. Discover, select, and verify operations update the same
+local Profile consumed by all Runtime callers. They do not create authority,
+assignment, write scope, or provider credentials.
+
 Each attached project remains responsible for its own source mutation,
 validation, Execution Guard, and evidence. Universe stores project roots and
 evidence references; it does not merge or rewrite project Runtime databases.
@@ -137,6 +144,10 @@ GET    /v1/projects
 GET    /v1/runtime/providers
 GET    /v1/settings/providers
 POST   /v1/settings/providers/universe
+GET    /v1/settings/host-tools
+POST   /v1/settings/host-tools/discover
+POST   /v1/settings/host-tools/{tool}/select
+POST   /v1/settings/host-tools/{tool}/verify
 POST   /v1/runtime/planning-binding
 GET    /v1/runtime/planning-binding
 GET    /v1/projects/{project_id}

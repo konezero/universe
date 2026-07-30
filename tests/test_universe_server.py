@@ -26,6 +26,7 @@ JsonObject = dict[str, Any]
 
 
 from core_release import build_release  # noqa: E402
+from host_profile import HostProfileStore  # noqa: E402
 from project_seed_assets import materialize_project_seed_assets  # noqa: E402
 from universe_server import (  # noqa: E402
     ConnectionCapabilities,
@@ -127,7 +128,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     },
                 }
             ),
+            host_profile=HostProfileStore(temp_root / "host.json"),
         )
+        self.host_tool_patchers = [
+            patch(
+                "core_release.resolve_host_tool",
+                side_effect=self.server.host_profile.resolve,
+            ),
+            patch(
+                "project_release_apply.resolve_host_tool",
+                side_effect=self.server.host_profile.resolve,
+            ),
+        ]
+        for patcher in self.host_tool_patchers:
+            patcher.start()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address[:2]
@@ -139,6 +153,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        for patcher in reversed(self.host_tool_patchers):
+            patcher.stop()
         self.temp.cleanup()
 
     def request(
@@ -515,6 +531,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="settings-dialog"', body)
             self.assertIn('id="universe-provider-setting"', body)
             self.assertIn('id="project-provider-settings"', body)
+            self.assertIn('id="host-tool-settings"', body)
+            self.assertIn('id="discover-host-tools-button"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
@@ -531,8 +549,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("UNIVERSE_CONDUCTOR", script)
             self.assertIn("callProjectMaster", script)
             self.assertIn("/v1/settings/providers", script)
+            self.assertIn("/v1/settings/host-tools", script)
             self.assertIn("/provider-setting", script)
             self.assertNotIn(self.token, script)
+
+    def test_host_tool_settings_are_discoverable_and_verifiable(self) -> None:
+        status, profile = self.request("GET", "/v1/settings/host-tools")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("ai-career.host-profile.v1", profile["schema"])
+        self.assertEqual(
+            str((self.temp_root / "host.json").resolve()),
+            profile["profile_path"],
+        )
+        self.assertEqual("AVAILABLE", profile["tools"]["python"]["status"])
+
+        status, discovered = self.request(
+            "POST",
+            "/v1/settings/host-tools/discover",
+            {},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("HOST_PROFILE_READY", discovered["status"])
+
+        status, selected = self.request(
+            "POST",
+            "/v1/settings/host-tools/python/select",
+            {"executable": sys.executable},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AVAILABLE", selected["tools"]["python"]["status"])
+
+        status, verified = self.request(
+            "POST",
+            "/v1/settings/host-tools/python/verify",
+            {},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AVAILABLE", verified["tools"]["python"]["status"])
 
     def test_cli_provider_settings_default_to_auto_and_persist(self) -> None:
         class FakeRuntimeHost:

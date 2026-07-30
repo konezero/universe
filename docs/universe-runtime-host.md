@@ -37,9 +37,18 @@ Guard and receipt-aware mutation gateway path.
 completed Worker envelope carries exactly one `result_receipt_ref`; the same
 reference may also appear in `evidence_refs`, but it is not a second receipt.
 
-The Grok adapter resolves `%GROK_HOME%\bin\grok.exe` (or
-`%USERPROFILE%\.grok\bin\grok.exe`) directly. It does not depend on `grok`
-being present in `PATH`.
+All product-owned external executables resolve through the local Host Profile.
+The active Profile path is selected by `AI_CAREER_HOST_PROFILE` and defaults to
+`%LOCALAPPDATA%\ai-career\host.json`. Runtime callers do not independently
+search `PATH`, inspect `GROK_HOME`, inspect `CODEX_CLI_PATH`, or reuse a Python
+shim.
+
+The Universe service initializes the Profile once. Initial discovery accepts
+the per-tool `AI_CAREER_*_EXECUTABLE` overrides, the current native Python
+process, known native application locations, and `PATH`. `GROK_HOME` and
+`CODEX_CLI_PATH` are migration inputs only. Once persisted, every Runtime
+caller consumes the Profile record. A missing, stale, script-based, or failed
+tool is `UNAVAILABLE`.
 
 ## Windows Native CLI Boundary
 
@@ -67,9 +76,11 @@ argument in the runner's argv array. Empty strings, spaces, quotes, JSON,
 newlines, non-ASCII text, timeout status, and separated stdout/stderr are
 covered by Runtime Host regression tests.
 
-The Python interpreter hosting Universe is not discovered through a PowerShell
-shim for provider execution. `grok.exe` and `codex.exe` must resolve to native
-executables; `.bat`, `.cmd`, and `.ps1` entrypoints are rejected.
+Python, Git, Grok, and Codex must resolve to native executables. `.bat`, `.cmd`,
+and `.ps1` entrypoints are rejected. The Profile stores only executable paths,
+versions, verification timestamps, discovery sources, and the non-secret
+`GROK_HOME` launch environment. Tokens, credentials, and provider sessions are
+not Profile fields.
 
 Other product-owned external CLI paths must satisfy the same contract even when
 they need a specialized transport. The Release Builder's byte-oriented Git

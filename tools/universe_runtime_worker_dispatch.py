@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import shutil
 import tempfile
 import time
 from typing import Any, Callable, Mapping
@@ -14,6 +13,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from host_profile import resolve_host_tool
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -144,23 +144,17 @@ def post_json(
 
 
 def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
-    grok_home = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).resolve()
-    executable = grok_home / "bin" / "grok.exe"
-    return (executable if executable.is_file() else None), {"GROK_HOME": str(grok_home)}
+    resolved = resolve_host_tool("grok")
+    if resolved is None:
+        return None, {}
+    return resolved.executable, dict(resolved.environment)
 
 
 def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
-    configured = os.environ.get("CODEX_CLI_PATH")
-    if configured:
-        candidate = Path(configured).resolve()
-        return (candidate if candidate.is_file() else None), {}
-    resolved = shutil.which("codex.exe") or shutil.which("codex")
-    if not resolved:
+    resolved = resolve_host_tool("codex")
+    if resolved is None:
         return None, {}
-    candidate = Path(resolved).resolve()
-    if candidate.suffix.lower() != ".exe":
-        return None, {}
-    return candidate, {}
+    return resolved.executable, dict(resolved.environment)
 
 
 def _provider_executable(provider: str) -> tuple[Path | None, dict[str, str]]:

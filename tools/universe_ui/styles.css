@@ -944,7 +944,7 @@ dialog {
 }
 
 .settings-dialog {
-  width: min(560px, calc(100vw - 28px));
+  width: min(720px, calc(100vw - 28px));
 }
 
 .settings-dialog .dialog-heading {
@@ -971,12 +971,63 @@ dialog {
   gap: 4px;
 }
 
+.settings-section-heading {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
 .settings-section-heading small,
 .project-provider-copy small,
 .provider-setting-status {
   color: var(--muted);
   font-size: 10px;
   font-weight: 500;
+}
+
+.host-tool-settings {
+  display: grid;
+  gap: 8px;
+}
+
+.host-tool-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+}
+
+.host-tool-heading {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.host-tool-heading small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.host-tool-heading .host-tool-available {
+  color: var(--teal);
+}
+
+.host-tool-path {
+  width: 100%;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.host-tool-actions {
+  display: flex;
+  gap: 6px;
 }
 
 .project-provider-settings {
@@ -993,6 +1044,16 @@ dialog {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface-quiet);
+}
+
+@media (max-width: 620px) {
+  .host-tool-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .host-tool-heading {
+    grid-column: 1 / -1;
+  }
 }
 
 dialog::backdrop {

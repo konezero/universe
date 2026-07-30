@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-import sys
 import tempfile
 from typing import Any, Mapping
 
+from host_profile import resolve_host_tool
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
@@ -38,6 +38,16 @@ class ProjectReleaseApplyError(ValueError):
         self.lifecycle_result = (
             dict(lifecycle_result) if lifecycle_result is not None else None
         )
+
+
+def _required_host_executable(tool: str) -> Path:
+    resolved = resolve_host_tool(tool)
+    if resolved is None:
+        raise ProjectReleaseApplyError(
+            "HOST_TOOL_UNAVAILABLE",
+            f"{tool.upper()}_HOST_TOOL_UNAVAILABLE",
+        )
+    return resolved.executable
 
 
 def plan_project_release_lifecycle(
@@ -227,7 +237,7 @@ def apply_project_release_proposal(
                 )
                 result = native_runner(
                     NativeCliRequest(
-                        executable=Path(sys.executable),
+                        executable=_required_host_executable("python"),
                         arguments=(
                             str(host_script),
                             "--request",

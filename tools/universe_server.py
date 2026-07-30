@@ -31,6 +31,7 @@ from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from core_release import CoreReleaseError, verify_release
+from host_profile import HostProfileError, HostProfileStore
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
 from universe_dispatch import (
     DispatchError,
@@ -8442,9 +8443,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         conductor_runtime_factory: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
+        host_profile: HostProfileStore | None = None,
     ):
         self.store = store
         self.token = token
+        self.host_profile = host_profile or HostProfileStore()
+        try:
+            self.host_profile.ensure_initialized()
+        except HostProfileError as error:
+            raise UniverseError(error.code, str(error)) from error
         self.runtime_host = runtime_host or UniverseRuntimeHost(
             Path(__file__).resolve().parents[1]
         )
@@ -8877,6 +8884,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         settings["status"] = "CLI_PROVIDER_SETTINGS_COLLECTED"
         return settings
 
+    def host_tool_settings(self) -> dict[str, Any]:
+        try:
+            return self.host_profile.snapshot()
+        except HostProfileError as error:
+            raise UniverseError(error.code, str(error)) from error
+
+    def discover_host_tools(self) -> dict[str, Any]:
+        try:
+            return self.host_profile.discover()
+        except HostProfileError as error:
+            raise UniverseError(error.code, str(error)) from error
+
+    def set_host_tool(self, tool: str, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="host_tool_setting",
+            required=frozenset({"executable"}),
+            optional=frozenset(),
+        )
+        try:
+            return self.host_profile.set_tool(
+                tool,
+                _required_text(request["executable"], "executable"),
+            )
+        except HostProfileError as error:
+            raise UniverseError(error.code, str(error)) from error
+
+    def verify_host_tool(self, tool: str) -> dict[str, Any]:
+        try:
+            return self.host_profile.verify_tool(tool)
+        except HostProfileError as error:
+            raise UniverseError(error.code, str(error)) from error
+
     def set_universe_provider_setting(self, value: Any) -> dict[str, Any]:
         setting = self.store.set_provider_setting(
             "UNIVERSE_CONDUCTOR",
@@ -9137,6 +9177,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 self.server.provider_settings(),
             )
+            return
+        if path == "/v1/settings/host-tools":
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.host_tool_settings(),
+                )
+            except UniverseError as error:
+                self._send_error(error)
             return
         if path == "/v1/runtime/planning-binding":
             self._send(
@@ -9530,6 +9579,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     HTTPStatus.OK,
                     self.server.set_universe_provider_setting(body),
+                )
+                return
+            if path == "/v1/settings/host-tools/discover":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.discover_host_tools(),
+                )
+                return
+            host_tool_match = re.fullmatch(
+                r"/v1/settings/host-tools/([^/]+)/(select|verify)",
+                path,
+            )
+            if host_tool_match is not None:
+                tool, operation = host_tool_match.groups()
+                self._send(
+                    HTTPStatus.OK,
+                    (
+                        self.server.set_host_tool(unquote(tool), body)
+                        if operation == "select"
+                        else self.server.verify_host_tool(unquote(tool))
+                    ),
                 )
                 return
             if path == "/v1/runtime/planning-binding":
@@ -10631,6 +10701,7 @@ def create_server(
     conductor_runtime_factory: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
+    host_profile: HostProfileStore | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -10653,6 +10724,7 @@ def create_server(
         conductor_runtime_factory=conductor_runtime_factory,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
+        host_profile=host_profile,
     )
 
 

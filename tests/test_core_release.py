@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +24,13 @@ from core_release import (  # noqa: E402
 
 class CoreReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
+        git = shutil.which("git.exe") or shutil.which("git")
+        self.assertIsNotNone(git)
+        self.host_tool_patcher = patch(
+            "core_release.resolve_host_tool",
+            return_value=SimpleNamespace(executable=Path(str(git)).resolve()),
+        )
+        self.host_tool_patcher.start()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.repo = self.root / "source"
@@ -34,6 +44,7 @@ class CoreReleaseTests(unittest.TestCase):
         self.commit = self._commit("initial")
 
     def tearDown(self) -> None:
+        self.host_tool_patcher.stop()
         self.temp.cleanup()
 
     def _git(self, *args: str) -> str:
