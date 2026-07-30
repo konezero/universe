@@ -344,6 +344,16 @@ relations remain distinct from observed evidence. Career adoption is separate.
    Project Room message. Per-task provider selection remains part of the
    separate Task Frame proposal. Provider credentials remain in each provider
    credential store and are never persisted in Universe settings.
+10. Productize the desktop-first Universe UI as the canonical responsive Web
+    SPA. Keep the persistent conversation surface and its + control scoped to
+    Project Master, Skill, and context invocation; explicit management remains
+    available through ordinary UI controls. Structured Wizards must support both
+    direct field entry and Conductor/Master-assisted completion of missing values,
+    with final user confirmation. Keep the custom graph behind a renderer boundary
+    so Canvas can advance to WebGL without changing application state contracts.
+    Package the stable Web UI later in a Tauri desktop shell with the Python
+    Universe service as a sidecar, tray, and autostart; mobile and remote clients
+    reuse the same responsive UI as a later delivery surface.
 
 ## Runtime Boundary
 
