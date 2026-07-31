@@ -136,7 +136,24 @@ bundled; the Host must provide `python` on `PATH`.
 
 1. ~~Optional system tray process~~ → `packaging/windows/Universe-Tray.ps1` + `tray` CLI
 2. ~~Single-folder portable zip~~ → `tools/build_portable.py` (Python still Host-provided)
-3. MSIX / signed installer for non-developer users.
+3. MSIX / signed installer for non-developer users (outline only below).
 4. Embed/pin a private Python runtime inside the portable zip.
 5. In-app settings panel actions that shell out only via Host-approved control.
 6. Custom tray icon asset (currently uses application system icon).
+
+## MSI / embed Python (outline — not implemented)
+
+Target later:
+
+```text
+1. Build portable tree with tools/build_portable.py
+2. Bundle official CPython embeddable package under runtime/python/
+3. Point launchers at runtime/python/python.exe instead of PATH
+4. Wrap with WiX / MSIX:
+   - per-user install
+   - Start Menu + optional autostart
+   - no admin unless machine-wide requested
+5. Code-sign installer and Python binaries
+```
+
+Until then, portable zip + Host Python remains the supported distribution.

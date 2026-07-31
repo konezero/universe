@@ -255,6 +255,10 @@ GET    /v1/projects/{project_id}/experience-cases
 POST   /v1/projects/{project_id}/experience-matches
 POST   /v1/projects/{project_id}/experience-pattern-proposals
 GET    /v1/projects/{project_id}/experience-pattern-proposals
+POST   /v1/projects/{project_id}/memories
+GET    /v1/projects/{project_id}/memories
+POST   /v1/projects/{project_id}/memories/link
+GET    /v1/projects/{project_id}/memories/propose-links
 POST   /v1/projects/{project_id}/seed
 GET    /v1/projects/{project_id}/seed
 GET    /v1/templates/project-seed

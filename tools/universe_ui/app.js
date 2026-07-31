@@ -14,6 +14,9 @@ const state = {
   skillBench: [],
   experienceCases: [],
   experiencePatterns: [],
+  contextPacks: [],
+  memories: [],
+  memoryProposals: [],
   selectedNode: null,
   focusedNodeId: null,
   view: "timeline",
@@ -107,6 +110,8 @@ const elements = {
   details: document.querySelector("#details-panel"),
   activity: document.querySelector("#activity-panel"),
   benchPanel: document.querySelector("#bench-panel"),
+  memoryPanel: document.querySelector("#memory-panel"),
+  futurePanel: document.querySelector("#future-panel"),
   dispatchForm: document.querySelector("#dispatch-form"),
   dispatchSubmit: document.querySelector("#dispatch-submit"),
   dispatchInstruction: document.querySelector("#dispatch-instruction"),
@@ -678,6 +683,9 @@ async function selectProject(projectId) {
     benchResult,
     experienceResult,
     patternResult,
+    contextPackResult,
+    memoryResult,
+    memoryProposalResult,
   ] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
@@ -705,6 +713,15 @@ async function selectProject(projectId) {
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/experience-pattern-proposals`
     ).catch(() => ({ proposals: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/context-packs`
+    ).catch(() => ({ context_packs: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/memories`
+    ).catch(() => ({ memories: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/memories/propose-links`
+    ).catch(() => ({ proposals: [] })),
   ]);
   state.projection = projectionResult?.projection || null;
   state.dispatches = await Promise.all(
@@ -724,6 +741,9 @@ async function selectProject(projectId) {
   state.skillBench = benchResult.bench || [];
   state.experienceCases = experienceResult.cases || [];
   state.experiencePatterns = patternResult.proposals || [];
+  state.contextPacks = contextPackResult.context_packs || [];
+  state.memories = memoryResult.memories || [];
+  state.memoryProposals = memoryProposalResult.proposals || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -733,6 +753,8 @@ async function selectProject(projectId) {
   renderDetails();
   renderActivity();
   renderBench();
+  renderMemory();
+  renderFuture();
   renderRoomMessages();
   renderReleaseCatalog();
   elements.todoProject.value = projectId;
@@ -3591,7 +3613,15 @@ function showInspectorTab(name) {
   if (elements.benchPanel) {
     elements.benchPanel.classList.toggle("hidden", name !== "bench");
   }
+  if (elements.memoryPanel) {
+    elements.memoryPanel.classList.toggle("hidden", name !== "memory");
+  }
+  if (elements.futurePanel) {
+    elements.futurePanel.classList.toggle("hidden", name !== "future");
+  }
   if (name === "bench") renderBench();
+  if (name === "memory") renderMemory();
+  if (name === "future") renderFuture();
 }
 
 function projectBenchRows() {
@@ -3677,15 +3707,36 @@ function renderBench() {
     for (const row of benchRows) {
       const succeeded = row.outcomes?.SUCCEEDED ?? 0;
       const failed = row.outcomes?.FAILED ?? 0;
+      const duration = row.metric_totals?.duration_ms;
+      const durationText =
+        typeof duration === "number" ? ` · ${Math.round(duration)}ms` : "";
       list.append(
         node(
           "li",
           "",
-          `${row.skill?.skill_id || "skill"} · ${row.provider_ref || "UNKNOWN"} · n=${row.observation_count || 0} · ok=${succeeded} fail=${failed}`
+          `${row.skill?.skill_id || "skill"} · ${row.provider_ref || "UNKNOWN"} · n=${row.observation_count || 0} · ok=${succeeded} fail=${failed}${durationText}`
         )
       );
     }
     benchGroup.append(list);
+  }
+  if (state.contextPacks.length) {
+    const packGroup = node("div", "detail-group");
+    packGroup.append(
+      node("h3", "", `Context Packs (${state.contextPacks.length})`)
+    );
+    const list = node("ul", "context-list bench-list");
+    for (const pack of state.contextPacks.slice(0, 6)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${pack.context_pack_id || pack.pack_id || "pack"} · ${pack.purpose || pack.status || "recorded"}`
+        )
+      );
+    }
+    packGroup.append(list);
+    elements.benchPanel.append(packGroup);
   }
   elements.benchPanel.append(benchGroup);
 
@@ -3789,9 +3840,342 @@ async function matchExperienceCase(caseId) {
         ? `Experience match: ${matches.length} similar case(s) (OBSERVED_SIMILARITY)`
         : "No similar Experience Cases yet"
     );
+    if (matches.length && elements.benchPanel) {
+      const box = node("div", "detail-group");
+      box.append(node("h3", "", "Why / match dimensions"));
+      const list = node("ul", "context-list bench-list");
+      for (const match of matches.slice(0, 5)) {
+        list.append(
+          node(
+            "li",
+            "",
+            `${match.case_id || "case"} · dims=${match.observed_dimension_count || 0} · ${match.relationship || "OBSERVED_SIMILARITY"}`
+          )
+        );
+      }
+      box.append(list);
+      elements.benchPanel.append(box);
+    }
   } catch (error) {
     toast(error.message, true);
   }
+}
+
+function renderMemory() {
+  if (!elements.memoryPanel) return;
+  elements.memoryPanel.replaceChildren();
+  if (!state.selectedProject) {
+    elements.memoryPanel.append(
+      node("p", "empty-copy", "Select a project for Memory RAG")
+    );
+    return;
+  }
+  const selectedNode = selectedNodeRef();
+  const intro = node("div", "detail-group");
+  intro.append(
+    node("h3", "", "Memory RAG"),
+    node(
+      "p",
+      "context-copy",
+      "Reference context only. Not a Candidate, Seed write, or Task Frame."
+    )
+  );
+  elements.memoryPanel.append(intro);
+
+  const create = node("div", "detail-group memory-create");
+  create.append(node("h3", "", "Add note"));
+  const title = node("input", "memory-title-input");
+  title.placeholder = "Title";
+  title.maxLength = 160;
+  const body = node("textarea", "memory-body-input");
+  body.placeholder = "Brainstorm, question, observation, or decision note";
+  body.rows = 3;
+  body.maxLength = 8000;
+  const add = node("button", "primary-button compact-action", "Save memory");
+  add.type = "button";
+  add.addEventListener("click", async () => {
+    try {
+      const payload = {
+        title: title.value.trim() || body.value.trim().slice(0, 80),
+        body: body.value.trim(),
+        state: "BRAINSTORM",
+      };
+      if (selectedNode) {
+        payload.node_ref = selectedNode;
+        payload.graph = "functional";
+      }
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          state.selectedProject.project_id
+        )}/memories`,
+        { method: "POST", body: payload }
+      );
+      state.memories = [result.memory, ...state.memories];
+      title.value = "";
+      body.value = "";
+      renderMemory();
+      toast(
+        selectedNode
+          ? "Memory linked to selected node"
+          : "Unlinked memory recorded"
+      );
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  create.append(title, body, add);
+  elements.memoryPanel.append(create);
+
+  const unlinked = state.memories.filter((item) => item.link_state === "UNLINKED");
+  const linked = state.memories.filter((item) => item.link_state !== "UNLINKED");
+  const unlinkedGroup = node("div", "detail-group");
+  unlinkedGroup.append(
+    node("h3", "", `Unlinked (${unlinked.length})`)
+  );
+  if (!unlinked.length) {
+    unlinkedGroup.append(node("p", "empty-copy", "No unlinked memories"));
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const memory of unlinked.slice(0, 8)) {
+      const row = node("li", "bench-case-row");
+      row.append(
+        node("span", "", `${memory.state} · ${memory.title}`)
+      );
+      if (selectedNode) {
+        const link = node("button", "handoff-action", "Link");
+        link.type = "button";
+        link.addEventListener("click", () =>
+          linkMemory(memory.memory_id, selectedNode, "functional", "LINKED")
+        );
+        row.append(link);
+      }
+      list.append(row);
+    }
+    unlinkedGroup.append(list);
+  }
+  if (state.memoryProposals.length) {
+    const propose = node(
+      "button",
+      "secondary-button compact-action",
+      `Apply first proposal (${state.memoryProposals.length})`
+    );
+    propose.type = "button";
+    propose.addEventListener("click", () => {
+      const first = state.memoryProposals[0];
+      if (!first) return;
+      linkMemory(
+        first.memory_id,
+        first.node_ref,
+        first.graph || "functional",
+        "PROPOSED"
+      );
+    });
+    unlinkedGroup.append(
+      node(
+        "p",
+        "context-copy",
+        `Deterministic proposals: ${state.memoryProposals.length} (token overlap; no Seed write)`
+      ),
+      propose
+    );
+  }
+  const refreshProposals = node(
+    "button",
+    "secondary-button compact-action",
+    "Refresh link proposals"
+  );
+  refreshProposals.type = "button";
+  refreshProposals.addEventListener("click", async () => {
+    try {
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          state.selectedProject.project_id
+        )}/memories/propose-links`
+      );
+      state.memoryProposals = result.proposals || [];
+      renderMemory();
+      toast(`Proposals: ${state.memoryProposals.length}`);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  unlinkedGroup.append(refreshProposals);
+  elements.memoryPanel.append(unlinkedGroup);
+
+  const linkedGroup = node("div", "detail-group");
+  const nodeScoped = selectedNode
+    ? linked.filter((item) => item.node_ref === selectedNode)
+    : linked;
+  linkedGroup.append(
+    node(
+      "h3",
+      "",
+      selectedNode
+        ? `Node memory (${nodeScoped.length})`
+        : `Linked memory (${linked.length})`
+    )
+  );
+  if (!nodeScoped.length) {
+    linkedGroup.append(node("p", "empty-copy", "No linked memory in this view"));
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const memory of nodeScoped.slice(0, 8)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${memory.link_state} · ${memory.node_ref || "-"} · ${memory.title}`
+        )
+      );
+    }
+    linkedGroup.append(list);
+  }
+  elements.memoryPanel.append(linkedGroup);
+}
+
+async function linkMemory(memoryId, nodeRef, graph, linkState) {
+  if (!state.selectedProject) return;
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(
+        state.selectedProject.project_id
+      )}/memories/link`,
+      {
+        method: "POST",
+        body: {
+          memory_id: memoryId,
+          node_ref: nodeRef,
+          graph,
+          link_state: linkState,
+        },
+      }
+    );
+    state.memories = state.memories.map((item) =>
+      item.memory_id === memoryId ? result.memory : item
+    );
+    renderMemory();
+    toast(`Memory ${linkState.toLowerCase()} → ${nodeRef}`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderFuture() {
+  if (!elements.futurePanel) return;
+  elements.futurePanel.replaceChildren();
+  if (!state.selectedProject) {
+    elements.futurePanel.append(
+      node("p", "empty-copy", "Select a project for Future routes")
+    );
+    return;
+  }
+  const heading = node("div", "detail-group");
+  heading.append(
+    node("h3", "", "Future plane"),
+    node(
+      "p",
+      "context-copy",
+      "Seed structure · Bench · Experience · predicted paths. Planning only."
+    )
+  );
+  elements.futurePanel.append(heading);
+
+  const seedGroup = node("div", "detail-group");
+  seedGroup.append(node("h3", "", "Seed / structure"));
+  const seedGrid = node("dl", "detail-grid");
+  addDetail(seedGrid, "Project", state.selectedProject.project_id);
+  addDetail(
+    seedGrid,
+    "Nodes",
+    String(state.projection?.nodes?.length || 0)
+  );
+  addDetail(
+    seedGrid,
+    "Predicted",
+    String(state.projection?.predicted_paths?.length || 0)
+  );
+  addDetail(
+    seedGrid,
+    "Documents",
+    String(state.projection?.documents?.length || 0)
+  );
+  seedGroup.append(seedGrid);
+  const predicted = state.projection?.predicted_paths || [];
+  if (predicted.length) {
+    const list = node("ul", "context-list bench-list");
+    for (const path of predicted.slice(0, 6)) {
+      list.append(
+        node(
+          "li",
+          "",
+          path.title || path.path_id || path.label || JSON.stringify(path).slice(0, 80)
+        )
+      );
+    }
+    seedGroup.append(list);
+  } else {
+    seedGroup.append(
+      node("p", "empty-copy", "No predicted paths on current projection")
+    );
+  }
+  elements.futurePanel.append(seedGroup);
+
+  const benchGroup = node("div", "detail-group");
+  benchGroup.append(
+    node(
+      "h3",
+      "",
+      `Bench · Experience (${state.skillBench.length} / ${state.experienceCases.length})`
+    )
+  );
+  benchGroup.append(
+    node(
+      "p",
+      "context-copy",
+      `Observations ${state.skillObservations.length} · Context packs ${state.contextPacks.length} · Patterns ${state.experiencePatterns.length}`
+    )
+  );
+  const openBench = node("button", "secondary-button compact-action", "Open Bench tab");
+  openBench.type = "button";
+  openBench.addEventListener("click", () => showInspectorTab("bench"));
+  benchGroup.append(openBench);
+  elements.futurePanel.append(benchGroup);
+
+  const memoryGroup = node("div", "detail-group");
+  const unlinked = state.memories.filter((item) => item.link_state === "UNLINKED");
+  memoryGroup.append(
+    node(
+      "h3",
+      "",
+      `Memory (${state.memories.length}, unlinked ${unlinked.length})`
+    )
+  );
+  const openMemory = node("button", "secondary-button compact-action", "Open Memory tab");
+  openMemory.type = "button";
+  openMemory.addEventListener("click", () => showInspectorTab("memory"));
+  memoryGroup.append(openMemory);
+  elements.futurePanel.append(memoryGroup);
+
+  const handoffGroup = node("div", "detail-group");
+  handoffGroup.append(
+    node("h3", "", `Master handoffs (${state.masterHandoffs.length})`)
+  );
+  if (!state.masterHandoffs.length) {
+    handoffGroup.append(node("p", "empty-copy", "No handoff proposals"));
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const handoff of state.masterHandoffs.slice(0, 4)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${handoff.delivery_state} · ${handoff.source?.kind || "source"}`
+        )
+      );
+    }
+    handoffGroup.append(list);
+  }
+  elements.futurePanel.append(handoffGroup);
 }
 
 function toast(message, error = false) {

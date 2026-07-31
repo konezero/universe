@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from core_release import CoreReleaseError, verify_release
@@ -75,6 +75,13 @@ from project_master_host import (
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
+from universe_memory import (
+    MEMORY_SCHEMA,
+    MemoryError,
+    normalize_memory_create,
+    normalize_memory_link,
+    propose_node_links,
+)
 from universe_runtime_host import (
     RuntimeHostError,
     UniverseRuntimeHost,
@@ -3708,6 +3715,39 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS experience_pattern_proposal_project_time
                 ON experience_pattern_proposal(project_id, created_at, proposal_id);
 
+                CREATE TABLE IF NOT EXISTS project_memory (
+                    memory_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    link_state TEXT NOT NULL,
+                    node_ref TEXT,
+                    graph TEXT,
+                    origin_ref TEXT,
+                    memory_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK(state IN ('BRAINSTORM', 'OBSERVED', 'QUESTION', 'DECISION_NOTE')),
+                    CHECK(link_state IN ('UNLINKED', 'LINKED', 'PROPOSED')),
+                    CHECK(
+                        (link_state = 'UNLINKED' AND node_ref IS NULL AND graph IS NULL)
+                        OR (
+                            link_state IN ('LINKED', 'PROPOSED')
+                            AND node_ref IS NOT NULL
+                            AND graph IN ('functional', 'implementation')
+                        )
+                    )
+                );
+
+                CREATE INDEX IF NOT EXISTS project_memory_project_time
+                ON project_memory(project_id, updated_at, memory_id);
+
+                CREATE INDEX IF NOT EXISTS project_memory_project_link
+                ON project_memory(project_id, link_state, node_ref, memory_id);
+
                 CREATE TABLE IF NOT EXISTS career_promotion_queue (
                     queue_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -6668,6 +6708,190 @@ class UniverseStore:
             proposal["created_at"] = row["created_at"]
             proposals.append(proposal)
         return proposals
+
+    def create_project_memory(
+        self, project_id: str, value: Any
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        try:
+            request = normalize_memory_create(value)
+        except MemoryError as error:
+            raise UniverseError(error.code, error.message) from error
+        now = utc_now()
+        material = {
+            "schema": MEMORY_SCHEMA,
+            "project_id": project["project_id"],
+            "title": request["title"],
+            "body": request["body"],
+            "state": request["state"],
+            "link_state": request["link_state"],
+            "node_ref": request["node_ref"],
+            "graph": request["graph"],
+            "origin_ref": request["origin_ref"],
+            "effects": {
+                "seed_write": "NONE",
+                "candidate": "NONE",
+                "queue_publication": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "USER_REVIEW_OR_NODE_LINK",
+        }
+        material["memory_digest"] = _json_sha256(material)
+        material["memory_id"] = "memory_" + material["memory_digest"][:24]
+        material["created_at"] = now
+        material["updated_at"] = now
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO project_memory(
+                    memory_id, project_id, title, body, state, link_state,
+                    node_ref, graph, origin_ref, memory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["memory_id"],
+                    project["project_id"],
+                    material["title"],
+                    material["body"],
+                    material["state"],
+                    material["link_state"],
+                    material["node_ref"],
+                    material["graph"],
+                    material["origin_ref"],
+                    _canonical_json(material),
+                    now,
+                    now,
+                ),
+            )
+        return material
+
+    def list_project_memories(
+        self,
+        project_id: str,
+        *,
+        link_state: str | None = None,
+        node_ref: str | None = None,
+        query: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project["project_id"]]
+        if link_state:
+            clauses.append("link_state = ?")
+            params.append(link_state.upper())
+        if node_ref:
+            clauses.append("node_ref = ?")
+            params.append(node_ref)
+        if query:
+            clauses.append("(title LIKE ? OR body LIKE ?)")
+            needle = f"%{query}%"
+            params.extend([needle, needle])
+        params.append(max(1, min(int(limit), 500)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT memory_json, created_at, updated_at
+                FROM project_memory
+                WHERE {" AND ".join(clauses)}
+                ORDER BY updated_at DESC, memory_id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = json.loads(row["memory_json"])
+            item["created_at"] = row["created_at"]
+            item["updated_at"] = row["updated_at"]
+            items.append(item)
+        return items
+
+    def get_project_memory(self, project_id: str, memory_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized = _identifier(memory_id, "memory_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT memory_json, created_at, updated_at
+                FROM project_memory
+                WHERE project_id = ? AND memory_id = ?
+                """,
+                (project["project_id"], normalized),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MEMORY_NOT_FOUND",
+                "project memory does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        item = json.loads(row["memory_json"])
+        item["created_at"] = row["created_at"]
+        item["updated_at"] = row["updated_at"]
+        return item
+
+    def link_project_memory(
+        self, project_id: str, memory_id: str, value: Any
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        try:
+            request = normalize_memory_link(value)
+        except MemoryError as error:
+            raise UniverseError(error.code, error.message) from error
+        current = self.get_project_memory(project["project_id"], memory_id)
+        now = utc_now()
+        current["node_ref"] = request["node_ref"]
+        current["graph"] = request["graph"]
+        current["link_state"] = request["link_state"]
+        current["updated_at"] = now
+        current["next_operation"] = "USER_REVIEW_ONLY"
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE project_memory
+                SET node_ref = ?, graph = ?, link_state = ?,
+                    memory_json = ?, updated_at = ?
+                WHERE project_id = ? AND memory_id = ?
+                """,
+                (
+                    current["node_ref"],
+                    current["graph"],
+                    current["link_state"],
+                    _canonical_json(current),
+                    now,
+                    project["project_id"],
+                    current["memory_id"],
+                ),
+            )
+        return current
+
+    def propose_memory_links(
+        self, project_id: str, *, limit: int = 20
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        unlinked = self.list_project_memories(
+            project["project_id"], link_state="UNLINKED", limit=200
+        )
+        nodes: list[dict[str, Any]] = []
+        try:
+            projection = self.get_project_projection(project["project_id"])
+            for item in projection.get("nodes") or []:
+                nodes.append(item if isinstance(item, dict) else {})
+        except UniverseError:
+            nodes = []
+        proposals = propose_node_links(memories=unlinked, nodes=nodes, limit=limit)
+        return {
+            "schema": "universe.project-memory-link-proposals.v1",
+            "project_id": project["project_id"],
+            "proposals": proposals,
+            "effects": {
+                "seed_write": "NONE",
+                "candidate": "NONE",
+                "authority": "NONE",
+            },
+            "next_operation": "USER_CONFIRM_LINK",
+        }
 
     def queue_career_promotion_candidate(
         self, project_id: str, value: Any
@@ -10497,6 +10721,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/memories":
+                query_map = parse_qs(urlsplit(self.path).query)
+                query = (query_map.get("q") or [None])[0]
+                link_state = (query_map.get("link_state") or [None])[0]
+                node_ref = (query_map.get("node_ref") or [None])[0]
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MEMORIES_COLLECTED",
+                        "project_id": project_id,
+                        "memories": self.server.store.list_project_memories(
+                            project_id,
+                            link_state=link_state,
+                            node_ref=node_ref,
+                            query=query,
+                        ),
+                    },
+                )
+                return
+            if suffix == "/memories/propose-links":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MEMORY_LINK_PROPOSALS_COLLECTED",
+                        **self.server.store.propose_memory_links(project_id),
+                    },
+                )
+                return
             if suffix == "/master-bridge":
                 self._send(
                     HTTPStatus.OK,
@@ -11310,6 +11564,31 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/memories":
+                memory = self.server.store.create_project_memory(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MEMORY_RECORDED",
+                        "memory": memory,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/memories/link":
+                memory_id = _identifier(body.get("memory_id"), "memory_id")
+                memory = self.server.store.link_project_memory(
+                    parts[0], memory_id, body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MEMORY_LINKED",
+                        "memory": memory,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/experience-matches":
                 result = self.server.store.match_experience_case(parts[0], body)
                 self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
@@ -11648,6 +11927,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/experience-cases",
             "/experience-matches",
             "/experience-pattern-proposals",
+            "/memories/propose-links",
+            "/memories/link",
+            "/memories",
             "/career-promotion-queue",
             "/context-packs",
             "/release-proposals/apply",

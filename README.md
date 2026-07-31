@@ -87,3 +87,5 @@ python tools/build_portable.py
 ```
 
 Details: `docs/universe-packaging.md`.
+
+Memory RAG (project-local notes, not Candidates): `docs/universe-memory-rag.md`.

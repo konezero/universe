@@ -67,17 +67,17 @@
 
 | 항목 | 수준 | 비고 |
 |------|------|------|
-| Memory RAG: 미연결 메모, 노드 부착, 검색, 야간 배치 | **DESIGN** | `.ai/memory/inbox/2026-07-31-node-memory-rag-nightly-maintenance.md` (BRAINSTORM). 제품 코드 경로 없음 |
-| Bench 고도화: 프로젝트별 관측, 모델/Skill 비교, Context Pack 반영 | **PARTIAL** → UI 노출 | 집계 API DONE. Inspector Bench 탭에 project-filtered bench + observations 표시. 대시보드/Context Pack 비교 고도화는 후속 |
-| Future/Experience Plane: Cases, Why, Patterns | **PARTIAL** → UI 개선 | Case/match/pattern API+테스트 DONE. Inspector **Bench** 탭: observations/bench/cases + Record Case + Match. 라이브 case 0→UI에서 생성 가능. Why/통합 Future 화면은 후속 |
-| Future 제안 통합 화면: Seed/구조/Bench/Experience 구분 | **NOT_STARTED** / 초보 | `future-paths`·composition 흐름은 분산. 통합 화면 미정착 |
+| Memory RAG: 미연결 메모, 노드 부착, 검색, 야간 배치 | **PARTIAL** → 1차 | API+UI+deterministic propose-links. 정본 `docs/universe-memory-rag.md`. Nightly LLM 배치는 후속 |
+| Bench 고도화: 프로젝트별 관측, 모델/Skill 비교, Context Pack 반영 | **PARTIAL** → 개선 | Bench 탭 + duration + Context Pack 목록 + match Why 표시 |
+| Future/Experience Plane: Cases, Why, Patterns | **PARTIAL** → 개선 | Bench/Experience + Match dims 표시. Pattern/Why 심화는 후속 |
+| Future 제안 통합 화면: Seed/구조/Bench/Experience 구분 | **PARTIAL** → 1차 | Inspector **Future** 탭으로 Seed/예측/Bench/Memory/Handoff 집약 |
 
 #### P2
 
 | 항목 | 수준 | 비고 |
 |------|------|------|
-| Release 운영: 서명, 채널, 롤백, 다프로젝트 일괄 업데이트 | **NOT_STARTED** | `core-release-db.md`에 non-goal/후속으로 명시. import/plan/apply 기본은 별 트랙 DONE |
-| 확장: 다국어, 원격·모바일, OAuth, P2P, MCP Adapter | **NOT_STARTED** | 설계 방향만 (SPA 재사용 등) |
+| Release 운영: 서명, 채널, 롤백, 다프로젝트 일괄 업데이트 | **NOT_STARTED** / 계약 유지 | import/plan/apply 기본 DONE. 서명·채널·롤백은 non-goal 유지, 별 트랙 |
+| 확장: 다국어, 원격·모바일, OAuth, P2P, MCP Adapter | **NOT_STARTED** | 설계 방향만. packaging portable/tray가 로컬 배포 경로 |
 
 ### 4) 로컬 런타임 스냅샷 (2026-07-31 관측)
 
@@ -106,16 +106,12 @@ P2 확장                                                    : NOT_STARTED
 
 **다음 착수 추천 (소스 갭 기준):**
 
-1. ~~Todo UI polish~~  
-2. ~~#6 LIVE_GAP seed discovery dispatch 닫기~~  
-3. ~~P0 E2E 시나리오 문서/고정 + 스모크 하네스~~  
-4. ~~Bench/Experience Inspector UI 1차~~  
-5. ~~UI 지도/컨트롤 정비 1차~~  
-6. ~~제품화 packaging 1차 (CLI lifecycle + Windows user install)~~  
-7. ~~packaging tray 후속~~  
-8. ~~portable zip 후속~~  
-9. packaging 후속: MSI / 임베드 Python  
-10. P1 Memory RAG / Future 통합 화면
+1. ~~Todo / seed / E2E / Bench UI / map / packaging / tray / portable~~  
+2. ~~P1 Memory RAG 1차~~  
+3. ~~Future 통합 탭 1차~~  
+4. ~~Bench/Experience 고도화 1차~~  
+5. P2 Release 서명·채널 / 원격 확장은 계약상 후순위 유지  
+6. packaging 후속: MSI / 임베드 Python (outline only)
 
 ### 6) 변경 이력
 
@@ -133,3 +129,4 @@ P2 확장                                                    : NOT_STARTED
 | 2026-07-31 | packaging 1차: service control CLI + Windows user install scripts |
 | 2026-07-31 | packaging tray: Universe-Tray.ps1 + `universe_server.py tray` |
 | 2026-07-31 | portable package: `tools/build_portable.py` + data/ env overrides |
+| 2026-07-31 | Memory RAG API/UI + Future tab + Bench/Context Pack polish |

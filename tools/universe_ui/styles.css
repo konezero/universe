@@ -895,13 +895,25 @@ body.inspector-open .inspector {
 }
 
 .inspector-tabs button {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   height: 44px;
+  padding: 0 6px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
+}
+
+.memory-create {
+  display: grid;
+  gap: 8px;
+}
+
+.memory-title-input,
+.memory-body-input {
+  width: 100%;
 }
 
 .inspector-tabs button.selected {
