@@ -12165,6 +12165,62 @@ def parser() -> argparse.ArgumentParser:
     serve.set_defaults(open_ui=True)
     serve.add_argument("--mode-registry", type=Path, default=DEFAULT_MODE_REGISTRY_PATH)
 
+    status_command = commands.add_parser(
+        "status",
+        help="Show local service PID/health from server.json",
+    )
+    status_command.add_argument(
+        "--state-file", type=Path, default=default_state_path()
+    )
+
+    start_command = commands.add_parser(
+        "start",
+        help="Start the local service in the background if it is not READY",
+    )
+    start_command.add_argument(
+        "--state-file", type=Path, default=default_state_path()
+    )
+    start_command.add_argument(
+        "--open-ui",
+        dest="open_ui",
+        action="store_true",
+        help="Open the local UI after start (default).",
+    )
+    start_command.add_argument(
+        "--no-open-ui",
+        dest="open_ui",
+        action="store_false",
+        help="Start headless without opening a browser.",
+    )
+    start_command.set_defaults(open_ui=True)
+
+    stop_command = commands.add_parser(
+        "stop",
+        help="Stop the local service process recorded in server.json",
+    )
+    stop_command.add_argument("--state-file", type=Path, default=default_state_path())
+
+    restart_command = commands.add_parser(
+        "restart",
+        help="Stop then start the local service",
+    )
+    restart_command.add_argument(
+        "--state-file", type=Path, default=default_state_path()
+    )
+    restart_command.add_argument(
+        "--open-ui",
+        dest="open_ui",
+        action="store_true",
+        help="Open the local UI after restart.",
+    )
+    restart_command.add_argument(
+        "--no-open-ui",
+        dest="open_ui",
+        action="store_false",
+        help="Restart headless (default).",
+    )
+    restart_command.set_defaults(open_ui=False)
+
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)
     register.add_argument("--project-root", type=Path, required=True)
@@ -12214,6 +12270,38 @@ def _connection_options(args: argparse.Namespace) -> tuple[str, str]:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command in {"status", "start", "stop", "restart"}:
+            from universe_service_control import (
+                restart_service,
+                service_status,
+                start_service,
+                stop_service,
+            )
+
+            if args.command == "status":
+                result = service_status(args.state_file)
+            elif args.command == "start":
+                result = start_service(
+                    state_path=args.state_file,
+                    open_ui=bool(args.open_ui),
+                )
+            elif args.command == "stop":
+                result = stop_service(args.state_file)
+            else:
+                result = restart_service(
+                    state_path=args.state_file,
+                    open_ui=bool(args.open_ui),
+                )
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            status_text = str(result.get("status") or "")
+            if status_text in {
+                "STOP_FAILED",
+                "STOP_TIMEOUT",
+                "START_FAILED",
+            }:
+                return 1
+            return 0
+
         if args.command == "serve":
             mode_registry = load_universe_mode_registry(args.mode_registry)
             mode_contract = universe_mode_contract(mode_registry)

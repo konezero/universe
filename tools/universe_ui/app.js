@@ -122,6 +122,7 @@ const elements = {
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsForm: document.querySelector("#settings-form"),
   settingsError: document.querySelector("#settings-error"),
+  localServiceStatus: document.querySelector("#local-service-status"),
   universeProviderSetting: document.querySelector("#universe-provider-setting"),
   universeProviderStatus: document.querySelector("#universe-provider-status"),
   projectProviderSettings: document.querySelector("#project-provider-settings"),
@@ -1030,6 +1031,30 @@ async function updateHostTool(tool, operation) {
   toast(`${tool} ${operation === "select" ? "saved" : "verified"}`);
 }
 
+function renderLocalServiceStatus() {
+  if (!elements.localServiceStatus) return;
+  elements.localServiceStatus.replaceChildren();
+  const health = elements.serviceStatus?.dataset?.state || "loading";
+  const ready = health === "ready";
+  const status = node("strong", "", ready ? "READY" : elements.serviceStatus?.textContent || "UNKNOWN");
+  status.dataset.state = ready ? "ready" : "error";
+  elements.localServiceStatus.append(
+    status,
+    node(
+      "span",
+      "",
+      ready
+        ? "Local loopback service is answering /health."
+        : "Service is not READY. Start it from CLI or Start Menu."
+    ),
+    node(
+      "small",
+      "",
+      "Control: python tools/universe_server.py status | start | stop | restart"
+    )
+  );
+}
+
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
   [state.providerSettings, state.hostTools] = await Promise.all([
@@ -1038,6 +1063,7 @@ async function openProviderSettings() {
   ]);
   renderProviderSettings();
   renderHostToolSettings();
+  renderLocalServiceStatus();
   elements.settingsDialog.showModal();
 }
 

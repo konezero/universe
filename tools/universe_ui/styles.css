@@ -1129,6 +1129,35 @@ dialog {
   border-top: 1px solid var(--line);
 }
 
+.local-service-status {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+  font-size: 12px;
+}
+
+.local-service-status strong[data-state="ready"] {
+  color: var(--green);
+}
+
+.local-service-status strong[data-state="error"] {
+  color: var(--red);
+}
+
+.settings-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.settings-help code {
+  font-size: 10px;
+}
+
 .settings-section-heading,
 .project-provider-row,
 .project-provider-copy {

@@ -64,3 +64,18 @@ python tools/universe_e2e_smoke.py check
 ```
 
 Service and dispatch contracts are in `docs/local-universe-service.md`.
+
+### Local packaging (Windows user)
+
+```powershell
+python tools/universe_server.py status
+python tools/universe_server.py start --open-ui
+python tools/universe_server.py stop
+python tools/universe_server.py restart --no-open-ui
+
+powershell -ExecutionPolicy Bypass -File packaging\windows\install-user.ps1
+# optional logon autostart:
+powershell -ExecutionPolicy Bypass -File packaging\windows\install-user.ps1 -Autostart
+```
+
+Details: `docs/universe-packaging.md`.

@@ -118,9 +118,23 @@ pass/fail re-runs. This file remains the API and boundary contract.
 
 ## Start the service
 
+Foreground developer path:
+
 ```powershell
 python tools/universe_server.py serve --open-ui
 ```
+
+Product control path (background lifecycle):
+
+```powershell
+python tools/universe_server.py status
+python tools/universe_server.py start --open-ui
+python tools/universe_server.py stop
+python tools/universe_server.py restart --no-open-ui
+```
+
+Windows user Start Menu / optional autostart install is documented in
+`docs/universe-packaging.md`.
 
 The process selects a free loopback port by default and writes its endpoint,
 token, PID, and database location to:
