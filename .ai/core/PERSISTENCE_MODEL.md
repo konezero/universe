@@ -136,6 +136,21 @@ CONTINUITY NEEDED
   -> WAIT FOR APPROVAL WHEN AUTHORITY WOULD CHANGE
 ```
 
+### Runtime Resume SSOT
+
+```text
+CHECKPOINT and RESUME durability
+  -> .ai/runtime/continuity/continuity.sqlite only
+
+Restore candidate filter
+  -> same node + same mode
+
+File-tree Resume Archive (.ai/resume/** and resume_archive templates)
+  -> DEPRECATED for runtime resume identity
+  -> keep in place; do not delete solely for deprecation
+  -> historical inspection only
+```
+
 Resume is not the default starting point when a valid Runtime Snapshot exists.
 
 When a Runtime Snapshot exposes `previous_session_id`, `current_session_id`, and

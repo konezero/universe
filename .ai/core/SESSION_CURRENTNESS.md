@@ -370,6 +370,20 @@ Resume Bundle loads only after approval or explicit request.
 Execution authority remains separate.
 ```
 
+## Runtime Resume SSOT
+
+```text
+CHECKPOINT and RESUME durability
+  -> .ai/runtime/continuity/continuity.sqlite
+
+File-tree Resume Archive (.ai/resume/**)
+  -> DEPRECATED for runtime restore identity
+  -> keep in place; do not delete solely for deprecation
+```
+
+See `.ai/templates/runtime_continuity/README.md` and the resume-save /
+resume-restore Skills.
+
 ## Restore Candidate Selection
 
 Restore candidates are selected only inside the same `node + mode` coordinate.

@@ -1,6 +1,28 @@
 # Worker Resume Archive Template
 
-Use this template for specialized worker roles.
+Status: **DEPRECATED (runtime resume path)**  
+Deprecation date: 2026-07-31  
+Branch / track: ai-career PR #269 (`codex/source-only-conductor-boundary`)
+
+## Runtime Resume SSOT
+
+```text
+Runtime Resume / Checkpoint durability
+  -> .ai/runtime/continuity/continuity.sqlite
+
+Restore filter
+  -> same node + same mode
+
+Do not use .ai/resume/<worker_role>/ as RESUME_SAVE or RESUME_RESTORE identity.
+Do not delete this template solely for deprecation; keep it historical.
+```
+
+See `.ai/templates/runtime_continuity/README.md` and the resume-save /
+resume-restore Skills.
+
+---
+
+Use this template only as historical layout for specialized worker roles.
 
 Worker archives are narrower than Conductor or Master archives.
 

@@ -1,14 +1,49 @@
 # Resume Archive Template
 
-Use this template to create a repository-backed Resume Archive for a role.
+Status: **DEPRECATED (runtime resume path)**  
+Deprecation date: 2026-07-31  
+Branch / track: ai-career PR #269 (`codex/source-only-conductor-boundary`)
 
-## Target Path
+## Runtime Resume SSOT
+
+```text
+Runtime Resume / Checkpoint durability
+  -> .ai/runtime/continuity/continuity.sqlite
+
+Commands
+  -> RESUME_SAVE / RESUME_RESTORE (resume-save / resume-restore Skills)
+  -> CHECKPOINT prepare/save
+
+Restore filter
+  -> same node + same mode
+
+Session evidence key
+  -> session_id + frame_id
+  -> session_id shape: <NODE>-<MODE>-YYYYMMDD-<LOCATION>-SEQ
+
+Do not use this file-tree archive as RESUME_SAVE or RESUME_RESTORE identity.
+Do not use repository + role as runtime resume identity.
+Do not delete this template solely for deprecation; keep it historical.
+```
+
+See `.ai/templates/runtime_continuity/README.md`,
+`.ai/skills/common/resume-save/SKILL.md`, and
+`.ai/skills/common/resume-restore/SKILL.md`.
+
+## Historical purpose (non-runtime)
+
+This template previously described a repository-backed Resume Archive under
+`.ai/resume/<role>/`. Existing trees remain readable historical material only.
+They are not the default continuity path and must not auto-restore Mode,
+Authority, or Execution Assignment.
+
+## Target Path (historical)
 
 ```text
 .ai/resume/<role>/
 ```
 
-## Required Files
+## Required Files (historical layout)
 
 ```text
 .ai/resume/<role>/
@@ -24,62 +59,46 @@ Use this template to create a repository-backed Resume Archive for a role.
   conversation/
 ```
 
-## Identity Rule
+## Identity Rule (deprecated)
 
 ```text
-Repository + Role = Resume Identity
+DEPRECATED: Repository + Role = Resume Identity
+
+Runtime resume identity is Node + Mode (continuity store).
+Role remains a Mode-resolved internal value, not the restore key.
 ```
 
 Do not use old chat session id as the restore identity.
 
-## Resume Archive vs Runtime Archive
-
-Resume Archive restores Role continuity.
-
-Runtime Archive records one scheduled or automation Runtime execution.
+## Resume Archive vs Runtime Continuity vs Runtime Archive
 
 ```text
-Resume Archive
-  -> role-scoped recovery source
-
-Runtime Archive
-  -> immutable execution record
-  -> derived runtime state source
+Resume Archive (this template)  DEPRECATED file tree; historical only
+Runtime Continuity Store        SSOT for CHECKPOINT + RESUME records (SQLite)
+Runtime Archive                 scheduled/automation execution record
 ```
 
-Use `.ai/templates/runtime_archive/README.md` for Carrier, Dispatch, Night Audit, or other scheduled Runtime execution records.
+Use `.ai/templates/runtime_archive/README.md` for Carrier, Dispatch, Night Audit,
+or other scheduled Runtime execution records.
 
-## Minimal Manifest Shape
+## Minimal Manifest Shape (historical)
+
+If an existing archive is annotated, set:
 
 ```json
 {
   "archive_schema": "1.0",
   "archive_type": "resume-archive",
-  "resume_version": 1,
-  "checkpoint_id": "<role>-<date>-<checkpoint>",
-  "parent_checkpoint": null,
-  "repository": "<owner>/<repo>",
-  "role": "<Role>",
-  "scope": "<scope>",
-  "created_at": "<iso8601>",
-  "storage_form": "main-unpacked-archive",
-  "status": "active",
-  "resume_identity": "repository + role",
-  "snapshot_files": [
-    "snapshots/current_state.md",
-    "snapshots/decisions.md",
-    "snapshots/next_actions.md"
-  ],
-  "safety": {
-    "contains_hidden_instructions": false,
-    "contains_private_chain_of_thought": false,
-    "contains_secrets": false,
-    "contains_project_source_patch": false
-  }
+  "status": "deprecated",
+  "runtime_resume_ssot": ".ai/runtime/continuity/continuity.sqlite",
+  "resume_identity": "deprecated:repository+role",
+  "runtime_resume_identity": "node+mode"
 }
 ```
 
-## Minimal Restore Order
+Legacy fields such as `role` and `checkpoint_id` may remain for history only.
+
+## Minimal Read Order (historical inspection only)
 
 ```text
 1. manifest.json
@@ -99,9 +118,12 @@ Optional:
 10. conversation/
 ```
 
+This order is for human/historical review. Runtime restore uses continuity
+discover/load only.
+
 ## Snapshot Rules
 
-Snapshots are fast boot state.
+Snapshots are fast boot state for historical archives.
 
 They should answer:
 
@@ -111,6 +133,8 @@ They should answer:
 - What should happen next?
 
 Snapshots should not become full conversation dumps.
+Compressed conversation for runtime resume belongs in the continuity
+RESUME candidate payload, not as an archive dump.
 
 ## History Rules
 
@@ -122,6 +146,8 @@ Git stores exact diffs. History stores checkpoint intent.
 
 ## Safety Rule
 
-Resume Archive restores operating context, not authority.
+Historical Resume Archive material restores no authority.
 
-User approval remains final.
+Runtime Resume load is passive rehydration only. User approval remains final.
+Mode Current Anchor, Authority, and Execution Assignment are never granted by
+archive presence or continuity load alone.

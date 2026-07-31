@@ -1,6 +1,6 @@
 # Runtime Continuity Store Template
 
-Status: project contract template
+Status: active project contract template (runtime resume SSOT)
 Scope: installed project Runtime operational state
 
 ## Purpose
@@ -10,6 +10,16 @@ Installed projects persist passive Checkpoint and Resume records at:
 ```text
 .ai/runtime/continuity/continuity.sqlite
 ```
+
+This SQLite store is the **only runtime SSOT** for `CHECKPOINT` and
+`RESUME_SAVE` / `RESUME_RESTORE`. File-tree Resume Archives under
+`.ai/resume/` are **DEPRECATED** for runtime restore identity; they remain
+historical and must not be deleted solely for deprecation.
+
+Resume candidate selection uses **same node + same mode**. Role is resolved
+from Mode and is not the restore key. Session evidence uses
+`session_id + frame_id` with session_id shape
+`<NODE>-<MODE>-YYYYMMDD-<LOCATION>-SEQ`.
 
 Installation creates only the managed
 `.ai/runtime/continuity/.gitignore` boundary. The Reference Runtime creates

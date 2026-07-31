@@ -1,6 +1,22 @@
 # Master Merge Archive Template
 
-Use this template for Master roles that integrate Worker handoffs.
+Status: **DEPRECATED (runtime resume path)**  
+Deprecation date: 2026-07-31  
+Branch / track: ai-career PR #269 (`codex/source-only-conductor-boundary`)
+
+## Runtime Resume SSOT
+
+```text
+Runtime Resume / Checkpoint durability
+  -> .ai/runtime/continuity/continuity.sqlite
+Restore filter: same node + same mode
+Do not use .ai/resume/master/ as runtime resume identity.
+Do not delete this template solely for deprecation; keep it historical.
+```
+
+---
+
+Use this template for historical Master layouts that integrate Worker handoffs.
 
 ## Purpose
 
