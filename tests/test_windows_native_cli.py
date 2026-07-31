@@ -229,6 +229,9 @@ class WindowsNativeCliTests(unittest.TestCase):
                 ).dispatch(request)
 
         self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
+        self.assertEqual("EPHEMERAL", result["session_persistence"])
+        self.assertEqual("UNKNOWN", result["persistent_session_ref"])
+        self.assertFalse(result["universe_coordinate_persisted"])
         self.assertEqual(
             {"schema": "example.output.v1", "value": "bounded"},
             result["structured_result"],

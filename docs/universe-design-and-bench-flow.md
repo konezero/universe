@@ -54,7 +54,15 @@ greeting. A new or replaced coordinate receives that greeting once.
 
 The coordinate is routing state only. The opened Session owns its Mode
 preparation and currentness evaluation. Task Frame Boss and Worker executions
-are ephemeral and never replace a target's last connection coordinate.
+are ephemeral and never replace a target's last connection coordinate. The
+application prepares the Conductor coordinate at service startup; `Call Project
+Master` prepares the selected Project coordinate before entering its room.
+
+Provider Session UI state is limited to Provider, connection state, and Mode
+intent. It is not a Current Anchor, authority, Assignment, or execution
+currentness statement. Task Frame results are accepted only when the dispatcher
+attests `EPHEMERAL`, an `UNKNOWN` persistent Session Ref, and no persisted
+Universe coordinate.
 
 ## Project Queue and Career Carrier Boundary
 
@@ -352,7 +360,7 @@ relations remain distinct from observed evidence. Career adoption is separate.
    selection never falls back silently when unavailable. Capability and
    resolution state are visible in the settings UI. Changing a Project Master
    setting stops its resident Host and applies the new selection on the next
-   Project Room message. Per-task provider selection remains part of the
+   explicit Project Master preparation. Per-task provider selection remains part of the
    separate Task Frame proposal. Provider credentials remain in each provider
    credential store and are never persisted in Universe settings.
 10. Use one Universe-owned ACP session gateway for Conductor Task Frame Workers

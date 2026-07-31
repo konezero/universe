@@ -829,6 +829,16 @@ class UniverseRuntimeHost:
     def _invocation_result(
         request: Mapping[str, Any], response: Mapping[str, Any]
     ) -> dict[str, Any]:
+        if (
+            response.get("session_persistence") != "EPHEMERAL"
+            or response.get("persistent_session_ref") != "UNKNOWN"
+            or response.get("universe_coordinate_persisted") is not False
+        ):
+            raise RuntimeHostError(
+                "WORKER_SESSION_BOUNDARY_INVALID",
+                "Task Frame Worker must attest an ephemeral Provider Session "
+                "without a Universe Provider Session coordinate",
+            )
         observation_count = response.get("skill_run_observation_count", 0)
         if (
             isinstance(observation_count, bool)
@@ -850,6 +860,12 @@ class UniverseRuntimeHost:
             ),
             "skill_run_observation_count": observation_count,
             "repository_write": False,
+            "session_persistence": "EPHEMERAL",
+            "persistent_session_ref": "UNKNOWN",
+            "universe_coordinate_persisted": False,
+            "provider_durable_chat_state": _text_or(
+                response.get("provider_durable_chat_state"), "UNKNOWN"
+            ),
             **optional_details,
         }
         returned = response.get("result")

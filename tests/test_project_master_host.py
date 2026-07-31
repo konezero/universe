@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+from agent_session_gateway import AgentSessionError  # noqa: E402
 from project_master_bridge import (  # noqa: E402
     MASTER_BRIDGE_ENVELOPE_SCHEMA,
     ProjectMasterBridgeError,
@@ -338,6 +339,59 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertNotIn("Enter MASTER Mode", prompts[1])
         self.assertNotIn("Enter MASTER Mode", prompts[2])
 
+    def test_mode_greeting_is_not_repeated_after_failed_first_turn(self) -> None:
+        prompts: list[str] = []
+
+        class FakeSession:
+            def __init__(self, *, session_id, session_observer, **_kwargs) -> None:
+                self.session_id = session_id or "grok-session-new"
+                self.session_ref = f"grok-acp:{self.session_id}"
+                session_observer(self.session_id)
+
+            def close(self) -> None:
+                return
+
+        class FailingOnceGateway:
+            def __init__(self, session) -> None:
+                self.session = session
+                self.session_ref = session.session_ref
+                self.calls = 0
+
+            def reply_stream(self, prompt, on_delta) -> str:
+                self.calls += 1
+                prompts.append(prompt)
+                if self.calls == 1:
+                    raise AgentSessionError("TURN_FAILED")
+                on_delta("ok")
+                return "ok"
+
+            def close(self) -> None:
+                self.session.close()
+
+        message = {
+            "message_id": "message-1",
+            "kind": "QUESTION",
+            "sender": "UNIVERSE_CONDUCTOR",
+            "body": "status?",
+        }
+        with (
+            patch(
+                "project_master_host._resolve_grok",
+                return_value=(self.root / "grok.exe", {}),
+            ),
+            patch("project_master_host.GrokAcpSession", FakeSession),
+            patch("project_master_host.UniverseAcpGateway", FailingOnceGateway),
+        ):
+            runtime = GrokProjectMasterRuntime(self.root, "GCS", self.state)
+            runtime.set_permission_requester(lambda _request: None)
+            with self.assertRaisesRegex(ProjectMasterHostError, "TURN_FAILED"):
+                runtime.reply(message)
+            runtime.reply(message)
+            runtime.close()
+
+        self.assertIn("Enter MASTER Mode", prompts[0])
+        self.assertNotIn("Enter MASTER Mode", prompts[1])
+
     def test_resident_mode_session_switches_provider_without_parallel_map(self) -> None:
         created: list[tuple[str, str, str, PreparedFakeProvider]] = []
 
@@ -372,6 +426,70 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(["CONDUCTOR", "CONDUCTOR"], [item[1] for item in created])
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
+
+    def test_resident_mode_session_restores_last_coordinate_after_restart(self) -> None:
+        serial = {"value": 0}
+
+        class StoreAwareProvider(PreparedFakeProvider):
+            def __init__(self, provider, store, requested_mode) -> None:
+                super().__init__()
+                self.provider = provider
+                self.store = store
+                self.requested_mode = requested_mode
+                self.connection_state = "UNKNOWN"
+                self.session_id = store.session_ref_for(provider)
+
+            def prepare_session(self) -> None:
+                self.prepare_count += 1
+                if self.session_id is None:
+                    serial["value"] += 1
+                    self.session_id = f"session-{serial['value']}"
+                self.connection_state = self.store.observe_provider_session(
+                    self.provider,
+                    self.session_id,
+                )
+                self.session_ref = f"{self.provider.lower()}:{self.session_id}"
+
+        def factory(provider, _root, _target, store, mode, _actor):
+            return StoreAwareProvider(provider, store, mode)
+
+        database = self.root / "conductor.sqlite"
+        first = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            database,
+            actor_label="Universe Conductor",
+            provider_factory=factory,
+        )
+        first_status = first.prepare("GROK")
+        active_status = first.prepare("GROK")
+        first.close()
+
+        reopened = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            database,
+            actor_label="Universe Conductor",
+            provider_factory=factory,
+        )
+        reused_status = reopened.prepare("GROK")
+        replaced_status = reopened.prepare("CODEX")
+        reopened.close()
+
+        self.assertEqual("NEW", first_status["connection_state"])
+        self.assertEqual("REUSED", active_status["connection_state"])
+        self.assertEqual(
+            first_status["last_session_ref"],
+            active_status["last_session_ref"],
+        )
+        self.assertEqual("REUSED", reused_status["connection_state"])
+        self.assertEqual("REPLACED", replaced_status["connection_state"])
+        self.assertEqual("CODEX", replaced_status["last_provider"])
+        self.assertEqual("CONDUCTOR", replaced_status["requested_mode"])
+        self.assertNotIn("authority", replaced_status)
+        self.assertNotIn("currentness", replaced_status)
 
     def test_live_bridge_invokes_provider_and_posts_reply_once(self) -> None:
         worker = self._worker()
@@ -767,6 +885,10 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         self.assertEqual("STARTED", first["status"])
         self.assertEqual("RESIDENT", second["status"])
+        self.assertEqual(
+            "REUSED",
+            second["session_connection"]["connection_state"],
+        )
         self.assertEqual(1, len(registrations))
         self.assertEqual(1, self.surface_observer.prepare_count)
         self.assertNotIn(registrations[0]["credential_env"], os.environ)

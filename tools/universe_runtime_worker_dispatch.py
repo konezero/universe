@@ -302,6 +302,16 @@ class RuntimeWorkerDispatcher:
                 "WORKER_ADAPTER",
                 "WORKER_RUN_REF_MISMATCH",
             )
+        if (
+            worker.get("session_persistence") != "EPHEMERAL"
+            or worker.get("persistent_session_ref") != "UNKNOWN"
+            or worker.get("universe_coordinate_persisted") is not False
+        ):
+            raise WorkerDispatchError(
+                "WORKER_SESSION_BOUNDARY_INVALID",
+                "WORKER_ADAPTER",
+                "EPHEMERAL_SESSION_ATTESTATION_REQUIRED",
+            )
 
         recorded_result: Any = worker.get("result")
         structured_result: dict[str, Any] | None = None
@@ -402,6 +412,14 @@ class RuntimeWorkerDispatcher:
             "result": recorded_result,
             "skill_run_observation_count": len(observations),
             "repository_write": False,
+            "session_persistence": worker["session_persistence"],
+            "persistent_session_ref": worker["persistent_session_ref"],
+            "universe_coordinate_persisted": worker[
+                "universe_coordinate_persisted"
+            ],
+            "provider_durable_chat_state": worker.get(
+                "provider_durable_chat_state", "UNKNOWN"
+            ),
             "runtime_result": result,
         }
         if structured_result is not None:

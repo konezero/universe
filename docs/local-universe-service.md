@@ -36,7 +36,9 @@ Universe Runtime Host provider processes remain outside the installed project Ru
 The Universe Conductor Room persists each user message before execution. The
 local service prepares the `CONDUCTOR / CONDUCTOR` Mode, starts one owned
 internal Skill Router Session Runtime, and binds its loopback endpoint in
-process memory before it accepts Conductor work. The executable Runtime does
+process memory before it accepts Conductor work. Service startup also opens or
+resumes the last Conductor Provider Session coordinate without sending a model
+prompt. The executable Runtime does
 not select or create the active Mode; the prepared `CONDUCTOR` Mode Current
 Anchor remains the governance coordinate. A single service-owned queue then
 delivers ordinary conversation to one resident Provider Session:
@@ -177,6 +179,7 @@ GET    /v1/projects/{project_id}
 DELETE /v1/projects/{project_id}
 GET    /v1/projects/{project_id}/provider-setting
 POST   /v1/projects/{project_id}/provider-setting
+POST   /v1/projects/{project_id}/master-session/prepare
 POST   /v1/future-paths
 POST   /v1/fresh-project-compositions
 GET    /v1/fresh-project-compositions
@@ -450,17 +453,18 @@ Universe Project Room
   -> Universe Project Room
 ```
 
-The local application also supplies a lazy resident Host route. When a Project
-Room is called without a usable Bridge, Universe starts one read-only Project
-Master Host for that project, registers its loopback Bridge, and keeps the Host
-resident until the Universe service stops. Later messages reuse the same
-last Provider Session coordinate and durable Host queue. Opening or selecting a
-project does not start its Host; the first actual Project Master message does.
+The local application also supplies a resident Host route. Selecting `Call
+Project Master` explicitly prepares that Project's `MASTER` Provider Session,
+registers its loopback Bridge, and keeps the Host resident until the Universe
+service stops. Later messages reuse the same last Provider Session coordinate
+and durable Host queue. Merely selecting a Project graph does not start its
+Host.
 
 Each Project Master has an independent persisted CLI selection with the same
 `AUTO`, `GROK`, and `CODEX` values. A changed selection closes the existing
-resident Host and is applied on the next Project Room message. Provider session
-state is target-scoped and contains exactly one `last_provider` plus
+resident Host; the next explicit Project Master preparation opens the selected
+Provider. Provider session state is target-scoped and contains exactly one
+`last_provider` plus
 `last_session_ref`. A Provider change replaces that coordinate; Universe does
 not retain parallel Grok and Codex session maps.
 
@@ -470,6 +474,11 @@ missing, changed-Provider, or changed-Session coordinate receives the requested
 Mode greeting once (`CONDUCTOR` for application entry and `MASTER` for a Project
 Master connection). The opened Session performs its own Mode preparation and
 currentness checks; Universe does not judge either.
+
+The UI exposes only the selected Provider, connection state (`NOT_OPENED`,
+`NEW`, `REUSED`, `REPLACED`, or `UNAVAILABLE`), and requested Mode intent. It
+does not present these fields as Current Anchor, authority, Assignment, or
+execution evidence.
 
 ### Universe ACP Gateway
 
@@ -497,6 +506,12 @@ Mode, authority, or execution-assignment rules.
 execution. Codex also receives `thread/start.ephemeral: true`. Grok ACP does not
 currently attest Provider-side durable chat cleanup, so that Provider storage
 state remains `UNKNOWN`.
+
+The Worker dispatcher must return `session_persistence: EPHEMERAL`,
+`persistent_session_ref: UNKNOWN`, and
+`universe_coordinate_persisted: false`. The Runtime Host rejects the Task Frame
+result before exposing it when any field is absent or different. This applies
+equally to Boss and Worker turns.
 
 Grok runs through its native ACP `agent stdio` interface. Codex currently
 exposes approval callbacks through `app-server`; the adapter maps those

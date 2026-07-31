@@ -9253,6 +9253,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_queued_ids: set[str] = set()
         self._conductor_queue_lock = threading.RLock()
         self._conductor_stop = threading.Event()
+        self._conductor_session_error: dict[str, str] | None = None
         self.project_room_events = ProjectRoomEventHub()
         super().__init__(address, UniverseRequestHandler)
         self.conductor_runtime: UniverseConductorRuntime | None = None
@@ -9300,6 +9301,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if auto_start_project_masters
             else None
         )
+        if self.conductor_session_host is not None:
+            self.prepare_conductor_session()
         self._conductor_worker = threading.Thread(
             target=self._conductor_worker_loop,
             name="universe-conductor-room-worker",
@@ -9674,14 +9677,69 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 strict=False,
             )
         )
+        settings["universe_conductor"]["session_connection"] = (
+            self.conductor_session_status()
+        )
         for project in settings["project_masters"]:
             project["resolved_provider"] = self._resolve_configured_provider(
                 project["provider"],
                 capabilities=capabilities,
                 strict=False,
             )
+            project["session_connection"] = (
+                self.project_master_hosts.connection_status(project["scope_id"])
+                if self.project_master_hosts is not None
+                else {
+                    "schema": "universe.provider-session-connection.v1",
+                    "target_kind": "PROJECT_MASTER",
+                    "target_id": project["scope_id"],
+                    "requested_mode": "MASTER",
+                    "last_provider": "UNKNOWN",
+                    "last_session_ref": "UNKNOWN",
+                    "connection_state": "NOT_OPENED",
+                    "session_persistence": "LAST_COORDINATE",
+                    "resident": False,
+                }
+            )
         settings["status"] = "CLI_PROVIDER_SETTINGS_COLLECTED"
         return settings
+
+    def conductor_session_status(self) -> dict[str, Any]:
+        if self.conductor_session_host is None:
+            return {
+                "schema": "universe.provider-session-connection.v1",
+                "target_kind": "UNIVERSE_CONDUCTOR",
+                "target_id": "CONDUCTOR",
+                "requested_mode": "CONDUCTOR",
+                "last_provider": "UNKNOWN",
+                "last_session_ref": "UNKNOWN",
+                "connection_state": "UNAVAILABLE",
+                "session_persistence": "LAST_COORDINATE",
+                "resident": False,
+                "reason": "CONDUCTOR_SESSION_HOST_DISABLED",
+            }
+        status = self.conductor_session_host.status()
+        if self._conductor_session_error is not None and not status["resident"]:
+            status["connection_state"] = "UNAVAILABLE"
+            status["reason"] = self._conductor_session_error["reason"]
+        return status
+
+    def prepare_conductor_session(self) -> dict[str, Any]:
+        if self.conductor_session_host is None:
+            return self.conductor_session_status()
+        try:
+            provider = self._resolve_conductor_provider(
+                {"requested_provider": "AUTO"}
+            )
+            status = self.conductor_session_host.prepare(provider)
+            self._conductor_session_error = None
+            return status
+        except (AgentSessionError, OSError, ProjectMasterHostError, UniverseError) as error:
+            self._conductor_session_error = {
+                "error_code": getattr(error, "code", type(error).__name__),
+                "reason": str(error),
+            }
+            return self.conductor_session_status()
 
     def host_tool_settings(self) -> dict[str, Any]:
         try:
@@ -9726,6 +9784,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "schema": API_SCHEMA,
             "status": "CLI_PROVIDER_SETTING_UPDATED",
             "setting": setting,
+            "session_connection": self.prepare_conductor_session(),
         }
 
     def set_project_provider_setting(
@@ -9744,7 +9803,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "schema": API_SCHEMA,
             "status": "CLI_PROVIDER_SETTING_UPDATED",
             "setting": setting,
-            "resident_host": "RESTART_ON_NEXT_MESSAGE",
+            "resident_host": "PREPARE_REQUIRED",
+            "session_connection": (
+                self.project_master_hosts.connection_status(project_id)
+                if self.project_master_hosts is not None
+                else None
+            ),
+        }
+
+    def prepare_project_master_session(self, project_id: str) -> dict[str, Any]:
+        host = self.ensure_project_master(project_id)
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_MASTER_SESSION_PREPARED",
+            "project_id": project_id,
+            "master_host": host,
+            "session_connection": (
+                self.project_master_hosts.connection_status(project_id)
+                if self.project_master_hosts is not None
+                else None
+            ),
         }
 
     def send_project_room_message(
@@ -10926,6 +11004,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             parts = self._project_path(path)
+            if parts is not None and parts[1] == "/master-session/prepare":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.prepare_project_master_session(parts[0]),
+                )
+                return
             if parts is not None and parts[1] == "/provider-setting":
                 self._send(
                     HTTPStatus.OK,
@@ -11532,6 +11616,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-bridge/stream",
             "/master-bridge/replies",
             "/master-bridge",
+            "/master-session/prepare",
             "/agent-session/permissions",
             "/provider-setting",
             "/room/stream",

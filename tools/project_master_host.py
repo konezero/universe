@@ -52,6 +52,7 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
 PROJECT_MASTER_SESSION_SCHEMA = "universe.project-master-session.v1"
+PROVIDER_SESSION_CONNECTION_SCHEMA = "universe.provider-session-connection.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
 
 
@@ -913,6 +914,36 @@ class ProjectMasterSessionStore:
             connection.close()
 
 
+def provider_session_connection(
+    *,
+    target_kind: str,
+    target_id: str,
+    requested_mode: str,
+    store: ProjectMasterSessionStore | None,
+    resident: bool,
+    connection_state: str | None = None,
+) -> dict[str, Any]:
+    coordinate = store.last_provider_session() if store is not None else None
+    state = str(connection_state or "").strip().upper()
+    if not state:
+        state = "STORED" if coordinate is not None else "NOT_OPENED"
+    return {
+        "schema": PROVIDER_SESSION_CONNECTION_SCHEMA,
+        "target_kind": _text(target_kind, "target_kind").upper(),
+        "target_id": _text(target_id, "target_id"),
+        "requested_mode": _text(requested_mode, "requested_mode").upper(),
+        "last_provider": (
+            coordinate["provider"] if coordinate is not None else "UNKNOWN"
+        ),
+        "last_session_ref": (
+            coordinate["session_ref"] if coordinate is not None else "UNKNOWN"
+        ),
+        "connection_state": state,
+        "session_persistence": "LAST_COORDINATE",
+        "resident": bool(resident),
+    }
+
+
 class GrokProjectMasterRuntime:
     def __init__(
         self,
@@ -963,8 +994,8 @@ class GrokProjectMasterRuntime:
             prompt = self._prompt(message)
             if self._greeting_pending:
                 prompt = f"{self._mode_greeting()}\n\n{prompt}"
+                self._greeting_pending = False
             result = gateway.reply_stream(prompt, on_delta)
-            self._greeting_pending = False
             return result
         except AgentSessionError as error:
             raise ProjectMasterHostError(str(error)) from error
@@ -1125,8 +1156,8 @@ class CodexProjectMasterRuntime:
             prompt = self._prompt(message)
             if self._greeting_pending:
                 prompt = f"{self._mode_greeting()}\n\n{prompt}"
+                self._greeting_pending = False
             result = gateway.reply_stream(prompt, on_delta)
-            self._greeting_pending = False
             return result
         except AgentSessionError as error:
             raise ProjectMasterHostError(str(error)) from error
@@ -1258,6 +1289,16 @@ class ResidentModeSessionHost:
         self._provider: MasterProvider | None = None
         self._lock = threading.RLock()
 
+    def prepare(self, provider: str) -> dict[str, Any]:
+        normalized_provider = _provider(provider)
+        with self._lock:
+            active = self._ensure(normalized_provider)
+            return self._connection_status(active=active)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._connection_status(active=self._provider)
+
     def reply(
         self,
         provider: str,
@@ -1291,6 +1332,7 @@ class ResidentModeSessionHost:
 
     def _ensure(self, provider: str) -> MasterProvider:
         if self._provider is not None and self._provider_name == provider:
+            setattr(self._provider, "connection_state", "REUSED")
             return self._provider
         self.close()
         active = self.provider_factory(
@@ -1337,6 +1379,25 @@ class ResidentModeSessionHost:
                 actor_label=actor_label,
             )
         raise ProjectMasterHostError("MODE_SESSION_PROVIDER_UNSUPPORTED")
+
+    def _connection_status(
+        self,
+        *,
+        active: MasterProvider | None,
+    ) -> dict[str, Any]:
+        state = (
+            str(getattr(active, "connection_state", "")).strip().upper()
+            if active is not None
+            else None
+        )
+        return provider_session_connection(
+            target_kind="UNIVERSE_CONDUCTOR",
+            target_id=self.target_id,
+            requested_mode=self.requested_mode,
+            store=self.store,
+            resident=active is not None,
+            connection_state=state if state and state != "UNKNOWN" else None,
+        )
 
 
 class ProjectMasterConversationWorker:
@@ -1695,11 +1756,13 @@ class ResidentProjectMasterHostManager:
                 and handle.thread.is_alive()
                 and handle.provider == selected_provider
             ):
+                setattr(handle.worker.provider, "connection_state", "REUSED")
                 return {
                     "status": "RESIDENT",
                     "project_id": project_id,
                     "provider": selected_provider,
                     "endpoint": handle.endpoint,
+                    "session_connection": self._handle_connection(handle),
                 }
             if handle is not None:
                 handle.close()
@@ -1799,12 +1862,33 @@ class ResidentProjectMasterHostManager:
                 "endpoint": endpoint,
                 "bridge": bridge,
                 "session_preparation": preparation,
+                "session_connection": self._handle_connection(handle),
             }
 
     def is_resident(self, project_id: str) -> bool:
         with self._lock:
             handle = self._handles.get(_text(project_id, "project_id"))
             return handle is not None and handle.thread.is_alive()
+
+    def connection_status(self, project_id: str) -> dict[str, Any]:
+        normalized = _text(project_id, "project_id")
+        with self._lock:
+            handle = self._handles.get(normalized)
+            if handle is not None and handle.thread.is_alive():
+                return self._handle_connection(handle)
+        database_path = _default_state_db(normalized)
+        store = (
+            ProjectMasterSessionStore(database_path, normalized)
+            if database_path.is_file()
+            else None
+        )
+        return provider_session_connection(
+            target_kind="PROJECT_MASTER",
+            target_id=normalized,
+            requested_mode="MASTER",
+            store=store,
+            resident=False,
+        )
 
     def invalidate(self, project_id: str) -> None:
         normalized = _text(project_id, "project_id")
@@ -1841,6 +1925,21 @@ class ResidentProjectMasterHostManager:
             self._handles.clear()
         for handle in handles:
             handle.close()
+
+    @staticmethod
+    def _handle_connection(
+        handle: ResidentProjectMasterHandle,
+    ) -> dict[str, Any]:
+        active = handle.worker.provider
+        state = str(getattr(active, "connection_state", "")).strip().upper()
+        return provider_session_connection(
+            target_kind="PROJECT_MASTER",
+            target_id=handle.project_id,
+            requested_mode=str(getattr(active, "requested_mode", "MASTER")),
+            store=handle.worker.store,
+            resident=True,
+            connection_state=state if state and state != "UNKNOWN" else None,
+        )
 
     @staticmethod
     def _default_provider(

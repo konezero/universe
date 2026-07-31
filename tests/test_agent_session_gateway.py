@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from agent_session_gateway import (  # noqa: E402
+    AgentSessionError,
     CodexAppServerSession,
     GrokAcpSession,
     cli_auto_approve_status,
@@ -234,6 +235,47 @@ class AgentSessionGatewayTests(unittest.TestCase):
         )
         self.assertTrue(transport.closed)
 
+    def test_grok_dead_session_is_replaced(self) -> None:
+        class DeadSessionTransport(FakeJsonRpcTransport):
+            def request(
+                self,
+                method: str,
+                params: Mapping[str, Any],
+                *,
+                timeout_seconds: float = 300,
+            ) -> Any:
+                if method == "session/load":
+                    self.requests.append((method, dict(params)))
+                    raise AgentSessionError("SESSION_NOT_FOUND")
+                return super().request(
+                    method,
+                    params,
+                    timeout_seconds=timeout_seconds,
+                )
+
+        sessions: list[str] = []
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            DeadSessionTransport,
+        ):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="dead-grok-session",
+                permission_requester=lambda _request: None,
+                session_observer=sessions.append,
+            )
+            session.close()
+
+        methods = [
+            method for method, _params in FakeJsonRpcTransport.instances[0].requests
+        ]
+        self.assertEqual(["grok-session-001"], sessions)
+        self.assertIn("session/load", methods)
+        self.assertIn("session/new", methods)
+
     def test_grok_initialization_failure_closes_transport(self) -> None:
         class InvalidSessionTransport(FakeJsonRpcTransport):
             def request(
@@ -350,6 +392,47 @@ class AgentSessionGatewayTests(unittest.TestCase):
         )
         self.assertTrue(start["ephemeral"])
         self.assertEqual(["codex-thread-001"], sessions)
+
+    def test_codex_dead_session_is_replaced(self) -> None:
+        class DeadThreadTransport(FakeJsonRpcTransport):
+            def request(
+                self,
+                method: str,
+                params: Mapping[str, Any],
+                *,
+                timeout_seconds: float = 300,
+            ) -> Any:
+                if method == "thread/resume":
+                    self.requests.append((method, dict(params)))
+                    raise AgentSessionError("THREAD_NOT_FOUND")
+                return super().request(
+                    method,
+                    params,
+                    timeout_seconds=timeout_seconds,
+                )
+
+        sessions: list[str] = []
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            DeadThreadTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="dead-codex-thread",
+                permission_requester=lambda _request: None,
+                session_observer=sessions.append,
+            )
+            session.close()
+
+        methods = [
+            method for method, _params in FakeJsonRpcTransport.instances[0].requests
+        ]
+        self.assertEqual(["codex-thread-001"], sessions)
+        self.assertIn("thread/resume", methods)
+        self.assertIn("thread/start", methods)
 
 
 if __name__ == "__main__":

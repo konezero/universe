@@ -681,6 +681,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/settings/providers", script)
             self.assertIn("/v1/settings/host-tools", script)
             self.assertIn("/provider-setting", script)
+            self.assertIn("/master-session/prepare", script)
+            self.assertIn('state.modeContract?.mode === "CONDUCTOR"', script)
+            self.assertIn("sessionConnectionText", script)
             self.assertNotIn(self.token, script)
 
     def test_conductor_fresh_project_draft_is_partial_and_review_only(self) -> None:
@@ -770,6 +773,24 @@ class UniverseLocalServiceTests(unittest.TestCase):
             defaults["project_masters"][0]["provider"],
         )
         self.assertEqual("GROK", defaults["universe_conductor"]["resolved_provider"])
+        self.assertEqual(
+            "UNAVAILABLE",
+            defaults["universe_conductor"]["session_connection"][
+                "connection_state"
+            ],
+        )
+        self.assertEqual(
+            "CONDUCTOR",
+            defaults["universe_conductor"]["session_connection"]["requested_mode"],
+        )
+        self.assertNotIn(
+            "authority",
+            defaults["universe_conductor"]["session_connection"],
+        )
+        self.assertNotIn(
+            "currentness",
+            defaults["universe_conductor"]["session_connection"],
+        )
 
         status, universe = self.request(
             "POST",
@@ -798,6 +819,113 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GROK",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
         )
+
+    def test_server_restart_reuses_one_conductor_provider_coordinate(self) -> None:
+        class FakeRuntimeHost:
+            @staticmethod
+            def provider_capabilities() -> list[dict[str, str]]:
+                return [
+                    {"provider": "GROK", "status": "AVAILABLE"},
+                    {"provider": "CODEX", "status": "AVAILABLE"},
+                ]
+
+            @staticmethod
+            def provider_capability(provider: str) -> dict[str, str]:
+                return {"provider": provider, "status": "AVAILABLE"}
+
+        class FakeConductorRuntime:
+            def __init__(self, _root: Path) -> None:
+                self.stopped = False
+
+            def start(self) -> dict[str, str]:
+                return {
+                    "schema": "universe.planning-runtime-binding.v1",
+                    "endpoint": "http://127.0.0.1:41991",
+                    "token": "runtime-token",
+                    "session_id": "universe-conductor-session",
+                    "origin_anchor_ref": "universe-anchor",
+                    "origin_frame_id": "current",
+                    "parent_actor_ref": "universe-conductor",
+                    "parent_evidence_ref": "host://parent/current",
+                    "binding_evidence_ref": "host://runtime/binding",
+                }
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        serial = {"value": 0}
+
+        class StoreAwareProvider:
+            def __init__(self, provider, store, requested_mode) -> None:
+                self.provider = provider
+                self.store = store
+                self.requested_mode = requested_mode
+                self.connection_state = "UNKNOWN"
+                self.session_id = store.session_ref_for(provider)
+                self.session_ref = f"{provider.lower()}:pending"
+
+            def set_permission_requester(self, _requester) -> None:
+                return
+
+            def prepare_session(self) -> None:
+                if self.session_id is None:
+                    serial["value"] += 1
+                    self.session_id = f"session-{serial['value']}"
+                self.connection_state = self.store.observe_provider_session(
+                    self.provider,
+                    self.session_id,
+                )
+                self.session_ref = f"{self.provider.lower()}:{self.session_id}"
+
+            def reply(self, _message) -> str:
+                return "ok"
+
+            def close(self) -> None:
+                return
+
+        def provider_factory(provider, _root, _target, store, mode, _actor):
+            return StoreAwareProvider(provider, store, mode)
+
+        database = self.temp_root / "restart-universe.sqlite3"
+        common = {
+            "database_path": database,
+            "token": "restart-token",
+            "runtime_host": FakeRuntimeHost(),
+            "mode_contract": self.server.mode_contract,
+            "auto_start_conductor_runtime": True,
+            "conductor_runtime_factory": FakeConductorRuntime,
+            "conductor_session_provider_factory": provider_factory,
+            "auto_start_project_masters": False,
+            "host_profile": HostProfileStore(self.temp_root / "restart-host.json"),
+        }
+        first = create_server(**common)
+        try:
+            initial = first.provider_settings()["universe_conductor"][
+                "session_connection"
+            ]
+            switched = first.set_universe_provider_setting({"provider": "CODEX"})[
+                "session_connection"
+            ]
+        finally:
+            first.server_close()
+
+        second = create_server(**common)
+        try:
+            restored = second.provider_settings()["universe_conductor"][
+                "session_connection"
+            ]
+        finally:
+            second.server_close()
+
+        self.assertEqual("NEW", initial["connection_state"])
+        self.assertEqual("GROK", initial["last_provider"])
+        self.assertEqual("REPLACED", switched["connection_state"])
+        self.assertEqual("CODEX", switched["last_provider"])
+        self.assertEqual("REUSED", restored["connection_state"])
+        self.assertEqual("CODEX", restored["last_provider"])
+        self.assertEqual(switched["last_session_ref"], restored["last_session_ref"])
+        self.assertEqual("CONDUCTOR", restored["requested_mode"])
+        self.assertTrue(restored["resident"])
 
     def test_explicit_unavailable_provider_does_not_fall_back(self) -> None:
         class FakeRuntimeHost:
@@ -1107,6 +1235,65 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "CONDUCTOR",
             session_host.calls[0][1]["runtime_context"]["requested_mode"],
         )
+
+    def test_project_master_call_prepares_master_session(self) -> None:
+        class FakeManager:
+            def __init__(self) -> None:
+                self.prepared: list[str] = []
+
+            def is_resident(self, _project_id: str) -> bool:
+                return False
+
+            def ensure(self, project: dict[str, object]) -> dict[str, object]:
+                project_id = str(project["project_id"])
+                self.prepared.append(project_id)
+                return {
+                    "status": "STARTED",
+                    "project_id": project_id,
+                    "provider": "GROK",
+                }
+
+            @staticmethod
+            def connection_status(project_id: str) -> dict[str, object]:
+                return {
+                    "schema": "universe.provider-session-connection.v1",
+                    "target_kind": "PROJECT_MASTER",
+                    "target_id": project_id,
+                    "requested_mode": "MASTER",
+                    "last_provider": "GROK",
+                    "last_session_ref": "project-master-session",
+                    "connection_state": "NEW",
+                    "session_persistence": "LAST_COORDINATE",
+                    "resident": True,
+                }
+
+            def close(self) -> None:
+                return
+
+        self.request("POST", "/v1/projects/register", self.registration())
+        manager = FakeManager()
+        self.server.project_master_hosts = manager
+
+        status, prepared = self.request(
+            "POST",
+            "/v1/projects/GCS/master-session/prepare",
+            {},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROJECT_MASTER_SESSION_PREPARED", prepared["status"])
+        self.assertEqual(["GCS"], manager.prepared)
+        self.assertEqual(
+            "MASTER",
+            prepared["session_connection"]["requested_mode"],
+        )
+        self.assertEqual(
+            "NEW",
+            prepared["session_connection"]["connection_state"],
+        )
+        self.assertNotIn("authority", prepared["session_connection"])
+        self.assertNotIn("currentness", prepared["session_connection"])
 
     def test_conductor_room_persists_fresh_project_draft_action(self) -> None:
         message, created = self.server.store.create_conductor_room_message(

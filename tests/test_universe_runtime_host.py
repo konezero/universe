@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from universe_runtime_host import (  # noqa: E402
     redacted_invocation_record,
 )
 from universe_runtime_worker_dispatch import WorkerDispatchError  # noqa: E402
+from project_master_host import ProjectMasterSessionStore  # noqa: E402
 
 
 class FakeWorkerDispatcher:
@@ -24,9 +26,11 @@ class FakeWorkerDispatcher:
         *,
         response: dict[str, object] | None = None,
         error: WorkerDispatchError | None = None,
+        attest_ephemeral: bool = True,
     ) -> None:
         self.response = response or {}
         self.error = error
+        self.attest_ephemeral = attest_ephemeral
         self.capability_calls: list[str] = []
         self.dispatch_calls: list[dict[str, object]] = []
 
@@ -42,7 +46,13 @@ class FakeWorkerDispatcher:
         self.dispatch_calls.append(request)
         if self.error is not None:
             raise self.error
-        return dict(self.response)
+        response = dict(self.response)
+        if self.attest_ephemeral:
+            response.setdefault("session_persistence", "EPHEMERAL")
+            response.setdefault("persistent_session_ref", "UNKNOWN")
+            response.setdefault("universe_coordinate_persisted", False)
+            response.setdefault("provider_durable_chat_state", "UNKNOWN")
+        return response
 
 
 class UniverseRuntimeHostLayoutTests(unittest.TestCase):
@@ -157,6 +167,9 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("result-1", result["result_receipt_ref"])
         self.assertEqual(2, result["skill_run_observation_count"])
         self.assertEqual({"text": "bounded reply"}, result["result"])
+        self.assertEqual("EPHEMERAL", result["session_persistence"])
+        self.assertEqual("UNKNOWN", result["persistent_session_ref"])
+        self.assertFalse(result["universe_coordinate_persisted"])
         self.assertNotIn("worker_run_ref", result)
         self.assertEqual(["GROK"], dispatcher.capability_calls)
         self.assertEqual(1, len(dispatcher.dispatch_calls))
@@ -165,6 +178,54 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             dispatcher.dispatch_calls[0]["schema"],
         )
         self.assertEqual("REDACTED", dispatcher.dispatch_calls[0]["result_mode"])
+
+    def test_unattested_worker_session_boundary_is_rejected(self) -> None:
+        dispatcher = FakeWorkerDispatcher(
+            response={
+                "status": "TASK_FRAME_RESULT_RECORDED",
+                "worker_id": "worker-1",
+                "result_receipt_ref": "result-1",
+            },
+            attest_ephemeral=False,
+        )
+        with self.assertRaises(RuntimeHostError) as captured:
+            UniverseRuntimeHost(
+                ROOT, worker_dispatcher=dispatcher
+            ).invoke_read_only(self.request())
+        self.assertEqual(
+            "WORKER_SESSION_BOUNDARY_INVALID",
+            captured.exception.code,
+        )
+
+    def test_boss_and_worker_do_not_replace_provider_session_coordinate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = ProjectMasterSessionStore(
+                Path(temp) / "provider-sessions.sqlite",
+                "GCS",
+            )
+            store.observe_provider_session("CODEX", "project-master-session")
+            dispatcher = FakeWorkerDispatcher(
+                response={
+                    "status": "TASK_FRAME_RESULT_RECORDED",
+                    "worker_id": "task-frame-worker",
+                    "result_receipt_ref": "result-ephemeral",
+                }
+            )
+            host = UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher)
+            for turn_id in ("planning-boss", "review-worker"):
+                request = self.request()
+                request["turn_id"] = turn_id
+                result = host.invoke_read_only(request)
+                self.assertEqual("EPHEMERAL", result["session_persistence"])
+                self.assertFalse(result["universe_coordinate_persisted"])
+
+            self.assertEqual(
+                {
+                    "provider": "CODEX",
+                    "session_ref": "project-master-session",
+                },
+                store.last_provider_session(),
+            )
 
     def test_structured_invocation_returns_only_parsed_result(self) -> None:
         dispatcher = FakeWorkerDispatcher(

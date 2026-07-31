@@ -160,7 +160,7 @@ async function api(path, options = {}) {
 function universeModeIsActive() {
   return (
     state.modeContract?.status === "ACTIVE" &&
-    state.modeContract?.mode === "UNIVERSE" &&
+    state.modeContract?.mode === "CONDUCTOR" &&
     state.modeContract?.role === "CONDUCTOR"
   );
 }
@@ -254,6 +254,15 @@ async function callProjectMaster(projectId) {
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
+  await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
+    {
+      method: "POST",
+      body: {},
+    }
+  );
+  state.providerSettings = await api("/v1/settings/providers");
+  await selectProject(projectId);
   state.conversationTarget = {
     kind: "PROJECT_MASTER",
     projectId,
@@ -265,17 +274,25 @@ async function callProjectMaster(projectId) {
   elements.dispatchInstruction.focus();
 }
 
+function sessionConnectionText(connection, fallbackMode) {
+  const provider = connection?.last_provider || "UNKNOWN";
+  const connectionState = connection?.connection_state || "NOT_OPENED";
+  const mode = connection?.requested_mode || fallbackMode;
+  return `${provider} / ${connectionState} / ${mode}`;
+}
+
 function renderComposerState() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     const setting = state.providerSettings?.universe_conductor || null;
     const provider = setting?.resolved_provider || "UNAVAILABLE";
     const autoApprove =
       providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
+    const session = setting?.session_connection || null;
     elements.roomContext.textContent =
-      `Universe Conductor / Auto-approve ${autoApprove}`;
+      `Universe Conductor / ${sessionConnectionText(session, "CONDUCTOR")}`;
     elements.roomHint.textContent =
       state.conductorRuntimeBinding?.status === "BOUND"
-        ? "LLM connected / use + to call a Project Master"
+        ? `LLM connected / Auto-approve ${autoApprove}`
         : "Waiting for Runtime binding";
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";
     return;
@@ -294,10 +311,11 @@ function renderComposerState() {
   const provider = setting?.resolved_provider || "UNAVAILABLE";
   const autoApprove =
     providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
+  const session = setting?.session_connection || null;
   elements.roomContext.textContent =
-    `${projectId} / Project Master / Auto-approve ${autoApprove}`;
+    `${projectId} / Project Master / ${sessionConnectionText(session, "MASTER")}`;
   elements.roomHint.textContent = directBridge
-    ? "Direct bridge connected"
+    ? `Direct bridge connected / Auto-approve ${autoApprove}`
     : registeredBridge
       ? "Bridge registered / awaiting first delivery"
       : "Project Room only";
@@ -718,15 +736,25 @@ function providerCapability(provider) {
 function providerStatusText(setting) {
   const configured = setting?.provider || "AUTO";
   const resolved = setting?.resolved_provider || "UNAVAILABLE";
+  const mode =
+    setting?.scope_kind === "UNIVERSE_CONDUCTOR" ? "CONDUCTOR" : "MASTER";
   if (configured === "AUTO") {
-    return resolved === "UNAVAILABLE"
+    const providerState = resolved === "UNAVAILABLE"
       ? "Auto / no CLI available"
       : `Auto / currently ${resolved}`;
+    return `${providerState} / ${sessionConnectionText(
+      setting?.session_connection,
+      mode
+    )}`;
   }
   const capability = providerCapability(configured);
-  return capability?.status === "AVAILABLE"
+  const providerState = capability?.status === "AVAILABLE"
     ? `${configured} available`
     : `${configured} unavailable / ${capability?.reason || "CLI unavailable"}`;
+  return `${providerState} / ${sessionConnectionText(
+    setting?.session_connection,
+    mode
+  )}`;
 }
 
 function renderProviderSettings() {
