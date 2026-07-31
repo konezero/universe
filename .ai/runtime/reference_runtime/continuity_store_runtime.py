@@ -13,7 +13,21 @@ from typing import Any
 
 
 DATABASE_RELATIVE_PATH = Path(".ai/runtime/continuity/continuity.sqlite")
+# Canonical continuity store URI for checkpoint/resume target_ref.
+# Do not use database://continuity or other informal aliases in new callers.
 DATABASE_REF = f"sqlite://{DATABASE_RELATIVE_PATH.as_posix()}"
+# Informal aliases accepted only for normalize→canonical rewrite on prepare.
+DATABASE_REF_ALIASES = frozenset(
+    {
+        "database://continuity",
+        "database://continuity.sqlite",
+        "database://.ai/runtime/continuity/continuity.sqlite",
+        "sqlite://continuity",
+        "sqlite://continuity.sqlite",
+        DATABASE_RELATIVE_PATH.as_posix(),
+        str(DATABASE_RELATIVE_PATH),
+    }
+)
 STORE_SCHEMA = "ai-career.continuity-store.v1"
 EVIDENCE_SCHEMA = "ai-career.continuity-save-evidence.v1"
 RECORD_TYPES = frozenset({"CHECKPOINT", "RESUME"})

@@ -10,7 +10,7 @@ remain source-bound. Edit project policy outside this block.
 
 Schema: ai-career.project-runtime-install-record.v1
 Source Repository: https://github.com/konezero/ai-career.git
-Source Commit: 3ea5db509a36f11804465e159f7f49fd882bd7f0
+Source Commit: ba4eb5812784c735dcbc8aed6cdb033957c2403e
 Source Policy: git show from one immutable commit
 Distribution Manifest: `.ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json`
 Installer: `.ai/runtime/tools/project_runtime_installer.py`

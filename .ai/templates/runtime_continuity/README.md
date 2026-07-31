@@ -8,8 +8,14 @@ Scope: installed project Runtime operational state
 Installed projects persist passive Checkpoint and Resume records at:
 
 ```text
-.ai/runtime/continuity/continuity.sqlite
+path: .ai/runtime/continuity/continuity.sqlite
+target_ref (canonical URI):
+  sqlite://.ai/runtime/continuity/continuity.sqlite
 ```
+
+Callers must pass that exact `target_ref` (or omit it to default). Informal
+values such as `database://continuity` are non-canonical; prepare rewrites only
+recognized aliases and rejects unknown store URIs.
 
 This SQLite store is the **only runtime SSOT** for `CHECKPOINT` and
 `RESUME_SAVE` / `RESUME_RESTORE`. File-tree Resume Archives under
@@ -35,8 +41,17 @@ prepare
 save
   -> append-only SQLite transaction
   -> LOCAL_SQLITE_COMMITTED evidence
-list/load
+  -> STOP (save is not restore)
+list/load / resume-restore
   -> read-only passive record access
+  -> only on explicit Commander restore intent
+```
+
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+RESUME_SAVE (리쥼 저장)  !=  RESUME (리쥼 복원)
+SAVED does not imply discover, load, or adoption.
+Do not chain restore or other commands after save by inference.
 ```
 
 The store does not create or activate Role, Authority, Execution Assignment,

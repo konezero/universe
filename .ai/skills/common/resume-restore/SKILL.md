@@ -7,6 +7,22 @@ description: Discover and load selected Resume candidates without activating an 
 
 Invocation class: `REFERENCE_RUNTIME_READ_ONLY`
 
+## Command intent (mandatory)
+
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+
+Run this Skill only on explicit Commander restore intent:
+  리쥼 복원 / RESUME / resume-restore / clear restore language
+
+Do NOT run after RESUME_SAVE solely because save succeeded.
+Do NOT treat CHECKPOINT, BOOT, Mode switch, or OS_* as restore intent.
+Do NOT chain BOOT, RESUME_SAVE, or other commands after load.
+```
+
+Save remains `.ai/skills/common/resume-save/SKILL.md`. This Skill never writes a
+new Resume candidate. After discover (awaiting selection) or load, stop and wait.
+
 Use `resume-restore discover` to query the project-local continuity store. The
 runtime filters durable Resume records to the same `node + mode` coordinate and
 returns ranked candidates only. Caller-supplied candidate evidence remains a
@@ -16,9 +32,11 @@ supported bounded input for provider-backed handoff cases.
 
 ```text
 SSOT: .ai/runtime/continuity/continuity.sqlite
+Canonical store URI: sqlite://.ai/runtime/continuity/continuity.sqlite
 Discover filter: same node + same mode
 File-tree .ai/resume/** : DEPRECATED; not a discover source for runtime restore.
 Do not delete existing archive trees solely for deprecation.
+Do not use database://continuity as target_ref or store identity.
 ```
 
 Cross-mode and cross-node records MUST NOT appear as restore candidates for the

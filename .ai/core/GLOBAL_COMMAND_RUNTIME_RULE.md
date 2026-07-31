@@ -38,6 +38,21 @@ Global commands are context stabilizers.
 They must be resolved before Role, Mode, or Task resolution.
 ```
 
+## One Command Rule
+
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+
+Do not chain a second global or runtime command by inference.
+Examples forbidden without a new Commander utterance:
+  리쥼 저장 then 리쥼 복원
+  부트 then 리쥼 저장
+  상태 then OS_UPDATE
+```
+
+Multi-step work is allowed only when it is the internal contract of the single
+named command (for example `resume-save prepare` then `save` for one candidate).
+
 ## Command Entry Flow
 
 ```text

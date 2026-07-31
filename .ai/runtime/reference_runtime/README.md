@@ -295,8 +295,13 @@ cli.py
 Checkpoint and Resume records use one fixed Runtime-owned database:
 
 ```text
-.ai/runtime/continuity/continuity.sqlite
+path: .ai/runtime/continuity/continuity.sqlite
+target_ref: sqlite://.ai/runtime/continuity/continuity.sqlite
 ```
+
+`target_ref` must be that URI (or omitted to default). Do not use
+`database://continuity` or other informal aliases in new callers; recognized
+aliases are rewritten to the canonical URI and unknown values fail closed.
 
 The database is created only by `checkpoint save` or `resume-save save`.
 Preparation, listing, discovery, and loading do not create storage. A save is

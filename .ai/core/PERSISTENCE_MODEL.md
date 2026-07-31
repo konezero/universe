@@ -151,6 +151,38 @@ File-tree Resume Archive (.ai/resume/** and resume_archive templates)
   -> historical inspection only
 ```
 
+### One command per Commander intent (no inferred chain)
+
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+
+Do not chain persistence commands by inference.
+RESUME_SAVE success does not authorize RESUME.
+CHECKPOINT success does not authorize RESUME or RESUME_SAVE.
+BOOT success does not authorize RESUME_SAVE or RESUME.
+```
+
+### RESUME_SAVE vs RESUME (mandatory separation)
+
+```text
+RESUME_SAVE (리쥼 저장)
+  -> resume-save prepare / save only
+  -> writes a passive durable candidate
+  -> MUST NOT run resume-restore discover or load
+  -> SAVED does not mean restored, activated, or adopted
+  -> STOP after SAVED or blocked/failed save
+
+RESUME (리쥼 복원)
+  -> only on explicit Commander restore intent
+  -> resume-restore discover / select / load
+  -> returns a passive rehydration candidate
+  -> MUST NOT be implied by RESUME_SAVE, CHECKPOINT, or BOOT
+  -> STOP after load report or candidate proposal awaiting selection
+
+Save and restore are separate commands.
+A second command requires a new explicit Commander request.
+```
+
 Resume is not the default starting point when a valid Runtime Snapshot exists.
 
 When a Runtime Snapshot exposes `previous_session_id`, `current_session_id`, and
@@ -170,14 +202,18 @@ The installed Reference Runtime uses the same project-local continuity store
 for Resume records:
 
 ```text
+# save path only
 resume-save prepare
   -> resume-save save
   -> LOCAL_SQLITE_COMMITTED evidence
+  -> STOP
 
+# restore path only (explicit Commander request)
 resume-restore discover
   -> Commander selects one durable candidate
   -> resume-restore load
   -> passive rehydration candidate
+  -> STOP (adoption / anchor realignment remain separate)
 ```
 
 Loading a Resume record does not activate it. Role, Authority, Execution

@@ -140,8 +140,53 @@ Korean aliases:
 ```text
 스냅샷 저장 -> SNAPSHOT_SAVE / CHECKPOINT
 리쥼 저장   -> RESUME_SAVE
+리쥼 복원   -> RESUME
 아카이브 저장 -> ARCHIVE_SAVE
 ```
+
+### One command per Commander intent (no inferred chain)
+
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+
+Hosts and agents MUST execute only the single command the Commander named.
+They MUST NOT chain a second command by inference, convenience, or "next step".
+
+Examples of forbidden chains:
+  RESUME_SAVE then RESUME
+  CHECKPOINT then RESUME
+  BOOT then RESUME_SAVE
+  OS_UPDATE then BOOT
+  prepare success then an unrequested follow-on command
+
+Allowed multi-step work stays inside one command contract only
+  (for example resume-save prepare then save of that same candidate).
+```
+
+Report the result of that one command, then wait for the next Commander utterance.
+
+### RESUME_SAVE vs RESUME (mandatory separation)
+
+```text
+RESUME_SAVE (리쥼 저장)
+  -> resume-save prepare / save only
+  -> durable passive candidate in continuity.sqlite
+  -> MUST NOT run resume-restore discover or load
+  -> MUST NOT treat SAVED as restored or activated
+  -> STOP after SAVED or blocked/failed save
+
+RESUME (리쥼 복원)
+  -> only when Commander explicitly requests restore
+     (e.g. 리쥼 복원, RESUME, resume-restore)
+  -> resume-restore discover -> selection -> load
+  -> passive rehydration candidate only
+  -> MUST NOT be implied by RESUME_SAVE success
+  -> STOP after load report or candidate proposal awaiting selection
+```
+
+Hosts and agents MUST NOT infer restore from save language, checkpoint language,
+or BOOT. Save and restore remain separate commands. A second command requires a
+new, explicit Commander request.
 
 ## OS_INSTALL Meaning
 
@@ -342,13 +387,35 @@ RESUME_SAVE
   -> prepare a bounded Resume candidate for long continuity
   -> save the exact candidate to the project-local continuity SQLite store
   -> preserve enough selected context to propose intentional continuation
-  -> keep saved and loaded records passive until a later adoption decision
+  -> stop after SAVED / LOCAL_SQLITE_COMMITTED
+  -> do not discover, load, or adopt
+  -> keep the saved record passive
 ```
 
 Korean alias:
 
 ```text
 리쥼 저장
+```
+
+`RESUME_SAVE` is not restore. Explicit Commander restore intent is required
+before any `RESUME` / `resume-restore` path runs.
+
+### RESUME
+
+```text
+RESUME
+  -> requires explicit Commander restore intent
+  -> discover same node+mode candidates from continuity.sqlite
+  -> wait for Commander selection when multiple or unselected
+  -> load selected record as passive rehydration candidate
+  -> do not create Authority, Assignment, or Mode Current Anchor
+```
+
+Korean alias:
+
+```text
+리쥼 복원
 ```
 
 ### ARCHIVE_SAVE
@@ -379,14 +446,14 @@ Korean alias:
 | `OS_ROLLBACK` | `RUNTIME_INSTRUCTION_SET.md` | Return local runtime to a known project checkpoint |
 | `OS_SYNC` | `RUNTIME_INSTRUCTION_SET.md` + candidate path | Route reusable observations back toward ai-career |
 | `SNAPSHOT_SAVE` / `CHECKPOINT` | `PERSISTENCE_MODEL.md` + `.ai/runtime/continuity/continuity.sqlite` | Prepare and durably save a passive current-state Checkpoint |
-| `RESUME_SAVE` | `PERSISTENCE_MODEL.md` + `.ai/runtime/continuity/continuity.sqlite` | Prepare and durably save a passive Resume candidate |
+| `RESUME_SAVE` | `PERSISTENCE_MODEL.md` + `.ai/runtime/continuity/continuity.sqlite` | Prepare and durably save a passive Resume candidate only (no restore) |
 | `ARCHIVE_SAVE` | `PERSISTENCE_MODEL.md` + archive path | Preserve historical recall material |
 | `MEMORY_SYNC` | Memory / Storage / L3 path | Extract or persist selected memory artifact |
 | `CARRIER` | Carrier profile / queue path | Collect candidate events |
 | `DISPATCH` | Dispatch service path | Deliver approved work |
 | `AUDIT` | Audit / validation path | Check evidence and gaps |
 | `TUTORIAL` | `TUTORIAL_GUIDE_MODE.md` | Activate a read-only interaction profile; it is not a registered ai-career Mode and performs no install, repository write, or feedback persistence |
-| `RESUME` | Resume candidate path | Restore from durable state when selected |
+| `RESUME` | `PERSISTENCE_MODEL.md` + resume-restore Skill | Explicit restore only: discover/load passive candidate when Commander requests 리쥼 복원 |
 | `BOOT` / `REBOOT` | `SESSION_RUNTIME_GOVERNANCE.md` + Session Framework path | Build, attach, or rebuild the disposable runtime session from an installed or source-backed Runtime |
 | `STATUS` | Source-backed status path | Report verified or unknown state |
 

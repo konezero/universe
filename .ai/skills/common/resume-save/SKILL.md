@@ -14,6 +14,27 @@ This is the discoverable `RESUME_SAVE` entrypoint over
 material and saves the exact immutable candidate in the project-local
 continuity store. Saving does not make a Resume record current or authoritative.
 
+## Command intent (mandatory)
+
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+
+Commander says 리쥼 저장 / RESUME_SAVE / resume-save
+  -> run resume-save prepare and save only
+  -> STOP after SAVED or a blocked/failed save report
+
+Do NOT chain any second command after save.
+Do NOT run resume-restore discover or load after save.
+Do NOT infer restore, adoption, BOOT, OS_UPDATE, or Mode Anchor activation.
+```
+
+Internal prepare→save for the **same** candidate is one `RESUME_SAVE` contract.
+Anything else needs a new Commander utterance.
+
+Restore is a separate command. Invoke `.ai/skills/common/resume-restore/SKILL.md`
+only when the Commander explicitly requests restore (for example `리쥼 복원`,
+`RESUME`, or `resume-restore`).
+
 ## SSOT and deprecation
 
 ```text
@@ -21,6 +42,24 @@ SSOT: .ai/runtime/continuity/continuity.sqlite
 Identity fields: node + mode (+ session_id + frame_id + anchor_id + checkpoint_ref)
 File-tree .ai/resume/** : DEPRECATED for runtime resume; do not write new runtime
   continuity there; do not delete existing trees solely for deprecation.
+```
+
+## target_ref (required store URI)
+
+Canonical value only (omit field to default):
+
+```text
+sqlite://.ai/runtime/continuity/continuity.sqlite
+```
+
+Do **not** invent informal URIs. The following are non-canonical; prepare rewrites
+recognized aliases to the canonical value, and unknown values fail closed:
+
+```text
+WRONG: database://continuity
+WRONG: database://continuity.sqlite
+WRONG: drive://continuity/checkpoint
+RIGHT: sqlite://.ai/runtime/continuity/continuity.sqlite
 ```
 
 Compressed conversation or handoff meaning belongs in the candidate payload
@@ -67,10 +106,11 @@ current Parent selects bounded conversation restoration content
 ```
 
 Report `SAVED` only after the local SQLite commit. Idempotent replay returns the
-original save evidence. Resume discovery and loading are separate operations
-and must not automatically activate an old Anchor, Mode Current Anchor, Role,
-Authority, or Execution Assignment. Source or project-owned writes outside the
-Runtime-owned continuity path still require Execution Guard.
+original save evidence. After `SAVED`, stop: do not chain discover/load.
+Resume discovery and loading are separate operations under explicit restore
+intent and must not automatically activate an old Anchor, Mode Current Anchor,
+Role, Authority, or Execution Assignment. Source or project-owned writes outside
+the Runtime-owned continuity path still require Execution Guard.
 
 A source-only mobile or web Connector must not claim `SAVED` for the local
 continuity store. Its durable boundary is an explicitly approved Provider

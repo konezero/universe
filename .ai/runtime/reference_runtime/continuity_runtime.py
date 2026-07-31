@@ -17,6 +17,7 @@ from typing import Any
 
 from .continuity_store_runtime import (
     DATABASE_REF,
+    DATABASE_REF_ALIASES,
     ContinuityStore,
     ContinuityStoreError,
 )
@@ -286,7 +287,7 @@ def _normalize_checkpoint_candidate(request: Mapping[str, Any]) -> dict[str, Any
         "summary": _optional_text(request.get("summary", ""), "summary"),
         "source_refs": _source_refs(request.get("source_refs")),
         "observed_at": _timestamp(request.get("observed_at"), "observed_at"),
-        "target_ref": _optional_text(request.get("target_ref", DATABASE_REF), "target_ref"),
+        "target_ref": _normalize_continuity_target_ref(request.get("target_ref")),
     }
 
 
@@ -957,7 +958,7 @@ def _normalize_resume_candidate(request: Mapping[str, Any]) -> dict[str, Any]:
         "source_refs": source_refs,
         "source_ref": source_ref,
         "observed_at": _timestamp(request.get("observed_at"), "observed_at"),
-        "target_ref": _optional_text(request.get("target_ref", DATABASE_REF), "target_ref"),
+        "target_ref": _normalize_continuity_target_ref(request.get("target_ref")),
     }
 
 
@@ -1481,11 +1482,35 @@ def _source_refs(value: Any) -> list[str]:
     return [_required_text(item, f"source_refs[{index}]") for index, item in enumerate(value)]
 
 
+def _normalize_continuity_target_ref(value: Any) -> str:
+    """Normalize continuity-related target_ref values.
+
+    Canonical store URI:
+      sqlite://.ai/runtime/continuity/continuity.sqlite
+
+    Informal aliases such as ``database://continuity`` are rewritten to the
+    canonical URI. Other non-empty values (for example external prepare-only
+    targets) are left unchanged; save still requires the canonical store URI.
+    """
+    if value is None:
+        return DATABASE_REF
+    text = _optional_text(value, "target_ref")
+    if text in {"", "UNKNOWN"}:
+        return DATABASE_REF
+    if text == DATABASE_REF or text in DATABASE_REF_ALIASES:
+        return DATABASE_REF
+    return text
+
+
 def _require_continuity_store_target(value: Any) -> None:
-    if _required_text(value, "target_ref") != DATABASE_REF:
+    normalized = _normalize_continuity_target_ref(value)
+    if normalized != DATABASE_REF:
         raise ContinuityCommandError(
             "CONTINUITY_STORE_TARGET_MISMATCH",
-            f"target_ref must be {DATABASE_REF}",
+            "target_ref must be "
+            f"{DATABASE_REF} "
+            f"(not {value!r}; do not use database://continuity — "
+            "use the canonical sqlite:// URI)",
         )
 
 

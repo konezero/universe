@@ -17,6 +17,15 @@ project-local continuity store. Archive and Memory routes remain capability
 dependent. This Skill does not select durable content, activate restored state,
 or create authority.
 
+```text
+ONE COMMAND INTENT -> ONE COMMAND EXECUTION -> STOP
+
+RESUME_SAVE (리쥼 저장)  -> resume-save only; stop after SAVED
+RESUME (리쥼 복원)       -> resume-restore only on explicit Commander restore intent
+SAVED does not imply discover, load, or adoption
+Do not chain a second command by inference after any persistence result
+```
+
 ## Targets
 
 ```text
