@@ -43,11 +43,22 @@ $statusShortcut.WindowStyle = 1
 $statusShortcut.Description = "Show local Universe service status"
 $statusShortcut.Save()
 
+$trayLauncher = Join-Path $UniverseRoot "packaging\windows\Start-Universe-Tray.cmd"
+$trayShortcutPath = Join-Path $startMenu "Universe Tray.lnk"
+$trayShortcut = $shell.CreateShortcut($trayShortcutPath)
+$trayShortcut.TargetPath = $trayLauncher
+$trayShortcut.WorkingDirectory = $UniverseRoot
+$trayShortcut.WindowStyle = 7
+$trayShortcut.Description = "Universe system tray (status / start / stop / open UI)"
+$trayShortcut.Save()
+
 $enableAutostart = $Autostart.IsPresent -and -not $NoAutostart.IsPresent
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 if ($enableAutostart) {
+  # Prefer tray host so logon starts service + tray controls.
+  $autostartTarget = if (Test-Path $trayLauncher) { $trayLauncher } else { $launcher }
   New-ItemProperty -Path $runKey -Name "UniverseLocalService" -PropertyType String `
-    -Value "`"$launcher`"" -Force | Out-Null
+    -Value "`"$autostartTarget`"" -Force | Out-Null
 }
 
 $result = [ordered]@{
@@ -55,8 +66,8 @@ $result = [ordered]@{
   status = "INSTALLED"
   universe_root = $UniverseRoot
   start_menu = $startMenu
-  shortcuts = @($shortcutPath, $statusShortcutPath)
+  shortcuts = @($shortcutPath, $statusShortcutPath, $trayShortcutPath)
   autostart = $enableAutostart
-  autostart_value = if ($enableAutostart) { $launcher } else { $null }
+  autostart_value = if ($enableAutostart) { $autostartTarget } else { $null }
 }
 $result | ConvertTo-Json -Depth 4

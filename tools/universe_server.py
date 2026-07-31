@@ -14,6 +14,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -12221,6 +12222,16 @@ def parser() -> argparse.ArgumentParser:
     )
     restart_command.set_defaults(open_ui=False)
 
+    tray_command = commands.add_parser(
+        "tray",
+        help="Start the Windows system-tray host (packaging/windows/Universe-Tray.ps1)",
+    )
+    tray_command.add_argument(
+        "--start-service",
+        action="store_true",
+        help="Start the local service when the tray opens",
+    )
+
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)
     register.add_argument("--project-root", type=Path, required=True)
@@ -12270,13 +12281,73 @@ def _connection_options(args: argparse.Namespace) -> tuple[str, str]:
 def main() -> int:
     args = parser().parse_args()
     try:
-        if args.command in {"status", "start", "stop", "restart"}:
+        if args.command in {"status", "start", "stop", "restart", "tray"}:
             from universe_service_control import (
                 restart_service,
                 service_status,
                 start_service,
                 stop_service,
             )
+
+            if args.command == "tray":
+                if os.name != "nt":
+                    print(
+                        json.dumps(
+                            {
+                                "schema": "universe.local-service-control.v1",
+                                "status": "TRAY_UNSUPPORTED",
+                                "detail": "System tray host is Windows-only in this slice",
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                    return 1
+                tray_script = (
+                    Path(__file__).resolve().parents[1]
+                    / "packaging"
+                    / "windows"
+                    / "Universe-Tray.ps1"
+                )
+                if not tray_script.is_file():
+                    raise UniverseError(
+                        "TRAY_SCRIPT_UNAVAILABLE",
+                        f"missing tray script: {tray_script}",
+                    )
+                tray_args = [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-File",
+                    str(tray_script),
+                    "-UniverseRoot",
+                    str(Path(__file__).resolve().parents[1]),
+                ]
+                if args.start_service:
+                    tray_args.append("-StartService")
+                # Detach tray so this CLI can return after launch.
+                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                )
+                process = subprocess.Popen(
+                    tray_args,
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                result = {
+                    "schema": "universe.local-service-control.v1",
+                    "status": "TRAY_STARTED",
+                    "tray_pid": process.pid,
+                    "script": str(tray_script),
+                }
+                print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
 
             if args.command == "status":
                 result = service_status(args.state_file)

@@ -72,6 +72,7 @@ python tools/universe_server.py status
 python tools/universe_server.py start --open-ui
 python tools/universe_server.py stop
 python tools/universe_server.py restart --no-open-ui
+python tools/universe_server.py tray --start-service
 
 powershell -ExecutionPolicy Bypass -File packaging\windows\install-user.ps1
 # optional logon autostart:
