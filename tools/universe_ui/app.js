@@ -8,6 +8,8 @@ const state = {
   dispatches: [],
   releases: [],
   releaseProposals: [],
+  masterHandoffs: [],
+  skillPlanAdoptions: [],
   selectedNode: null,
   focusedNodeId: null,
   view: "timeline",
@@ -39,9 +41,48 @@ const state = {
     refinementCandidate: null,
     refinementAdoption: null,
     adoption: null,
+    handoff: null,
   },
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
 };
+
+const WORKLIST_SEED_TODOS = [
+  {
+    title: "Close seed discovery dispatch (QUEUED)",
+    detail:
+      "GCS project_dispatch is still QUEUED for seed discovery. Confirm Project Master inbox delivery and Project Seed publish path.",
+    priority: "P0",
+    state: "READY",
+  },
+  {
+    title: "Deliver one Project Master handoff end-to-end",
+    detail:
+      "Propose and DELIVER one adopted Skill Plan or Fresh Composition handoff. Confirm room message + delivery_state DELIVERED_TO_MASTER.",
+    priority: "P0",
+    state: "READY",
+  },
+  {
+    title: "Todo work map stays current for Master review",
+    detail:
+      "Keep PROJECT/NODE todos accurate. Use Send to Master for bounded questions; do not treat Todo as Task Frame execution.",
+    priority: "P1",
+    state: "IN_PROGRESS",
+  },
+  {
+    title: "Verify Project Master bridge / CLI provider",
+    detail:
+      "Bridge AVAILABLE or room-only path understood. Provider setting for this Project Master is intentional (AUTO/GROK/CODEX).",
+    priority: "P1",
+    state: "READY",
+  },
+  {
+    title: "Capture first Experience Case after a Skill run",
+    detail:
+      "After a redacted Skill observation is ingested, record one Experience Case. Causal inference stays NOT_INFERRED.",
+    priority: "P2",
+    state: "BACKLOG",
+  },
+];
 
 const elements = {
   serviceStatus: document.querySelector("#service-status"),
@@ -129,9 +170,20 @@ const elements = {
   todoNode: document.querySelector("#todo-node"),
   todoScopeFilter: document.querySelector("#todo-scope-filter"),
   todoStateFilter: document.querySelector("#todo-state-filter"),
+  todoPriorityFilter: document.querySelector("#todo-priority-filter"),
   todoList: document.querySelector("#todo-list"),
   todoCount: document.querySelector("#todo-count"),
   todoFormError: document.querySelector("#todo-form-error"),
+  seedWorklistButton: document.querySelector("#seed-worklist-button"),
+  proposeMasterHandoffButton: document.querySelector(
+    "#propose-master-handoff-button"
+  ),
+  deliverMasterHandoffButton: document.querySelector(
+    "#deliver-master-handoff-button"
+  ),
+  freshProjectHandoffStatus: document.querySelector(
+    "#fresh-project-handoff-status"
+  ),
 };
 
 function node(tag, className, text) {
@@ -545,6 +597,8 @@ async function selectProject(projectId) {
     roomResult,
     bridgeResult,
     permissionResult,
+    handoffResult,
+    skillPlanAdoptionResult,
   ] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
@@ -556,6 +610,12 @@ async function selectProject(projectId) {
     api(`/v1/projects/${encodeURIComponent(projectId)}/agent-session/permissions`).catch(
       () => ({ permissions: [] })
     ),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/master-handoffs`).catch(
+      () => ({ handoffs: [] })
+    ),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/skill-plan-adoptions`
+    ).catch(() => ({ adoptions: [] })),
   ]);
   state.projection = projectionResult?.projection || null;
   state.dispatches = await Promise.all(
@@ -569,6 +629,8 @@ async function selectProject(projectId) {
   state.roomMessages = roomResult.messages || [];
   state.masterBridge = bridgeResult.bridge || null;
   state.projectPermissions = permissionResult.permissions || [];
+  state.masterHandoffs = handoffResult.handoffs || [];
+  state.skillPlanAdoptions = skillPlanAdoptionResult.adoptions || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -1833,13 +1895,86 @@ function renderDetails() {
   } else {
     const list = node("ul", "context-list todo-context-list");
     for (const todo of matchingTodos.slice(0, 6)) {
-      list.append(
-        node("li", "", `${todo.priority} / ${todo.state} / ${todo.title}`)
+      const row = node("li", "todo-context-item");
+      const label = node(
+        "button",
+        "todo-context-open",
+        `${todo.priority} / ${todo.state} / ${todo.title}`
       );
+      label.type = "button";
+      label.title = "Open Todo work map";
+      label.addEventListener("click", () => openTodoDialog(true));
+      row.append(label);
+      if (todo.scope_kind !== "UNIVERSE" && todo.project_id) {
+        const send = node("button", "todo-context-master", "Master");
+        send.type = "button";
+        send.title = "Send this Todo to Project Master";
+        send.addEventListener("click", () => sendTodoToMaster(todo));
+        row.append(send);
+      }
+      list.append(row);
     }
     todoGroup.append(list);
   }
   elements.details.append(todoGroup);
+
+  if (state.selectedProject) {
+    const handoffGroup = node("div", "detail-group");
+    const handoffHeading = node("div", "detail-heading-row");
+    handoffHeading.append(
+      node("h3", "", `Master handoffs (${state.masterHandoffs.length})`)
+    );
+    handoffGroup.append(handoffHeading);
+    if (!state.masterHandoffs.length) {
+      handoffGroup.append(
+        node(
+          "p",
+          "empty-copy",
+          "No handoff proposals yet. Adopt a Skill Plan or Fresh Composition, then propose delivery."
+        )
+      );
+    } else {
+      const list = node("ul", "context-list");
+      for (const handoff of state.masterHandoffs.slice(0, 6)) {
+        const row = node("li", "handoff-context-item");
+        const sourceKind = handoff.source?.kind || "UNKNOWN";
+        row.append(
+          node(
+            "span",
+            "",
+            `${handoff.delivery_state} · ${sourceKind} · ${handoff.handoff_id.slice(0, 18)}…`
+          )
+        );
+        if (handoff.delivery_state === "PROPOSAL_ONLY") {
+          const deliver = node("button", "todo-context-master", "Deliver");
+          deliver.type = "button";
+          deliver.title = "Deliver handoff to Project Master (approval=DELIVER)";
+          deliver.addEventListener("click", () =>
+            deliverMasterHandoff(state.selectedProject.project_id, handoff)
+          );
+          row.append(deliver);
+        }
+        list.append(row);
+      }
+      handoffGroup.append(list);
+    }
+    if (state.skillPlanAdoptions.length) {
+      const undelivered = undeliveredSkillPlanAdoptions();
+      if (undelivered.length) {
+        const propose = node(
+          "button",
+          "secondary-button compact-action",
+          `Propose Skill Plan handoff (${undelivered.length})`
+        );
+        propose.type = "button";
+        propose.addEventListener("click", () =>
+          proposeSkillPlanHandoff(undelivered[0])
+        );
+        handoffGroup.append(propose);
+      }
+    }
+    elements.details.append(handoffGroup);
+  }
 
   const isProjectContext = !selected || selected.kind === "project";
   const relatedDocuments = (state.projection?.documents || []).filter((item) =>
@@ -1911,11 +2046,43 @@ function renderActivity() {
     elements.activity.append(node("p", "empty-copy", "No project selected"));
     return;
   }
-  if (!state.dispatches.length && !state.roomMessages.length) {
-    elements.activity.append(node("p", "empty-copy", "No dispatches"));
+  if (
+    !state.dispatches.length &&
+    !state.roomMessages.length &&
+    !state.masterHandoffs.length
+  ) {
+    elements.activity.append(node("p", "empty-copy", "No activity yet"));
     return;
   }
   const timeline = node("div", "timeline");
+  for (const handoff of state.masterHandoffs) {
+    const row = node("div", "timeline-item handoff-item");
+    const copy = node("div", "timeline-copy");
+    const sourceKind = handoff.source?.kind || "UNKNOWN";
+    copy.append(
+      node("strong", "", `MASTER_HANDOFF / ${sourceKind}`),
+      node(
+        "small",
+        "",
+        `${handoff.delivery_state} · ${handoff.handoff_id}`
+      ),
+      node(
+        "small",
+        "",
+        handoff.purpose || handoff.next_operation || "Project Master handoff"
+      )
+    );
+    if (handoff.delivery_state === "PROPOSAL_ONLY") {
+      const action = node("button", "timeline-action", "Deliver");
+      action.type = "button";
+      action.addEventListener("click", () =>
+        deliverMasterHandoff(state.selectedProject.project_id, handoff)
+      );
+      copy.append(action);
+    }
+    row.append(node("span"), copy);
+    timeline.append(row);
+  }
   for (const message of state.roomMessages) {
     const row = node("div", "timeline-item room-message");
     const copy = node("div", "timeline-copy");
@@ -2323,9 +2490,11 @@ function todoScopeLabel(todo) {
 function visibleTodos() {
   const scope = elements.todoScopeFilter.value;
   const stateFilter = elements.todoStateFilter.value;
+  const priorityFilter = elements.todoPriorityFilter?.value || "ALL";
   return state.todos.filter((todo) => {
     if (stateFilter === "OPEN" && todo.state === "DONE") return false;
     if (stateFilter === "DONE" && todo.state !== "DONE") return false;
+    if (priorityFilter !== "ALL" && todo.priority !== priorityFilter) return false;
     if (scope === "UNIVERSE" && todo.scope_kind !== "UNIVERSE") return false;
     if (
       scope === "PROJECT" &&
@@ -2366,10 +2535,34 @@ function renderTodos() {
   elements.todoCount.textContent = `${todos.length} item${
     todos.length === 1 ? "" : "s"
   }`;
+  if (elements.seedWorklistButton) {
+    const projectId = state.selectedProject?.project_id;
+    const projectTodoCount = projectId
+      ? state.todos.filter((todo) => todo.project_id === projectId).length
+      : 0;
+    elements.seedWorklistButton.hidden = !projectId || projectTodoCount > 0;
+  }
   if (!todos.length) {
-    elements.todoList.append(
+    const empty = node("div", "todo-empty-block");
+    empty.append(
       node("p", "empty-copy todo-empty", "No Todo matches this view")
     );
+    if (
+      state.selectedProject &&
+      !state.todos.some(
+        (todo) => todo.project_id === state.selectedProject.project_id
+      )
+    ) {
+      const seed = node(
+        "button",
+        "secondary-button",
+        "Seed P0 worklist for this project"
+      );
+      seed.type = "button";
+      seed.addEventListener("click", seedWorklistTodos);
+      empty.append(seed);
+    }
+    elements.todoList.append(empty);
     return;
   }
   for (const todo of todos) {
@@ -2417,12 +2610,24 @@ function renderTodos() {
         state: todoState.value,
       })
     );
+    const sendMaster = node(
+      "button",
+      "secondary-button todo-send-master",
+      "Master"
+    );
+    sendMaster.type = "button";
+    sendMaster.title =
+      todo.scope_kind === "UNIVERSE"
+        ? "Universe todos stay in Conductor; bind to a Project first"
+        : "Send this Todo context to Project Master";
+    sendMaster.disabled = todo.scope_kind === "UNIVERSE" || !todo.project_id;
+    sendMaster.addEventListener("click", () => sendTodoToMaster(todo));
     const remove = node("button", "icon-button compact todo-delete", "\u00d7");
     remove.type = "button";
     remove.title = "Delete Todo";
     remove.setAttribute("aria-label", remove.title);
     remove.addEventListener("click", () => deleteTodo(todo));
-    controls.append(priority, todoState, save, remove);
+    controls.append(priority, todoState, save, sendMaster, remove);
     item.append(header, title, detail, controls);
     elements.todoList.append(item);
   }
@@ -2514,6 +2719,271 @@ async function deleteTodo(todo) {
   }
 }
 
+function undeliveredSkillPlanAdoptions() {
+  const deliveredAdoptionIds = new Set(
+    state.masterHandoffs
+      .filter((item) => item.source?.kind === "SKILL_PLAN")
+      .map((item) => item.source?.adoption?.adoption_id || item.source?.adoption_id)
+      .filter(Boolean)
+  );
+  return state.skillPlanAdoptions.filter(
+    (adoption) => !deliveredAdoptionIds.has(adoption.adoption_id)
+  );
+}
+
+function todoMasterMessage(todo) {
+  const lines = [
+    `Todo review request (planning only, not execution).`,
+    `title: ${todo.title}`,
+    `priority: ${todo.priority}`,
+    `state: ${todo.state}`,
+    `scope: ${todoScopeLabel(todo)}`,
+    `todo_id: ${todo.todo_id}`,
+  ];
+  if (todo.detail) lines.push(`detail: ${todo.detail}`);
+  lines.push(
+    "Please propose the next bounded Project Master step. Do not start a Task Frame or mutate source without separate approval."
+  );
+  return lines.join("\n");
+}
+
+async function sendTodoToMaster(todo) {
+  if (!todo?.project_id || todo.scope_kind === "UNIVERSE") {
+    toast("Bind this Todo to a Project before sending to Master", true);
+    return;
+  }
+  const project = state.projects.find(
+    (item) => item.project_id === todo.project_id
+  );
+  if (!project) {
+    toast("Project is not connected", true);
+    return;
+  }
+  if (state.selectedProject?.project_id !== project.project_id) {
+    await selectProject(project.project_id);
+  }
+  state.conversationTarget = {
+    kind: "PROJECT_MASTER",
+    projectId: project.project_id,
+  };
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  elements.dispatchInstruction.value = todoMasterMessage(todo);
+  elements.conversationLayer?.classList.remove("collapsed");
+  elements.todoDialog?.close();
+  elements.dispatchInstruction.focus();
+  toast(`Composer ready for ${project.project_id} Master`);
+}
+
+async function seedWorklistTodos() {
+  if (!state.selectedProject) {
+    toast("Select a project first", true);
+    return;
+  }
+  const projectId = state.selectedProject.project_id;
+  const existing = state.todos.filter((todo) => todo.project_id === projectId);
+  if (existing.length) {
+    toast("Project already has todos; seed skipped", true);
+    return;
+  }
+  if (
+    !window.confirm(
+      `Create ${WORKLIST_SEED_TODOS.length} planning todos for ${projectId}?`
+    )
+  ) {
+    return;
+  }
+  try {
+    const created = [];
+    for (const [index, seed] of WORKLIST_SEED_TODOS.entries()) {
+      const result = await api("/v1/todos", {
+        method: "POST",
+        body: {
+          scope_kind: "PROJECT",
+          project_id: projectId,
+          title: seed.title,
+          detail: seed.detail,
+          priority: seed.priority,
+          state: seed.state,
+          source_kind: "USER",
+          sort_order: index,
+        },
+      });
+      created.push(result.todo);
+    }
+    state.todos = [...created, ...state.todos];
+    renderProjects();
+    renderTodos();
+    renderDetails();
+    drawGraph();
+    toast(`Seeded ${created.length} worklist todos`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function proposeSkillPlanHandoff(adoption) {
+  if (!state.selectedProject || !adoption) return;
+  const projectId = state.selectedProject.project_id;
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/master-handoffs`,
+      {
+        method: "POST",
+        body: {
+          source: {
+            kind: "SKILL_PLAN",
+            adoption_id: adoption.adoption_id,
+          },
+          purpose: "Deliver adopted Skill Plan to Project Master planning context",
+        },
+      }
+    );
+    state.masterHandoffs = [
+      result.handoff,
+      ...state.masterHandoffs.filter(
+        (item) => item.handoff_id !== result.handoff.handoff_id
+      ),
+    ];
+    renderDetails();
+    renderActivity();
+    toast(
+      result.status === "PROJECT_MASTER_HANDOFF_PROPOSAL_RECORDED"
+        ? "Master handoff proposed"
+        : "Existing Master handoff reused"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function proposeFreshProjectHandoff() {
+  const adoption = state.freshProject.adoption;
+  if (!adoption) {
+    toast("Adopt a Fresh Project composition first", true);
+    return;
+  }
+  if (!state.selectedProject) {
+    toast("Select the target project before proposing Master handoff", true);
+    return;
+  }
+  const projectId = state.selectedProject.project_id;
+  if (elements.proposeMasterHandoffButton) {
+    elements.proposeMasterHandoffButton.disabled = true;
+  }
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/master-handoffs`,
+      {
+        method: "POST",
+        body: {
+          source: {
+            kind: "FRESH_PROJECT_COMPOSITION",
+            adoption_id: adoption.adoption_id,
+          },
+          purpose: "Deliver adopted Fresh Project plan to Project Master",
+        },
+      }
+    );
+    state.freshProject.handoff = result.handoff;
+    state.masterHandoffs = [
+      result.handoff,
+      ...state.masterHandoffs.filter(
+        (item) => item.handoff_id !== result.handoff.handoff_id
+      ),
+    ];
+    renderFreshProjectHandoffControls();
+    renderDetails();
+    renderActivity();
+    toast(
+      result.status === "PROJECT_MASTER_HANDOFF_PROPOSAL_RECORDED"
+        ? "Master handoff proposed"
+        : "Existing Master handoff reused"
+    );
+  } catch (error) {
+    if (elements.freshProjectError) {
+      elements.freshProjectError.textContent = error.message;
+    }
+    toast(error.message, true);
+  } finally {
+    if (elements.proposeMasterHandoffButton) {
+      elements.proposeMasterHandoffButton.disabled = false;
+    }
+  }
+}
+
+async function deliverMasterHandoff(projectId, handoff) {
+  if (!projectId || !handoff) return;
+  if (
+    !window.confirm(
+      "Deliver this handoff to Project Master?\n\napproval must be DELIVER. This stores planning context only; it does not create a Task Frame or write project source."
+    )
+  ) {
+    return;
+  }
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/master-handoffs/${encodeURIComponent(handoff.handoff_id)}/deliver`,
+      {
+        method: "POST",
+        body: { approval: "DELIVER" },
+      }
+    );
+    const updated = result.handoff || handoff;
+    state.masterHandoffs = state.masterHandoffs.map((item) =>
+      item.handoff_id === updated.handoff_id ? updated : item
+    );
+    if (state.freshProject.handoff?.handoff_id === updated.handoff_id) {
+      state.freshProject.handoff = updated;
+      renderFreshProjectHandoffControls();
+    }
+    if (state.selectedProject?.project_id === projectId) {
+      await selectProject(projectId);
+      showInspectorTab("activity");
+    } else {
+      renderDetails();
+      renderActivity();
+    }
+    toast(
+      result.status === "PROJECT_MASTER_HANDOFF_ALREADY_DELIVERED"
+        ? "Handoff already delivered"
+        : "Handoff delivered to Project Master"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderFreshProjectHandoffControls() {
+  const handoff = state.freshProject.handoff;
+  const adoption = state.freshProject.adoption;
+  if (elements.freshProjectHandoffStatus) {
+    if (handoff) {
+      elements.freshProjectHandoffStatus.textContent = `${handoff.delivery_state} · ${handoff.handoff_id}`;
+    } else if (adoption) {
+      elements.freshProjectHandoffStatus.textContent =
+        "Handoff candidate ready. Select target project, then propose delivery.";
+    } else {
+      elements.freshProjectHandoffStatus.textContent = "";
+    }
+  }
+  if (elements.proposeMasterHandoffButton) {
+    elements.proposeMasterHandoffButton.hidden = !adoption;
+    elements.proposeMasterHandoffButton.disabled = Boolean(
+      handoff && handoff.delivery_state !== "PROPOSAL_ONLY"
+    );
+  }
+  if (elements.deliverMasterHandoffButton) {
+    const canDeliver =
+      handoff &&
+      handoff.delivery_state === "PROPOSAL_ONLY" &&
+      state.selectedProject;
+    elements.deliverMasterHandoffButton.hidden = !handoff;
+    elements.deliverMasterHandoffButton.disabled = !canDeliver;
+  }
+}
+
 function commaList(value) {
   return String(value || "")
     .split(",")
@@ -2555,6 +3025,7 @@ function openFreshProjectWizard() {
     refinementCandidate: null,
     refinementAdoption: null,
     adoption: null,
+    handoff: null,
   };
   elements.freshProjectForm.reset();
   elements.freshProjectRouteList.replaceChildren();
@@ -2564,6 +3035,7 @@ function openFreshProjectWizard() {
   elements.planningProposal.classList.add("hidden");
   elements.refinementCandidate.classList.add("hidden");
   elements.planningRunStatus.textContent = "";
+  renderFreshProjectHandoffControls();
   showFreshProjectPanel("intent");
   elements.freshProjectDialog.showModal();
 }
@@ -2978,8 +3450,10 @@ async function adoptFreshProjectComposition() {
       },
     });
     state.freshProject.adoption = result.adoption;
+    state.freshProject.handoff = null;
     elements.freshProjectAdoptionRef.textContent =
       `${result.adoption.adoption_id} · Project Master handoff candidate`;
+    renderFreshProjectHandoffControls();
     showFreshProjectPanel("adopted");
     toast("Fresh project plan adopted");
   } catch (error) {
@@ -3060,6 +3534,29 @@ function bindEvents() {
   elements.todoProject.addEventListener("change", renderTodoScopeControls);
   elements.todoScopeFilter.addEventListener("change", renderTodos);
   elements.todoStateFilter.addEventListener("change", renderTodos);
+  if (elements.todoPriorityFilter) {
+    elements.todoPriorityFilter.addEventListener("change", renderTodos);
+  }
+  if (elements.seedWorklistButton) {
+    elements.seedWorklistButton.addEventListener("click", seedWorklistTodos);
+  }
+  if (elements.proposeMasterHandoffButton) {
+    elements.proposeMasterHandoffButton.addEventListener(
+      "click",
+      proposeFreshProjectHandoff
+    );
+  }
+  if (elements.deliverMasterHandoffButton) {
+    elements.deliverMasterHandoffButton.addEventListener("click", () => {
+      const handoff = state.freshProject.handoff;
+      const projectId = state.selectedProject?.project_id;
+      if (!handoff || !projectId) {
+        toast("Select target project and propose handoff first", true);
+        return;
+      }
+      deliverMasterHandoff(projectId, handoff);
+    });
+  }
 
   document
     .querySelector("#release-button")

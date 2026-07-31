@@ -2,8 +2,8 @@
 
 대화 내용 + 기존 문서(정본 2개 + 임시본 참고용) 기준으로 정렬한 목록입니다.
 
-**구현 수준 갱신:** 2026-07-31  
-**대조 기준:** `tools/` · `tests/` · `docs/` · HEAD `e9c158d` · 로컬 DB `%LOCALAPPDATA%\Universe\universe.sqlite3`  
+**구현 수준 갱신:** 2026-07-31 (Todo UI + Master 전달 polish)  
+**대조 기준:** `tools/` · `tests/` · `docs/` · HEAD `7861684`+local · 로컬 DB `%LOCALAPPDATA%\Universe\universe.sqlite3`  
 **등급:**
 
 | 등급 | 의미 |
@@ -58,10 +58,10 @@
 
 | 항목 | 수준 | 비고 |
 |------|------|------|
-| Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위, Master 전달 | **PARTIAL** | CRUD·필터·draft 있음. Master 전달·실무 워크플로 polish·실데이터 채움 미완 |
+| Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위, Master 전달 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Send to Master** (composer 프리필) + **Seed worklist** (빈 프로젝트 5건). 실 DB 채움은 런타임 Seed 버튼 1회 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** | graph canvas, inspector, conductor/master room 존재. 반응형·컨트롤 정비·완성도는 잔여 |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** / packaging **NOT_STARTED** | Provider/Host 설정 화면은 있음. tray/autostart/installer **미착수** |
-| 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** | 단위·통합 테스트 다수(OK). **제품 한 줄 E2E 시나리오/증적은 없음**. GCS dispatch 중단이 E2E 구멍 |
+| 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** | 단위·통합 테스트 다수(OK). UI: Master handoff propose/deliver + Activity 노출. **제품 한 줄 E2E 시나리오/증적은 아직 없음**. GCS dispatch QUEUED 잔존 |
 
 #### P1
 
@@ -83,10 +83,10 @@
 
 ```text
 project_connection: 1 (GCS)
-project_todo: 0
+project_todo: 0 (UI Seed worklist로 채움 가능; 로컬 미적용이면 0)
 project_dispatch: 1 (QUEUED — seed discovery)
 project_seed / projection: 3 / 3 (current seed in Universe store)
-project_master_handoff: 0
+project_master_handoff: 0 (UI propose/deliver 경로 추가; 로컬 미적용이면 0)
 release_artifact / release_proposal: 0 / 0
 skill_run_observation: 1
 experience_*: 0
@@ -106,9 +106,10 @@ P2 확장                                                    : NOT_STARTED
 
 **다음 착수 추천 (소스 갭 기준):**
 
-1. P0 E2E 한 시나리오 고정 **또는** Todo UI 실사용 채움 + Master 전달 polish  
+1. ~~Todo UI + Master 전달 polish~~ (UI 착수 완료 — 로컬 Seed/Deliver 실사용 검증 남음)  
 2. #6 LIVE_GAP — GCS Project Master Seed 발행으로 Dispatch 닫기  
-3. P1 Memory RAG는 P0 한 줄 선 후  
+3. P0 E2E 한 시나리오 고정(설치→연결→Master→handoff/dispatch→결과)  
+4. P1 Memory RAG는 P0 한 줄 선 후  
 
 ### 6) 변경 이력
 
@@ -116,3 +117,4 @@ P2 확장                                                    : NOT_STARTED
 |------|------|
 | (원본) | 대화+문서 통합 목록 |
 | 2026-07-31 | 소스/테스트/로컬 DB 대조 후 구현 수준 등급 표 추가 |
+| 2026-07-31 | Todo UI: priority filter, Send to Master, Seed worklist; Fresh/Skill handoff propose+deliver UI |

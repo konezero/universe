@@ -330,7 +330,19 @@
           <span class="wizard-complete-mark" aria-hidden="true">&#10003;</span>
           <h3>Project plan adopted</h3>
           <p id="fresh-project-adoption-ref"></p>
-          <button type="button" class="primary-button" data-close-dialog>Done</button>
+          <p id="fresh-project-handoff-status" class="handoff-status"></p>
+          <div class="wizard-handoff-actions">
+            <button id="propose-master-handoff-button" type="button" class="secondary-button">
+              Propose Master handoff
+            </button>
+            <button id="deliver-master-handoff-button" type="button" class="primary-button" hidden>
+              Deliver to Master
+            </button>
+          </div>
+          <p class="wizard-hint">
+            Delivery needs a selected Project Universe. It records planning context only — no Task Frame, no source write.
+          </p>
+          <button type="button" class="secondary-button" data-close-dialog>Done</button>
         </div>
       </section>
       <p id="fresh-project-error" class="form-error" role="alert"></p>
@@ -413,6 +425,19 @@
             <option value="DONE">Done</option>
           </select>
         </label>
+        <label>
+          Priority
+          <select id="todo-priority-filter">
+            <option value="ALL">All</option>
+            <option value="P0">P0</option>
+            <option value="P1">P1</option>
+            <option value="P2">P2</option>
+            <option value="P3">P3</option>
+          </select>
+        </label>
+        <button id="seed-worklist-button" class="secondary-button todo-seed-button" type="button" hidden>
+          Seed worklist
+        </button>
         <span id="todo-count" class="todo-count">0 items</span>
       </div>
       <div id="todo-list" class="todo-list" aria-live="polite"></div>
