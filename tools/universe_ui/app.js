@@ -1905,13 +1905,6 @@ function renderDetails() {
       label.title = "Open Todo work map";
       label.addEventListener("click", () => openTodoDialog(true));
       row.append(label);
-      if (todo.scope_kind !== "UNIVERSE" && todo.project_id) {
-        const send = node("button", "todo-context-master", "Master");
-        send.type = "button";
-        send.title = "Send this Todo to Project Master";
-        send.addEventListener("click", () => sendTodoToMaster(todo));
-        row.append(send);
-      }
       list.append(row);
     }
     todoGroup.append(list);
@@ -1946,7 +1939,7 @@ function renderDetails() {
           )
         );
         if (handoff.delivery_state === "PROPOSAL_ONLY") {
-          const deliver = node("button", "todo-context-master", "Deliver");
+          const deliver = node("button", "handoff-action", "Deliver");
           deliver.type = "button";
           deliver.title = "Deliver handoff to Project Master (approval=DELIVER)";
           deliver.addEventListener("click", () =>
@@ -2610,24 +2603,12 @@ function renderTodos() {
         state: todoState.value,
       })
     );
-    const sendMaster = node(
-      "button",
-      "secondary-button todo-send-master",
-      "Master"
-    );
-    sendMaster.type = "button";
-    sendMaster.title =
-      todo.scope_kind === "UNIVERSE"
-        ? "Universe todos stay in Conductor; bind to a Project first"
-        : "Send this Todo context to Project Master";
-    sendMaster.disabled = todo.scope_kind === "UNIVERSE" || !todo.project_id;
-    sendMaster.addEventListener("click", () => sendTodoToMaster(todo));
     const remove = node("button", "icon-button compact todo-delete", "\u00d7");
     remove.type = "button";
     remove.title = "Delete Todo";
     remove.setAttribute("aria-label", remove.title);
     remove.addEventListener("click", () => deleteTodo(todo));
-    controls.append(priority, todoState, save, sendMaster, remove);
+    controls.append(priority, todoState, save, remove);
     item.append(header, title, detail, controls);
     elements.todoList.append(item);
   }
@@ -2729,51 +2710,6 @@ function undeliveredSkillPlanAdoptions() {
   return state.skillPlanAdoptions.filter(
     (adoption) => !deliveredAdoptionIds.has(adoption.adoption_id)
   );
-}
-
-function todoMasterMessage(todo) {
-  const lines = [
-    `Todo review request (planning only, not execution).`,
-    `title: ${todo.title}`,
-    `priority: ${todo.priority}`,
-    `state: ${todo.state}`,
-    `scope: ${todoScopeLabel(todo)}`,
-    `todo_id: ${todo.todo_id}`,
-  ];
-  if (todo.detail) lines.push(`detail: ${todo.detail}`);
-  lines.push(
-    "Please propose the next bounded Project Master step. Do not start a Task Frame or mutate source without separate approval."
-  );
-  return lines.join("\n");
-}
-
-async function sendTodoToMaster(todo) {
-  if (!todo?.project_id || todo.scope_kind === "UNIVERSE") {
-    toast("Bind this Todo to a Project before sending to Master", true);
-    return;
-  }
-  const project = state.projects.find(
-    (item) => item.project_id === todo.project_id
-  );
-  if (!project) {
-    toast("Project is not connected", true);
-    return;
-  }
-  if (state.selectedProject?.project_id !== project.project_id) {
-    await selectProject(project.project_id);
-  }
-  state.conversationTarget = {
-    kind: "PROJECT_MASTER",
-    projectId: project.project_id,
-  };
-  renderComposerActions();
-  renderComposerState();
-  renderRoomMessages();
-  elements.dispatchInstruction.value = todoMasterMessage(todo);
-  elements.conversationLayer?.classList.remove("collapsed");
-  elements.todoDialog?.close();
-  elements.dispatchInstruction.focus();
-  toast(`Composer ready for ${project.project_id} Master`);
 }
 
 async function seedWorklistTodos() {

@@ -58,7 +58,7 @@
 
 | 항목 | 수준 | 비고 |
 |------|------|------|
-| Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위, Master 전달 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Send to Master** (composer 프리필) + **Seed worklist** (빈 프로젝트 5건). 실 DB 채움은 런타임 Seed 버튼 1회 |
+| Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** | graph canvas, inspector, conductor/master room 존재. 반응형·컨트롤 정비·완성도는 잔여 |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** / packaging **NOT_STARTED** | Provider/Host 설정 화면은 있음. tray/autostart/installer **미착수** |
 | 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** | 단위·통합 테스트 다수(OK). UI: Master handoff propose/deliver + Activity 노출. **제품 한 줄 E2E 시나리오/증적은 아직 없음**. GCS dispatch QUEUED 잔존 |
@@ -117,4 +117,5 @@ P2 확장                                                    : NOT_STARTED
 |------|------|
 | (원본) | 대화+문서 통합 목록 |
 | 2026-07-31 | 소스/테스트/로컬 DB 대조 후 구현 수준 등급 표 추가 |
-| 2026-07-31 | Todo UI: priority filter, Send to Master, Seed worklist; Fresh/Skill handoff propose+deliver UI |
+| 2026-07-31 | Todo UI: priority filter, Seed worklist; Fresh/Skill handoff propose+deliver UI |
+| 2026-07-31 | Todo→Master Queue 제거 (Todo=열람/지시 참고만, 전달 큐 불필요) |
