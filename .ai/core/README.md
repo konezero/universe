@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: 2045648041f86c8b0258a08e0c10104f4bfad7c9
+Source Commit: 0909c75b11abcf01c112f87435cd8a422ef33af0
 
 ## Entry
 
@@ -65,6 +65,7 @@ Source Commit: 2045648041f86c8b0258a08e0c10104f4bfad7c9
 - `.ai/core/PROJECT_ANCHOR.md`
 - `.ai/core/PROJECT_INSTANCE_RUNTIME_RULE.md`
 - `.ai/core/PROJECT_RUNTIME_INSTALL.md`
+- `.ai/core/PROVIDER_SESSION_CONNECTION.md`
 - `.ai/core/ROLE_LAUNCHER_POLICY.md`
 - `.ai/core/ROLE_MODE_AUTHORITY_GATE.md`
 - `.ai/core/RUNTIME_ANCHOR_FRAME_ROUTING_CONSTRAINT.md`
@@ -112,6 +113,7 @@ Source Commit: 2045648041f86c8b0258a08e0c10104f4bfad7c9
 - `.ai/runtime/reference_runtime/os_status_runtime.py`
 - `.ai/runtime/reference_runtime/profiles/continuity-command-v1.json`
 - `.ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json`
+- `.ai/runtime/reference_runtime/provider_session_runtime.py`
 - `.ai/runtime/reference_runtime/receipt_verifying_write_gateway.py`
 - `.ai/runtime/reference_runtime/session_boot_adapter.py`
 - `.ai/runtime/reference_runtime/session_boot_launcher.py`

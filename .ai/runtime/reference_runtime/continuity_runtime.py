@@ -190,6 +190,8 @@ def run_continuity_command(
     request: Mapping[str, Any],
     store: ContinuityStore | None = None,
 ) -> dict[str, Any]:
+    if operation == "handoff-append.attest":
+        return attest_handoff_append(request)
     if operation not in profile.command_policy:
         raise ContinuityCommandError(
             "CONTINUITY_OPERATION_UNSUPPORTED", f"unsupported operation: {operation}"
@@ -634,6 +636,9 @@ def _attest_handoff_append(request: Mapping[str, Any]) -> dict[str, Any]:
             "provider",
             "provider_write_capability",
             "target_path",
+            "target_repository_ref",
+            "target_branch",
+            "repository_default_branch",
             "selection_ref",
             "base_source_ref",
             "result_ref",
@@ -664,11 +669,32 @@ def _attest_handoff_append(request: Mapping[str, Any]) -> dict[str, Any]:
             "HANDOFF_APPEND_PATH_FORBIDDEN",
             "target_path is not a Runtime-owned append-only path",
         )
+    provider = _required_text(request.get("provider"), "provider")
+    repository_target: dict[str, str] = {}
+    if provider.lower() in {"git", "github", "gitlab", "bitbucket"}:
+        target_repository_ref = _required_text(
+            request.get("target_repository_ref"), "target_repository_ref"
+        )
+        target_branch = _required_text(request.get("target_branch"), "target_branch")
+        repository_default_branch = _required_text(
+            request.get("repository_default_branch"), "repository_default_branch"
+        )
+        if target_branch != repository_default_branch:
+            raise ContinuityCommandError(
+                "HANDOFF_APPEND_TARGET_BRANCH_MISMATCH",
+                "target_branch must equal the provider-observed repository_default_branch",
+            )
+        repository_target = {
+            "target_repository_ref": target_repository_ref,
+            "target_branch": target_branch,
+            "repository_default_branch": repository_default_branch,
+        }
     evidence = {
-        "schema": "ai-career.handoff-append-evidence.v1",
+        "schema": "ai-career.handoff-append-evidence.v2",
         "operation_class": "HANDOFF_APPEND",
-        "provider": _required_text(request.get("provider"), "provider"),
+        "provider": provider,
         "target_path": target_path,
+        **repository_target,
         "selection_ref": _required_text(request.get("selection_ref"), "selection_ref"),
         "base_source_ref": _required_text(
             request.get("base_source_ref"), "base_source_ref"
@@ -684,6 +710,21 @@ def _attest_handoff_append(request: Mapping[str, Any]) -> dict[str, Any]:
         "repository_write": False,
         "execution_host_required": False,
         "evidence": evidence,
+    }
+
+
+def attest_handoff_append(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate provider-native append evidence without an installed Runtime."""
+
+    result = _attest_handoff_append(request)
+    return {
+        "schema": "ai-career.handoff-append-result.v1",
+        "operation": "handoff-append.attest",
+        "repository_write": False,
+        "runtime_state_write": False,
+        "authority_created": False,
+        "activation_performed": False,
+        "result": result,
     }
 
 

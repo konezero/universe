@@ -34,6 +34,10 @@ from .os_status_runtime import (
     OsStatusError,
     evaluate_source_only_os_status,
 )
+from .provider_session_runtime import (
+    ProviderSessionError,
+    evaluate_provider_session_connection,
+)
 from .receipt_verifying_write_gateway import ReceiptVerifyingWriteGateway
 from .session_boot_adapter import (
     PreparedSessionBoot,
@@ -76,6 +80,7 @@ __all__ = [
     "ModeRegistry",
     "ModeRegistryError",
     "OsStatusError",
+    "ProviderSessionError",
     "PreparedSessionBoot",
     "ReceiptVerifyingWriteGateway",
     "ParentObservation",
@@ -91,6 +96,7 @@ __all__ = [
     "invoke_task_frame_runtime",
     "invoke_execution_guard",
     "evaluate_source_only_os_status",
+    "evaluate_provider_session_connection",
     "apply_execution_binding",
     "load_profile",
     "load_mode_registry",

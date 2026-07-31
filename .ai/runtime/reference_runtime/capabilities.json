@@ -5,6 +5,7 @@
     "anchor_session_memory": "AVAILABLE",
     "governance_boot": "AVAILABLE",
     "mode_registry_resolution": "AVAILABLE",
+    "provider_session_connection": "AVAILABLE",
     "master_mode_registry_management": "AVAILABLE",
     "session_boot_executor": "AVAILABLE",
     "task_assignment_proposal": "AVAILABLE",

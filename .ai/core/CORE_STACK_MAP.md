@@ -18,6 +18,7 @@ Use it to decide where a concept belongs and which document should be loaded fir
 ```text
 L0 INTERPRETS.
 L1 ALIGNS.
+PROVIDER CONNECTION ROUTES TO ONE LAST SESSION COORDINATE.
 ANCHOR TIME ADVANCES THE CURRENT COORDINATE.
 LIFECYCLE ORDERS SESSION AUTHORITY.
 COMMANDS ROUTE INSIDE LIFECYCLE.
@@ -163,6 +164,20 @@ Project observation
   -> Template Candidate
   -> ai-career instruction/model update if adopted
 ```
+
+## Provider Session Connection
+
+```text
+Connection target
+  -> one last Provider + Session Ref
+  -> Provider opens or resumes
+  -> same coordinate: no greeting
+  -> new or replaced coordinate: requested Mode greeting once
+```
+
+This routing coordinate is not an Anchor and does not establish currentness,
+authority, Assignment, or execution permission. Task Frame Boss and Worker
+invocations are ephemeral and do not change the target's last coordinate.
 
 ## Anchor Flow
 

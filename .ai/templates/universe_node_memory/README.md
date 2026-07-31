@@ -61,5 +61,11 @@ memory-sync node-prepare
   -> separately approved provider HANDOFF_APPEND
 ```
 
+For repository-backed storage, the append target is the provider-observed
+repository default branch. The source PR, Candidate branch, BOOT source, and
+current checkout remain source references only. If provider write or
+default-branch evidence is unavailable, stop without writing to the local
+checkout.
+
 Preparation does not create a directory or file. The target is valid only for
 the selected normalized graph and node identifier.

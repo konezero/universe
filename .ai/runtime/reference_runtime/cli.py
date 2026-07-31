@@ -33,8 +33,13 @@ if __package__:
         OsStatusError,
         evaluate_source_only_os_status,
     )
+    from .provider_session_runtime import (
+        ProviderSessionError,
+        evaluate_provider_session_connection,
+    )
     from .continuity_runtime import (
         ContinuityCommandError,
+        attest_handoff_append,
         load_continuity_profile,
         run_continuity_command,
     )
@@ -76,8 +81,13 @@ else:
         OsStatusError,
         evaluate_source_only_os_status,
     )
+    from reference_runtime.provider_session_runtime import (
+        ProviderSessionError,
+        evaluate_provider_session_connection,
+    )
     from reference_runtime.continuity_runtime import (
         ContinuityCommandError,
+        attest_handoff_append,
         load_continuity_profile,
         run_continuity_command,
     )
@@ -1261,6 +1271,20 @@ def _source_review(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
     return (0 if result["status"] == "SOURCE_REVIEW_PERMITTED" else 4), result
 
 
+def _provider_session(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
+    if not args or args[0] != "evaluate":
+        raise CliFailure("CLI_USAGE_ERROR", "provider-session requires evaluate")
+    options = _parse_options(
+        args[1:],
+        required=frozenset({"--request"}),
+    )
+    request = _load_request(options["--request"])
+    try:
+        return 0, evaluate_provider_session_connection(request)
+    except ProviderSessionError as error:
+        raise CliFailure(error.error_code, error.detail, 4) from error
+
+
 def _continuity_command(
     command: str, args: Sequence[str]
 ) -> tuple[int, Mapping[str, Any]]:
@@ -1299,8 +1323,10 @@ def _continuity_command(
     request = _load_request(options["--request"])
     store: ContinuityStore | None = None
     try:
-        profile = load_continuity_profile(repo_root, profile_path)
         full_operation = f"{command}.{operation}"
+        if full_operation == "handoff-append.attest":
+            return 0, attest_handoff_append(request)
+        profile = load_continuity_profile(repo_root, profile_path)
         if full_operation in {"checkpoint.save", "resume-save.save"}:
             store = ContinuityStore.open_for_write(repo_root)
         elif full_operation in {
@@ -1418,6 +1444,7 @@ def _help() -> Mapping[str, Any]:
                 "--request <path|->"
             ),
             "source-review check --request <path|->",
+            "provider-session evaluate --request <path|->",
         ],
     }
 
@@ -1487,6 +1514,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             code, payload = _anchor_currentness(command_args)
         elif command == "source-review":
             code, payload = _source_review(command_args)
+        elif command == "provider-session":
+            code, payload = _provider_session(command_args)
         else:
             raise CliFailure(
                 "CAPABILITY_UNSUPPORTED",

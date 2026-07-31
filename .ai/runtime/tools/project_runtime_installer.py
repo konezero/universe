@@ -2188,6 +2188,14 @@ def _render_generated_surface(
             Mode Definition Digest: UNKNOWN
             Executable Runtime Currentness: UNKNOWN
             Interaction Carrier: UNKNOWN
+            Provider Session Target: UNKNOWN
+            Last Provider: UNKNOWN
+            Last Provider Session Ref: UNKNOWN
+            Requested Mode: UNKNOWN
+            Provider Session Connection State: UNKNOWN
+            Provider Session Greeting Required: UNKNOWN
+            Provider Session Persistence: UNKNOWN
+            Provider Session Authority: false
             Execution Host Ref: UNKNOWN
             Execution Host Capability: UNKNOWN
             Execution Host Binding: UNKNOWN
@@ -2284,6 +2292,14 @@ STATE_SHAPE_COMPATIBILITY: dict[str, dict[str, Any]] = {
             "Mode Definition Digest",
             "Executable Runtime Currentness",
             "Interaction Carrier",
+            "Provider Session Target",
+            "Last Provider",
+            "Last Provider Session Ref",
+            "Requested Mode",
+            "Provider Session Connection State",
+            "Provider Session Greeting Required",
+            "Provider Session Persistence",
+            "Provider Session Authority",
             "Execution Host Ref",
             "Execution Host Capability",
             "Execution Host Binding",

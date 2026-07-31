@@ -20,6 +20,14 @@ Mode Registry Revision: UNKNOWN
 Mode Registry Digest: UNKNOWN
 Mode Definition Digest: UNKNOWN
 Executable Runtime Currentness: UNKNOWN
+Provider Session Target: UNKNOWN
+Last Provider: UNKNOWN
+Last Provider Session Ref: UNKNOWN
+Requested Mode: UNKNOWN
+Provider Session Connection State: UNKNOWN
+Provider Session Greeting Required: UNKNOWN
+Provider Session Persistence: UNKNOWN
+Provider Session Authority: UNKNOWN
 Interaction Carrier: UNKNOWN
 Execution Host Ref: UNKNOWN
 Execution Host Capability: UNKNOWN

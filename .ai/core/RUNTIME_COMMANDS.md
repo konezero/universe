@@ -411,6 +411,14 @@ Archive evidence. It requires an approved provider write capability, an exact
 Runtime-owned append path, explicit user selection or approval, and provider
 write evidence. It does not require an executable Runtime merely to append.
 
+For repository-backed handoff storage, the provider-observed repository default
+branch is the only append target. A PR, Candidate branch, source-only BOOT
+commit, or current checkout is recorded as `base_source_ref`; it never becomes
+the append target. Missing installed Runtime metadata may block local
+preparation, but it does not block an approved provider append. If the provider
+cannot prove its write capability and default branch, the operation stops
+without a local filesystem or Git fallback.
+
 `SOURCE_MUTATION` covers source, Core, templates, configuration,
 project-owned artifacts, and external systems. It never uses `HANDOFF_APPEND`.
 It requires an execution evidence Host. A Host that cannot provide one returns

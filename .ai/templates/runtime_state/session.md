@@ -69,6 +69,16 @@ transport:
   evidence_ref: <host-evidence-ref-or-UNKNOWN>
   authority: false
 
+provider_session_connection:
+  target_ref: <connection-target-or-UNKNOWN>
+  last_provider: <provider-or-UNKNOWN>
+  last_session_ref: <provider-session-ref-or-UNKNOWN>
+  requested_mode: <mode-intent-or-UNKNOWN>
+  state: NEW | REPLACED | REUSED | UNKNOWN
+  greeting_required: true | false | UNKNOWN
+  persistence: LAST_COORDINATE | EPHEMERAL | UNKNOWN
+  authority: false
+
 session_preparation:
   state: PREPARED | REHYDRATED | UNKNOWN
   mode: <selected-mode-or-UNKNOWN>
@@ -204,6 +214,15 @@ Transport State: <ATTACHED | DETACHED | RECONNECTED | ROUTE_CHANGED | UNKNOWN>
 Transport Observed At: <host-observation-time-or-UNKNOWN>
 Transport Evidence: <host-evidence-ref-or-UNKNOWN>
 Transport Authority: false
+
+Provider Session Target: <connection-target-or-UNKNOWN>
+Last Provider: <provider-or-UNKNOWN>
+Last Provider Session Ref: <provider-session-ref-or-UNKNOWN>
+Requested Mode: <mode-intent-or-UNKNOWN>
+Provider Session Connection State: <NEW | REPLACED | REUSED | UNKNOWN>
+Provider Session Greeting Required: <true | false | UNKNOWN>
+Provider Session Persistence: <LAST_COORDINATE | EPHEMERAL | UNKNOWN>
+Provider Session Authority: false
 
 Runtime Frame:
   session_id: <current-session-id>

@@ -9,6 +9,12 @@ Runtime-owned path, explicit selection, and provider evidence. Inbox append is
 not source mutation and does not imply adoption, execution authority, or an
 Execution Assignment.
 
+For repository-backed storage, append only to the provider-observed repository
+default branch. A PR, Candidate branch, BOOT source, or current checkout is a
+source reference only. Missing installed Runtime metadata must not redirect the
+append into the local checkout. If provider write or default-branch evidence is
+unavailable, preserve only the passive artifact and stop.
+
 ## Assembly Gate
 
 Before creating an inbox, resolve its owner through the installed Mode
@@ -108,13 +114,15 @@ observed_at: <ISO-8601 timestamp>
 
 1. Inbox items are metadata, not authority.
 2. Append requires an approved provider capability and exact target path.
-3. Processing or adoption is a separate receiving-Parent decision.
-4. Do not store secrets.
-5. Do not store private chain-of-thought.
-6. Keep full evidence in the referenced provider or repository artifact.
-7. Deleting a Mode preserves its Inbox in place without moving, archiving,
+3. Repository append targets the provider-observed default branch; source and
+   working branches never select the destination.
+4. Processing or adoption is a separate receiving-Parent decision.
+5. Do not store secrets.
+6. Do not store private chain-of-thought.
+7. Keep full evidence in the referenced provider or repository artifact.
+8. Deleting a Mode preserves its Inbox in place without moving, archiving,
    deleting, or rewriting it.
-8. Re-adding the same Mode reuses the preserved Inbox and continues its
+9. Re-adding the same Mode reuses the preserved Inbox and continues its
    existing queue and processed history.
-9. Adding a Mode with no Inbox assembles this target shape in the same approved
+10. Adding a Mode with no Inbox assembles this target shape in the same approved
    Mode creation operation.
