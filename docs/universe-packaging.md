@@ -83,10 +83,60 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\uninstall-user.ps1
 - Does not implement a native tray icon yet (follow-up: optional tray host).
 - Does not grant project authority or Execution Assignment.
 
+## Portable package (zip / folder)
+
+Build from the repository root:
+
+```powershell
+python tools/build_portable.py
+# folder only:
+python tools/build_portable.py --no-zip
+```
+
+Output:
+
+```text
+dist/portable/UniversePortable-YYYYMMDD/
+dist/portable/UniversePortable-YYYYMMDD.zip
+```
+
+Layout:
+
+```text
+UniversePortable-*/
+  Start-Universe.cmd
+  Start-Universe-Headless.cmd
+  Start-Universe-Tray.cmd
+  Stop-Universe.cmd
+  Status-Universe.cmd
+  tools/
+  packaging/
+  docs/
+  .ai/runtime/project_instance/mode_registry.json
+  data/          # portable server.json + sqlite
+  logs/
+  README-PORTABLE.txt
+  VERSION.txt
+```
+
+Launchers set:
+
+```text
+UNIVERSE_DATA_DIR
+UNIVERSE_STATE_FILE
+UNIVERSE_DATABASE
+UNIVERSE_LOG_FILE
+UNIVERSE_MODE_REGISTRY
+```
+
+so state stays inside the package when the folder is moved. Python is **not**
+bundled; the Host must provide `python` on `PATH`.
+
 ## Follow-ups
 
 1. ~~Optional system tray process~~ → `packaging/windows/Universe-Tray.ps1` + `tray` CLI
-2. Single-folder portable zip with pinned Python runtime.
+2. ~~Single-folder portable zip~~ → `tools/build_portable.py` (Python still Host-provided)
 3. MSIX / signed installer for non-developer users.
-4. In-app settings panel actions that shell out only via Host-approved control.
-5. Custom tray icon asset (currently uses application system icon).
+4. Embed/pin a private Python runtime inside the portable zip.
+5. In-app settings panel actions that shell out only via Host-approved control.
+6. Custom tray icon asset (currently uses application system icon).

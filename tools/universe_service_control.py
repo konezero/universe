@@ -20,15 +20,48 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER_SCRIPT = Path(__file__).resolve().with_name("universe_server.py")
 
 
-def default_state_path() -> Path:
+def default_data_dir() -> Path:
+    portable = os.environ.get("UNIVERSE_DATA_DIR")
+    if portable:
+        return Path(portable).expanduser()
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / "Universe" / "server.json"
-    return Path.home() / ".local" / "share" / "universe" / "server.json"
+        return Path(local_app_data) / "Universe"
+    return Path.home() / ".local" / "share" / "universe"
+
+
+def default_state_path() -> Path:
+    override = os.environ.get("UNIVERSE_STATE_FILE")
+    if override:
+        return Path(override).expanduser()
+    return default_data_dir() / "server.json"
+
+
+def default_database_path() -> Path:
+    override = os.environ.get("UNIVERSE_DATABASE")
+    if override:
+        return Path(override).expanduser()
+    return default_data_dir() / "universe.sqlite3"
 
 
 def default_log_path() -> Path:
-    return default_state_path().parent / "service.log"
+    override = os.environ.get("UNIVERSE_LOG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return default_data_dir() / "service.log"
+
+
+def default_mode_registry_path() -> Path:
+    override = os.environ.get("UNIVERSE_MODE_REGISTRY")
+    if override:
+        return Path(override).expanduser()
+    return (
+        Path(__file__).resolve().parents[1]
+        / ".ai"
+        / "runtime"
+        / "project_instance"
+        / "mode_registry.json"
+    )
 
 
 def load_state(path: Path | None = None) -> dict[str, Any] | None:
@@ -170,12 +203,18 @@ def stop_service(
 def start_service(
     *,
     state_path: Path | None = None,
+    database_path: Path | None = None,
+    mode_registry: Path | None = None,
     open_ui: bool = True,
     python_executable: str | None = None,
     log_path: Path | None = None,
+    working_directory: Path | None = None,
     wait_seconds: float = 12.0,
 ) -> dict[str, Any]:
     path = (state_path or default_state_path()).expanduser()
+    database = (database_path or default_database_path()).expanduser()
+    registry = (mode_registry or default_mode_registry_path()).expanduser()
+    workdir = (working_directory or ROOT).expanduser()
     current = service_status(path)
     if current.get("status") == "READY" and current.get("pid_running"):
         return {
@@ -186,12 +225,18 @@ def start_service(
     python = python_executable or sys.executable
     log_file = (log_path or default_log_path()).expanduser()
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    database.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     args = [
         python,
         str(SERVER_SCRIPT),
         "serve",
         "--state-file",
         str(path),
+        "--database",
+        str(database),
+        "--mode-registry",
+        str(registry),
     ]
     if open_ui:
         args.append("--open-ui")
@@ -207,7 +252,7 @@ def start_service(
         )
     process = subprocess.Popen(
         args,
-        cwd=str(ROOT),
+        cwd=str(workdir),
         stdout=stdout,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
@@ -237,11 +282,20 @@ def start_service(
 def restart_service(
     *,
     state_path: Path | None = None,
+    database_path: Path | None = None,
+    mode_registry: Path | None = None,
     open_ui: bool = False,
+    working_directory: Path | None = None,
 ) -> dict[str, Any]:
     path = state_path or default_state_path()
     stop_result = stop_service(path)
-    start_result = start_service(state_path=path, open_ui=open_ui)
+    start_result = start_service(
+        state_path=path,
+        database_path=database_path,
+        mode_registry=mode_registry,
+        open_ui=open_ui,
+        working_directory=working_directory,
+    )
     return {
         "schema": "universe.local-service-control.v1",
         "status": start_result.get("status"),

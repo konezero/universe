@@ -79,4 +79,11 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\install-user.ps1
 powershell -ExecutionPolicy Bypass -File packaging\windows\install-user.ps1 -Autostart
 ```
 
+Portable folder/zip (data stays inside the package):
+
+```powershell
+python tools/build_portable.py
+# -> dist/portable/UniversePortable-YYYYMMDD.zip
+```
+
 Details: `docs/universe-packaging.md`.

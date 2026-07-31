@@ -234,13 +234,20 @@ UNIVERSE_MODE_INTENTS = {
     "\ucee8\ub355\ud130": UNIVERSE_MODE,
     "\ucee8\ub355\ud130\ubaa8\ub4dc": UNIVERSE_MODE,
 }
-DEFAULT_MODE_REGISTRY_PATH = (
-    Path(__file__).resolve().parents[1]
-    / ".ai"
-    / "runtime"
-    / "project_instance"
-    / "mode_registry.json"
-)
+def default_mode_registry_path() -> Path:
+    override = os.environ.get("UNIVERSE_MODE_REGISTRY")
+    if override:
+        return Path(override).expanduser()
+    return (
+        Path(__file__).resolve().parents[1]
+        / ".ai"
+        / "runtime"
+        / "project_instance"
+        / "mode_registry.json"
+    )
+
+
+DEFAULT_MODE_REGISTRY_PATH = default_mode_registry_path()
 UI_ROOT = Path(__file__).resolve().with_name("universe_ui")
 
 
@@ -362,6 +369,9 @@ def utc_now() -> str:
 
 
 def default_data_dir() -> Path:
+    portable = os.environ.get("UNIVERSE_DATA_DIR")
+    if portable:
+        return Path(portable).expanduser()
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         return Path(local_app_data) / "Universe"
@@ -369,10 +379,16 @@ def default_data_dir() -> Path:
 
 
 def default_database_path() -> Path:
+    override = os.environ.get("UNIVERSE_DATABASE")
+    if override:
+        return Path(override).expanduser()
     return default_data_dir() / "universe.sqlite3"
 
 
 def default_state_path() -> Path:
+    override = os.environ.get("UNIVERSE_STATE_FILE")
+    if override:
+        return Path(override).expanduser()
     return default_data_dir() / "server.json"
 
 
@@ -12164,7 +12180,9 @@ def parser() -> argparse.ArgumentParser:
         help="Keep the local service headless.",
     )
     serve.set_defaults(open_ui=True)
-    serve.add_argument("--mode-registry", type=Path, default=DEFAULT_MODE_REGISTRY_PATH)
+    serve.add_argument(
+        "--mode-registry", type=Path, default=default_mode_registry_path()
+    )
 
     status_command = commands.add_parser(
         "status",
@@ -12180,6 +12198,12 @@ def parser() -> argparse.ArgumentParser:
     )
     start_command.add_argument(
         "--state-file", type=Path, default=default_state_path()
+    )
+    start_command.add_argument(
+        "--database", type=Path, default=default_database_path()
+    )
+    start_command.add_argument(
+        "--mode-registry", type=Path, default=default_mode_registry_path()
     )
     start_command.add_argument(
         "--open-ui",
@@ -12207,6 +12231,12 @@ def parser() -> argparse.ArgumentParser:
     )
     restart_command.add_argument(
         "--state-file", type=Path, default=default_state_path()
+    )
+    restart_command.add_argument(
+        "--database", type=Path, default=default_database_path()
+    )
+    restart_command.add_argument(
+        "--mode-registry", type=Path, default=default_mode_registry_path()
     )
     restart_command.add_argument(
         "--open-ui",
@@ -12354,6 +12384,8 @@ def main() -> int:
             elif args.command == "start":
                 result = start_service(
                     state_path=args.state_file,
+                    database_path=args.database,
+                    mode_registry=args.mode_registry,
                     open_ui=bool(args.open_ui),
                 )
             elif args.command == "stop":
@@ -12361,6 +12393,8 @@ def main() -> int:
             else:
                 result = restart_service(
                     state_path=args.state_file,
+                    database_path=args.database,
+                    mode_registry=args.mode_registry,
                     open_ui=bool(args.open_ui),
                 )
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
