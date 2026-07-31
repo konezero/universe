@@ -56,5 +56,11 @@ The initial contract is documented in
 `docs/official-development-seed-v0.md`.
 
 Local product E2E (GCS seed + Master line) is fixed in
-`docs/universe-e2e-product-scenario.md`. Service and dispatch contracts are in
-`docs/local-universe-service.md`.
+`docs/universe-e2e-product-scenario.md`. Smoke:
+
+```powershell
+python tools/universe_e2e_smoke.py run
+python tools/universe_e2e_smoke.py check
+```
+
+Service and dispatch contracts are in `docs/local-universe-service.md`.

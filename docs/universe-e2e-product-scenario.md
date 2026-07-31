@@ -309,6 +309,24 @@ path, approval, or seed-asset apply.
 **Scenario FAIL** if any required step ends in a blocking error above, or if
 dispatch remains `QUEUED` after approved deliver while inbox path is valid.
 
+## Automated smoke harness
+
+```powershell
+# Isolated in-process product line (CI-safe)
+python tools/universe_e2e_smoke.py run
+
+# Observe the running local service from %LOCALAPPDATA%\Universe\server.json
+python tools/universe_e2e_smoke.py check
+python tools/universe_e2e_smoke.py check --json
+
+# Unit tests for the harness
+python -m pytest tests/test_universe_e2e_product_scenario.py -q
+```
+
+`run` closes seed discovery dispatch through COMPLETED without Host seed-asset
+apply (that Host path remains a live `check` criterion). `check` requires a
+READY local service and reports PASS/FAIL per step for the GCS line.
+
 ## Related documents
 
 - `docs/local-universe-service.md` — service, register, inbox, dispatch APIs

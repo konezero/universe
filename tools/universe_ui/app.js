@@ -10,6 +10,10 @@ const state = {
   releaseProposals: [],
   masterHandoffs: [],
   skillPlanAdoptions: [],
+  skillObservations: [],
+  skillBench: [],
+  experienceCases: [],
+  experiencePatterns: [],
   selectedNode: null,
   focusedNodeId: null,
   view: "timeline",
@@ -94,6 +98,7 @@ const elements = {
   graphEmpty: document.querySelector("#graph-empty"),
   details: document.querySelector("#details-panel"),
   activity: document.querySelector("#activity-panel"),
+  benchPanel: document.querySelector("#bench-panel"),
   dispatchForm: document.querySelector("#dispatch-form"),
   dispatchSubmit: document.querySelector("#dispatch-submit"),
   dispatchInstruction: document.querySelector("#dispatch-instruction"),
@@ -599,6 +604,10 @@ async function selectProject(projectId) {
     permissionResult,
     handoffResult,
     skillPlanAdoptionResult,
+    observationResult,
+    benchResult,
+    experienceResult,
+    patternResult,
   ] = await Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
       () => null
@@ -616,6 +625,16 @@ async function selectProject(projectId) {
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/skill-plan-adoptions`
     ).catch(() => ({ adoptions: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/skill-observations`
+    ).catch(() => ({ observations: [] })),
+    api("/v1/bench/skills").catch(() => ({ bench: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/experience-cases`
+    ).catch(() => ({ cases: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/experience-pattern-proposals`
+    ).catch(() => ({ proposals: [] })),
   ]);
   state.projection = projectionResult?.projection || null;
   state.dispatches = await Promise.all(
@@ -631,6 +650,10 @@ async function selectProject(projectId) {
   state.projectPermissions = permissionResult.permissions || [];
   state.masterHandoffs = handoffResult.handoffs || [];
   state.skillPlanAdoptions = skillPlanAdoptionResult.adoptions || [];
+  state.skillObservations = observationResult.observations || [];
+  state.skillBench = benchResult.bench || [];
+  state.experienceCases = experienceResult.cases || [];
+  state.experiencePatterns = patternResult.proposals || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -639,6 +662,7 @@ async function selectProject(projectId) {
   buildGraph();
   renderDetails();
   renderActivity();
+  renderBench();
   renderRoomMessages();
   renderReleaseCatalog();
   elements.todoProject.value = projectId;
@@ -3451,6 +3475,210 @@ function showInspectorTab(name) {
   }
   elements.details.classList.toggle("hidden", name !== "details");
   elements.activity.classList.toggle("hidden", name !== "activity");
+  if (elements.benchPanel) {
+    elements.benchPanel.classList.toggle("hidden", name !== "bench");
+  }
+  if (name === "bench") renderBench();
+}
+
+function projectBenchRows() {
+  const projectSkillIds = new Set(
+    state.skillObservations
+      .map((item) => item.skill?.skill_id)
+      .filter(Boolean)
+  );
+  if (!projectSkillIds.size) return state.skillBench.slice(0, 12);
+  return state.skillBench
+    .filter((item) => projectSkillIds.has(item.skill?.skill_id))
+    .slice(0, 12);
+}
+
+function renderBench() {
+  if (!elements.benchPanel) return;
+  elements.benchPanel.replaceChildren();
+  if (!state.selectedProject) {
+    elements.benchPanel.append(
+      node("p", "empty-copy", "Select a project to inspect Bench and Experience")
+    );
+    return;
+  }
+
+  const obsGroup = node("div", "detail-group");
+  obsGroup.append(
+    node(
+      "h3",
+      "",
+      `Skill observations (${state.skillObservations.length})`
+    )
+  );
+  if (!state.skillObservations.length) {
+    obsGroup.append(
+      node(
+        "p",
+        "empty-copy",
+        "No redacted Skill observations yet. Publish from a Project Task Frame run."
+      )
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const observation of state.skillObservations.slice(0, 8)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${observation.outcome || "UNKNOWN"} · ${observation.skill?.skill_id || "skill"} · ${observation.validation_state || "NOT_RUN"} · ${observation.observed_at || ""}`
+        )
+      );
+    }
+    obsGroup.append(list);
+    const record = node(
+      "button",
+      "secondary-button compact-action",
+      "Record Experience Case"
+    );
+    record.type = "button";
+    record.title =
+      "Create an Experience Case from the latest observation (causal_state stays NOT_INFERRED)";
+    record.addEventListener("click", () =>
+      recordExperienceCaseFromLatestObservation()
+    );
+    obsGroup.append(record);
+  }
+  elements.benchPanel.append(obsGroup);
+
+  const benchGroup = node("div", "detail-group");
+  const benchRows = projectBenchRows();
+  benchGroup.append(
+    node("h3", "", `Skill bench (${benchRows.length})`)
+  );
+  if (!benchRows.length) {
+    benchGroup.append(
+      node(
+        "p",
+        "empty-copy",
+        "No bench aggregates yet. Aggregates appear after Skill observations are ingested."
+      )
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const row of benchRows) {
+      const succeeded = row.outcomes?.SUCCEEDED ?? 0;
+      const failed = row.outcomes?.FAILED ?? 0;
+      list.append(
+        node(
+          "li",
+          "",
+          `${row.skill?.skill_id || "skill"} · ${row.provider_ref || "UNKNOWN"} · n=${row.observation_count || 0} · ok=${succeeded} fail=${failed}`
+        )
+      );
+    }
+    benchGroup.append(list);
+  }
+  elements.benchPanel.append(benchGroup);
+
+  const caseGroup = node("div", "detail-group");
+  caseGroup.append(
+    node("h3", "", `Experience cases (${state.experienceCases.length})`)
+  );
+  if (!state.experienceCases.length) {
+    caseGroup.append(
+      node(
+        "p",
+        "empty-copy",
+        "No Experience Cases. Record one from an observation first."
+      )
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const item of state.experienceCases.slice(0, 8)) {
+      const row = node("li", "bench-case-row");
+      row.append(
+        node(
+          "span",
+          "",
+          `${item.case_state || "OBSERVED"} · ${item.causal_state || "NOT_INFERRED"} · ${item.title || item.case_id}`
+        )
+      );
+      const match = node("button", "handoff-action", "Match");
+      match.type = "button";
+      match.title = "Compare this case with other cases in the same Project";
+      match.addEventListener("click", () => matchExperienceCase(item.case_id));
+      row.append(match);
+      list.append(row);
+    }
+    caseGroup.append(list);
+  }
+  if (state.experiencePatterns.length) {
+    caseGroup.append(
+      node(
+        "p",
+        "context-copy",
+        `Pattern proposals: ${state.experiencePatterns.length} (PROPOSAL_ONLY)`
+      )
+    );
+  }
+  elements.benchPanel.append(caseGroup);
+}
+
+async function recordExperienceCaseFromLatestObservation() {
+  if (!state.selectedProject) {
+    toast("Select a project", true);
+    return;
+  }
+  const observation = state.skillObservations[0];
+  if (!observation?.observation_id) {
+    toast("No Skill observation available", true);
+    return;
+  }
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(
+        state.selectedProject.project_id
+      )}/experience-cases`,
+      {
+        method: "POST",
+        body: {
+          observation_ids: [observation.observation_id],
+          title: `Case for ${observation.skill?.skill_id || observation.observation_id}`,
+        },
+      }
+    );
+    const created = result.case || result;
+    state.experienceCases = [
+      created,
+      ...state.experienceCases.filter(
+        (item) => item.case_id !== created.case_id
+      ),
+    ];
+    renderBench();
+    toast("Experience Case recorded (NOT_INFERRED)");
+    showInspectorTab("bench");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function matchExperienceCase(caseId) {
+  if (!state.selectedProject || !caseId) return;
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(
+        state.selectedProject.project_id
+      )}/experience-matches`,
+      {
+        method: "POST",
+        body: { case_id: caseId, limit: 10 },
+      }
+    );
+    const matches = result.matches || result.candidates || [];
+    toast(
+      matches.length
+        ? `Experience match: ${matches.length} similar case(s) (OBSERVED_SIMILARITY)`
+        : "No similar Experience Cases yet"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function toast(message, error = false) {

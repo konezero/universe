@@ -855,6 +855,25 @@ body.inspector-open .inspector {
   display: none;
 }
 
+.bench-list {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.bench-case-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.bench-case-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .detail-group {
   padding: 0 0 14px;
   border-bottom: 1px solid var(--line);
