@@ -61,7 +61,7 @@
 | Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** | graph canvas, inspector, conductor/master room 존재. 반응형·컨트롤 정비·완성도는 잔여 |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** / packaging **NOT_STARTED** | Provider/Host 설정 화면은 있음. tray/autostart/installer **미착수** |
-| 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** | 단위·통합 테스트 다수(OK). UI handoff + live seed dispatch **COMPLETED** 증적 있음. **제품 한 줄 E2E 시나리오 문서화는 아직** |
+| 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** → **시나리오 고정** | 정본: `docs/universe-e2e-product-scenario.md` (`UNIVERSE_E2E_GCS_SEED_AND_MASTER_LINE_V1`). 라이브 COMPLETED 증적 수록. 자동화 테스트 하네스는 후속 |
 
 #### P1
 
@@ -108,9 +108,10 @@ P2 확장                                                    : NOT_STARTED
 
 1. ~~Todo UI polish~~  
 2. ~~#6 LIVE_GAP seed discovery dispatch 닫기~~  
-3. P0 E2E 한 시나리오 문서/고정(설치→연결→Master→handoff/dispatch→결과)  
+3. ~~P0 E2E 한 시나리오 문서/고정~~ → `docs/universe-e2e-product-scenario.md`  
 4. UI 지도/컨트롤 정비 또는 packaging  
 5. P1 Memory RAG는 P0 한 줄 선 후  
+6. (후속) E2E 시나리오 자동화 스모크 하네스
 
 ### 6) 변경 이력
 
@@ -122,3 +123,4 @@ P2 확장                                                    : NOT_STARTED
 | 2026-07-31 | Todo→Master Queue 제거 (Todo=열람/지시 참고만, 전달 큐 불필요) |
 | 2026-07-31 | #6: `.ai/master/inbox` deliver 허용; seed dispatch COMPLETED; GCS seed assets apply |
 | 2026-07-31 | 문서 정본: `local-universe-service.md` MASTER inbox 경로 계약 고정 (default `.ai/inbox/MASTER` + alternate `.ai/master/inbox`) |
+| 2026-07-31 | P0 E2E 시나리오 고정: `docs/universe-e2e-product-scenario.md` |

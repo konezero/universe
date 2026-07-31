@@ -54,3 +54,7 @@ python -m unittest discover -s tests -v
 
 The initial contract is documented in
 `docs/official-development-seed-v0.md`.
+
+Local product E2E (GCS seed + Master line) is fixed in
+`docs/universe-e2e-product-scenario.md`. Service and dispatch contracts are in
+`docs/local-universe-service.md`.

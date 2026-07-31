@@ -103,6 +103,19 @@ Each attached project remains responsible for its own source mutation,
 validation, Execution Guard, and evidence. Universe stores project roots and
 evidence references; it does not merge or rewrite project Runtime databases.
 
+## Product E2E scenario
+
+One fixed product line (start → connect GCS → Master surface → seed
+dispatch deliver → seed asset publish → dispatch COMPLETED → optional
+Master handoff) is documented in:
+
+```text
+docs/universe-e2e-product-scenario.md
+```
+
+Scenario ID: `UNIVERSE_E2E_GCS_SEED_AND_MASTER_LINE_V1`. Use that document for
+pass/fail re-runs. This file remains the API and boundary contract.
+
 ## Start the service
 
 ```powershell
