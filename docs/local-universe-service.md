@@ -145,6 +145,21 @@ Registration requires `REPOSITORY_MANIFEST.md`. When a Mode Registry exists,
 its owner must match the supplied project ID. Project references must remain
 relative to the registered project root.
 
+Default project refs include:
+
+```text
+manifest: REPOSITORY_MANIFEST.md
+mode_registry: .ai/runtime/project_instance/mode_registry.json
+runtime_status: .ai/runtime/project_instance/status.md
+anchor_store: .ai/runtime/anchor_store
+master_inbox: .ai/inbox/MASTER
+```
+
+`master_inbox` is the Project-owned MASTER inbox directory used by approved
+dispatch delivery. The default is `.ai/inbox/MASTER`. A project may register
+the alternate exact path `.ai/master/inbox` when that is the Project Master
+layout already in use. Universe does not create either directory.
+
 Registering the same ID and root again refreshes metadata instead of creating
 a duplicate connection.
 
@@ -386,11 +401,30 @@ Proposal generation reads the attached Project only to calculate actions and
 collisions. It never applies those actions.
 
 Dispatch creation is durable and idempotent. Delivery to the Project-owned
-`.ai/inbox/MASTER` path is a separate mutation and requires
-`{"approval": "APPROVED"}` on that request. The explicit Deliver action in the
-desktop UI supplies this value. The Project must already expose the inbox path;
-Universe does not create it. Wake adapters record receipts but do not advance
-dispatch status.
+MASTER inbox is a separate mutation and requires `{"approval": "APPROVED"}` on
+that request. The explicit Deliver action in the desktop UI supplies this
+value.
+
+Inbox path contract (source of truth for delivery validation):
+
+```text
+default / canonical template:  .ai/inbox/MASTER
+allowed under prefix:          .ai/inbox/<name>
+project-owned alternate:       .ai/master/inbox   (exact path only)
+```
+
+Delivery writes through the registered project ref `master_inbox`, not a
+hard-coded string. Seed discovery dispatches store that same registered
+`inbox_ref` on the envelope so the durable request matches the Project layout.
+The Project must already expose the registered inbox directory; Universe does
+not create it. Paths outside the allow-list, path escape (`..`), absolute
+paths, and symlink hops are rejected. Wake adapters record receipts but do not
+advance dispatch status.
+
+Room conversation and MASTER inbox dispatch remain separate surfaces. Ordinary
+Project Room / Bridge conversation does not create a dispatch inbox file.
+Approved dispatch delivery is the only path that writes a
+`dispatch_<id>.json` envelope into the registered MASTER inbox.
 
 The ordered lifecycle is:
 
@@ -606,9 +640,10 @@ dispatch remains a separate, explicit operation.
 The resident Project Master Host accepts ordinary conversation at
 `/v1/project-master/messages`, queues it in the local session store, and returns
 `repository_write: false`; it does not copy room messages into the Project
-Inbox. A standalone receiver rejects that conversation route. Its separate
-`/v1/project-master/inbox-dispatches` route is reserved for an explicitly
-selected asynchronous Inbox operation.
+Inbox as a dispatch envelope. A standalone receiver rejects that conversation
+route. Its separate `/v1/project-master/inbox-dispatches` route is reserved for
+an explicitly selected asynchronous Inbox operation and uses the same Project
+`master_inbox` allow-list (`.ai/inbox/*` or exact `.ai/master/inbox`).
 
 Set one shared credential in the same local environment as both services, then
 start the receiver for the attached project:

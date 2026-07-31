@@ -561,17 +561,24 @@ def _dispatch_id(value: Any) -> str:
     return result
 
 
+# Canonical default remains under .ai/inbox/. Project registration may also
+# use the project-owned alternate used by resident Project Master Hosts.
+ALLOWED_MASTER_INBOX_PREFIXES = (".ai/inbox/",)
+ALLOWED_MASTER_INBOX_EXACT = frozenset({".ai/master/inbox"})
+
+
 def _relative_inbox_ref(value: Any) -> str:
-    text = _text(value, "inbox_ref").replace("\\", "/")
+    text = _text(value, "inbox_ref").replace("\\", "/").rstrip("/")
     path = Path(text)
-    if (
-        path.is_absolute()
-        or ".." in path.parts
-        or path.as_posix() != text
-        or not text.startswith(".ai/inbox/")
-    ):
-        raise DispatchError("inbox_ref must remain below .ai/inbox")
-    return text.rstrip("/")
+    if path.is_absolute() or ".." in path.parts or path.as_posix() != text:
+        raise DispatchError("inbox_ref must remain a relative project path")
+    if text in ALLOWED_MASTER_INBOX_EXACT:
+        return text
+    if any(text.startswith(prefix) for prefix in ALLOWED_MASTER_INBOX_PREFIXES):
+        return text
+    raise DispatchError(
+        "inbox_ref must be under .ai/inbox/ or exactly .ai/master/inbox"
+    )
 
 
 def _inbox_path(root: Path, value: Any) -> Path:
@@ -579,15 +586,25 @@ def _inbox_path(root: Path, value: Any) -> Path:
     candidate = root / Path(relative)
     try:
         resolved = candidate.resolve(strict=True)
-        allowed = (root / ".ai" / "inbox").resolve(strict=True)
+        project_root = root.expanduser().resolve(strict=True)
     except OSError as error:
         raise DispatchError("MASTER_INBOX_UNAVAILABLE") from error
     try:
-        resolved.relative_to(allowed)
+        resolved.relative_to(project_root)
     except ValueError as error:
         raise DispatchError("MASTER_INBOX_BOUNDARY_VIOLATION") from error
+    if relative in ALLOWED_MASTER_INBOX_EXACT:
+        expected = (project_root / Path(relative)).resolve(strict=True)
+        if resolved != expected:
+            raise DispatchError("MASTER_INBOX_BOUNDARY_VIOLATION")
+    else:
+        try:
+            allowed = (project_root / ".ai" / "inbox").resolve(strict=True)
+            resolved.relative_to(allowed)
+        except (OSError, ValueError) as error:
+            raise DispatchError("MASTER_INBOX_BOUNDARY_VIOLATION") from error
     current = resolved
-    while current != root:
+    while current != project_root:
         if current.is_symlink():
             raise DispatchError("MASTER_INBOX_SYMLINK_FORBIDDEN")
         current = current.parent

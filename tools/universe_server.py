@@ -8692,6 +8692,9 @@ class UniverseStore:
                     "result": "PUBLISHED_PROJECT_SEED_ASSETS_OR_BLOCKED_RESULT_PACKET",
                 },
                 "requested_mode": MASTER_MODE,
+                # Deliver uses the registered project ref; keep the envelope
+                # aligned so discovery dispatches match Project Master inbox layout.
+                "inbox_ref": project["refs"]["master_inbox"],
             },
         )
 

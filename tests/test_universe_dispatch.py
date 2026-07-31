@@ -75,11 +75,29 @@ class UniverseDispatchTests(unittest.TestCase):
                 self.root,
                 ".ai/inbox/NOT_CREATED",
             ).deliver(envelope)
-        with self.assertRaisesRegex(DispatchError, "below .ai/inbox"):
+        with self.assertRaisesRegex(DispatchError, "relative project path|inbox_ref"):
             LocalInboxConnector(
                 self.root,
                 ".ai/inbox/../core",
             ).deliver(envelope)
+
+    def test_local_inbox_accepts_project_owned_master_inbox(self) -> None:
+        alternate = self.root / ".ai" / "master" / "inbox"
+        alternate.mkdir(parents=True)
+        envelope = normalize_dispatch_request(
+            "GCS",
+            {**self.request, "inbox_ref": ".ai/master/inbox"},
+        )
+        connector = LocalInboxConnector(self.root, ".ai/master/inbox")
+
+        receipt = connector.deliver(envelope)
+
+        self.assertEqual("DELIVERED", receipt["status"])
+        self.assertEqual(
+            f".ai/master/inbox/{envelope['dispatch_id']}.json",
+            receipt["target_ref"],
+        )
+        self.assertTrue((alternate / f"{envelope['dispatch_id']}.json").is_file())
 
     def test_lifecycle_requires_ordered_transitions_and_started_result(self) -> None:
         envelope = normalize_dispatch_request("GCS", self.request)

@@ -33,7 +33,7 @@
 | 3 | Context Pack + Skill Plan 제안 파이프라인 | **DONE** (+ `LIVE_GAP`) | context pack / skill plan / adoption schemas; non-executing tests; master bind `02669bd` | context_pack 3, skill_plan_proposal 3, **adoption 0** → `USER_SELECTION_REQUIRED` 잔존 |
 | 4 | Project-side Task Frame SkillRunObservation 발행 | **DONE** | queue + drain + redaction tests; `test_universe_task_frame_skill_observation.py`; publisher receipt | queue 1 **INGESTED**. 어댑터 follow-up은 호스트 경로 의존 |
 | 5 | Project publication provider 큐/소비/순서 보장 | **PARTIAL** | skill-observation-queue drain, career-promotion-queue API, idempotent receipts | career queue 0; 일상 multi-project drain 운영 검증은 E2E 미완 |
-| 6 | Seed/Skill Plan handoff + OS_INSTALL/OS_UPDATE 계획 | **DONE** (코드) / **LIVE_GAP** (GCS) | `project_seed_apply`, `project_release_apply`, skill plan master apply tests; design doc §6 “implemented” | seed 3·projection 3 있으나 GCS `.ai/universe`는 README만; **dispatch 1 = QUEUED** (seed discovery 미완); release_artifact/proposal 0 |
+| 6 | Seed/Skill Plan handoff + OS_INSTALL/OS_UPDATE 계획 | **DONE** (코드) / **LIVE 닫힘** (GCS) | `project_seed_apply`, `project_release_apply`, skill plan master apply tests; design doc §6 “implemented” | 2026-07-31: dispatch deliver 경로 수정(`.ai/master/inbox` 허용) → **DELIVERED→COMPLETED**; seed-asset-proposal apply로 GCS `.ai/universe` 5 assets 발행 |
 | 7 | Experience 및 인과 비교 | **PARTIAL** | experience-case/match/pattern APIs + tests (`test_experience_case_*`) | 로컬 case/observation/pattern **0**. UI 통합·인과 비교는 약함 |
 | 8 | UI 로컬라이제이션 | **NOT_STARTED** | `index.html lang="en"` 고정; i18n 키/전환 없음 | design doc §8 presentation follow-up |
 | 9 | Conductor/Project Provider 설정 (`AUTO/GROK/CODEX`) + SQLite | **DONE** | `cli_provider_setting`; `/v1/settings/providers`; resident host restart on change; tests | 로컬 settings 2 (CONDUCTOR + GCS MASTER), 값 AUTO |
@@ -61,7 +61,7 @@
 | Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** | graph canvas, inspector, conductor/master room 존재. 반응형·컨트롤 정비·완성도는 잔여 |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** / packaging **NOT_STARTED** | Provider/Host 설정 화면은 있음. tray/autostart/installer **미착수** |
-| 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** | 단위·통합 테스트 다수(OK). UI: Master handoff propose/deliver + Activity 노출. **제품 한 줄 E2E 시나리오/증적은 아직 없음**. GCS dispatch QUEUED 잔존 |
+| 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **PARTIAL** | 단위·통합 테스트 다수(OK). UI handoff + live seed dispatch **COMPLETED** 증적 있음. **제품 한 줄 E2E 시나리오 문서화는 아직** |
 
 #### P1
 
@@ -83,10 +83,10 @@
 
 ```text
 project_connection: 1 (GCS)
-project_todo: 0 (UI Seed worklist로 채움 가능; 로컬 미적용이면 0)
-project_dispatch: 1 (QUEUED — seed discovery)
-project_seed / projection: 3 / 3 (current seed in Universe store)
-project_master_handoff: 0 (UI propose/deliver 경로 추가; 로컬 미적용이면 0)
+project_todo: 5 (seed worklist)
+project_dispatch: 1 COMPLETED (seed discovery; was QUEUED)
+project_seed / projection: current seed + assets under GCS .ai/universe/
+project_master_handoff: 1 DELIVERED_TO_MASTER (Fresh Composition)
 release_artifact / release_proposal: 0 / 0
 skill_run_observation: 1
 experience_*: 0
@@ -99,17 +99,18 @@ cli_provider_setting: 2 (AUTO)
 ```text
 코어 런타임·Bench·Provider·ACP·Host Profile·Todo/Fresh API : 대부분 DONE
 제품 P0 (UI polish·패키징·E2E)                            : PARTIAL / packaging 미착수
-Seed 실프로젝트 핸드오프 (GCS Dispatch QUEUED)              : LIVE_GAP (목록 #6)
+Seed 실프로젝트 핸드오프 (GCS Dispatch)                   : LIVE 닫힘 (COMPLETED + assets)
 지능형 P1 (Memory RAG·Experience UI·Future 통합)          : DESIGN~PARTIAL
 P2 확장                                                    : NOT_STARTED
 ```
 
 **다음 착수 추천 (소스 갭 기준):**
 
-1. ~~Todo UI + Master 전달 polish~~ (UI 착수 완료 — 로컬 Seed/Deliver 실사용 검증 남음)  
-2. #6 LIVE_GAP — GCS Project Master Seed 발행으로 Dispatch 닫기  
-3. P0 E2E 한 시나리오 고정(설치→연결→Master→handoff/dispatch→결과)  
-4. P1 Memory RAG는 P0 한 줄 선 후  
+1. ~~Todo UI polish~~  
+2. ~~#6 LIVE_GAP seed discovery dispatch 닫기~~  
+3. P0 E2E 한 시나리오 문서/고정(설치→연결→Master→handoff/dispatch→결과)  
+4. UI 지도/컨트롤 정비 또는 packaging  
+5. P1 Memory RAG는 P0 한 줄 선 후  
 
 ### 6) 변경 이력
 
@@ -119,3 +120,5 @@ P2 확장                                                    : NOT_STARTED
 | 2026-07-31 | 소스/테스트/로컬 DB 대조 후 구현 수준 등급 표 추가 |
 | 2026-07-31 | Todo UI: priority filter, Seed worklist; Fresh/Skill handoff propose+deliver UI |
 | 2026-07-31 | Todo→Master Queue 제거 (Todo=열람/지시 참고만, 전달 큐 불필요) |
+| 2026-07-31 | #6: `.ai/master/inbox` deliver 허용; seed dispatch COMPLETED; GCS seed assets apply |
+| 2026-07-31 | 문서 정본: `local-universe-service.md` MASTER inbox 경로 계약 고정 (default `.ai/inbox/MASTER` + alternate `.ai/master/inbox`) |
