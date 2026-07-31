@@ -30,6 +30,7 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
+  zoom: 0.92;
 }
 
 button,

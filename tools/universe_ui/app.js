@@ -13,6 +13,7 @@ const state = {
   skillObservations: [],
   skillBench: [],
   experienceCases: [],
+  benchComparisons: [],
   experiencePatterns: [],
   contextPacks: [],
   memories: [],
@@ -681,6 +682,7 @@ async function selectProject(projectId) {
     skillPlanAdoptionResult,
     observationResult,
     benchResult,
+    benchCompareResult,
     experienceResult,
     patternResult,
     contextPackResult,
@@ -707,6 +709,9 @@ async function selectProject(projectId) {
       `/v1/projects/${encodeURIComponent(projectId)}/skill-observations`
     ).catch(() => ({ observations: [] })),
     api("/v1/bench/skills").catch(() => ({ bench: [] })),
+    api("/v1/bench/compare?group_by=skill&limit=20").catch(() => ({
+      comparisons: [],
+    })),
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/experience-cases`
     ).catch(() => ({ cases: [] })),
@@ -739,6 +744,7 @@ async function selectProject(projectId) {
   state.skillPlanAdoptions = skillPlanAdoptionResult.adoptions || [];
   state.skillObservations = observationResult.observations || [];
   state.skillBench = benchResult.bench || [];
+  state.benchComparisons = benchCompareResult.comparisons || [];
   state.experienceCases = experienceResult.cases || [];
   state.experiencePatterns = patternResult.proposals || [];
   state.contextPacks = contextPackResult.context_packs || [];
@@ -3740,10 +3746,131 @@ function renderBench() {
   }
   elements.benchPanel.append(benchGroup);
 
+  const compareGroup = node("div", "detail-group");
+  const comparisons = state.benchComparisons || [];
+  compareGroup.append(
+    node("h3", "", `Skill/model compare (${comparisons.length})`)
+  );
+  if (!comparisons.length) {
+    compareGroup.append(
+      node(
+        "p",
+        "empty-copy",
+        "No comparison rows yet. Comparisons aggregate redacted Skill observations by skill, model, or provider."
+      )
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const row of comparisons.slice(0, 8)) {
+      const rate =
+        row.success_rate == null
+          ? "n/a"
+          : `${Math.round(row.success_rate * 100)}%`;
+      const dur =
+        typeof row.avg_duration_ms === "number"
+          ? ` · avg ${Math.round(row.avg_duration_ms)}ms`
+          : "";
+      const label =
+        row.label?.skill_id ||
+        row.label?.model_ref ||
+        row.label?.provider_ref ||
+        row.label?.project_id ||
+        row.group_key ||
+        "group";
+      list.append(
+        node(
+          "li",
+          "",
+          `${label} · n=${row.observation_count || 0} · success=${rate}${dur}`
+        )
+      );
+    }
+    compareGroup.append(list);
+    const groups = ["skill", "model", "provider", "project"];
+    for (const group of groups) {
+      const btn = node(
+        "button",
+        "secondary-button compact-action",
+        `By ${group}`
+      );
+      btn.type = "button";
+      btn.addEventListener("click", async () => {
+        try {
+          const result = await api(
+            `/v1/bench/compare?group_by=${encodeURIComponent(group)}&limit=20`
+          );
+          state.benchComparisons = result.comparisons || [];
+          renderBench();
+          toast(`Bench compare by ${group}`);
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+      compareGroup.append(btn);
+    }
+  }
+  elements.benchPanel.append(compareGroup);
+
   const caseGroup = node("div", "detail-group");
   caseGroup.append(
     node("h3", "", `Experience cases (${state.experienceCases.length})`)
   );
+  const caseActions = node("div", "section-actions");
+  const fromObs = node(
+    "button",
+    "secondary-button compact-action",
+    "Cases from observations"
+  );
+  fromObs.type = "button";
+  fromObs.title = "Create one Experience Case per Skill observation not already linked";
+  fromObs.addEventListener("click", async () => {
+    try {
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          state.selectedProject.project_id
+        )}/experience-cases/from-observations`,
+        { method: "POST", body: { limit: 50 } }
+      );
+      toast(
+        `Experience cases: created ${result.created_count || 0}, reused ${
+          result.reused_count || 0
+        }`
+      );
+      await selectProject(state.selectedProject.project_id);
+      showInspectorTab("bench");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  const autoPattern = node(
+    "button",
+    "secondary-button compact-action",
+    "Auto pattern proposals"
+  );
+  autoPattern.type = "button";
+  autoPattern.title =
+    "Propose patterns for cases with enough local OBSERVED_SIMILARITY support";
+  autoPattern.addEventListener("click", async () => {
+    try {
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          state.selectedProject.project_id
+        )}/experience-patterns/auto`,
+        { method: "POST", body: { minimum_support: 2 } }
+      );
+      toast(
+        `Patterns: recorded ${result.recorded_count || 0}, skipped ${
+          result.skipped_count || 0
+        }`
+      );
+      await selectProject(state.selectedProject.project_id);
+      showInspectorTab("bench");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  caseActions.append(fromObs, autoPattern);
+  caseGroup.append(caseActions);
   if (!state.experienceCases.length) {
     caseGroup.append(
       node(
@@ -3849,7 +3976,24 @@ async function matchExperienceCase(caseId) {
           node(
             "li",
             "",
-            `${match.case_id || "case"} · dims=${match.observed_dimension_count || 0} · ${match.relationship || "OBSERVED_SIMILARITY"}`
+            (() => {
+              const skills = (match.shared_skills || [])
+                .map((s) => s.skill_id || s)
+                .filter(Boolean)
+                .slice(0, 3)
+                .join(",");
+              const outcomes = (match.shared_outcomes || []).slice(0, 3).join(",");
+              const validation = (match.shared_validation_states || [])
+                .slice(0, 2)
+                .join(",");
+              return `${match.case_id || "case"} · dims=${
+                match.observed_dimension_count || 0
+              } · ${
+                match.relation || match.relationship || "OBSERVED_SIMILARITY"
+              } · skills=${skills || "-"} · outcomes=${outcomes || "-"} · val=${
+                validation || "-"
+              }`;
+            })()
           )
         );
       }
@@ -3881,6 +4025,79 @@ function renderMemory() {
     )
   );
   elements.memoryPanel.append(intro);
+
+  const maintainGroup = node("div", "detail-group");
+  maintainGroup.append(node("h3", "", "Maintain batch"));
+  maintainGroup.append(
+    node(
+      "p",
+      "context-copy",
+      "Deterministic propose-links batch. Optional apply writes PROPOSED only (never auto LINKED, no Seed write). LLM nightly remains NOT_RUN."
+    )
+  );
+  const maintainBtn = node(
+    "button",
+    "secondary-button compact-action",
+    "Run maintain (propose only)"
+  );
+  maintainBtn.type = "button";
+  maintainBtn.addEventListener("click", async () => {
+    try {
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          state.selectedProject.project_id
+        )}/memories/maintain`,
+        {
+          method: "POST",
+          body: { apply_proposals: false, limit: 20, scorer: "HEURISTIC" },
+        }
+      );
+      state.memoryProposals = result.proposals || [];
+      toast(
+        `Maintain: ${result.proposal_count || 0} · ${result.batch_kind || "batch"} · llm=${
+          result.llm_batch || "NOT_RUN"
+        }`
+      );
+      renderMemory();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  const applyBtn = node(
+    "button",
+    "secondary-button compact-action",
+    "Apply top as PROPOSED"
+  );
+  applyBtn.type = "button";
+  applyBtn.addEventListener("click", async () => {
+    try {
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          state.selectedProject.project_id
+        )}/memories/maintain`,
+        {
+          method: "POST",
+          body: {
+            apply_proposals: true,
+            limit: 20,
+            per_memory: 1,
+            scorer: "AUTO",
+          },
+        }
+      );
+      toast(
+        `Applied PROPOSED: ${result.applied_count || 0} · ${
+          result.batch_kind || "batch"
+        }`
+      );
+      await selectProject(state.selectedProject.project_id);
+      showInspectorTab("memory");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  maintainGroup.append(maintainBtn, applyBtn);
+  elements.memoryPanel.append(maintainGroup);
 
   const create = node("div", "detail-group memory-create");
   create.append(node("h3", "", "Add note"));

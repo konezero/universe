@@ -169,5 +169,167 @@ class UniverseMemoryTests(unittest.TestCase):
         self.assertEqual("NONE", proposals[0]["effects"]["seed_write"])
 
 
+    def test_memory_maintain_batch_propose_and_apply_proposed(self) -> None:
+        # Seed a node via projection-free path: just create memory and force nodes
+        # through maintain against empty projection (no proposals) first.
+        status, created = self.request(
+            "POST",
+            "/v1/projects/GCS/memories",
+            {
+                "title": "order risk note",
+                "body": "order risk functional constraints for the order-risk node",
+                "state": "OBSERVED",
+            },
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        memory_id = created["memory"]["memory_id"]
+
+        status, maintain = self.request(
+            "POST",
+            "/v1/projects/GCS/memories/maintain",
+            {"apply_proposals": False, "limit": 10},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROJECT_MEMORY_MAINTAIN_COMPLETED", maintain["status"])
+        self.assertEqual("DETERMINISTIC_TOKEN_OVERLAP", maintain["batch_kind"])
+        self.assertEqual("NOT_RUN", maintain["llm_batch"])
+        self.assertFalse(maintain["apply_proposals"])
+        self.assertEqual("NONE", maintain["effects"]["seed_write"])
+
+        # Without projection nodes, proposals may be empty; unit helper still covers
+        # selection. Apply path must remain safe (no crash).
+        status, applied = self.request(
+            "POST",
+            "/v1/projects/GCS/memories/maintain",
+            {"apply_proposals": True, "limit": 10, "per_memory": 1},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROJECT_MEMORY_MAINTAIN_COMPLETED", applied["status"])
+        for item in applied.get("applied") or []:
+            self.assertEqual("PROPOSED", item["link_state"])
+
+        # Direct PROPOSED link still works for user confirm path.
+        status, linked = self.request(
+            "POST",
+            "/v1/projects/GCS/memories/link",
+            {
+                "memory_id": memory_id,
+                "node_ref": "order-risk",
+                "graph": "functional",
+                "link_state": "PROPOSED",
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROPOSED", linked["memory"]["link_state"])
+
+    def test_select_best_proposals_helper(self) -> None:
+        from universe_memory import select_best_proposals
+
+        selected = select_best_proposals(
+            [
+                {"memory_id": "m1", "node_ref": "b", "score": 2},
+                {"memory_id": "m1", "node_ref": "a", "score": 3},
+                {"memory_id": "m2", "node_ref": "c", "score": 1},
+                {"memory_id": "m2", "node_ref": "d", "score": 0},
+            ],
+            per_memory=1,
+            min_score=1,
+        )
+        self.assertEqual(2, len(selected))
+        self.assertEqual("a", selected[0]["node_ref"])
+        self.assertEqual("c", selected[1]["node_ref"])
+
+
+    def test_heuristic_and_llm_maintain(self) -> None:
+        from universe_memory import (
+            filter_llm_proposals,
+            propose_node_links_heuristic,
+            merge_proposals,
+        )
+
+        memories = [
+            {
+                "memory_id": "memory_1",
+                "link_state": "UNLINKED",
+                "title": "order risk note",
+                "body": "document order-risk constraints carefully",
+            }
+        ]
+        nodes = [
+            {"node_id": "order-risk", "label": "Order Risk", "kind": "system"},
+            {"node_id": "market-data", "label": "Market Data", "kind": "system"},
+        ]
+        heuristic = propose_node_links_heuristic(memories=memories, nodes=nodes)
+        self.assertTrue(heuristic)
+        self.assertEqual("order-risk", heuristic[0]["node_ref"])
+        self.assertEqual("HEURISTIC_WEIGHTED", heuristic[0]["proposal_kind"])
+
+        llm = filter_llm_proposals(
+            llm_proposals=[
+                {
+                    "memory_id": "memory_1",
+                    "node_ref": "order-risk",
+                    "graph": "functional",
+                    "score": 9,
+                    "reason": "nightly",
+                    "proposal_kind": "LLM_BATCH",
+                    "effects": {
+                        "seed_write": "NONE",
+                        "candidate": "NONE",
+                        "authority": "NONE",
+                    },
+                },
+                {
+                    "memory_id": "memory_1",
+                    "node_ref": "unknown-node",
+                    "graph": "functional",
+                    "score": 9,
+                    "reason": "bad",
+                    "proposal_kind": "LLM_BATCH",
+                    "effects": {
+                        "seed_write": "NONE",
+                        "candidate": "NONE",
+                        "authority": "NONE",
+                    },
+                },
+            ],
+            memories=memories,
+            nodes=nodes,
+        )
+        self.assertEqual(1, len(llm))
+        merged = merge_proposals(heuristic, llm)
+        self.assertEqual("order-risk", merged[0]["node_ref"])
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/memories/maintain",
+            {"apply_proposals": False, "scorer": "HEURISTIC", "limit": 10},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("HEURISTIC_WEIGHTED", result["batch_kind"])
+
+        status, llm_run = self.request(
+            "POST",
+            "/v1/projects/GCS/memories/maintain",
+            {
+                "apply_proposals": False,
+                "scorer": "LLM",
+                "llm_proposals": [
+                    {
+                        "memory_id": "does-not-exist",
+                        "node_ref": "order-risk",
+                        "graph": "functional",
+                        "score": 5,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn(llm_run["llm_batch"], {
+            "UNAVAILABLE_FALLBACK_DETERMINISTIC",
+            "APPLIED_EXTERNAL_PROPOSALS",
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

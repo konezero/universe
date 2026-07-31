@@ -78,9 +78,14 @@ from seed import SeedError, suggest_paths
 from universe_memory import (
     MEMORY_SCHEMA,
     MemoryError,
+    filter_llm_proposals,
+    merge_proposals,
     normalize_memory_create,
     normalize_memory_link,
+    normalize_memory_maintain,
     propose_node_links,
+    propose_node_links_heuristic,
+    select_best_proposals,
 )
 from universe_runtime_host import (
     RuntimeHostError,
@@ -6405,6 +6410,134 @@ class UniverseStore:
         material["created_at"] = now
         return material, True
 
+    def create_experience_cases_from_unlinked_observations(
+        self, project_id: str, value: Any = None
+    ) -> dict[str, Any]:
+        """Create one Experience Case per observation not already in a case."""
+
+        project = self.get_project(project_id)
+        body = value if isinstance(value, dict) else {}
+        limit = body.get("limit", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise UniverseError(
+                "EXPERIENCE_CASE_REQUEST_INVALID",
+                "limit must be an integer from 1 through 200",
+            )
+        observations = self.list_skill_observations(project["project_id"], limit=500)
+        linked_observation_ids: set[str] = set()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT observation_id
+                FROM experience_case_observation
+                WHERE case_id IN (
+                    SELECT case_id FROM experience_case WHERE project_id = ?
+                )
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            linked_observation_ids = {row["observation_id"] for row in rows}
+        created_cases: list[dict[str, Any]] = []
+        reused_cases: list[dict[str, Any]] = []
+        for observation in observations:
+            observation_id = observation["observation_id"]
+            if observation_id in linked_observation_ids:
+                continue
+            if len(created_cases) + len(reused_cases) >= limit:
+                break
+            skill = observation.get("skill") or {}
+            title = (
+                f"Case for {skill.get('skill_id') or observation_id}"
+            )
+            case, created = self.create_experience_case(
+                project["project_id"],
+                {
+                    "observation_ids": [observation_id],
+                    "title": title,
+                },
+            )
+            if created:
+                created_cases.append(case)
+            else:
+                reused_cases.append(case)
+        return {
+            "schema": "universe.experience-cases-from-observations.v1",
+            "status": "EXPERIENCE_CASES_FROM_OBSERVATIONS_COMPLETED",
+            "project_id": project["project_id"],
+            "created_count": len(created_cases),
+            "reused_count": len(reused_cases),
+            "created": created_cases,
+            "reused": reused_cases,
+            "effects": {
+                "project_source_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "causal_inference": "NONE",
+            },
+            "next_operation": "USER_REVIEW_OR_EXPERIENCE_MATCH",
+        }
+
+    def auto_experience_pattern_proposals(
+        self, project_id: str, value: Any = None
+    ) -> dict[str, Any]:
+        """Attempt pattern proposals for each case with local match support."""
+
+        project = self.get_project(project_id)
+        body = value if isinstance(value, dict) else {}
+        minimum_support = body.get("minimum_support", 2)
+        if (
+            isinstance(minimum_support, bool)
+            or not isinstance(minimum_support, int)
+            or not 2 <= minimum_support <= 20
+        ):
+            raise UniverseError(
+                "EXPERIENCE_PATTERN_REQUEST_INVALID",
+                "minimum_support must be an integer from 2 through 20",
+            )
+        cases = self.list_experience_cases(project["project_id"], limit=200)
+        recorded: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for case in cases:
+            try:
+                proposal, created = self.create_experience_pattern_proposal(
+                    project["project_id"],
+                    {
+                        "case_id": case["case_id"],
+                        "minimum_support": minimum_support,
+                    },
+                )
+                recorded.append(
+                    {
+                        "case_id": case["case_id"],
+                        "proposal_id": proposal.get("proposal_id"),
+                        "created": created,
+                        "support_case_count": proposal.get("support_case_count"),
+                    }
+                )
+            except UniverseError as error:
+                skipped.append(
+                    {
+                        "case_id": case["case_id"],
+                        "error_code": error.code,
+                        "message": error.message,
+                    }
+                )
+        return {
+            "schema": "universe.experience-pattern-auto.v1",
+            "status": "EXPERIENCE_PATTERN_AUTO_COMPLETED",
+            "project_id": project["project_id"],
+            "recorded_count": len(recorded),
+            "skipped_count": len(skipped),
+            "recorded": recorded,
+            "skipped": skipped,
+            "effects": {
+                "career_governance_write": "NONE",
+                "promotion_state": "PROPOSAL_ONLY",
+                "authority": "NONE",
+            },
+            "next_operation": "USER_REVIEW_OR_PATTERN_ADOPTION",
+        }
+
     def list_experience_cases(
         self, project_id: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -6891,6 +7024,262 @@ class UniverseStore:
                 "authority": "NONE",
             },
             "next_operation": "USER_CONFIRM_LINK",
+        }
+
+    def maintain_project_memories(
+        self, project_id: str, value: Any = None
+    ) -> dict[str, Any]:
+        """Memory maintenance batch with scorer modes.
+
+        DETERMINISTIC / HEURISTIC run locally. LLM accepts validated
+        ``llm_proposals`` from an offline nightly job; live model calls remain
+        outside this service. AUTO prefers LLM proposals when present, else
+        HEURISTIC. Apply only writes PROPOSED (never auto-LINKED / Seed write).
+        """
+
+        project = self.get_project(project_id)
+        try:
+            request = normalize_memory_maintain(value)
+        except MemoryError as error:
+            raise UniverseError(error.code, error.message) from error
+
+        unlinked = self.list_project_memories(
+            project["project_id"], link_state="UNLINKED", limit=200
+        )
+        nodes: list[dict[str, Any]] = []
+        try:
+            projection = self.get_project_projection(project["project_id"])
+            for item in projection.get("nodes") or []:
+                if isinstance(item, dict):
+                    nodes.append(item)
+        except UniverseError:
+            nodes = []
+
+        scorer = request["scorer"]
+        llm_status = "NOT_RUN"
+        batch_kind = "DETERMINISTIC_TOKEN_OVERLAP"
+        proposals: list[dict[str, Any]] = []
+
+        if scorer in {"LLM", "AUTO"} and request.get("llm_proposals"):
+            accepted = filter_llm_proposals(
+                llm_proposals=request["llm_proposals"] or [],
+                memories=unlinked,
+                nodes=nodes,
+            )
+            if accepted:
+                proposals = accepted
+                batch_kind = "LLM_BATCH"
+                llm_status = "APPLIED_EXTERNAL_PROPOSALS"
+            elif scorer == "LLM":
+                llm_status = "UNAVAILABLE_FALLBACK_DETERMINISTIC"
+                proposals = propose_node_links(
+                    memories=unlinked, nodes=nodes, limit=request["limit"]
+                )
+                batch_kind = "DETERMINISTIC_TOKEN_OVERLAP"
+            else:
+                llm_status = "UNAVAILABLE_FALLBACK_HEURISTIC"
+                proposals = propose_node_links_heuristic(
+                    memories=unlinked, nodes=nodes, limit=request["limit"]
+                )
+                batch_kind = "HEURISTIC_WEIGHTED"
+        elif scorer == "LLM":
+            # No external proposals and no in-process model: fall back.
+            llm_status = "UNAVAILABLE_FALLBACK_DETERMINISTIC"
+            proposals = propose_node_links(
+                memories=unlinked, nodes=nodes, limit=request["limit"]
+            )
+            batch_kind = "DETERMINISTIC_TOKEN_OVERLAP"
+        elif scorer in {"HEURISTIC", "AUTO"}:
+            proposals = propose_node_links_heuristic(
+                memories=unlinked, nodes=nodes, limit=request["limit"]
+            )
+            batch_kind = "HEURISTIC_WEIGHTED"
+            if scorer == "AUTO":
+                llm_status = "NOT_RUN_HEURISTIC_DEFAULT"
+        else:
+            proposals = propose_node_links(
+                memories=unlinked, nodes=nodes, limit=request["limit"]
+            )
+            batch_kind = "DETERMINISTIC_TOKEN_OVERLAP"
+
+        selected = select_best_proposals(
+            proposals,
+            per_memory=request["per_memory"],
+            min_score=request["min_score"],
+        )
+        applied: list[dict[str, Any]] = []
+        if request["apply_proposals"]:
+            for proposal in selected:
+                memory = self.link_project_memory(
+                    project["project_id"],
+                    str(proposal["memory_id"]),
+                    {
+                        "node_ref": proposal["node_ref"],
+                        "graph": proposal["graph"],
+                        "link_state": "PROPOSED",
+                    },
+                )
+                applied.append(
+                    {
+                        "memory_id": memory["memory_id"],
+                        "node_ref": memory.get("node_ref"),
+                        "graph": memory.get("graph"),
+                        "link_state": memory.get("link_state"),
+                        "score": proposal.get("score"),
+                        "reason": proposal.get("reason"),
+                        "proposal_kind": proposal.get("proposal_kind"),
+                    }
+                )
+        return {
+            "schema": "universe.project-memory-maintain.v1",
+            "status": "PROJECT_MEMORY_MAINTAIN_COMPLETED",
+            "project_id": project["project_id"],
+            "batch_kind": batch_kind,
+            "scorer": scorer,
+            "llm_batch": llm_status,
+            "apply_proposals": request["apply_proposals"],
+            "proposal_count": len(proposals),
+            "selected_count": len(selected),
+            "applied_count": len(applied),
+            "proposals": proposals,
+            "selected": selected,
+            "applied": applied,
+            "effects": {
+                "seed_write": "NONE",
+                "candidate": "NONE",
+                "authority": "NONE",
+                "auto_linked": False,
+            },
+            "next_operation": (
+                "USER_CONFIRM_LINK" if applied else "USER_REVIEW_PROPOSALS"
+            ),
+        }
+
+    def compare_skill_bench(
+        self, *, group_by: str = "skill", limit: int = 50
+    ) -> dict[str, Any]:
+        """Compare Skill observations by skill, model, provider, or project."""
+
+        normalized = str(group_by or "skill").strip().lower()
+        if normalized not in {"skill", "model", "provider", "project"}:
+            raise UniverseError(
+                "BENCH_COMPARE_GROUP_INVALID",
+                "group_by must be skill, model, provider, or project",
+            )
+        bounded = max(1, min(int(limit), 200))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM skill_run_observation
+                ORDER BY observed_at DESC, observation_id DESC
+                """
+            ).fetchall()
+        groups: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = self._skill_observation_row(row)
+            skill = item["skill"]
+            provider_ref = provider_ref_from_model_ref(item["model_ref"])
+            if normalized == "skill":
+                key = f"{skill['skill_id']}@{skill['skill_version']}"
+                label = {
+                    "skill_id": skill["skill_id"],
+                    "skill_version": skill["skill_version"],
+                    "operation_class": skill["operation_class"],
+                }
+            elif normalized == "model":
+                key = str(item["model_ref"] or "UNKNOWN")
+                label = {"model_ref": item["model_ref"], "provider_ref": provider_ref}
+            elif normalized == "provider":
+                key = provider_ref
+                label = {"provider_ref": provider_ref}
+            else:
+                key = str(item.get("project_id") or "UNKNOWN")
+                label = {"project_id": item.get("project_id")}
+            group = groups.setdefault(
+                key,
+                {
+                    "group_key": key,
+                    "group_by": normalized,
+                    "label": label,
+                    "observation_count": 0,
+                    "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
+                    "validation_states": {
+                        state: 0 for state in sorted(SKILL_VALIDATION_STATES)
+                    },
+                    "skills": set(),
+                    "models": set(),
+                    "providers": set(),
+                    "projects": set(),
+                    "metric_totals": {},
+                    "duration_samples": [],
+                },
+            )
+            group["observation_count"] += 1
+            group["outcomes"][item["outcome"]] += 1
+            group["validation_states"][item["validation_state"]] += 1
+            group["skills"].add(
+                f"{skill['skill_id']}@{skill['skill_version']}"
+            )
+            group["models"].add(str(item["model_ref"] or "UNKNOWN"))
+            group["providers"].add(provider_ref)
+            group["projects"].add(str(item.get("project_id") or "UNKNOWN"))
+            for metric_key, metric_value in item["metrics"].items():
+                if isinstance(metric_value, (int, float)) and not isinstance(
+                    metric_value, bool
+                ):
+                    group["metric_totals"][metric_key] = (
+                        group["metric_totals"].get(metric_key, 0) + metric_value
+                    )
+                    if metric_key == "duration_ms":
+                        group["duration_samples"].append(float(metric_value))
+        comparisons: list[dict[str, Any]] = []
+        for group in groups.values():
+            succeeded = int(group["outcomes"].get("SUCCEEDED") or 0)
+            failed = int(group["outcomes"].get("FAILED") or 0)
+            decided = succeeded + failed
+            success_rate = (
+                round(succeeded / decided, 4) if decided else None
+            )
+            samples = group.pop("duration_samples")
+            avg_duration = (
+                round(sum(samples) / len(samples), 2) if samples else None
+            )
+            comparisons.append(
+                {
+                    "group_key": group["group_key"],
+                    "group_by": group["group_by"],
+                    "label": group["label"],
+                    "observation_count": group["observation_count"],
+                    "outcomes": group["outcomes"],
+                    "validation_states": group["validation_states"],
+                    "success_rate": success_rate,
+                    "avg_duration_ms": avg_duration,
+                    "metric_totals": group["metric_totals"],
+                    "distinct_skills": len(group["skills"]),
+                    "distinct_models": len(group["models"]),
+                    "distinct_providers": len(group["providers"]),
+                    "distinct_projects": len(group["projects"]),
+                }
+            )
+        comparisons.sort(
+            key=lambda item: (
+                -(item["success_rate"] if item["success_rate"] is not None else -1),
+                -item["observation_count"],
+                item["group_key"],
+            )
+        )
+        return {
+            "schema": "universe.skill-bench-compare.v1",
+            "status": "SKILL_BENCH_COMPARE_COLLECTED",
+            "group_by": normalized,
+            "comparisons": comparisons[:bounded],
+            "effects": {
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "career_promotion": "NONE",
+            },
+            "next_operation": "USER_REVIEW_ONLY",
         }
 
     def queue_career_promotion_candidate(
@@ -10554,6 +10943,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/bench/compare":
+            query_map = parse_qs(urlsplit(self.path).query)
+            group_by = (query_map.get("group_by") or ["skill"])[0]
+            limit_raw = (query_map.get("limit") or ["50"])[0]
+            try:
+                limit = int(limit_raw)
+            except (TypeError, ValueError):
+                limit = 50
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **self.server.store.compare_skill_bench(
+                            group_by=group_by, limit=limit
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/career-promotion-queue":
             self._send(
                 HTTPStatus.OK,
@@ -11589,6 +11999,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/memories/maintain":
+                result = self.server.store.maintain_project_memories(parts[0], body)
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
+            if parts is not None and parts[1] == "/experience-cases/from-observations":
+                result = self.server.store.create_experience_cases_from_unlinked_observations(
+                    parts[0], body
+                )
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
+            if parts is not None and parts[1] == "/experience-patterns/auto":
+                result = self.server.store.auto_experience_pattern_proposals(
+                    parts[0], body
+                )
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
             if parts is not None and parts[1] == "/experience-matches":
                 result = self.server.store.match_experience_case(parts[0], body)
                 self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
@@ -11924,10 +12350,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/skill-plan-proposals",
             "/skill-plan-adoptions",
             "/master-handoffs",
+            "/experience-cases/from-observations",
             "/experience-cases",
             "/experience-matches",
+            "/experience-patterns/auto",
             "/experience-pattern-proposals",
             "/memories/propose-links",
+            "/memories/maintain",
             "/memories/link",
             "/memories",
             "/career-promotion-queue",
