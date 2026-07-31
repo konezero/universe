@@ -59,12 +59,18 @@ Runtime startup. A failed owned Runtime startup is reported as `START_FAILED`;
 messages must not wait indefinitely. Raw CLI transcripts, tokens, endpoint
 credentials, and repository contents are not Conductor Room records.
 
-The Conductor Worker returns a bounded structured reply with either no UI
-action or one `TODO_DRAFT`. A draft is validated against the registered
-Project and the currently selected node before it is attached to the reply.
-It only opens the editable Todo review dialog. The Todo is not recorded until
-the user confirms the normal Todo form, and it never creates a Dispatch, Task
-Frame execution, Project mutation, authority, or Assignment.
+The Conductor Worker returns a bounded structured reply with no UI action, one
+`TODO_DRAFT`, or one `FRESH_PROJECT_DRAFT`. A Todo draft is validated against
+the registered Project and the currently selected node before it is attached
+to the reply. It only opens the editable Todo review dialog. The Todo is not
+recorded until the user confirms the normal Todo form.
+
+A Fresh Project draft may be partial. It only pre-fills the existing Intent
+step of the Fresh Project Wizard. Missing required fields remain visibly empty,
+and route search still requires the user's explicit `Find routes` action. The
+draft does not search Seed routes, create or adopt a Composition, register a
+Project, create a Dispatch or Task Frame execution, mutate a Project, or create
+authority or Assignment.
 
 Before each Conductor provider turn, the service asks the installed Universe
 Runtime to observe the input with `commander_surface: UNIVERSE_UI`. This updates

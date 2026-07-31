@@ -604,6 +604,16 @@ function renderRoomMessages() {
         actions.append(review);
         item.append(actions);
       }
+      if (message.ui_action?.kind === "FRESH_PROJECT_DRAFT") {
+        const actions = node("div", "room-message-actions");
+        const review = node("button", "secondary-button", "Review project draft");
+        review.type = "button";
+        review.addEventListener("click", () =>
+          openConductorFreshProjectDraft(message.ui_action)
+        );
+        actions.append(review);
+        item.append(actions);
+      }
       elements.roomMessageList.append(item);
     }
     return;
@@ -2254,6 +2264,26 @@ function openConductorTodoDraft(action) {
   renderTodos();
   elements.todoDialog.showModal();
   elements.todoTitle.focus();
+}
+
+function openConductorFreshProjectDraft(action) {
+  const intent = action?.intent;
+  if (!intent) {
+    toast("Conductor Fresh Project draft is unavailable", true);
+    return;
+  }
+  openFreshProjectWizard();
+  const form = elements.freshProjectForm.elements;
+  form.namedItem("project").value = intent.project || "";
+  form.namedItem("kind").value = intent.kind || "";
+  form.namedItem("goal").value = intent.goal || "";
+  form.namedItem("target_users").value = intent.target_users || "";
+  form.namedItem("technologies").value = (intent.technologies || []).join(", ");
+  form.namedItem("constraints").value = (intent.constraints || []).join(", ");
+  const firstMissing = ["project", "kind", "goal"]
+    .map((name) => form.namedItem(name))
+    .find((field) => !field.value.trim());
+  (firstMissing || form.namedItem("project")).focus();
 }
 
 function todoScopeLabel(todo) {

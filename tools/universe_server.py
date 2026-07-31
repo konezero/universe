@@ -2394,60 +2394,166 @@ def normalize_conductor_ui_context(value: Any) -> dict[str, Any]:
 
 
 def normalize_conductor_ui_action(value: Any) -> dict[str, Any]:
+    fresh_project_fields = frozenset(
+        {
+            "project",
+            "project_kind",
+            "goal",
+            "target_users",
+            "technologies",
+            "constraints",
+        }
+    )
     request = _exact_object_fields(
         value,
         field="conductor_ui_action",
         required=frozenset({"kind"}),
-        optional=frozenset({"todo"}),
+        optional=frozenset({"todo", "intent"}) | fresh_project_fields,
     )
     kind = _required_text(request["kind"], "conductor_ui_action.kind").upper()
     if kind == "NONE":
-        if request.get("todo") is not None:
+        if (
+            request.get("todo") is not None
+            or request.get("intent") is not None
+            or fresh_project_fields.intersection(request)
+        ):
             raise UniverseError(
                 "CONDUCTOR_UI_ACTION_INVALID",
-                "NONE action cannot include a Todo draft",
+                "NONE action cannot include a UI draft",
             )
         return {"schema": CONDUCTOR_ROOM_UI_ACTION_SCHEMA, "kind": "NONE"}
-    if kind != "TODO_DRAFT":
+
+    if kind == "TODO_DRAFT":
+        if (
+            request.get("intent") is not None
+            or fresh_project_fields.intersection(request)
+        ):
+            raise UniverseError(
+                "CONDUCTOR_UI_ACTION_INVALID",
+                "TODO_DRAFT cannot include a Fresh Project intent",
+            )
+        todo_value = request.get("todo")
+        if not isinstance(todo_value, dict):
+            raise UniverseError(
+                "CONDUCTOR_TODO_DRAFT_INVALID",
+                "TODO_DRAFT requires a Todo object",
+            )
+        draft_request = _exact_object_fields(
+            todo_value,
+            field="conductor_todo_draft",
+            required=frozenset(
+                {"scope_kind", "title", "detail", "priority", "state"}
+            ),
+            optional=frozenset({"project_id", "node_ref"}),
+        )
+        scope_kind = _required_text(
+            draft_request["scope_kind"],
+            "conductor_todo_draft.scope_kind",
+        ).upper()
+        canonical_draft = dict(draft_request)
+        if scope_kind == "UNIVERSE":
+            canonical_draft.pop("project_id", None)
+            canonical_draft.pop("node_ref", None)
+        elif scope_kind == "PROJECT":
+            canonical_draft.pop("node_ref", None)
+        todo = normalize_todo(
+            {
+                **canonical_draft,
+                "source_kind": "CONDUCTOR",
+                "sort_order": 0,
+            }
+        )
+        return {
+            "schema": CONDUCTOR_ROOM_UI_ACTION_SCHEMA,
+            "kind": "TODO_DRAFT",
+            "todo": todo,
+        }
+
+    if kind != "FRESH_PROJECT_DRAFT":
         raise UniverseError(
             "CONDUCTOR_UI_ACTION_INVALID",
-            "action kind must be NONE or TODO_DRAFT",
+            "action kind must be NONE, TODO_DRAFT, or FRESH_PROJECT_DRAFT",
         )
-    todo_value = request.get("todo")
-    if not isinstance(todo_value, dict):
+    if request.get("todo") is not None:
         raise UniverseError(
-            "CONDUCTOR_TODO_DRAFT_INVALID",
-            "TODO_DRAFT requires a Todo object",
+            "CONDUCTOR_UI_ACTION_INVALID",
+            "FRESH_PROJECT_DRAFT cannot include a Todo",
         )
-    draft_request = _exact_object_fields(
-        todo_value,
-        field="conductor_todo_draft",
-        required=frozenset(
-            {"scope_kind", "title", "detail", "priority", "state"}
-        ),
-        optional=frozenset({"project_id", "node_ref"}),
-    )
-    scope_kind = _required_text(
-        draft_request["scope_kind"],
-        "conductor_todo_draft.scope_kind",
-    ).upper()
-    canonical_draft = dict(draft_request)
-    if scope_kind == "UNIVERSE":
-        canonical_draft.pop("project_id", None)
-        canonical_draft.pop("node_ref", None)
-    elif scope_kind == "PROJECT":
-        canonical_draft.pop("node_ref", None)
-    todo = normalize_todo(
-        {
-            **canonical_draft,
-            "source_kind": "CONDUCTOR",
-            "sort_order": 0,
+    intent_value = request.get("intent")
+    direct_fields = fresh_project_fields.intersection(request)
+    if intent_value is not None and direct_fields:
+        raise UniverseError(
+            "CONDUCTOR_FRESH_PROJECT_DRAFT_INVALID",
+            "Fresh Project draft cannot mix nested and direct intent fields",
+        )
+    if intent_value is None:
+        intent_value = {
+            "project": request.get("project", ""),
+            "kind": request.get("project_kind", ""),
+            "goal": request.get("goal", ""),
+            "target_users": request.get("target_users", ""),
+            "technologies": request.get("technologies", []),
+            "constraints": request.get("constraints", []),
         }
+    if not isinstance(intent_value, dict):
+        raise UniverseError(
+            "CONDUCTOR_FRESH_PROJECT_DRAFT_INVALID",
+            "FRESH_PROJECT_DRAFT requires an intent object",
+        )
+    intent_request = _exact_object_fields(
+        intent_value,
+        field="conductor_fresh_project_draft",
+        required=frozenset(
+            {
+                "project",
+                "kind",
+                "goal",
+                "target_users",
+                "technologies",
+                "constraints",
+            }
+        ),
     )
+
+    def draft_text(field: str, limit: int) -> str:
+        raw = intent_request[field]
+        if not isinstance(raw, str):
+            raise UniverseError(
+                "CONDUCTOR_FRESH_PROJECT_DRAFT_INVALID",
+                f"{field} must be a string",
+            )
+        normalized = raw.strip()
+        if len(normalized) > limit:
+            raise UniverseError(
+                "CONDUCTOR_FRESH_PROJECT_DRAFT_INVALID",
+                f"{field} must be no longer than {limit} characters",
+            )
+        return normalized
+
+    technologies = _string_array(
+        intent_request["technologies"],
+        "conductor_fresh_project_draft.technologies",
+    )
+    constraints = _string_array(
+        intent_request["constraints"],
+        "conductor_fresh_project_draft.constraints",
+    )
+    if len(technologies) > 64 or len(constraints) > 32:
+        raise UniverseError(
+            "CONDUCTOR_FRESH_PROJECT_DRAFT_INVALID",
+            "Fresh Project draft contains too many technologies or constraints",
+        )
     return {
         "schema": CONDUCTOR_ROOM_UI_ACTION_SCHEMA,
-        "kind": "TODO_DRAFT",
-        "todo": todo,
+        "kind": "FRESH_PROJECT_DRAFT",
+        "intent": {
+            "project": draft_text("project", 160),
+            "kind": draft_text("kind", 160),
+            "goal": draft_text("goal", 4000),
+            "target_users": draft_text("target_users", 1000),
+            "technologies": technologies,
+            "constraints": constraints,
+        },
     }
 
 
@@ -7078,7 +7184,7 @@ class UniverseStore:
                     "updated_at": completed_at,
                 }
             )
-            if ui_action is not None and ui_action.get("kind") == "TODO_DRAFT":
+            if ui_action is not None and ui_action.get("kind") != "NONE":
                 reply["ui_action"] = dict(ui_action)
             connection.execute(
                 """

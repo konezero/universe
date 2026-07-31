@@ -40,6 +40,7 @@ from universe_server import (  # noqa: E402
     create_server,
     interface_profile,
     local_connection_profile,
+    normalize_conductor_ui_action,
     provider_ref_from_model_ref,
     publish_skill_observation,
     prepare_skill_observation_archive,
@@ -670,10 +671,33 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/fresh-project-composition-adoptions", script)
             self.assertIn("UNIVERSE_CONDUCTOR", script)
             self.assertIn("callProjectMaster", script)
+            self.assertIn("Review project draft", script)
+            self.assertIn("openConductorFreshProjectDraft", script)
             self.assertIn("/v1/settings/providers", script)
             self.assertIn("/v1/settings/host-tools", script)
             self.assertIn("/provider-setting", script)
             self.assertNotIn(self.token, script)
+
+    def test_conductor_fresh_project_draft_is_partial_and_review_only(self) -> None:
+        action = normalize_conductor_ui_action(
+            {
+                "kind": "FRESH_PROJECT_DRAFT",
+                "project": "",
+                "goal": "Coordinate several development projects.",
+                "target_users": "",
+                "technologies": ["python", "sqlite"],
+                "constraints": ["local-first"],
+            }
+        )
+
+        self.assertEqual("FRESH_PROJECT_DRAFT", action["kind"])
+        self.assertEqual("", action["intent"]["project"])
+        self.assertEqual("", action["intent"]["kind"])
+        self.assertEqual(
+            ["python", "sqlite"],
+            action["intent"]["technologies"],
+        )
+        self.assertEqual([], self.server.store.list_fresh_project_compositions())
 
     def test_host_tool_settings_are_discoverable_and_verifiable(self) -> None:
         status, profile = self.request("GET", "/v1/settings/host-tools")
@@ -988,6 +1012,51 @@ class UniverseLocalServiceTests(unittest.TestCase):
             f"universe://conductor-room/messages/{message_id}",
             fake.calls[0]["binding"]["parent_evidence_ref"],
         )
+
+    def test_conductor_room_persists_fresh_project_draft_action(self) -> None:
+        message, created = self.server.store.create_conductor_room_message(
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "Create a fresh project.",
+                "provider": "AUTO",
+                "idempotency_key": "conductor-fresh-project-001",
+            }
+        )
+        self.assertTrue(created)
+        claimed = self.server.store.claim_conductor_room_message(
+            message["message_id"], provider="GROK"
+        )
+        self.assertIsNotNone(claimed)
+
+        _, reply = self.server.store.complete_conductor_room_message(
+            message["message_id"],
+            provider="GROK",
+            body="Review the fresh project draft.",
+            result_receipt_ref="grok-cli:conductor-001:result-fresh-001",
+            ui_action={
+                "kind": "FRESH_PROJECT_DRAFT",
+                "intent": {
+                    "project": "Orbit Notes",
+                    "kind": "",
+                    "goal": "Connect project notes.",
+                    "target_users": ["Developers"],
+                    "technologies": ["Python", "SQLite"],
+                    "constraints": ["Offline operation"],
+                },
+            },
+        )
+
+        self.assertEqual("FRESH_PROJECT_DRAFT", reply["ui_action"]["kind"])
+        self.assertEqual(
+            "Orbit Notes", reply["ui_action"]["intent"]["project"]
+        )
+        stored_reply = next(
+            item
+            for item in self.server.store.list_conductor_room_messages()
+            if item.get("in_reply_to") == message["message_id"]
+        )
+        self.assertEqual("FRESH_PROJECT_DRAFT", stored_reply["ui_action"]["kind"])
 
     def test_conductor_worker_survives_unavailable_provider(self) -> None:
         class UnavailableRuntimeHost:

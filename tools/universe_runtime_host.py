@@ -602,11 +602,11 @@ class UniverseRuntimeHost:
             if isinstance(item, Mapping) and str(item.get("body") or "").strip()
         ]
         output_contract = {
-            "schema": "universe.conductor-chat-output-contract.v2",
+            "schema": "universe.conductor-chat-output-contract.v3",
             "format": "STRUCTURED_JSON",
             "language_policy": "MATCH_LATEST_USER_MESSAGE",
             "required": ["reply", "action"],
-            "action_kinds": ["NONE", "TODO_DRAFT"],
+            "action_kinds": ["NONE", "TODO_DRAFT", "FRESH_PROJECT_DRAFT"],
             "todo_contract": {
                 "required": [
                     "scope_kind",
@@ -627,6 +627,30 @@ class UniverseRuntimeHost:
                     "DONE",
                 ],
             },
+            "fresh_project_contract": {
+                "action_field": "intent",
+                "required": [
+                    "project",
+                    "kind",
+                    "goal",
+                    "target_users",
+                    "technologies",
+                    "constraints",
+                ],
+                "partial_values_allowed": True,
+                "list_fields": ["technologies", "constraints"],
+                "example": {
+                    "kind": "FRESH_PROJECT_DRAFT",
+                    "intent": {
+                        "project": "Example",
+                        "kind": "",
+                        "goal": "",
+                        "target_users": "",
+                        "technologies": [],
+                        "constraints": [],
+                    },
+                },
+            },
             "instruction": (
                 "Answer the latest user message as the Universe Conductor. "
                 "Return action kind TODO_DRAFT only when the user explicitly asks "
@@ -637,6 +661,16 @@ class UniverseRuntimeHost:
                 "available Project. Use P2 and BACKLOG when priority or state is "
                 "not supplied. For NONE, return action as {\"kind\":\"NONE\"}. "
                 "For TODO_DRAFT, return action with kind and one todo object. "
+                "Return FRESH_PROJECT_DRAFT when the user explicitly wants to "
+                "start, create, or plan a new Project. Include one intent object "
+                "with every required field. Preserve missing scalar details as "
+                "empty strings and missing list details as empty arrays instead "
+                "of inventing evidence. This draft only opens a review Wizard; "
+                "for explicit new-Project intent FRESH_PROJECT_DRAFT is required "
+                "and NONE is invalid. Put Project fields inside action.intent "
+                "exactly as shown in fresh_project_contract.example. "
+                "never claim routes were searched, a Composition was created or "
+                "adopted, or a Project was registered. "
                 "Use only supplied context. Do not claim repository access, "
                 "execution authority, or completed work."
             ),

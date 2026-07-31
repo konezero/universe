@@ -350,6 +350,29 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual(
             "GCS", request["context_pack"]["available_projects"][0]["project_id"]
         )
+        self.assertIn(
+            "FRESH_PROJECT_DRAFT",
+            request["output_contract"]["action_kinds"],
+        )
+        self.assertEqual(
+            [
+                "project",
+                "kind",
+                "goal",
+                "target_users",
+                "technologies",
+                "constraints",
+            ],
+            request["output_contract"]["fresh_project_contract"]["required"],
+        )
+        self.assertEqual(
+            "FRESH_PROJECT_DRAFT",
+            request["output_contract"]["fresh_project_contract"]["example"]["kind"],
+        )
+        self.assertEqual(
+            "intent",
+            request["output_contract"]["fresh_project_contract"]["action_field"],
+        )
         self.assertEqual(
             [
                 "/v1/task-frame/create",
