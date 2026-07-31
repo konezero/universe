@@ -48,6 +48,8 @@ const state = {
     handoff: null,
   },
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
+  graphPan: null,
+  inspectorDismissed: false,
 };
 
 const WORKLIST_SEED_TODOS = [
@@ -96,6 +98,12 @@ const elements = {
   workspaceSubtitle: document.querySelector("#workspace-subtitle"),
   canvas: document.querySelector("#universe-graph"),
   graphEmpty: document.querySelector("#graph-empty"),
+  graphHint: document.querySelector("#graph-hint"),
+  graphZoomIn: document.querySelector("#graph-zoom-in"),
+  graphZoomOut: document.querySelector("#graph-zoom-out"),
+  graphFit: document.querySelector("#graph-fit"),
+  conversationTitle: document.querySelector("#conversation-title"),
+  conversationTargetLabel: document.querySelector("#conversation-target-label"),
   details: document.querySelector("#details-panel"),
   activity: document.querySelector("#activity-panel"),
   benchPanel: document.querySelector("#bench-panel"),
@@ -352,6 +360,12 @@ function renderComposerState() {
         ? `LLM connected / Auto-approve ${autoApprove}`
         : "Waiting for Runtime binding";
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";
+    if (elements.conversationTitle) {
+      elements.conversationTitle.textContent = "Conversation";
+    }
+    if (elements.conversationTargetLabel) {
+      elements.conversationTargetLabel.textContent = "Universe Conductor";
+    }
     return;
   }
   const projectId = state.conversationTarget.projectId;
@@ -377,6 +391,60 @@ function renderComposerState() {
       ? "Bridge registered / awaiting first delivery"
       : "Project Room only";
   elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
+  if (elements.conversationTitle) {
+    elements.conversationTitle.textContent = "Conversation";
+  }
+  if (elements.conversationTargetLabel) {
+    elements.conversationTargetLabel.textContent = `${projectId} Master`;
+  }
+}
+
+function setGraphScale(nextScale) {
+  state.graph.scale = Math.min(2.2, Math.max(0.4, nextScale));
+  drawGraph();
+}
+
+function fitGraphView() {
+  const nodes = state.graph.nodes;
+  if (!nodes.length) {
+    state.graph.scale = 1;
+    state.graph.x = 0;
+    state.graph.y = 0;
+    drawGraph();
+    return;
+  }
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const item of nodes) {
+    minX = Math.min(minX, item.x);
+    maxX = Math.max(maxX, item.x);
+    minY = Math.min(minY, item.y);
+    maxY = Math.max(maxY, item.y);
+  }
+  const { ratio, width, height } = canvasMetrics();
+  const viewportWidth = width / ratio;
+  const viewportHeight = height / ratio;
+  const spanX = Math.max(180, maxX - minX + 160);
+  const spanY = Math.max(140, maxY - minY + 140);
+  const scale = Math.min(1.6, Math.max(0.5, Math.min(viewportWidth / spanX, viewportHeight / spanY)));
+  state.graph.scale = scale;
+  state.graph.x = -((minX + maxX) / 2) * scale;
+  state.graph.y = -((minY + maxY) / 2) * scale;
+  drawGraph();
+}
+
+function updateGraphChrome() {
+  if (elements.graphHint) {
+    elements.graphHint.classList.toggle(
+      "hidden",
+      !state.selectedProject || !state.graph.nodes.length
+    );
+  }
+  if (elements.graphEmpty) {
+    // empty state already driven elsewhere
+  }
 }
 
 async function refresh() {
@@ -590,6 +658,7 @@ async function selectProject(projectId) {
   state.selectedProject = project;
   state.selectedNode = null;
   state.focusedNodeId = null;
+  state.inspectorDismissed = false;
   renderProjects();
   await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
     method: "POST",
@@ -1406,6 +1475,7 @@ function exitNodeUniverse() {
 function closeInspector() {
   state.focusedNodeId = null;
   state.selectedNode = null;
+  state.inspectorDismissed = true;
   document.body.classList.remove("inspector-open");
   buildGraph();
   renderDetails();
@@ -1708,6 +1778,7 @@ function canvasMetrics() {
 }
 
 function drawGraph() {
+  updateGraphChrome();
   const { ratio, width, height } = canvasMetrics();
   const context = elements.canvas.getContext("2d");
   context.clearRect(0, 0, width, height);
@@ -1765,9 +1836,13 @@ function drawGraph() {
     }[item.kind];
     const widthValue = ["project", "focus"].includes(item.kind) ? 126 : 108;
     const heightValue = ["project", "focus"].includes(item.kind) ? 42 : 36;
-    context.fillStyle = selected ? "#20262d" : item.kind === "focus" ? "#0e2528" : "#ffffff";
-    context.strokeStyle = selected ? "#20262d" : color;
-    context.lineWidth = selected ? 2.4 : 1.6;
+    context.fillStyle = selected
+      ? "#10242b"
+      : item.kind === "focus"
+        ? "#0e2528"
+        : "#ffffff";
+    context.strokeStyle = selected ? "#41d7c3" : color;
+    context.lineWidth = selected ? 2.8 : 1.6;
     roundedRect(
       context,
       item.x - widthValue / 2,
@@ -1831,6 +1906,7 @@ function graphPoint(event) {
 }
 
 function selectGraphNode(event) {
+  if (state.graphPan?.moved) return;
   const point = graphPoint(event);
   const selected =
     [...state.graph.nodes]
@@ -1841,11 +1917,13 @@ function selectGraphNode(event) {
           Math.abs(point.y - item.y) <= 24
       ) || null;
   if (!selected) return;
+  state.inspectorDismissed = false;
   if (selected.kind === "project") {
     state.focusedNodeId = null;
     state.selectedNode = selected;
     buildGraph();
     renderDetails();
+    showInspectorTab("details");
     return;
   }
   if (["system", "related", "focus"].includes(selected.kind)) {
@@ -1854,21 +1932,28 @@ function selectGraphNode(event) {
     state.selectedNode = selected;
     buildGraph();
     renderDetails();
+    showInspectorTab("details");
     return;
   }
   state.selectedNode = selected;
   drawGraph();
   renderDetails();
+  showInspectorTab("details");
 }
 
 function renderDetails() {
   elements.details.replaceChildren();
   if (!state.selectedProject) {
+    document.body.classList.remove("inspector-open");
     elements.details.append(node("p", "empty-copy", "No project selected"));
     return;
   }
   const selected = state.selectedNode;
-  document.body.classList.toggle("inspector-open", Boolean(selected));
+  // Project selection keeps inspector available unless the user dismissed it.
+  document.body.classList.toggle(
+    "inspector-open",
+    Boolean(state.selectedProject) && !state.inspectorDismissed
+  );
   const heading = node("div", "detail-group");
   heading.append(
     node(
@@ -2184,10 +2269,12 @@ function renderEmpty() {
   state.graph.nodes = [];
   state.graph.edges = [];
   state.focusedNodeId = null;
+  state.inspectorDismissed = false;
   elements.nodeBreadcrumb.classList.add("hidden");
   drawGraph();
   renderDetails();
   renderActivity();
+  if (typeof renderBench === "function") renderBench();
 }
 
 async function submitDispatch(event) {
@@ -3847,18 +3934,87 @@ function bindEvents() {
     button.addEventListener("click", () => showInspectorTab(button.dataset.tab));
   }
   elements.canvas.addEventListener("click", selectGraphNode);
+  elements.canvas.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    state.graphPan = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: state.graph.x,
+      originY: state.graph.y,
+      moved: false,
+    };
+    try {
+      elements.canvas.setPointerCapture(event.pointerId);
+    } catch (_error) {
+      // Older hosts without capture still pan via window listeners.
+    }
+  });
+  elements.canvas.addEventListener("pointermove", (event) => {
+    const pan = state.graphPan;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    const dx = event.clientX - pan.startX;
+    const dy = event.clientY - pan.startY;
+    if (Math.hypot(dx, dy) > 3) {
+      pan.moved = true;
+      elements.canvas.classList.add("is-panning");
+    }
+    if (!pan.moved) return;
+    state.graph.x = pan.originX + dx;
+    state.graph.y = pan.originY + dy;
+    drawGraph();
+  });
+  const endPan = (event) => {
+    const pan = state.graphPan;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    elements.canvas.classList.remove("is-panning");
+    // Keep moved flag until click handler runs, then clear.
+    window.setTimeout(() => {
+      if (state.graphPan === pan) state.graphPan = null;
+    }, 0);
+  };
+  elements.canvas.addEventListener("pointerup", endPan);
+  elements.canvas.addEventListener("pointercancel", endPan);
   elements.canvas.addEventListener(
     "wheel",
     (event) => {
       event.preventDefault();
-      state.graph.scale = Math.min(
-        1.8,
-        Math.max(0.55, state.graph.scale * (event.deltaY > 0 ? 0.9 : 1.1))
-      );
-      drawGraph();
+      setGraphScale(state.graph.scale * (event.deltaY > 0 ? 0.9 : 1.1));
     },
     { passive: false }
   );
+  if (elements.graphZoomIn) {
+    elements.graphZoomIn.addEventListener("click", () =>
+      setGraphScale(state.graph.scale * 1.12)
+    );
+  }
+  if (elements.graphZoomOut) {
+    elements.graphZoomOut.addEventListener("click", () =>
+      setGraphScale(state.graph.scale * 0.9)
+    );
+  }
+  if (elements.graphFit) {
+    elements.graphFit.addEventListener("click", fitGraphView);
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    if (elements.composerActionMenu && !elements.composerActionMenu.classList.contains("hidden")) {
+      closeComposerActionMenu();
+      return;
+    }
+    if (
+      elements.conversationLayer &&
+      !elements.conversationLayer.classList.contains("collapsed")
+    ) {
+      elements.conversationLayer.classList.add("collapsed");
+      elements.conversationToggle.textContent = "+";
+      elements.conversationToggle.title = "Expand conversation";
+      return;
+    }
+    if (document.body.classList.contains("inspector-open")) {
+      closeInspector();
+    }
+  });
   const resize = new ResizeObserver(drawGraph);
   resize.observe(elements.canvas);
 }

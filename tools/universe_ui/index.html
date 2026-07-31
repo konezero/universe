@@ -59,19 +59,25 @@
           <p id="workspace-subtitle">Select a project universe to inspect its timeline</p>
         </div>
         <div class="graph-toolbar-actions">
-          <button id="prepare-project-button" class="secondary-button" type="button" title="Queue a project-map discovery request for the Project Master">
-            Request Project Map
-          </button>
           <div class="segmented-control" aria-label="Graph view">
             <button type="button" class="selected" data-view="timeline">Timeline</button>
             <button type="button" data-view="universe">Universe map</button>
             <button type="button" data-view="documents">Documents</button>
           </div>
+          <div class="graph-map-controls" aria-label="Map controls">
+            <button id="graph-zoom-out" class="icon-button compact" type="button" title="Zoom out" aria-label="Zoom out">&#8722;</button>
+            <button id="graph-fit" class="icon-button compact" type="button" title="Fit graph" aria-label="Fit graph">&#9638;</button>
+            <button id="graph-zoom-in" class="icon-button compact" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+          </div>
+          <button id="prepare-project-button" class="secondary-button" type="button" title="Queue a project-map discovery request for the Project Master">
+            Request Project Map
+          </button>
         </div>
       </div>
       <div class="canvas-wrap">
         <canvas id="universe-graph" aria-label="Project system graph"></canvas>
         <div id="graph-empty" class="graph-empty">Select a project</div>
+        <p id="graph-hint" class="graph-hint">Drag to pan · Wheel to zoom · Click a node for details</p>
         <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
           <button id="exit-node-universe" class="icon-button compact" type="button" title="Return to project universe" aria-label="Return to project universe">&#8592;</button>
           <span id="node-breadcrumb-project"></span>
@@ -80,7 +86,10 @@
         </nav>
         <section id="conversation-layer" class="conversation-layer collapsed" aria-label="Project Room conversation">
           <header class="conversation-layer-header">
-            <strong>Conversation</strong>
+            <div class="conversation-title-wrap">
+              <strong id="conversation-title">Conversation</strong>
+              <small id="conversation-target-label">Universe Conductor</small>
+            </div>
             <label class="layer-opacity" title="Conversation transparency">
               <span>Opacity</span>
               <input id="conversation-opacity" type="range" min="25" max="100" value="86">

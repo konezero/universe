@@ -291,7 +291,13 @@ button {
   z-index: 5;
   top: 64px;
   right: 18px;
-  max-width: min(520px, calc(100vw - 246px));
+  left: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 14px;
+  max-width: min(720px, calc(100vw - 246px));
   padding: 10px 12px;
   border: 1px solid rgba(64, 83, 110, 0.45);
   border-radius: 8px;
@@ -307,17 +313,55 @@ button {
 }
 
 .graph-toolbar-actions {
-  display: none;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
   min-width: 0;
 }
 
+.graph-map-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
 .graph-toolbar p {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 11px;
+}
+
+.graph-hint {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 148px;
+  margin: 0;
+  padding: 4px 10px;
+  border: 1px solid rgba(64, 83, 110, 0.35);
+  border-radius: 999px;
+  background: rgba(7, 12, 23, 0.62);
+  color: var(--muted);
+  font-size: 11px;
+  transform: translateX(-50%);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+body.inspector-open .graph-hint {
+  right: min(380px, 42vw);
+  left: auto;
+  transform: none;
+}
+
+.graph-hint.hidden {
+  display: none;
 }
 
 .segmented-control {
@@ -357,7 +401,12 @@ button {
   display: block;
   width: 100%;
   height: 100%;
+  cursor: grab;
   touch-action: none;
+}
+
+#universe-graph.is-panning {
+  cursor: grabbing;
 }
 
 .graph-empty {
@@ -426,16 +475,40 @@ button {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 36px;
+  min-height: 36px;
   padding: 0 8px 0 12px;
   border-bottom: 1px solid rgba(126, 162, 213, 0.22);
   color: var(--text);
   font-size: 12px;
 }
 
+.conversation-title-wrap {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.conversation-title-wrap strong {
+  line-height: 1.2;
+}
+
+.conversation-title-wrap small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .conversation-layer.collapsed .conversation-layer-header {
   border-bottom: 0;
 }
+
+.conversation-layer.collapsed .conversation-title-wrap small {
+  display: none;
+}
+
+
 
 .layer-opacity {
   display: inline-flex;
@@ -810,10 +883,13 @@ textarea:focus {
 }
 
 body.inspector-open .inspector {
-  display: block;
+  display: flex;
+  flex-direction: column;
 }
 
 .inspector-tabs {
+  display: flex;
+  flex: 0 0 auto;
   height: 44px;
   border-bottom: 1px solid var(--line);
 }
@@ -1910,6 +1986,10 @@ dialog label {
   }
 
   .graph-toolbar {
+    top: 60px;
+    right: 10px;
+    left: 10px;
+    max-width: none;
     align-items: flex-start;
     gap: 8px;
   }
@@ -1919,8 +1999,25 @@ dialog label {
   }
 
   .graph-toolbar-actions {
-    align-items: flex-end;
-    flex-direction: column;
+    width: 100%;
+    align-items: center;
+    justify-content: flex-start;
+  }
+
+  .graph-hint {
+    bottom: 132px;
+    max-width: calc(100vw - 24px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  body.inspector-open .graph-hint {
+    right: 12px;
+  }
+
+  .conversation-layer {
+    width: min(700px, calc(100vw - 20px));
+    bottom: 140px;
   }
 
   .command-composer {

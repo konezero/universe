@@ -59,7 +59,7 @@
 | 항목 | 수준 | 비고 |
 |------|------|------|
 | Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
-| UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** | graph canvas, inspector, conductor/master room 존재. 반응형·컨트롤 정비·완성도는 잔여 |
+| UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** → 개선 | 뷰 전환 노출, pan/zoom/fit, Inspector 프로젝트 상시(닫기 가능), Conversation 대상 라벨, Esc, 모바일 toolbar/hint polish |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** / packaging **NOT_STARTED** | Provider/Host 설정 화면은 있음. tray/autostart/installer **미착수** |
 | 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **시나리오+스모크** | 정본: `docs/universe-e2e-product-scenario.md`. 하네스: `tools/universe_e2e_smoke.py` (`run`/`check`) + `tests/test_universe_e2e_product_scenario.py` |
 
@@ -110,8 +110,9 @@ P2 확장                                                    : NOT_STARTED
 2. ~~#6 LIVE_GAP seed discovery dispatch 닫기~~  
 3. ~~P0 E2E 시나리오 문서/고정 + 스모크 하네스~~  
 4. ~~Bench/Experience Inspector UI 1차~~  
-5. UI 지도/컨트롤 정비 또는 packaging  
-6. P1 Memory RAG / Future 통합 화면
+5. ~~UI 지도/컨트롤 정비 1차~~  
+6. packaging (tray/autostart/installer)  
+7. P1 Memory RAG / Future 통합 화면
 
 ### 6) 변경 이력
 
@@ -125,3 +126,4 @@ P2 확장                                                    : NOT_STARTED
 | 2026-07-31 | 문서 정본: `local-universe-service.md` MASTER inbox 경로 계약 고정 (default `.ai/inbox/MASTER` + alternate `.ai/master/inbox`) |
 | 2026-07-31 | P0 E2E 시나리오 고정: `docs/universe-e2e-product-scenario.md` |
 | 2026-07-31 | E2E smoke: `tools/universe_e2e_smoke.py` + tests; Bench/Experience Inspector 탭 |
+| 2026-07-31 | UI map controls: show view switcher, pan/zoom/fit, inspector project open, conversation labels |
