@@ -4002,7 +4002,20 @@ class UniverseStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(scope_kind, scope_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS service_setting (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO service_setting(setting_key, setting_value, updated_at)
+                VALUES ('memory_maintain_interval_hours', '0', ?)
+                """,
+                (utc_now(),),
             )
             room_columns = {
                 row["name"]
@@ -4151,6 +4164,86 @@ class UniverseStore:
                 for project in self.list_projects()
             ],
         }
+
+    def get_service_settings(self) -> dict[str, Any]:
+        """Return durable local-service settings. interval_hours 0 disables batch."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT setting_key, setting_value, updated_at
+                FROM service_setting
+                """
+            ).fetchall()
+        values = {row["setting_key"]: row["setting_value"] for row in rows}
+        raw = values.get("memory_maintain_interval_hours", "0")
+        try:
+            interval_hours = int(raw)
+        except (TypeError, ValueError):
+            interval_hours = 0
+        if interval_hours < 0:
+            interval_hours = 0
+        if interval_hours > 24 * 30:
+            interval_hours = 24 * 30
+        return {
+            "schema": "universe.service-settings.v1",
+            "status": "SERVICE_SETTINGS_COLLECTED",
+            "memory_maintain": {
+                "interval_hours": interval_hours,
+                "enabled": interval_hours > 0,
+                "scorer": "HEURISTIC",
+                "apply_proposals": True,
+                "note": "0 hours disables the in-process maintain worker",
+            },
+            "updated_at": next(
+                (
+                    row["updated_at"]
+                    for row in rows
+                    if row["setting_key"] == "memory_maintain_interval_hours"
+                ),
+                None,
+            ),
+        }
+
+    def set_service_settings(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise UniverseError(
+                "SERVICE_SETTINGS_INVALID",
+                "service settings body must be an object",
+            )
+        maintain = value.get("memory_maintain")
+        if maintain is None and "interval_hours" in value:
+            maintain = value
+        if not isinstance(maintain, dict):
+            raise UniverseError(
+                "SERVICE_SETTINGS_INVALID",
+                "memory_maintain must be an object",
+            )
+        raw = maintain.get("interval_hours", 0)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise UniverseError(
+                "SERVICE_SETTINGS_INVALID",
+                "memory_maintain.interval_hours must be an integer >= 0",
+            )
+        if raw < 0 or raw > 24 * 30:
+            raise UniverseError(
+                "SERVICE_SETTINGS_INVALID",
+                "memory_maintain.interval_hours must be 0..720",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO service_setting(setting_key, setting_value, updated_at)
+                VALUES ('memory_maintain_interval_hours', ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (str(raw), now),
+            )
+        return self.get_service_settings()
+
 
     def register_project(self, value: Any) -> tuple[dict[str, Any], bool]:
         project = normalize_registration(value)
@@ -9942,6 +10035,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._conductor_worker.start()
+        self._maintain_stop = threading.Event()
+        self._maintain_wake = threading.Event()
+        self._maintain_last_run: dict[str, Any] | None = None
+        self._maintain_worker = threading.Thread(
+            target=self._memory_maintain_worker_loop,
+            name="universe-memory-maintain-worker",
+            daemon=True,
+        )
+        self._maintain_worker.start()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
 
@@ -10735,7 +10837,95 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "; ".join(unavailable) or "no Conductor provider is available",
         )
 
+    def notify_maintain_settings_changed(self) -> None:
+        """Wake the maintain worker so interval 0/non-zero changes apply soon."""
+
+        self._maintain_wake.set()
+
+    def memory_maintain_worker_status(self) -> dict[str, Any]:
+        settings = self.store.get_service_settings()["memory_maintain"]
+        return {
+            "schema": "universe.memory-maintain-worker.v1",
+            "status": "ACTIVE" if settings["enabled"] else "DISABLED",
+            "interval_hours": settings["interval_hours"],
+            "last_run": self._maintain_last_run,
+        }
+
+    def _memory_maintain_worker_loop(self) -> None:
+        """In-process maintain batch. interval_hours 0 => idle recheck only."""
+
+        while not self._maintain_stop.is_set():
+            settings = self.store.get_service_settings()["memory_maintain"]
+            interval_hours = int(settings.get("interval_hours") or 0)
+            if interval_hours <= 0:
+                # Disabled: wake every 30s or on settings change.
+                self._maintain_wake.wait(timeout=30.0)
+                self._maintain_wake.clear()
+                continue
+            try:
+                projects = self.store.list_projects()
+                results: list[dict[str, Any]] = []
+                for project in projects:
+                    project_id = project.get("project_id")
+                    if not project_id:
+                        continue
+                    try:
+                        outcome = self.store.maintain_project_memories(
+                            str(project_id),
+                            {
+                                "scorer": settings.get("scorer") or "HEURISTIC",
+                                "apply_proposals": bool(
+                                    settings.get("apply_proposals", True)
+                                ),
+                                "limit": 50,
+                                "per_memory": 1,
+                            },
+                        )
+                        results.append(
+                            {
+                                "project_id": project_id,
+                                "status": outcome.get("status"),
+                                "proposal_count": outcome.get("proposal_count"),
+                                "applied_count": outcome.get("applied_count"),
+                                "batch_kind": outcome.get("batch_kind"),
+                            }
+                        )
+                    except UniverseError as error:
+                        results.append(
+                            {
+                                "project_id": project_id,
+                                "status": "FAILED",
+                                "error_code": error.code,
+                            }
+                        )
+                self._maintain_last_run = {
+                    "ran_at": utc_now(),
+                    "interval_hours": interval_hours,
+                    "project_count": len(results),
+                    "results": results,
+                }
+            except Exception as error:  # noqa: BLE001 - keep worker alive
+                self._maintain_last_run = {
+                    "ran_at": utc_now(),
+                    "status": "WORKER_ERROR",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            # Wait interval, but allow early wake on settings change.
+            deadline = time.monotonic() + max(60.0, interval_hours * 3600.0)
+            while not self._maintain_stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._maintain_wake.wait(timeout=min(30.0, remaining)):
+                    self._maintain_wake.clear()
+                    # Settings may have disabled or shortened interval.
+                    break
+
     def server_close(self) -> None:
+        if not self._maintain_stop.is_set():
+            self._maintain_stop.set()
+            self._maintain_wake.set()
+            self._maintain_worker.join(timeout=5)
         if not self._conductor_stop.is_set():
             self._conductor_stop.set()
             self._conductor_queue.put(None)
@@ -10792,6 +10982,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 self.server.provider_settings(),
             )
+            return
+        if path == "/v1/settings/service":
+            settings = self.server.store.get_service_settings()
+            settings["worker"] = self.server.memory_maintain_worker_status()
+            self._send(HTTPStatus.OK, settings)
             return
         if path == "/v1/settings/host-tools":
             try:
@@ -11266,6 +11461,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             body = self._read_json()
+            if path == "/v1/settings/service":
+                settings = self.server.store.set_service_settings(body)
+                self.server.notify_maintain_settings_changed()
+                self._send(HTTPStatus.OK, settings)
+                return
             if path == "/v1/settings/providers/universe":
                 self._send(
                     HTTPStatus.OK,

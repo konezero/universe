@@ -130,6 +130,8 @@ const elements = {
   settingsError: document.querySelector("#settings-error"),
   localServiceStatus: document.querySelector("#local-service-status"),
   universeProviderSetting: document.querySelector("#universe-provider-setting"),
+  memoryMaintainInterval: document.querySelector("#memory-maintain-interval"),
+  memoryMaintainStatus: document.querySelector("#memory-maintain-status"),
   universeProviderStatus: document.querySelector("#universe-provider-status"),
   projectProviderSettings: document.querySelector("#project-provider-settings"),
   hostProfilePath: document.querySelector("#host-profile-path"),
@@ -1085,10 +1087,24 @@ function renderLocalServiceStatus() {
 
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
-  [state.providerSettings, state.hostTools] = await Promise.all([
-    api("/v1/settings/providers"),
-    api("/v1/settings/host-tools"),
-  ]);
+  [state.providerSettings, state.hostTools, state.serviceSettings] =
+    await Promise.all([
+      api("/v1/settings/providers"),
+      api("/v1/settings/host-tools"),
+      api("/v1/settings/service").catch(() => null),
+    ]);
+  if (elements.memoryMaintainInterval && state.serviceSettings?.memory_maintain) {
+    elements.memoryMaintainInterval.value = String(
+      state.serviceSettings.memory_maintain.interval_hours ?? 0
+    );
+  }
+  if (elements.memoryMaintainStatus) {
+    const worker = state.serviceSettings?.worker;
+    elements.memoryMaintainStatus.textContent = worker
+      ? `Worker ${worker.status} · interval ${worker.interval_hours}h` +
+        (worker.last_run?.ran_at ? ` · last ${worker.last_run.ran_at}` : "")
+      : "0 = off. Server runs HEURISTIC maintain when > 0.";
+  }
   renderProviderSettings();
   renderHostToolSettings();
   renderLocalServiceStatus();
@@ -1117,11 +1133,18 @@ async function submitProviderSettings(event) {
       );
     }
     await Promise.all(requests);
+    if (elements.memoryMaintainInterval) {
+      const hours = Number(elements.memoryMaintainInterval.value || 0);
+      state.serviceSettings = await api("/v1/settings/service", {
+        method: "POST",
+        body: { memory_maintain: { interval_hours: Number.isFinite(hours) ? hours : 0 } },
+      });
+    }
     state.providerSettings = await api("/v1/settings/providers");
     renderProviderSettings();
     renderComposerState();
     elements.settingsDialog.close();
-    toast("CLI provider settings saved");
+    toast("Settings saved");
   } catch (error) {
     elements.settingsError.textContent = error.message;
   } finally {

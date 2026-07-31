@@ -192,6 +192,19 @@
           Use <code>python tools/universe_server.py status|start|stop|restart</code>
           or Start Menu shortcuts from <code>packaging/windows/install-user.ps1</code>.
         </p>
+        <label for="memory-maintain-interval">Memory maintain interval (hours)</label>
+        <input
+          id="memory-maintain-interval"
+          name="memory_maintain_interval_hours"
+          type="number"
+          min="0"
+          max="720"
+          step="1"
+          value="0"
+        >
+        <small id="memory-maintain-status" class="provider-setting-status">
+          0 = off. Server process runs HEURISTIC maintain when &gt; 0.
+        </small>
       </section>
       <section class="settings-section">
         <div class="settings-section-heading">

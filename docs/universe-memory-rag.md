@@ -91,3 +91,18 @@ Inspector **Memory** tab:
 
 Inspector **Future** tab aggregates Seed structure, Bench/Experience counts,
 Memory, and Master handoffs for a single planning surface.
+
+## In-process maintain worker
+
+The local `serve` process owns a background worker:
+
+```text
+GET  /v1/settings/service
+POST /v1/settings/service
+  body: { "memory_maintain": { "interval_hours": 0 } }
+```
+
+- `interval_hours = 0` (default): worker idle (rechecks ~30s)
+- `interval_hours > 0`: runs HEURISTIC maintain for each connected project on that period, applying PROPOSED only
+- UI: Settings → Memory maintain interval (hours)
+
