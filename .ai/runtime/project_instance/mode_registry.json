@@ -1,5 +1,10 @@
 {
   "modes": {
+    "CONDUCTOR": {
+      "mode_profile": "GOVERNANCE_ONLY",
+      "role": "CONDUCTOR",
+      "scope": "project-network/navigation/distribution"
+    },
     "MASTER": {
       "mode_profile": "GOVERNANCE_ONLY",
       "role": "MASTER",
@@ -14,7 +19,7 @@
   "owner": "universe",
   "policy": "MASTER_MANAGED",
   "repository_kind": "PROJECT",
-  "revision": 3,
+  "revision": 4,
   "root_mode": "MASTER",
   "schema": "ai-career.mode-registry.v1"
 }

@@ -342,7 +342,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         request = dispatcher.dispatch_calls[0]
         self.assertEqual("NONE", request["repository_write_scope"])
         self.assertEqual([], request["mutation_scope"]["operations"])
-        self.assertEqual("UNIVERSE", request["context_pack"]["mode"])
+        self.assertEqual("CONDUCTOR", request["context_pack"]["mode"])
         self.assertEqual("STRUCTURED_JSON", request["result_mode"])
         self.assertEqual(
             "GCS", request["context_pack"]["ui_context"]["selected_project_id"]

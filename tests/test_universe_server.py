@@ -121,6 +121,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
                             "scope": "architecture/governance",
                             "mode_profile": "GOVERNANCE_ONLY",
                         },
+                        "CONDUCTOR": {
+                            "role": "CONDUCTOR",
+                            "scope": "project-network/navigation/distribution",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        },
                         "UNIVERSE": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
@@ -459,7 +464,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {
                 "schema": "universe.mode-contract.v1",
                 "status": "ACTIVE",
-                "mode": "UNIVERSE",
+                "mode": "CONDUCTOR",
                 "role": "CONDUCTOR",
                 "scope": "project-network/navigation/distribution",
                 "mode_profile": "GOVERNANCE_ONLY",
@@ -1011,6 +1016,96 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             f"universe://conductor-room/messages/{message_id}",
             fake.calls[0]["binding"]["parent_evidence_ref"],
+        )
+
+    def test_conductor_room_reuses_resident_mode_session_when_available(self) -> None:
+        class CapabilityHost:
+            @staticmethod
+            def provider_capability(provider: str) -> dict[str, object]:
+                return {
+                    "provider": provider,
+                    "status": "AVAILABLE" if provider == "GROK" else "UNAVAILABLE",
+                    "reason": "test capability",
+                }
+
+            def invoke_conductor_message(self, **_kwargs):
+                raise AssertionError("ordinary Conductor chat must not use Task Frame")
+
+        class SessionHost:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            def reply(self, provider: str, message: dict[str, object]):
+                self.calls.append((provider, message))
+                return {
+                    "provider": provider,
+                    "session_ref": "grok-acp:conductor-session-1",
+                    "connection_state": "REUSED",
+                    "requested_mode": "CONDUCTOR",
+                    "session_persistence": "LAST_COORDINATE",
+                    "text": "Conductor response",
+                }
+
+            def close(self) -> None:
+                return
+
+        self.server.runtime_host = CapabilityHost()
+        session_host = SessionHost()
+        self.server.conductor_session_host = session_host
+        status, _bound = self.request(
+            "POST",
+            "/v1/runtime/planning-binding",
+            {
+                "schema": "universe.planning-runtime-binding.v1",
+                "endpoint": "http://127.0.0.1:41991",
+                "token": "runtime-token",
+                "session_id": "universe-conductor-session",
+                "origin_anchor_ref": "universe-anchor",
+                "origin_frame_id": "current",
+                "parent_actor_ref": "universe-conductor",
+                "parent_evidence_ref": "host://parent/current",
+                "binding_evidence_ref": "host://runtime/binding",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        status, queued = self.request(
+            "POST",
+            "/v1/conductor-room/messages",
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "Show current projects.",
+                "provider": "AUTO",
+                "idempotency_key": "conductor-resident-session-001",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        message_id = queued["message"]["message_id"]
+
+        deadline = time.monotonic() + 3
+        messages: list[dict[str, object]] = []
+        while time.monotonic() < deadline:
+            _, collected = self.request(
+                "GET", "/v1/conductor-room/messages", token=self.token
+            )
+            messages = collected["messages"]
+            if any(item.get("in_reply_to") == message_id for item in messages):
+                break
+            time.sleep(0.02)
+
+        reply = next(
+            item for item in messages if item.get("in_reply_to") == message_id
+        )
+        self.assertEqual("Conductor response", reply["body"])
+        self.assertEqual(
+            "grok-acp:conductor-session-1",
+            reply["result_receipt_ref"],
+        )
+        self.assertEqual(
+            "CONDUCTOR",
+            session_host.calls[0][1]["runtime_context"]["requested_mode"],
         )
 
     def test_conductor_room_persists_fresh_project_draft_action(self) -> None:
@@ -3732,6 +3827,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
                             "scope": "architecture/governance",
                             "mode_profile": "GOVERNANCE_ONLY",
                         },
+                        "CONDUCTOR": {
+                            "role": "CONDUCTOR",
+                            "scope": "project-network/navigation/distribution",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        },
                         "UNIVERSE": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
@@ -3743,12 +3843,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             encoding="utf-8",
         )
         registry = load_universe_mode_registry(registry_path)
-        self.assertEqual("CONDUCTOR", registry["modes"]["UNIVERSE"]["role"])
+        self.assertEqual("CONDUCTOR", registry["modes"]["CONDUCTOR"]["role"])
         self.assertEqual(
             {
                 "schema": "universe.mode-contract.v1",
                 "status": "ACTIVE",
-                "mode": "UNIVERSE",
+                "mode": "CONDUCTOR",
                 "role": "CONDUCTOR",
                 "scope": "project-network/navigation/distribution",
                 "mode_profile": "GOVERNANCE_ONLY",
@@ -3767,15 +3867,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "\ucee8\ub355\ud130\ubaa8\ub4dc",
         ):
             with self.subTest(intent=intent):
-                self.assertEqual("UNIVERSE", resolve_universe_mode_intent(intent))
+                self.assertEqual("CONDUCTOR", resolve_universe_mode_intent(intent))
 
         require_release_lifecycle_mode("MASTER")
         with self.assertRaisesRegex(UniverseError, "require MASTER Mode"):
             require_release_lifecycle_mode("UNIVERSE")
 
-        registry["modes"]["UNIVERSE"]["role"] = "NAVIGATOR"
+        registry["modes"]["CONDUCTOR"]["role"] = "NAVIGATOR"
         registry_path.write_text(json.dumps(registry), encoding="utf-8")
-        with self.assertRaisesRegex(UniverseError, "UNIVERSE"):
+        with self.assertRaisesRegex(UniverseError, "CONDUCTOR"):
             load_universe_mode_registry(registry_path)
 
     def test_remote_auth_types_are_reserved_without_runtime_implementation(

@@ -314,7 +314,42 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual({"decision": "accept"}, decision)
         self.assertEqual("CODEX", selected[0]["provider"])
         self.assertEqual("allow_once", selected[0]["options"][0]["kind"])
+        start = next(
+            params
+            for method, params in transport.requests
+            if method == "thread/start"
+        )
+        self.assertFalse(start["ephemeral"])
         self.assertTrue(transport.closed)
+
+    def test_codex_ephemeral_session_never_resumes_or_persists_thread(self) -> None:
+        sessions: list[str] = []
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="stored-thread",
+                permission_requester=lambda _request: None,
+                session_observer=sessions.append,
+                ephemeral=True,
+            )
+            session.close()
+
+        transport = FakeJsonRpcTransport.instances[0]
+        methods = [method for method, _params in transport.requests]
+        self.assertNotIn("thread/resume", methods)
+        start = next(
+            params
+            for method, params in transport.requests
+            if method == "thread/start"
+        )
+        self.assertTrue(start["ephemeral"])
+        self.assertEqual(["codex-thread-001"], sessions)
 
 
 if __name__ == "__main__":

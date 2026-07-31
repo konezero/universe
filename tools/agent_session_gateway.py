@@ -516,12 +516,14 @@ class CodexAppServerSession:
         session_id: str | None,
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
+        ephemeral: bool = False,
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.session_id = session_id
         self.permission_requester = permission_requester
         self.session_observer = session_observer
+        self.ephemeral = bool(ephemeral)
         self._active_delta: Callable[[str], None] | None = None
         self._turn_events: dict[str, threading.Event] = {}
         self._completed_turns: set[str] = set()
@@ -612,7 +614,7 @@ class CodexAppServerSession:
         if not isinstance(result, Mapping):
             raise AgentSessionError("CODEX_APP_INITIALIZE_INVALID")
         self._transport.notify("initialized")
-        if self.session_id:
+        if self.session_id and not self.ephemeral:
             try:
                 session_result = self._transport.request(
                     "thread/resume",
@@ -639,7 +641,7 @@ class CodexAppServerSession:
                     "sandbox": "read-only",
                     "developerInstructions": self.system_prompt,
                     "runtimeWorkspaceRoots": [str(self.cwd)],
-                    "ephemeral": False,
+                    "ephemeral": self.ephemeral,
                 },
                 timeout_seconds=30,
             )

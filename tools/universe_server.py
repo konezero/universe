@@ -69,6 +69,7 @@ from project_release_apply import (
 )
 from project_master_host import (
     ProjectMasterHostError,
+    ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
@@ -217,7 +218,8 @@ IMPLEMENTATION_BINDING_RELATIONS = frozenset(
     {"IMPLEMENTS", "SUPPORTS", "ADAPTS", "EXPOSES"}
 )
 MASTER_MODE = "MASTER"
-UNIVERSE_MODE = "UNIVERSE"
+UNIVERSE_MODE = "CONDUCTOR"
+UNIVERSE_ALIAS_MODE = "UNIVERSE"
 UNIVERSE_ROLE = "CONDUCTOR"
 UNIVERSE_SCOPE = "project-network/navigation/distribution"
 UNIVERSE_MODE_PROFILE = "GOVERNANCE_ONLY"
@@ -436,6 +438,11 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
             "mode_profile": "GOVERNANCE_ONLY",
         },
         UNIVERSE_MODE: {
+            "role": UNIVERSE_ROLE,
+            "scope": UNIVERSE_SCOPE,
+            "mode_profile": UNIVERSE_MODE_PROFILE,
+        },
+        UNIVERSE_ALIAS_MODE: {
             "role": UNIVERSE_ROLE,
             "scope": UNIVERSE_SCOPE,
             "mode_profile": UNIVERSE_MODE_PROFILE,
@@ -9220,6 +9227,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         *,
         auto_start_conductor_runtime: bool = False,
         conductor_runtime_factory: Any = None,
+        conductor_session_provider_factory: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
         host_profile: HostProfileStore | None = None,
@@ -9266,6 +9274,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     ),
                     "reason": f"{type(error).__name__}: {error}",
                 }
+        self.conductor_session_host = (
+            ResidentModeSessionHost(
+                Path(__file__).resolve().parents[1],
+                "CONDUCTOR",
+                "CONDUCTOR",
+                self.store.database_path.parent / "conductor-mode-session.sqlite",
+                actor_label="Universe Conductor",
+                provider_factory=conductor_session_provider_factory,
+            )
+            if auto_start_conductor_runtime
+            else None
+        )
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
         self.connection_profile = local_connection_profile(f"http://{host_text}:{port}")
@@ -9874,6 +9894,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
                 for project in self.store.list_projects()[:50]
             ]
+            if self.conductor_session_host is not None:
+                worker_message["runtime_context"] = {
+                    "requested_mode": "CONDUCTOR",
+                    "session_id": binding.get("session_id", "UNKNOWN"),
+                    "origin_anchor_ref": binding.get(
+                        "origin_anchor_ref", "UNKNOWN"
+                    ),
+                    "origin_frame_id": binding.get("origin_frame_id", "UNKNOWN"),
+                    "commander_surface": "UNIVERSE_UI",
+                    "history": history[-50:],
+                }
+                session_result = self.conductor_session_host.reply(
+                    provider,
+                    worker_message,
+                )
+                self.store.complete_conductor_room_message(
+                    message_id,
+                    provider=provider,
+                    body=str(session_result["text"]).strip()[:12000],
+                    result_receipt_ref=str(session_result["session_ref"]),
+                    ui_action=normalize_conductor_ui_action({"kind": "NONE"}),
+                )
+                return
             invocation = self.runtime_host.invoke_conductor_message(
                 runtime_binding=binding,
                 message=worker_message,
@@ -9988,6 +10031,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._conductor_worker.join(timeout=5)
         if self.project_master_hosts is not None:
             self.project_master_hosts.close()
+        if self.conductor_session_host is not None:
+            self.conductor_session_host.close()
+            self.conductor_session_host = None
         if self.conductor_runtime is not None:
             self.conductor_runtime.stop()
             self.conductor_runtime = None
@@ -11725,6 +11771,7 @@ def create_server(
     mode_contract: dict[str, Any] | None = None,
     auto_start_conductor_runtime: bool = False,
     conductor_runtime_factory: Any = None,
+    conductor_session_provider_factory: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
     host_profile: HostProfileStore | None = None,
@@ -11748,6 +11795,7 @@ def create_server(
         mode_contract,
         auto_start_conductor_runtime=auto_start_conductor_runtime,
         conductor_runtime_factory=conductor_runtime_factory,
+        conductor_session_provider_factory=conductor_session_provider_factory,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
         host_profile=host_profile,

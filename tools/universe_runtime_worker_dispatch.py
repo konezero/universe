@@ -555,6 +555,10 @@ class RuntimeWorkerDispatcher:
             "sandbox_profile": "read-only",
             "permission_mode": "plan",
             "repository_write_scope": "NONE",
+            "session_persistence": "EPHEMERAL",
+            "persistent_session_ref": "UNKNOWN",
+            "universe_coordinate_persisted": False,
+            "provider_durable_chat_state": "UNKNOWN",
         }
 
     def _invoke_codex(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -576,6 +580,7 @@ class RuntimeWorkerDispatcher:
                     session_id=None,
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
+                    ephemeral=True,
                 )
             )
             try:
@@ -606,6 +611,10 @@ class RuntimeWorkerDispatcher:
             ),
             "result": {"text": text, "stop_reason": "COMPLETED"},
             "repository_write_scope": "NONE",
+            "session_persistence": "EPHEMERAL",
+            "persistent_session_ref": "UNKNOWN",
+            "universe_coordinate_persisted": False,
+            "provider_durable_chat_state": "NOT_PERSISTED",
         }
 
     @staticmethod

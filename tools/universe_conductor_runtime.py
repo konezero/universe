@@ -79,7 +79,7 @@ class UniverseConductorRuntime:
             self._binding = None
             self._process = None
 
-        definition = self._universe_definition()
+        definition = self._conductor_definition()
         source_commit = self.source_commit_resolver(self.repository_root)
         host_session_ref = f"universe://local-service/conductor/{uuid4().hex}"
         prepared = self._invoke(
@@ -92,7 +92,7 @@ class UniverseConductorRuntime:
                 ),
                 "source_commit": source_commit,
                 "source_repository": str(self.repository_root),
-                "mode": "UNIVERSE",
+                "mode": "CONDUCTOR",
                 "role": definition["role"],
                 "scope": definition["scope"],
                 "host_session_ref": host_session_ref,
@@ -206,7 +206,7 @@ class UniverseConductorRuntime:
                 str(self.repository_root),
             ),
             {
-                "mode": "UNIVERSE",
+                "mode": "CONDUCTOR",
                 "commander_surface": "UNIVERSE_UI",
                 "evidence_ref": (
                     f"universe://conductor-room/messages/{normalized_id}"
@@ -328,7 +328,7 @@ class UniverseConductorRuntime:
             )
         return payload
 
-    def _universe_definition(self) -> Mapping[str, str]:
+    def _conductor_definition(self) -> Mapping[str, str]:
         registry_path = (
             self.repository_root
             / ".ai"
@@ -338,21 +338,21 @@ class UniverseConductorRuntime:
         )
         try:
             registry = json.loads(registry_path.read_text(encoding="utf-8"))
-            definition = registry["modes"]["UNIVERSE"]
+            definition = registry["modes"]["CONDUCTOR"]
         except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
             raise UniverseConductorRuntimeError(
-                "UNIVERSE_MODE_UNAVAILABLE"
+                "CONDUCTOR_MODE_UNAVAILABLE"
             ) from error
         if not isinstance(definition, Mapping):
-            raise UniverseConductorRuntimeError("UNIVERSE_MODE_UNAVAILABLE")
-        role = _text(definition.get("role"), "UNIVERSE.role")
+            raise UniverseConductorRuntimeError("CONDUCTOR_MODE_UNAVAILABLE")
+        role = _text(definition.get("role"), "CONDUCTOR.role")
         if role != "CONDUCTOR":
-            raise UniverseConductorRuntimeError("UNIVERSE_MODE_ROLE_MISMATCH")
+            raise UniverseConductorRuntimeError("CONDUCTOR_MODE_ROLE_MISMATCH")
         return {
             "role": role,
-            "scope": _text(definition.get("scope"), "UNIVERSE.scope"),
+            "scope": _text(definition.get("scope"), "CONDUCTOR.scope"),
             "mode_profile": _text(
-                definition.get("mode_profile"), "UNIVERSE.mode_profile"
+                definition.get("mode_profile"), "CONDUCTOR.mode_profile"
             ),
         }
 

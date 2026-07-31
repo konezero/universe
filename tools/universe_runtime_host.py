@@ -765,7 +765,7 @@ class UniverseRuntimeHost:
                     "mutation_scope": {"operations": [], "targets": []},
                     "context_pack": {
                         "schema": "universe.conductor-chat-context.v1",
-                        "mode": "UNIVERSE",
+                        "mode": "CONDUCTOR",
                         "role": "CONDUCTOR",
                         "room_id": "UNIVERSE_CONDUCTOR",
                         "history": bounded_history,

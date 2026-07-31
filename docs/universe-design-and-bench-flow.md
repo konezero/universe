@@ -45,6 +45,17 @@ Career
 Universe must not mutate Project source, create execution authority, or treat
 a room message, Skill Plan, or Bench result as execution permission.
 
+## Provider Session Boundary
+
+Universe retains one last Provider/Session coordinate per connection target.
+The application target requests `CONDUCTOR`; each Project Master target
+requests `MASTER`. A matching Provider Session is resumed without another Mode
+greeting. A new or replaced coordinate receives that greeting once.
+
+The coordinate is routing state only. The opened Session owns its Mode
+preparation and currentness evaluation. Task Frame Boss and Worker executions
+are ephemeral and never replace a target's last connection coordinate.
+
 ## Project Queue and Career Carrier Boundary
 
 Project progress is useful Universe evidence, but it is not Career input by

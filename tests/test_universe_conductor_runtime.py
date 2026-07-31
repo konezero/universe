@@ -42,7 +42,7 @@ class FakeProcess:
 
 
 class UniverseConductorRuntimeTests(unittest.TestCase):
-    def test_start_prepares_universe_mode_and_owns_session_runtime(self) -> None:
+    def test_start_prepares_conductor_mode_and_owns_session_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
@@ -56,7 +56,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 json.dumps(
                     {
                         "modes": {
-                            "UNIVERSE": {
+                            "CONDUCTOR": {
                                 "role": "CONDUCTOR",
                                 "scope": "project-network/navigation/distribution",
                                 "mode_profile": "GOVERNANCE_ONLY",
@@ -113,7 +113,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                         },
                         "runtime_state": {
                             "anchor_id": "UNIVERSE-CURRENT-001",
-                            "mode": "UNIVERSE",
+                            "mode": "CONDUCTOR",
                             "role": "CONDUCTOR",
                             "session_id": session_id,
                             "executable_runtime_currentness": "CURRENT",
@@ -139,7 +139,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             self.assertEqual("UNIVERSE-CURRENT-001", binding["origin_anchor_ref"])
             self.assertEqual("http://127.0.0.1:41991", binding["endpoint"])
             self.assertEqual("COMMANDER_INPUT_OBSERVED", observed["status"])
-            self.assertEqual("UNIVERSE", requests[0]["mode"])
+            self.assertEqual("CONDUCTOR", requests[0]["mode"])
             self.assertEqual("CONDUCTOR", requests[0]["role"])
             self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
             self.assertIn("session-boot", process.command)

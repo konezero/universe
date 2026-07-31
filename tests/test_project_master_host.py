@@ -30,6 +30,7 @@ from project_master_host import (  # noqa: E402
     ProjectMasterConversationWorker,
     ProjectModeCoordinator,
     ProjectMasterSessionStore,
+    ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
@@ -261,6 +262,116 @@ class ProjectMasterHostTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_provider_session_store_keeps_one_last_coordinate(self) -> None:
+        self.assertIsNone(self.state.last_provider_session())
+        self.assertEqual(
+            "NEW",
+            self.state.observe_provider_session("GROK", "grok-session-1"),
+        )
+        self.assertEqual(
+            {
+                "provider": "GROK",
+                "session_ref": "grok-session-1",
+            },
+            self.state.last_provider_session(),
+        )
+        self.assertEqual(
+            "REUSED",
+            self.state.observe_provider_session("GROK", "grok-session-1"),
+        )
+        self.assertEqual(
+            "REPLACED",
+            self.state.observe_provider_session("CODEX", "codex-session-1"),
+        )
+        self.assertIsNone(self.state.session_ref_for("GROK"))
+        self.assertEqual("codex-session-1", self.state.session_ref_for("CODEX"))
+
+    def test_project_master_greets_only_new_provider_session(self) -> None:
+        prompts: list[str] = []
+
+        class FakeSession:
+            def __init__(self, *, session_id, session_observer, **_kwargs) -> None:
+                self.session_id = session_id or "grok-session-new"
+                self.session_ref = f"grok-acp:{self.session_id}"
+                session_observer(self.session_id)
+
+            def close(self) -> None:
+                return
+
+        class CapturingGateway:
+            def __init__(self, session) -> None:
+                self.session = session
+                self.session_ref = session.session_ref
+
+            def reply_stream(self, prompt, on_delta) -> str:
+                prompts.append(prompt)
+                on_delta("ok")
+                return "ok"
+
+            def close(self) -> None:
+                self.session.close()
+
+        message = {
+            "message_id": "message-1",
+            "kind": "QUESTION",
+            "sender": "UNIVERSE_CONDUCTOR",
+            "body": "status?",
+        }
+        with (
+            patch("project_master_host._resolve_grok", return_value=(self.root / "grok.exe", {})),
+            patch("project_master_host.GrokAcpSession", FakeSession),
+            patch("project_master_host.UniverseAcpGateway", CapturingGateway),
+        ):
+            first = GrokProjectMasterRuntime(self.root, "GCS", self.state)
+            first.set_permission_requester(lambda _request: None)
+            first.reply(message)
+            first.reply(message)
+            first.close()
+
+            resumed = GrokProjectMasterRuntime(self.root, "GCS", self.state)
+            resumed.set_permission_requester(lambda _request: None)
+            resumed.reply(message)
+            resumed.close()
+
+        self.assertIn("Enter MASTER Mode", prompts[0])
+        self.assertNotIn("Enter MASTER Mode", prompts[1])
+        self.assertNotIn("Enter MASTER Mode", prompts[2])
+
+    def test_resident_mode_session_switches_provider_without_parallel_map(self) -> None:
+        created: list[tuple[str, str, str, PreparedFakeProvider]] = []
+
+        def factory(
+            provider,
+            _root,
+            _target,
+            _store,
+            requested_mode,
+            actor_label,
+        ):
+            instance = PreparedFakeProvider()
+            created.append((provider, requested_mode, actor_label, instance))
+            return instance
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=factory,
+        )
+        try:
+            host.reply("GROK", self._envelope()["message"])
+            host.reply("GROK", self._envelope()["message"])
+            host.reply("CODEX", self._envelope()["message"])
+        finally:
+            host.close()
+
+        self.assertEqual(["GROK", "CODEX"], [item[0] for item in created])
+        self.assertEqual(["CONDUCTOR", "CONDUCTOR"], [item[1] for item in created])
+        self.assertTrue(created[0][3].closed)
+        self.assertTrue(created[1][3].closed)
 
     def test_live_bridge_invokes_provider_and_posts_reply_once(self) -> None:
         worker = self._worker()

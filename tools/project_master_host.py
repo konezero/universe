@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from agent_session_gateway import (
     AgentSessionError,
@@ -535,76 +535,99 @@ class ProjectMasterSessionStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._initialize()
+        self._migrate_legacy_provider_sessions()
 
-    def provider_session_id(
-        self,
-        provider: str = "GROK",
-        *,
-        create: bool = True,
-    ) -> str | None:
-        normalized_provider = _provider(provider)
-        key = f"provider_session_id:{normalized_provider}"
+    def last_provider_session(self) -> dict[str, str] | None:
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT value FROM host_metadata WHERE key = ?",
-                (key,),
-            ).fetchone()
-            if row is None and normalized_provider == "GROK":
-                row = connection.execute(
-                    "SELECT value FROM host_metadata WHERE key = 'provider_session_id'"
-                ).fetchone()
-            if row is not None:
-                return str(row["value"])
-            if not create:
-                return None
-            session_id = str(uuid4())
-            connection.execute(
-                "INSERT INTO host_metadata(key, value) VALUES(?, ?)",
-                (key, session_id),
-            )
-            return session_id
+            rows = {
+                str(row["key"]): str(row["value"])
+                for row in connection.execute(
+                    """
+                    SELECT key, value
+                    FROM host_metadata
+                    WHERE key IN ('last_provider', 'last_session_ref')
+                    """
+                ).fetchall()
+            }
+        provider = rows.get("last_provider")
+        session_ref = rows.get("last_session_ref")
+        if not provider or not session_ref:
+            return None
+        return {
+            "provider": _provider(provider),
+            "session_ref": _text(session_ref, "last_session_ref"),
+        }
 
-    def set_provider_session_id(self, provider: str, session_id: str) -> None:
+    def session_ref_for(self, provider: str) -> str | None:
         normalized_provider = _provider(provider)
-        normalized_session = _text(session_id, "session_id")
+        coordinate = self.last_provider_session()
+        if coordinate is None or coordinate["provider"] != normalized_provider:
+            return None
+        return coordinate["session_ref"]
+
+    def observe_provider_session(self, provider: str, session_ref: str) -> str:
+        normalized_provider = _provider(provider)
+        normalized_session = _text(session_ref, "session_ref")
+        previous = self.last_provider_session()
+        if previous is None:
+            state = "NEW"
+        elif previous == {
+            "provider": normalized_provider,
+            "session_ref": normalized_session,
+        }:
+            state = "REUSED"
+        else:
+            state = "REPLACED"
         with self._connection() as connection:
+            for key, value in (
+                ("last_provider", normalized_provider),
+                ("last_session_ref", normalized_session),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO host_metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+        return state
+
+    def _migrate_legacy_provider_sessions(self) -> None:
+        current = self.last_provider_session()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT key, value
+                FROM host_metadata
+                WHERE key = 'provider_session_id'
+                   OR key LIKE 'provider_session_id:%'
+                ORDER BY key
+                """
+            ).fetchall()
+            candidates: dict[str, str] = {}
+            for row in rows:
+                key = str(row["key"])
+                provider = key.partition(":")[2] or "GROK"
+                candidates[_provider(provider)] = str(row["value"])
+            if current is None and len(candidates) == 1:
+                provider, session_ref = next(iter(candidates.items()))
+                for key, value in (
+                    ("last_provider", provider),
+                    ("last_session_ref", session_ref),
+                ):
+                    connection.execute(
+                        "INSERT OR REPLACE INTO host_metadata(key, value) VALUES(?, ?)",
+                        (key, value),
+                    )
             connection.execute(
                 """
-                INSERT INTO host_metadata(key, value)
-                VALUES(?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (
-                    f"provider_session_id:{normalized_provider}",
-                    normalized_session,
-                ),
-            )
-
-    def provider_session_initialized(self, provider: str = "GROK") -> bool:
-        normalized_provider = _provider(provider)
-        key = f"provider_session_initialized:{normalized_provider}"
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT value FROM host_metadata WHERE key = ?",
-                (key,),
-            ).fetchone()
-            if row is None and normalized_provider == "GROK":
-                row = connection.execute(
-                    "SELECT value FROM host_metadata "
-                    "WHERE key = 'provider_session_initialized'"
-                ).fetchone()
-        return row is not None and str(row["value"]) == "true"
-
-    def mark_provider_session_initialized(self, provider: str = "GROK") -> None:
-        normalized_provider = _provider(provider)
-        with self._connection() as connection:
-            connection.execute(
+                DELETE FROM host_metadata
+                WHERE key = 'provider_session_id'
+                   OR key LIKE 'provider_session_id:%'
+                   OR key = 'provider_session_initialized'
+                   OR key LIKE 'provider_session_initialized:%'
                 """
-                INSERT INTO host_metadata(key, value)
-                VALUES(?, 'true')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (f"provider_session_initialized:{normalized_provider}",),
             )
 
     def register(self, envelope: Mapping[str, Any]) -> bool:
@@ -900,6 +923,8 @@ class GrokProjectMasterRuntime:
         native_runner: NativeRunner = run_native_cli,
         model: str = "",
         max_turns: int = 8,
+        requested_mode: str = "MASTER",
+        actor_label: str | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
@@ -907,10 +932,15 @@ class GrokProjectMasterRuntime:
         self.native_runner = native_runner
         self.model = model.strip()
         self.max_turns = max(1, int(max_turns))
-        self.session_id = store.provider_session_id("GROK")
-        if self.session_id is None:
-            raise ProjectMasterHostError("GROK_SESSION_ID_UNAVAILABLE")
-        UUID(self.session_id)
+        self.requested_mode = _text(requested_mode, "requested_mode").upper()
+        self.actor_label = (
+            _text(actor_label, "actor_label")
+            if actor_label is not None
+            else f"Project Master for {self.project_id}"
+        )
+        self.session_id = store.session_ref_for("GROK")
+        self.connection_state = "UNKNOWN"
+        self._greeting_pending = False
         self._permission_requester: Callable[[Mapping[str, Any]], str | None] | None = (
             None
         )
@@ -929,7 +959,13 @@ class GrokProjectMasterRuntime:
         on_delta: Callable[[str], None],
     ) -> str:
         try:
-            return self._acp_gateway().reply_stream(self._prompt(message), on_delta)
+            gateway = self._acp_gateway()
+            prompt = self._prompt(message)
+            if self._greeting_pending:
+                prompt = f"{self._mode_greeting()}\n\n{prompt}"
+            result = gateway.reply_stream(prompt, on_delta)
+            self._greeting_pending = False
+            return result
         except AgentSessionError as error:
             raise ProjectMasterHostError(str(error)) from error
 
@@ -962,8 +998,10 @@ class GrokProjectMasterRuntime:
 
         def observe_session(session_id: str) -> None:
             self.session_id = session_id
-            self.store.set_provider_session_id("GROK", session_id)
-            self.store.mark_provider_session_initialized("GROK")
+            self.connection_state = self.store.observe_provider_session(
+                "GROK", session_id
+            )
+            self._greeting_pending = self.connection_state != "REUSED"
 
         self._gateway = UniverseAcpGateway(
             GrokAcpSession(
@@ -980,11 +1018,10 @@ class GrokProjectMasterRuntime:
 
     def _system_prompt(self) -> str:
         return (
-            f"You are the Project Master for {self.project_id}. "
+            f"You are the {self.actor_label}. "
             "This is a persistent, read-only conversation Host connected to the "
-            "Universe Conductor. Work from the repository at the configured cwd. "
-            "At the start of the session, follow the repository entry order and "
-            "prepare MASTER Mode from source-backed evidence. Never claim that "
+            "Universe interface. Work from the repository at the configured cwd. "
+            "Never claim that "
             "Mode, Role, BOOT, or a chat message grants mutation authority. "
             "You may inspect source, review, explain, audit, and propose bounded "
             "work. Do not create, edit, delete, move, commit, push, execute project "
@@ -995,6 +1032,14 @@ class GrokProjectMasterRuntime:
             "Commander Surface answers; static state files may be older. Mark "
             "unavailable facts UNKNOWN. Reply in the user's language and keep "
             "ordinary conversation direct."
+        )
+
+    def _mode_greeting(self) -> str:
+        return (
+            f"Enter {self.requested_mode} Mode for this connection. "
+            "Follow the repository entry order, resolve the requested Mode through "
+            "the installed Mode Registry, and perform the Session's own preparation "
+            "and currentness checks. Treat this as Mode intent only."
         )
 
     def _prompt(self, message: Mapping[str, Any]) -> str:
@@ -1038,12 +1083,22 @@ class CodexProjectMasterRuntime:
         store: ProjectMasterSessionStore,
         *,
         native_runner: NativeRunner = run_native_cli,
+        requested_mode: str = "MASTER",
+        actor_label: str | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
         self.store = store
         self.native_runner = native_runner
-        self.session_id = store.provider_session_id("CODEX", create=False)
+        self.requested_mode = _text(requested_mode, "requested_mode").upper()
+        self.actor_label = (
+            _text(actor_label, "actor_label")
+            if actor_label is not None
+            else f"Project Master for {self.project_id}"
+        )
+        self.session_id = store.session_ref_for("CODEX")
+        self.connection_state = "UNKNOWN"
+        self._greeting_pending = False
         self._permission_requester: Callable[[Mapping[str, Any]], str | None] | None = (
             None
         )
@@ -1066,7 +1121,13 @@ class CodexProjectMasterRuntime:
         on_delta: Callable[[str], None],
     ) -> str:
         try:
-            return self._acp_gateway().reply_stream(self._prompt(message), on_delta)
+            gateway = self._acp_gateway()
+            prompt = self._prompt(message)
+            if self._greeting_pending:
+                prompt = f"{self._mode_greeting()}\n\n{prompt}"
+            result = gateway.reply_stream(prompt, on_delta)
+            self._greeting_pending = False
+            return result
         except AgentSessionError as error:
             raise ProjectMasterHostError(str(error)) from error
 
@@ -1099,8 +1160,10 @@ class CodexProjectMasterRuntime:
 
         def observe_session(session_id: str) -> None:
             self.session_id = session_id
-            self.store.set_provider_session_id("CODEX", session_id)
-            self.store.mark_provider_session_initialized("CODEX")
+            self.connection_state = self.store.observe_provider_session(
+                "CODEX", session_id
+            )
+            self._greeting_pending = self.connection_state != "REUSED"
 
         self._gateway = UniverseAcpGateway(
             CodexAppServerSession(
@@ -1117,14 +1180,21 @@ class CodexProjectMasterRuntime:
 
     def _system_prompt(self) -> str:
         return (
-            f"You are the Project Master for {self.project_id}. "
+            f"You are the {self.actor_label}. "
             "This is a persistent, read-only conversation Host connected to the "
-            "Universe Conductor. Follow the repository entry order and prepare "
-            "MASTER Mode from source-backed evidence. Do not create, edit, delete, "
+            "Universe interface. Do not create, edit, delete, "
             "move, commit, push, execute project code, invoke subagents, or use "
             "network tools. Mode and Role do not create mutation authority. "
             "Inspect, review, explain, audit, and propose bounded work only. "
             "Reply in the user's language."
+        )
+
+    def _mode_greeting(self) -> str:
+        return (
+            f"Enter {self.requested_mode} Mode for this connection. "
+            "Follow the repository entry order, resolve the requested Mode through "
+            "the installed Mode Registry, and perform the Session's own preparation "
+            "and currentness checks. Treat this as Mode intent only."
         )
 
     @staticmethod
@@ -1159,6 +1229,114 @@ class CodexProjectMasterRuntime:
             f"project_skill_binding_proposals: {skill_binding_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
+
+
+class ResidentModeSessionHost:
+    """Keep one provider-owned Mode Session connection for one target."""
+
+    def __init__(
+        self,
+        repository_root: Path,
+        target_id: str,
+        requested_mode: str,
+        database_path: Path,
+        *,
+        actor_label: str,
+        provider_factory: Callable[
+            [str, Path, str, ProjectMasterSessionStore, str, str],
+            MasterProvider,
+        ]
+        | None = None,
+    ) -> None:
+        self.repository_root = repository_root.expanduser().resolve(strict=True)
+        self.target_id = _text(target_id, "target_id")
+        self.requested_mode = _text(requested_mode, "requested_mode").upper()
+        self.actor_label = _text(actor_label, "actor_label")
+        self.store = ProjectMasterSessionStore(database_path, self.target_id)
+        self.provider_factory = provider_factory or self._default_provider
+        self._provider_name: str | None = None
+        self._provider: MasterProvider | None = None
+        self._lock = threading.RLock()
+
+    def reply(
+        self,
+        provider: str,
+        message: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        normalized_provider = _provider(provider)
+        with self._lock:
+            active = self._ensure(normalized_provider)
+            text = active.reply(message)
+            connection_state = str(
+                getattr(active, "connection_state", "UNKNOWN")
+            )
+            return {
+                "provider": normalized_provider,
+                "session_ref": active.session_ref,
+                "connection_state": connection_state,
+                "requested_mode": self.requested_mode,
+                "session_persistence": "LAST_COORDINATE",
+                "text": text,
+            }
+
+    def close(self) -> None:
+        with self._lock:
+            provider = self._provider
+            self._provider = None
+            self._provider_name = None
+        if provider is not None:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+
+    def _ensure(self, provider: str) -> MasterProvider:
+        if self._provider is not None and self._provider_name == provider:
+            return self._provider
+        self.close()
+        active = self.provider_factory(
+            provider,
+            self.repository_root,
+            self.target_id,
+            self.store,
+            self.requested_mode,
+            self.actor_label,
+        )
+        permission_setter = getattr(active, "set_permission_requester", None)
+        if callable(permission_setter):
+            permission_setter(lambda _request: None)
+        prepare = getattr(active, "prepare_session", None)
+        if callable(prepare):
+            prepare()
+        self._provider = active
+        self._provider_name = provider
+        return active
+
+    @staticmethod
+    def _default_provider(
+        provider: str,
+        repository_root: Path,
+        target_id: str,
+        store: ProjectMasterSessionStore,
+        requested_mode: str,
+        actor_label: str,
+    ) -> MasterProvider:
+        if provider == "GROK":
+            return GrokProjectMasterRuntime(
+                repository_root,
+                target_id,
+                store,
+                requested_mode=requested_mode,
+                actor_label=actor_label,
+            )
+        if provider == "CODEX":
+            return CodexProjectMasterRuntime(
+                repository_root,
+                target_id,
+                store,
+                requested_mode=requested_mode,
+                actor_label=actor_label,
+            )
+        raise ProjectMasterHostError("MODE_SESSION_PROVIDER_UNSUPPORTED")
 
 
 class ProjectMasterConversationWorker:

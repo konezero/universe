@@ -6,9 +6,9 @@ assignments.
 
 ## Operating Mode contract
 
-The canonical operating coordinate is `Mode=UNIVERSE, Role=CONDUCTOR`.
-`Universe Mode` and `Conductor Mode` are project-local aliases for that same
-coordinate. The service validates the repository Mode Registry before listening.
+The application entry intent is `Mode=CONDUCTOR, Role=CONDUCTOR`.
+`UNIVERSE` remains a project-local operational alias, but application startup
+requests `CONDUCTOR` through the installed Mode Registry.
 
 `MASTER` remains separate and is required for Release DB installation, update,
 Mode Registry mutation, and Universe policy lifecycle changes. Neither Mode
@@ -34,21 +34,26 @@ grants authority or permission to mutate an attached project. See
 Universe Runtime Host provider processes remain outside the installed project Runtime. They can return a bounded read-only Worker result, but cannot create project authority, write scope, or mutation permission. See `docs/universe-runtime-host.md`.
 
 The Universe Conductor Room persists each user message before execution. The
-local service prepares the `UNIVERSE / CONDUCTOR` Mode, starts one owned
+local service prepares the `CONDUCTOR / CONDUCTOR` Mode, starts one owned
 internal Skill Router Session Runtime, and binds its loopback endpoint in
 process memory before it accepts Conductor work. The executable Runtime does
-not select or create the active Mode; the prepared `UNIVERSE` Mode Current
+not select or create the active Mode; the prepared `CONDUCTOR` Mode Current
 Anchor remains the governance coordinate. A single service-owned queue then
-dispatches the message through the read-only Task Frame Runtime Host:
+delivers ordinary conversation to one resident Provider Session:
 
 ```text
 Universe UI
   -> durable Conductor Room message
   -> QUEUED
-  -> one read-only Task Frame Worker
-  -> bounded reply plus provider Result Receipt
+  -> resident Conductor Provider Session
+  -> bounded reply plus Provider Session Ref
   -> durable Conductor Room reply
 ```
+
+The Conductor creates a Task Frame only when it delegates bounded work. A Task
+Frame Boss or Worker opens an ephemeral Provider execution, never reads or
+replaces the Conductor's last Provider Session coordinate, and does not leave a
+Universe-owned durable Provider chat.
 
 The HTTP request does not wait for the provider. The UI polls the durable room
 for `PROCESSING`, `ANSWERED`, or `FAILED`. Restart recovery returns interrupted
@@ -449,14 +454,22 @@ The local application also supplies a lazy resident Host route. When a Project
 Room is called without a usable Bridge, Universe starts one read-only Project
 Master Host for that project, registers its loopback Bridge, and keeps the Host
 resident until the Universe service stops. Later messages reuse the same
-provider session ID and durable Host queue. Opening or selecting a project does
-not start its Host; the first actual Project Master message does.
+last Provider Session coordinate and durable Host queue. Opening or selecting a
+project does not start its Host; the first actual Project Master message does.
 
 Each Project Master has an independent persisted CLI selection with the same
 `AUTO`, `GROK`, and `CODEX` values. A changed selection closes the existing
 resident Host and is applied on the next Project Room message. Provider session
-references are provider-scoped so a Grok session is never resumed as Codex, or
-the reverse.
+state is target-scoped and contains exactly one `last_provider` plus
+`last_session_ref`. A Provider change replaces that coordinate; Universe does
+not retain parallel Grok and Codex session maps.
+
+On open, Universe supplies that last coordinate and records the Provider and
+Session Ref actually opened. An exact match resumes without a greeting. A
+missing, changed-Provider, or changed-Session coordinate receives the requested
+Mode greeting once (`CONDUCTOR` for application entry and `MASTER` for a Project
+Master connection). The opened Session performs its own Mode preparation and
+currentness checks; Universe does not judge either.
 
 ### Universe ACP Gateway
 
@@ -466,19 +479,24 @@ that boundary; it does not connect to a provider CLI directly.
 ```text
 Universe UI
   -> Universe ACP Gateway
-     -> Universe Conductor Task Frame Worker session
+     -> resident Universe Conductor session
      -> resident Project Master session
+     -> ephemeral Task Frame Boss or Worker execution
      -> Grok ACP over JSON-RPC stdio
      -> Codex app-server adapter normalized to ACP events
 ```
 
-The implemented common session vocabulary is `session/new` or provider resume,
-`session/prompt`, `session/update`, and `session/request_permission`. The
-Universe Conductor keeps its governed Task Frame create, claim, result, and
-close path, but its bounded provider Worker now runs through the same ACP
-Gateway instead of raw one-shot provider CLI execution. Project Master sessions
-remain resident for conversation continuity. ACP is the client/session protocol
-and does not bypass Task Frame, Mode, authority, or execution-assignment rules.
+The implemented common session vocabulary is `session/new` or Provider resume,
+`session/prompt`, `session/update`, and `session/request_permission`. Universe
+Conductor and Project Master sessions remain resident for conversation
+continuity. Task Frame Provider executions use the same Gateway but remain
+ephemeral. ACP is the client/session protocol and does not bypass Task Frame,
+Mode, authority, or execution-assignment rules.
+
+`EPHEMERAL` means Universe does not retain a connection coordinate for that
+execution. Codex also receives `thread/start.ephemeral: true`. Grok ACP does not
+currently attest Provider-side durable chat cleanup, so that Provider storage
+state remains `UNKNOWN`.
 
 Grok runs through its native ACP `agent stdio` interface. Codex currently
 exposes approval callbacks through `app-server`; the adapter maps those
