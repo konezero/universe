@@ -60,7 +60,7 @@
 |------|------|------|
 | Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** → 개선 | 뷰 전환 노출, pan/zoom/fit, Inspector 프로젝트 상시(닫기 가능), Conversation 대상 라벨, Esc, 모바일 toolbar/hint polish |
-| 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** → 2 | CLI lifecycle + user install + tray + **portable zip** (`tools/build_portable.py`). MSI/임베드 Python 미착수 |
+| 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** → 3 | CLI + tray + portable + **embed Python** (`--with-python`) + per-user install script. Signed MSI/MSIX 미착수 |
 | 통합 E2E 검증: 설치 → 연결 → Master 대화 → 작업 전달 → 결과 회수 | **시나리오+스모크** | 정본: `docs/universe-e2e-product-scenario.md`. 하네스: `tools/universe_e2e_smoke.py` (`run`/`check`) + `tests/test_universe_e2e_product_scenario.py` |
 
 #### P1
@@ -111,7 +111,8 @@ P2 확장                                                    : NOT_STARTED
 3. ~~Future 통합 탭 1차~~  
 4. ~~Bench/Experience 고도화 1차~~  
 5. P2 Release 서명·채널 / 원격 확장은 계약상 후순위 유지  
-6. packaging 후속: MSI / 임베드 Python (outline only)
+6. ~~임베드 Python + per-user portable install~~  
+7. packaging 후속: signed MSI/MSIX
 
 ### 6) 변경 이력
 
@@ -130,3 +131,4 @@ P2 확장                                                    : NOT_STARTED
 | 2026-07-31 | packaging tray: Universe-Tray.ps1 + `universe_server.py tray` |
 | 2026-07-31 | portable package: `tools/build_portable.py` + data/ env overrides |
 | 2026-07-31 | Memory RAG API/UI + Future tab + Bench/Context Pack polish |
+| 2026-07-31 | portable --with-python embed + Install-Portable-User.ps1 |

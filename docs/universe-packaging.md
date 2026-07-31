@@ -91,6 +91,9 @@ Build from the repository root:
 python tools/build_portable.py
 # folder only:
 python tools/build_portable.py --no-zip
+# embed Windows CPython (download official embed zip, or pass local zip):
+python tools/build_portable.py --with-python
+python tools/build_portable.py --with-python --python-zip C:\cache\python-3.12.8-embed-amd64.zip
 ```
 
 Output:
@@ -98,6 +101,7 @@ Output:
 ```text
 dist/portable/UniversePortable-YYYYMMDD/
 dist/portable/UniversePortable-YYYYMMDD.zip
+dist/portable/UniversePortable-YYYYMMDD-pyembed/   # when --with-python
 ```
 
 Layout:
@@ -129,31 +133,43 @@ UNIVERSE_LOG_FILE
 UNIVERSE_MODE_REGISTRY
 ```
 
-so state stays inside the package when the folder is moved. Python is **not**
-bundled; the Host must provide `python` on `PATH`.
+so state stays inside the package when the folder is moved.
+
+Python options:
+
+| Build | Runtime |
+|-------|---------|
+| default | Host `python` on PATH |
+| `--with-python` | `runtime/python/python.exe` (official embeddable CPython) |
+
+### Per-user install (no MSI)
+
+```powershell
+# after build_portable.py
+powershell -ExecutionPolicy Bypass -File packaging\windows\Install-Portable-User.ps1 `
+  -Source dist\portable\UniversePortable-YYYYMMDD.zip `
+  -Autostart `
+  -StartAfterInstall
+```
+
+Installs under `%LOCALAPPDATA%\Programs\UniversePortable` and creates Start Menu
+shortcuts. This is the interim installer path until signed MSIX/MSI.
 
 ## Follow-ups
 
 1. ~~Optional system tray process~~ → `packaging/windows/Universe-Tray.ps1` + `tray` CLI
-2. ~~Single-folder portable zip~~ → `tools/build_portable.py` (Python still Host-provided)
-3. MSIX / signed installer for non-developer users (outline only below).
-4. Embed/pin a private Python runtime inside the portable zip.
-5. In-app settings panel actions that shell out only via Host-approved control.
-6. Custom tray icon asset (currently uses application system icon).
+2. ~~Single-folder portable zip~~ → `tools/build_portable.py`
+3. ~~Embed Python in portable~~ → `--with-python` / `--python-zip`
+4. ~~Per-user portable installer~~ → `Install-Portable-User.ps1`
+5. Signed MSIX/MSI (WiX) for enterprise distribution.
+6. In-app settings panel actions that shell out only via Host-approved control.
+7. Custom tray icon asset (currently uses application system icon).
 
-## MSI / embed Python (outline — not implemented)
-
-Target later:
+## Signed MSI (still later)
 
 ```text
-1. Build portable tree with tools/build_portable.py
-2. Bundle official CPython embeddable package under runtime/python/
-3. Point launchers at runtime/python/python.exe instead of PATH
-4. Wrap with WiX / MSIX:
-   - per-user install
-   - Start Menu + optional autostart
-   - no admin unless machine-wide requested
-5. Code-sign installer and Python binaries
+1. tools/build_portable.py --with-python
+2. WiX/MSIX harvest of the portable tree
+3. per-user package + Start Menu + optional autostart
+4. code-sign installer and runtime/python binaries
 ```
-
-Until then, portable zip + Host Python remains the supported distribution.

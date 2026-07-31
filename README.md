@@ -83,7 +83,10 @@ Portable folder/zip (data stays inside the package):
 
 ```powershell
 python tools/build_portable.py
-# -> dist/portable/UniversePortable-YYYYMMDD.zip
+python tools/build_portable.py --with-python
+# -> dist/portable/UniversePortable-YYYYMMDD[-pyembed].zip
+powershell -ExecutionPolicy Bypass -File packaging\windows\Install-Portable-User.ps1 `
+  -Source dist\portable\UniversePortable-YYYYMMDD.zip
 ```
 
 Details: `docs/universe-packaging.md`.
