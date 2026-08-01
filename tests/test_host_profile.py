@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from host_profile import (  # noqa: E402
     HostProfileError,
     HostProfileStore,
+    PROFILE_REVISION,
     PROFILE_SCHEMA,
     default_host_profile_path,
 )
@@ -88,6 +89,10 @@ class HostProfileTests(unittest.TestCase):
             self.assertNotIn(codex_batch.resolve(), calls)
             stored = json.loads(profile_path.read_text(encoding="utf-8"))
             self.assertEqual(PROFILE_SCHEMA, stored["schema"])
+            self.assertEqual(PROFILE_REVISION, stored["revision"])
+            self.assertEqual("NOT_APPLICABLE", stored["tools"]["python"]["model"])
+            self.assertEqual("grok-build", stored["tools"]["grok"]["model"])
+            self.assertEqual("default", stored["tools"]["claude"]["model"])
 
     def test_legacy_environment_is_migration_input_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -181,6 +186,84 @@ class HostProfileTests(unittest.TestCase):
                 claude.resolve(),
                 store.resolve("claude").executable,
             )
+            self.assertEqual(PROFILE_REVISION, result["revision"])
+
+    def test_revision_one_profile_migrates_models_without_rediscovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "host.json"
+            claude = root / ".local" / "bin" / "claude.exe"
+            claude.parent.mkdir(parents=True)
+            claude.write_bytes(b"placeholder")
+            profile_path.write_text(
+                json.dumps(
+                    {
+                        "schema": PROFILE_SCHEMA,
+                        "revision": 1,
+                        "created_at": "before",
+                        "updated_at": "before",
+                        "tools": {
+                            tool: {
+                                "status": "AVAILABLE" if tool == "claude" else "UNAVAILABLE",
+                                "executable": str(claude) if tool == "claude" else "UNKNOWN",
+                                "version": "claude 1.0" if tool == "claude" else "UNKNOWN",
+                                "verified_at": "before" if tool == "claude" else "UNKNOWN",
+                                "discovery_source": "USER_SELECTED" if tool == "claude" else "NONE",
+                                "environment": {},
+                                "evidence_ref": "test://claude" if tool == "claude" else "UNKNOWN",
+                                "reason": f"{tool.upper()}_NOT_DISCOVERED",
+                            }
+                            for tool in ("python", "git", "codex", "grok", "claude")
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = HostProfileStore(
+                profile_path,
+                environment={},
+                path_lookup=lambda _name: None,
+                native_runner=lambda _request: self.fail("migration rediscovered tools"),
+                current_python=root / "missing-python.exe",
+                home=root,
+            )
+
+            result = store.ensure_initialized()
+
+            self.assertEqual(PROFILE_REVISION, result["revision"])
+            self.assertEqual("default", result["tools"]["claude"]["model"])
+            self.assertEqual("grok-build", result["tools"]["grok"]["model"])
+            self.assertEqual("NOT_APPLICABLE", result["tools"]["git"]["model"])
+
+    def test_provider_model_is_validated_and_preserved_by_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "host.json"
+            claude = root / ".local" / "bin" / "claude.exe"
+            claude.parent.mkdir(parents=True)
+            claude.write_bytes(b"placeholder")
+            store = HostProfileStore(
+                profile_path,
+                environment={},
+                path_lookup=lambda _name: None,
+                native_runner=lambda _request: completed("claude 2.1"),
+                current_python=root / "missing-python.exe",
+                home=root,
+            )
+            store.discover()
+
+            selected = store.set_model("claude", "opus")
+            verified = store.verify_tool("claude")
+
+            self.assertEqual("opus", selected["tools"]["claude"]["model"])
+            self.assertEqual("opus", verified["tools"]["claude"]["model"])
+            self.assertEqual("opus", store.resolve("claude").model)
+            with self.assertRaises(HostProfileError) as raised:
+                store.set_model("claude", "opus --dangerously-skip-permissions")
+            self.assertEqual("HOST_TOOL_MODEL_INVALID", raised.exception.code)
+            with self.assertRaises(HostProfileError) as raised:
+                store.set_model("python", "3.14")
+            self.assertEqual("HOST_TOOL_MODEL_UNSUPPORTED", raised.exception.code)
 
     def test_profile_rejects_unknown_tool_and_does_not_store_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1024,7 +1024,7 @@ class GrokProjectMasterRuntime:
             return self._gateway
         if self._permission_requester is None:
             raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
-        executable, environment = _resolve_grok()
+        executable, environment, model = _resolve_grok()
         if executable is None:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
 
@@ -1040,6 +1040,7 @@ class GrokProjectMasterRuntime:
                 executable=executable,
                 cwd=self.project_root,
                 environment=environment,
+                model=model,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
                 permission_requester=self._permission_requester,
@@ -1186,7 +1187,7 @@ class CodexProjectMasterRuntime:
             return self._gateway
         if self._permission_requester is None:
             raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
-        executable, environment = _resolve_codex()
+        executable, environment, model = _resolve_codex()
         if executable is None:
             raise ProjectMasterHostError("CODEX_CLI_UNAVAILABLE")
 
@@ -1202,6 +1203,7 @@ class CodexProjectMasterRuntime:
                 executable=executable,
                 cwd=self.project_root,
                 environment=environment,
+                model=model,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
                 permission_requester=self._permission_requester,
@@ -1299,7 +1301,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             return self._gateway
         if self._permission_requester is None:
             raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
-        executable, environment = _resolve_claude()
+        executable, environment, model = _resolve_claude()
         if executable is None:
             raise ProjectMasterHostError("CLAUDE_CLI_UNAVAILABLE")
 
@@ -1314,6 +1316,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             executable=executable,
             cwd=self.project_root,
             environment=environment,
+            model=model,
             system_prompt=self._system_prompt(),
             session_id=self.session_id,
             permission_requester=self._permission_requester,
@@ -2045,25 +2048,25 @@ class ResidentProjectMasterHostManager:
         raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_NOT_READY")
 
 
-def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
+def _resolve_grok() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("grok")
     if resolved is None:
-        return None, {}
-    return resolved.executable, dict(resolved.environment)
+        return None, {}, "UNKNOWN"
+    return resolved.executable, dict(resolved.environment), resolved.model
 
 
-def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
+def _resolve_codex() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("codex")
     if resolved is None:
-        return None, {}
-    return resolved.executable, dict(resolved.environment)
+        return None, {}, "UNKNOWN"
+    return resolved.executable, dict(resolved.environment), resolved.model
 
 
-def _resolve_claude() -> tuple[Path | None, dict[str, str]]:
+def _resolve_claude() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("claude")
     if resolved is None:
-        return None, {}
-    return resolved.executable, dict(resolved.environment)
+        return None, {}, "UNKNOWN"
+    return resolved.executable, dict(resolved.environment), resolved.model
 
 
 def _required_host_executable(tool: str) -> Path:

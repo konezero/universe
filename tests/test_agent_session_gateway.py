@@ -51,7 +51,7 @@ class FakeJsonRpcTransport:
     ) -> Any:
         del timeout_seconds
         self.requests.append((method, dict(params)))
-        if self.arguments[-2:] == ("agent", "stdio"):
+        if "agent" in self.arguments and self.arguments[-1] == "stdio":
             if method == "initialize":
                 return {
                     "authMethods": [{"id": "cached_token"}],
@@ -185,6 +185,7 @@ class AgentSessionGatewayTests(unittest.TestCase):
             environment={},
             system_prompt="System",
             session_id="claude-session-old",
+            model="opus",
             permission_requester=lambda _request: None,
             session_observer=sessions.append,
             native_runner=runner,
@@ -197,6 +198,10 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual(["claude-session-new"], sessions)
         self.assertIn("--resume", requests[0].arguments)
         self.assertIn("claude-session-old", requests[0].arguments)
+        self.assertEqual(
+            "opus",
+            requests[0].arguments[requests[0].arguments.index("--model") + 1],
+        )
         self.assertEqual(
             "Read,Glob,Grep",
             requests[0].arguments[requests[0].arguments.index("--tools") + 1],
@@ -242,8 +247,63 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertNotIn("--resume", arguments)
         self.assertNotIn("--bare", arguments)
         self.assertIn("--no-session-persistence", arguments)
+        self.assertEqual("default", arguments[arguments.index("--model") + 1])
         self.assertEqual("", arguments[arguments.index("--tools") + 1])
         self.assertEqual([], sessions)
+
+    def test_claude_structured_session_binds_schema_and_uses_structured_output(
+        self,
+    ) -> None:
+        requests = []
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["value"],
+            "properties": {"value": {"type": "string"}},
+        }
+
+        def runner(request):
+            requests.append(request)
+            return NativeCliResult(
+                contract="test",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "result": "This prose must not be consumed.",
+                        "structured_output": {"value": "bounded"},
+                        "session_id": "ephemeral-structured-session",
+                        "is_error": False,
+                    }
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            json_schema=schema,
+            native_runner=runner,
+        )
+        deltas: list[str] = []
+        answer = session.prompt("Question", deltas.append)
+
+        self.assertEqual('{"value":"bounded"}', answer)
+        self.assertEqual(['{"value":"bounded"}'], deltas)
+        arguments = requests[0].arguments
+        self.assertEqual(
+            schema,
+            json.loads(arguments[arguments.index("--json-schema") + 1]),
+        )
 
     def test_grok_runs_as_acp_session_and_forwards_permission(self) -> None:
         selected: list[dict[str, Any]] = []
@@ -293,6 +353,8 @@ class AgentSessionGatewayTests(unittest.TestCase):
                 "--permission-mode",
                 "default",
                 "agent",
+                "--model",
+                "default",
                 "stdio",
             ),
             transport.arguments,
@@ -441,7 +503,7 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         transport = FakeJsonRpcTransport.instances[0]
         self.assertEqual(
-            ("app-server", "--listen", "stdio://"),
+            ("app-server", "-c", 'model="default"', "--listen", "stdio://"),
             transport.arguments,
         )
         self.assertIn(("initialized", None), transport.notifications)

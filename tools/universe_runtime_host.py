@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from host_profile import resolve_host_tool
@@ -27,11 +27,6 @@ RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 PLANNING_PROFILE = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
 )
-PLANNING_MODELS = {
-    "GROK": "grok-build",
-    "CODEX": "default",
-    "CLAUDE": "default",
-}
 
 
 @dataclass(frozen=True)
@@ -51,6 +46,165 @@ def _required_host_executable(tool: str) -> Path:
             f"{tool.upper()}_HOST_TOOL_UNAVAILABLE",
         )
     return resolved.executable
+
+
+def _capability_model(capability: Mapping[str, Any]) -> str:
+    model = capability.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise RuntimeHostError(
+            "WORKER_PROVIDER_MODEL_UNAVAILABLE",
+            "selected provider has no Host Profile model",
+        )
+    return model.strip()
+
+
+def _model_ref(provider: str, model: str) -> str:
+    return f"provider://{provider}/model/{quote(model, safe='')}"
+
+
+def _conductor_chat_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reply", "action"],
+        "properties": {
+            "reply": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 12000,
+            },
+            "action": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["kind"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["NONE"]}
+                        },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["kind", "todo"],
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["TODO_DRAFT"],
+                            },
+                            "todo": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "scope_kind",
+                                    "title",
+                                    "detail",
+                                    "priority",
+                                    "state",
+                                ],
+                                "properties": {
+                                    "scope_kind": {
+                                        "type": "string",
+                                        "enum": ["UNIVERSE", "PROJECT", "NODE"],
+                                    },
+                                    "project_id": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                    },
+                                    "node_ref": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                    },
+                                    "title": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 160,
+                                    },
+                                    "detail": {
+                                        "type": "string",
+                                        "maxLength": 4000,
+                                    },
+                                    "priority": {
+                                        "type": "string",
+                                        "enum": ["P0", "P1", "P2", "P3"],
+                                    },
+                                    "state": {
+                                        "type": "string",
+                                        "enum": [
+                                            "BACKLOG",
+                                            "READY",
+                                            "IN_PROGRESS",
+                                            "BLOCKED",
+                                            "DONE",
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["kind", "intent"],
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["FRESH_PROJECT_DRAFT"],
+                            },
+                            "intent": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": [
+                                    "project",
+                                    "kind",
+                                    "goal",
+                                    "target_users",
+                                    "technologies",
+                                    "constraints",
+                                ],
+                                "properties": {
+                                    "project": {
+                                        "type": "string",
+                                        "maxLength": 160,
+                                    },
+                                    "kind": {
+                                        "type": "string",
+                                        "maxLength": 160,
+                                    },
+                                    "goal": {
+                                        "type": "string",
+                                        "maxLength": 4000,
+                                    },
+                                    "target_users": {
+                                        "type": "string",
+                                        "maxLength": 1000,
+                                    },
+                                    "technologies": {
+                                        "type": "array",
+                                        "maxItems": 64,
+                                        "uniqueItems": True,
+                                        "items": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                    },
+                                    "constraints": {
+                                        "type": "array",
+                                        "maxItems": 32,
+                                        "uniqueItems": True,
+                                        "items": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                ]
+            },
+        },
+    }
 
 
 def _canonical_json(value: Any) -> str:
@@ -225,6 +379,10 @@ class UniverseRuntimeHost:
             result["reason"] = response["reason"]
         if response.get("cli_auto_approve") in {"ON", "OFF", "UNKNOWN"}:
             result["cli_auto_approve"] = response["cli_auto_approve"]
+        if isinstance(response.get("model"), str) and response["model"]:
+            result["model"] = response["model"]
+        if isinstance(response.get("model_ref"), str) and response["model_ref"]:
+            result["model_ref"] = response["model_ref"]
         return result
 
     def invoke_read_only(self, value: Mapping[str, Any]) -> dict[str, Any]:
@@ -271,7 +429,7 @@ class UniverseRuntimeHost:
                 "WORKER_PROVIDER_UNAVAILABLE",
                 capability.get("reason", "selected provider is unavailable"),
             )
-        model = PLANNING_MODELS[normalized_provider]
+        model = _capability_model(capability)
         frame_id = f"fresh-project-planning:{_required_text(run_id, 'run_id')}"
         turn_id = "planning-boss"
         request_id = _required_text(refinement_request.get("request_id"), "request_id")
@@ -349,7 +507,7 @@ class UniverseRuntimeHost:
             )
         return {
             "provider": normalized_provider,
-            "model_ref": (f"provider://{normalized_provider}/model/{model}"),
+            "model_ref": _model_ref(normalized_provider, model),
             "frame_id": frame_id,
             "turn_id": turn_id,
             "execution_proposal": dict(proposal),
@@ -544,7 +702,7 @@ class UniverseRuntimeHost:
         frame_id = f"conductor-chat:{message_id}"
         turn_id = "conductor"
         source_ref = f"universe://conductor-room/messages/{message_id}"
-        model = PLANNING_MODELS[normalized_provider]
+        model = _capability_model(capability)
         execution_plan = {
             "profile_id": "task-frame-debate-v1",
             "requested_shape": "DEBATE",
@@ -652,6 +810,7 @@ class UniverseRuntimeHost:
                     },
                 },
             },
+            "json_schema": _conductor_chat_json_schema(),
             "instruction": (
                 "Answer the latest user message as the Universe Conductor. "
                 "Return action kind TODO_DRAFT only when the user explicitly asks "
@@ -855,6 +1014,7 @@ class UniverseRuntimeHost:
         result = {
             "status": _text_or(response.get("status"), "WORKER_PROVIDER_FAILED"),
             "provider": request["provider"],
+            "model_ref": _text_or(response.get("model_ref"), "UNKNOWN"),
             "worker_id": _text_or(response.get("worker_id"), "UNKNOWN"),
             "result_receipt_ref": _text_or(
                 response.get("result_receipt_ref"), "UNKNOWN"

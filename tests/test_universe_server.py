@@ -742,6 +742,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("AVAILABLE", verified["tools"]["python"]["status"])
 
+        status, model_selected = self.request(
+            "POST",
+            "/v1/settings/host-tools/claude/model",
+            {"model": "opus"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("opus", model_selected["tools"]["claude"]["model"])
+
     def test_cli_provider_settings_default_to_auto_and_persist(self) -> None:
         class FakeRuntimeHost:
             @staticmethod

@@ -10547,6 +10547,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
 
+    def set_host_tool_model(self, tool: str, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="host_tool_model_setting",
+            required=frozenset({"model"}),
+            optional=frozenset(),
+        )
+        try:
+            profile = self.host_profile.set_model(
+                tool,
+                _required_text(request["model"], "model"),
+            )
+        except HostProfileError as error:
+            raise UniverseError(error.code, str(error)) from error
+        if self.project_master_hosts is not None:
+            self.project_master_hosts.close()
+        if self.conductor_session_host is not None:
+            self.conductor_session_host.close()
+            self._conductor_session_error = None
+        return profile
+
     def set_universe_provider_setting(self, value: Any) -> dict[str, Any]:
         setting = self.store.set_provider_setting(
             "UNIVERSE_CONDUCTOR",
@@ -11523,16 +11544,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             host_tool_match = re.fullmatch(
-                r"/v1/settings/host-tools/([^/]+)/(select|verify)",
+                r"/v1/settings/host-tools/([^/]+)/(select|verify|model)",
                 path,
             )
             if host_tool_match is not None:
                 tool, operation = host_tool_match.groups()
                 self._send(
                     HTTPStatus.OK,
-                    (
-                        self.server.set_host_tool(unquote(tool), body)
-                        if operation == "select"
+                    self.server.set_host_tool(unquote(tool), body)
+                    if operation == "select"
+                    else (
+                        self.server.set_host_tool_model(unquote(tool), body)
+                        if operation == "model"
                         else self.server.verify_host_tool(unquote(tool))
                     ),
                 )

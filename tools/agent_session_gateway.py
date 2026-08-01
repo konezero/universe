@@ -344,12 +344,14 @@ class GrokAcpSession:
         environment: Mapping[str, str],
         system_prompt: str,
         session_id: str | None,
+        model: str = "default",
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.session_id = session_id
+        self.model = _text(model, "model")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self._active_delta: Callable[[str], None] | None = None
@@ -360,6 +362,8 @@ class GrokAcpSession:
                 "--permission-mode",
                 GROK_PERMISSION_MODE,
                 "agent",
+                "--model",
+                self.model,
                 "stdio",
             ),
             cwd=cwd,
@@ -519,6 +523,7 @@ class CodexAppServerSession:
         environment: Mapping[str, str],
         system_prompt: str,
         session_id: str | None,
+        model: str = "default",
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
@@ -526,6 +531,7 @@ class CodexAppServerSession:
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.session_id = session_id
+        self.model = _text(model, "model")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
@@ -534,7 +540,13 @@ class CodexAppServerSession:
         self._completed_turns: set[str] = set()
         self._transport = JsonRpcStdioProcess(
             executable=executable,
-            arguments=("app-server", "--listen", "stdio://"),
+            arguments=(
+                "app-server",
+                "-c",
+                f"model={json.dumps(self.model)}",
+                "--listen",
+                "stdio://",
+            ),
             cwd=cwd,
             environment=environment,
             request_handler=self._handle_request,
@@ -752,16 +764,19 @@ class ClaudeCodeSession:
         environment: Mapping[str, str],
         system_prompt: str,
         session_id: str | None,
+        model: str = "default",
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         max_turns: int = 8,
+        json_schema: Mapping[str, Any] | None = None,
         native_runner: Callable[[NativeCliRequest], NativeCliResult] = run_native_cli,
     ) -> None:
         self.executable = executable
         self.cwd = cwd
         self.environment = dict(environment)
         self.system_prompt = system_prompt
+        self.model = _text(model, "model")
         self._resume_session = bool(session_id) and not ephemeral
         self.session_id = (
             None
@@ -772,6 +787,9 @@ class ClaudeCodeSession:
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
         self.max_turns = max(1, int(max_turns))
+        self.json_schema = (
+            _json_object(json_schema) if json_schema is not None else None
+        )
         self.native_runner = native_runner
 
     @property
@@ -790,6 +808,8 @@ class ClaudeCodeSession:
             "json",
             "--permission-mode",
             CLAUDE_PERMISSION_MODE,
+            "--model",
+            self.model,
             "--max-turns",
             str(self.max_turns),
             "--strict-mcp-config",
@@ -802,6 +822,19 @@ class ClaudeCodeSession:
             arguments.extend(("--resume", self.session_id))
         elif self.session_id:
             arguments.extend(("--session-id", self.session_id))
+        if self.json_schema is not None:
+            arguments.extend(
+                (
+                    "--json-schema",
+                    json.dumps(
+                        self.json_schema,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+            )
         try:
             result = self.native_runner(
                 NativeCliRequest(
@@ -825,9 +858,21 @@ class ClaudeCodeSession:
             raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID") from error
         if not isinstance(payload, Mapping) or payload.get("is_error") is True:
             raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID")
-        output = payload.get("result")
-        if not isinstance(output, str) or not output.strip():
-            raise AgentSessionError("CLAUDE_CODE_RESPONSE_MISSING")
+        if self.json_schema is not None:
+            structured_output = payload.get("structured_output")
+            if not isinstance(structured_output, Mapping):
+                raise AgentSessionError("CLAUDE_CODE_STRUCTURED_OUTPUT_MISSING")
+            output = json.dumps(
+                _json_object(structured_output),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        else:
+            output = payload.get("result")
+            if not isinstance(output, str) or not output.strip():
+                raise AgentSessionError("CLAUDE_CODE_RESPONSE_MISSING")
         observed_session = payload.get("session_id")
         if isinstance(observed_session, str) and observed_session.strip():
             self.session_id = observed_session.strip()

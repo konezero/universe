@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -14,9 +15,17 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
 PROFILE_SCHEMA = "ai-career.host-profile.v1"
+PROFILE_REVISION = 2
 PROFILE_ENVIRONMENT = "AI_CAREER_HOST_PROFILE"
 SUPPORTED_TOOLS = ("python", "git", "codex", "grok", "claude")
 REQUIRED_TOOLS = frozenset({"python", "git"})
+PROVIDER_TOOLS = frozenset({"codex", "grok", "claude"})
+DEFAULT_TOOL_MODELS = {
+    "codex": "default",
+    "grok": "grok-build",
+    "claude": "default",
+}
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 FORBIDDEN_SUFFIXES = frozenset({".bat", ".cmd", ".ps1"})
 EXECUTABLE_OVERRIDES = {
     tool: f"AI_CAREER_{tool.upper()}_EXECUTABLE" for tool in SUPPORTED_TOOLS
@@ -34,6 +43,7 @@ TOOL_FIELDS = frozenset(
         "environment",
         "evidence_ref",
         "reason",
+        "model",
     }
 )
 ALLOWED_TOOL_ENVIRONMENT = frozenset({"GROK_HOME"})
@@ -50,6 +60,7 @@ class HostToolResolution:
     tool: str
     executable: Path
     version: str
+    model: str
     environment: Mapping[str, str]
     evidence_ref: str
 
@@ -111,6 +122,10 @@ class HostProfileStore:
             profile = self._load()
             if set(profile["tools"]) != set(SUPPORTED_TOOLS):
                 return self.discover()
+            if profile["revision"] < PROFILE_REVISION:
+                self._save(
+                    self._profile(profile["tools"], profile.get("created_at"))
+                )
             return self.snapshot()
         return self.discover()
 
@@ -119,10 +134,15 @@ class HostProfileStore:
         tools: dict[str, dict[str, Any]] = {}
         for tool in SUPPORTED_TOOLS:
             record = self._discover_tool(tool)
+            existing = previous["tools"].get(tool)
             if record["status"] != "AVAILABLE":
-                existing = previous["tools"].get(tool)
                 if isinstance(existing, Mapping):
                     record = self._verify_record(tool, existing)
+            if isinstance(existing, Mapping):
+                record["model"] = self._normalize_model(
+                    tool,
+                    existing.get("model"),
+                )
             tools[tool] = record
         profile = self._profile(tools, previous.get("created_at"))
         self._save(profile)
@@ -131,11 +151,33 @@ class HostProfileStore:
     def set_tool(self, tool: str, executable: str) -> dict[str, Any]:
         normalized = self._tool_name(tool)
         profile = self._load(allow_absent=True)
+        current = profile["tools"].get(normalized)
         profile["tools"][normalized] = self._candidate_record(
             normalized,
             Path(executable).expanduser(),
             "USER_SELECTED",
+            model=(current.get("model") if isinstance(current, Mapping) else None),
         )
+        updated = self._profile(profile["tools"], profile.get("created_at"))
+        self._save(updated)
+        return self.snapshot()
+
+    def set_model(self, tool: str, model: str) -> dict[str, Any]:
+        normalized = self._tool_name(tool)
+        if normalized not in PROVIDER_TOOLS:
+            raise HostProfileError(
+                "HOST_TOOL_MODEL_UNSUPPORTED",
+                f"{normalized} does not select a provider model",
+            )
+        profile = self._load(allow_absent=True)
+        current = profile["tools"].get(normalized)
+        record = dict(
+            current
+            if isinstance(current, Mapping)
+            else self._unavailable_record(normalized)
+        )
+        record["model"] = self._normalize_model(normalized, model)
+        profile["tools"][normalized] = record
         updated = self._profile(profile["tools"], profile.get("created_at"))
         self._save(updated)
         return self.snapshot()
@@ -175,6 +217,7 @@ class HostProfileStore:
             tool=normalized,
             executable=executable,
             version=str(record.get("version") or "UNKNOWN"),
+            model=self._normalize_model(normalized, record.get("model")),
             environment=safe_environment,
             evidence_ref=str(record.get("evidence_ref") or "UNKNOWN"),
         )
@@ -240,7 +283,12 @@ class HostProfileStore:
                     "HOST_PROFILE_INVALID",
                     f"Host Profile tool {key} environment is invalid",
                 )
-            normalized_tools[str(key)] = dict(item)
+            normalized_item = dict(item)
+            normalized_item["model"] = self._normalize_model(
+                str(key),
+                item.get("model"),
+            )
+            normalized_tools[str(key)] = normalized_item
         return {
             "schema": PROFILE_SCHEMA,
             "revision": int(value.get("revision") or 1),
@@ -257,11 +305,14 @@ class HostProfileStore:
         now = utc_now()
         return {
             "schema": PROFILE_SCHEMA,
-            "revision": 1,
+            "revision": PROFILE_REVISION,
             "created_at": str(created_at or now),
             "updated_at": now,
             "tools": {
-                tool: dict(tools.get(tool) or self._unavailable_record(tool))
+                tool: self._record_with_model(
+                    tool,
+                    tools.get(tool) or self._unavailable_record(tool),
+                )
                 for tool in SUPPORTED_TOOLS
             },
         }
@@ -352,10 +403,16 @@ class HostProfileStore:
         tool: str,
         candidate: Path,
         source: str,
+        model: Any = None,
     ) -> dict[str, Any]:
         executable = self._native_path(candidate)
         if executable is None:
-            return self._unavailable_record(tool, "EXECUTABLE_INVALID", source)
+            return self._unavailable_record(
+                tool,
+                "EXECUTABLE_INVALID",
+                source,
+                model=model,
+            )
         environment: dict[str, str] = {}
         if tool == "grok" and executable.parent.name.lower() == "bin":
             environment["GROK_HOME"] = str(executable.parent.parent)
@@ -369,10 +426,20 @@ class HostProfileStore:
                 )
             )
         except (OSError, ValueError):
-            return self._unavailable_record(tool, "VERSION_CHECK_FAILED", source)
+            return self._unavailable_record(
+                tool,
+                "VERSION_CHECK_FAILED",
+                source,
+                model=model,
+            )
         version = (result.stdout or result.stderr).strip().splitlines()
         if result.status != "COMPLETED" or result.return_code != 0 or not version:
-            return self._unavailable_record(tool, "VERSION_CHECK_FAILED", source)
+            return self._unavailable_record(
+                tool,
+                "VERSION_CHECK_FAILED",
+                source,
+                model=model,
+            )
         verified_at = utc_now()
         return {
             "status": "AVAILABLE",
@@ -381,6 +448,7 @@ class HostProfileStore:
             "verified_at": verified_at,
             "discovery_source": source,
             "environment": environment,
+            "model": self._normalize_model(tool, model),
             "evidence_ref": (
                 f"host-tool://{tool}/{executable.name}?verified_at={verified_at}"
             ),
@@ -398,6 +466,7 @@ class HostProfileStore:
             tool,
             Path(executable),
             str(record.get("discovery_source") or "HOST_PROFILE"),
+            model=record.get("model"),
         )
 
     @staticmethod
@@ -418,11 +487,14 @@ class HostProfileStore:
             return None
         return resolved
 
-    @staticmethod
+    @classmethod
     def _unavailable_record(
+        cls,
         tool: str,
         reason: str = "NOT_DISCOVERED",
         source: str = "NONE",
+        *,
+        model: Any = None,
     ) -> dict[str, Any]:
         return {
             "status": "UNAVAILABLE",
@@ -431,9 +503,37 @@ class HostProfileStore:
             "verified_at": "UNKNOWN",
             "discovery_source": source,
             "environment": {},
+            "model": cls._normalize_model(tool, model),
             "evidence_ref": "UNKNOWN",
             "reason": f"{tool.upper()}_{reason}",
         }
+
+    @classmethod
+    def _record_with_model(
+        cls,
+        tool: str,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(record)
+        normalized["model"] = cls._normalize_model(tool, record.get("model"))
+        return normalized
+
+    @staticmethod
+    def _normalize_model(tool: str, value: Any) -> str:
+        if tool not in PROVIDER_TOOLS:
+            if value not in (None, "", "NOT_APPLICABLE"):
+                raise HostProfileError(
+                    "HOST_TOOL_MODEL_INVALID",
+                    f"{tool} cannot define a provider model",
+                )
+            return "NOT_APPLICABLE"
+        model = str(value or DEFAULT_TOOL_MODELS[tool]).strip()
+        if not MODEL_PATTERN.fullmatch(model):
+            raise HostProfileError(
+                "HOST_TOOL_MODEL_INVALID",
+                f"invalid provider model for {tool}",
+            )
+        return model
 
     @staticmethod
     def _profile_status(profile: Mapping[str, Any]) -> str:

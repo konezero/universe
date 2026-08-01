@@ -27,11 +27,6 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 DISPATCH_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
-PROVIDER_MODELS = {
-    "GROK": "grok-build",
-    "CODEX": "default",
-    "CLAUDE": "default",
-}
 
 
 @dataclass(frozen=True)
@@ -147,35 +142,37 @@ def post_json(
     return result
 
 
-def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
+def _resolve_grok() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("grok")
     if resolved is None:
-        return None, {}
-    return resolved.executable, dict(resolved.environment)
+        return None, {}, "UNKNOWN"
+    return resolved.executable, dict(resolved.environment), resolved.model
 
 
-def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
+def _resolve_codex() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("codex")
     if resolved is None:
-        return None, {}
-    return resolved.executable, dict(resolved.environment)
+        return None, {}, "UNKNOWN"
+    return resolved.executable, dict(resolved.environment), resolved.model
 
 
-def _resolve_claude() -> tuple[Path | None, dict[str, str]]:
+def _resolve_claude() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("claude")
     if resolved is None:
-        return None, {}
-    return resolved.executable, dict(resolved.environment)
+        return None, {}, "UNKNOWN"
+    return resolved.executable, dict(resolved.environment), resolved.model
 
 
-def _provider_executable(provider: str) -> tuple[Path | None, dict[str, str]]:
+def _provider_executable(
+    provider: str,
+) -> tuple[Path | None, dict[str, str], str]:
     if provider == "GROK":
         return _resolve_grok()
     if provider == "CODEX":
         return _resolve_codex()
     if provider == "CLAUDE":
         return _resolve_claude()
-    return None, {}
+    return None, {}, "UNKNOWN"
 
 
 class RuntimeWorkerDispatcher:
@@ -198,7 +195,7 @@ class RuntimeWorkerDispatcher:
                 "provider": normalized,
                 "reason": "WORKER_PROVIDER_UNSUPPORTED",
             }
-        executable, environment = _provider_executable(normalized)
+        executable, environment, model = _provider_executable(normalized)
         if executable is None:
             return {
                 "status": "UNAVAILABLE",
@@ -225,6 +222,8 @@ class RuntimeWorkerDispatcher:
         return {
             "status": "AVAILABLE",
             "provider": normalized,
+            "model": model,
+            "model_ref": f"provider://{normalized}/model/{quote(model, safe='')}",
             "cli_auto_approve": cli_auto_approve_status(normalized),
             "capability_evidence_ref": (
                 f"{normalized.lower()}-cli:{encoded_path}:{version}"
@@ -280,6 +279,13 @@ class RuntimeWorkerDispatcher:
                 "TASK_FRAME_PLAN",
                 "PLANNED_PROVIDER_MISMATCH",
             )
+        planned_model = _required_text(planned_invocation.get("model"), "model")
+        if planned_model != capability["model"]:
+            raise WorkerDispatchError(
+                "WORKER_MODEL_PROFILE_MISMATCH",
+                "TASK_FRAME_PLAN",
+                "PLANNED_MODEL_PROFILE_MISMATCH",
+            )
 
         skill_bindings = self._skill_bindings(planned_invocation)
         worker_run_ref = f"universe-runtime-host:{uuid4().hex}"
@@ -290,6 +296,7 @@ class RuntimeWorkerDispatcher:
                 "CLAUDE": "universe.claude-worker-request.v1",
             }[provider],
             "runtime_profile": "TASK_FRAME_RUNTIME",
+            "model": planned_model,
             "task_frame_id": request["frame_id"],
             "turn_id": request["turn_id"],
             "worker_run_ref": worker_run_ref,
@@ -378,7 +385,7 @@ class RuntimeWorkerDispatcher:
                 "TURN_CLAIM_REJECTED",
             )
 
-        model = str(planned_invocation.get("model") or PROVIDER_MODELS[provider])
+        model = planned_model
         model_ref = f"provider://{provider}/model/{quote(model, safe='')}"
         observations = [
             {
@@ -532,13 +539,14 @@ class RuntimeWorkerDispatcher:
         )
 
     def _invoke_grok(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        executable, environment = _resolve_grok()
+        executable, environment, configured_model = _resolve_grok()
         if executable is None:
             raise WorkerDispatchError(
                 "WORKER_INVOCATION_UNAVAILABLE",
                 "WORKER_ADAPTER",
                 "GROK_CLI_UNAVAILABLE",
             )
+        model = self._request_model(request, configured_model)
         runtime_profile = str(request.get("runtime_profile", "READ_ONLY")).upper()
         if runtime_profile not in {"READ_ONLY", "TASK_FRAME_RUNTIME"}:
             raise WorkerDispatchError(
@@ -553,6 +561,7 @@ class RuntimeWorkerDispatcher:
                     executable=executable,
                     cwd=Path(tempfile.gettempdir()),
                     environment=environment,
+                    model=model,
                     system_prompt=self._system_prompt(runtime_profile),
                     session_id=None,
                     permission_requester=self._reject_task_frame_permission,
@@ -596,13 +605,14 @@ class RuntimeWorkerDispatcher:
         }
 
     def _invoke_codex(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        executable, environment = _resolve_codex()
+        executable, environment, configured_model = _resolve_codex()
         if executable is None:
             raise WorkerDispatchError(
                 "WORKER_INVOCATION_UNAVAILABLE",
                 "WORKER_ADAPTER",
                 "CODEX_CLI_UNAVAILABLE",
             )
+        model = self._request_model(request, configured_model)
         session_ids: list[str] = []
         try:
             gateway = UniverseAcpGateway(
@@ -610,6 +620,7 @@ class RuntimeWorkerDispatcher:
                     executable=executable,
                     cwd=Path(tempfile.gettempdir()),
                     environment=environment,
+                    model=model,
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
                     permission_requester=self._reject_task_frame_permission,
@@ -652,13 +663,27 @@ class RuntimeWorkerDispatcher:
         }
 
     def _invoke_claude(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        executable, environment = _resolve_claude()
+        executable, environment, configured_model = _resolve_claude()
         if executable is None:
             raise WorkerDispatchError(
                 "WORKER_INVOCATION_UNAVAILABLE",
                 "WORKER_ADAPTER",
                 "CLAUDE_CLI_UNAVAILABLE",
             )
+        model = self._request_model(request, configured_model)
+        json_schema: dict[str, Any] | None = None
+        if str(request.get("result_mode", "REDACTED")).upper() == "STRUCTURED_JSON":
+            output_contract = _mapping(
+                request.get("output_contract"), "output_contract"
+            )
+            raw_schema = output_contract.get("json_schema")
+            if not isinstance(raw_schema, Mapping):
+                raise WorkerDispatchError(
+                    "WORKER_OUTPUT_SCHEMA_REQUIRED",
+                    "WORKER_ADAPTER",
+                    "CLAUDE_JSON_SCHEMA_REQUIRED",
+                )
+            json_schema = dict(raw_schema)
         session_ids: list[str] = []
         try:
             gateway = UniverseAcpGateway(
@@ -666,12 +691,14 @@ class RuntimeWorkerDispatcher:
                     executable=executable,
                     cwd=Path(tempfile.gettempdir()),
                     environment=environment,
+                    model=model,
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
                     ephemeral=True,
                     max_turns=int(request.get("max_turns", 8)),
+                    json_schema=json_schema,
                     native_runner=self.native_runner,
                 )
             )
@@ -709,6 +736,17 @@ class RuntimeWorkerDispatcher:
             "universe_coordinate_persisted": False,
             "provider_durable_chat_state": "NOT_PERSISTED",
         }
+
+    @staticmethod
+    def _request_model(request: Mapping[str, Any], configured_model: str) -> str:
+        model = _required_text(request.get("model"), "model")
+        if model != configured_model:
+            raise WorkerDispatchError(
+                "WORKER_MODEL_PROFILE_MISMATCH",
+                "WORKER_ADAPTER",
+                "REQUESTED_MODEL_PROFILE_MISMATCH",
+            )
+        return model
 
     @staticmethod
     def _system_prompt(runtime_profile: str) -> str:

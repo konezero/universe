@@ -321,7 +321,10 @@ class ProjectMasterHostTests(unittest.TestCase):
             "body": "status?",
         }
         with (
-            patch("project_master_host._resolve_grok", return_value=(self.root / "grok.exe", {})),
+            patch(
+                "project_master_host._resolve_grok",
+                return_value=(self.root / "grok.exe", {}, "grok-build"),
+            ),
             patch("project_master_host.GrokAcpSession", FakeSession),
             patch("project_master_host.UniverseAcpGateway", CapturingGateway),
         ):
@@ -378,7 +381,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         with (
             patch(
                 "project_master_host._resolve_grok",
-                return_value=(self.root / "grok.exe", {}),
+                return_value=(self.root / "grok.exe", {}, "grok-build"),
             ),
             patch("project_master_host.GrokAcpSession", FakeSession),
             patch("project_master_host.UniverseAcpGateway", FailingOnceGateway),

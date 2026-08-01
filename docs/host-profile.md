@@ -22,7 +22,7 @@ DB, or source control.
 
 ## Managed Tools
 
-Version 1 manages:
+Revision 2 manages:
 
 ```text
 python
@@ -44,7 +44,13 @@ discovery_source
 environment
 evidence_ref
 reason
+model
 ```
+
+`model` is `NOT_APPLICABLE` for Python and Git. Provider tools use one local,
+explicit selection. Defaults are `default` for Codex and Claude and
+`grok-build` for Grok. Revision 1 Profiles are migrated in place without
+rediscovering or replacing an already selected executable.
 
 Only `GROK_HOME` is permitted in the stored launch environment. Secrets,
 tokens, cookies, provider sessions, and arbitrary environment variables are
@@ -78,7 +84,15 @@ The local UI and API can:
 - inspect the active Profile and its path;
 - rediscover all tools;
 - select one exact executable path;
+- select one exact model for Codex, Grok, or Claude;
 - reverify one stored executable.
+
+The selected model is passed to the provider CLI for every new persistent
+Mode Session and every ephemeral Task Frame Worker. The same value is bound to
+the Task Frame plan and Result Packet `model_ref`; a mismatch stops invocation.
+Changing a model closes resident provider sessions so the next message starts
+with the new selection. Existing provider-owned session history is not
+relabelled as having used the new model.
 
 Selecting or verifying a Host tool changes local application configuration
 only. It grants no governance authority, execution assignment, write scope, or

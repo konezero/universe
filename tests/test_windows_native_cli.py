@@ -215,7 +215,7 @@ class WindowsNativeCliTests(unittest.TestCase):
             with (
                 patch(
                     "universe_runtime_worker_dispatch._resolve_grok",
-                    return_value=(executable, {"GROK_HOME": temp}),
+                    return_value=(executable, {"GROK_HOME": temp}, "grok-build"),
                 ),
                 patch(
                     "universe_runtime_worker_dispatch.GrokAcpSession",

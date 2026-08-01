@@ -39,6 +39,7 @@ class FakeWorkerDispatcher:
         return {
             "provider": provider,
             "status": "AVAILABLE",
+            "model": "grok-build" if provider == "GROK" else "default",
             "cli_auto_approve": "ON",
         }
 
@@ -151,6 +152,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         dispatcher = FakeWorkerDispatcher(
             response={
                 "status": "TASK_FRAME_RESULT_RECORDED",
+                "model_ref": "provider://GROK/model/grok-build",
                 "worker_id": "grok-1",
                 "result_receipt_ref": "result-1",
                 "skill_run_observation_count": 2,
@@ -165,6 +167,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
         self.assertFalse(result["repository_write"])
         self.assertEqual("result-1", result["result_receipt_ref"])
+        self.assertEqual("provider://GROK/model/grok-build", result["model_ref"])
         self.assertEqual(2, result["skill_run_observation_count"])
         self.assertEqual({"text": "bounded reply"}, result["result"])
         self.assertEqual("EPHEMERAL", result["session_persistence"])
@@ -301,6 +304,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             run_id="planningrun_001",
         )
         self.assertEqual("GROK", result["provider"])
+        self.assertEqual("provider://GROK/model/grok-build", result["model_ref"])
         self.assertEqual("planning-boss", result["turn_id"])
         self.assertEqual(
             "NONE",
@@ -433,6 +437,16 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual(
             "intent",
             request["output_contract"]["fresh_project_contract"]["action_field"],
+        )
+        json_schema = request["output_contract"]["json_schema"]
+        self.assertEqual(["reply", "action"], json_schema["required"])
+        self.assertFalse(json_schema["additionalProperties"])
+        self.assertEqual(
+            ["NONE", "TODO_DRAFT", "FRESH_PROJECT_DRAFT"],
+            [
+                variant["properties"]["kind"]["enum"][0]
+                for variant in json_schema["properties"]["action"]["oneOf"]
+            ],
         )
         self.assertEqual(
             [
