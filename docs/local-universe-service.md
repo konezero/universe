@@ -767,6 +767,11 @@ See `docs/project-projection-contract.md`.
 
 ## Connection and authentication boundary
 
+The complete local and paired remote-access topology is defined in
+`docs/universe-network-architecture.md`. Remote mobile access forwards this
+existing Web UI, HTTP API, and SSE service; it does not create a second mobile
+backend or command protocol.
+
 The local service exposes a connection profile instead of making callers depend
 on a hard-coded local endpoint. The current implementation provides exactly one
 active combination:
@@ -790,7 +795,7 @@ The axes remain independent:
 - interface: `HTTP_API`, with `MCP` and `CLI` reserved
 - connection: `LOCAL`, with `REMOTE` and `PEER` reserved
 - transport: `HTTP`, with `GIT` and `P2P` reserved
-- authentication: `NONE` for loopback local HTTP, with `OAUTH2` and `PEER_KEY` reserved for future remote or peer adapters
+- authentication: `NONE` for loopback local HTTP, with `DEVICE_PAIRING` reserved for paired remote browser access and `OAUTH2` and `PEER_KEY` reserved for future account or peer adapters
 
 Only HTTP addresses are currently validated as HTTP URLs. Git and P2P address
 formats remain Adapter-owned so this initial contract does not force future
@@ -801,8 +806,8 @@ expose Universe operations to an LLM, while an MCP client adapter may invoke an
 external project interface over whichever network transport that connection
 selects.
 
-Reserved values do not start remote synchronization, OAuth flows, peer
-discovery, key exchange, Git exchange, or MCP tools. Requesting an unimplemented
+Reserved values do not start remote synchronization, device pairing, OAuth
+flows, peer discovery, key exchange, Git exchange, or MCP tools. Requesting an unimplemented
 authentication provider fails explicitly with `AUTH_PROVIDER_NOT_IMPLEMENTED`.
 
 The local service binds only to a literal loopback address and accepts local

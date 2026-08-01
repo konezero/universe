@@ -385,6 +385,11 @@ relations remain distinct from observed evidence. Career adoption is separate.
     of independently searching process state. Runtime Settings exposes
     discovery, exact executable selection, and verification. Installer and tray
     packaging will set the Profile pointer and reuse this same settings surface.
+13. Add paired remote browser access to the existing local Universe HTTP
+    service. The desktop opens an outbound fixed-origin tunnel; the remote path
+    forwards the same SPA, HTTP API, and SSE streams without adding a mobile
+    backend or command protocol. OAuth, P2P, and Universe peer networking remain
+    later adapters. See `docs/universe-network-architecture.md`.
 
 ## Runtime Boundary
 
