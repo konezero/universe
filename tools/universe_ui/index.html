@@ -7,144 +7,218 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <div class="app-shell">
+  <div class="app-shell mockup-shell">
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Universe</strong>
-        <span id="mode-status" class="mode-label" data-state="loading">UNIVERSE / CONDUCTOR</span>
       </div>
+      <nav id="primary-nav" class="primary-nav" aria-label="Primary views">
+        <button type="button" class="selected" data-primary-view="network">Network</button>
+        <button type="button" data-primary-view="ecosystem">Ecosystem</button>
+        <button type="button" data-primary-view="timeline">Timeline</button>
+        <button type="button" data-primary-view="memory">Memory</button>
+        <button type="button" data-primary-view="future">Future</button>
+      </nav>
+      <label class="top-search">
+        <span class="sr-only">Search</span>
+        <input id="global-search" type="search" placeholder="Search universes, projects, nodes, events…">
+      </label>
       <div class="topbar-actions">
-        <span id="service-status" class="status-dot" data-state="loading">
-          Connecting
-        </span>
-        <button id="todo-button" class="icon-button" type="button" title="Open Todo work map" aria-label="Open Todo work map">
-          &#9745;
-        </button>
-        <button id="start-project-topbar-button" class="icon-button mobile-project-start" type="button" title="Start fresh project" aria-label="Start fresh project">
-          &#10022;
-        </button>
-        <button id="release-button" class="icon-button" type="button" title="Release catalog">
-          &#9638;
-        </button>
-        <button id="settings-button" class="icon-button" type="button" title="CLI provider settings" aria-label="CLI provider settings">
-          &#9881;
-        </button>
-        <button id="refresh-button" class="icon-button" type="button" title="Refresh">
-          &#8635;
-        </button>
-
+        <span id="service-status" class="status-dot local-node-chip" data-state="loading">Local Node</span>
+        <span id="mode-status" class="mode-label" data-state="loading">—</span>
+        <button id="todo-button" class="icon-button" type="button" title="Todo work map" aria-label="Todo work map">&#9745;</button>
+        <button id="start-project-topbar-button" class="icon-button mobile-project-start" type="button" title="Start fresh project" aria-label="Start fresh project">&#10022;</button>
+        <button id="release-button" class="icon-button" type="button" title="Release catalog">&#9638;</button>
+        <button id="settings-button" class="icon-button" type="button" title="Settings" aria-label="Settings">&#9881;</button>
+        <button id="refresh-button" class="icon-button" type="button" title="Refresh">&#8635;</button>
+        <span class="user-chip" title="Session">UC</span>
       </div>
     </header>
 
     <aside class="project-rail universe-rail">
       <div class="section-heading">
-        <span>Project Universes</span>
+        <span>Universes</span>
         <span class="section-actions">
-          <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project">
-            &#10022;
-          </button>
-          <button id="add-project-button" class="icon-button compact" type="button" title="Connect existing project" aria-label="Connect existing project">
-            +
-          </button>
+          <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project">&#10022;</button>
+          <button id="add-project-button" class="icon-button compact" type="button" title="Connect project" aria-label="Connect project">+</button>
         </span>
       </div>
       <div id="project-list" class="project-list" role="listbox" aria-label="Projects"></div>
+
+      <div class="rail-block">
+        <div class="section-heading rail-subhead"><span>Views</span></div>
+        <nav class="rail-views" aria-label="Workspace views">
+          <button type="button" class="rail-view selected" data-view="universe">Multiverse Map</button>
+          <button type="button" class="rail-view" data-view="timeline">Timeline Flow</button>
+          <button type="button" class="rail-view" data-view="documents">Documents</button>
+          <button type="button" class="rail-view" data-primary-view="memory">Memory</button>
+          <button type="button" class="rail-view" data-primary-view="bench">Performance Bench</button>
+          <button type="button" class="rail-view" data-primary-view="future">Future Paths</button>
+        </nav>
+      </div>
+
+      <div class="rail-block session-block">
+        <div class="section-heading rail-subhead"><span>Session</span></div>
+        <div class="session-card">
+          <strong>Universe Conductor</strong>
+          <small id="session-provider-line">Provider · AUTO</small>
+          <span class="session-dot" data-state="ready"></span>
+        </div>
+        <small class="network-latency" id="network-latency">Network · local loopback</small>
+      </div>
     </aside>
 
     <main class="graph-workspace">
-      <div class="graph-toolbar">
-        <div>
-          <h1 id="workspace-title">Universe observation</h1>
-          <p id="workspace-subtitle">Select a project universe to inspect its timeline</p>
-        </div>
-        <div class="graph-toolbar-actions">
+      <div class="graph-toolbar glass-bar">
+        <div class="toolbar-filters">
+          <label>View
+            <select id="view-mode-select" aria-label="View mode">
+              <option value="universe">Multiverse Map</option>
+              <option value="timeline">Timeline</option>
+              <option value="documents">Documents</option>
+            </select>
+          </label>
           <div class="segmented-control" aria-label="Graph view">
-            <button type="button" class="selected" data-view="timeline">Timeline</button>
-            <button type="button" data-view="universe">Universe map</button>
+            <button type="button" data-view="timeline">Timeline</button>
+            <button type="button" class="selected" data-view="universe">Universe map</button>
             <button type="button" data-view="documents">Documents</button>
           </div>
           <div class="graph-map-controls" aria-label="Map controls">
-            <button id="graph-zoom-out" class="icon-button compact" type="button" title="Zoom out" aria-label="Zoom out">&#8722;</button>
-            <button id="graph-fit" class="icon-button compact" type="button" title="Fit graph" aria-label="Fit graph">&#9638;</button>
-            <button id="graph-zoom-in" class="icon-button compact" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+            <button id="graph-zoom-out" class="icon-button compact" type="button" title="Zoom out">&#8722;</button>
+            <button id="graph-fit" class="icon-button compact" type="button" title="Fit graph">&#9638;</button>
+            <button id="graph-zoom-in" class="icon-button compact" type="button" title="Zoom in">+</button>
           </div>
-          <button id="prepare-project-button" class="secondary-button" type="button" title="Queue a project-map discovery request for the Project Master">
-            Request Project Map
-          </button>
+          <button id="prepare-project-button" class="secondary-button" type="button" title="Queue project-map discovery">Request Project Map</button>
         </div>
-      </div>
-      <div class="canvas-wrap">
-        <canvas id="universe-graph" aria-label="Project system graph"></canvas>
-        <div id="graph-empty" class="graph-empty">Select a project</div>
-        <p id="graph-hint" class="graph-hint">Drag to pan · Wheel to zoom · Click a node for details</p>
-        <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
-          <button id="exit-node-universe" class="icon-button compact" type="button" title="Return to project universe" aria-label="Return to project universe">&#8592;</button>
-          <span id="node-breadcrumb-project"></span>
-          <span aria-hidden="true">/</span>
-          <strong id="node-breadcrumb-node"></strong>
-        </nav>
-        <section id="conversation-layer" class="conversation-layer collapsed" aria-label="Project Room conversation">
-          <header class="conversation-layer-header">
-            <div class="conversation-title-wrap">
-              <strong id="conversation-title">Conversation</strong>
-              <small id="conversation-target-label">Universe Conductor</small>
-            </div>
-            <label class="layer-opacity" title="Conversation transparency">
-              <span>Opacity</span>
-              <input id="conversation-opacity" type="range" min="25" max="100" value="86">
-            </label>
-            <button id="conversation-toggle" class="icon-button compact" type="button" title="Expand conversation" aria-label="Expand conversation">+</button>
-          </header>
-          <div id="room-message-list" class="room-message-list"></div>
-        </section>
-        <div class="graph-legend" aria-hidden="true">
+        <div class="toolbar-legend graph-legend" aria-hidden="true">
           <span><i class="node-key project"></i>Adopted path</span>
           <span><i class="node-key system"></i>Parallel work</span>
           <span><i class="node-key predicted"></i>Future branch</span>
           <span><i class="node-key document"></i>Documents</span>
         </div>
       </div>
-      <form id="dispatch-form" class="command-composer project-room">
-        <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
-        <div class="composer-action-wrap">
-          <button id="composer-action-button" class="composer-action-button" type="button" title="Conversation actions" aria-label="Conversation actions" aria-expanded="false">
-            +
+      <div class="canvas-wrap starfield">
+        <canvas id="universe-graph" aria-label="Project system graph"></canvas>
+        <div id="graph-empty" class="graph-empty">Select a project</div>
+        <p id="graph-hint" class="graph-hint">Drag to pan · Wheel to zoom · Click a node for details</p>
+        <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
+          <button id="exit-node-universe" class="icon-button compact" type="button" title="Return" aria-label="Return">&#8592;</button>
+          <span id="node-breadcrumb-project"></span>
+          <span aria-hidden="true">/</span>
+          <strong id="node-breadcrumb-node"></strong>
+        </nav>
+      </div>
+
+      <section class="conductor-panel glass-panel" aria-label="Universe Conductor">
+        <div id="conductor-summary" class="conductor-summary collapsed">
+          <button id="conductor-summary-toggle" class="summary-dock-toggle" type="button" title="Expand overview" aria-label="Expand overview" aria-expanded="false">
+            <span class="summary-dock-icon" aria-hidden="true">&#9638;</span>
+            <span class="summary-dock-label">Overview</span>
+            <span id="conductor-summary-line" class="summary-dock-line">P 0 · T 0 · D 0 · —</span>
+            <time id="conductor-clock-compact" class="summary-dock-clock"></time>
+            <span class="summary-dock-chevron" aria-hidden="true">&#9660;</span>
           </button>
-          <div id="composer-action-menu" class="composer-action-menu hidden" role="menu" aria-label="Conversation target">
-            <button id="return-to-conductor" class="composer-menu-item selected" type="button" role="menuitem">
-              <span>Universe Conductor</span>
-              <small>Current control room</small>
-            </button>
-            <div id="project-master-actions" class="project-master-actions"></div>
+          <div class="conductor-summary-body">
+            <header class="conductor-header">
+              <div>
+                <span class="conductor-kicker">Universe Conductor</span>
+                <h1 id="workspace-title" class="conductor-greeting">Good day, Conductor.</h1>
+                <p id="workspace-subtitle" class="conductor-sub">Connect a project to begin observation.</p>
+              </div>
+              <time id="conductor-clock" class="conductor-clock"></time>
+            </header>
+            <div class="metric-row" id="conductor-metrics">
+              <article class="metric-card"><span class="metric-label">Projects</span><strong id="metric-projects">0</strong><small>Observed</small></article>
+              <article class="metric-card"><span class="metric-label">Todos</span><strong id="metric-todos">0</strong><small>Open work</small></article>
+              <article class="metric-card"><span class="metric-label">Dispatches</span><strong id="metric-dispatches">0</strong><small>Activity</small></article>
+              <article class="metric-card"><span class="metric-label">Service</span><strong id="metric-service">—</strong><small>Loopback</small></article>
+            </div>
+            <div class="conductor-actions">
+              <button type="button" class="ghost-action" id="action-fit-map">Open Multiverse Map</button>
+              <button type="button" class="ghost-action" id="action-refresh">Sync Peers</button>
+              <button type="button" class="ghost-action" data-primary-view="future">Review Future Paths</button>
+              <button type="button" class="ghost-action" id="action-todo">Dispatch Board</button>
+            </div>
           </div>
         </div>
-        <textarea id="dispatch-instruction" name="instruction" rows="3" placeholder="Message Universe Conductor" required></textarea>
-        <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send message" aria-label="Send message">
-          &#8593;
-        </button>
-        <div class="room-actions">
-          <span id="room-context" class="room-context">Universe Conductor</span>
-          <span id="room-hint" class="room-hint">Use + to call a Project Master</span>
-        </div>
-      </form>
+        <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Project Room conversation">
+          <header class="conversation-layer-header">
+            <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse conversation" aria-label="Collapse conversation" aria-expanded="true">
+              <span class="chat-dock-icon" aria-hidden="true">&#128172;</span>
+              <span class="chat-dock-label">Chat</span>
+              <span id="conversation-badge" class="chat-badge hidden">0</span>
+              <span class="chat-dock-chevron" aria-hidden="true">&#9660;</span>
+            </button>
+            <div class="conversation-title-wrap">
+              <strong id="conversation-title">Conversation</strong>
+              <small id="conversation-target-label">Universe Conductor</small>
+            </div>
+            <label class="layer-opacity" title="Conversation transparency">
+              <span>Opacity</span>
+              <input id="conversation-opacity" type="range" min="25" max="100" value="92">
+            </label>
+          </header>
+          <div id="room-message-list" class="room-message-list"></div>
+        </section>
+
+        <form id="dispatch-form" class="command-composer project-room conductor-composer">
+          <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
+          <div class="composer-action-wrap">
+            <button id="composer-action-button" class="composer-action-button" type="button" title="Conversation actions" aria-expanded="false">+</button>
+            <div id="composer-action-menu" class="composer-action-menu hidden" role="menu">
+              <button id="return-to-conductor" class="composer-menu-item selected" type="button" role="menuitem">
+                <span>Universe Conductor</span>
+                <small>Current control room</small>
+              </button>
+              <div id="project-master-actions" class="project-master-actions"></div>
+            </div>
+          </div>
+          <textarea id="dispatch-instruction" name="instruction" rows="1" placeholder="Message Universe Conductor…" required></textarea>
+          <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send" aria-label="Send">&#8593;</button>
+          <div class="room-actions">
+            <span id="room-context" class="room-context">Universe Conductor</span>
+            <span id="room-hint" class="room-hint">Use + to call a Project Master</span>
+          </div>
+        </form>
+      </section>
     </main>
 
     <aside class="inspector" aria-label="Selected project context">
+      <header class="inspector-hero">
+        <div>
+          <span class="inspector-kicker">Inspector</span>
+          <h2 id="inspector-title">Local Instance</h2>
+          <small id="inspector-subtitle">Select a project or node</small>
+        </div>
+        <button id="close-inspector" class="icon-button compact" type="button" title="Close" aria-label="Close">&times;</button>
+      </header>
       <div class="inspector-tabs" role="tablist">
         <button class="selected" type="button" data-tab="details">Details</button>
         <button type="button" data-tab="activity">Activity</button>
         <button type="button" data-tab="bench">Bench</button>
         <button type="button" data-tab="memory">Memory</button>
         <button type="button" data-tab="future">Future</button>
-        <button id="close-inspector" class="icon-button compact" type="button" title="Close selected context" aria-label="Close selected context">&times;</button>
       </div>
       <section id="details-panel" class="inspector-panel"></section>
       <section id="activity-panel" class="inspector-panel hidden"></section>
       <section id="bench-panel" class="inspector-panel hidden" aria-label="Skill bench and experience"></section>
       <section id="memory-panel" class="inspector-panel hidden" aria-label="Project memory RAG"></section>
       <section id="future-panel" class="inspector-panel hidden" aria-label="Future routes and proposals"></section>
+      <section class="inspector-laws" aria-label="Career laws">
+        <div class="section-heading rail-subhead"><span>Career Laws / Compatibility</span></div>
+        <ul class="law-list">
+          <li><span>Contract</span><strong id="law-contract">—</strong></li>
+          <li><span>Runtime</span><strong id="law-runtime">—</strong></li>
+          <li><span>Local</span><strong id="law-local">INSTANCE</strong></li>
+        </ul>
+      </section>
     </aside>
+
+    <footer class="status-bar">
+      <span id="status-bar-left">Universe local control plane</span>
+      <span id="status-bar-right">Network Health —</span>
+    </footer>
   </div>
 
   <dialog id="project-dialog">
@@ -224,6 +298,7 @@
           <option value="AUTO">Auto</option>
           <option value="GROK">Grok</option>
           <option value="CODEX">Codex</option>
+          <option value="CLAUDE">Claude</option>
         </select>
         <small id="universe-provider-status" class="provider-setting-status"></small>
       </section>

@@ -81,7 +81,7 @@ const WORKLIST_SEED_TODOS = [
   {
     title: "Verify Project Master bridge / CLI provider",
     detail:
-      "Bridge AVAILABLE or room-only path understood. Provider setting for this Project Master is intentional (AUTO/GROK/CODEX).",
+      "Bridge AVAILABLE or room-only path understood. Provider setting for this Project Master is intentional (AUTO/GROK/CODEX/CLAUDE).",
     priority: "P1",
     state: "READY",
   },
@@ -125,6 +125,24 @@ const elements = {
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
   settingsButton: document.querySelector("#settings-button"),
+  primaryNav: document.querySelector("#primary-nav"),
+  metricProjects: document.querySelector("#metric-projects"),
+  metricTodos: document.querySelector("#metric-todos"),
+  metricDispatches: document.querySelector("#metric-dispatches"),
+  metricService: document.querySelector("#metric-service"),
+  conductorSummary: document.querySelector("#conductor-summary"),
+  conductorSummaryToggle: document.querySelector("#conductor-summary-toggle"),
+  conductorSummaryLine: document.querySelector("#conductor-summary-line"),
+  conductorClock: document.querySelector("#conductor-clock"),
+  conductorClockCompact: document.querySelector("#conductor-clock-compact"),
+  inspectorTitle: document.querySelector("#inspector-title"),
+  inspectorSubtitle: document.querySelector("#inspector-subtitle"),
+  statusBarLeft: document.querySelector("#status-bar-left"),
+  statusBarRight: document.querySelector("#status-bar-right"),
+  viewModeSelect: document.querySelector("#view-mode-select"),
+  lawContract: document.querySelector("#law-contract"),
+  lawRuntime: document.querySelector("#law-runtime"),
+  lawLocal: document.querySelector("#law-local"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsForm: document.querySelector("#settings-form"),
   settingsError: document.querySelector("#settings-error"),
@@ -172,6 +190,7 @@ const elements = {
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
   conversationLayer: document.querySelector("#conversation-layer"),
   conversationToggle: document.querySelector("#conversation-toggle"),
+  conversationBadge: document.querySelector("#conversation-badge"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
   roomContext: document.querySelector("#room-context"),
@@ -763,11 +782,51 @@ async function selectProject(projectId) {
   renderBench();
   renderMemory();
   renderFuture();
+  if (typeof refreshConductorPanel === "function") refreshConductorPanel();
   renderRoomMessages();
   renderReleaseCatalog();
   elements.todoProject.value = projectId;
   renderTodoScopeControls();
   renderTodos();
+}
+
+
+function conversationMessageCount() {
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    return (state.conductorMessages || []).length;
+  }
+  return (
+    (state.roomMessages || []).length +
+    (state.projectPermissions || []).filter((item) => item.state === "PENDING").length
+  );
+}
+
+function updateConversationBadge() {
+  if (!elements.conversationBadge) return;
+  const count = conversationMessageCount();
+  if (count > 0) {
+    elements.conversationBadge.textContent = count > 99 ? "99+" : String(count);
+    elements.conversationBadge.classList.remove("hidden");
+  } else {
+    elements.conversationBadge.textContent = "0";
+    elements.conversationBadge.classList.add("hidden");
+  }
+}
+
+function syncConversationToggle(collapsed) {
+  if (!elements.conversationToggle) return;
+  const title = collapsed ? "Expand conversation" : "Collapse conversation";
+  elements.conversationToggle.title = title;
+  elements.conversationToggle.setAttribute("aria-label", title);
+  elements.conversationToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function expandConversationLayer() {
+  if (!elements.conversationLayer) return;
+  if (elements.conversationLayer.classList.contains("collapsed")) {
+    elements.conversationLayer.classList.remove("collapsed");
+    syncConversationToggle(false);
+  }
 }
 
 function renderRoomMessages() {
@@ -781,6 +840,7 @@ function renderRoomMessages() {
         node("small", "", "Send a message here or use + to call a Project Master.")
       );
       elements.roomMessageList.append(item);
+      updateConversationBadge();
       return;
     }
     for (const message of state.conductorMessages.slice(-8)) {
@@ -820,6 +880,8 @@ function renderRoomMessages() {
       }
       elements.roomMessageList.append(item);
     }
+    elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+    updateConversationBadge();
     return;
   }
   for (const permission of state.projectPermissions.filter(
@@ -835,6 +897,7 @@ function renderRoomMessages() {
         `No messages for ${state.conversationTarget.projectId} Master`
       )
     );
+    updateConversationBadge();
     return;
   }
   for (const message of state.roomMessages.slice(-8)) {
@@ -856,6 +919,7 @@ function renderRoomMessages() {
     elements.roomMessageList.append(item);
   }
   elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+  updateConversationBadge();
 }
 
 function renderPermissionCard(permission) {
@@ -969,6 +1033,7 @@ function renderProviderSettings() {
       ["AUTO", "Auto"],
       ["GROK", "Grok"],
       ["CODEX", "Codex"],
+      ["CLAUDE", "Claude"],
     ]) {
       const option = node("option", "", label);
       option.value = value;
@@ -990,10 +1055,12 @@ function renderHostToolSettings() {
   if (!profile) return;
   elements.hostProfilePath.textContent = profile.profile_path || "Profile unavailable";
   elements.hostToolSettings.replaceChildren();
-  for (const tool of ["python", "git", "codex", "grok"]) {
+  for (const tool of ["python", "git", "codex", "grok", "claude"]) {
     const setting = profile.tools?.[tool] || {};
+    const providerTool = ["codex", "grok", "claude"].includes(tool);
     const row = node("div", "host-tool-row");
     row.dataset.tool = tool;
+    if (!providerTool) row.classList.add("host-tool-row-no-model");
     const heading = node("div", "host-tool-heading");
     heading.append(
       node("strong", "", tool === "python" ? "Python" : tool[0].toUpperCase() + tool.slice(1)),
@@ -1021,8 +1088,29 @@ function renderHostToolSettings() {
     verifyButton.type = "button";
     verifyButton.dataset.tool = tool;
     verifyButton.title = `Verify ${tool}`;
-    actions.append(setButton, verifyButton);
-    row.append(heading, input, actions);
+    if (providerTool) {
+      const modelInput = document.createElement("input");
+      modelInput.type = "text";
+      modelInput.className = "host-tool-model";
+      modelInput.dataset.tool = tool;
+      modelInput.autocomplete = "off";
+      modelInput.spellcheck = false;
+      modelInput.placeholder = "Model";
+      modelInput.value = setting.model || "default";
+      const modelButton = node(
+        "button",
+        "secondary-button host-tool-model-set",
+        "Model"
+      );
+      modelButton.type = "button";
+      modelButton.dataset.tool = tool;
+      modelButton.title = `Set ${tool} model`;
+      actions.append(modelButton, setButton, verifyButton);
+      row.append(heading, input, modelInput, actions);
+    } else {
+      actions.append(setButton, verifyButton);
+      row.append(heading, input, actions);
+    }
     elements.hostToolSettings.append(row);
   }
 }
@@ -1049,16 +1137,29 @@ async function updateHostTool(tool, operation) {
   const input = elements.hostToolSettings.querySelector(
     `.host-tool-path[data-tool="${tool}"]`
   );
+  const modelInput = elements.hostToolSettings.querySelector(
+    `.host-tool-model[data-tool="${tool}"]`
+  );
   const options =
     operation === "select"
       ? { method: "POST", body: { executable: input?.value.trim() || "" } }
-      : { method: "POST", body: {} };
+      : operation === "model"
+        ? { method: "POST", body: { model: modelInput?.value.trim() || "" } }
+        : { method: "POST", body: {} };
   state.hostTools = await api(
     `/v1/settings/host-tools/${encodeURIComponent(tool)}/${operation}`,
     options
   );
   renderHostToolSettings();
-  toast(`${tool} ${operation === "select" ? "saved" : "verified"}`);
+  toast(
+    `${tool} ${
+      operation === "select"
+        ? "saved"
+        : operation === "model"
+          ? "model saved"
+          : "verified"
+    }`
+  );
 }
 
 function renderLocalServiceStatus() {
@@ -1083,6 +1184,7 @@ function renderLocalServiceStatus() {
       "Control: python tools/universe_server.py status | start | stop | restart"
     )
   );
+  if (typeof refreshLawStrip === "function") refreshLawStrip();
 }
 
 async function openProviderSettings() {
@@ -1887,12 +1989,12 @@ function drawGraph() {
     const isImplementationLink = edge.kind === "implementation-binding";
     context.lineWidth = isDocumentLink ? 1.4 : 1.2;
     context.strokeStyle = isPredicted
-      ? "#ac8bff"
+      ? "rgba(155, 124, 255, 0.75)"
       : isDocumentLink
-      ? "#a15c00"
+      ? "rgba(240, 184, 74, 0.7)"
       : isImplementationLink
-        ? "#6b4fa3"
-        : "#aeb7c1";
+        ? "rgba(122, 106, 212, 0.7)"
+        : "rgba(120, 180, 230, 0.35)";
     context.setLineDash(isPredicted ? [7, 6] : isDocumentLink ? [5, 4] : isImplementationLink ? [3, 3] : []);
     context.beginPath();
     context.moveTo(from.x, from.y);
@@ -1903,34 +2005,37 @@ function drawGraph() {
   for (const item of state.graph.nodes) {
     const selected = state.selectedNode?.id === item.id;
     const color = {
-      project: "#087f78",
+      project: "#3d7ecf",
       system: "#1769aa",
-      focus: "#41d7c3",
+      focus: "#4ec4ff",
       related: "#61a8ff",
-      document: "#a15c00",
-      implementation: "#6b4fa3",
-      predicted: "#b13b36",
+      document: "#c48a2a",
+      implementation: "#7a6ad4",
+      predicted: "#c45b58",
     }[item.kind];
     const widthValue = ["project", "focus"].includes(item.kind) ? 126 : 108;
     const heightValue = ["project", "focus"].includes(item.kind) ? 42 : 36;
+    const x0 = item.x - widthValue / 2;
+    const y0 = item.y - heightValue / 2;
+    if (selected) {
+      context.shadowColor = "rgba(61, 224, 255, 0.55)";
+      context.shadowBlur = 18;
+    } else {
+      context.shadowColor = "rgba(61, 224, 255, 0.12)";
+      context.shadowBlur = 8;
+    }
     context.fillStyle = selected
-      ? "#10242b"
+      ? "rgba(12, 28, 52, 0.92)"
       : item.kind === "focus"
-        ? "#0e2528"
-        : "#ffffff";
-    context.strokeStyle = selected ? "#41d7c3" : color;
-    context.lineWidth = selected ? 2.8 : 1.6;
-    roundedRect(
-      context,
-      item.x - widthValue / 2,
-      item.y - heightValue / 2,
-      widthValue,
-      heightValue,
-      5
-    );
+        ? "rgba(16, 34, 58, 0.9)"
+        : "rgba(10, 22, 42, 0.88)";
+    context.strokeStyle = selected ? "#3de0ff" : color;
+    context.lineWidth = selected ? 2.4 : 1.5;
+    roundedRect(context, x0, y0, widthValue, heightValue, 10);
     context.fill();
     context.stroke();
-    context.fillStyle = selected ? "#ffffff" : "#20262d";
+    context.shadowBlur = 0;
+    context.fillStyle = selected ? "#eaf8ff" : "#d7e7f8";
     context.font = `${item.kind === "project" ? "600" : "500"} 11px Segoe UI`;
     context.textAlign = "center";
     context.textBaseline = "middle";
@@ -2379,6 +2484,7 @@ async function submitDispatch(event) {
         result.message,
       ];
       state.conductorRuntimeBinding = result.runtime_binding || null;
+      expandConversationLayer();
       renderComposerState();
       renderRoomMessages();
       toast("Message queued for Universe Conductor");
@@ -4473,11 +4579,15 @@ function bindEvents() {
     discoverHostTools().catch((error) => toast(error.message, true));
   });
   elements.hostToolSettings.addEventListener("click", (event) => {
-    const action = event.target.closest(".host-tool-set, .host-tool-verify");
+    const action = event.target.closest(
+      ".host-tool-set, .host-tool-verify, .host-tool-model-set"
+    );
     if (!action) return;
     const operation = action.classList.contains("host-tool-set")
       ? "select"
-      : "verify";
+      : action.classList.contains("host-tool-model-set")
+        ? "model"
+        : "verify";
     action.disabled = true;
     updateHostTool(action.dataset.tool, operation)
       .catch((error) => {
@@ -4518,11 +4628,15 @@ function bindEvents() {
   elements.prepareProject.addEventListener("click", prepareProjectSeed);
   elements.exitNodeUniverse.addEventListener("click", exitNodeUniverse);
   elements.closeInspector.addEventListener("click", closeInspector);
+  if (elements.conductorSummaryToggle && elements.conductorSummary) {
+    elements.conductorSummaryToggle.addEventListener("click", () => {
+      const collapsed = elements.conductorSummary.classList.toggle("collapsed");
+      syncConductorSummaryToggle(collapsed);
+    });
+  }
   elements.conversationToggle.addEventListener("click", () => {
     const collapsed = elements.conversationLayer.classList.toggle("collapsed");
-    elements.conversationToggle.textContent = collapsed ? "+" : "-";
-    elements.conversationToggle.title = collapsed ? "Expand conversation" : "Collapse conversation";
-    elements.conversationToggle.setAttribute("aria-label", elements.conversationToggle.title);
+    syncConversationToggle(collapsed);
   });
   elements.conversationOpacity.addEventListener("input", () => {
     elements.conversationLayer.style.setProperty(
@@ -4532,6 +4646,164 @@ function bindEvents() {
   });
   elements.projectForm.addEventListener("submit", submitProject);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
+
+  if (elements.viewModeSelect) {
+    elements.viewModeSelect.addEventListener("change", () => {
+      const value = elements.viewModeSelect.value;
+      const btn = document.querySelector(`.segmented-control [data-view="${value}"]`);
+      if (btn) btn.click();
+    });
+  }
+  document.querySelectorAll(".rail-view[data-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll(".rail-view[data-view]").forEach((b) => b.classList.remove("selected"));
+      button.classList.add("selected");
+      const value = button.getAttribute("data-view");
+      const seg = document.querySelector(`.segmented-control [data-view="${value}"]`);
+      if (seg) seg.click();
+      if (elements.viewModeSelect) elements.viewModeSelect.value = value;
+    });
+  });
+  document.querySelectorAll(".rail-view[data-primary-view], .ghost-action[data-primary-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const view = button.getAttribute("data-primary-view");
+      const nav = elements.primaryNav?.querySelector(`[data-primary-view="${view}"]`);
+      if (nav) nav.click();
+    });
+  });
+  const fitBtn = document.querySelector("#action-fit-map");
+  if (fitBtn) fitBtn.addEventListener("click", () => document.querySelector("#graph-fit")?.click());
+  const refreshAct = document.querySelector("#action-refresh");
+  if (refreshAct) refreshAct.addEventListener("click", () => document.querySelector("#refresh-button")?.click());
+  const todoAct = document.querySelector("#action-todo");
+  if (todoAct) todoAct.addEventListener("click", () => document.querySelector("#todo-button")?.click());
+  setInterval(() => {
+    const now = new Date().toLocaleTimeString();
+    if (elements.conductorClock) elements.conductorClock.textContent = now;
+    if (elements.conductorClockCompact) elements.conductorClockCompact.textContent = now;
+  }, 1000);
+  if (typeof refreshConductorPanel === "function") refreshConductorPanel();
+
+  if (elements.primaryNav) {
+    elements.primaryNav.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-primary-view]");
+      if (!button) return;
+      const view = button.getAttribute("data-primary-view");
+      for (const item of elements.primaryNav.querySelectorAll("[data-primary-view]")) {
+        item.classList.toggle("selected", item === button);
+      }
+      if (view === "ecosystem") {
+        toast("Ecosystem · project list");
+        return;
+      }
+      if (view === "project") {
+        if (typeof showGraphView === "function") showGraphView("universe");
+        else if (document.querySelector('[data-view="universe"]')) {
+          document.querySelector('[data-view="universe"]').click();
+        }
+        toast("Project topology");
+        return;
+      }
+      if (view === "network") {
+        toast("Network peer map is a later surface (placeholder)");
+        return;
+      }
+      const tabMap = {
+        experience: "bench",
+        memory: "memory",
+        future: "future",
+        bench: "bench",
+      };
+      const tab = tabMap[view];
+      if (tab && typeof showInspectorTab === "function") {
+        document.body.classList.add("inspector-open");
+        showInspectorTab(tab);
+      }
+    });
+  }
+  
+
+function syncConductorSummaryToggle(collapsed) {
+  if (!elements.conductorSummaryToggle) return;
+  const title = collapsed ? "Expand overview" : "Collapse overview";
+  elements.conductorSummaryToggle.title = title;
+  elements.conductorSummaryToggle.setAttribute("aria-label", title);
+  elements.conductorSummaryToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function refreshConductorPanel() {
+  const projectCount = (state.projects || []).length;
+  const todoCount = (state.todos || []).length;
+  const dispatchCount = (state.dispatches || []).length;
+  if (elements.metricProjects) elements.metricProjects.textContent = String(projectCount);
+  if (elements.metricTodos) elements.metricTodos.textContent = String(todoCount);
+  if (elements.metricDispatches) elements.metricDispatches.textContent = String(dispatchCount);
+  if (elements.metricService) {
+    const ready = elements.serviceStatus?.dataset?.state === "ready";
+    elements.metricService.textContent = ready ? "READY" : "…";
+  }
+  if (elements.conductorSummaryLine) {
+    const service = elements.metricService?.textContent || "—";
+    elements.conductorSummaryLine.textContent =
+      `P ${projectCount} · T ${todoCount} · D ${dispatchCount} · ${service}`;
+  }
+  if (elements.workspaceTitle && elements.workspaceTitle.classList.contains("conductor-greeting")) {
+    const hour = new Date().getHours();
+    const greet = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+    elements.workspaceTitle.textContent = greet + ", Conductor.";
+  }
+  if (elements.workspaceSubtitle) {
+    if (state.selectedProject) {
+      elements.workspaceSubtitle.textContent =
+        `Observing ${state.selectedProject.project_id} · ${projectCount} project(s) registered`;
+    } else if (projectCount) {
+      elements.workspaceSubtitle.textContent =
+        `You're connected to ${projectCount} observed project(s).`;
+    } else {
+      elements.workspaceSubtitle.textContent = "Connect a project to begin observation.";
+    }
+  }
+  if (elements.inspectorTitle) {
+    elements.inspectorTitle.textContent = state.selectedProject
+      ? state.selectedProject.project_id
+      : "Local Instance";
+  }
+  if (elements.inspectorSubtitle) {
+    elements.inspectorSubtitle.textContent = state.selectedProject
+      ? state.selectedProject.project_root || "Connected project"
+      : "Select a project or node";
+  }
+  if (elements.statusBarLeft) {
+    elements.statusBarLeft.textContent = state.selectedProject
+      ? `Project ${state.selectedProject.project_id}`
+      : `${projectCount} projects · local control plane`;
+  }
+  if (elements.statusBarRight) {
+    const ready = elements.serviceStatus?.dataset?.state === "ready";
+    elements.statusBarRight.textContent = ready ? "Network Health · READY" : "Network Health · …";
+  }
+  if (elements.conductorClock || elements.conductorClockCompact) {
+    const now = new Date().toLocaleTimeString();
+    if (elements.conductorClock) elements.conductorClock.textContent = now;
+    if (elements.conductorClockCompact) elements.conductorClockCompact.textContent = now;
+  }
+  if (typeof refreshLawStrip === "function") refreshLawStrip();
+}
+
+function refreshLawStrip() {
+    if (elements.lawContract) {
+      elements.lawContract.textContent =
+        state.health?.mode_contract?.status === "ACTIVE" ? "COMPATIBLE" : "UNKNOWN";
+    }
+    if (elements.lawRuntime) {
+      const ready = elements.serviceStatus?.dataset?.state === "ready";
+      elements.lawRuntime.textContent = ready ? "VERIFIED" : "STANDBY";
+    }
+    if (elements.lawLocal) {
+      elements.lawLocal.textContent = "INSTANCE";
+    }
+  }
+  const _setServiceStatus = typeof setServiceStatus === "function" ? setServiceStatus : null;
   elements.freshProjectForm.addEventListener("submit", submitFreshProjectIntent);
   document
     .querySelector("#edit-project-intent")
@@ -4657,8 +4929,15 @@ function bindEvents() {
       !elements.conversationLayer.classList.contains("collapsed")
     ) {
       elements.conversationLayer.classList.add("collapsed");
-      elements.conversationToggle.textContent = "+";
-      elements.conversationToggle.title = "Expand conversation";
+      syncConversationToggle(true);
+      return;
+    }
+    if (
+      elements.conductorSummary &&
+      !elements.conductorSummary.classList.contains("collapsed")
+    ) {
+      elements.conductorSummary.classList.add("collapsed");
+      syncConductorSummaryToggle(true);
       return;
     }
     if (document.body.classList.contains("inspector-open")) {
