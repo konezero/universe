@@ -356,8 +356,8 @@ relations remain distinct from observed evidence. Career adoption is separate.
    and evidence identifiers remain stable English values in APIs and storage.
 9. Universe Conductor and per-Project Master CLI provider settings are
    implemented as local SQLite configuration. The default is `AUTO`, with the
-   current ordered preference `GROK` then `CODEX`; explicit `GROK` or `CODEX`
-   selection never falls back silently when unavailable. Capability and
+   current ordered preference `GROK`, then `CODEX`, then `CLAUDE`; an explicit
+   provider selection never falls back silently when unavailable. Capability and
    resolution state are visible in the settings UI. Changing a Project Master
    setting stops its resident Host and applies the new selection on the next
    explicit Project Master preparation. Per-task provider selection remains part of the
@@ -366,8 +366,9 @@ relations remain distinct from observed evidence. Career adoption is separate.
 10. Use one Universe-owned ACP session gateway for Conductor Task Frame Workers
     and resident Project Master conversation sessions. Grok uses native ACP.
     Codex app-server callbacks are normalized to ACP updates and permission
-    options. HTTP/SSE remains the Web UI adapter and does not become provider
-    authority or a Task Frame bypass.
+    options. Claude uses print-mode JSON with target-scoped session resume and
+    non-persistent Task Frame calls. HTTP/SSE remains the Web UI adapter and
+    does not become provider authority or a Task Frame bypass.
 11. Productize the desktop-first Universe UI as the canonical responsive Web
     SPA. Keep the persistent conversation surface and its + control scoped to
     Project Master, Skill, and context invocation; explicit management remains
@@ -378,7 +379,7 @@ relations remain distinct from observed evidence. Career adoption is separate.
     Package the stable Web UI later in a Tauri desktop shell with the Python
     Universe service as a sidecar, tray, and autostart; mobile and remote clients
     reuse the same responsive UI as a later delivery surface.
-12. Central Host Profile resolution for Python, Git, Codex, and Grok is
+12. Central Host Profile resolution for Python, Git, Codex, Grok, and Claude is
     implemented. The local Universe service initializes and verifies one
     machine-local Profile, and all product Runtime callers consume it instead
     of independently searching process state. Runtime Settings exposes

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -819,6 +820,44 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GROK",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
         )
+
+    def test_provider_setting_migrates_existing_database_for_claude(self) -> None:
+        database = self.temp_root / "legacy-provider-setting.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE cli_provider_setting (
+                    scope_kind TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    provider TEXT NOT NULL
+                        CHECK(provider IN ('AUTO', 'GROK', 'CODEX')),
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope_kind, scope_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO cli_provider_setting VALUES (?, ?, ?, ?)",
+                ("UNIVERSE_CONDUCTOR", "CONDUCTOR", "GROK", "before"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = UniverseStore(database)
+        self.assertEqual(
+            "GROK",
+            store.provider_setting("UNIVERSE_CONDUCTOR", "CONDUCTOR")[
+                "provider"
+            ],
+        )
+        updated = store.set_provider_setting(
+            "UNIVERSE_CONDUCTOR",
+            "CONDUCTOR",
+            {"provider": "CLAUDE"},
+        )
+        self.assertEqual("CLAUDE", updated["provider"])
 
     def test_server_restart_reuses_one_conductor_provider_coordinate(self) -> None:
         class FakeRuntimeHost:

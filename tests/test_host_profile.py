@@ -54,7 +54,9 @@ class HostProfileTests(unittest.TestCase):
             git = root / "git.exe"
             codex_batch = root / "codex.cmd"
             grok = root / "grok.exe"
-            for path in (python, git, codex_batch, grok):
+            claude = root / ".local" / "bin" / "claude.exe"
+            claude.parent.mkdir(parents=True)
+            for path in (python, git, codex_batch, grok, claude):
                 path.write_bytes(b"placeholder")
             lookup = {
                 "git.exe": str(git),
@@ -82,6 +84,7 @@ class HostProfileTests(unittest.TestCase):
             self.assertEqual("AVAILABLE", result["tools"]["git"]["status"])
             self.assertEqual("UNAVAILABLE", result["tools"]["codex"]["status"])
             self.assertEqual("AVAILABLE", result["tools"]["grok"]["status"])
+            self.assertEqual("AVAILABLE", result["tools"]["claude"]["status"])
             self.assertNotIn(codex_batch.resolve(), calls)
             stored = json.loads(profile_path.read_text(encoding="utf-8"))
             self.assertEqual(PROFILE_SCHEMA, stored["schema"])
@@ -142,6 +145,42 @@ class HostProfileTests(unittest.TestCase):
             python.unlink()
 
             self.assertIsNone(store.resolve("python"))
+
+    def test_existing_profile_discovers_new_supported_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "host.json"
+            claude = root / ".local" / "bin" / "claude.exe"
+            claude.parent.mkdir(parents=True)
+            claude.write_bytes(b"placeholder")
+            profile_path.write_text(
+                json.dumps(
+                    {
+                        "schema": PROFILE_SCHEMA,
+                        "revision": 1,
+                        "created_at": "before",
+                        "updated_at": "before",
+                        "tools": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = HostProfileStore(
+                profile_path,
+                environment={},
+                path_lookup=lambda _name: None,
+                native_runner=lambda _request: completed("claude 1.0"),
+                current_python=root / "missing-python.exe",
+                home=root,
+            )
+
+            result = store.ensure_initialized()
+
+            self.assertEqual("AVAILABLE", result["tools"]["claude"]["status"])
+            self.assertEqual(
+                claude.resolve(),
+                store.resolve("claude").executable,
+            )
 
     def test_profile_rejects_unknown_tool_and_does_not_store_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

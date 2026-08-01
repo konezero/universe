@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -13,11 +14,13 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from agent_session_gateway import (  # noqa: E402
     AgentSessionError,
+    ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
     cli_auto_approve_status,
     normalize_permission_request,
 )
+from windows_native_cli import NativeCliResult  # noqa: E402
 
 
 class FakeJsonRpcTransport:
@@ -150,6 +153,97 @@ class AgentSessionGatewayTests(unittest.TestCase):
     def test_cli_auto_approve_status_uses_effective_universe_policy(self) -> None:
         self.assertEqual("OFF", cli_auto_approve_status("GROK"))
         self.assertEqual("OFF", cli_auto_approve_status("CODEX"))
+        self.assertEqual("OFF", cli_auto_approve_status("CLAUDE"))
+
+    def test_claude_print_session_resumes_and_observes_session_id(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            self.assertIn("System\n\nQuestion", request.stdin_path.read_text("utf-8"))
+            return NativeCliResult(
+                contract="test",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "result": "Claude answer",
+                        "session_id": "claude-session-new",
+                        "is_error": False,
+                    }
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        sessions: list[str] = []
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id="claude-session-old",
+            permission_requester=lambda _request: None,
+            session_observer=sessions.append,
+            native_runner=runner,
+        )
+        deltas: list[str] = []
+        answer = session.prompt("Question", deltas.append)
+
+        self.assertEqual("Claude answer", answer)
+        self.assertEqual(["Claude answer"], deltas)
+        self.assertEqual(["claude-session-new"], sessions)
+        self.assertIn("--resume", requests[0].arguments)
+        self.assertIn("claude-session-old", requests[0].arguments)
+        self.assertEqual(
+            "Read,Glob,Grep",
+            requests[0].arguments[requests[0].arguments.index("--tools") + 1],
+        )
+
+    def test_claude_ephemeral_session_disables_tools_and_persistence(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            return NativeCliResult(
+                contract="test",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "result": "Bounded result",
+                        "session_id": "ephemeral-session",
+                        "is_error": False,
+                    }
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        sessions: list[str] = []
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id="must-not-resume",
+            permission_requester=lambda _request: None,
+            session_observer=sessions.append,
+            ephemeral=True,
+            native_runner=runner,
+        )
+        session.prompt("Question", lambda _delta: None)
+
+        arguments = requests[0].arguments
+        self.assertNotIn("--resume", arguments)
+        self.assertNotIn("--bare", arguments)
+        self.assertIn("--no-session-persistence", arguments)
+        self.assertEqual("", arguments[arguments.index("--tools") + 1])
+        self.assertEqual([], sessions)
 
     def test_grok_runs_as_acp_session_and_forwards_permission(self) -> None:
         selected: list[dict[str, Any]] = []

@@ -36,7 +36,7 @@
 | 6 | Seed/Skill Plan handoff + OS_INSTALL/OS_UPDATE 계획 | **DONE** (코드) / **LIVE 닫힘** (GCS) | `project_seed_apply`, `project_release_apply`, skill plan master apply tests; design doc §6 “implemented” | 2026-07-31: dispatch deliver 경로 수정(`.ai/master/inbox` 허용) → **DELIVERED→COMPLETED**; seed-asset-proposal apply로 GCS `.ai/universe` 5 assets 발행 |
 | 7 | Experience 및 인과 비교 | **PARTIAL** | experience-case/match/pattern APIs + tests (`test_experience_case_*`) | 로컬 case/observation/pattern **0**. UI 통합·인과 비교는 약함 |
 | 8 | UI 로컬라이제이션 | **NOT_STARTED** | `index.html lang="en"` 고정; i18n 키/전환 없음 | design doc §8 presentation follow-up |
-| 9 | Conductor/Project Provider 설정 (`AUTO/GROK/CODEX`) + SQLite | **DONE** | `cli_provider_setting`; `/v1/settings/providers`; resident host restart on change; tests | 로컬 settings 2 (CONDUCTOR + GCS MASTER), 값 AUTO |
+| 9 | Conductor/Project Provider 설정 (`AUTO/GROK/CODEX/CLAUDE`) + SQLite | **DONE** | `cli_provider_setting`; `/v1/settings/providers`; resident host restart on change; tests | 로컬 settings 2 (CONDUCTOR + GCS MASTER), 값 AUTO |
 | 10 | 단일 ACP 세션 게이트웨이 (Conductor, Project Master 공용) | **DONE** | `agent_session_gateway.py`; provider session boundary `e9c158d`/`78ef57a`; ACP tests | Task Frame ephemeral vs resident session 분리 테스트 존재 |
 | 11 | 데스크톱형 SPA + Tauri/트레이/오토스타트 | **PARTIAL** | `tools/universe_ui` SPA (graph/todo/conductor/master); desktop-first docs | **Tauri/tray/autostart/installer 없음**. SPA 본편은 동작 표면 있음 |
 | 12 | 중앙 Host Profile 해상도 | **DONE** | `host_profile.py`, settings host-tools discover/select/verify, `test_host_profile.py`, `c915510` | 런타임 호출자가 중앙 Profile 소비 |

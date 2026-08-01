@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from agent_session_gateway import (
     AgentSessionError,
+    ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
     UniverseAcpGateway,
@@ -24,9 +25,13 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
 DISPATCH_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
-SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
+SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
-PROVIDER_MODELS = {"GROK": "grok-build", "CODEX": "default"}
+PROVIDER_MODELS = {
+    "GROK": "grok-build",
+    "CODEX": "default",
+    "CLAUDE": "default",
+}
 
 
 @dataclass(frozen=True)
@@ -156,11 +161,20 @@ def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
     return resolved.executable, dict(resolved.environment)
 
 
+def _resolve_claude() -> tuple[Path | None, dict[str, str]]:
+    resolved = resolve_host_tool("claude")
+    if resolved is None:
+        return None, {}
+    return resolved.executable, dict(resolved.environment)
+
+
 def _provider_executable(provider: str) -> tuple[Path | None, dict[str, str]]:
     if provider == "GROK":
         return _resolve_grok()
     if provider == "CODEX":
         return _resolve_codex()
+    if provider == "CLAUDE":
+        return _resolve_claude()
     return None, {}
 
 
@@ -270,11 +284,11 @@ class RuntimeWorkerDispatcher:
         skill_bindings = self._skill_bindings(planned_invocation)
         worker_run_ref = f"universe-runtime-host:{uuid4().hex}"
         worker_request = {
-            "schema": (
-                "universe.grok-worker-request.v1"
-                if provider == "GROK"
-                else "universe.codex-worker-request.v1"
-            ),
+            "schema": {
+                "GROK": "universe.grok-worker-request.v1",
+                "CODEX": "universe.codex-worker-request.v1",
+                "CLAUDE": "universe.claude-worker-request.v1",
+            }[provider],
             "runtime_profile": "TASK_FRAME_RUNTIME",
             "task_frame_id": request["frame_id"],
             "turn_id": request["turn_id"],
@@ -509,6 +523,8 @@ class RuntimeWorkerDispatcher:
             return self._invoke_grok(request)
         if provider == "CODEX":
             return self._invoke_codex(request)
+        if provider == "CLAUDE":
+            return self._invoke_claude(request)
         raise WorkerDispatchError(
             "WORKER_PROVIDER_UNSUPPORTED",
             "WORKER_ADAPTER",
@@ -628,6 +644,65 @@ class RuntimeWorkerDispatcher:
                 f"codex-app-server:{session_id}:{request['worker_run_ref']}"
             ),
             "result": {"text": text, "stop_reason": "COMPLETED"},
+            "repository_write_scope": "NONE",
+            "session_persistence": "EPHEMERAL",
+            "persistent_session_ref": "UNKNOWN",
+            "universe_coordinate_persisted": False,
+            "provider_durable_chat_state": "NOT_PERSISTED",
+        }
+
+    def _invoke_claude(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        executable, environment = _resolve_claude()
+        if executable is None:
+            raise WorkerDispatchError(
+                "WORKER_INVOCATION_UNAVAILABLE",
+                "WORKER_ADAPTER",
+                "CLAUDE_CLI_UNAVAILABLE",
+            )
+        session_ids: list[str] = []
+        try:
+            gateway = UniverseAcpGateway(
+                ClaudeCodeSession(
+                    executable=executable,
+                    cwd=Path(tempfile.gettempdir()),
+                    environment=environment,
+                    system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
+                    session_id=None,
+                    permission_requester=self._reject_task_frame_permission,
+                    session_observer=session_ids.append,
+                    ephemeral=True,
+                    max_turns=int(request.get("max_turns", 8)),
+                    native_runner=self.native_runner,
+                )
+            )
+            try:
+                text = gateway.reply_stream(
+                    self._worker_prompt(request),
+                    lambda _delta: None,
+                )
+                session_ref = gateway.session_ref
+            finally:
+                gateway.close()
+        except AgentSessionError as error:
+            raise WorkerDispatchError(
+                "WORKER_PROVIDER_FAILED",
+                "WORKER_ADAPTER",
+                f"CLAUDE_CODE_{error}",
+            ) from error
+        session_id = session_ref.split(":", 1)[-1]
+        return {
+            "schema": "universe.claude-worker-result.v1",
+            "status": "COMPLETED",
+            "runtime_provider": "CLAUDE_CODE_CLI_ADAPTER",
+            "runtime_profile": "TASK_FRAME_RUNTIME",
+            "source_mutation": "HOST_GATEWAY_ONLY",
+            "worker_id": f"claude-code:{session_id}",
+            "worker_run_ref": request["worker_run_ref"],
+            "result_receipt_ref": (
+                f"claude-code:{session_id}:{request['worker_run_ref']}"
+            ),
+            "result": {"text": text, "stop_reason": "COMPLETED"},
+            "permission_mode": "plan",
             "repository_write_scope": "NONE",
             "session_persistence": "EPHEMERAL",
             "persistent_session_ref": "UNKNOWN",

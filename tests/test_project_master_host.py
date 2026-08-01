@@ -24,6 +24,7 @@ from project_seed_apply import build_project_seed_asset_approval  # noqa: E402
 from project_seed_assets import build_project_seed_asset_proposal  # noqa: E402
 from project_skill_plan_apply import build_project_skill_plan_approval  # noqa: E402
 from project_master_host import (  # noqa: E402
+    ClaudeProjectMasterRuntime,
     CodexProjectMasterRuntime,
     GrokProjectMasterRuntime,
     LiveProjectMasterBridgeHost,
@@ -704,6 +705,21 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("codex-answer", answer)
         self.assertIn("Universe Project Room message", gateway.prompts[0])
         self.assertTrue(runtime.session_ref.startswith("codex-app-server:"))
+
+    def test_claude_runtime_routes_project_message_through_cli_session(self) -> None:
+        runtime = ClaudeProjectMasterRuntime(
+            self.root,
+            "GCS",
+            self.state,
+        )
+        gateway = FakeAgentGateway("claude-answer")
+        runtime._gateway = gateway
+
+        answer = runtime.reply(self._envelope()["message"])
+
+        self.assertEqual("claude-answer", answer)
+        self.assertIn("Universe Project Room message", gateway.prompts[0])
+        self.assertTrue(runtime.session_ref.startswith("claude-code:"))
 
     def test_streaming_provider_emits_started_deltas_and_completed(self) -> None:
         self.provider = StreamingFakeProvider()

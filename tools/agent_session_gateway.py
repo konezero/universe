@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import queue
 import subprocess  # nosec B404
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
-from windows_native_cli import NativeCliRequest, open_native_cli
+from windows_native_cli import NativeCliRequest, NativeCliResult, open_native_cli, run_native_cli
 
 
 AGENT_SESSION_SCHEMA = "universe.agent-session.v1"
@@ -20,6 +22,7 @@ PERMISSION_KINDS = frozenset(
 )
 GROK_PERMISSION_MODE = "default"
 CODEX_APPROVAL_POLICY = "on-request"
+CLAUDE_PERMISSION_MODE = "plan"
 
 
 class AgentSessionError(RuntimeError):
@@ -34,6 +37,8 @@ def cli_auto_approve_status(
         return "OFF" if GROK_PERMISSION_MODE == "default" else "UNKNOWN"
     if normalized == "CODEX":
         return "OFF" if CODEX_APPROVAL_POLICY == "on-request" else "UNKNOWN"
+    if normalized == "CLAUDE":
+        return "OFF" if CLAUDE_PERMISSION_MODE == "plan" else "UNKNOWN"
     return "UNKNOWN"
 
 
@@ -734,6 +739,119 @@ class CodexAppServerSession:
         if option_id not in {option["optionId"] for option in request["options"]}:
             raise AgentSessionError("AGENT_PERMISSION_OPTION_UNKNOWN")
         return {"decision": option_id}
+
+
+class ClaudeCodeSession:
+    """Claude Code print-mode adapter with explicit session persistence."""
+
+    def __init__(
+        self,
+        *,
+        executable: Path,
+        cwd: Path,
+        environment: Mapping[str, str],
+        system_prompt: str,
+        session_id: str | None,
+        permission_requester: PermissionRequester,
+        session_observer: Callable[[str], None],
+        ephemeral: bool = False,
+        max_turns: int = 8,
+        native_runner: Callable[[NativeCliRequest], NativeCliResult] = run_native_cli,
+    ) -> None:
+        self.executable = executable
+        self.cwd = cwd
+        self.environment = dict(environment)
+        self.system_prompt = system_prompt
+        self._resume_session = bool(session_id) and not ephemeral
+        self.session_id = (
+            None
+            if ephemeral
+            else session_id or str(uuid4())
+        )
+        self.permission_requester = permission_requester
+        self.session_observer = session_observer
+        self.ephemeral = bool(ephemeral)
+        self.max_turns = max(1, int(max_turns))
+        self.native_runner = native_runner
+
+    @property
+    def session_ref(self) -> str:
+        return (
+            f"claude-code:{self.session_id}"
+            if self.session_id
+            else "claude-code:pending"
+        )
+
+    def prompt(self, text: str, on_delta: Callable[[str], None]) -> str:
+        prompt_path = self._prompt_file(text)
+        arguments = [
+            "-p",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            CLAUDE_PERMISSION_MODE,
+            "--max-turns",
+            str(self.max_turns),
+            "--strict-mcp-config",
+            "--tools",
+            "" if self.ephemeral else "Read,Glob,Grep",
+        ]
+        if self.ephemeral:
+            arguments.append("--no-session-persistence")
+        elif self._resume_session and self.session_id:
+            arguments.extend(("--resume", self.session_id))
+        elif self.session_id:
+            arguments.extend(("--session-id", self.session_id))
+        try:
+            result = self.native_runner(
+                NativeCliRequest(
+                    executable=self.executable,
+                    arguments=tuple(arguments),
+                    cwd=self.cwd,
+                    timeout_seconds=300,
+                    output_encoding="utf-8",
+                    environment=self.environment,
+                    stdin_path=prompt_path,
+                )
+            )
+        finally:
+            prompt_path.unlink(missing_ok=True)
+        if result.status != "COMPLETED" or result.return_code != 0:
+            detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:500]
+            raise AgentSessionError(f"CLAUDE_CODE_FAILED:{detail or result.status}")
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID") from error
+        if not isinstance(payload, Mapping) or payload.get("is_error") is True:
+            raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID")
+        output = payload.get("result")
+        if not isinstance(output, str) or not output.strip():
+            raise AgentSessionError("CLAUDE_CODE_RESPONSE_MISSING")
+        observed_session = payload.get("session_id")
+        if isinstance(observed_session, str) and observed_session.strip():
+            self.session_id = observed_session.strip()
+            if not self.ephemeral:
+                self.session_observer(self.session_id)
+        on_delta(output)
+        return output.strip()
+
+    def close(self) -> None:
+        return None
+
+    def _prompt_file(self, text: str) -> Path:
+        root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        root = root / "Universe" / "runtime-tmp"
+        root.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix="claude-prompt-",
+            suffix=".txt",
+            dir=root,
+        )
+        path = Path(temporary)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(f"{self.system_prompt}\n\n{text}\n")
+        return path
 
 
 def _json_object(value: Mapping[str, Any]) -> dict[str, Any]:

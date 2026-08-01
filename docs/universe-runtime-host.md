@@ -25,9 +25,9 @@ Frame Runtime returns `WORKER_INVOCATION_READY`. Provider configuration never
 creates a Task Frame, authority, assignment, write scope, or source-mutation
 permission.
 
-Current providers are `GROK` and `CODEX`. Provider capability is Host-dependent.
-An unavailable CLI remains `UNAVAILABLE`; it is not replaced by a simulated
-Worker result.
+Current providers are `GROK`, `CODEX`, and `CLAUDE`. Provider capability is
+Host-dependent. An unavailable CLI remains `UNAVAILABLE`; it is not replaced
+by a simulated Worker result.
 
 Every provider request requires `repository_write_scope: NONE` and an empty
 mutation scope. Source mutation stays on the attached Project's Execution
@@ -71,19 +71,17 @@ execution routes. Legacy PowerShell adapter files fail closed with
 `WINDOWS_NATIVE_CLI_ROUTE_REQUIRED`.
 
 Provider capability checks use the bounded one-shot runner. Provider turns use
-the persistent native process opener because ACP and app-server are JSON-RPC
-stdio sessions. Grok messages use native ACP `session/prompt`; Codex app-server
-turns are normalized to the same Universe ACP update and permission contract.
-Grok is launched with `--permission-mode default` and Codex with
-`approvalPolicy: on-request`; both Universe-owned sessions therefore request
-tool approval independently of user-global provider defaults.
-Context Pack and Output Contract text travel inside protocol messages, not shell
-arguments or prompt files. Exact argv boundaries, non-ASCII protocol text,
-structured results, and provider permission normalization are covered by
-Runtime Host regression tests.
+the persistent native process opener for Grok ACP and Codex app-server JSON-RPC
+stdio sessions. Claude uses bounded print-mode JSON calls, resumes only the one
+target-scoped `session_id`, and transports prompt text through a temporary stdin
+file. Claude resident sessions expose only `Read`, `Glob`, and `Grep` under
+`--permission-mode plan` and no MCP configuration. Task Frame Claude calls also
+use `--tools ""` and `--no-session-persistence`. Exact argv boundaries,
+non-ASCII protocol text, structured results, and provider permission boundaries
+are covered by Runtime Host regression tests.
 
-Python, Git, Grok, and Codex must resolve to native executables. `.bat`, `.cmd`,
-and `.ps1` entrypoints are rejected. The Profile stores only executable paths,
+Python, Git, Grok, Codex, and Claude must resolve to native executables. `.bat`,
+`.cmd`, and `.ps1` entrypoints are rejected. The Profile stores executable paths,
 versions, verification timestamps, discovery sources, and the non-secret
 `GROK_HOME` launch environment. Tokens, credentials, and provider sessions are
 not Profile fields.
@@ -104,7 +102,8 @@ Temporary Runtime lifecycle and Task Frame request files are stored under:
 
 If `LOCALAPPDATA` is unavailable, the Host uses `%TEMP%\Universe\runtime-tmp`.
 Those files are transient Host transport data and are not project evidence.
-Provider prompts no longer create a separate transient prompt file.
+Grok and Codex carry prompts in protocol messages. Claude print mode uses a
+per-call stdin file in this directory and deletes it immediately after return.
 
 ## Universe Service Integration
 

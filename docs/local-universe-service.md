@@ -87,13 +87,14 @@ remain process-local and are never persisted to the Universe database or
 browser state.
 
 The Conductor CLI selection is local application configuration. Its persisted
-value is `AUTO`, `GROK`, or `CODEX`; absence is equivalent to `AUTO`. `AUTO`
-chooses the first available provider in the configured order. An explicit
+value is `AUTO`, `GROK`, `CODEX`, or `CLAUDE`; absence is equivalent to `AUTO`.
+`AUTO` chooses the first available provider in the configured order. An explicit
 provider that is unavailable fails visibly and is never replaced after the
 request has started.
 
 Provider selection is separate from Host executable resolution. Runtime
-Settings exposes the central Host Profile for Python, Git, Codex, and Grok.
+Settings exposes the central Host Profile for Python, Git, Codex, Grok, and
+Claude.
 The service initializes this Profile before Runtime providers or resident
 Project Masters start. Discover, select, and verify operations update the same
 local Profile consumed by all Runtime callers. They do not create authority,
@@ -526,12 +527,12 @@ and durable Host queue. Merely selecting a Project graph does not start its
 Host.
 
 Each Project Master has an independent persisted CLI selection with the same
-`AUTO`, `GROK`, and `CODEX` values. A changed selection closes the existing
+`AUTO`, `GROK`, `CODEX`, and `CLAUDE` values. A changed selection closes the existing
 resident Host; the next explicit Project Master preparation opens the selected
 Provider. Provider session state is target-scoped and contains exactly one
 `last_provider` plus
 `last_session_ref`. A Provider change replaces that coordinate; Universe does
-not retain parallel Grok and Codex session maps.
+not retain parallel provider session maps.
 
 On open, Universe supplies that last coordinate and records the Provider and
 Session Ref actually opened. An exact match resumes without a greeting. A
@@ -558,6 +559,7 @@ Universe UI
      -> ephemeral Task Frame Boss or Worker execution
      -> Grok ACP over JSON-RPC stdio
      -> Codex app-server adapter normalized to ACP events
+     -> Claude Code print-mode JSON adapter
 ```
 
 The implemented common session vocabulary is `session/new` or Provider resume,
@@ -568,9 +570,9 @@ ephemeral. ACP is the client/session protocol and does not bypass Task Frame,
 Mode, authority, or execution-assignment rules.
 
 `EPHEMERAL` means Universe does not retain a connection coordinate for that
-execution. Codex also receives `thread/start.ephemeral: true`. Grok ACP does not
-currently attest Provider-side durable chat cleanup, so that Provider storage
-state remains `UNKNOWN`.
+execution. Codex also receives `thread/start.ephemeral: true`; Claude receives
+`--no-session-persistence`. Grok ACP does not currently attest Provider-side
+durable chat cleanup, so that Provider storage state remains `UNKNOWN`.
 
 The Worker dispatcher must return `session_persistence: EPHEMERAL`,
 `persistent_session_ref: UNKNOWN`, and
@@ -583,6 +585,10 @@ exposes approval callbacks through `app-server`; the adapter maps those
 callbacks into the same ACP permission option contract. Provider-specific
 request or decision values are preserved inside the adapter and do not leak
 into the browser API.
+
+Claude uses one-shot JSON responses. Resident Conductor and Project Master
+calls resume the target's single last Claude `session_id`; Task Frame calls
+disable tools and session persistence and never publish a Universe coordinate.
 
 Universe pins both provider sessions to request approval. Grok starts with
 `--permission-mode default`, so a user-level `always-approve` setting is not

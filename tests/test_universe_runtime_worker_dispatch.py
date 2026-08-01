@@ -102,6 +102,38 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertFalse(result["universe_coordinate_persisted"])
         self.assertEqual("UNKNOWN", result["provider_durable_chat_state"])
 
+    def test_claude_task_frame_disables_session_persistence(self) -> None:
+        observed: list[tuple[bool, int]] = []
+
+        class FakeClaudeSession:
+            def __init__(self, *, ephemeral, max_turns, **_kwargs) -> None:
+                observed.append((ephemeral, max_turns))
+                self.session_ref = "claude-code:ephemeral-1"
+
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        with (
+            patch(
+                "universe_runtime_worker_dispatch._resolve_claude",
+                return_value=(self.root / "claude.exe", {}),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.ClaudeCodeSession",
+                FakeClaudeSession,
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.UniverseAcpGateway",
+                FakeGateway,
+            ),
+        ):
+            result = dispatcher._invoke_claude({**self.request, "max_turns": 5})
+
+        self.assertEqual([(True, 5)], observed)
+        self.assertEqual("CLAUDE_CODE_CLI_ADAPTER", result["runtime_provider"])
+        self.assertEqual("EPHEMERAL", result["session_persistence"])
+        self.assertEqual("UNKNOWN", result["persistent_session_ref"])
+        self.assertFalse(result["universe_coordinate_persisted"])
+        self.assertEqual("NOT_PERSISTED", result["provider_durable_chat_state"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,10 +29,11 @@ python
 git
 codex
 grok
+claude
 ```
 
-Python and Git are required for a ready base Profile. Codex and Grok are
-optional provider capabilities. Each record contains:
+Python and Git are required for a ready base Profile. Codex, Grok, and Claude
+are optional provider capabilities. Each record contains:
 
 ```text
 status
@@ -61,6 +62,9 @@ uses this order:
 
 Legacy `CODEX_CLI_PATH` and `GROK_HOME` are read only while discovering a
 Profile entry. Runtime callers do not read them after initialization.
+
+On Windows, Claude discovery includes the official native installer location
+`%USERPROFILE%\.local\bin\claude.exe`. Batch and command shims are not used.
 
 Every candidate must be a native executable and pass `--version` through the
 Windows native CLI runner. `.bat`, `.cmd`, and `.ps1` launchers are rejected.

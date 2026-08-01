@@ -126,9 +126,9 @@ CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
         "FAILED",
     }
 )
-CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX"})
+CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
 PROVIDER_SETTING_SCHEMA = "universe.cli-provider-setting.v1"
-PROVIDER_SETTING_CHOICES = frozenset({"AUTO", "GROK", "CODEX"})
+PROVIDER_SETTING_CHOICES = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
 PROVIDER_SETTING_SCOPES = frozenset({"UNIVERSE_CONDUCTOR", "PROJECT_MASTER"})
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
@@ -191,7 +191,7 @@ TODO_STATES = frozenset(
     {"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"}
 )
 TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
-FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX"})
+FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
 )
@@ -1752,7 +1752,7 @@ def normalize_fresh_project_refinement_run_request(value: Any) -> dict[str, str]
     if provider not in FRESH_PROJECT_REFINEMENT_PROVIDERS:
         raise UniverseError(
             "FRESH_PROJECT_REFINEMENT_PROVIDER_INVALID",
-            "provider must be GROK or CODEX",
+            "provider must be GROK, CODEX, or CLAUDE",
         )
     return {
         "request_id": _identifier(request["request_id"], "request_id"),
@@ -2612,7 +2612,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
     if requested_provider not in CONDUCTOR_ROOM_PROVIDERS:
         raise UniverseError(
             "CONDUCTOR_ROOM_PROVIDER_INVALID",
-            "provider must be AUTO, GROK, or CODEX",
+            "provider must be AUTO, GROK, CODEX, or CLAUDE",
         )
     idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
     ui_context = normalize_conductor_ui_context(value.get("ui_context"))
@@ -3998,7 +3998,7 @@ class UniverseStore:
                         CHECK(scope_kind IN ('UNIVERSE_CONDUCTOR', 'PROJECT_MASTER')),
                     scope_id TEXT NOT NULL,
                     provider TEXT NOT NULL
-                        CHECK(provider IN ('AUTO', 'GROK', 'CODEX')),
+                        CHECK(provider IN ('AUTO', 'GROK', 'CODEX', 'CLAUDE')),
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(scope_kind, scope_id)
                 );
@@ -4010,6 +4010,44 @@ class UniverseStore:
                 );
                 """
             )
+            provider_table = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'cli_provider_setting'"
+            ).fetchone()
+            if provider_table is not None and "CLAUDE" not in str(
+                provider_table["sql"]
+            ).upper():
+                connection.execute(
+                    "ALTER TABLE cli_provider_setting "
+                    "RENAME TO cli_provider_setting_legacy"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE cli_provider_setting (
+                        scope_kind TEXT NOT NULL
+                            CHECK(scope_kind IN (
+                                'UNIVERSE_CONDUCTOR', 'PROJECT_MASTER'
+                            )),
+                        scope_id TEXT NOT NULL,
+                        provider TEXT NOT NULL
+                            CHECK(provider IN (
+                                'AUTO', 'GROK', 'CODEX', 'CLAUDE'
+                            )),
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(scope_kind, scope_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cli_provider_setting(
+                        scope_kind, scope_id, provider, updated_at
+                    )
+                    SELECT scope_kind, scope_id, provider, updated_at
+                    FROM cli_provider_setting_legacy
+                    """
+                )
+                connection.execute("DROP TABLE cli_provider_setting_legacy")
             connection.execute(
                 """
                 INSERT OR IGNORE INTO service_setting(setting_key, setting_value, updated_at)
@@ -4129,7 +4167,7 @@ class UniverseStore:
         if provider not in PROVIDER_SETTING_CHOICES:
             raise UniverseError(
                 "PROVIDER_SETTING_INVALID",
-                "provider must be AUTO, GROK, or CODEX",
+                "provider must be AUTO, GROK, CODEX, or CLAUDE",
             )
         current = self.provider_setting(scope_kind, scope_id)
         updated_at = utc_now()
@@ -10403,7 +10441,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "reason": f"{provider}_CLI_UNAVAILABLE",
                 },
             )
-            for provider in ("GROK", "CODEX")
+            for provider in ("GROK", "CODEX", "CLAUDE")
         ]
         settings["universe_conductor"]["resolved_provider"] = (
             self._resolve_configured_provider(
@@ -10794,7 +10832,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )["provider"]
         if configured == "AUTO":
             configured = os.environ.get("UNIVERSE_CONDUCTOR_PROVIDER", "AUTO").upper()
-        selected = requested if requested in {"GROK", "CODEX"} else configured
+        selected = (
+            requested
+            if requested in {"GROK", "CODEX", "CLAUDE"}
+            else configured
+        )
         return self._resolve_configured_provider(selected, strict=True)
 
     def _resolve_project_master_provider(self, project_id: str) -> str:
@@ -10813,7 +10855,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     ) -> str:
         normalized = str(selected or "AUTO").strip().upper()
         candidates = (
-            [normalized] if normalized in {"GROK", "CODEX"} else ["GROK", "CODEX"]
+            [normalized]
+            if normalized in {"GROK", "CODEX", "CLAUDE"}
+            else ["GROK", "CODEX", "CLAUDE"]
         )
         unavailable: list[str] = []
         for provider in candidates:

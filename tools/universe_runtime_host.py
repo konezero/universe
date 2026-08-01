@@ -22,7 +22,7 @@ from universe_runtime_worker_dispatch import (
 )
 
 RUNTIME_WORKER_REQUEST_SCHEMA = "universe.runtime-worker-invocation-request.v1"
-SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
+SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 PLANNING_PROFILE = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
@@ -30,6 +30,7 @@ PLANNING_PROFILE = Path(
 PLANNING_MODELS = {
     "GROK": "grok-build",
     "CODEX": "default",
+    "CLAUDE": "default",
 }
 
 

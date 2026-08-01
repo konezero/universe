@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from agent_session_gateway import (
     AgentSessionError,
+    ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
     UniverseAcpGateway,
@@ -53,7 +54,7 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
 PROJECT_MASTER_SESSION_SCHEMA = "universe.project-master-session.v1"
 PROVIDER_SESSION_CONNECTION_SCHEMA = "universe.provider-session-connection.v1"
-SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX"})
+SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 
 
 class ProjectMasterHostError(RuntimeError):
@@ -1262,6 +1263,69 @@ class CodexProjectMasterRuntime:
         )
 
 
+class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
+    def __init__(
+        self,
+        project_root: Path,
+        project_id: str,
+        store: ProjectMasterSessionStore,
+        *,
+        native_runner: NativeRunner = run_native_cli,
+        max_turns: int = 8,
+        requested_mode: str = "MASTER",
+        actor_label: str | None = None,
+    ) -> None:
+        super().__init__(
+            project_root,
+            project_id,
+            store,
+            native_runner=native_runner,
+            requested_mode=requested_mode,
+            actor_label=actor_label,
+        )
+        self.session_id = store.session_ref_for("CLAUDE")
+        self.max_turns = max(1, int(max_turns))
+
+    @property
+    def session_ref(self) -> str:
+        return (
+            f"claude-code:{self.session_id}"
+            if self.session_id
+            else f"claude-code:pending:{self.project_id}"
+        )
+
+    def _acp_gateway(self) -> UniverseAcpGateway:
+        if self._gateway is not None:
+            return self._gateway
+        if self._permission_requester is None:
+            raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
+        executable, environment = _resolve_claude()
+        if executable is None:
+            raise ProjectMasterHostError("CLAUDE_CLI_UNAVAILABLE")
+
+        def observe_session(session_id: str) -> None:
+            self.session_id = session_id
+            self.connection_state = self.store.observe_provider_session(
+                "CLAUDE", session_id
+            )
+            self._greeting_pending = self.connection_state != "REUSED"
+
+        session = ClaudeCodeSession(
+            executable=executable,
+            cwd=self.project_root,
+            environment=environment,
+            system_prompt=self._system_prompt(),
+            session_id=self.session_id,
+            permission_requester=self._permission_requester,
+            session_observer=observe_session,
+            max_turns=self.max_turns,
+            native_runner=self.native_runner,
+        )
+        self.session_id = session.session_id
+        self._gateway = UniverseAcpGateway(session)
+        return self._gateway
+
+
 class ResidentModeSessionHost:
     """Keep one provider-owned Mode Session connection for one target."""
 
@@ -1372,6 +1436,14 @@ class ResidentModeSessionHost:
             )
         if provider == "CODEX":
             return CodexProjectMasterRuntime(
+                repository_root,
+                target_id,
+                store,
+                requested_mode=requested_mode,
+                actor_label=actor_label,
+            )
+        if provider == "CLAUDE":
+            return ClaudeProjectMasterRuntime(
                 repository_root,
                 target_id,
                 store,
@@ -1952,6 +2024,8 @@ class ResidentProjectMasterHostManager:
             return GrokProjectMasterRuntime(project_root, project_id, store)
         if provider == "CODEX":
             return CodexProjectMasterRuntime(project_root, project_id, store)
+        if provider == "CLAUDE":
+            return ClaudeProjectMasterRuntime(project_root, project_id, store)
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 
     @staticmethod
@@ -1980,6 +2054,13 @@ def _resolve_grok() -> tuple[Path | None, dict[str, str]]:
 
 def _resolve_codex() -> tuple[Path | None, dict[str, str]]:
     resolved = resolve_host_tool("codex")
+    if resolved is None:
+        return None, {}
+    return resolved.executable, dict(resolved.environment)
+
+
+def _resolve_claude() -> tuple[Path | None, dict[str, str]]:
+    resolved = resolve_host_tool("claude")
     if resolved is None:
         return None, {}
     return resolved.executable, dict(resolved.environment)
@@ -2077,21 +2158,27 @@ def main() -> int:
     token = _read_token(args.token_env)
     state_db = args.state_db or _default_state_db(args.project_id)
     store = ProjectMasterSessionStore(state_db, args.project_id)
-    provider = (
-        GrokProjectMasterRuntime(
+    if args.provider == "GROK":
+        provider = GrokProjectMasterRuntime(
             args.project_root,
             args.project_id,
             store,
             model=args.model,
             max_turns=args.max_turns,
         )
-        if args.provider == "GROK"
-        else CodexProjectMasterRuntime(
+    elif args.provider == "CODEX":
+        provider = CodexProjectMasterRuntime(
             args.project_root,
             args.project_id,
             store,
         )
-    )
+    else:
+        provider = ClaudeProjectMasterRuntime(
+            args.project_root,
+            args.project_id,
+            store,
+            max_turns=args.max_turns,
+        )
     coordinator = ProjectModeCoordinator(
         args.project_root,
         args.project_id,

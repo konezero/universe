@@ -15,7 +15,7 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 PROFILE_SCHEMA = "ai-career.host-profile.v1"
 PROFILE_ENVIRONMENT = "AI_CAREER_HOST_PROFILE"
-SUPPORTED_TOOLS = ("python", "git", "codex", "grok")
+SUPPORTED_TOOLS = ("python", "git", "codex", "grok", "claude")
 REQUIRED_TOOLS = frozenset({"python", "git"})
 FORBIDDEN_SUFFIXES = frozenset({".bat", ".cmd", ".ps1"})
 EXECUTABLE_OVERRIDES = {
@@ -108,6 +108,9 @@ class HostProfileStore:
 
     def ensure_initialized(self) -> dict[str, Any]:
         if self.path.is_file():
+            profile = self._load()
+            if set(profile["tools"]) != set(SUPPORTED_TOOLS):
+                return self.discover()
             return self.snapshot()
         return self.discover()
 
@@ -317,6 +320,10 @@ class HostProfileStore:
                     (Path(grok_home).expanduser() / "bin" / "grok.exe", "LEGACY_ENVIRONMENT")
                 )
             values.append((self.home / ".grok" / "bin" / "grok.exe", "KNOWN_LOCATION"))
+        elif tool == "claude":
+            values.append(
+                (self.home / ".local" / "bin" / "claude.exe", "KNOWN_LOCATION")
+            )
         elif tool == "python":
             values.append((self.current_python, "CURRENT_PROCESS"))
         names = {
@@ -324,6 +331,7 @@ class HostProfileStore:
             "git": ("git.exe", "git"),
             "codex": ("codex.exe", "codex"),
             "grok": ("grok.exe", "grok"),
+            "claude": ("claude.exe", "claude"),
         }[tool]
         for name in names:
             resolved = self.path_lookup(name)
