@@ -12,6 +12,8 @@ from typing import Any, Callable, Mapping, Protocol, TextIO
 from uuid import uuid4
 
 from host_profile import resolve_host_tool
+from process_identity import launched_process_identity
+from session_supervisor import SessionSupervisorError, SessionSupervisorStore
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -27,6 +29,7 @@ SourceCommitResolver = Callable[[Path], str]
 
 
 class RuntimeProcess(Protocol):
+    pid: int
     stdout: TextIO | None
     stderr: TextIO | None
 
@@ -53,12 +56,14 @@ class UniverseConductorRuntime:
         source_commit_resolver: SourceCommitResolver | None = None,
         process_factory: ProcessFactory = subprocess.Popen,
         startup_timeout: float = 30,
+        session_supervisor: SessionSupervisorStore | None = None,
     ) -> None:
         self.repository_root = repository_root.expanduser().resolve(strict=True)
         self.native_runner = native_runner
         self.source_commit_resolver = source_commit_resolver or self._git_head
         self.process_factory = process_factory
         self.startup_timeout = startup_timeout
+        self.session_supervisor = session_supervisor
         self.runtime_cli = (
             self.repository_root
             / ".ai"
@@ -71,6 +76,10 @@ class UniverseConductorRuntime:
         self._process: RuntimeProcess | None = None
         self._binding: dict[str, Any] | None = None
         self._stderr: deque[str] = deque(maxlen=40)
+        self._supervisor_session_id: str | None = None
+        self._lease_token: str | None = None
+        self._lease_version: int | None = None
+        self._process_identity: dict[str, Any] | None = None
 
     def start(self) -> Mapping[str, Any]:
         if self._binding is not None and self._process is not None:
@@ -185,12 +194,21 @@ class UniverseConductorRuntime:
                 "session_id": session_id,
                 "origin_anchor_ref": anchor_id,
                 "origin_frame_id": frame_id,
+                "runtime_currentness_observation": str(
+                    runtime_state["executable_runtime_currentness"]
+                ),
                 "parent_actor_ref": "universe-conductor",
                 "parent_evidence_ref": host_session_ref,
                 "binding_evidence_ref": (
                     f"process-local://universe/conductor-runtime/{session_id}"
                 ),
             }
+            self._register_process_lease(
+                process=process,
+                command=command,
+                endpoint=endpoint,
+                token=token,
+            )
             return dict(self._binding)
         except Exception:
             self.stop()
@@ -221,16 +239,157 @@ class UniverseConductorRuntime:
 
     def stop(self) -> None:
         process = self._process
+        if process is None or process.poll() is not None:
+            self._process = None
+            self._binding = None
+            self._mark_stale_if_owned("PROCESS_NOT_RUNNING_AT_STOP")
+            return
+        stop_receipt = self._authorize_supervised_stop()
         self._process = None
         self._binding = None
-        if process is None or process.poll() is not None:
-            return
         process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        self._complete_supervised_stop(stop_receipt)
+
+    def reconcile(self) -> str:
+        process = self._process
+        if process is None:
+            return "NOT_STARTED"
+        if process.poll() is None:
+            return "LIVE"
+        self._process = None
+        self._binding = None
+        self._mark_stale_if_owned("PROCESS_EXITED_UNEXPECTEDLY")
+        return "EXITED"
+
+    def continuity_coordinate(self) -> Mapping[str, str] | None:
+        if self._binding is None or self._process is None:
+            return None
+        if self._process.poll() is not None:
+            return None
+        return {
+            "node": "universe",
+            "mode": "CONDUCTOR",
+            "session_id": str(self._binding["session_id"]),
+            "frame_id": str(self._binding["origin_frame_id"]),
+            "anchor_id": str(self._binding["origin_anchor_ref"]),
+            "currentness": str(
+                self._binding["runtime_currentness_observation"]
+            ),
+            "source_ref": (
+                "git-object-database://universe@"
+                + self.source_commit_resolver(self.repository_root)
+            ),
+        }
+
+    def _register_process_lease(
+        self,
+        *,
+        process: RuntimeProcess,
+        command: list[str],
+        endpoint: str,
+        token: str,
+    ) -> None:
+        if self.session_supervisor is None:
+            return
+        sessions = self.session_supervisor.list_sessions(
+            node="CONDUCTOR", mode="CONDUCTOR"
+        )
+        session = next((item for item in sessions if item["is_default"]), None)
+        if session is None:
+            raise UniverseConductorRuntimeError(
+                "SUPERVISOR_CONDUCTOR_SESSION_UNAVAILABLE"
+            )
+        identity = launched_process_identity(
+            process,
+            executable=Path(command[0]),
+            command=command,
+            endpoint=endpoint,
+            handshake_token=token,
+        )
+        existing = session.get("process_lease")
+        expected_version = (
+            0 if existing is None else int(existing.get("lease_version", 0))
+        )
+        acquired = self.session_supervisor.acquire_lease(
+            session["session_id"],
+            identity,
+            expected_lease_version=expected_version,
+        )
+        self._supervisor_session_id = str(session["session_id"])
+        self._lease_token = str(acquired["lease_token"])
+        self._lease_version = int(acquired["lease"]["lease_version"])
+        self._process_identity = identity
+
+    def _authorize_supervised_stop(self) -> Mapping[str, Any] | None:
+        if (
+            self.session_supervisor is None
+            or self._supervisor_session_id is None
+            or self._lease_token is None
+            or self._lease_version is None
+            or self._process_identity is None
+        ):
+            return None
+        try:
+            receipt = self.session_supervisor.authorize_stop(
+                self._supervisor_session_id,
+                self._process_identity,
+                lease_token=self._lease_token,
+                expected_lease_version=self._lease_version,
+            )
+        except SessionSupervisorError:
+            current = self.session_supervisor.get_session(
+                self._supervisor_session_id
+            ).get("process_lease")
+            if isinstance(current, Mapping):
+                self._lease_version = int(current["lease_version"])
+            raise
+        self._lease_version = int(receipt["lease_version"])
+        return receipt
+
+    def _complete_supervised_stop(self, receipt: Mapping[str, Any] | None) -> None:
+        if (
+            receipt is None
+            or self.session_supervisor is None
+            or self._supervisor_session_id is None
+            or self._lease_token is None
+            or self._lease_version is None
+        ):
+            return
+        self.session_supervisor.complete_stop(
+            self._supervisor_session_id,
+            lease_token=self._lease_token,
+            expected_lease_version=self._lease_version,
+        )
+        self._supervisor_session_id = None
+        self._lease_token = None
+        self._lease_version = None
+        self._process_identity = None
+
+    def _mark_stale_if_owned(self, reason: str) -> None:
+        if (
+            self.session_supervisor is None
+            or self._supervisor_session_id is None
+            or self._lease_token is None
+            or self._lease_version is None
+            or self._process_identity is None
+        ):
+            return
+        self.session_supervisor.mark_lease_stale(
+            self._supervisor_session_id,
+            self._process_identity,
+            lease_token=self._lease_token,
+            expected_lease_version=self._lease_version,
+            reason=reason,
+        )
+        self._supervisor_session_id = None
+        self._lease_token = None
+        self._lease_version = None
+        self._process_identity = None
 
     def _read_startup(self, process: RuntimeProcess) -> Mapping[str, Any]:
         if process.stdout is None:

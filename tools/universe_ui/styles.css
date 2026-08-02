@@ -46,7 +46,7 @@
 
 html,
 body {
-  width: 100%;
+  width: calc(100% - 20px);
   height: 100%;
   margin: 0;
   overflow: hidden;
@@ -2662,11 +2662,166 @@ body {
 .session-block { margin-top: auto; }
 .session-card {
   position: relative;
+  width: 100%;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
   margin: 0 10px 8px;
   padding: 12px;
   border: 1px solid rgba(90, 150, 220, 0.16);
-  border-radius: 12px;
+  border-radius: 8px;
   background: rgba(10, 22, 40, 0.75);
+}
+.session-card:hover { border-color: rgba(54, 207, 180, 0.5); }
+
+.session-observatory-dialog {
+  width: min(920px, calc(100vw - 32px));
+  max-height: min(780px, calc(100vh - 32px));
+  overflow: auto;
+}
+
+.session-observatory-toolbar,
+.session-card-heading,
+.session-card-meta,
+.session-card-actions,
+.session-event-row {
+  display: flex;
+  align-items: center;
+}
+
+.session-observatory-toolbar {
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.session-observatory-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.supervisor-session-card {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(5, 14, 28, 0.72);
+}
+
+.supervisor-session-card[data-default="true"] {
+  border-color: rgba(54, 207, 180, 0.62);
+  box-shadow: inset 3px 0 0 var(--teal);
+}
+
+.session-card-heading {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.session-card-heading strong,
+.session-card-meta span,
+.session-event-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-state-pill {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 9px;
+}
+
+.session-state-pill[data-state="LIVE"] { color: var(--teal); }
+.session-state-pill[data-state="UNKNOWN"] { color: #f0b45d; }
+.session-state-pill[data-state="STOPPED"] { color: var(--text-3); }
+
+.session-card-meta {
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  margin-top: 9px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+
+.session-ref-line {
+  margin: 9px 0 0;
+  color: var(--text-2);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.session-alias-input {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.session-card-actions {
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.legacy-executor-section,
+.session-event-section { margin-top: 18px; }
+.section-note {
+  margin: 5px 0 9px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.legacy-executor-list { display: grid; gap: 6px; }
+.legacy-executor-row {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) minmax(70px, auto) minmax(0, 1fr);
+  gap: 7px 12px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--text-3);
+  border-radius: 6px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.legacy-executor-row[data-state="UNKNOWN"] { border-left-color: #f0b45d; }
+.legacy-executor-row[data-state="UNMANAGED"] { border-left-color: #e46f78; }
+.legacy-executor-row[data-state="MANAGED_EXACT"] { border-left-color: var(--teal); }
+.legacy-executor-row code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.legacy-executor-row small { grid-column: 3; color: var(--text-3); }
+.session-event-list { display: grid; gap: 6px; }
+.session-event-row {
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 10px;
+}
+.session-event-row strong { color: var(--text-2); font-size: 10px; }
+.session-event-row time { margin-left: auto; white-space: nowrap; }
+
+@media (max-width: 720px) {
+  .session-observatory-list { grid-template-columns: 1fr; }
+  .session-observatory-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+  }
+  .legacy-executor-row { grid-template-columns: 1fr auto; }
+  .legacy-executor-row code,
+  .legacy-executor-row small { grid-column: 1 / -1; }
 }
 .session-card strong { display: block; font-size: 12px; }
 .session-card small { color: var(--text-3); font-size: 10px; }

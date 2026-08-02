@@ -935,6 +935,7 @@ def _normalize_resume_candidate(request: Mapping[str, Any]) -> dict[str, Any]:
     )
     snapshot = dict(_required_mapping(request.get("snapshot"), "snapshot"))
     _ensure_json(snapshot, "snapshot")
+    _require_resume_recovery_context(snapshot)
     source_refs = _source_refs(request.get("source_refs"))
     source_ref = _optional_text(
         request.get("source_ref", source_refs[0]), "source_ref"
@@ -945,12 +946,12 @@ def _normalize_resume_candidate(request: Mapping[str, Any]) -> dict[str, Any]:
             "source_ref must match the first source_refs entry",
         )
     return {
-        "node": _required_text(request.get("node"), "node"),
-        "mode": _required_text(request.get("mode"), "mode").upper(),
-        "session_id": _required_text(request.get("session_id"), "session_id"),
-        "frame_id": _required_text(request.get("frame_id"), "frame_id"),
-        "anchor_id": _required_text(request.get("anchor_id"), "anchor_id"),
-        "checkpoint_ref": _required_text(
+        "node": _required_known_text(request.get("node"), "node"),
+        "mode": _required_known_text(request.get("mode"), "mode").upper(),
+        "session_id": _required_known_text(request.get("session_id"), "session_id"),
+        "frame_id": _required_known_text(request.get("frame_id"), "frame_id"),
+        "anchor_id": _required_known_text(request.get("anchor_id"), "anchor_id"),
+        "checkpoint_ref": _required_known_text(
             request.get("checkpoint_ref"), "checkpoint_ref"
         ),
         "snapshot": snapshot,
@@ -996,13 +997,15 @@ def _discover_resume(
     _exact_fields(request, {"current", "candidates", "limit"}, "resume request")
     current = _required_mapping(request.get("current"), "current")
     _exact_fields(current, {"node", "mode", "session_id", "frame_id"}, "current")
-    current_node = _required_text(current.get("node"), "current.node")
-    current_mode = _required_text(current.get("mode"), "current.mode").upper()
+    current_node = _required_known_text(current.get("node"), "current.node")
+    current_mode = _required_known_text(current.get("mode"), "current.mode").upper()
     current_coordinate = {
         "node": current_node,
         "mode": current_mode,
-        "session_id": _required_text(current.get("session_id"), "current.session_id"),
-        "frame_id": _required_text(current.get("frame_id"), "current.frame_id"),
+        "session_id": _required_known_text(
+            current.get("session_id"), "current.session_id"
+        ),
+        "frame_id": _required_known_text(current.get("frame_id"), "current.frame_id"),
     }
     limit = _limit(request.get("limit", 20))
     raw_candidates = request.get("candidates")
@@ -1013,14 +1016,19 @@ def _discover_resume(
                 record_type="RESUME",
                 node=current_node,
                 mode=current_mode,
-                limit=limit,
+                limit=100,
             ):
                 loaded = store.load(
                     record_type="RESUME", record_id=summary["record_id"]
                 )
                 if loaded is None:
                     continue
-                candidate = loaded["candidate"]
+                try:
+                    candidate = _normalize_resume_candidate(
+                        _required_mapping(loaded.get("candidate"), "stored resume candidate")
+                    )
+                except ContinuityCommandError:
+                    continue
                 raw_candidates.append(
                     {
                         "candidate_id": loaded["record_id"],
@@ -1035,6 +1043,8 @@ def _discover_resume(
                         "summary": candidate["summary"],
                     }
                 )
+                if len(raw_candidates) >= limit:
+                    break
     if not isinstance(raw_candidates, list):
         raise ContinuityCommandError(
             "CONTINUITY_REQUEST_INVALID", "candidates must be an array"
@@ -1060,12 +1070,12 @@ def _discover_resume(
         )
         normalized = {
             "candidate_id": _required_text(candidate.get("candidate_id"), f"candidates[{index}].candidate_id"),
-            "node": _required_text(candidate.get("node"), f"candidates[{index}].node"),
-            "mode": _required_text(candidate.get("mode"), f"candidates[{index}].mode"),
-            "session_id": _required_text(candidate.get("session_id"), f"candidates[{index}].session_id"),
-            "frame_id": _required_text(candidate.get("frame_id"), f"candidates[{index}].frame_id"),
-            "anchor_id": _required_text(candidate.get("anchor_id"), f"candidates[{index}].anchor_id"),
-            "checkpoint_ref": _required_text(candidate.get("checkpoint_ref"), f"candidates[{index}].checkpoint_ref"),
+            "node": _required_known_text(candidate.get("node"), f"candidates[{index}].node"),
+            "mode": _required_known_text(candidate.get("mode"), f"candidates[{index}].mode").upper(),
+            "session_id": _required_known_text(candidate.get("session_id"), f"candidates[{index}].session_id"),
+            "frame_id": _required_known_text(candidate.get("frame_id"), f"candidates[{index}].frame_id"),
+            "anchor_id": _required_known_text(candidate.get("anchor_id"), f"candidates[{index}].anchor_id"),
+            "checkpoint_ref": _required_known_text(candidate.get("checkpoint_ref"), f"candidates[{index}].checkpoint_ref"),
             "updated_at": _timestamp(candidate.get("updated_at"), f"candidates[{index}].updated_at"),
             "source_ref": _required_text(candidate.get("source_ref"), f"candidates[{index}].source_ref"),
             "summary": _optional_text(candidate.get("summary", ""), f"candidates[{index}].summary"),
@@ -1095,6 +1105,13 @@ def _load_resume(
     record = (
         None if store is None else store.load(record_type="RESUME", record_id=resume_id)
     )
+    if record is not None:
+        try:
+            _normalize_resume_candidate(
+                _required_mapping(record.get("candidate"), "stored resume candidate")
+            )
+        except ContinuityCommandError:
+            record = None
     return {
         "status": (
             "REHYDRATION_CANDIDATE_LOADED"
@@ -1447,6 +1464,27 @@ def _required_text(
     if not isinstance(value, str) or not value.strip():
         raise ContinuityCommandError(error_code, f"{context} must be a non-empty string")
     return value.strip()
+
+
+def _required_known_text(
+    value: Any,
+    context: str,
+    *,
+    error_code: str = "CONTINUITY_REQUEST_INVALID",
+) -> str:
+    text = _required_text(value, context, error_code=error_code)
+    if text.upper() == "UNKNOWN":
+        raise ContinuityCommandError(error_code, f"{context} must not be UNKNOWN")
+    return text
+
+
+def _require_resume_recovery_context(snapshot: Mapping[str, Any]) -> None:
+    compressed_context = snapshot.get("compressed_context")
+    if not isinstance(compressed_context, str) or not compressed_context.strip():
+        raise ContinuityCommandError(
+            "CONTINUITY_REQUEST_INVALID",
+            "snapshot.compressed_context must be a non-empty string",
+        )
 
 
 def _optional_text(value: Any, context: str) -> str:

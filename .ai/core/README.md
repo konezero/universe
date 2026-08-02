@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: ba4eb5812784c735dcbc8aed6cdb033957c2403e
+Source Commit: 6f724c269ff45c6e75977577c6dba135abbb06ae
 
 ## Entry
 

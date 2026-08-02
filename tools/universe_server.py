@@ -12,6 +12,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -26,12 +27,16 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from core_release import CoreReleaseError, verify_release
+from continuity_coordinator import (
+    ProjectContinuityCoordinator,
+    RuntimeContinuityBackend,
+)
 from agent_session_gateway import (
     PERMISSION_DECISION_SCHEMA,
     PERMISSION_REQUEST_SCHEMA,
@@ -39,7 +44,12 @@ from agent_session_gateway import (
     normalize_permission_request,
 )
 from host_profile import HostProfileError, HostProfileStore
+from legacy_executor_classifier import (
+    classify_inventory,
+    collect_windows_session_boot_executors,
+)
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
+from session_supervisor import SessionSupervisorError, SessionSupervisorStore
 from universe_dispatch import (
     DispatchError,
     HttpProjectMasterBridge,
@@ -79,7 +89,6 @@ from universe_memory import (
     MEMORY_SCHEMA,
     MemoryError,
     filter_llm_proposals,
-    merge_proposals,
     normalize_memory_create,
     normalize_memory_link,
     normalize_memory_maintain,
@@ -1690,6 +1699,7 @@ def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
                 "parent_actor_ref",
                 "parent_evidence_ref",
                 "binding_evidence_ref",
+                "runtime_currentness_observation",
             }
         ),
     )
@@ -1709,6 +1719,15 @@ def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
         raise UniverseError(
             "PLANNING_RUNTIME_ENDPOINT_INVALID",
             "Planning Runtime endpoint must be loopback HTTP",
+        )
+    currentness = _required_text(
+        binding["runtime_currentness_observation"],
+        "planning_runtime_binding.runtime_currentness_observation",
+    ).upper()
+    if currentness not in {"CURRENT", "STALE", "UNKNOWN"}:
+        raise UniverseError(
+            "PLANNING_RUNTIME_CURRENTNESS_INVALID",
+            "Planning Runtime currentness observation is unsupported",
         )
     return {
         "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
@@ -1737,6 +1756,7 @@ def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
             binding["binding_evidence_ref"],
             "planning_runtime_binding.binding_evidence_ref",
         ),
+        "runtime_currentness_observation": currentness,
     }
 
 
@@ -9997,12 +10017,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         host_profile: HostProfileStore | None = None,
     ):
         self.store = store
+        self.session_supervisor = SessionSupervisorStore(store.database_path)
         self.token = token
         self.host_profile = host_profile or HostProfileStore()
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
+        python_tool = self.host_profile.resolve("python")
+        self.continuity_coordinator = (
+            ProjectContinuityCoordinator(
+                store.database_path,
+                RuntimeContinuityBackend(python_tool.executable),
+            )
+            if python_tool is not None
+            else None
+        )
         self.runtime_host = runtime_host or UniverseRuntimeHost(
             Path(__file__).resolve().parents[1]
         )
@@ -10020,25 +10050,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_session_error: dict[str, str] | None = None
         self.project_room_events = ProjectRoomEventHub()
         super().__init__(address, UniverseRequestHandler)
-        self.conductor_runtime: UniverseConductorRuntime | None = None
-        if auto_start_conductor_runtime:
-            factory = conductor_runtime_factory or UniverseConductorRuntime
-            try:
-                self.conductor_runtime = factory(Path(__file__).resolve().parents[1])
-                self._planning_binding = normalize_planning_runtime_binding(
-                    self.conductor_runtime.start()
-                )
-                self._planning_binding["bound_at"] = utc_now()
-            except (OSError, UniverseConductorRuntimeError, UniverseError) as error:
-                self.conductor_runtime = None
-                self._planning_binding_error = {
-                    "error_code": getattr(
-                        error,
-                        "code",
-                        str(error) or type(error).__name__,
-                    ),
-                    "reason": f"{type(error).__name__}: {error}",
-                }
         self.conductor_session_host = (
             ResidentModeSessionHost(
                 Path(__file__).resolve().parents[1],
@@ -10046,11 +10057,54 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "CONDUCTOR",
                 self.store.database_path.parent / "conductor-mode-session.sqlite",
                 actor_label="Universe Conductor",
+                session_supervisor=self.session_supervisor,
+                continuity_coordinator=self.continuity_coordinator,
+                coordinate_resolver=self._conductor_continuity_coordinate,
                 provider_factory=conductor_session_provider_factory,
             )
             if auto_start_conductor_runtime
             else None
         )
+        if self.conductor_session_host is not None:
+            self.prepare_conductor_session()
+        self.conductor_runtime: UniverseConductorRuntime | None = None
+        if auto_start_conductor_runtime:
+            try:
+                self.conductor_runtime = (
+                    conductor_runtime_factory(Path(__file__).resolve().parents[1])
+                    if conductor_runtime_factory is not None
+                    else UniverseConductorRuntime(
+                        Path(__file__).resolve().parents[1],
+                        session_supervisor=self.session_supervisor,
+                    )
+                )
+                self._planning_binding = normalize_planning_runtime_binding(
+                    self.conductor_runtime.start()
+                )
+                self._planning_binding["bound_at"] = utc_now()
+            except (
+                OSError,
+                SessionSupervisorError,
+                UniverseConductorRuntimeError,
+                UniverseError,
+            ) as error:
+                cleanup_error = None
+                if self.conductor_runtime is not None:
+                    try:
+                        self.conductor_runtime.stop()
+                    except Exception as stop_error:  # noqa: BLE001 - report both failures
+                        cleanup_error = (
+                            f"; cleanup={type(stop_error).__name__}: {stop_error}"
+                        )
+                self.conductor_runtime = None
+                self._planning_binding_error = {
+                    "error_code": getattr(
+                        error,
+                        "code",
+                        str(error) or type(error).__name__,
+                    ),
+                    "reason": f"{type(error).__name__}: {error}{cleanup_error or ''}",
+                }
         host, port = self.server_address[:2]
         host_text = host.decode("ascii") if isinstance(host, bytes) else host
         self.connection_profile = local_connection_profile(f"http://{host_text}:{port}")
@@ -10059,14 +10113,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ResidentProjectMasterHostManager(
                 universe_endpoint=self.connection_profile.endpoint,
                 bridge_registrar=self.store.register_master_bridge,
+                session_supervisor=self.session_supervisor,
+                continuity_coordinator=self.continuity_coordinator,
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
             )
             if auto_start_project_masters
             else None
         )
-        if self.conductor_session_host is not None:
-            self.prepare_conductor_session()
         self._conductor_worker = threading.Thread(
             target=self._conductor_worker_loop,
             name="universe-conductor-room-worker",
@@ -10082,8 +10136,67 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._maintain_worker.start()
+        self._supervisor_maintenance_stop = threading.Event()
+        self._supervisor_maintenance_last_run: dict[str, Any] | None = None
+        self._supervisor_maintenance_worker = threading.Thread(
+            target=self._supervisor_maintenance_loop,
+            name="universe-session-supervisor-maintenance",
+            daemon=True,
+        )
+        self._supervisor_maintenance_worker.start()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
+
+    def run_supervisor_maintenance_once(
+        self, *, idle_seconds: float = 300.0
+    ) -> dict[str, Any]:
+        results: dict[str, Any] = {
+            "schema": "universe.session-supervisor-maintenance.v1",
+            "status": "OBSERVED",
+            "project_idle_saves": [],
+            "dirty_ends": [],
+        }
+        if self.conductor_session_host is not None:
+            results["conductor_idle_save"] = self.conductor_session_host.save_idle(
+                idle_seconds
+            )
+        if self.project_master_hosts is not None:
+            results["project_idle_saves"] = (
+                self.project_master_hosts.save_idle_sessions(idle_seconds)
+            )
+            results["dirty_ends"] = self.project_master_hosts.reconcile_residents()
+        reconcile_runtime = getattr(self.conductor_runtime, "reconcile", None)
+        if callable(reconcile_runtime):
+            runtime_state = reconcile_runtime()
+            results["conductor_runtime"] = runtime_state
+            if runtime_state == "EXITED" and self.continuity_coordinator is not None:
+                results["conductor_dirty_end"] = (
+                    self.continuity_coordinator.mark_dirty_end(
+                        Path(__file__).resolve().parents[1],
+                        "CONDUCTOR_SESSION_RUNTIME_EXITED",
+                    )
+                )
+        return results
+
+    def _conductor_continuity_coordinate(self) -> Mapping[str, Any] | None:
+        resolver = getattr(self.conductor_runtime, "continuity_coordinate", None)
+        if not callable(resolver):
+            return None
+        return resolver()
+
+    def _supervisor_maintenance_loop(self) -> None:
+        while not self._supervisor_maintenance_stop.wait(30.0):
+            try:
+                self._supervisor_maintenance_last_run = (
+                    self.run_supervisor_maintenance_once()
+                )
+            except Exception as error:  # noqa: BLE001 - preserve worker availability
+                self._supervisor_maintenance_last_run = {
+                    "schema": "universe.session-supervisor-maintenance.v1",
+                    "status": "WORKER_ERROR",
+                    "observed_at": utc_now(),
+                    "error": f"{type(error).__name__}: {error}",
+                }
 
     def bind_planning_runtime(self, value: Any) -> dict[str, Any]:
         binding = normalize_planning_runtime_binding(value)
@@ -10127,6 +10240,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "parent_actor_ref": binding["parent_actor_ref"],
             "parent_evidence_ref": binding["parent_evidence_ref"],
             "binding_evidence_ref": binding["binding_evidence_ref"],
+            "runtime_currentness_observation": binding[
+                "runtime_currentness_observation"
+            ],
         }
         return {
             "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
@@ -10920,7 +11036,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         """In-process maintain batch. interval_hours 0 => idle recheck only."""
 
         while not self._maintain_stop.is_set():
-            settings = self.store.get_service_settings()["memory_maintain"]
+            try:
+                settings = self.store.get_service_settings()["memory_maintain"]
+            except Exception as error:  # noqa: BLE001 - preserve worker boundary
+                if self._maintain_stop.is_set():
+                    return
+                self._maintain_last_run = {
+                    "ran_at": utc_now(),
+                    "status": "WORKER_ERROR",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                if self._maintain_stop.wait(1.0):
+                    return
+                continue
             interval_hours = int(settings.get("interval_hours") or 0)
             if interval_hours <= 0:
                 # Disabled: wake every 30s or on settings change.
@@ -10987,23 +11115,60 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     break
 
     def server_close(self) -> None:
-        if not self._maintain_stop.is_set():
-            self._maintain_stop.set()
-            self._maintain_wake.set()
-            self._maintain_worker.join(timeout=5)
-        if not self._conductor_stop.is_set():
-            self._conductor_stop.set()
-            self._conductor_queue.put(None)
-            self._conductor_worker.join(timeout=5)
+        self._shutdown_errors: list[dict[str, str]] = []
+
+        def close_step(label: str, action: Callable[[], None]) -> None:
+            try:
+                action()
+            except Exception as error:  # noqa: BLE001 - finish remaining cleanup
+                self._shutdown_errors.append(
+                    {
+                        "component": label,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+
+        self._supervisor_maintenance_stop.set()
+        if self._supervisor_maintenance_worker.is_alive():
+            close_step(
+                "supervisor_maintenance_worker",
+                lambda: self._supervisor_maintenance_worker.join(timeout=5),
+            )
+        self._maintain_stop.set()
+        self._maintain_wake.set()
+        if self._maintain_worker.is_alive():
+            close_step(
+                "memory_maintenance_worker",
+                lambda: self._maintain_worker.join(timeout=5),
+            )
+        self._conductor_stop.set()
+        self._conductor_queue.put(None)
+        if self._conductor_worker.is_alive():
+            close_step(
+                "conductor_room_worker",
+                lambda: self._conductor_worker.join(timeout=5),
+            )
         if self.project_master_hosts is not None:
-            self.project_master_hosts.close()
+            close_step("project_master_hosts", self.project_master_hosts.close)
+            self.project_master_hosts = None
         if self.conductor_session_host is not None:
-            self.conductor_session_host.close()
+            close_step("conductor_session_host", self.conductor_session_host.close)
             self.conductor_session_host = None
         if self.conductor_runtime is not None:
-            self.conductor_runtime.stop()
+            close_step("conductor_runtime", self.conductor_runtime.stop)
             self.conductor_runtime = None
-        super().server_close()
+        close_step("http_server", super().server_close)
+        print(
+            json.dumps(
+                {
+                    "schema": "universe.local-service-shutdown.v1",
+                    "status": "UNIVERSE_SERVICE_CLOSED",
+                    "shutdown_errors": self._shutdown_errors,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 class UniverseRequestHandler(BaseHTTPRequestHandler):
@@ -11031,6 +11196,89 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorize():
+            return
+        if path == "/v1/supervisor/sessions":
+            query = parse_qs(urlsplit(self.path).query)
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SUPERVISOR_SESSIONS_COLLECTED",
+                    "sessions": self.server.session_supervisor.list_sessions(
+                        node=query.get("node", [None])[0],
+                        mode=query.get("mode", [None])[0],
+                    ),
+                },
+            )
+            return
+        if path == "/v1/supervisor/events":
+            query = parse_qs(urlsplit(self.path).query)
+            raw_limit = query.get("limit", ["100"])[0]
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": "SESSION_SUPERVISOR_REQUEST_INVALID",
+                        "detail": "limit must be an integer",
+                    },
+                )
+                return
+            try:
+                events = self.server.session_supervisor.list_events(
+                    session_id=query.get("session_id", [None])[0],
+                    limit=limit,
+                )
+            except SessionSupervisorError as error:
+                self._send_supervisor_error(error)
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SUPERVISOR_EVENTS_COLLECTED",
+                    "events": events,
+                },
+            )
+            return
+        if path == "/v1/supervisor/legacy-executors":
+            inventory = collect_windows_session_boot_executors()
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": inventory["status"],
+                    "reason": inventory.get("reason"),
+                    "executors": classify_inventory(
+                        inventory.get("observations", []),
+                        self.server.session_supervisor.list_sessions(),
+                    ),
+                    "destructive_action_performed": False,
+                },
+            )
+            return
+        supervisor_session_match = re.fullmatch(
+            r"/v1/supervisor/sessions/([^/]+)", path
+        )
+        if supervisor_session_match is not None:
+            try:
+                session = self.server.session_supervisor.get_session(
+                    unquote(supervisor_session_match.group(1))
+                )
+            except SessionSupervisorError as error:
+                self._send_supervisor_error(error)
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SUPERVISOR_SESSION_COLLECTED",
+                    "session": session,
+                },
+            )
             return
         if path == "/v1/runtime/providers":
             self._send(
@@ -11524,8 +11772,116 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        if path == "/v1/service/shutdown" and not self._authorize_service_control():
+            return
+        privileged_supervisor_match = re.fullmatch(
+            r"/v1/supervisor/sessions/[^/]+/"
+            r"(bind|lease|reconcile|stop-authorization|recover-absent)",
+            path,
+        )
+        if (
+            path == "/v1/supervisor/sessions"
+            or privileged_supervisor_match is not None
+        ) and not self._authorize_supervisor_control():
+            return
         try:
             body = self._read_json()
+            if path == "/v1/service/shutdown":
+                self._send(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SERVICE_SHUTDOWN_ACCEPTED",
+                    },
+                )
+                threading.Thread(
+                    target=self.server.shutdown,
+                    name="universe-service-shutdown",
+                    daemon=True,
+                ).start()
+                return
+            if path == "/v1/supervisor/sessions":
+                session, created = self.server.session_supervisor.register_session(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "SUPERVISOR_SESSION_REGISTERED"
+                            if created
+                            else "SUPERVISOR_SESSION_ALREADY_REGISTERED"
+                        ),
+                        "session": session,
+                    },
+                )
+                return
+            supervisor_operation_match = re.fullmatch(
+                r"/v1/supervisor/sessions/([^/]+)/"
+                r"(alias|bind|lease|default|reconcile|stop-authorization|recover-absent)",
+                path,
+            )
+            if supervisor_operation_match is not None:
+                session_id = unquote(supervisor_operation_match.group(1))
+                operation = supervisor_operation_match.group(2)
+                if not isinstance(body, Mapping):
+                    raise SessionSupervisorError(
+                        "SESSION_SUPERVISOR_REQUEST_INVALID",
+                        "request body must be an object",
+                    )
+                if operation == "alias":
+                    result = self.server.session_supervisor.update_alias(
+                        session_id,
+                        alias=body.get("alias"),
+                        expected_version=body.get("expected_version"),
+                    )
+                elif operation == "bind":
+                    result = self.server.session_supervisor.bind_provider_session(
+                        session_id,
+                        provider=body.get("provider"),
+                        provider_session_ref=body.get("provider_session_ref"),
+                        expected_version=body.get("expected_version"),
+                    )
+                elif operation == "lease":
+                    result = self.server.session_supervisor.acquire_lease(
+                        session_id,
+                        body.get("process_identity"),
+                        expected_lease_version=body.get("expected_lease_version", 0),
+                    )
+                elif operation == "default":
+                    result = self.server.session_supervisor.set_default(
+                        session_id,
+                        expected_pointer_version=body.get("expected_pointer_version"),
+                    )
+                elif operation == "reconcile":
+                    result = self.server.session_supervisor.reconcile(
+                        session_id,
+                        body.get("process_identity"),
+                        expected_lease_version=body.get("expected_lease_version"),
+                    )
+                elif operation == "recover-absent":
+                    supervisor = self.server.session_supervisor
+                    result = supervisor.recover_unknown_lease_if_process_absent(
+                        session_id,
+                        expected_lease_version=body.get("expected_lease_version"),
+                        operator_evidence_ref=body.get("operator_evidence_ref"),
+                    )
+                else:
+                    result = self.server.session_supervisor.authorize_stop(
+                        session_id,
+                        body.get("process_identity"),
+                        lease_token=body.get("lease_token"),
+                        expected_lease_version=body.get("expected_lease_version"),
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SUPERVISOR_OPERATION_COMPLETED",
+                        "operation": operation.upper().replace("-", "_"),
+                        "result": result,
+                    },
+                )
+                return
             if path == "/v1/settings/service":
                 settings = self.server.store.set_service_settings(body)
                 self.server.notify_maintain_settings_changed()
@@ -12487,6 +12843,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
             self._not_found()
+        except SessionSupervisorError as error:
+            self._send_supervisor_error(error)
         except UniverseError as error:
             self._send_error(error)
         except (OSError, sqlite3.Error) as error:
@@ -12581,6 +12939,31 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             },
         )
         return False
+
+    def _authorize_service_control(self) -> bool:
+        return self._authorize_control_token("SERVICE_CONTROL_TOKEN_REQUIRED")
+
+    def _authorize_supervisor_control(self) -> bool:
+        return self._authorize_control_token("SUPERVISOR_CONTROL_TOKEN_REQUIRED")
+
+    def _authorize_control_token(self, error_code: str) -> bool:
+        authorization = self.headers.get("Authorization") or ""
+        scheme, separator, candidate = authorization.partition(" ")
+        if (
+            not separator
+            or scheme.lower() != "bearer"
+            or not hmac.compare_digest(candidate, self.server.token)
+        ):
+            self._send(
+                HTTPStatus.UNAUTHORIZED,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "UNAUTHORIZED",
+                    "error_code": error_code,
+                },
+            )
+            return False
+        return True
 
     def _read_json(self) -> Any:
         try:
@@ -12737,6 +13120,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _send_error(self, error: UniverseError) -> None:
+        self._send(
+            error.status,
+            {
+                "schema": API_SCHEMA,
+                "status": "ERROR",
+                "error_code": error.code,
+                "detail": error.detail,
+            },
+        )
+
+    def _send_supervisor_error(self, error: SessionSupervisorError) -> None:
         self._send(
             error.status,
             {
@@ -13322,8 +13716,14 @@ def main() -> int:
                         "TRAY_SCRIPT_UNAVAILABLE",
                         f"missing tray script: {tray_script}",
                     )
+                powershell = shutil.which("powershell.exe")
+                if powershell is None:
+                    raise UniverseError(
+                        "TRAY_HOST_UNAVAILABLE",
+                        "powershell.exe was not found",
+                    )
                 tray_args = [
-                    "powershell",
+                    powershell,
                     "-NoProfile",
                     "-ExecutionPolicy",
                     "Bypass",
@@ -13340,7 +13740,8 @@ def main() -> int:
                 creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
                     subprocess, "CREATE_NEW_PROCESS_GROUP", 0
                 )
-                process = subprocess.Popen(
+                # PowerShell is resolved to an absolute path; all arguments are fixed.
+                process = subprocess.Popen(  # nosec B603
                     tray_args,
                     cwd=str(Path(__file__).resolve().parents[1]),
                     stdin=subprocess.DEVNULL,
@@ -13435,6 +13836,12 @@ def main() -> int:
                 server.serve_forever(poll_interval=0.2)
             finally:
                 server.server_close()
+                try:
+                    state = load_server_state(args.state_file)
+                except UniverseError:
+                    state = {}
+                if state.get("pid") == os.getpid():
+                    args.state_file.expanduser().unlink(missing_ok=True)
             return 0
 
         if args.command == "prepare-skill-observation-archive":

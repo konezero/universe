@@ -60,11 +60,11 @@
 
       <div class="rail-block session-block">
         <div class="section-heading rail-subhead"><span>Session</span></div>
-        <div class="session-card">
+        <button id="session-observatory-button" class="session-card" type="button" title="Open session observatory">
           <strong>Universe Conductor</strong>
           <small id="session-provider-line">Provider · AUTO</small>
           <span class="session-dot" data-state="ready"></span>
-        </div>
+        </button>
         <small class="network-latency" id="network-latency">Network · local loopback</small>
       </div>
     </aside>
@@ -315,6 +315,31 @@
         <button type="submit" class="primary-button">Save</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Local Supervisor</span>
+        <h2>Session Observatory</h2>
+        <p>Persistent Mode sessions known to this Universe instance.</p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div class="session-observatory-toolbar">
+      <span id="session-observatory-summary">Loading sessions…</span>
+      <button id="refresh-sessions-button" class="secondary-button" type="button">Refresh</button>
+    </div>
+    <div id="session-observatory-list" class="session-observatory-list"></div>
+    <section class="legacy-executor-section">
+      <div class="section-heading"><span>Legacy executors</span></div>
+      <p class="section-note">Observed only. Partial identity never permits adoption or stop.</p>
+      <div id="legacy-executor-list" class="legacy-executor-list"></div>
+    </section>
+    <section class="session-event-section">
+      <div class="section-heading"><span>Recent Supervisor events</span></div>
+      <div id="session-event-list" class="session-event-list"></div>
+    </section>
   </dialog>
 
   <dialog id="fresh-project-dialog" class="wide-dialog wizard-dialog">

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import hashlib
 import json
 import sys
 import tempfile
@@ -16,11 +17,13 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_conductor_runtime import (  # noqa: E402
     UniverseConductorRuntime,
 )
+from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
 from windows_native_cli import NativeCliResult  # noqa: E402
 
 
 class FakeProcess:
     def __init__(self, startup: dict[str, Any]) -> None:
+        self.pid = 4242
         self.stdout = StringIO(json.dumps(startup) + "\n")
         self.stderr = StringIO("")
         self.return_code: int | None = None
@@ -128,15 +131,52 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 native_runner=native_runner,
                 source_commit_resolver=lambda _: "a" * 40,
                 process_factory=process_factory,
+                session_supervisor=(
+                    supervisor := SessionSupervisorStore(
+                        root / "universe.sqlite3",
+                        process_observer=lambda pid, created: {
+                            "status": "PROCESS_PRESENT_EXACT",
+                            "pid": pid,
+                            "process_created_at": created,
+                        },
+                    )
+                ),
+            )
+            session, _ = supervisor.register_session(
+                {
+                    "session_id": "conductor-session",
+                    "node": "CONDUCTOR",
+                    "mode": "CONDUCTOR",
+                    "provider": "CODEX",
+                    "provider_session_ref": "codex-session",
+                }
+            )
+            supervisor.set_default(
+                session["session_id"], expected_pointer_version=0
             )
             with patch(
                 "universe_conductor_runtime._required_host_executable",
                 return_value=Path(sys.executable),
+            ), patch(
+                "universe_conductor_runtime.launched_process_identity",
+                side_effect=lambda _process, **values: {
+                    "pid": 4242,
+                    "process_created_at": "2026-08-02T12:00:00Z",
+                    "executable": str(values["executable"].resolve()),
+                    "command": values["command"],
+                    "endpoint": values["endpoint"],
+                    "handshake_fingerprint": hashlib.sha256(
+                        values["handshake_token"].encode("utf-8")
+                    ).hexdigest(),
+                },
             ):
                 binding = runtime.start()
                 observed = runtime.observe("message-001")
 
             self.assertEqual("UNIVERSE-CURRENT-001", binding["origin_anchor_ref"])
+            self.assertEqual(
+                "CURRENT", binding["runtime_currentness_observation"]
+            )
             self.assertEqual("http://127.0.0.1:41991", binding["endpoint"])
             self.assertEqual("COMMANDER_INPUT_OBSERVED", observed["status"])
             self.assertEqual("CONDUCTOR", requests[0]["mode"])
@@ -144,12 +184,82 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
             self.assertIn("session-boot", process.command)
             self.assertEqual(
+                "OWNED",
+                supervisor.get_session("conductor-session")["process_lease"][
+                    "lease_state"
+                ],
+            )
+            self.assertEqual(
                 "UNIVERSE_UI",
                 process.command[process.command.index("--commander-surface") + 1],
+            )
+            coordinate = runtime.continuity_coordinate()
+            self.assertIsNotNone(coordinate)
+            self.assertEqual(binding["session_id"], coordinate["session_id"])
+            self.assertEqual("CONDUCTOR", coordinate["mode"])
+            self.assertEqual(
+                binding["runtime_currentness_observation"],
+                coordinate["currentness"],
             )
 
             runtime.stop()
             self.assertEqual(0, process.return_code)
+            self.assertEqual(
+                "STOPPED", supervisor.get_session("conductor-session")["state"]
+            )
+
+    def test_stop_denial_retains_process_and_refreshes_lease_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+            runtime_cli.parent.mkdir(parents=True)
+            runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
+
+            class DenyingSupervisor:
+                @staticmethod
+                def authorize_stop(*_args, **_kwargs):
+                    raise SessionSupervisorError(
+                        "STOP_AUTHORIZATION_DENIED", "identity mismatch"
+                    )
+
+                @staticmethod
+                def get_session(_session_id):
+                    return {"process_lease": {"lease_version": 7}}
+
+            runtime = UniverseConductorRuntime(
+                root,
+                source_commit_resolver=lambda _: "a" * 40,
+                session_supervisor=DenyingSupervisor(),
+            )
+            process = FakeProcess({})
+            runtime._process = process
+            runtime._binding = {
+                "session_id": "runtime-session",
+                "origin_frame_id": "conductor",
+                "origin_anchor_ref": "anchor",
+                "runtime_currentness_observation": "CURRENT",
+            }
+            runtime._supervisor_session_id = "supervisor-session"
+            runtime._lease_token = "lease-token"
+            runtime._lease_version = 6
+            runtime._process_identity = {
+                "pid": 4242,
+                "process_created_at": "2026-08-02T12:00:00Z",
+                "executable": "python.exe",
+                "command": ["python.exe"],
+                "endpoint": "http://127.0.0.1:51702",
+                "handshake_fingerprint": "a" * 64,
+            }
+
+            with self.assertRaisesRegex(
+                SessionSupervisorError, "identity mismatch"
+            ):
+                runtime.stop()
+
+            self.assertIs(runtime._process, process)
+            self.assertIsNotNone(runtime._binding)
+            self.assertIsNone(process.return_code)
+            self.assertEqual(7, runtime._lease_version)
 
 
 if __name__ == "__main__":

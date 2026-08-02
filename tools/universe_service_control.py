@@ -5,16 +5,19 @@ Packaging entry points use these helpers. They do not create project authority.
 
 from __future__ import annotations
 
+import ctypes
+import ipaddress
 import json
 import os
-import signal
-import subprocess
+# Subprocess starts only the fixed Universe server entry with sys.executable.
+import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SCRIPT = Path(__file__).resolve().with_name("universe_server.py")
@@ -35,6 +38,32 @@ def default_state_path() -> Path:
     if override:
         return Path(override).expanduser()
     return default_data_dir() / "server.json"
+
+
+def _is_loopback_http_origin(endpoint: str) -> bool:
+    try:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "http"
+        or host is None
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def default_database_path() -> Path:
@@ -79,14 +108,31 @@ def pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint32,
+        )
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
         try:
-            # OpenProcess would be ideal; os.kill(pid, 0) works for same-user PIDs on Windows Python.
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-        except SystemError:
-            return False
+            exit_code = ctypes.c_uint32()
+            if not kernel32.GetExitCodeProcess(
+                ctypes.c_void_p(handle), ctypes.byref(exit_code)
+            ):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
     try:
         os.kill(pid, 0)
         return True
@@ -99,14 +145,46 @@ def pid_is_running(pid: int) -> bool:
 
 
 def probe_health(endpoint: str, *, timeout: float = 2.0) -> dict[str, Any] | None:
-    if not endpoint:
+    if not endpoint or not _is_loopback_http_origin(endpoint):
         return None
     try:
-        with urlopen(endpoint.rstrip("/") + "/health", timeout=timeout) as response:
+        # The endpoint is a validated loopback HTTP origin.
+        with urlopen(  # nosec B310
+            endpoint.rstrip("/") + "/health", timeout=timeout
+        ) as response:
             raw = response.read().decode("utf-8")
             payload = json.loads(raw) if raw else {}
             return payload if isinstance(payload, dict) else None
     except (URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def request_graceful_shutdown(
+    endpoint: str,
+    token: str,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any] | None:
+    if not endpoint or not token or not _is_loopback_http_origin(endpoint):
+        return None
+    request = Request(
+        endpoint.rstrip("/") + "/v1/service/shutdown",
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        # The request URL uses the validated loopback origin.
+        with urlopen(  # nosec B310
+            request, timeout=timeout
+        ) as response:
+            raw = response.read().decode("utf-8")
+            value = json.loads(raw) if raw else {}
+            return value if isinstance(value, dict) else None
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
         return None
 
 
@@ -158,6 +236,7 @@ def stop_service(
 ) -> dict[str, Any]:
     path = (state_path or default_state_path()).expanduser()
     before = service_status(path)
+    state = load_state(path)
     pid = before.get("pid")
     if not before.get("pid_running") or not pid:
         return {
@@ -167,22 +246,16 @@ def stop_service(
             "previous": before,
         }
     pid_int = int(pid)
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(pid_int), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        else:
-            os.kill(pid_int, signal.SIGTERM)
-    except OSError as error:
+    endpoint = str((state or {}).get("endpoint") or "")
+    token = str((state or {}).get("token") or "")
+    receipt = request_graceful_shutdown(endpoint, token)
+    if receipt is None or receipt.get("status") != "SERVICE_SHUTDOWN_ACCEPTED":
         return {
             "schema": "universe.local-service-control.v1",
             "status": "STOP_FAILED",
             "state_file": str(path),
-            "error": str(error),
+            "error": "AUTHENTICATED_GRACEFUL_SHUTDOWN_UNAVAILABLE",
+            "destructive_fallback_performed": False,
             "previous": before,
         }
     deadline = time.time() + timeout_seconds
@@ -197,6 +270,8 @@ def stop_service(
         "state_file": str(path),
         "previous": before,
         "current": after,
+        "shutdown_receipt": receipt,
+        "destructive_fallback_performed": False,
     }
 
 
@@ -250,7 +325,8 @@ def start_service(
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
-    process = subprocess.Popen(
+    # sys.executable and SERVER_SCRIPT are fixed local executable paths.
+    process = subprocess.Popen(  # nosec B603
         args,
         cwd=str(workdir),
         stdout=stdout,

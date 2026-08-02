@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -36,6 +37,7 @@ from project_master_host import (  # noqa: E402
     ResidentProjectMasterHostManager,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
+from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
 
 
 def _digest(value: object) -> str:
@@ -176,6 +178,21 @@ class PreparedFakeProvider(FakeProvider):
         self.closed = True
 
 
+class FakeContinuityCoordinator:
+    def __init__(self) -> None:
+        self.saves: list[dict[str, Any]] = []
+        self.dirty_ends: list[dict[str, Any]] = []
+
+    def save(self, **values) -> Mapping[str, Any]:
+        self.saves.append(dict(values))
+        return {"status": "AUTO_CONTINUITY_SAVED"}
+
+    def mark_dirty_end(self, project_root: Path, reason: str) -> Mapping[str, Any]:
+        value = {"project_root": project_root, "reason": reason}
+        self.dirty_ends.append(value)
+        return {"status": "DIRTY_END", **value}
+
+
 class FakeAgentGateway:
     def __init__(self, answer: str) -> None:
         self.answer = answer
@@ -288,6 +305,61 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertIsNone(self.state.session_ref_for("GROK"))
         self.assertEqual("codex-session-1", self.state.session_ref_for("CODEX"))
+
+    def test_provider_sessions_move_to_neutral_supervisor_default(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "universe.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        self.assertEqual("NEW", state.observe_provider_session("GROK", "grok-1"))
+        self.assertEqual(
+            "REPLACED", state.observe_provider_session("CODEX", "codex-1")
+        )
+        sessions = supervisor.list_sessions(node="GCS", mode="MASTER")
+        self.assertEqual(2, len(sessions))
+        self.assertEqual(
+            ["CODEX"], [item["provider"] for item in sessions if item["is_default"]]
+        )
+        self.assertEqual("codex-1", state.session_ref_for("CODEX"))
+        self.assertIsNone(state.session_ref_for("GROK"))
+
+    def test_legacy_provider_coordinate_is_migrated_without_deletion(self) -> None:
+        database = self.root / "legacy-state.sqlite"
+        legacy = ProjectMasterSessionStore(database, "GCS")
+        with legacy._connection() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO host_metadata(key, value) VALUES(?, ?)",
+                ("provider_session_id:CLAUDE", "claude-legacy"),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO host_metadata(key, value) VALUES(?, ?)",
+                ("provider_session_initialized:CLAUDE", "true"),
+            )
+        supervisor = SessionSupervisorStore(self.root / "universe.sqlite3")
+        migrated = ProjectMasterSessionStore(
+            database,
+            "GCS",
+            session_supervisor=supervisor,
+        )
+        self.assertEqual(
+            {"provider": "CLAUDE", "session_ref": "claude-legacy"},
+            migrated.last_provider_session(),
+        )
+        connection = sqlite3.connect(database)
+        try:
+            keys = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT key FROM host_metadata WHERE key LIKE 'provider_session_%'"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertIn("provider_session_id:CLAUDE", keys)
+        self.assertIn("provider_session_initialized:CLAUDE", keys)
 
     def test_project_master_greets_only_new_provider_session(self) -> None:
         prompts: list[str] = []
@@ -430,6 +502,59 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(["CONDUCTOR", "CONDUCTOR"], [item[1] for item in created])
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
+
+    def test_resident_mode_session_saves_idle_and_preserves_provider_on_close(
+        self,
+    ) -> None:
+        continuity = FakeContinuityCoordinator()
+
+        def factory(provider, _root, _target, _store, _mode, _actor):
+            instance = PreparedFakeProvider()
+            instance.session_ref = f"{provider.lower()}:session"
+            return instance
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-continuity.sqlite",
+            actor_label="Universe Conductor",
+            continuity_coordinator=continuity,
+            provider_factory=factory,
+        )
+        host.reply("GROK", self._envelope()["message"])
+        host.save_idle(0)
+        host.close()
+
+        self.assertEqual(["IDLE", "NORMAL_STOP"], [item["trigger"] for item in continuity.saves])
+        closing = json.loads(continuity.saves[-1]["compressed_context"])
+        self.assertEqual("GROK", closing["provider"])
+
+    def test_resident_mode_session_records_dirty_end_when_provider_reply_fails(
+        self,
+    ) -> None:
+        continuity = FakeContinuityCoordinator()
+
+        class FailingProvider(PreparedFakeProvider):
+            def reply(self, message: Mapping[str, Any]) -> str:
+                raise ProjectMasterHostError("PROVIDER_DIED")
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-failure.sqlite",
+            actor_label="Universe Conductor",
+            continuity_coordinator=continuity,
+            provider_factory=lambda *_args: FailingProvider(),
+        )
+        try:
+            with self.assertRaisesRegex(ProjectMasterHostError, "PROVIDER_DIED"):
+                host.reply("GROK", self._envelope()["message"])
+        finally:
+            host.close()
+        self.assertEqual(1, len(continuity.dirty_ends))
+        self.assertIn("GROK_REPLY_FAILED", continuity.dirty_ends[0]["reason"])
 
     def test_resident_mode_session_restores_last_coordinate_after_restart(self) -> None:
         serial = {"value": 0}
@@ -874,6 +999,75 @@ class ProjectMasterHostTests(unittest.TestCase):
             f"universe://project-room/messages/{self._message_id()}",
             requests[1]["evidence_ref"],
         )
+
+    def test_project_stop_denial_retains_process_and_refreshes_lease_version(
+        self,
+    ) -> None:
+        runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+
+        class RunningProcess:
+            return_code: int | None = None
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                self.return_code = 0
+
+            def wait(self, timeout=None):
+                del timeout
+                return 0
+
+            def kill(self):
+                self.return_code = -9
+
+        class DenyingSupervisor:
+            @staticmethod
+            def authorize_stop(*_args, **_kwargs):
+                raise SessionSupervisorError(
+                    "STOP_AUTHORIZATION_DENIED", "identity mismatch"
+                )
+
+            @staticmethod
+            def get_session(_session_id):
+                return {"process_lease": {"lease_version": 9}}
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "provider-session",
+            source_commit_resolver=lambda _root: "a" * 40,
+            session_supervisor=DenyingSupervisor(),
+        )
+        process = RunningProcess()
+        coordinator._runtime_process = process
+        coordinator._runtime_binding = {
+            "session_id": "project-session",
+            "frame_id": "master",
+            "anchor_id": "anchor",
+            "runtime_currentness_observation": "CURRENT",
+        }
+        coordinator._supervisor_session_id = "supervisor-session"
+        coordinator._lease_token = "lease-token"
+        coordinator._lease_version = 8
+        coordinator._process_identity = {
+            "pid": 4242,
+            "process_created_at": "2026-08-02T12:00:00Z",
+            "executable": "python.exe",
+            "command": ["python.exe"],
+            "endpoint": "http://127.0.0.1:51702",
+            "handshake_fingerprint": "a" * 64,
+        }
+
+        with self.assertRaisesRegex(SessionSupervisorError, "identity mismatch"):
+            coordinator.close()
+
+        self.assertIs(coordinator._runtime_process, process)
+        self.assertIsNotNone(coordinator._runtime_binding)
+        self.assertIsNone(process.return_code)
+        self.assertEqual(9, coordinator._lease_version)
 
     def test_resident_manager_starts_one_host_per_project(self) -> None:
         registrations: list[dict[str, Any]] = []

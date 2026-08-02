@@ -42,6 +42,7 @@ from universe_server import (  # noqa: E402
     interface_profile,
     local_connection_profile,
     normalize_conductor_ui_action,
+    normalize_planning_runtime_binding,
     provider_ref_from_model_ref,
     publish_skill_observation,
     prepare_skill_observation_archive,
@@ -662,6 +663,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="project-provider-settings"', body)
             self.assertIn('id="host-tool-settings"', body)
             self.assertIn('id="discover-host-tools-button"', body)
+            self.assertIn('id="session-observatory-dialog"', body)
+            self.assertIn('id="session-observatory-list"', body)
+            self.assertIn('id="legacy-executor-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
@@ -685,6 +689,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/master-session/prepare", script)
             self.assertIn('state.modeContract?.mode === "CONDUCTOR"', script)
             self.assertIn("sessionConnectionText", script)
+            self.assertIn("/v1/supervisor/sessions", script)
+            self.assertIn("refreshSupervisorSessions", script)
+            self.assertIn("/v1/supervisor/legacy-executors", script)
             self.assertNotIn(self.token, script)
 
     def test_conductor_fresh_project_draft_is_partial_and_review_only(self) -> None:
@@ -829,6 +836,251 @@ class UniverseLocalServiceTests(unittest.TestCase):
             reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
         )
 
+    def test_supervisor_session_registry_and_reconcile_api(self) -> None:
+        status, registered = self.request(
+            "POST",
+            "/v1/supervisor/sessions",
+            {
+                "session_id": "session-gcs-master",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "provider-session-1",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual(
+            "PERSISTENT_MODE_SESSION", registered["session"]["session_kind"]
+        )
+
+        status, defaulted = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-gcs-master/default",
+            {"expected_pointer_version": 0},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, defaulted["result"]["pointer_version"])
+
+        identity = {
+            "pid": 4242,
+            "process_created_at": "2026-08-02T12:00:00Z",
+            "executable": "C:\\Tools\\codex.exe",
+            "command": ["C:\\Tools\\codex.exe", "resume", "provider-session-1"],
+            "endpoint": "http://127.0.0.1:51702",
+            "handshake_fingerprint": hashlib.sha256(b"handshake").hexdigest(),
+        }
+        status, leased = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-gcs-master/lease",
+            {"process_identity": identity, "expected_lease_version": 0},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn("lease_token", leased["result"])
+
+        mismatch = dict(identity)
+        mismatch["endpoint"] = "http://127.0.0.1:59999"
+        status, reconciled = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-gcs-master/reconcile",
+            {"process_identity": mismatch, "expected_lease_version": 1},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertFalse(reconciled["result"]["destructive_action_permitted"])
+
+        status, sessions = self.request(
+            "GET", "/v1/supervisor/sessions?node=GCS&mode=MASTER", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("UNKNOWN", sessions["sessions"][0]["state"])
+        self.assertTrue(sessions["sessions"][0]["is_default"])
+
+        status, aliased = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-gcs-master/alias",
+            {
+                "alias": "GCS Control Room",
+                "expected_version": sessions["sessions"][0]["row_version"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GCS Control Room", aliased["result"]["alias"])
+
+        status, events = self.request(
+            "GET",
+            "/v1/supervisor/events?session_id=session-gcs-master",
+            token=self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn(
+            "PROCESS_IDENTITY_MISMATCH",
+            [event["event_type"] for event in events["events"]],
+        )
+
+        self.server.session_supervisor.process_observer = lambda pid, created: {
+            "status": "ORIGINAL_PROCESS_ABSENT",
+            "reason": "PID_NOT_RUNNING",
+            "pid": pid,
+            "expected_process_created_at": created,
+        }
+        status, recovered = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-gcs-master/recover-absent",
+            {
+                "expected_lease_version": 2,
+                "operator_evidence_ref": "operator:test-api",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("DISCONNECTED", recovered["result"]["state"])
+        self.assertEqual(
+            "NOT_PERFORMED",
+            recovered["result"]["recovery"]["process_termination"],
+        )
+
+    def test_supervisor_privileged_mutations_require_service_token(self) -> None:
+        status, denied = self.request(
+            "POST",
+            "/v1/supervisor/sessions",
+            {
+                "session_id": "session-denied",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "provider-session-denied",
+            },
+        )
+        self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+        self.assertEqual(
+            "SUPERVISOR_CONTROL_TOKEN_REQUIRED", denied["error_code"]
+        )
+
+        status, registered = self.request(
+            "POST",
+            "/v1/supervisor/sessions",
+            {
+                "session_id": "session-ui-safe",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "provider-session-ui",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+
+        status, defaulted = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-ui-safe/default",
+            {"expected_pointer_version": 0},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, defaulted["result"]["pointer_version"])
+
+        status, denied_lease = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-ui-safe/lease",
+            {"process_identity": {}, "expected_lease_version": 0},
+        )
+        self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+        self.assertEqual(
+            "SUPERVISOR_CONTROL_TOKEN_REQUIRED", denied_lease["error_code"]
+        )
+
+        status, denied_recovery = self.request(
+            "POST",
+            "/v1/supervisor/sessions/session-ui-safe/recover-absent",
+            {"expected_lease_version": 1, "operator_evidence_ref": "operator:test"},
+        )
+        self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+        self.assertEqual(
+            "SUPERVISOR_CONTROL_TOKEN_REQUIRED", denied_recovery["error_code"]
+        )
+
+    def test_legacy_executor_inventory_is_read_only_and_never_auto_adopts(self) -> None:
+        with patch(
+            "universe_server.collect_windows_session_boot_executors",
+            return_value={
+                "status": "HOST_INVENTORY_OBSERVED",
+                "observations": [
+                    {
+                        "pid": 99,
+                        "process_created_at": "2026-08-02T12:00:00Z",
+                        "executable": sys.executable,
+                        "command": [
+                            sys.executable,
+                            "cli.py",
+                            "session-boot",
+                            "serve",
+                        ],
+                        "endpoint": None,
+                        "handshake_fingerprint": None,
+                    }
+                ],
+            },
+        ):
+            status, result = self.request(
+                "GET",
+                "/v1/supervisor/legacy-executors",
+                token=self.token,
+            )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("UNMANAGED", result["executors"][0]["status"])
+        observation = result["executors"][0]["observation"]
+        self.assertNotIn("command", observation)
+        self.assertEqual("SESSION_BOOT_SERVE", observation["command_profile"])
+        self.assertFalse(result["destructive_action_performed"])
+
+    def test_service_shutdown_endpoint_requires_auth_and_requests_clean_stop(self) -> None:
+        status, _ = self.request("POST", "/v1/service/shutdown", {})
+        self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+        with patch.object(self.server, "shutdown") as shutdown:
+            status, result = self.request(
+                "POST",
+                "/v1/service/shutdown",
+                {},
+                self.token,
+            )
+            deadline = time.monotonic() + 2
+            while not shutdown.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(HTTPStatus.ACCEPTED, status)
+        self.assertEqual("SERVICE_SHUTDOWN_ACCEPTED", result["status"])
+        shutdown.assert_called_once_with()
+
+    def test_server_close_continues_after_component_cleanup_failure(self) -> None:
+        class FailingSessionHost:
+            def close(self) -> None:
+                raise RuntimeError("continuity save failed")
+
+        class RuntimeProbe:
+            stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        runtime = RuntimeProbe()
+        self.server.conductor_session_host = FailingSessionHost()
+        self.server.conductor_runtime = runtime
+
+        with patch("builtins.print") as output:
+            self.server.server_close()
+
+        self.assertTrue(runtime.stopped)
+        self.assertIsNone(self.server.conductor_session_host)
+        self.assertIsNone(self.server.conductor_runtime)
+        self.assertEqual(
+            "conductor_session_host", self.server._shutdown_errors[0]["component"]
+        )
+        output.assert_called_once()
+
     def test_provider_setting_migrates_existing_database_for_claude(self) -> None:
         database = self.temp_root / "legacy-provider-setting.sqlite3"
         connection = sqlite3.connect(database)
@@ -881,8 +1133,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 return {"provider": provider, "status": "AVAILABLE"}
 
         class FakeConductorRuntime:
+            instances: list["FakeConductorRuntime"] = []
+
             def __init__(self, _root: Path) -> None:
                 self.stopped = False
+                self.instances.append(self)
 
             def start(self) -> dict[str, str]:
                 return {
@@ -895,6 +1150,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "parent_actor_ref": "universe-conductor",
                     "parent_evidence_ref": "host://parent/current",
                     "binding_evidence_ref": "host://runtime/binding",
+                    "runtime_currentness_observation": "CURRENT",
                 }
 
             def stop(self) -> None:
@@ -947,6 +1203,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         first = create_server(**common)
         try:
+            planning = first.planning_binding_status()
             initial = first.provider_settings()["universe_conductor"][
                 "session_connection"
             ]
@@ -965,6 +1222,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             second.server_close()
 
         self.assertEqual("NEW", initial["connection_state"])
+        self.assertEqual("BOUND", planning["status"])
+        self.assertEqual("CURRENT", planning["runtime_currentness_observation"])
         self.assertEqual("GROK", initial["last_provider"])
         self.assertEqual("REPLACED", switched["connection_state"])
         self.assertEqual("CODEX", switched["last_provider"])
@@ -973,6 +1232,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(switched["last_session_ref"], restored["last_session_ref"])
         self.assertEqual("CONDUCTOR", restored["requested_mode"])
         self.assertTrue(restored["resident"])
+        self.assertTrue(all(instance.stopped for instance in FakeConductorRuntime.instances))
+
+    def test_planning_runtime_binding_requires_currentness_observation(self) -> None:
+        binding = {
+            "schema": "universe.planning-runtime-binding.v1",
+            "endpoint": "http://127.0.0.1:41991",
+            "token": "runtime-token",
+            "session_id": "session-one",
+            "origin_anchor_ref": "anchor-one",
+            "origin_frame_id": "conductor",
+            "parent_actor_ref": "universe-conductor",
+            "parent_evidence_ref": "host://parent/current",
+            "binding_evidence_ref": "host://runtime/binding",
+            "runtime_currentness_observation": "UNKNOWN",
+        }
+        normalized = normalize_planning_runtime_binding(binding)
+        self.assertEqual("UNKNOWN", normalized["runtime_currentness_observation"])
+        del binding["runtime_currentness_observation"]
+        with self.assertRaisesRegex(UniverseError, "missing"):
+            normalize_planning_runtime_binding(binding)
 
     def test_explicit_unavailable_provider_does_not_fall_back(self) -> None:
         class FakeRuntimeHost:
@@ -1127,6 +1406,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "parent_actor_ref": "universe-conductor",
                 "parent_evidence_ref": "host://parent/current",
                 "binding_evidence_ref": "host://runtime/binding",
+                "runtime_currentness_observation": "CURRENT",
             },
             self.token,
         )
@@ -1240,6 +1520,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "parent_actor_ref": "universe-conductor",
                 "parent_evidence_ref": "host://parent/current",
                 "binding_evidence_ref": "host://runtime/binding",
+                "runtime_currentness_observation": "CURRENT",
             },
             self.token,
         )
@@ -1411,6 +1692,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "parent_actor_ref": "universe-conductor",
                 "parent_evidence_ref": "host://parent/current",
                 "binding_evidence_ref": "host://runtime/binding",
+                "runtime_currentness_observation": "CURRENT",
             },
             self.token,
         )
@@ -2658,6 +2940,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "parent_actor_ref": "universe-conductor",
                 "parent_evidence_ref": "host://parent/current",
                 "binding_evidence_ref": "host://runtime/binding",
+                "runtime_currentness_observation": "CURRENT",
             },
             self.token,
         )

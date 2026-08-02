@@ -62,13 +62,13 @@ WRONG: drive://continuity/checkpoint
 RIGHT: sqlite://.ai/runtime/continuity/continuity.sqlite
 ```
 
-Compressed conversation or handoff meaning belongs in the candidate payload
-(for example `summary` and/or `snapshot.compressed_context`), not in a new
-Resume Archive tree and not as a raw full transcript dump.
+Compressed conversation or handoff meaning belongs in
+`snapshot.compressed_context`. `summary` may accompany it but cannot replace
+it. Do not create a new Resume Archive tree or store a raw full transcript.
 
 ## Compressed context (candidate payload)
 
-Optional but preferred for session handoff:
+Required for session handoff:
 
 ```text
 snapshot.compressed_context
@@ -76,17 +76,19 @@ snapshot.compressed_context
   -> not authority, not assignment, not Mode Current Anchor proof
 
 summary
-  -> short passive recovery line; may accompany compressed_context
+  -> optional short passive recovery line; cannot replace compressed_context
 ```
 
-Hosts SHOULD prefer compressed meaning over replaying chat. Secrets, tokens,
-and raw provider transcripts MUST NOT be placed in either field.
+`snapshot.compressed_context` MUST be a non-empty string containing bounded
+recovery meaning. Secrets, tokens, and raw provider transcripts MUST NOT be
+placed in either field.
 
 ## Fail-closed coordinates
 
 ```text
 node / mode missing or UNKNOWN
 session_id / frame_id / anchor_id / checkpoint_ref missing or UNKNOWN
+snapshot.compressed_context missing, non-string, or empty
   -> do not claim SAVED
   -> require Session Preparation / Mode resolution first
 ```
@@ -99,6 +101,7 @@ not an independent resume identity.
 ```text
 current Parent selects bounded conversation restoration content
   -> require Mode-resolved node/mode and session coordinates (fail closed if UNKNOWN)
+  -> require non-empty snapshot.compressed_context
   -> resume-save prepare validates and hashes the candidate
   -> resume-save save verifies candidate_id + candidate
   -> .ai/runtime/continuity/continuity.sqlite transaction commits

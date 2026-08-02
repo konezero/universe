@@ -46,11 +46,13 @@ active coordinate. Role labels on historical archives are not discover keys.
 Snapshot insufficient
   -> discover Resume candidates from continuity.sqlite only
   -> filter same node + same mode
+  -> exclude records that fail Resume coordinate or compressed-context validation
   -> report source and checkpoint reference
   -> Commander selection
   -> resume-restore load selected record
+  -> reject the selected record if the same validation no longer passes
   -> return passive rehydration candidate
-       (summary / snapshot.compressed_context when present)
+       (snapshot.compressed_context and optional summary)
   -> OS_STATUS or OS_VALIDATE
   -> Current Anchor realignment decision (separate; not automatic)
 ```

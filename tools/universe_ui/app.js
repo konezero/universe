@@ -34,6 +34,9 @@ const state = {
   modeContract: null,
   providerSettings: null,
   hostTools: null,
+  supervisorSessions: [],
+  supervisorEvents: [],
+  legacyExecutors: [],
   conversationTarget: {
     kind: "UNIVERSE_CONDUCTOR",
     projectId: null,
@@ -125,6 +128,14 @@ const elements = {
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
   settingsButton: document.querySelector("#settings-button"),
+  sessionObservatoryButton: document.querySelector("#session-observatory-button"),
+  sessionProviderLine: document.querySelector("#session-provider-line"),
+  sessionObservatoryDialog: document.querySelector("#session-observatory-dialog"),
+  sessionObservatorySummary: document.querySelector("#session-observatory-summary"),
+  sessionObservatoryList: document.querySelector("#session-observatory-list"),
+  legacyExecutorList: document.querySelector("#legacy-executor-list"),
+  sessionEventList: document.querySelector("#session-event-list"),
+  refreshSessionsButton: document.querySelector("#refresh-sessions-button"),
   primaryNav: document.querySelector("#primary-nav"),
   metricProjects: document.querySelector("#metric-projects"),
   metricTodos: document.querySelector("#metric-todos"),
@@ -248,6 +259,160 @@ async function api(path, options = {}) {
     throw new Error(payload.detail || payload.error_code || payload.status);
   }
   return payload;
+}
+
+async function refreshSupervisorSessions() {
+  const [sessions, events, legacy] = await Promise.all([
+    api("/v1/supervisor/sessions"),
+    api("/v1/supervisor/events?limit=40"),
+    api("/v1/supervisor/legacy-executors"),
+  ]);
+  state.supervisorSessions = sessions.sessions || [];
+  state.supervisorEvents = events.events || [];
+  state.legacyExecutors = legacy.executors || [];
+  renderSessionObservatory();
+}
+
+function renderSessionObservatory() {
+  if (!elements.sessionObservatoryList) return;
+  const sessions = state.supervisorSessions || [];
+  const live = sessions.filter((item) => item.state === "LIVE").length;
+  const unknown = sessions.filter((item) => item.state === "UNKNOWN").length;
+  elements.sessionObservatorySummary.textContent =
+    `${sessions.length} sessions · ${live} live · ${unknown} unknown`;
+  elements.sessionObservatoryList.replaceChildren();
+  if (!sessions.length) {
+    elements.sessionObservatoryList.append(
+      node("p", "empty-copy", "No persistent Mode session has registered yet.")
+    );
+  }
+  for (const session of sessions) {
+    const card = node("article", "supervisor-session-card");
+    card.dataset.default = String(Boolean(session.is_default));
+    const heading = node("div", "session-card-heading");
+    heading.append(
+      node("strong", "", session.alias || `${session.node} ${session.mode}`),
+      node("span", "session-state-pill", session.state || "UNKNOWN")
+    );
+    heading.lastElementChild.dataset.state = session.state || "UNKNOWN";
+    const meta = node("div", "session-card-meta");
+    meta.append(
+      node("span", "", `${session.node} / ${session.mode}`),
+      node("span", "", session.provider || "UNKNOWN"),
+      node("span", "", session.currentness || "UNKNOWN"),
+      node("span", "", session.is_default ? "DEFAULT" : "ALTERNATIVE")
+    );
+    const ref = node(
+      "p",
+      "session-ref-line",
+      session.provider_session_ref || "Provider session not observed"
+    );
+    const alias = document.createElement("input");
+    alias.className = "session-alias-input";
+    alias.value = session.alias || "";
+    alias.maxLength = 120;
+    alias.setAttribute("aria-label", `Alias for ${session.session_id}`);
+    const actions = node("div", "session-card-actions");
+    const saveAlias = node("button", "secondary-button compact-action", "Save alias");
+    saveAlias.type = "button";
+    saveAlias.addEventListener("click", async () => {
+      try {
+        await api(
+          `/v1/supervisor/sessions/${encodeURIComponent(session.session_id)}/alias`,
+          {
+            method: "POST",
+            body: { alias: alias.value, expected_version: session.row_version },
+          }
+        );
+        await refreshSupervisorSessions();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    const resume = node(
+      "button",
+      "primary-button compact-action",
+      session.is_default ? "Reconnect" : "Use session"
+    );
+    resume.type = "button";
+    resume.addEventListener("click", async () => {
+      try {
+        if (!session.is_default) {
+          await api(
+            `/v1/supervisor/sessions/${encodeURIComponent(session.session_id)}/default`,
+            {
+              method: "POST",
+              body: {
+                expected_pointer_version: session.default_pointer_version,
+              },
+            }
+          );
+        }
+        const project = state.projects.find(
+          (item) => item.project_id === session.node
+        );
+        elements.sessionObservatoryDialog.close();
+        if (project && session.mode === "MASTER") {
+          await callProjectMaster(project.project_id);
+        } else {
+          returnToUniverseConductor();
+        }
+        await refreshSupervisorSessions();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    actions.append(saveAlias, resume);
+    card.append(heading, meta, ref, alias, actions);
+    elements.sessionObservatoryList.append(card);
+  }
+
+  if (elements.legacyExecutorList) {
+    elements.legacyExecutorList.replaceChildren();
+    for (const executor of state.legacyExecutors || []) {
+      const observation = executor.observation || {};
+      const row = node("article", "legacy-executor-row");
+      row.dataset.state = executor.status || "UNKNOWN";
+      const command = observation.command_profile || "Command unavailable";
+      row.append(
+        node("strong", "", executor.status || "UNKNOWN"),
+        node("span", "", `PID ${observation.pid || "UNKNOWN"}`),
+        node("code", "", command),
+        node("small", "", executor.reason || executor.required_route || "Observed")
+      );
+      elements.legacyExecutorList.append(row);
+    }
+    if (!(state.legacyExecutors || []).length) {
+      elements.legacyExecutorList.append(
+        node("p", "empty-copy", "No legacy Session Boot executor was observed.")
+      );
+    }
+  }
+
+  elements.sessionEventList.replaceChildren();
+  for (const event of (state.supervisorEvents || []).slice(0, 20)) {
+    const row = node("div", "session-event-row");
+    row.append(
+      node("strong", "", event.event_type || "EVENT"),
+      node("span", "", event.session_id || "service"),
+      node("time", "", event.occurred_at || "")
+    );
+    elements.sessionEventList.append(row);
+  }
+  if (!(state.supervisorEvents || []).length) {
+    elements.sessionEventList.append(
+      node("p", "empty-copy", "No Supervisor event has been recorded.")
+    );
+  }
+
+  const conductor = sessions.find(
+    (session) => session.is_default && session.mode === "CONDUCTOR"
+  );
+  if (elements.sessionProviderLine) {
+    elements.sessionProviderLine.textContent = conductor
+      ? `${conductor.provider} · ${conductor.state}`
+      : "Provider · not registered";
+  }
 }
 
 function universeModeIsActive() {
@@ -510,6 +675,15 @@ async function refresh() {
       conductorRoomResult.runtime_binding || null;
     state.providerSettings = providerSettings;
     state.hostTools = hostTools;
+    try {
+      await refreshSupervisorSessions();
+    } catch (error) {
+      state.supervisorSessions = [];
+      state.supervisorEvents = [];
+      state.legacyExecutors = [];
+      renderSessionObservatory();
+      console.warn("Session Supervisor refresh failed", error);
+    }
     renderProjects();
     renderComposerActions();
     renderReleaseCatalog();
@@ -4574,6 +4748,17 @@ function bindEvents() {
     });
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
+  });
+  elements.sessionObservatoryButton.addEventListener("click", async () => {
+    try {
+      await refreshSupervisorSessions();
+      elements.sessionObservatoryDialog.showModal();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  elements.refreshSessionsButton.addEventListener("click", () => {
+    refreshSupervisorSessions().catch((error) => toast(error.message, true));
   });
   elements.discoverHostTools.addEventListener("click", () => {
     discoverHostTools().catch((error) => toast(error.message, true));

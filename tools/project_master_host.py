@@ -17,6 +17,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
+
+from session_supervisor import SessionSupervisorError, SessionSupervisorStore
 from uuid import uuid4
 
 from agent_session_gateway import (
@@ -48,6 +50,7 @@ from project_skill_plan_apply import (
     build_project_skill_plan_context,
     project_skill_plan_receipt,
 )
+from process_identity import launched_process_identity
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -66,6 +69,23 @@ class MasterProvider(Protocol):
     def session_ref(self) -> str: ...
 
     def reply(self, message: Mapping[str, Any]) -> str: ...
+
+
+class ContinuitySaver(Protocol):
+    def save(
+        self,
+        *,
+        project_root: Path,
+        trigger: str,
+        compressed_context: str,
+        summary: str = "",
+        source_refs: list[str] | None = None,
+        runtime_coordinate: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def mark_dirty_end(
+        self, project_root: Path, reason: str
+    ) -> Mapping[str, Any]: ...
 
 
 ReplyPoster = Callable[..., dict[str, Any]]
@@ -93,12 +113,14 @@ class ProjectModeCoordinator:
         *,
         native_runner: NativeRunner = run_native_cli,
         source_commit_resolver: SourceCommitResolver | None = None,
+        session_supervisor: SessionSupervisorStore | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
         self.host_session_ref = _text(host_session_ref, "host_session_ref")
         self.native_runner = native_runner
         self.source_commit_resolver = source_commit_resolver or self._git_head
+        self.session_supervisor = session_supervisor
         self.runtime_cli = (
             self.project_root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         )
@@ -109,6 +131,10 @@ class ProjectModeCoordinator:
         self._runtime_binding: dict[str, str] | None = None
         self._runtime_stderr: deque[str] = deque(maxlen=40)
         self._runtime_lock = threading.RLock()
+        self._supervisor_session_id: str | None = None
+        self._lease_token: str | None = None
+        self._lease_version: int | None = None
+        self._process_identity: dict[str, Any] | None = None
 
     def prepare(self) -> Mapping[str, Any]:
         definition = self._master_definition()
@@ -295,16 +321,58 @@ class ProjectModeCoordinator:
     def close(self) -> None:
         with self._runtime_lock:
             process = self._runtime_process
+        if process is None or process.poll() is not None:
+            with self._runtime_lock:
+                self._runtime_process = None
+                self._runtime_binding = None
+            self._mark_stale_if_owned("PROCESS_NOT_RUNNING_AT_STOP")
+            return
+        stop_receipt = self._authorize_supervised_stop()
+        with self._runtime_lock:
             self._runtime_process = None
             self._runtime_binding = None
-        if process is None or process.poll() is not None:
-            return
         process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        self._complete_supervised_stop(stop_receipt)
+
+    def reconcile(self) -> str:
+        with self._runtime_lock:
+            process = self._runtime_process
+            if process is None:
+                return "NOT_STARTED"
+            if process.poll() is None:
+                return "LIVE"
+            self._runtime_process = None
+            self._runtime_binding = None
+        self._mark_stale_if_owned("PROCESS_EXITED_UNEXPECTEDLY")
+        return "EXITED"
+
+    def continuity_coordinate(self) -> Mapping[str, str] | None:
+        with self._runtime_lock:
+            binding = (
+                dict(self._runtime_binding)
+                if self._runtime_binding is not None
+                else None
+            )
+            process = self._runtime_process
+        if binding is None or process is None or process.poll() is not None:
+            return None
+        return {
+            "node": self.project_id,
+            "mode": "MASTER",
+            "session_id": binding["session_id"],
+            "frame_id": binding["frame_id"],
+            "anchor_id": binding["anchor_id"],
+            "currentness": binding["runtime_currentness_observation"],
+            "source_ref": (
+                f"git-object-database://{self.project_id}@"
+                + self.source_commit_resolver(self.project_root)
+            ),
+        }
 
     def _ensure_runtime(self) -> dict[str, str]:
         with self._runtime_lock:
@@ -403,8 +471,120 @@ class ProjectModeCoordinator:
                 "session_id": session_id,
                 "frame_id": frame_id,
                 "anchor_id": anchor_id,
+                "runtime_currentness_observation": str(
+                    runtime_state["executable_runtime_currentness"]
+                ),
             }
+            self._register_process_lease(
+                process=process,
+                command=command,
+                endpoint=endpoint,
+                token=token,
+            )
             return dict(self._runtime_binding)
+
+    def _register_process_lease(
+        self,
+        *,
+        process: subprocess.Popen[str],
+        command: list[str],
+        endpoint: str,
+        token: str,
+    ) -> None:
+        if self.session_supervisor is None:
+            return
+        sessions = self.session_supervisor.list_sessions(
+            node=self.project_id, mode="MASTER"
+        )
+        session = next((item for item in sessions if item["is_default"]), None)
+        if session is None:
+            raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
+        identity = launched_process_identity(
+            process,
+            executable=Path(command[0]),
+            command=command,
+            endpoint=endpoint,
+            handshake_token=token,
+        )
+        existing = session.get("process_lease")
+        expected_version = (
+            0 if existing is None else int(existing.get("lease_version", 0))
+        )
+        acquired = self.session_supervisor.acquire_lease(
+            session["session_id"],
+            identity,
+            expected_lease_version=expected_version,
+        )
+        self._supervisor_session_id = str(session["session_id"])
+        self._lease_token = str(acquired["lease_token"])
+        self._lease_version = int(acquired["lease"]["lease_version"])
+        self._process_identity = identity
+
+    def _authorize_supervised_stop(self) -> Mapping[str, Any] | None:
+        if (
+            self.session_supervisor is None
+            or self._supervisor_session_id is None
+            or self._lease_token is None
+            or self._lease_version is None
+            or self._process_identity is None
+        ):
+            return None
+        try:
+            receipt = self.session_supervisor.authorize_stop(
+                self._supervisor_session_id,
+                self._process_identity,
+                lease_token=self._lease_token,
+                expected_lease_version=self._lease_version,
+            )
+        except SessionSupervisorError:
+            current = self.session_supervisor.get_session(
+                self._supervisor_session_id
+            ).get("process_lease")
+            if isinstance(current, Mapping):
+                self._lease_version = int(current["lease_version"])
+            raise
+        self._lease_version = int(receipt["lease_version"])
+        return receipt
+
+    def _complete_supervised_stop(self, receipt: Mapping[str, Any] | None) -> None:
+        if (
+            receipt is None
+            or self.session_supervisor is None
+            or self._supervisor_session_id is None
+            or self._lease_token is None
+            or self._lease_version is None
+        ):
+            return
+        self.session_supervisor.complete_stop(
+            self._supervisor_session_id,
+            lease_token=self._lease_token,
+            expected_lease_version=self._lease_version,
+        )
+        self._supervisor_session_id = None
+        self._lease_token = None
+        self._lease_version = None
+        self._process_identity = None
+
+    def _mark_stale_if_owned(self, reason: str) -> None:
+        if (
+            self.session_supervisor is None
+            or self._supervisor_session_id is None
+            or self._lease_token is None
+            or self._lease_version is None
+            or self._process_identity is None
+        ):
+            return
+        self.session_supervisor.mark_lease_stale(
+            self._supervisor_session_id,
+            self._process_identity,
+            lease_token=self._lease_token,
+            expected_lease_version=self._lease_version,
+            reason=reason,
+        )
+        self._supervisor_session_id = None
+        self._lease_token = None
+        self._lease_version = None
+        self._process_identity = None
 
     def _read_runtime_startup(
         self, process: subprocess.Popen[str]
@@ -531,15 +711,41 @@ class ProjectModeCoordinator:
 
 
 class ProjectMasterSessionStore:
-    def __init__(self, database_path: Path, project_id: str) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        project_id: str,
+        *,
+        session_supervisor: SessionSupervisorStore | None = None,
+        requested_mode: str = "MASTER",
+    ) -> None:
         self.database_path = database_path.expanduser().resolve()
         self.project_id = _text(project_id, "project_id")
+        self.session_supervisor = session_supervisor
+        self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._initialize()
         self._migrate_legacy_provider_sessions()
+        self._migrate_supervisor_binding()
 
     def last_provider_session(self) -> dict[str, str] | None:
+        if self.session_supervisor is not None:
+            sessions = self.session_supervisor.list_sessions(
+                node=self.project_id,
+                mode=self.requested_mode,
+            )
+            selected = next(
+                (session for session in sessions if session["is_default"]), None
+            )
+            if selected is not None and selected["provider_session_ref"]:
+                return {
+                    "provider": str(selected["provider"]),
+                    "session_ref": str(selected["provider_session_ref"]),
+                }
+        return self._legacy_provider_session()
+
+    def _legacy_provider_session(self) -> dict[str, str] | None:
         with self._connection() as connection:
             rows = {
                 str(row["key"]): str(row["value"])
@@ -580,6 +786,26 @@ class ProjectMasterSessionStore:
             state = "REUSED"
         else:
             state = "REPLACED"
+        if self.session_supervisor is not None:
+            supervisor_session_id = self._supervisor_session_id(
+                normalized_provider, normalized_session
+            )
+            candidate, _ = self.session_supervisor.register_session(
+                {
+                    "session_id": supervisor_session_id,
+                    "node": self.project_id,
+                    "mode": self.requested_mode,
+                    "provider": normalized_provider,
+                    "provider_session_ref": normalized_session,
+                    "state": "LIVE",
+                    "currentness": "UNKNOWN",
+                }
+            )
+            if not candidate["is_default"]:
+                self.session_supervisor.set_default(
+                    supervisor_session_id,
+                    expected_pointer_version=candidate["default_pointer_version"],
+                )
         with self._connection() as connection:
             for key, value in (
                 ("last_provider", normalized_provider),
@@ -596,7 +822,7 @@ class ProjectMasterSessionStore:
         return state
 
     def _migrate_legacy_provider_sessions(self) -> None:
-        current = self.last_provider_session()
+        current = self._legacy_provider_session()
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -622,15 +848,53 @@ class ProjectMasterSessionStore:
                         "INSERT OR REPLACE INTO host_metadata(key, value) VALUES(?, ?)",
                         (key, value),
                     )
-            connection.execute(
-                """
-                DELETE FROM host_metadata
-                WHERE key = 'provider_session_id'
-                   OR key LIKE 'provider_session_id:%'
-                   OR key = 'provider_session_initialized'
-                   OR key LIKE 'provider_session_initialized:%'
-                """
+
+    def _migrate_supervisor_binding(self) -> None:
+        if self.session_supervisor is None:
+            return
+        if any(
+            session["is_default"]
+            for session in self.session_supervisor.list_sessions(
+                node=self.project_id,
+                mode=self.requested_mode,
             )
+        ):
+            return
+        legacy = self._legacy_provider_session()
+        if legacy is None:
+            return
+        supervisor_session_id = self._supervisor_session_id(
+            legacy["provider"], legacy["session_ref"]
+        )
+        session, _ = self.session_supervisor.register_session(
+            {
+                "session_id": supervisor_session_id,
+                "node": self.project_id,
+                "mode": self.requested_mode,
+                "provider": legacy["provider"],
+                "provider_session_ref": legacy["session_ref"],
+                "state": "DISCONNECTED",
+                "currentness": "UNKNOWN",
+            }
+        )
+        if not session["is_default"]:
+            self.session_supervisor.set_default(
+                supervisor_session_id,
+                expected_pointer_version=session["default_pointer_version"],
+            )
+
+    def _supervisor_session_id(self, provider: str, session_ref: str) -> str:
+        material = json.dumps(
+            {
+                "node": self.project_id,
+                "mode": self.requested_mode,
+                "provider": provider,
+                "provider_session_ref": session_ref,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return "session_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
     def register(self, envelope: Mapping[str, Any]) -> bool:
         normalized = normalize_bridge_envelope(envelope)
@@ -1340,6 +1604,9 @@ class ResidentModeSessionHost:
         database_path: Path,
         *,
         actor_label: str,
+        session_supervisor: SessionSupervisorStore | None = None,
+        continuity_coordinator: ContinuitySaver | None = None,
+        coordinate_resolver: Callable[[], Mapping[str, Any] | None] | None = None,
         provider_factory: Callable[
             [str, Path, str, ProjectMasterSessionStore, str, str],
             MasterProvider,
@@ -1350,10 +1617,19 @@ class ResidentModeSessionHost:
         self.target_id = _text(target_id, "target_id")
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = _text(actor_label, "actor_label")
-        self.store = ProjectMasterSessionStore(database_path, self.target_id)
+        self.continuity_coordinator = continuity_coordinator
+        self.coordinate_resolver = coordinate_resolver
+        self.store = ProjectMasterSessionStore(
+            database_path,
+            self.target_id,
+            session_supervisor=session_supervisor,
+            requested_mode=self.requested_mode,
+        )
         self.provider_factory = provider_factory or self._default_provider
         self._provider_name: str | None = None
         self._provider: MasterProvider | None = None
+        self._last_interaction: dict[str, str] | None = None
+        self._last_interaction_at = 0.0
         self._lock = threading.RLock()
 
     def prepare(self, provider: str) -> dict[str, Any]:
@@ -1374,7 +1650,20 @@ class ResidentModeSessionHost:
         normalized_provider = _provider(provider)
         with self._lock:
             active = self._ensure(normalized_provider)
-            text = active.reply(message)
+            try:
+                text = active.reply(message)
+            except Exception as error:
+                self._mark_dirty_end(
+                    f"{normalized_provider}_REPLY_FAILED:{type(error).__name__}"
+                )
+                raise
+            self._last_interaction = {
+                "target_id": self.target_id,
+                "mode": self.requested_mode,
+                "provider": normalized_provider,
+                "provider_session_ref": active.session_ref,
+            }
+            self._last_interaction_at = time.monotonic()
             connection_state = str(
                 getattr(active, "connection_state", "UNKNOWN")
             )
@@ -1390,9 +1679,11 @@ class ResidentModeSessionHost:
     def close(self) -> None:
         with self._lock:
             provider = self._provider
+            provider_name = self._provider_name
             self._provider = None
             self._provider_name = None
         if provider is not None:
+            self._save_continuity("NORMAL_STOP", provider, provider_name)
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
@@ -1401,7 +1692,15 @@ class ResidentModeSessionHost:
         if self._provider is not None and self._provider_name == provider:
             setattr(self._provider, "connection_state", "REUSED")
             return self._provider
-        self.close()
+        if self._provider is not None:
+            previous = self._provider
+            previous_name = self._provider_name
+            self._save_continuity("PROVIDER_SWITCH", previous, previous_name)
+            self._provider = None
+            self._provider_name = None
+            close = getattr(previous, "close", None)
+            if callable(close):
+                close()
         active = self.provider_factory(
             provider,
             self.repository_root,
@@ -1419,6 +1718,83 @@ class ResidentModeSessionHost:
         self._provider = active
         self._provider_name = provider
         return active
+
+    def save_idle(self, idle_seconds: float) -> Mapping[str, Any] | None:
+        with self._lock:
+            if (
+                self.continuity_coordinator is None
+                or self._last_interaction is None
+                or time.monotonic() - self._last_interaction_at < idle_seconds
+            ):
+                return None
+            context = dict(self._last_interaction)
+        try:
+            return self.continuity_coordinator.save(
+                project_root=self.repository_root,
+                trigger="IDLE",
+                compressed_context=json.dumps(
+                    context,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                summary=f"{self.target_id} {self.requested_mode} session state",
+                runtime_coordinate=self._runtime_coordinate(),
+            )
+        except Exception:
+            return None
+
+    def _save_continuity(
+        self,
+        trigger: str,
+        provider: MasterProvider,
+        provider_name: str | None = None,
+    ) -> None:
+        if self.continuity_coordinator is None:
+            return
+        context = json.dumps(
+            {
+                "target_id": self.target_id,
+                "mode": self.requested_mode,
+                "provider": provider_name or self._provider_name or "UNKNOWN",
+                "provider_session_ref": str(
+                    getattr(provider, "session_ref", "UNKNOWN")
+                ),
+                "transition": trigger,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            self.continuity_coordinator.save(
+                project_root=self.repository_root,
+                trigger=trigger,
+                compressed_context=context,
+                summary=f"{self.target_id} {self.requested_mode} {trigger.lower()}",
+                runtime_coordinate=self._runtime_coordinate(),
+            )
+        except Exception:
+            return
+
+    def _runtime_coordinate(self) -> Mapping[str, Any] | None:
+        if self.coordinate_resolver is None:
+            return None
+        try:
+            return self.coordinate_resolver()
+        except Exception:
+            return None
+
+    def _mark_dirty_end(self, reason: str) -> None:
+        if self.continuity_coordinator is None:
+            return
+        try:
+            self.continuity_coordinator.mark_dirty_end(
+                self.repository_root,
+                reason,
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _default_provider(
@@ -1488,6 +1864,7 @@ class ProjectMasterConversationWorker:
         reply_poster: ReplyPoster = post_master_reply,
         stream_poster: StreamPoster = post_master_stream_event,
         permission_poster: PermissionPoster = post_agent_permission_request,
+        completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -1498,6 +1875,9 @@ class ProjectMasterConversationWorker:
         self.reply_poster = reply_poster
         self.stream_poster = stream_poster
         self.permission_poster = permission_poster
+        self.completion_observer = completion_observer
+        self._last_completion: dict[str, Any] | None = None
+        self._last_completion_at = 0.0
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._permission_lock = threading.RLock()
         self._permission_waiters: dict[str, dict[str, Any]] = {}
@@ -1634,13 +2014,48 @@ class ProjectMasterConversationWorker:
         except Exception as error:
             emit("FAILED", detail=f"{type(error).__name__}: {error}")
             self.store.fail(message_id, f"{type(error).__name__}: {error}")
+            if self.completion_observer is not None:
+                try:
+                    self.completion_observer(
+                        {
+                            "status": "FAILED",
+                            "project_id": self.project_id,
+                            "message_id": message_id,
+                            "provider_session_ref": self.provider.session_ref,
+                            "reason": f"PROVIDER_REPLY_FAILED:{type(error).__name__}",
+                        }
+                    )
+                except Exception:
+                    pass
             self._active_bridge_id = ""
             self._active_message_id = ""
             return
         emit("COMPLETED")
         self.store.complete(message_id)
+        if self.completion_observer is not None:
+            try:
+                completion = {
+                    "status": "COMPLETED",
+                    "project_id": self.project_id,
+                    "message_id": message_id,
+                    "provider_session_ref": self.provider.session_ref,
+                    "runtime_context": provider_message.get("runtime_context", {}),
+                }
+                self._last_completion = completion
+                self._last_completion_at = time.monotonic()
+                self.completion_observer(completion)
+            except Exception:
+                pass
         self._active_bridge_id = ""
         self._active_message_id = ""
+
+    def idle_completion(self, idle_seconds: float) -> Mapping[str, Any] | None:
+        if (
+            self._last_completion is None
+            or time.monotonic() - self._last_completion_at < idle_seconds
+        ):
+            return None
+        return dict(self._last_completion)
 
     def _request_permission(self, request: Mapping[str, Any]) -> str | None:
         request_id = _text(request.get("request_id"), "request_id")
@@ -1775,6 +2190,7 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
 @dataclass
 class ResidentProjectMasterHandle:
     project_id: str
+    project_root: Path
     provider: str
     endpoint: str
     credential_env: str
@@ -1800,6 +2216,8 @@ class ResidentProjectMasterHostManager:
         *,
         universe_endpoint: str,
         bridge_registrar: BridgeRegistrar,
+        session_supervisor: SessionSupervisorStore | None = None,
+        continuity_coordinator: ContinuitySaver | None = None,
         provider_factory: Callable[
             [Path, str, ProjectMasterSessionStore], MasterProvider
         ]
@@ -1810,6 +2228,8 @@ class ResidentProjectMasterHostManager:
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
         self.bridge_registrar = bridge_registrar
+        self.session_supervisor = session_supervisor
+        self.continuity_coordinator = continuity_coordinator
         self.provider_factory = provider_factory
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.coordinator_factory = coordinator_factory or self._default_coordinator
@@ -1840,6 +2260,7 @@ class ResidentProjectMasterHostManager:
                     "session_connection": self._handle_connection(handle),
                 }
             if handle is not None:
+                self._save_handle_continuity(handle, "PROVIDER_SWITCH")
                 handle.close()
                 self._handles.pop(project_id, None)
 
@@ -1848,6 +2269,8 @@ class ResidentProjectMasterHostManager:
             store = ProjectMasterSessionStore(
                 _default_state_db(project_id),
                 project_id,
+                session_supervisor=self.session_supervisor,
+                requested_mode="MASTER",
             )
             provider = (
                 self.provider_factory(project_root, project_id, store)
@@ -1885,6 +2308,15 @@ class ResidentProjectMasterHostManager:
                 project_id=project_id,
                 bridge_token=os.environ[credential_env],
                 surface_observer=coordinator,
+                completion_observer=(
+                    lambda event, root=project_root, owner=coordinator: (
+                        self._save_project_completion(
+                            root,
+                            event,
+                            runtime_coordinate=self._continuity_coordinate(owner),
+                        )
+                    )
+                ),
             )
             host = LiveProjectMasterBridgeHost(
                 project_root,
@@ -1904,6 +2336,7 @@ class ResidentProjectMasterHostManager:
             thread.start()
             handle = ResidentProjectMasterHandle(
                 project_id=project_id,
+                project_root=project_root,
                 provider=selected_provider,
                 endpoint=endpoint,
                 credential_env=credential_env,
@@ -1952,11 +2385,14 @@ class ResidentProjectMasterHostManager:
             if handle is not None and handle.thread.is_alive():
                 return self._handle_connection(handle)
         database_path = _default_state_db(normalized)
-        store = (
-            ProjectMasterSessionStore(database_path, normalized)
-            if database_path.is_file()
-            else None
-        )
+        store = None
+        if database_path.is_file():
+            store = ProjectMasterSessionStore(
+                database_path,
+                normalized,
+                session_supervisor=self.session_supervisor,
+                requested_mode="MASTER",
+            )
         return provider_session_connection(
             target_kind="PROJECT_MASTER",
             target_id=normalized,
@@ -1970,6 +2406,7 @@ class ResidentProjectMasterHostManager:
         with self._lock:
             handle = self._handles.pop(normalized, None)
         if handle is not None:
+            self._save_handle_continuity(handle, "NORMAL_STOP")
             handle.close()
 
     def stop(self, project_id: str) -> bool:
@@ -1978,6 +2415,7 @@ class ResidentProjectMasterHostManager:
             handle = self._handles.pop(normalized, None)
         if handle is None:
             return False
+        self._save_handle_continuity(handle, "NORMAL_STOP")
         handle.close()
         return True
 
@@ -1999,7 +2437,148 @@ class ResidentProjectMasterHostManager:
             handles = list(self._handles.values())
             self._handles.clear()
         for handle in handles:
+            self._save_handle_continuity(handle, "NORMAL_STOP")
             handle.close()
+
+    def _save_project_completion(
+        self,
+        project_root: Path,
+        event: Mapping[str, Any],
+        trigger: str = "TASK_COMPLETED",
+        runtime_coordinate: Mapping[str, Any] | None = None,
+    ) -> None:
+        if self.continuity_coordinator is None:
+            return
+        if event.get("status") == "FAILED":
+            try:
+                self.continuity_coordinator.mark_dirty_end(
+                    project_root,
+                    str(event.get("reason") or "PROJECT_MASTER_FAILED"),
+                )
+            except Exception:
+                pass
+            return
+        bounded = {
+            "project_id": event.get("project_id"),
+            "message_id": event.get("message_id"),
+            "provider_session_ref": event.get("provider_session_ref"),
+            "runtime_context": event.get("runtime_context", {}),
+        }
+        self.continuity_coordinator.save(
+            project_root=project_root,
+            trigger=trigger,
+            compressed_context=json.dumps(
+                bounded,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            summary=f"Project Master state {event.get('message_id', 'UNKNOWN')}",
+            runtime_coordinate=runtime_coordinate,
+        )
+
+    def save_idle_sessions(self, idle_seconds: float) -> list[dict[str, Any]]:
+        with self._lock:
+            handles = list(self._handles.values())
+        results: list[dict[str, Any]] = []
+        for handle in handles:
+            completion = handle.worker.idle_completion(idle_seconds)
+            if completion is None:
+                continue
+            try:
+                self._save_project_completion(
+                    handle.project_root,
+                    completion,
+                    trigger="IDLE",
+                    runtime_coordinate=self._continuity_coordinate(
+                        handle.coordinator
+                    ),
+                )
+            except Exception as error:
+                results.append(
+                    {
+                        "project_id": handle.project_id,
+                        "status": "FAILED",
+                        "reason": type(error).__name__,
+                    }
+                )
+            else:
+                results.append(
+                    {"project_id": handle.project_id, "status": "OBSERVED"}
+                )
+        return results
+
+    def reconcile_residents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            handles = list(self._handles.values())
+        results: list[dict[str, Any]] = []
+        for handle in handles:
+            reason = ""
+            if not handle.thread.is_alive():
+                reason = "PROJECT_MASTER_BRIDGE_THREAD_EXITED"
+            else:
+                reconcile = getattr(handle.coordinator, "reconcile", None)
+                if callable(reconcile) and reconcile() == "EXITED":
+                    reason = "PROJECT_SESSION_RUNTIME_EXITED"
+            if not reason:
+                continue
+            if self.continuity_coordinator is not None:
+                try:
+                    self.continuity_coordinator.mark_dirty_end(
+                        handle.project_root,
+                        reason,
+                    )
+                except Exception:
+                    pass
+            results.append(
+                {
+                    "project_id": handle.project_id,
+                    "status": "DIRTY_END",
+                    "reason": reason,
+                }
+            )
+        return results
+
+    def _save_handle_continuity(
+        self, handle: ResidentProjectMasterHandle, trigger: str
+    ) -> None:
+        if self.continuity_coordinator is None:
+            return
+        provider = handle.worker.provider
+        context = json.dumps(
+            {
+                "project_id": handle.project_id,
+                "mode": str(getattr(provider, "requested_mode", "MASTER")),
+                "provider": handle.provider,
+                "provider_session_ref": provider.session_ref,
+                "transition": trigger,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            self.continuity_coordinator.save(
+                project_root=handle.project_root,
+                trigger=trigger,
+                compressed_context=context,
+                summary=f"{handle.project_id} MASTER {trigger.lower()}",
+                runtime_coordinate=self._continuity_coordinate(handle.coordinator),
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _continuity_coordinate(
+        owner: CommanderSurfaceObserver,
+    ) -> Mapping[str, Any] | None:
+        resolver = getattr(owner, "continuity_coordinate", None)
+        if not callable(resolver):
+            return None
+        try:
+            return resolver()
+        except Exception:
+            return None
 
     @staticmethod
     def _handle_connection(
@@ -2031,8 +2610,8 @@ class ResidentProjectMasterHostManager:
             return ClaudeProjectMasterRuntime(project_root, project_id, store)
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 
-    @staticmethod
     def _default_coordinator(
+        self,
         project_root: Path,
         project_id: str,
         host_session_ref: str,
@@ -2041,6 +2620,7 @@ class ResidentProjectMasterHostManager:
             project_root,
             project_id,
             host_session_ref,
+            session_supervisor=self.session_supervisor,
         )
 
     @staticmethod
