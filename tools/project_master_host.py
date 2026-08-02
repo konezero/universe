@@ -1626,6 +1626,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             session_observer=observe_session,
             permission_mcp_config=mcp_config,
             permission_bridge=bridge,
+            permission_ready=broker.wait_for_registration,
         )
         self._permission_broker = broker
         self._mcp_config_root = config_root

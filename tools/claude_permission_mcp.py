@@ -30,9 +30,16 @@ PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "universe_permission"
 TOOL_NAME = "approve"
 ENDPOINT_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT"
-TOKEN_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_TOKEN"
+BOOTSTRAP_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
 TOKEN_HEADER = "X-Universe-Claude-Permission-Token"
+BROKER_PATH = "/v1/claude-permission/approve"
+EXCHANGE_PATH = "/v1/claude-permission/exchange"
 REQUEST_TIMEOUT_SECONDS = 300.0
+
+# The session token lives here and nowhere else: not on disk, not in the
+# environment, not in argv. It is obtained once by trading the one-time
+# bootstrap token during MCP initialize.
+_SESSION_TOKEN: str | None = None
 
 TOOL_DEFINITION = {
     "name": TOOL_NAME,
@@ -56,6 +63,53 @@ def _deny(message: str) -> dict[str, Any]:
     return {"behavior": "deny", "message": message}
 
 
+def _base_endpoint() -> str | None:
+    endpoint = os.environ.get(ENDPOINT_ENVIRONMENT, "").strip().rstrip("/")
+    if not endpoint:
+        return None
+    if not endpoint.startswith(("http://127.0.0.1:", "http://localhost:")):
+        # Loopback only; never send a prompt off-box.
+        return None
+    return endpoint
+
+
+def register(*, opener=urllib.request.urlopen) -> bool:
+    """Trade the one-time bootstrap token for the session token.
+
+    Runs once, at MCP initialize. The bootstrap token is dropped from this
+    process as soon as it is spent, so nothing replayable remains.
+    """
+
+    global _SESSION_TOKEN
+
+    if _SESSION_TOKEN:
+        return True
+    endpoint = _base_endpoint()
+    bootstrap = os.environ.pop(BOOTSTRAP_ENVIRONMENT, "").strip()
+    if endpoint is None or not bootstrap:
+        return False
+    request = urllib.request.Request(
+        f"{endpoint}{EXCHANGE_PATH}",
+        data=b"{}",
+        method="POST",
+        headers={"Content-Type": "application/json", TOKEN_HEADER: bootstrap},
+    )
+    try:
+        with opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(decoded, Mapping) or decoded.get("status") != "REGISTERED":
+        return False
+    token = decoded.get("session_token")
+    if not isinstance(token, str) or not token:
+        return False
+    _SESSION_TOKEN = token
+    return True
+
+
 def ask_universe(
     arguments: Mapping[str, Any],
     *,
@@ -63,16 +117,18 @@ def ask_universe(
 ) -> dict[str, Any]:
     """Forward one prompt to the loopback broker. Any failure denies."""
 
-    endpoint = os.environ.get(ENDPOINT_ENVIRONMENT, "").strip()
-    token = os.environ.get(TOKEN_ENVIRONMENT, "").strip()
-    if not endpoint or not token:
+    configured = os.environ.get(ENDPOINT_ENVIRONMENT, "").strip()
+    if not configured:
         return _deny("CLAUDE_PERMISSION_TRANSPORT_UNCONFIGURED")
-    if not endpoint.startswith(("http://127.0.0.1:", "http://localhost:")):
-        # Loopback only; never send a prompt off-box.
+    endpoint = _base_endpoint()
+    if endpoint is None:
         return _deny("CLAUDE_PERMISSION_ENDPOINT_NOT_LOOPBACK")
+    token = _SESSION_TOKEN
+    if not token:
+        return _deny("CLAUDE_PERMISSION_NOT_REGISTERED")
     body = json.dumps(dict(arguments), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
-        endpoint,
+        f"{endpoint}{BROKER_PATH}",
         data=body,
         method="POST",
         headers={"Content-Type": "application/json", TOKEN_HEADER: token},
@@ -98,6 +154,9 @@ def handle_message(message: Mapping[str, Any], *, asker=ask_universe) -> dict[st
     method = message.get("method")
     message_id = message.get("id")
     if method == "initialize":
+        # Register before Claude can run a turn. If the exchange fails the
+        # server still answers, but every approve call will deny.
+        register()
         result: dict[str, Any] = {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},

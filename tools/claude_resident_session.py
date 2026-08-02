@@ -261,10 +261,14 @@ class ClaudeResidentSession:
         turn_timeout_seconds: float = 600.0,
         permission_mcp_config: Path | None = None,
         permission_bridge: Any | None = None,
+        permission_ready: Callable[[], bool] | None = None,
         process_factory: Callable[..., ClaudeStreamProcess] | None = None,
     ) -> None:
         self.permission_mcp_config = permission_mcp_config
         self.permission_bridge = permission_bridge
+        # Blocks until the MCP permission server has registered. A turn must
+        # not start before the approval path exists.
+        self.permission_ready = permission_ready
         self.executable = executable
         self.cwd = cwd
         self.environment = dict(environment)
@@ -355,6 +359,10 @@ class ClaudeResidentSession:
             self._turn_done.clear()
             self._turn_deltas = []
             self._turn_text = []
+            if self.permission_ready is not None and not self.permission_ready():
+                # No approval path yet: refuse rather than run unguarded.
+                self._set_state(SESSION_FAILED)
+                raise ClaudeResidentError("CLAUDE_PERMISSION_MCP_NOT_REGISTERED")
             self._turn_error = None
             self._on_delta = on_delta
             self._turn_id = uuid4().hex

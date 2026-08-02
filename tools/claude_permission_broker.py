@@ -32,7 +32,12 @@ from claude_permission_bridge import ClaudePermissionBridge, deny
 
 
 BROKER_PATH = "/v1/claude-permission/approve"
+EXCHANGE_PATH = "/v1/claude-permission/exchange"
 TOKEN_HEADER = "X-Universe-Claude-Permission-Token"
+# Only the one-time bootstrap token is ever written to the MCP config. The
+# real session token is handed back in the exchange response and lives in the
+# MCP process memory only.
+BOOTSTRAP_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
 TOKEN_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_TOKEN"
 ENDPOINT_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT"
 MCP_SERVER_NAME = "universe_permission"
@@ -97,6 +102,12 @@ class ClaudePermissionBroker:
             session_ref=bridge.session_ref,
             target=target,
         )
+        # One-time bootstrap credential. It is the only secret that reaches
+        # disk, and it stops working the moment it is exchanged.
+        self._bootstrap_token = secrets.token_urlsafe(32)
+        self._bootstrap_lock = threading.Lock()
+        self._bootstrap_consumed = False
+        self._registered = threading.Event()
         self._seen_lock = threading.Lock()
         self._seen: set[str] = set()
         self._server = HTTPServer((host, port), self._handler_type())
@@ -123,7 +134,13 @@ class ClaudePermissionBroker:
         if self._stopped.is_set():
             return
         self._stopped.set()
+        with self._bootstrap_lock:
+            # Burn the bootstrap credential too, so a late child cannot use it.
+            self._bootstrap_consumed = True
+            self._bootstrap_token = ""
         self.token.revoke()
+        # Closing the bridge cancels every pending request, including one whose
+        # operator decision is still in flight.
         self.bridge.close()
         if self._thread is not None:
             # shutdown() waits for serve_forever() to acknowledge; calling it on
@@ -132,6 +149,39 @@ class ClaudePermissionBroker:
             self._thread.join(timeout=2)
             self._thread = None
         self._server.server_close()
+
+    @property
+    def registered(self) -> bool:
+        """True once the MCP server has exchanged its bootstrap token."""
+
+        return self._registered.is_set()
+
+    def wait_for_registration(self, timeout_seconds: float = 30.0) -> bool:
+        """Block until the MCP server registers. A turn must not start first."""
+
+        return self._registered.wait(timeout_seconds)
+
+    def exchange_bootstrap(self, presented: str | None) -> dict[str, Any]:
+        """Trade the one-time bootstrap token for the session token.
+
+        The bootstrap token is burned on the first successful exchange, so a
+        replay -- including one by a Claude child that read the config file --
+        gets nothing.
+        """
+
+        if self._stopped.is_set():
+            return {"status": "DENIED", "reason": "BROKER_STOPPED"}
+        with self._bootstrap_lock:
+            if self._bootstrap_consumed:
+                return {"status": "DENIED", "reason": "BOOTSTRAP_ALREADY_USED"}
+            if not presented or not secrets.compare_digest(
+                str(presented), self._bootstrap_token
+            ):
+                return {"status": "DENIED", "reason": "BOOTSTRAP_INVALID"}
+            self._bootstrap_consumed = True
+            self._bootstrap_token = ""
+            self._registered.set()
+            return {"status": "REGISTERED", "session_token": self.token.value}
 
     def provider_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
         """Strip permission-token names before handing env to the provider.
@@ -144,11 +194,16 @@ class ClaudePermissionBroker:
         return {
             str(key): str(value)
             for key, value in environment.items()
-            if str(key) not in {TOKEN_ENVIRONMENT, ENDPOINT_ENVIRONMENT}
+            if str(key)
+            not in {TOKEN_ENVIRONMENT, ENDPOINT_ENVIRONMENT, BOOTSTRAP_ENVIRONMENT}
         }
 
     def mcp_config(self) -> dict[str, Any]:
-        """Config for ``--mcp-config``. The token rides in ``env``, not argv."""
+        """Config for ``--mcp-config``.
+
+        Carries the endpoint and the **one-time bootstrap token** only. The
+        session token never touches disk or argv.
+        """
 
         server_script = Path(__file__).with_name("claude_permission_mcp.py")
         return {
@@ -157,8 +212,8 @@ class ClaudePermissionBroker:
                     "command": _python_executable(),
                     "args": [str(server_script)],
                     "env": {
-                        ENDPOINT_ENVIRONMENT: f"{self.endpoint}{BROKER_PATH}",
-                        TOKEN_ENVIRONMENT: self.token.value,
+                        ENDPOINT_ENVIRONMENT: self.endpoint,
+                        BOOTSTRAP_ENVIRONMENT: self._bootstrap_token,
                     },
                 }
             }
@@ -209,7 +264,7 @@ class ClaudePermissionBroker:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
-                if self.path != BROKER_PATH:
+                if self.path not in {BROKER_PATH, EXCHANGE_PATH}:
                     self._send(404, deny("CLAUDE_PERMISSION_ROUTE_NOT_FOUND"))
                     return
                 try:
@@ -224,6 +279,15 @@ class ClaudePermissionBroker:
                     return
                 if not isinstance(payload, Mapping):
                     self._send(400, deny("CLAUDE_PERMISSION_PAYLOAD_INVALID"))
+                    return
+                if self.path == EXCHANGE_PATH:
+                    self._send(
+                        200,
+                        broker.exchange_bootstrap(
+                            self.headers.get(TOKEN_HEADER)
+                            or payload.get("bootstrap_token")
+                        ),
+                    )
                     return
                 result = broker.handle_payload(
                     payload,

@@ -139,9 +139,10 @@ class BrokerTests(unittest.TestCase):
 
         self.assertNotIn(broker.token.value, json.dumps(server["args"]))
         self.assertNotIn(broker.token.value, server["command"])
-        self.assertEqual(
-            broker.token.value, server["env"]["UNIVERSE_CLAUDE_PERMISSION_TOKEN"]
-        )
+        # The session token is never written; only the one-time bootstrap is.
+        self.assertNotIn(broker.token.value, json.dumps(server["env"]))
+        self.assertNotIn("UNIVERSE_CLAUDE_PERMISSION_TOKEN", server["env"])
+        self.assertTrue(server["env"]["UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"])
         self.assertTrue(
             server["env"]["UNIVERSE_CLAUDE_PERMISSION_ENDPOINT"].startswith(
                 "http://127.0.0.1:"
@@ -155,8 +156,9 @@ class BrokerTests(unittest.TestCase):
         token = broker.token.value
         server = broker.mcp_config()["mcpServers"]["universe_permission"]
 
-        # MCP child process environment: token present.
-        self.assertEqual(token, server["env"]["UNIVERSE_CLAUDE_PERMISSION_TOKEN"])
+        # MCP child environment: a usable bootstrap, never the session token.
+        self.assertTrue(server["env"]["UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"])
+        self.assertNotIn(token, json.dumps(server["env"]))
 
         # Claude process environment: token absent, even if a caller tries.
         provider_env = broker.provider_environment(
@@ -230,6 +232,169 @@ class BrokerTests(unittest.TestCase):
 
         rejected = post(_prompt(tool_use_id="toolu_2"), "bad-token")
         self.assertEqual("deny", rejected["behavior"])
+
+
+class BootstrapExchangeTests(unittest.TestCase):
+    """The session token must never touch disk, argv, or the environment."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.brokers: list[ClaudePermissionBroker] = []
+
+    def tearDown(self) -> None:
+        for broker in self.brokers:
+            broker.close()
+        self.temp.cleanup()
+
+    def _broker(self, decision="allow-once") -> ClaudePermissionBroker:
+        broker = ClaudePermissionBroker(
+            bridge=_bridge(decision), target="universe/MASTER"
+        )
+        self.brokers.append(broker)
+        return broker
+
+    def test_mcp_config_contains_no_session_token(self) -> None:
+        broker = self._broker()
+        path = broker.write_mcp_config(self.root / "mcp.json")
+        raw = path.read_text(encoding="utf-8")
+
+        self.assertNotIn(broker.token.value, raw)
+        self.assertNotIn("UNIVERSE_CLAUDE_PERMISSION_TOKEN", raw)
+        # Only the one-time bootstrap credential is on disk.
+        self.assertIn("UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP", raw)
+
+    def test_first_bootstrap_exchange_succeeds(self) -> None:
+        broker = self._broker()
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+        self.assertFalse(broker.registered)
+
+        result = broker.exchange_bootstrap(bootstrap)
+
+        self.assertEqual("REGISTERED", result["status"])
+        self.assertEqual(broker.token.value, result["session_token"])
+        self.assertTrue(broker.registered)
+
+    def test_bootstrap_replay_is_refused(self) -> None:
+        broker = self._broker()
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+        self.assertEqual("REGISTERED", broker.exchange_bootstrap(bootstrap)["status"])
+
+        replay = broker.exchange_bootstrap(bootstrap)
+        self.assertEqual("DENIED", replay["status"])
+        self.assertEqual("BOOTSTRAP_ALREADY_USED", replay["reason"])
+        self.assertNotIn("session_token", replay)
+
+        # A config read after registration yields a dead credential.
+        stale = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+        self.assertEqual("", stale)
+
+    def test_wrong_bootstrap_is_refused(self) -> None:
+        broker = self._broker()
+        result = broker.exchange_bootstrap("not-the-token")
+
+        self.assertEqual("DENIED", result["status"])
+        self.assertEqual("BOOTSTRAP_INVALID", result["reason"])
+        self.assertFalse(broker.registered)
+
+    def test_bootstrap_dead_after_close(self) -> None:
+        broker = self._broker()
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+        broker.close()
+
+        result = broker.exchange_bootstrap(bootstrap)
+        self.assertEqual("DENIED", result["status"])
+        self.assertEqual("BROKER_STOPPED", result["reason"])
+
+    def test_turn_is_refused_before_mcp_registers(self) -> None:
+        from claude_resident_session import (
+            ClaudeResidentError,
+            ClaudeResidentSession,
+        )
+
+        class Process:
+            def __init__(self, **_kwargs):
+                self.alive = True
+                self.sent: list[str] = []
+
+            def send_user_message(self, text: str) -> None:
+                self.sent.append(text)
+
+            def stderr_detail(self) -> str:
+                return ""
+
+            def close(self) -> None:
+                self.alive = False
+
+        built: list[Process] = []
+
+        def factory(**kwargs):
+            process = Process(**kwargs)
+            built.append(process)
+            return process
+
+        broker = self._broker()
+        session = ClaudeResidentSession(
+            executable=Path("claude.exe"),
+            cwd=self.root,
+            environment={},
+            system_prompt="probe",
+            session_id=None,
+            session_observer=lambda _s: None,
+            permission_ready=lambda: broker.wait_for_registration(0.1),
+            process_factory=factory,
+        )
+
+        with self.assertRaises(ClaudeResidentError) as caught:
+            session.send_message("go", lambda _d: None)
+        self.assertIn("MCP_NOT_REGISTERED", str(caught.exception))
+        # The prompt must never have been written.
+        self.assertEqual([], built[0].sent)
+
+    def test_mcp_client_registers_then_uses_memory_token(self) -> None:
+        broker = self._broker().start()
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+        environment = {
+            "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT": broker.endpoint,
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP": bootstrap,
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            mcp._SESSION_TOKEN = None
+            try:
+                self.assertTrue(mcp.register())
+                # The bootstrap credential is gone from the environment.
+                import os
+
+                self.assertNotIn("UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP", os.environ)
+                self.assertNotIn("UNIVERSE_CLAUDE_PERMISSION_TOKEN", os.environ)
+
+                decision = mcp.ask_universe(_prompt())
+                self.assertEqual("allow", decision["behavior"])
+            finally:
+                mcp._SESSION_TOKEN = None
+
+    def test_mcp_client_denies_before_registration(self) -> None:
+        broker = self._broker().start()
+        with patch.dict(
+            "os.environ",
+            {"UNIVERSE_CLAUDE_PERMISSION_ENDPOINT": broker.endpoint},
+            clear=True,
+        ):
+            mcp._SESSION_TOKEN = None
+            decision = mcp.ask_universe(_prompt())
+
+        self.assertEqual("deny", decision["behavior"])
+        self.assertIn("NOT_REGISTERED", decision["message"])
 
 
 class PendingPermissionShutdownTests(unittest.TestCase):
@@ -449,15 +614,18 @@ class McpServerTests(unittest.TestCase):
 
     def test_broker_unreachable_denies(self) -> None:
         environment = {
-            "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT": "http://127.0.0.1:1/approve",
-            "UNIVERSE_CLAUDE_PERMISSION_TOKEN": "t",
+            "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT": "http://127.0.0.1:1",
         }
 
         def boom(*_args, **_kwargs):
             raise OSError("refused")
 
         with patch.dict("os.environ", environment, clear=True):
-            decision = mcp.ask_universe(_prompt(), opener=boom)
+            mcp._SESSION_TOKEN = "in-memory-token"
+            try:
+                decision = mcp.ask_universe(_prompt(), opener=boom)
+            finally:
+                mcp._SESSION_TOKEN = None
 
         self.assertEqual("deny", decision["behavior"])
         self.assertIn("UNREACHABLE", decision["message"])
@@ -468,10 +636,16 @@ class McpServerTests(unittest.TestCase):
         ).start()
         try:
             environment = {
-                "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT": f"{broker.endpoint}{BROKER_PATH}",
-                "UNIVERSE_CLAUDE_PERMISSION_TOKEN": broker.token.value,
+                "UNIVERSE_CLAUDE_PERMISSION_ENDPOINT": broker.endpoint,
+                "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP": broker.mcp_config()[
+                    "mcpServers"
+                ]["universe_permission"]["env"][
+                    "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+                ],
             }
             with patch.dict("os.environ", environment, clear=True):
+                mcp._SESSION_TOKEN = None
+                self.assertTrue(mcp.register())
                 response = mcp.handle_message(
                     {
                         "jsonrpc": "2.0",
@@ -482,6 +656,7 @@ class McpServerTests(unittest.TestCase):
                 )
             decision = json.loads(response["result"]["content"][0]["text"])
         finally:
+            mcp._SESSION_TOKEN = None
             broker.close()
 
         self.assertEqual("deny", decision["behavior"])
