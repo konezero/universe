@@ -90,6 +90,9 @@ class ClaudePermissionBridge:
         self.timeout_seconds = float(timeout_seconds)
         self._closed = threading.Event()
         self._turn_id: str | None = None
+        # Bumped on every turn bind. A decision is adopted only if the
+        # revision is unchanged since the prompt was raised (CAS).
+        self._turn_revision = 0
         self._lock = threading.Lock()
 
     def bind_turn(self, turn_id: str | None) -> None:
@@ -97,11 +100,19 @@ class ClaudePermissionBridge:
 
         with self._lock:
             self._turn_id = str(turn_id) if turn_id else None
+            self._turn_revision += 1
 
     def close(self) -> None:
-        """Stop serving. Any later request fails closed."""
+        """Stop serving. Any later request, and any in-flight decision that has
+        not yet been adopted, fails closed.
 
-        self._closed.set()
+        ``close`` takes the same lock the adoption step uses, so a decision can
+        never be adopted after this returns.
+        """
+
+        with self._lock:
+            self._closed.set()
+            self._turn_revision += 1
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """Answer one Claude permission prompt.
@@ -131,6 +142,9 @@ class ClaudePermissionBridge:
             if str(claimed_turn) != active_turn:
                 return deny("CLAUDE_PERMISSION_TURN_MISMATCH")
 
+        with self._lock:
+            revision_at_prompt = self._turn_revision
+
         suggestions = request.get("suggestions")
         suggestions = suggestions if isinstance(suggestions, list) else []
         universe_request = {
@@ -156,21 +170,34 @@ class ClaudePermissionBridge:
         except Exception as error:  # noqa: BLE001 - any failure denies
             return deny(f"CLAUDE_PERMISSION_REQUESTER_FAILED:{error}"[:500])
 
-        if option_id is None:
-            # No answer from the UI: timeout, cancel, or disconnect.
-            return deny("CLAUDE_PERMISSION_NO_DECISION")
-        kind = _OPTION_KIND_BY_ID.get(str(option_id))
-        if kind is None:
-            return deny("CLAUDE_PERMISSION_OPTION_UNKNOWN")
-        if kind == OPTION_REJECT_ONCE:
-            return deny("User rejected this action")
-        if kind == OPTION_ALLOW_ONCE:
-            return allow(tool_input)
-        # allow_always: persist only what Claude itself proposed, and only
-        # because the user explicitly picked the persistent option in the UI.
-        persist = [
-            item
-            for item in suggestions
-            if isinstance(item, Mapping) and item.get("destination") == "localSettings"
-        ]
-        return allow(tool_input, updated_permissions=persist)
+        # Adopt the decision atomically: the shutdown check, the turn-revision
+        # CAS, and building the allow result all happen under one lock, so a
+        # close() that lands right after the check cannot leak an approval.
+        with self._lock:
+            if self._closed.is_set():
+                return deny("CLAUDE_PERMISSION_CANCELLED_BY_SHUTDOWN")
+            if self._turn_revision != revision_at_prompt:
+                # The turn moved on while the operator was deciding.
+                return deny("CLAUDE_PERMISSION_TURN_SUPERSEDED")
+            if claimed_turn is not None and self._turn_id is not None:
+                if str(claimed_turn) != self._turn_id:
+                    return deny("CLAUDE_PERMISSION_TURN_MISMATCH")
+            if option_id is None:
+                # No answer from the UI: timeout, cancel, or disconnect.
+                return deny("CLAUDE_PERMISSION_NO_DECISION")
+            kind = _OPTION_KIND_BY_ID.get(str(option_id))
+            if kind is None:
+                return deny("CLAUDE_PERMISSION_OPTION_UNKNOWN")
+            if kind == OPTION_REJECT_ONCE:
+                return deny("User rejected this action")
+            if kind == OPTION_ALLOW_ONCE:
+                return allow(tool_input)
+            # allow_always: persist only what Claude itself proposed, and only
+            # because the user explicitly picked the persistent option in the UI.
+            persist = [
+                item
+                for item in suggestions
+                if isinstance(item, Mapping)
+                and item.get("destination") == "localSettings"
+            ]
+            return allow(tool_input, updated_permissions=persist)

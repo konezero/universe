@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from pathlib import Path
@@ -229,6 +230,148 @@ class BrokerTests(unittest.TestCase):
 
         rejected = post(_prompt(tool_use_id="toolu_2"), "bad-token")
         self.assertEqual("deny", rejected["behavior"])
+
+
+class PendingPermissionShutdownTests(unittest.TestCase):
+    """Test 9: a permission still waiting when the process stops must cancel."""
+
+    def test_in_flight_request_is_cancelled_when_broker_closes(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_requester(_request: Mapping[str, Any]) -> str | None:
+            entered.set()
+            release.wait(timeout=5)
+            # The operator answered, but the service is gone by now.
+            return "allow-once"
+
+        bridge = ClaudePermissionBridge(
+            session_ref="claude-code:session-1",
+            permission_requester=slow_requester,
+        )
+        broker = ClaudePermissionBroker(bridge=bridge, target="universe/MASTER")
+        results: list[Mapping[str, Any]] = []
+
+        def call() -> None:
+            results.append(
+                broker.handle_payload(_prompt(), presented_token=broker.token.value)
+            )
+
+        worker = threading.Thread(target=call)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=5))
+
+        # Shut down while the approval is still pending.
+        broker.close()
+        release.set()
+        worker.join(timeout=5)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("deny", results[0]["behavior"])
+
+    def test_session_close_cancels_pending_turn(self) -> None:
+        from claude_resident_session import ClaudeResidentSession
+
+        class HangingProcess:
+            def __init__(self, **_kwargs):
+                self.alive = True
+                self.closed = False
+
+            def send_user_message(self, _text: str) -> None:
+                return None  # never emits a result
+
+            def stderr_detail(self) -> str:
+                return ""
+
+            def close(self) -> None:
+                self.closed = True
+                self.alive = False
+
+        session = ClaudeResidentSession(
+            executable=Path("claude.exe"),
+            cwd=Path("."),
+            environment={},
+            system_prompt="probe",
+            session_id=None,
+            session_observer=lambda _s: None,
+            turn_timeout_seconds=10.0,
+            process_factory=HangingProcess,
+        )
+        errors: list[Exception] = []
+
+        def turn() -> None:
+            try:
+                session.send_message("go", lambda _d: None)
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        worker = threading.Thread(target=turn)
+        worker.start()
+        threading.Event().wait(0.2)
+        session.close()
+        worker.join(timeout=5)
+
+        self.assertEqual(1, len(errors))
+        self.assertIn("CANCELLED", str(errors[0]))
+
+
+class IndependentSessionTests(unittest.TestCase):
+    """Test 11: Conductor and Project Master must not share a session."""
+
+    def test_conductor_and_project_master_have_separate_tokens(self) -> None:
+        conductor = ClaudePermissionBroker(
+            bridge=_bridge("allow-once"), target="universe/CONDUCTOR"
+        )
+        master = ClaudePermissionBroker(
+            bridge=ClaudePermissionBridge(
+                session_ref="claude-code:gcs-master",
+                permission_requester=lambda _r: "allow-once",
+            ),
+            target="GCS/MASTER",
+        )
+        try:
+            self.assertNotEqual(conductor.token.value, master.token.value)
+            self.assertNotEqual(conductor.endpoint, master.endpoint)
+            self.assertEqual(
+                "universe/CONDUCTOR", conductor.token.identity()["target"]
+            )
+            self.assertEqual("GCS/MASTER", master.token.identity()["target"])
+
+            # A Conductor token must not authorize a Project Master prompt.
+            crossed = master.handle_payload(
+                _prompt(), presented_token=conductor.token.value
+            )
+            self.assertEqual("deny", crossed["behavior"])
+            self.assertIn("TOKEN_INVALID", crossed["message"])
+        finally:
+            conductor.close()
+            master.close()
+
+    def test_closing_one_session_leaves_the_other_serving(self) -> None:
+        conductor = ClaudePermissionBroker(
+            bridge=_bridge("allow-once"), target="universe/CONDUCTOR"
+        )
+        master = ClaudePermissionBroker(
+            bridge=ClaudePermissionBridge(
+                session_ref="claude-code:gcs-master",
+                permission_requester=lambda _r: "allow-once",
+            ),
+            target="GCS/MASTER",
+        )
+        try:
+            conductor.close()
+            still = master.handle_payload(
+                {
+                    "tool_name": "Write",
+                    "input": {"file_path": "x"},
+                    "tool_use_id": "t1",
+                    "session_ref": "claude-code:gcs-master",
+                },
+                presented_token=master.token.value,
+            )
+            self.assertEqual("allow", still["behavior"])
+        finally:
+            master.close()
 
 
 class McpServerTests(unittest.TestCase):

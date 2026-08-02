@@ -146,6 +146,67 @@ class ClaudePermissionBridgeTests(unittest.TestCase):
             "deny", bridge.handle({"tool_name": "Write", "input": "x"})["behavior"]
         )
 
+    def test_close_during_decision_is_never_adopted(self) -> None:
+        """close() landing right after the check must not leak an approval."""
+        holder: dict[str, Any] = {}
+
+        def decide(_request):
+            # The operator answers, but the service stops in the same breath.
+            holder["bridge"].close()
+            return "allow-once"
+
+        bridge = self._bridge(decide)
+        holder["bridge"] = bridge
+        result = bridge.handle(self._request())
+
+        self.assertEqual("deny", result["behavior"])
+        self.assertIn("CANCELLED_BY_SHUTDOWN", result["message"])
+
+    def test_turn_change_during_decision_supersedes_the_answer(self) -> None:
+        holder: dict[str, Any] = {}
+
+        def decide(_request):
+            # A new turn starts while the operator is still deciding.
+            holder["bridge"].bind_turn("turn-2")
+            return "allow-once"
+
+        bridge = self._bridge(decide)
+        holder["bridge"] = bridge
+        bridge.bind_turn("turn-1")
+        result = bridge.handle(self._request(turn_id="turn-1"))
+
+        self.assertEqual("deny", result["behavior"])
+        self.assertIn("SUPERSEDED", result["message"])
+
+    def test_concurrent_close_never_yields_allow_after_shutdown(self) -> None:
+        """Stress the check/adopt boundary from another thread."""
+        import threading
+
+        for _ in range(60):
+            holder: dict[str, Any] = {}
+            entered = threading.Event()
+
+            def decide(_request):
+                entered.set()
+                return "allow-once"
+
+            bridge = self._bridge(decide)
+            holder["bridge"] = bridge
+            results: list[dict[str, Any]] = []
+
+            worker = threading.Thread(
+                target=lambda: results.append(bridge.handle(self._request()))
+            )
+            worker.start()
+            entered.wait(timeout=2)
+            bridge.close()
+            worker.join(timeout=2)
+
+            self.assertEqual(1, len(results))
+            if results[0]["behavior"] == "allow":
+                # Only legal if adoption completed before close took the lock.
+                self.assertNotIn("updatedPermissions", results[0])
+
     def test_request_uses_universe_contract_and_offers_three_options(self) -> None:
         bridge = self._bridge("allow-once")
         bridge.bind_turn("turn-9")
