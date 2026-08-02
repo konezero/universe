@@ -128,13 +128,55 @@ class ProjectMasterIsResidentTests(unittest.TestCase):
                     f"{callee} Project Master session must not be ephemeral",
                 )
 
-    def test_project_master_observes_session_ids_for_resume(self) -> None:
-        calls = _calls_named(PROJECT_MASTER, "ClaudeCodeSession")
-        self.assertTrue(calls)
-        for call in calls:
+    def test_project_master_selects_the_resident_claude_session(self) -> None:
+        """The gateway must build the resident adapter, not print mode."""
+
+        calls = _calls_named(PROJECT_MASTER, "ClaudeResidentSession")
+        self.assertTrue(
+            calls, "Project Master must construct a ClaudeResidentSession"
+        )
+        self.assertEqual(
+            [],
+            _calls_named(PROJECT_MASTER, "ClaudeCodeSession"),
+            "Project Master must no longer build the print-mode session",
+        )
+
+    def test_resident_claude_observes_session_ids_for_resume(self) -> None:
+        for call in _calls_named(PROJECT_MASTER, "ClaudeResidentSession"):
             self.assertIsNotNone(
                 _keyword(call, "session_observer"),
                 "a resident Master session must report its session id",
+            )
+            self.assertIsNotNone(
+                _keyword(call, "session_id"),
+                "a resident Master session must offer a stored id to resume",
+            )
+
+    def test_resident_claude_binds_the_permission_bridge(self) -> None:
+        calls = _calls_named(PROJECT_MASTER, "ClaudeResidentSession")
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertIsNotNone(
+                _keyword(call, "permission_mcp_config"),
+                "resident Claude must be given the permission MCP config",
+            )
+            self.assertIsNotNone(
+                _keyword(call, "permission_bridge"),
+                "resident Claude must bind its turns to the bridge",
+            )
+
+    def test_resident_claude_environment_is_token_stripped(self) -> None:
+        """Claude's own environment must be filtered by the broker."""
+
+        for call in _calls_named(PROJECT_MASTER, "ClaudeResidentSession"):
+            environment = _keyword(call, "environment")
+            self.assertIsNotNone(environment)
+            callee = getattr(environment, "func", None)
+            name = getattr(callee, "attr", None) or getattr(callee, "id", None)
+            self.assertEqual(
+                "provider_environment",
+                name,
+                "resident Claude env must pass through broker.provider_environment",
             )
 
 

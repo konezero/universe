@@ -12,6 +12,7 @@ import queue
 import secrets
 import sqlite3
 import subprocess  # nosec B404
+import shutil
 import tempfile
 import threading
 import time
@@ -28,6 +29,9 @@ from agent_session_gateway import (
     GrokAcpSession,
     UniverseAcpGateway,
 )
+from claude_permission_bridge import ClaudePermissionBridge
+from claude_permission_broker import ClaudePermissionBroker
+from claude_resident_session import ClaudeResidentSession
 from host_profile import resolve_host_tool
 from project_master_bridge import (
     ProjectMasterBridgeHost,
@@ -1571,6 +1575,8 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         )
         self.session_id = store.session_ref_for("CLAUDE")
         self.max_turns = max(1, int(max_turns))
+        self._permission_broker: ClaudePermissionBroker | None = None
+        self._mcp_config_root: Path | None = None
 
     @property
     def session_ref(self) -> str:
@@ -1596,21 +1602,47 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             )
             self._greeting_pending = self.connection_state != "REUSED"
 
-        session = ClaudeCodeSession(
+        # Resident Claude: one long-lived stream-json process for this target,
+        # with permission prompts routed to the existing requester through the
+        # loopback MCP bridge.
+        bridge = ClaudePermissionBridge(
+            session_ref=self.session_ref,
+            permission_requester=self._permission_requester,
+        )
+        broker = ClaudePermissionBroker(
+            bridge=bridge,
+            target=f"{self.project_id}/{self.requested_mode}",
+        ).start()
+        config_root = Path(tempfile.mkdtemp(prefix="universe-claude-mcp-"))
+        mcp_config = broker.write_mcp_config(config_root / "mcp.json")
+        session = ClaudeResidentSession(
             executable=executable,
             cwd=self.project_root,
-            environment=environment,
+            # The capability token must never reach Claude's own environment.
+            environment=broker.provider_environment(environment),
             model=model,
             system_prompt=self._system_prompt(),
             session_id=self.session_id,
-            permission_requester=self._permission_requester,
             session_observer=observe_session,
-            max_turns=self.max_turns,
-            native_runner=self.native_runner,
+            permission_mcp_config=mcp_config,
+            permission_bridge=bridge,
         )
+        self._permission_broker = broker
+        self._mcp_config_root = config_root
         self.session_id = session.session_id
         self._gateway = UniverseAcpGateway(session)
         return self._gateway
+
+    def close(self) -> None:
+        super().close()
+        broker = getattr(self, "_permission_broker", None)
+        if broker is not None:
+            broker.close()
+            self._permission_broker = None
+        config_root = getattr(self, "_mcp_config_root", None)
+        if config_root is not None:
+            shutil.rmtree(config_root, ignore_errors=True)
+            self._mcp_config_root = None
 
 
 class ResidentModeSessionHost:
@@ -1651,6 +1683,7 @@ class ResidentModeSessionHost:
         self.provider_factory = provider_factory or self._default_provider
         self._provider_name: str | None = None
         self._provider: MasterProvider | None = None
+        self._provider_session_ref: str | None = None
         self._last_interaction: dict[str, str] | None = None
         self._last_interaction_at = 0.0
         self._lock = threading.RLock()
@@ -1705,6 +1738,7 @@ class ResidentModeSessionHost:
             provider_name = self._provider_name
             self._provider = None
             self._provider_name = None
+            self._provider_session_ref = None
         if provider is not None:
             self._save_continuity("NORMAL_STOP", provider, provider_name)
             close = getattr(provider, "close", None)
@@ -1712,15 +1746,24 @@ class ResidentModeSessionHost:
                 close()
 
     def _ensure(self, provider: str) -> MasterProvider:
+        selected_session_ref = self.store.session_ref_for(provider)
         if self._provider is not None and self._provider_name == provider:
-            setattr(self._provider, "connection_state", "REUSED")
-            return self._provider
+            if (
+                selected_session_ref is None
+                or selected_session_ref == self._provider_session_ref
+            ):
+                setattr(self._provider, "connection_state", "REUSED")
+                return self._provider
+            replacement_trigger = "SESSION_SELECTION_CHANGED"
+        else:
+            replacement_trigger = "PROVIDER_SWITCH"
         if self._provider is not None:
             previous = self._provider
             previous_name = self._provider_name
-            self._save_continuity("PROVIDER_SWITCH", previous, previous_name)
+            self._save_continuity(replacement_trigger, previous, previous_name)
             self._provider = None
             self._provider_name = None
+            self._provider_session_ref = None
             close = getattr(previous, "close", None)
             if callable(close):
                 close()
@@ -1740,6 +1783,11 @@ class ResidentModeSessionHost:
             prepare()
         self._provider = active
         self._provider_name = provider
+        self._provider_session_ref = self.store.session_ref_for(provider)
+        if self._provider_session_ref is None:
+            raw_session_id = getattr(active, "session_id", None)
+            if isinstance(raw_session_id, str) and raw_session_id.strip():
+                self._provider_session_ref = raw_session_id.strip()
         return active
 
     def save_idle(self, idle_seconds: float) -> Mapping[str, Any] | None:
