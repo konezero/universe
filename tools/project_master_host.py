@@ -1417,16 +1417,36 @@ class CodexProjectMasterRuntime:
         message: Mapping[str, Any],
         on_delta: Callable[[str], None],
     ) -> str:
-        try:
-            gateway = self._acp_gateway()
-            prompt = self._prompt(message)
-            if self._greeting_pending:
-                prompt = f"{self._mode_greeting()}\n\n{prompt}"
+        base_prompt = self._prompt(message)
+        emitted_delta = False
+
+        def tracked_delta(delta: str) -> None:
+            nonlocal emitted_delta
+            emitted_delta = True
+            on_delta(delta)
+
+        for attempt in range(2):
+            try:
+                gateway = self._acp_gateway()
+                prompt = base_prompt
+                if self._greeting_pending:
+                    prompt = f"{self._mode_greeting()}\n\n{prompt}"
+                    self._greeting_pending = False
+                return gateway.reply_stream(prompt, tracked_delta)
+            except AgentSessionError as error:
+                can_replace_stale_resume = (
+                    attempt == 0
+                    and str(error) == "CODEX_TURN_FAILED"
+                    and self.connection_state == "REUSED"
+                    and not emitted_delta
+                )
+                if not can_replace_stale_resume:
+                    raise ProjectMasterHostError(str(error)) from error
+                self.close()
+                self.session_id = None
+                self.connection_state = "UNKNOWN"
                 self._greeting_pending = False
-            result = gateway.reply_stream(prompt, on_delta)
-            return result
-        except AgentSessionError as error:
-            raise ProjectMasterHostError(str(error)) from error
+        raise ProjectMasterHostError("CODEX_SESSION_RECOVERY_FAILED")
 
     def set_permission_requester(
         self,

@@ -834,6 +834,42 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("Universe Project Room message", gateway.prompts[0])
         self.assertTrue(runtime.session_ref.startswith("codex-app-server:"))
 
+    def test_codex_runtime_replaces_stale_resumed_session_once(self) -> None:
+        class FailingGateway(FakeAgentGateway):
+            def reply_stream(self, prompt: str, on_delta) -> str:
+                del on_delta
+                self.prompts.append(prompt)
+                raise AgentSessionError("CODEX_TURN_FAILED")
+
+        self.state.observe_provider_session("CODEX", "stale-thread")
+        runtime = CodexProjectMasterRuntime(
+            self.root,
+            "GCS",
+            self.state,
+        )
+        runtime.connection_state = "REUSED"
+        failed = FailingGateway("unused")
+        recovered = FakeAgentGateway("recovered-answer")
+        gateways = iter((failed, recovered))
+
+        def next_gateway():
+            gateway = next(gateways)
+            runtime._gateway = gateway
+            if gateway is recovered:
+                runtime.session_id = "fresh-thread"
+                runtime.connection_state = "REPLACED"
+                runtime._greeting_pending = True
+            return gateway
+
+        with patch.object(runtime, "_acp_gateway", side_effect=next_gateway):
+            answer = runtime.reply(self._envelope()["message"])
+
+        self.assertEqual("recovered-answer", answer)
+        self.assertTrue(failed.closed)
+        self.assertEqual(1, len(failed.prompts))
+        self.assertEqual(1, len(recovered.prompts))
+        self.assertTrue(recovered.prompts[0].startswith("Enter MASTER Mode"))
+
     def test_claude_runtime_routes_project_message_through_cli_session(self) -> None:
         runtime = ClaudeProjectMasterRuntime(
             self.root,

@@ -124,6 +124,40 @@ binding only in process memory. The GET response is redacted, and SQLite never
 receives the endpoint or token. Restarting Universe returns the binding to
 `UNBOUND`; a Host must attach it again.
 
+
+## Worker Binding Resolution
+
+A user-managed Worker Binding chooses the preferred Provider, model, effort,
+and Skill references for one Worker role and task type. The five roles are
+`IMPLEMENTER`, `REVIEWER`, `QA`, `SCOUT`,
+and `ROUTINE`. Bindings are stored in Universe SQLite and edited
+through the Runtime settings UI or:
+
+```text
+GET  /v1/settings/worker-bindings
+POST /v1/settings/worker-bindings
+POST /v1/settings/worker-bindings/resolve
+```
+
+Resolution order is exact and deterministic:
+
+```text
+PROJECT exact task type
+-> PROJECT wildcard
+-> UNIVERSE exact task type
+-> UNIVERSE wildcard
+-> DEFAULT_AUTO
+```
+
+The resolved profile is copied into an immutable
+`universe.worker-binding-snapshot.v1` with a `binding_digest`
+before an invocation is claimed. Later settings changes cannot rewrite that
+invocation's Provider, model, effort, or Skill inputs. A binding is routing
+input only: it does not create a Task Frame, currentness, authority, assignment,
+approval, or repository write scope. Skill references become executable
+observations only after a Boss declares them in a bounded Task Frame allocation
+and the Host returns evidence for that exact binding digest.
+
 `POST /v1/fresh-project-refinement-runs` creates an exact, durable one-turn
 Planning Frame proposal without invoking a model. The proposal fixes the
 provider, model, BOSS turn, read-only repository boundary, request digest, and

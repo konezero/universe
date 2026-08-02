@@ -27,7 +27,7 @@ python tools/universe_server.py serve --open-ui
 |---------|----------|
 | `status` | Reads `%LOCALAPPDATA%\Universe\server.json`, checks PID, probes `/health` |
 | `start` | Detached background `serve` if not READY; optional UI open |
-| `stop` | `taskkill` of recorded PID tree (Windows) |
+| `stop` | Authenticated graceful shutdown through the recorded service endpoint and control token |
 | `restart` | `stop` then `start` |
 | `serve` | Foreground service (existing developer path) |
 | `tray` | Windows system-tray host (Open UI / Start / Stop / Restart) |
@@ -80,7 +80,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\uninstall-user.ps1
 - No administrator elevation required for this slice.
 - Does not ship Python; Host Python must already be on `PATH`.
 - Does not create Windows Services (`services.msc`).
-- Does not implement a native tray icon yet (follow-up: optional tray host).
+- Ships a PowerShell WinForms tray host; a compiled native tray binary and custom icon remain follow-up work.
 - Does not grant project authority or Execution Assignment.
 
 ## Portable package (zip / folder)

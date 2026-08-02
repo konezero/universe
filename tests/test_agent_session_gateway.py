@@ -503,13 +503,14 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         transport = FakeJsonRpcTransport.instances[0]
         self.assertEqual(
-            ("app-server", "-c", 'model="default"', "--listen", "stdio://"),
+            ("app-server", "--listen", "stdio://"),
             transport.arguments,
         )
         self.assertIn(("initialized", None), transport.notifications)
         self.assertEqual("Codex answer", answer)
         self.assertEqual(["Codex answer"], deltas)
         self.assertEqual({"decision": "accept"}, decision)
+        self.assertNotIn('model="default"', transport.arguments)
         self.assertEqual("CODEX", selected[0]["provider"])
         self.assertEqual("allow_once", selected[0]["options"][0]["kind"])
         start = next(
@@ -519,6 +520,65 @@ class AgentSessionGatewayTests(unittest.TestCase):
         )
         self.assertFalse(start["ephemeral"])
         self.assertTrue(transport.closed)
+
+    def test_codex_uses_completed_agent_message_when_delta_is_absent(self) -> None:
+        class CompletedItemOnlyTransport(FakeJsonRpcTransport):
+            def request(
+                self,
+                method: str,
+                params: Mapping[str, Any],
+                *,
+                timeout_seconds: float = 300,
+            ) -> Any:
+                if method != "turn/start":
+                    return super().request(
+                        method,
+                        params,
+                        timeout_seconds=timeout_seconds,
+                    )
+                self.requests.append((method, dict(params)))
+                turn_id = "codex-turn-completed-item"
+                self.notification_handler(
+                    "item/completed",
+                    {
+                        "threadId": params["threadId"],
+                        "turnId": turn_id,
+                        "completedAtMs": 1,
+                        "item": {
+                            "id": "item-final",
+                            "type": "agentMessage",
+                            "text": "Final Codex answer",
+                        },
+                    },
+                )
+                self.notification_handler(
+                    "turn/completed",
+                    {
+                        "threadId": params["threadId"],
+                        "turn": {"id": turn_id, "status": "completed"},
+                    },
+                )
+                return {"turn": {"id": turn_id}}
+
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            CompletedItemOnlyTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id=None,
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            deltas: list[str] = []
+            answer = session.prompt("Question", deltas.append)
+            session.close()
+
+        self.assertEqual("Final Codex answer", answer)
+        self.assertEqual(["Final Codex answer"], deltas)
 
     def test_codex_ephemeral_session_never_resumes_or_persists_thread(self) -> None:
         sessions: list[str] = []

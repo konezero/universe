@@ -661,9 +661,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="settings-dialog"', body)
             self.assertIn('id="universe-provider-setting"', body)
             self.assertIn('id="project-provider-settings"', body)
+            self.assertIn('id="worker-binding-scope"', body)
+            self.assertIn('id="worker-binding-settings"', body)
             self.assertIn('id="host-tool-settings"', body)
             self.assertIn('id="discover-host-tools-button"', body)
             self.assertIn('id="session-observatory-dialog"', body)
+            self.assertIn('id="session-observatory-topbar-button"', body)
             self.assertIn('id="session-observatory-list"', body)
             self.assertIn('id="legacy-executor-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
@@ -684,6 +687,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("Review project draft", script)
             self.assertIn("openConductorFreshProjectDraft", script)
             self.assertIn("/v1/settings/providers", script)
+            self.assertIn("/v1/settings/worker-bindings", script)
+            self.assertIn("renderWorkerBindingSettings", script)
             self.assertIn("/v1/settings/host-tools", script)
             self.assertIn("/provider-setting", script)
             self.assertIn("/master-session/prepare", script)
@@ -835,6 +840,73 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GROK",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
         )
+
+    def test_worker_binding_profiles_resolve_by_scope_and_revision(self) -> None:
+        status, _ = self.request("POST", "/v1/projects/register", self.registration())
+        self.assertEqual(HTTPStatus.CREATED, status)
+
+        status, empty = self.request("GET", "/v1/settings/worker-bindings")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([], empty["profiles"])
+
+        universe_profile = {
+            "scope_kind": "UNIVERSE",
+            "scope_id": "UNIVERSE",
+            "worker_role": "REVIEWER",
+            "task_type": "*",
+            "provider": "CLAUDE",
+            "model_ref": "opus",
+            "effort": "HIGH",
+            "skill_refs": ["webapp-testing"],
+            "enabled": True,
+        }
+        status, created = self.request(
+            "POST", "/v1/settings/worker-bindings", universe_profile
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, created["profile"]["revision"])
+        status, inherited = self.request(
+            "POST",
+            "/v1/settings/worker-bindings/resolve",
+            {"project_id": "GCS", "worker_role": "REVIEWER"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("CLAUDE", inherited["snapshot"]["provider"])
+        first_digest = inherited["snapshot"]["binding_digest"]
+        self.assertEqual(64, len(first_digest))
+
+        universe_profile["effort"] = "MAX"
+        status, updated = self.request(
+            "POST", "/v1/settings/worker-bindings", universe_profile
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(2, updated["profile"]["revision"])
+        status, revised = self.request(
+            "POST",
+            "/v1/settings/worker-bindings/resolve",
+            {"project_id": "GCS", "worker_role": "REVIEWER"},
+        )
+        self.assertNotEqual(first_digest, revised["snapshot"]["binding_digest"])
+
+        project_profile = {
+            **universe_profile,
+            "scope_kind": "PROJECT",
+            "scope_id": "GCS",
+            "provider": "CODEX",
+            "model_ref": "sol",
+            "effort": "MEDIUM",
+        }
+        status, _ = self.request(
+            "POST", "/v1/settings/worker-bindings", project_profile
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        status, project = self.request(
+            "POST",
+            "/v1/settings/worker-bindings/resolve",
+            {"project_id": "GCS", "worker_role": "REVIEWER"},
+        )
+        self.assertEqual("PROJECT", project["snapshot"]["scope_kind"])
+        self.assertEqual("CODEX", project["snapshot"]["provider"])
 
     def test_supervisor_session_registry_and_reconcile_api(self) -> None:
         status, registered = self.request(
@@ -4529,6 +4601,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertNotIn("never-store-this-token", encoded)
         self.assertNotIn("must not persist", encoded)
         self.assertFalse(created["invocation"]["result"]["repository_write"])
+        binding_snapshot = created["invocation"]["invocation"][
+            "worker_binding_snapshot"
+        ]
+        self.assertEqual("DEFAULT_AUTO", binding_snapshot["profile_id"])
+        self.assertEqual(
+            binding_snapshot,
+            self.server.runtime_host.request["context_pack"][
+                "worker_binding_snapshot"
+            ],
+        )
+        self.assertEqual(
+            binding_snapshot["binding_digest"],
+            created["invocation"]["invocation"]["worker_binding_digest"],
+        )
         self.assertEqual(
             "result-001",
             created["invocation"]["result"]["result_receipt_ref"],

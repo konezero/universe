@@ -139,6 +139,13 @@ CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
 PROVIDER_SETTING_SCHEMA = "universe.cli-provider-setting.v1"
 PROVIDER_SETTING_CHOICES = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
 PROVIDER_SETTING_SCOPES = frozenset({"UNIVERSE_CONDUCTOR", "PROJECT_MASTER"})
+WORKER_BINDING_SCHEMA = "universe.worker-binding-profile.v1"
+WORKER_BINDING_RESOLUTION_SCHEMA = "universe.worker-binding-resolution.v1"
+WORKER_BINDING_SCOPES = frozenset({"UNIVERSE", "PROJECT"})
+WORKER_BINDING_ROLES = frozenset(
+    {"IMPLEMENTER", "REVIEWER", "QA", "SCOUT", "ROUTINE"}
+)
+WORKER_BINDING_EFFORTS = frozenset({"AUTO", "LOW", "MEDIUM", "HIGH", "MAX"})
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 PROJECT_MASTER_STREAM_SCHEMA = "universe.project-master-stream-event.v1"
@@ -4023,6 +4030,33 @@ class UniverseStore:
                     PRIMARY KEY(scope_kind, scope_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS worker_binding_profile (
+                    profile_id TEXT PRIMARY KEY,
+                    scope_kind TEXT NOT NULL
+                        CHECK(scope_kind IN ('UNIVERSE', 'PROJECT')),
+                    scope_id TEXT NOT NULL,
+                    worker_role TEXT NOT NULL
+                        CHECK(worker_role IN (
+                            'IMPLEMENTER', 'REVIEWER', 'QA', 'SCOUT', 'ROUTINE'
+                        )),
+                    task_type TEXT NOT NULL,
+                    provider TEXT NOT NULL
+                        CHECK(provider IN ('AUTO', 'GROK', 'CODEX', 'CLAUDE')),
+                    model_ref TEXT NOT NULL,
+                    effort TEXT NOT NULL
+                        CHECK(effort IN ('AUTO', 'LOW', 'MEDIUM', 'HIGH', 'MAX')),
+                    skill_refs_json TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(scope_kind, scope_id, worker_role, task_type)
+                );
+
+                CREATE INDEX IF NOT EXISTS worker_binding_profile_scope
+                ON worker_binding_profile(
+                    scope_kind, scope_id, worker_role, task_type, enabled
+                );
+
                 CREATE TABLE IF NOT EXISTS service_setting (
                     setting_key TEXT PRIMARY KEY,
                     setting_value TEXT NOT NULL,
@@ -4221,6 +4255,264 @@ class UniverseStore:
                 self.provider_setting("PROJECT_MASTER", project["project_id"])
                 for project in self.list_projects()
             ],
+        }
+
+    def _normalize_worker_binding_profile(self, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="worker_binding_profile",
+            required=frozenset({"scope_kind", "scope_id", "worker_role", "provider"}),
+            optional=frozenset(
+                {"task_type", "model_ref", "effort", "skill_refs", "enabled"}
+            ),
+        )
+        scope_kind = _required_text(request["scope_kind"], "scope_kind").upper()
+        if scope_kind not in WORKER_BINDING_SCOPES:
+            raise UniverseError(
+                "WORKER_BINDING_SCOPE_INVALID",
+                "scope_kind must be UNIVERSE or PROJECT",
+            )
+        scope_id = _required_text(request["scope_id"], "scope_id")
+        if scope_kind == "UNIVERSE":
+            if scope_id.upper() != "UNIVERSE":
+                raise UniverseError(
+                    "WORKER_BINDING_SCOPE_INVALID",
+                    "Universe binding scope_id must be UNIVERSE",
+                )
+            scope_id = "UNIVERSE"
+        else:
+            scope_id = _project_id(scope_id)
+            self.get_project(scope_id)
+
+        worker_role = _required_text(request["worker_role"], "worker_role").upper()
+        if worker_role not in WORKER_BINDING_ROLES:
+            raise UniverseError(
+                "WORKER_BINDING_ROLE_INVALID",
+                "worker_role must be IMPLEMENTER, REVIEWER, QA, SCOUT, or ROUTINE",
+            )
+        task_type = str(request.get("task_type", "*")).strip().upper()
+        if task_type != "*":
+            task_type = _identifier(task_type, "task_type").upper()
+        provider = _required_text(request["provider"], "provider").upper()
+        if provider not in PROVIDER_SETTING_CHOICES:
+            raise UniverseError(
+                "WORKER_BINDING_PROVIDER_INVALID",
+                "provider must be AUTO, GROK, CODEX, or CLAUDE",
+            )
+        model_ref = str(request.get("model_ref", "")).strip()
+        if len(model_ref) > 256:
+            raise UniverseError(
+                "WORKER_BINDING_MODEL_INVALID", "model_ref must be at most 256 characters"
+            )
+        effort = str(request.get("effort", "AUTO")).strip().upper()
+        if effort not in WORKER_BINDING_EFFORTS:
+            raise UniverseError(
+                "WORKER_BINDING_EFFORT_INVALID",
+                "effort must be AUTO, LOW, MEDIUM, HIGH, or MAX",
+            )
+        raw_skill_refs = request.get("skill_refs", [])
+        if not isinstance(raw_skill_refs, list):
+            raise UniverseError(
+                "WORKER_BINDING_SKILLS_INVALID", "skill_refs must be an array"
+            )
+        skill_refs: list[str] = []
+        for index, raw_ref in enumerate(raw_skill_refs):
+            skill_ref = _required_text(raw_ref, f"skill_refs[{index}]")
+            if len(skill_ref) > 256 or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", skill_ref
+            ):
+                raise UniverseError(
+                    "WORKER_BINDING_SKILLS_INVALID",
+                    f"skill_refs[{index}] is not a valid Skill reference",
+                )
+            if skill_ref not in skill_refs:
+                skill_refs.append(skill_ref)
+        enabled = request.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise UniverseError(
+                "WORKER_BINDING_ENABLED_INVALID", "enabled must be boolean"
+            )
+        key = {
+            "scope_kind": scope_kind,
+            "scope_id": scope_id,
+            "worker_role": worker_role,
+            "task_type": task_type,
+        }
+        return {
+            "profile_id": "worker_binding_" + _json_sha256(key)[:24],
+            **key,
+            "provider": provider,
+            "model_ref": model_ref,
+            "effort": effort,
+            "skill_refs": skill_refs,
+            "enabled": enabled,
+        }
+
+    def upsert_worker_binding(self, value: Any) -> dict[str, Any]:
+        profile = self._normalize_worker_binding_profile(value)
+        updated_at = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT revision FROM worker_binding_profile
+                WHERE scope_kind = ? AND scope_id = ?
+                  AND worker_role = ? AND task_type = ?
+                """,
+                (
+                    profile["scope_kind"],
+                    profile["scope_id"],
+                    profile["worker_role"],
+                    profile["task_type"],
+                ),
+            ).fetchone()
+            revision = int(existing["revision"]) + 1 if existing is not None else 1
+            connection.execute(
+                """
+                INSERT INTO worker_binding_profile(
+                    profile_id, scope_kind, scope_id, worker_role, task_type,
+                    provider, model_ref, effort, skill_refs_json, enabled,
+                    revision, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_kind, scope_id, worker_role, task_type) DO UPDATE SET
+                    provider = excluded.provider,
+                    model_ref = excluded.model_ref,
+                    effort = excluded.effort,
+                    skill_refs_json = excluded.skill_refs_json,
+                    enabled = excluded.enabled,
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile["profile_id"],
+                    profile["scope_kind"],
+                    profile["scope_id"],
+                    profile["worker_role"],
+                    profile["task_type"],
+                    profile["provider"],
+                    profile["model_ref"],
+                    profile["effort"],
+                    _canonical_json(profile["skill_refs"]),
+                    int(profile["enabled"]),
+                    revision,
+                    updated_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM worker_binding_profile WHERE profile_id = ?",
+                (profile["profile_id"],),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "WORKER_BINDING_UNAVAILABLE", "worker binding was not persisted"
+            )
+        return self._worker_binding_row(row)
+
+    def list_worker_bindings(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM worker_binding_profile
+                ORDER BY scope_kind, scope_id, worker_role, task_type
+                """
+            ).fetchall()
+        return {
+            "schema": WORKER_BINDING_SCHEMA,
+            "status": "WORKER_BINDINGS_COLLECTED",
+            "profiles": [self._worker_binding_row(row) for row in rows],
+        }
+
+    def resolve_worker_binding(self, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="worker_binding_resolution",
+            required=frozenset({"worker_role"}),
+            optional=frozenset({"project_id", "task_type"}),
+        )
+        worker_role = _required_text(request["worker_role"], "worker_role").upper()
+        if worker_role not in WORKER_BINDING_ROLES:
+            raise UniverseError(
+                "WORKER_BINDING_ROLE_INVALID", "unsupported worker_role"
+            )
+        task_type = str(request.get("task_type", "*")).strip().upper()
+        if task_type != "*":
+            task_type = _identifier(task_type, "task_type").upper()
+        project_id = None
+        if request.get("project_id") is not None:
+            project_id = _project_id(request["project_id"])
+            self.get_project(project_id)
+
+        candidates: list[tuple[str, str, str]] = []
+        if project_id is not None:
+            candidates.extend(
+                [("PROJECT", project_id, task_type), ("PROJECT", project_id, "*")]
+            )
+        candidates.extend(
+            [("UNIVERSE", "UNIVERSE", task_type), ("UNIVERSE", "UNIVERSE", "*")]
+        )
+        unique_candidates = list(dict.fromkeys(candidates))
+        selected: dict[str, Any] | None = None
+        with self._connection() as connection:
+            for scope_kind, scope_id, candidate_task_type in unique_candidates:
+                row = connection.execute(
+                    """
+                    SELECT * FROM worker_binding_profile
+                    WHERE scope_kind = ? AND scope_id = ? AND worker_role = ?
+                      AND task_type = ? AND enabled = 1
+                    """,
+                    (scope_kind, scope_id, worker_role, candidate_task_type),
+                ).fetchone()
+                if row is not None:
+                    selected = self._worker_binding_row(row)
+                    break
+
+        if selected is None:
+            selected = {
+                "profile_id": "DEFAULT_AUTO",
+                "scope_kind": "DEFAULT",
+                "scope_id": project_id or "UNIVERSE",
+                "worker_role": worker_role,
+                "task_type": task_type,
+                "provider": "AUTO",
+                "model_ref": "",
+                "effort": "AUTO",
+                "skill_refs": [],
+                "enabled": True,
+                "revision": 0,
+                "updated_at": None,
+            }
+        snapshot = {
+            "schema": "universe.worker-binding-snapshot.v1",
+            **selected,
+        }
+        snapshot["binding_digest"] = _json_sha256(snapshot)
+        return {
+            "schema": WORKER_BINDING_RESOLUTION_SCHEMA,
+            "status": "WORKER_BINDING_RESOLVED",
+            "request": {
+                "project_id": project_id,
+                "worker_role": worker_role,
+                "task_type": task_type,
+            },
+            "snapshot": snapshot,
+            "resolved_at": utc_now(),
+        }
+
+    @staticmethod
+    def _worker_binding_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": WORKER_BINDING_SCHEMA,
+            "profile_id": str(row["profile_id"]),
+            "scope_kind": str(row["scope_kind"]),
+            "scope_id": str(row["scope_id"]),
+            "worker_role": str(row["worker_role"]),
+            "task_type": str(row["task_type"]),
+            "provider": str(row["provider"]),
+            "model_ref": str(row["model_ref"]),
+            "effort": str(row["effort"]),
+            "skill_refs": json.loads(row["skill_refs_json"]),
+            "enabled": bool(row["enabled"]),
+            "revision": int(row["revision"]),
+            "updated_at": str(row["updated_at"]),
         }
 
     def get_service_settings(self) -> dict[str, Any]:
@@ -9280,10 +9572,62 @@ class UniverseStore:
         runtime_host: UniverseRuntimeHost,
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "RUNTIME_WORKER_REQUEST_INVALID", "worker invocation must be an object"
+            )
+        material = dict(value)
+        binding_request = {
+            "project_id": project["project_id"],
+            "worker_role": material.pop("worker_role", "ROUTINE"),
+            "task_type": material.pop("task_type", "*"),
+        }
+        binding_resolution = self.resolve_worker_binding(binding_request)
+        binding_snapshot = binding_resolution["snapshot"]
+        configured_provider = binding_snapshot["provider"]
+        requested_provider = str(material.get("provider", "AUTO")).strip().upper()
+        if configured_provider != "AUTO":
+            if requested_provider not in {"AUTO", configured_provider}:
+                raise UniverseError(
+                    "WORKER_BINDING_PROVIDER_MISMATCH",
+                    "request provider does not match the selected Worker Binding",
+                    HTTPStatus.CONFLICT,
+                )
+            material["provider"] = configured_provider
+        elif requested_provider == "AUTO":
+            available = [
+                item["provider"]
+                for item in runtime_host.provider_capabilities()
+                if item.get("status") == "AVAILABLE"
+                and item.get("provider") in {"GROK", "CODEX", "CLAUDE"}
+            ]
+            if not available:
+                raise UniverseError(
+                    "WORKER_PROVIDER_UNAVAILABLE",
+                    "AUTO Worker Binding could not resolve an available provider",
+                )
+            material["provider"] = next(
+                provider
+                for provider in ("GROK", "CODEX", "CLAUDE")
+                if provider in available
+            )
+        context_pack = material.get("context_pack")
+        if not isinstance(context_pack, Mapping):
+            raise UniverseError(
+                "RUNTIME_WORKER_REQUEST_INVALID", "context_pack must be an object"
+            )
+        material["context_pack"] = {
+            **dict(context_pack),
+            "worker_binding_snapshot": binding_snapshot,
+        }
         try:
-            redacted = redacted_invocation_record(value)
+            redacted = redacted_invocation_record(material)
         except RuntimeHostError as error:
             raise UniverseError(error.code, error.detail) from error
+        redacted.pop("request_digest", None)
+        redacted["worker_binding_snapshot"] = binding_snapshot
+        redacted["worker_binding_digest"] = binding_snapshot["binding_digest"]
+        redacted["request_digest"] = _json_sha256(redacted)
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
@@ -9319,7 +9663,7 @@ class UniverseStore:
                 ),
             )
         try:
-            result = runtime_host.invoke_read_only(value)
+            result = runtime_host.invoke_read_only(material)
         except RuntimeHostError as error:
             result = {
                 "status": "RUNTIME_HOST_UNAVAILABLE",
@@ -11296,6 +11640,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self.server.provider_settings(),
             )
             return
+        if path == "/v1/settings/worker-bindings":
+            self._send(
+                HTTPStatus.OK,
+                self.server.store.list_worker_bindings(),
+            )
+            return
         if path == "/v1/settings/service":
             settings = self.server.store.get_service_settings()
             settings["worker"] = self.server.memory_maintain_worker_status()
@@ -11880,6 +12230,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "operation": operation.upper().replace("-", "_"),
                         "result": result,
                     },
+                )
+                return
+            if path == "/v1/settings/worker-bindings":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "WORKER_BINDING_UPDATED",
+                        "profile": self.server.store.upsert_worker_binding(body),
+                    },
+                )
+                return
+            if path == "/v1/settings/worker-bindings/resolve":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.resolve_worker_binding(body),
                 )
                 return
             if path == "/v1/settings/service":

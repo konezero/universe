@@ -536,17 +536,17 @@ class CodexAppServerSession:
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
         self._active_delta: Callable[[str], None] | None = None
+        self._active_final_text: str | None = None
         self._turn_events: dict[str, threading.Event] = {}
         self._completed_turns: set[str] = set()
+        self._turn_statuses: dict[str, str] = {}
+        transport_arguments = ["app-server"]
+        if self.model.casefold() not in {"auto", "default"}:
+            transport_arguments.extend(("-c", f"model={json.dumps(self.model)}"))
+        transport_arguments.extend(("--listen", "stdio://"))
         self._transport = JsonRpcStdioProcess(
             executable=executable,
-            arguments=(
-                "app-server",
-                "-c",
-                f"model={json.dumps(self.model)}",
-                "--listen",
-                "stdio://",
-            ),
+            arguments=tuple(transport_arguments),
             cwd=cwd,
             environment=environment,
             request_handler=self._handle_request,
@@ -576,6 +576,7 @@ class CodexAppServerSession:
             on_delta(delta)
 
         self._active_delta = receive
+        self._active_final_text = None
         try:
             result = self._transport.request(
                 "turn/start",
@@ -602,9 +603,19 @@ class CodexAppServerSession:
                 event.set()
             if not event.wait(300):
                 raise AgentSessionError("CODEX_TURN_TIMED_OUT")
+            turn_status = self._turn_statuses.pop(turn_id, "completed")
+            if turn_status != "completed":
+                raise AgentSessionError("CODEX_TURN_FAILED")
         finally:
             self._active_delta = None
-        output = "".join(parts).strip()
+        final_text = self._active_final_text
+        self._active_final_text = None
+        if final_text is not None:
+            output = final_text.strip()
+            if output and not parts:
+                on_delta(output)
+        else:
+            output = "".join(parts).strip()
         if not output:
             raise AgentSessionError("CODEX_RESPONSE_MISSING")
         return output
@@ -676,6 +687,15 @@ class CodexAppServerSession:
             if isinstance(delta, str) and delta:
                 self._active_delta(delta)
             return
+        if method == "item/completed":
+            item = params.get("item")
+            if (
+                isinstance(item, Mapping)
+                and item.get("type") == "agentMessage"
+                and isinstance(item.get("text"), str)
+            ):
+                self._active_final_text = item["text"]
+            return
         if method != "turn/completed":
             return
         turn = params.get("turn")
@@ -684,6 +704,9 @@ class CodexAppServerSession:
         turn_id = turn.get("id")
         if not isinstance(turn_id, str) or not turn_id:
             return
+        status = turn.get("status")
+        if isinstance(status, str) and status:
+            self._turn_statuses[turn_id] = status
         self._completed_turns.add(turn_id)
         self._turn_events.setdefault(turn_id, threading.Event()).set()
 

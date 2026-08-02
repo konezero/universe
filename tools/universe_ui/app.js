@@ -33,6 +33,7 @@ const state = {
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
+  workerBindings: null,
   hostTools: null,
   supervisorSessions: [],
   supervisorEvents: [],
@@ -129,6 +130,9 @@ const elements = {
   projectFormError: document.querySelector("#project-form-error"),
   settingsButton: document.querySelector("#settings-button"),
   sessionObservatoryButton: document.querySelector("#session-observatory-button"),
+  sessionObservatoryTopbarButton: document.querySelector(
+    "#session-observatory-topbar-button"
+  ),
   sessionProviderLine: document.querySelector("#session-provider-line"),
   sessionObservatoryDialog: document.querySelector("#session-observatory-dialog"),
   sessionObservatorySummary: document.querySelector("#session-observatory-summary"),
@@ -163,6 +167,8 @@ const elements = {
   memoryMaintainStatus: document.querySelector("#memory-maintain-status"),
   universeProviderStatus: document.querySelector("#universe-provider-status"),
   projectProviderSettings: document.querySelector("#project-provider-settings"),
+  workerBindingScope: document.querySelector("#worker-binding-scope"),
+  workerBindingSettings: document.querySelector("#worker-binding-settings"),
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
@@ -640,7 +646,7 @@ function updateGraphChrome() {
   }
 }
 
-async function refresh() {
+async function refresh({ syncSelectedProject = false } = {}) {
   try {
     const health = await fetch("/health", { cache: "no-store" }).then((response) =>
       response.json()
@@ -693,9 +699,15 @@ async function refresh() {
         (project) => project.project_id === state.selectedProject.project_id
       );
     if (preferred) {
-      await selectProject(preferred.project_id);
+      await selectProject(preferred.project_id, {
+        revealInspector: !state.inspectorDismissed,
+        syncAssets: syncSelectedProject,
+      });
     } else if (state.projects.length) {
-      await selectProject(state.projects[0].project_id);
+      await selectProject(state.projects[0].project_id, {
+        revealInspector: !window.matchMedia("(max-width: 720px)").matches,
+        syncAssets: syncSelectedProject,
+      });
     } else {
       state.selectedProject = null;
       state.projection = null;
@@ -854,18 +866,23 @@ async function proposeProjectRelease(releaseId) {
   }
 }
 
-async function selectProject(projectId) {
+async function selectProject(
+  projectId,
+  { revealInspector = true, syncAssets = false } = {}
+) {
   const project = state.projects.find((item) => item.project_id === projectId);
   if (!project) return;
   state.selectedProject = project;
   state.selectedNode = null;
   state.focusedNodeId = null;
-  state.inspectorDismissed = false;
+  state.inspectorDismissed = !revealInspector;
   renderProjects();
-  await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
-    method: "POST",
-    body: {},
-  }).catch(() => null);
+  if (syncAssets) {
+    await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
+      method: "POST",
+      body: {},
+    }).catch((error) => toast(error.message, true));
+  }
   const [
     projectionResult,
     dispatchResult,
@@ -1224,6 +1241,76 @@ function renderProviderSettings() {
   }
 }
 
+function renderWorkerBindingSettings() {
+  if (!elements.workerBindingScope || !elements.workerBindingSettings) return;
+  const previousScope = elements.workerBindingScope.value || "UNIVERSE:UNIVERSE";
+  elements.workerBindingScope.replaceChildren();
+  const scopes = [
+    { value: "UNIVERSE:UNIVERSE", label: "Universe defaults" },
+    ...state.projects.map((project) => ({
+      value: `PROJECT:${project.project_id}`,
+      label: `${project.project_id} project`,
+    })),
+  ];
+  for (const scope of scopes) {
+    const option = node("option", "", scope.label);
+    option.value = scope.value;
+    elements.workerBindingScope.append(option);
+  }
+  elements.workerBindingScope.value = scopes.some(
+    (scope) => scope.value === previousScope
+  )
+    ? previousScope
+    : "UNIVERSE:UNIVERSE";
+  const [scopeKind, scopeId] = elements.workerBindingScope.value.split(":", 2);
+  const profiles = state.workerBindings?.profiles || [];
+  elements.workerBindingSettings.replaceChildren();
+  for (const role of ["IMPLEMENTER", "REVIEWER", "QA", "SCOUT", "ROUTINE"]) {
+    const profile = profiles.find(
+      (item) =>
+        item.scope_kind === scopeKind &&
+        item.scope_id === scopeId &&
+        item.worker_role === role &&
+        item.task_type === "*"
+    );
+    const row = node("div", "worker-binding-row");
+    row.dataset.role = role;
+    const copy = node("div", "worker-binding-copy");
+    copy.append(
+      node("strong", "", role[0] + role.slice(1).toLowerCase()),
+      node(
+        "small",
+        "",
+        profile ? `Revision ${profile.revision}` : "Inherited AUTO"
+      )
+    );
+    const provider = node("select", "worker-binding-provider");
+    for (const value of ["AUTO", "GROK", "CODEX", "CLAUDE"]) {
+      const option = node("option", "", value[0] + value.slice(1).toLowerCase());
+      option.value = value;
+      provider.append(option);
+    }
+    provider.value = profile?.provider || "AUTO";
+    const model = node("input", "worker-binding-model");
+    model.type = "text";
+    model.placeholder = "Host default";
+    model.value = profile?.model_ref || "";
+    const effort = node("select", "worker-binding-effort");
+    for (const value of ["AUTO", "LOW", "MEDIUM", "HIGH", "MAX"]) {
+      const option = node("option", "", value[0] + value.slice(1).toLowerCase());
+      option.value = value;
+      effort.append(option);
+    }
+    effort.value = profile?.effort || "AUTO";
+    const skills = node("input", "worker-binding-skills");
+    skills.type = "text";
+    skills.placeholder = "skill-a, skill-b";
+    skills.value = (profile?.skill_refs || []).join(", ");
+    row.append(copy, provider, model, effort, skills);
+    elements.workerBindingSettings.append(row);
+  }
+}
+
 function renderHostToolSettings() {
   const profile = state.hostTools;
   if (!profile) return;
@@ -1363,12 +1450,17 @@ function renderLocalServiceStatus() {
 
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
-  [state.providerSettings, state.hostTools, state.serviceSettings] =
-    await Promise.all([
-      api("/v1/settings/providers"),
-      api("/v1/settings/host-tools"),
-      api("/v1/settings/service").catch(() => null),
-    ]);
+  [
+    state.providerSettings,
+    state.workerBindings,
+    state.hostTools,
+    state.serviceSettings,
+  ] = await Promise.all([
+    api("/v1/settings/providers"),
+    api("/v1/settings/worker-bindings"),
+    api("/v1/settings/host-tools"),
+    api("/v1/settings/service").catch(() => null),
+  ]);
   if (elements.memoryMaintainInterval && state.serviceSettings?.memory_maintain) {
     elements.memoryMaintainInterval.value = String(
       state.serviceSettings.memory_maintain.interval_hours ?? 0
@@ -1382,6 +1474,7 @@ async function openProviderSettings() {
       : "0 = off. Server runs HEURISTIC maintain when > 0.";
   }
   renderProviderSettings();
+  renderWorkerBindingSettings();
   renderHostToolSettings();
   renderLocalServiceStatus();
   elements.settingsDialog.showModal();
@@ -1408,6 +1501,31 @@ async function submitProviderSettings(event) {
         })
       );
     }
+    const [scopeKind, scopeId] = elements.workerBindingScope.value.split(":", 2);
+    for (const row of elements.workerBindingSettings.querySelectorAll(
+      ".worker-binding-row"
+    )) {
+      requests.push(
+        api("/v1/settings/worker-bindings", {
+          method: "POST",
+          body: {
+            scope_kind: scopeKind,
+            scope_id: scopeId,
+            worker_role: row.dataset.role,
+            task_type: "*",
+            provider: row.querySelector(".worker-binding-provider").value,
+            model_ref: row.querySelector(".worker-binding-model").value.trim(),
+            effort: row.querySelector(".worker-binding-effort").value,
+            skill_refs: row
+              .querySelector(".worker-binding-skills")
+              .value.split(",")
+              .map((value) => value.trim())
+              .filter(Boolean),
+            enabled: true,
+          },
+        })
+      );
+    }
     await Promise.all(requests);
     if (elements.memoryMaintainInterval) {
       const hours = Number(elements.memoryMaintainInterval.value || 0);
@@ -1416,8 +1534,12 @@ async function submitProviderSettings(event) {
         body: { memory_maintain: { interval_hours: Number.isFinite(hours) ? hours : 0 } },
       });
     }
-    state.providerSettings = await api("/v1/settings/providers");
+    [state.providerSettings, state.workerBindings] = await Promise.all([
+      api("/v1/settings/providers"),
+      api("/v1/settings/worker-bindings"),
+    ]);
     renderProviderSettings();
+    renderWorkerBindingSettings();
     renderComposerState();
     elements.settingsDialog.close();
     toast("Settings saved");
@@ -4708,7 +4830,7 @@ function toast(message, error = false) {
 function bindEvents() {
   document
     .querySelector("#refresh-button")
-    .addEventListener("click", refresh);
+    .addEventListener("click", () => refresh({ syncSelectedProject: true }));
   elements.todoButton.addEventListener("click", () => openTodoDialog(false));
   elements.todoForm.addEventListener("submit", submitTodo);
   elements.todoScope.addEventListener("change", renderTodoScopeControls);
@@ -4749,14 +4871,22 @@ function bindEvents() {
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
-  elements.sessionObservatoryButton.addEventListener("click", async () => {
+  const openSessionObservatory = async () => {
     try {
       await refreshSupervisorSessions();
       elements.sessionObservatoryDialog.showModal();
     } catch (error) {
       toast(error.message, true);
     }
-  });
+  };
+  elements.sessionObservatoryButton.addEventListener(
+    "click",
+    openSessionObservatory
+  );
+  elements.sessionObservatoryTopbarButton.addEventListener(
+    "click",
+    openSessionObservatory
+  );
   elements.refreshSessionsButton.addEventListener("click", () => {
     refreshSupervisorSessions().catch((error) => toast(error.message, true));
   });
@@ -4830,6 +4960,7 @@ function bindEvents() {
     );
   });
   elements.projectForm.addEventListener("submit", submitProject);
+  elements.workerBindingScope.addEventListener("change", renderWorkerBindingSettings);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
 
   if (elements.viewModeSelect) {
