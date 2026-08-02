@@ -521,6 +521,69 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertFalse(start["ephemeral"])
         self.assertTrue(transport.closed)
 
+    def test_codex_additional_permissions_preserve_profile_and_scope(self) -> None:
+        selected: list[dict[str, Any]] = []
+        requested = {
+            "network": {"enabled": True},
+            "fileSystem": {
+                "entries": [
+                    {
+                        "access": "write",
+                        "path": {"type": "path", "path": str(self.root)},
+                    }
+                ]
+            },
+        }
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id=None,
+                permission_requester=lambda request: (
+                    selected.append(dict(request)) or "grantForSession"
+                ),
+                session_observer=lambda _session_id: None,
+            )
+            params = {
+                "threadId": "codex-thread-001",
+                "turnId": "turn-001",
+                "itemId": "item-001",
+                "startedAtMs": 1,
+                "cwd": str(self.root),
+                "environmentId": "local",
+                "reason": "Need bounded access",
+                "permissions": requested,
+            }
+            granted = session._handle_request(
+                "item/permissions/requestApproval",
+                params,
+            )
+            session.permission_requester = lambda _request: None
+            denied = session._handle_request(
+                "item/permissions/requestApproval",
+                params,
+            )
+            session.close()
+
+        self.assertEqual(
+            {"permissions": requested, "scope": "session"},
+            granted,
+        )
+        self.assertEqual({"permissions": {}, "scope": "turn"}, denied)
+        self.assertEqual(
+            requested,
+            selected[0]["tool_call"]["requestedPermissions"],
+        )
+        self.assertEqual(
+            ["grantForTurn", "grantForSession", "decline"],
+            [option["optionId"] for option in selected[0]["options"]],
+        )
+
     def test_codex_uses_completed_agent_message_when_delta_is_absent(self) -> None:
         class CompletedItemOnlyTransport(FakeJsonRpcTransport):
             def request(

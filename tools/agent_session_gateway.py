@@ -24,6 +24,33 @@ GROK_PERMISSION_MODE = "default"
 CODEX_APPROVAL_POLICY = "on-request"
 CLAUDE_PERMISSION_MODE = "plan"
 
+# Claude Code routes permission prompts to the MCP tool named by
+# --permission-prompt-tool. Verified against claude-code 2.1.212: the flag is
+# accepted (it is hidden from --help), and in plan mode file edits and
+# file-modifying shell commands are never auto-approved -- they reach the
+# prompt tool instead.
+CLAUDE_PERMISSION_TOOL_SERVER = "universe_permission"
+CLAUDE_PERMISSION_TOOL_NAME = "approve"
+CLAUDE_PERMISSION_PROMPT_TOOL = (
+    f"mcp__{CLAUDE_PERMISSION_TOOL_SERVER}__{CLAUDE_PERMISSION_TOOL_NAME}"
+)
+# Read-only tools the resident session may pre-approve. Anything that writes,
+# executes a shell, or reaches the network must go through the prompt tool.
+CLAUDE_READ_ONLY_TOOLS = ("Read", "Glob", "Grep")
+# Argument vectors that would bypass or pre-approve permission checks.
+CLAUDE_FORBIDDEN_ARGUMENTS = frozenset(
+    {
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--yolo",
+    }
+)
+# Permission modes that do not route write or shell execution to the prompt
+# tool. ``plan`` and ``default`` both reach it; the modes below do not.
+CLAUDE_FORBIDDEN_PERMISSION_MODES = frozenset(
+    {"acceptEdits", "auto", "bypassPermissions", "dontAsk"}
+)
+
 
 class AgentSessionError(RuntimeError):
     pass
@@ -40,6 +67,49 @@ def cli_auto_approve_status(
     if normalized == "CLAUDE":
         return "OFF" if CLAUDE_PERMISSION_MODE == "plan" else "UNKNOWN"
     return "UNKNOWN"
+
+
+def permission_bridge_status(provider: str) -> dict[str, Any]:
+    """Report whether a provider can surface permission requests to Universe.
+
+    ``AVAILABLE`` means the adapter forwards provider permission requests
+    through ``universe.agent-permission-request.v1``. ``UNAVAILABLE`` means the
+    provider offers no such channel; the adapter must fail closed instead of
+    synthesizing an approval.
+    """
+
+    normalized = str(provider).strip().upper()
+    if normalized == "GROK":
+        return {
+            "provider": normalized,
+            "status": "AVAILABLE",
+            "transport": "session/request_permission",
+            "option_kinds": sorted(PERMISSION_KINDS),
+            "evidence_ref": "acp session/request_permission",
+        }
+    if normalized == "CODEX":
+        return {
+            "provider": normalized,
+            "status": "AVAILABLE",
+            "transport": "item/permissions/requestApproval",
+            "option_kinds": ["allow_once", "allow_always", "reject_once"],
+            "evidence_ref": "codex app-server approval requests",
+        }
+    if normalized == "CLAUDE":
+        return {
+            "provider": normalized,
+            "status": "AVAILABLE",
+            "transport": CLAUDE_PERMISSION_PROMPT_TOOL,
+            "option_kinds": ["allow_once", "allow_always", "reject_once"],
+            "evidence_ref": "claude-code --permission-prompt-tool mcp bridge",
+        }
+    return {
+        "provider": normalized,
+        "status": "UNKNOWN",
+        "transport": "UNKNOWN",
+        "option_kinds": [],
+        "evidence_ref": "UNKNOWN",
+    }
 
 
 class PermissionRequester(Protocol):
@@ -724,6 +794,8 @@ class CodexAppServerSession:
                 params,
                 ["accept", "acceptForSession", "decline", "cancel"],
             )
+        if method == "item/permissions/requestApproval":
+            return self._codex_permissions_approval(params)
         raise AgentSessionError("CODEX_APP_REQUEST_UNSUPPORTED")
 
     def _codex_approval(
@@ -774,6 +846,56 @@ class CodexAppServerSession:
         if option_id not in {option["optionId"] for option in request["options"]}:
             raise AgentSessionError("AGENT_PERMISSION_OPTION_UNKNOWN")
         return {"decision": option_id}
+
+    def _codex_permissions_approval(
+        self,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        permissions = params.get("permissions")
+        if not isinstance(permissions, Mapping):
+            raise AgentSessionError("CODEX_PERMISSION_PROFILE_INVALID")
+        requested_permissions = _json_object(permissions)
+        options = [
+            {
+                "optionId": "grantForTurn",
+                "name": "Allow for this turn",
+                "kind": "allow_once",
+            },
+            {
+                "optionId": "grantForSession",
+                "name": "Allow for this session",
+                "kind": "allow_always",
+            },
+            {
+                "optionId": "decline",
+                "name": "Reject",
+                "kind": "reject_once",
+            },
+        ]
+        request = normalize_permission_request(
+            {
+                "request_id": f"permission_{uuid4().hex}",
+                "provider": "CODEX",
+                "session_id": params.get("threadId"),
+                "tool_call": {
+                    "toolCallId": params.get("itemId"),
+                    "title": "item/permissions/requestApproval",
+                    "cwd": params.get("cwd"),
+                    "environmentId": params.get("environmentId"),
+                    "reason": params.get("reason"),
+                    "requestedPermissions": requested_permissions,
+                },
+                "options": options,
+            }
+        )
+        option_id = self.permission_requester(request) or "decline"
+        if option_id == "grantForTurn":
+            return {"permissions": requested_permissions, "scope": "turn"}
+        if option_id == "grantForSession":
+            return {"permissions": requested_permissions, "scope": "session"}
+        if option_id == "decline":
+            return {"permissions": {}, "scope": "turn"}
+        raise AgentSessionError("AGENT_PERMISSION_OPTION_UNKNOWN")
 
 
 class ClaudeCodeSession:
@@ -837,7 +959,7 @@ class ClaudeCodeSession:
             str(self.max_turns),
             "--strict-mcp-config",
             "--tools",
-            "" if self.ephemeral else "Read,Glob,Grep",
+            "" if self.ephemeral else ",".join(CLAUDE_READ_ONLY_TOOLS),
         ]
         if self.ephemeral:
             arguments.append("--no-session-persistence")
@@ -859,6 +981,7 @@ class ClaudeCodeSession:
                 )
             )
         try:
+            self._assert_fail_closed(arguments)
             result = self.native_runner(
                 NativeCliRequest(
                     executable=self.executable,
@@ -906,6 +1029,39 @@ class ClaudeCodeSession:
 
     def close(self) -> None:
         return None
+
+    @staticmethod
+    def _argument_value(arguments: list[str], flag: str, error_code: str) -> str:
+        if flag not in arguments:
+            raise AgentSessionError(error_code)
+        index = arguments.index(flag) + 1
+        if index >= len(arguments):
+            raise AgentSessionError(error_code)
+        return arguments[index]
+
+    @staticmethod
+    def _assert_fail_closed(arguments: list[str]) -> None:
+        """Refuse to launch unless the argument vector keeps the prompt gate.
+
+        Anything beyond the read-only tool set must reach the Universe
+        permission UI through the ``--permission-prompt-tool`` bridge, so the
+        adapter must never pre-approve a write, shell, or network capable tool
+        and must never bypass the CLI permission check.
+        """
+
+        if CLAUDE_FORBIDDEN_ARGUMENTS.intersection(arguments):
+            raise AgentSessionError("CLAUDE_PERMISSION_BYPASS_FORBIDDEN")
+        mode = ClaudeCodeSession._argument_value(
+            arguments, "--permission-mode", "CLAUDE_PERMISSION_MODE_REQUIRED"
+        )
+        if mode in CLAUDE_FORBIDDEN_PERMISSION_MODES:
+            raise AgentSessionError("CLAUDE_PERMISSION_MODE_FORBIDDEN")
+        granted = ClaudeCodeSession._argument_value(
+            arguments, "--tools", "CLAUDE_TOOL_GRANT_REQUIRED"
+        )
+        requested = {name.strip() for name in granted.split(",") if name.strip()}
+        if not requested.issubset(CLAUDE_READ_ONLY_TOOLS):
+            raise AgentSessionError("CLAUDE_WRITE_TOOL_FORBIDDEN")
 
     def _prompt_file(self, text: str) -> Path:
         root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
