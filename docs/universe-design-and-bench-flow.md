@@ -391,6 +391,22 @@ relations remain distinct from observed evidence. Career adoption is separate.
     backend or command protocol. OAuth, P2P, and Universe peer networking remain
     later adapters. See `docs/universe-network-architecture.md`.
 
+14. Separate provider execution capability from three-tier model binding.
+    Host Profile retains executable, authentication availability, and transport
+    capability only. Universe Binding DB independently selects Provider, Model,
+    Reasoning Effort, and fallback chain for `INTERACTIVE_SESSION`,
+    `TASK_FRAME_BOSS`, and `TASK_FRAME_WORKER`, with Node/Task override,
+    Project default, Universe default, then Host fallback precedence.
+    Master room UI lists saved Provider Sessions, allows one active selection per
+    Node/Mode, and treats a Provider or Model change as a new prepared session
+    while retaining prior session history.
+    Normalize every provider behind one ACP client contract with capability
+    negotiation: Grok uses native ACP; Codex uses a pinned `codex-acp` or
+    equivalent validated app-server adapter; Claude uses a pinned
+    `claude-agent-acp` adapter. Print-mode CLI remains `LEGACY_LIMITED` and must
+    not claim ACP parity. Usage/quota HUD state and provider-limit rebinding
+    belong to this binding layer.
+
 ## Runtime Boundary
 
 Universe consumes the installed ai-career Skill binding and observation
