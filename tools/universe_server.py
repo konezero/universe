@@ -10343,6 +10343,150 @@ class ProjectRoomEventHub:
                 self._condition.wait(remaining)
 
 
+class ConductorPermissionBridge:
+    """Process-local approval bridge for the active Conductor provider turn."""
+
+    def __init__(self, *, timeout_seconds: float = 600.0) -> None:
+        self.timeout_seconds = max(0.01, float(timeout_seconds))
+        self._lock = threading.RLock()
+        self._context = threading.local()
+        self._requests: dict[str, dict[str, Any]] = {}
+        self._waiters: dict[str, dict[str, Any]] = {}
+
+    @contextmanager
+    def message_context(self, message_id: str):
+        normalized = _required_text(message_id, "message_id")
+        previous = getattr(self._context, "message_id", None)
+        self._context.message_id = normalized
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._context.message_id
+            else:
+                self._context.message_id = previous
+
+    def request(self, permission: Mapping[str, Any]) -> str | None:
+        try:
+            normalized = normalize_permission_request(permission)
+        except AgentSessionError as error:
+            raise UniverseError(
+                "AGENT_PERMISSION_REQUEST_INVALID",
+                str(error),
+            ) from error
+        message_id = getattr(self._context, "message_id", None)
+        if not isinstance(message_id, str) or not message_id:
+            raise UniverseError(
+                "CONDUCTOR_PERMISSION_CONTEXT_UNAVAILABLE",
+                "Conductor permission request has no active room message",
+                HTTPStatus.CONFLICT,
+            )
+        request_id = normalized["request_id"]
+        option_ids = {option["optionId"] for option in normalized["options"]}
+        waiter = {
+            "event": threading.Event(),
+            "options": option_ids,
+            "option_id": None,
+        }
+        requested_at = utc_now()
+        record = {
+            **normalized,
+            "scope_kind": "UNIVERSE_CONDUCTOR",
+            "scope_id": "CONDUCTOR",
+            "in_reply_to": message_id,
+            "state": "PENDING",
+            "selected_option_id": None,
+            "requested_at": requested_at,
+            "resolved_at": None,
+            "persistence": "PROCESS_LOCAL",
+        }
+        with self._lock:
+            if request_id in self._requests:
+                raise UniverseError(
+                    "AGENT_PERMISSION_REQUEST_DUPLICATE",
+                    "Conductor permission request id is already active",
+                    HTTPStatus.CONFLICT,
+                )
+            self._requests[request_id] = record
+            self._waiters[request_id] = waiter
+        if not waiter["event"].wait(self.timeout_seconds):
+            with self._lock:
+                current = self._requests.get(request_id)
+                if current is not None and current["state"] == "PENDING":
+                    current["state"] = "CANCELLED"
+                    current["resolved_at"] = utc_now()
+                self._waiters.pop(request_id, None)
+            return None
+        with self._lock:
+            selected = waiter["option_id"]
+            self._waiters.pop(request_id, None)
+        return str(selected) if selected else None
+
+    def list_requests(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._lock:
+            records = list(self._requests.values())[-bounded_limit:]
+            return [json.loads(_canonical_json(record)) for record in records]
+
+    def resolve(
+        self,
+        request_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        normalized_id = _required_text(request_id, "request_id")
+        decision = normalize_permission_decision(value)
+        option_id = decision["option_id"]
+        with self._lock:
+            record = self._requests.get(normalized_id)
+            if record is None:
+                raise UniverseError(
+                    "AGENT_PERMISSION_NOT_FOUND",
+                    "Conductor permission request does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if option_id not in {
+                option["optionId"] for option in record["options"]
+            }:
+                raise UniverseError(
+                    "AGENT_PERMISSION_OPTION_UNKNOWN",
+                    "selected option is not offered by this request",
+                    HTTPStatus.CONFLICT,
+                )
+            if record["state"] != "PENDING":
+                if record["selected_option_id"] == option_id:
+                    return json.loads(_canonical_json(record)), False
+                raise UniverseError(
+                    "AGENT_PERMISSION_ALREADY_RESOLVED",
+                    "permission request already has another decision",
+                    HTTPStatus.CONFLICT,
+                )
+            waiter = self._waiters.get(normalized_id)
+            if waiter is None:
+                raise UniverseError(
+                    "AGENT_PERMISSION_SESSION_UNAVAILABLE",
+                    "resident Conductor session cannot accept this decision",
+                    HTTPStatus.CONFLICT,
+                )
+            record["state"] = "RESOLVED"
+            record["selected_option_id"] = option_id
+            record["resolved_at"] = utc_now()
+            waiter["option_id"] = option_id
+            result = json.loads(_canonical_json(record))
+            waiter["event"].set()
+            return result, True
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            waiters = list(self._waiters.items())
+            self._waiters.clear()
+            for request_id, waiter in waiters:
+                record = self._requests.get(request_id)
+                if record is not None and record["state"] == "PENDING":
+                    record["state"] = "CANCELLED"
+                    record["resolved_at"] = utc_now()
+                waiter["event"].set()
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -10394,6 +10538,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_stop = threading.Event()
         self._conductor_session_error: dict[str, str] | None = None
         self.project_room_events = ProjectRoomEventHub()
+        self.conductor_permissions = ConductorPermissionBridge()
         super().__init__(address, UniverseRequestHandler)
         self.conductor_session_host = (
             ResidentModeSessionHost(
@@ -10405,6 +10550,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 session_supervisor=self.session_supervisor,
                 continuity_coordinator=self.continuity_coordinator,
                 coordinate_resolver=self._conductor_continuity_coordinate,
+                permission_requester=self.conductor_permissions.request,
                 provider_factory=conductor_session_provider_factory,
             )
             if auto_start_conductor_runtime
@@ -11152,6 +11298,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.publish_agent_permission(project_id, permission)
         return permission, changed
 
+    def resolve_conductor_permission(
+        self,
+        request_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        return self.conductor_permissions.resolve(request_id, value)
+
     def _conductor_worker_loop(self) -> None:
         while not self._conductor_stop.is_set():
             message_id = self._conductor_queue.get()
@@ -11238,10 +11391,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "commander_surface": "UNIVERSE_UI",
                     "history": history[-50:],
                 }
-                session_result = self.conductor_session_host.reply(
-                    provider,
-                    worker_message,
-                )
+                with self.conductor_permissions.message_context(message_id):
+                    session_result = self.conductor_session_host.reply(
+                        provider,
+                        worker_message,
+                    )
                 self.store.complete_conductor_room_message(
                     message_id,
                     provider=provider,
@@ -11486,6 +11640,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "memory_maintenance_worker",
                 lambda: self._maintain_worker.join(timeout=5),
             )
+        self.conductor_permissions.cancel_all()
         self._conductor_stop.set()
         self._conductor_queue.put(None)
         if self._conductor_worker.is_alive():
@@ -11716,6 +11871,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "CONDUCTOR_ROOM_MESSAGES_COLLECTED",
                     "messages": self.server.store.list_conductor_room_messages(),
+                    "permissions": self.server.conductor_permissions.list_requests(),
                     "runtime_binding": self.server.planning_binding_status(),
                 },
             )
@@ -12657,6 +12813,25 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     result,
                 )
                 return
+            conductor_permission_id = self._conductor_permission_path(path)
+            if conductor_permission_id is not None:
+                permission, changed = self.server.resolve_conductor_permission(
+                    conductor_permission_id,
+                    body,
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "AGENT_PERMISSION_RESOLVED"
+                            if changed
+                            else "AGENT_PERMISSION_ALREADY_RESOLVED"
+                        ),
+                        "permission": permission,
+                    },
+                )
+                return
             permission_parts = self._agent_permission_path(path)
             if permission_parts is not None:
                 permission, changed = self.server.resolve_agent_permission(
@@ -13395,6 +13570,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if remainder.endswith(suffix):
                 return unquote(remainder[: -len(suffix)]), suffix
         return unquote(remainder), ""
+
+    @staticmethod
+    def _conductor_permission_path(path: str) -> str | None:
+        prefix = "/v1/conductor-room/agent-session/permissions/"
+        suffix = "/decision"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        request_id = unquote(path[len(prefix) : -len(suffix)])
+        if not request_id or "/" in request_id:
+            return None
+        return request_id
 
     @staticmethod
     def _agent_permission_path(path: str) -> tuple[str, str] | None:

@@ -30,6 +30,7 @@ from core_release import build_release  # noqa: E402
 from host_profile import HostProfileStore  # noqa: E402
 from project_seed_assets import materialize_project_seed_assets  # noqa: E402
 from universe_server import (  # noqa: E402
+    ConductorPermissionBridge,
     ConnectionCapabilities,
     HttpUniverseTransport,
     UniverseError,
@@ -690,6 +691,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/settings/worker-bindings", script)
             self.assertIn("renderWorkerBindingSettings", script)
             self.assertIn("/v1/settings/host-tools", script)
+            self.assertIn(
+                "/v1/conductor-room/agent-session/permissions/",
+                script,
+            )
             self.assertIn("/provider-setting", script)
             self.assertIn("/master-session/prepare", script)
             self.assertIn('state.modeContract?.mode === "CONDUCTOR"', script)
@@ -1343,6 +1348,108 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "CODEX_CLI_LAUNCH_FAILED"):
             self.server._resolve_conductor_provider({"requested_provider": "AUTO"})
+
+    def test_conductor_permission_round_trip_unblocks_resident_session(self) -> None:
+        message, _created = self.server.store.create_conductor_room_message(
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "Inspect a guarded operation.",
+                "idempotency_key": "conductor-permission-parent-001",
+            }
+        )
+        selected: dict[str, str | None] = {"option_id": None}
+        request = {
+            "schema": "universe.agent-permission-request.v1",
+            "request_id": "permission_conductor_001",
+            "provider": "CODEX",
+            "session_id": "codex-thread-001",
+            "tool_call": {
+                "toolCallId": "tool-001",
+                "title": "item/permissions/requestApproval",
+                "requestedPermissions": {"network": {"enabled": True}},
+            },
+            "options": [
+                {
+                    "optionId": "grantForTurn",
+                    "name": "Allow for this turn",
+                    "kind": "allow_once",
+                },
+                {
+                    "optionId": "decline",
+                    "name": "Reject",
+                    "kind": "reject_once",
+                },
+            ],
+        }
+
+        def wait_for_decision() -> None:
+            with self.server.conductor_permissions.message_context(
+                message["message_id"]
+            ):
+                selected["option_id"] = self.server.conductor_permissions.request(
+                    request
+                )
+
+        worker = threading.Thread(target=wait_for_decision, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 2
+        permissions: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            _status, collected = self.request(
+                "GET", "/v1/conductor-room/messages", token=self.token
+            )
+            permissions = collected["permissions"]
+            if permissions:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual("PENDING", permissions[0]["state"])
+        self.assertEqual("UNIVERSE_CONDUCTOR", permissions[0]["scope_kind"])
+        self.assertEqual(message["message_id"], permissions[0]["in_reply_to"])
+        status, resolved = self.request(
+            "POST",
+            (
+                "/v1/conductor-room/agent-session/permissions/"
+                "permission_conductor_001/decision"
+            ),
+            {"option_id": "grantForTurn"},
+            self.token,
+        )
+        worker.join(timeout=2)
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual("grantForTurn", selected["option_id"])
+        self.assertEqual("RESOLVED", resolved["permission"]["state"])
+
+    def test_conductor_permission_timeout_is_fail_closed(self) -> None:
+        bridge = ConductorPermissionBridge(timeout_seconds=0.01)
+        with bridge.message_context("conductor-message-timeout"):
+            selected = bridge.request(
+                {
+                    "schema": "universe.agent-permission-request.v1",
+                    "request_id": "permission_conductor_timeout",
+                    "provider": "GROK",
+                    "session_id": "grok-session-001",
+                    "tool_call": {"toolCallId": "tool-timeout"},
+                    "options": [
+                        {
+                            "optionId": "allow-once",
+                            "name": "Allow once",
+                            "kind": "allow_once",
+                        },
+                        {
+                            "optionId": "reject-once",
+                            "name": "Reject",
+                            "kind": "reject_once",
+                        },
+                    ],
+                }
+            )
+
+        self.assertIsNone(selected)
+        self.assertEqual("CANCELLED", bridge.list_requests()[0]["state"])
 
     def test_conductor_room_message_is_durable_and_idempotent(self) -> None:
         request = {

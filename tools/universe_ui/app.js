@@ -23,6 +23,7 @@ const state = {
   view: "timeline",
   roomMessages: [],
   conductorMessages: [],
+  conductorPermissions: [],
   conductorRuntimeBinding: null,
   conductorRefreshInFlight: false,
   todoDraftSourceKind: "USER",
@@ -693,6 +694,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.todos = todoResult.todos;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];
+    state.conductorPermissions = conductorRoomResult.permissions || [];
     state.conductorRuntimeBinding =
       conductorRoomResult.runtime_binding || null;
     state.providerSettings = providerSettings;
@@ -1000,7 +1002,12 @@ async function selectProject(
 
 function conversationMessageCount() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    return (state.conductorMessages || []).length;
+    return (
+      (state.conductorMessages || []).length +
+      (state.conductorPermissions || []).filter(
+        (item) => item.state === "PENDING"
+      ).length
+    );
   }
   return (
     (state.roomMessages || []).length +
@@ -1039,7 +1046,10 @@ function expandConversationLayer() {
 function renderRoomMessages() {
   elements.roomMessageList.replaceChildren();
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    if (!state.conductorMessages.length) {
+    const pendingPermissions = state.conductorPermissions.filter(
+      (item) => item.state === "PENDING"
+    );
+    if (!state.conductorMessages.length && !pendingPermissions.length) {
       const item = node("article", "room-message conductor-message");
       item.append(
         node("strong", "", "UNIVERSE / CONDUCTOR"),
@@ -1047,8 +1057,6 @@ function renderRoomMessages() {
         node("small", "", "Send a message here or use + to call a Project Master.")
       );
       elements.roomMessageList.append(item);
-      updateConversationBadge();
-      return;
     }
     for (const message of state.conductorMessages.slice(-8)) {
       const item = node("article", "room-message conductor-message");
@@ -1086,6 +1094,9 @@ function renderRoomMessages() {
         item.append(actions);
       }
       elements.roomMessageList.append(item);
+    }
+    for (const permission of pendingPermissions) {
+      elements.roomMessageList.append(renderPermissionCard(permission));
     }
     elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
     updateConversationBadge();
@@ -1161,20 +1172,31 @@ function renderPermissionCard(permission) {
 
 async function resolveAgentPermission(permission, optionId) {
   try {
-    const result = await api(
-      `/v1/projects/${encodeURIComponent(
-        permission.project_id
-      )}/agent-session/permissions/${encodeURIComponent(
-        permission.request_id
-      )}/decision`,
-      {
-        method: "POST",
-        body: { option_id: optionId },
-      }
-    );
-    state.projectPermissions = state.projectPermissions.map((item) =>
+    const isConductor = permission.scope_kind === "UNIVERSE_CONDUCTOR";
+    const endpoint = isConductor
+      ? `/v1/conductor-room/agent-session/permissions/${encodeURIComponent(
+          permission.request_id
+        )}/decision`
+      : `/v1/projects/${encodeURIComponent(
+          permission.project_id
+        )}/agent-session/permissions/${encodeURIComponent(
+          permission.request_id
+        )}/decision`;
+    const result = await api(endpoint, {
+      method: "POST",
+      body: { option_id: optionId },
+    });
+    const collection = isConductor
+      ? state.conductorPermissions
+      : state.projectPermissions;
+    const updated = collection.map((item) =>
       item.request_id === permission.request_id ? result.permission : item
     );
+    if (isConductor) {
+      state.conductorPermissions = updated;
+    } else {
+      state.projectPermissions = updated;
+    }
     renderRoomMessages();
     toast("Agent permission decision delivered");
   } catch (error) {
@@ -1590,6 +1612,7 @@ async function refreshConductorRoom() {
   try {
     const result = await api("/v1/conductor-room/messages");
     state.conductorMessages = result.messages || [];
+    state.conductorPermissions = result.permissions || [];
     state.conductorRuntimeBinding = result.runtime_binding || null;
     renderComposerState();
     renderRoomMessages();

@@ -503,6 +503,28 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
 
+    def test_resident_mode_session_binds_declared_permission_requester(self) -> None:
+        provider = PreparedFakeProvider()
+
+        def requester(_request: Mapping[str, Any]) -> str:
+            return "allow-once"
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-permission.sqlite",
+            actor_label="Universe Conductor",
+            permission_requester=requester,
+            provider_factory=lambda *_args: provider,
+        )
+        try:
+            host.prepare("CODEX")
+            self.assertIs(requester, provider.permission_requester)
+            self.assertEqual("allow-once", provider.permission_requester({}))
+        finally:
+            host.close()
+
     def test_resident_mode_session_saves_idle_and_preserves_provider_on_close(
         self,
     ) -> None:

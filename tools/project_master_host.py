@@ -1627,6 +1627,8 @@ class ResidentModeSessionHost:
         session_supervisor: SessionSupervisorStore | None = None,
         continuity_coordinator: ContinuitySaver | None = None,
         coordinate_resolver: Callable[[], Mapping[str, Any] | None] | None = None,
+        permission_requester: Callable[[Mapping[str, Any]], str | None]
+        | None = None,
         provider_factory: Callable[
             [str, Path, str, ProjectMasterSessionStore, str, str],
             MasterProvider,
@@ -1639,6 +1641,7 @@ class ResidentModeSessionHost:
         self.actor_label = _text(actor_label, "actor_label")
         self.continuity_coordinator = continuity_coordinator
         self.coordinate_resolver = coordinate_resolver
+        self.permission_requester = permission_requester or (lambda _request: None)
         self.store = ProjectMasterSessionStore(
             database_path,
             self.target_id,
@@ -1731,7 +1734,7 @@ class ResidentModeSessionHost:
         )
         permission_setter = getattr(active, "set_permission_requester", None)
         if callable(permission_setter):
-            permission_setter(lambda _request: None)
+            permission_setter(self.permission_requester)
         prepare = getattr(active, "prepare_session", None)
         if callable(prepare):
             prepare()
