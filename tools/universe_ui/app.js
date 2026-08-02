@@ -251,6 +251,21 @@ function node(tag, className, text) {
   return item;
 }
 
+function sessionDisplayName(session) {
+  if (session.alias) return session.alias;
+  const parts = [session.node, session.mode].filter(Boolean);
+  return [...new Set(parts)].join(" ") || "Unnamed session";
+}
+
+function sessionCoordinateLabel(session) {
+  if (session.node === session.mode) return session.node || "UNKNOWN";
+  return `${session.node || "UNKNOWN"} / ${session.mode || "UNKNOWN"}`;
+}
+
+function sessionStateLabel(session) {
+  return session.state === "LIVE" ? "SESSION LIVE" : (session.state || "UNKNOWN");
+}
+
 
 async function api(path, options = {}) {
   const headers = options.body ? { "Content-Type": "application/json" } : {};
@@ -297,13 +312,13 @@ function renderSessionObservatory() {
     card.dataset.default = String(Boolean(session.is_default));
     const heading = node("div", "session-card-heading");
     heading.append(
-      node("strong", "", session.alias || `${session.node} ${session.mode}`),
-      node("span", "session-state-pill", session.state || "UNKNOWN")
+      node("strong", "", sessionDisplayName(session)),
+      node("span", "session-state-pill", sessionStateLabel(session))
     );
     heading.lastElementChild.dataset.state = session.state || "UNKNOWN";
     const meta = node("div", "session-card-meta");
     meta.append(
-      node("span", "", `${session.node} / ${session.mode}`),
+      node("span", "", sessionCoordinateLabel(session)),
       node("span", "", session.provider || "UNKNOWN"),
       node("span", "", session.currentness || "UNKNOWN"),
       node("span", "", session.is_default ? "DEFAULT" : "ALTERNATIVE")
@@ -651,6 +666,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
     const health = await fetch("/health", { cache: "no-store" }).then((response) =>
       response.json()
     );
+    state.health = health;
     elements.serviceStatus.dataset.state = health.status === "READY" ? "ready" : "error";
     elements.serviceStatus.textContent =
       health.status === "READY" ? "Local service" : health.status;
@@ -4827,6 +4843,9 @@ function toast(message, error = false) {
   setTimeout(() => item.remove(), 4200);
 }
 
+let refreshConductorPanel = () => {};
+let refreshLawStrip = () => {};
+
 function bindEvents() {
   document
     .querySelector("#refresh-button")
@@ -5047,7 +5066,7 @@ function syncConductorSummaryToggle(collapsed) {
   elements.conductorSummaryToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
 }
 
-function refreshConductorPanel() {
+refreshConductorPanel = function () {
   const projectCount = (state.projects || []).length;
   const todoCount = (state.todos || []).length;
   const dispatchCount = (state.dispatches || []).length;
@@ -5104,9 +5123,9 @@ function refreshConductorPanel() {
     if (elements.conductorClockCompact) elements.conductorClockCompact.textContent = now;
   }
   if (typeof refreshLawStrip === "function") refreshLawStrip();
-}
+};
 
-function refreshLawStrip() {
+refreshLawStrip = function () {
     if (elements.lawContract) {
       elements.lawContract.textContent =
         state.health?.mode_contract?.status === "ACTIVE" ? "COMPATIBLE" : "UNKNOWN";
@@ -5118,7 +5137,7 @@ function refreshLawStrip() {
     if (elements.lawLocal) {
       elements.lawLocal.textContent = "INSTANCE";
     }
-  }
+  };
   const _setServiceStatus = typeof setServiceStatus === "function" ? setServiceStatus : null;
   elements.freshProjectForm.addEventListener("submit", submitFreshProjectIntent);
   document

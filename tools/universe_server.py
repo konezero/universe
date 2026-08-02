@@ -16,6 +16,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -14046,6 +14047,39 @@ def _connection_options(args: argparse.Namespace) -> tuple[str, str]:
     )
 
 
+def _windows_tray_command(
+    *,
+    powershell: str,
+    tray_script: Path,
+    universe_root: Path,
+    python_executable: Path,
+    start_service: bool,
+) -> list[str]:
+    command = [
+        powershell,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        str(tray_script),
+        "-UniverseRoot",
+        str(universe_root),
+        "-PythonExecutable",
+        str(python_executable.resolve()),
+    ]
+    if start_service:
+        command.append("-StartService")
+    return command
+
+
+def _windows_tray_creationflags() -> int:
+    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+        subprocess, "CREATE_NO_WINDOW", 0
+    )
+
+
 def main() -> int:
     args = parser().parse_args()
     try:
@@ -14088,24 +14122,15 @@ def main() -> int:
                         "TRAY_HOST_UNAVAILABLE",
                         "powershell.exe was not found",
                     )
-                tray_args = [
-                    powershell,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-File",
-                    str(tray_script),
-                    "-UniverseRoot",
-                    str(Path(__file__).resolve().parents[1]),
-                ]
-                if args.start_service:
-                    tray_args.append("-StartService")
-                # Detach tray so this CLI can return after launch.
-                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                tray_args = _windows_tray_command(
+                    powershell=powershell,
+                    tray_script=tray_script,
+                    universe_root=Path(__file__).resolve().parents[1],
+                    python_executable=Path(sys.executable),
+                    start_service=bool(args.start_service),
                 )
+                # Detach tray so this CLI can return after launch.
+                creationflags = _windows_tray_creationflags()
                 # PowerShell is resolved to an absolute path; all arguments are fixed.
                 process = subprocess.Popen(  # nosec B603
                     tray_args,

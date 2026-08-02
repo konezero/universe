@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import sys
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -94,15 +93,11 @@ cd /d "%UNIVERSE_PORTABLE_ROOT%"
 
 def write_launchers(package_root: Path, *, includes_python: bool) -> None:
     python_cmd = (
-        r'"%UNIVERSE_PORTABLE_ROOT%\runtime\python\python.exe"'
+        r"%UNIVERSE_PORTABLE_ROOT%\runtime\python\python.exe"
         if includes_python
         else "python"
     )
     base = env_snippet(python_cmd=python_cmd)
-    # Prefer embedded python when present even for PATH builds that later gain runtime/
-    resolve = r"""if exist "%UNIVERSE_PORTABLE_ROOT%\runtime\python\python.exe" set "UNIVERSE_PYTHON=%UNIVERSE_PORTABLE_ROOT%\runtime\python\python.exe"
-if not defined UNIVERSE_PYTHON set "UNIVERSE_PYTHON=python"
-"""
     # env_snippet already sets UNIVERSE_PYTHON; for PATH mode still allow runtime override
     if not includes_python:
         base = base.replace(
@@ -113,32 +108,32 @@ if not defined UNIVERSE_PYTHON set "UNIVERSE_PYTHON=python"
     write_launcher(
         package_root / "Start-Universe.cmd",
         base
-        + '%UNIVERSE_PYTHON% tools\\universe_server.py start --open-ui\r\n'
+        + '"%UNIVERSE_PYTHON%" tools\\universe_server.py start --open-ui\r\n'
         + "exit /b %ERRORLEVEL%\r\n",
     )
     write_launcher(
         package_root / "Start-Universe-Headless.cmd",
         base
-        + '%UNIVERSE_PYTHON% tools\\universe_server.py start --no-open-ui\r\n'
+        + '"%UNIVERSE_PYTHON%" tools\\universe_server.py start --no-open-ui\r\n'
         + "exit /b %ERRORLEVEL%\r\n",
     )
     write_launcher(
         package_root / "Stop-Universe.cmd",
         base
-        + '%UNIVERSE_PYTHON% tools\\universe_server.py stop\r\n'
+        + '"%UNIVERSE_PYTHON%" tools\\universe_server.py stop\r\n'
         + "exit /b %ERRORLEVEL%\r\n",
     )
     write_launcher(
         package_root / "Status-Universe.cmd",
         base
-        + '%UNIVERSE_PYTHON% tools\\universe_server.py status\r\n'
+        + '"%UNIVERSE_PYTHON%" tools\\universe_server.py status\r\n'
         + "pause\r\n"
         + "exit /b %ERRORLEVEL%\r\n",
     )
     write_launcher(
         package_root / "Start-Universe-Tray.cmd",
         base
-        + '%UNIVERSE_PYTHON% tools\\universe_server.py tray --start-service\r\n'
+        + '"%UNIVERSE_PYTHON%" tools\\universe_server.py tray --start-service\r\n'
         + "exit /b %ERRORLEVEL%\r\n",
     )
 

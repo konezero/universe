@@ -16,6 +16,7 @@ from universe_service_control import (  # noqa: E402
     pid_is_running,
     probe_health,
     service_status,
+    start_service,
     stop_service,
 )
 
@@ -96,6 +97,33 @@ class UniverseServiceControlTests(unittest.TestCase):
                     report = service_status(path)
             self.assertEqual("STOPPED", report["status"])
             self.assertFalse(report["pid_running"])
+
+    def test_start_detaches_all_parent_handles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            process = mock.MagicMock()
+            process.pid = 123
+            process.poll.return_value = None
+            stopped = {"status": "STOPPED", "pid_running": False}
+            ready = {"status": "READY", "pid_running": True, "pid": 123}
+            with mock.patch(
+                "universe_service_control.service_status",
+                side_effect=[stopped, ready],
+            ):
+                with mock.patch(
+                    "universe_service_control.subprocess.Popen",
+                    return_value=process,
+                ) as popen:
+                    result = start_service(
+                        state_path=root / "server.json",
+                        database_path=root / "universe.sqlite3",
+                        mode_registry=root / "mode_registry.json",
+                        log_path=root / "service.log",
+                        working_directory=root,
+                        wait_seconds=0,
+                    )
+            self.assertEqual("READY", result["status"])
+            self.assertTrue(popen.call_args.kwargs["close_fds"])
 
     def test_stop_uses_authenticated_graceful_shutdown_without_taskkill(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

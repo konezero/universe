@@ -10,6 +10,7 @@
 [CmdletBinding()]
 param(
   [string]$UniverseRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
+  [string]$PythonExecutable = "",
   [switch]$StartService
 )
 
@@ -17,7 +18,20 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$python = (Get-Command python -ErrorAction Stop).Source
+if (-not $PythonExecutable) {
+  if ($env:UNIVERSE_PYTHON) {
+    $PythonExecutable = $env:UNIVERSE_PYTHON.Trim('"')
+  } else {
+    $PythonExecutable = (Get-Command python.exe -ErrorAction Stop).Source
+  }
+}
+$python = [System.IO.Path]::GetFullPath($PythonExecutable)
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+  throw "native python executable not found: $python"
+}
+if ([System.IO.Path]::GetExtension($python) -ne ".exe") {
+  throw "native python executable required: $python"
+}
 $serverPy = Join-Path $UniverseRoot "tools\universe_server.py"
 if (-not (Test-Path $serverPy)) {
   throw "universe_server.py not found: $serverPy"
@@ -80,6 +94,7 @@ $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = $icon
 $notify.Visible = $true
 $notify.Text = "Universe"
+$notify.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $itemOpen = $menu.Items.Add("Open UI")
@@ -158,5 +173,12 @@ if ($StartService) {
   Invoke-UniverseCli -Args @("start", "--no-open-ui") | Out-Null
 }
 
-Update-TrayStatus | Out-Null
+$initialStatus = Update-TrayStatus
+$notify.BalloonTipTitle = "Universe"
+$notify.BalloonTipText = if ($initialStatus.status -eq "READY") {
+  "Local service is ready."
+} else {
+  "Tray controls are ready; service status is $($initialStatus.status)."
+}
+$notify.ShowBalloonTip(2500)
 [System.Windows.Forms.Application]::Run()

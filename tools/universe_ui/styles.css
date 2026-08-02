@@ -949,8 +949,12 @@ body.inspector-open .graph-hint {
 }
 
 .room-context {
+  min-width: 0;
+  overflow: hidden;
   color: #c8d8f2;
   font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .room-actions {
@@ -963,6 +967,8 @@ body.inspector-open .graph-hint {
 }
 
 .room-hint {
+  flex: 0 1 42%;
+  min-width: 0;
   color: var(--muted);
   font-size: 11px;
   overflow: hidden;
@@ -2374,6 +2380,29 @@ dialog label {
 
   .command-composer {
     grid-template-columns: 40px minmax(0, 1fr) 44px;
+  }
+
+  .command-composer.conductor-composer {
+    grid-template-columns: 38px minmax(0, 1fr) 42px;
+  }
+
+  .command-composer.conductor-composer .room-actions {
+    grid-column: 1 / -1;
+    gap: 8px;
+    padding-inline: 4px;
+  }
+
+  .command-composer.conductor-composer .room-context,
+  .command-composer.conductor-composer .room-hint {
+    font-size: 10px;
+  }
+
+  .conversation-layer-header .layer-opacity span {
+    display: none;
+  }
+
+  .conversation-layer-header .layer-opacity input {
+    width: 56px;
   }
 
   .todo-dialog {

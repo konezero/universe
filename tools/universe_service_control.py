@@ -333,7 +333,7 @@ def start_service(
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
-        close_fds=os.name != "nt",
+        close_fds=True,
     )
     stdout.close()
     deadline = time.time() + wait_seconds
