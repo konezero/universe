@@ -138,6 +138,20 @@ class ClaudePermissionBridgeTests(unittest.TestCase):
 
         self.assertEqual("allow", result["behavior"])
 
+    def test_permission_requester_can_be_rebound_before_the_first_turn(self) -> None:
+        bridge = self._bridge("reject-once")
+        seen: list[Mapping[str, Any]] = []
+
+        def requester(request: Mapping[str, Any]) -> str:
+            seen.append(request)
+            return "allow-once"
+
+        bridge.set_permission_requester(requester)
+        result = bridge.handle(self._request())
+
+        self.assertEqual("allow", result["behavior"])
+        self.assertEqual(1, len(seen))
+
     def test_invalid_payload_fails_closed(self) -> None:
         bridge = self._bridge("allow-once")
 

@@ -198,6 +198,7 @@ class FakeAgentGateway:
         self.answer = answer
         self.prompts: list[str] = []
         self.closed = False
+        self.permission_requester = None
 
     @property
     def session_ref(self) -> str:
@@ -207,6 +208,9 @@ class FakeAgentGateway:
         self.prompts.append(prompt)
         on_delta(self.answer)
         return self.answer
+
+    def set_permission_requester(self, requester) -> None:
+        self.permission_requester = requester
 
     def close(self) -> None:
         self.closed = True
@@ -965,6 +969,27 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("claude-answer", answer)
         self.assertIn("Universe Project Room message", gateway.prompts[0])
         self.assertTrue(runtime.session_ref.startswith("claude-code:"))
+
+    def test_resident_provider_permission_requester_is_rebound_after_prepare(
+        self,
+    ) -> None:
+        def requester(_request):
+            return "allow-once"
+
+        for runtime_type in (
+            GrokProjectMasterRuntime,
+            CodexProjectMasterRuntime,
+            ClaudeProjectMasterRuntime,
+        ):
+            with self.subTest(runtime=runtime_type.__name__):
+                runtime = runtime_type(self.root, "GCS", self.state)
+                gateway = FakeAgentGateway("unused")
+                runtime._gateway = gateway
+
+                runtime.set_permission_requester(requester)
+
+                self.assertIs(requester, runtime._permission_requester)
+                self.assertIs(requester, gateway.permission_requester)
 
     def test_streaming_provider_emits_started_deltas_and_completed(self) -> None:
         self.provider = StreamingFakeProvider()

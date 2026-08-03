@@ -1297,6 +1297,8 @@ class GrokProjectMasterRuntime:
         requester: Callable[[Mapping[str, Any]], str | None],
     ) -> None:
         self._permission_requester = requester
+        if self._gateway is not None:
+            self._gateway.set_permission_requester(requester)
 
     def prepare_session(self) -> str:
         try:
@@ -1465,6 +1467,8 @@ class CodexProjectMasterRuntime:
         requester: Callable[[Mapping[str, Any]], str | None],
     ) -> None:
         self._permission_requester = requester
+        if self._gateway is not None:
+            self._gateway.set_permission_requester(requester)
 
     def prepare_session(self) -> str:
         try:

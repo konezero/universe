@@ -71,7 +71,6 @@ from agent_session_gateway import (  # noqa: E402
     SESSION_READY,
     SESSION_STATES,
     SESSION_STOPPED,
-    SESSION_WAITING_APPROVAL,
 )
 
 # Result subtypes and retry categories that mean the account limit is spent.
@@ -307,6 +306,17 @@ class ClaudeResidentSession:
         """How many OS processes this session has started (tests assert 1)."""
 
         return self._launch_count
+
+    def set_permission_requester(
+        self,
+        requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> None:
+        if self.permission_bridge is None:
+            raise ClaudeResidentError("CLAUDE_PERMISSION_BRIDGE_UNAVAILABLE")
+        setter = getattr(self.permission_bridge, "set_permission_requester", None)
+        if not callable(setter):
+            raise ClaudeResidentError("CLAUDE_PERMISSION_REBIND_UNAVAILABLE")
+        setter(requester)
 
     def session_status(self) -> str:
         with self._state_lock:

@@ -149,6 +149,8 @@ class AgentSession(Protocol):
 
     def prompt(self, text: str, on_delta: Callable[[str], None]) -> str: ...
 
+    def set_permission_requester(self, requester: PermissionRequester) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -460,6 +462,9 @@ class UniverseAcpGateway:
     ) -> str:
         return self.session.prompt(message, on_delta)
 
+    def set_permission_requester(self, requester: PermissionRequester) -> None:
+        self.session.set_permission_requester(requester)
+
     def close(self) -> None:
         self.session.close()
 
@@ -517,6 +522,9 @@ class GrokAcpSession:
             if self.session_id
             else "grok-acp:initializing"
         )
+
+    def set_permission_requester(self, requester: PermissionRequester) -> None:
+        self.permission_requester = requester
 
     def prompt(self, text: str, on_delta: Callable[[str], None]) -> str:
         if not self.session_id:
@@ -700,6 +708,9 @@ class CodexAppServerSession:
             if self.session_id
             else "codex-app-server:initializing"
         )
+
+    def set_permission_requester(self, requester: PermissionRequester) -> None:
+        self.permission_requester = requester
 
     def prompt(self, text: str, on_delta: Callable[[str], None]) -> str:
         if not self.session_id:

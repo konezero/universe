@@ -102,6 +102,13 @@ class ClaudePermissionBridge:
             self._turn_id = str(turn_id) if turn_id else None
             self._turn_revision += 1
 
+    def set_permission_requester(
+        self,
+        requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> None:
+        with self._lock:
+            self.permission_requester = requester
+
     def close(self) -> None:
         """Stop serving. Any later request, and any in-flight decision that has
         not yet been adopted, fails closed.
