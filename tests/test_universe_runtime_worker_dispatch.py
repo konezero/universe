@@ -14,6 +14,7 @@ from universe_runtime_worker_dispatch import (  # noqa: E402
     RuntimeWorkerDispatcher,
     WorkerDispatchError,
 )
+from worker_failure_evidence import WorkerFailureEvidenceStore  # noqa: E402
 
 
 class FakeGateway:
@@ -167,6 +168,215 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
 
         self.assertEqual("WORKER_OUTPUT_SCHEMA_REQUIRED", captured.exception.code)
         self.assertEqual("CLAUDE_JSON_SCHEMA_REQUIRED", captured.exception.reason)
+
+    @staticmethod
+    def _dispatch_request() -> dict[str, object]:
+        return {
+            "schema": "universe.task-frame-worker-dispatch-request.v1",
+            "provider": "CODEX",
+            "endpoint": "http://127.0.0.1:17777",
+            "token": "transient",
+            "session_id": "session-1",
+            "frame_id": "frame-1",
+            "turn_id": "turn-1",
+            "invoker_actor_ref": "universe-runtime-host",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "context_pack": {"goal": "review"},
+            "output_contract": {"type": "text"},
+            "max_turns": 1,
+            "result_mode": "REDACTED",
+        }
+
+    def test_dispatch_claims_before_starting_provider(self) -> None:
+        events: list[str] = []
+
+        def post(_endpoint, _token, path, payload):
+            if path == "/v1/task-frame/worker-result":
+                events.append("result")
+                return {"status": "TASK_FRAME_RESULT_RECORDED"}
+            operation = payload["operation"]["operation"]
+            events.append(operation)
+            if operation == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TURN_CLAIMED"},
+            }
+
+        class Dispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, request):
+                self.assert_claimed(request)
+                events.append("provider")
+                return {
+                    "status": "COMPLETED",
+                    "worker_id": "provider-worker-1",
+                    "worker_run_ref": request["worker_run_ref"],
+                    "result_receipt_ref": "result://worker-1",
+                    "result": {"text": "done"},
+                    "session_persistence": "EPHEMERAL",
+                    "persistent_session_ref": "UNKNOWN",
+                    "universe_coordinate_persisted": False,
+                }
+
+            @staticmethod
+            def assert_claimed(_request):
+                if events[-1] != "claim_turn":
+                    raise AssertionError("provider started before the turn was claimed")
+
+        result = Dispatcher(self.root, post=post).dispatch(self._dispatch_request())
+
+        self.assertEqual(
+            ["worker_invocation_plan", "claim_turn", "provider", "result"], events
+        )
+        self.assertTrue(result["worker_id"].startswith("universe-runtime-worker:"))
+        self.assertEqual("provider-worker-1", result["provider_worker_ref"])
+
+    def test_provider_failure_is_persisted_before_claim_recovery(self) -> None:
+        store = WorkerFailureEvidenceStore(self.root / "universe.sqlite3")
+        observed_ref = ""
+
+        def post(_endpoint, _token, _path, payload):
+            nonlocal observed_ref
+            operation = payload["operation"]["operation"]
+            if operation == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            if operation == "claim_turn":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {"status": "TURN_CLAIMED"},
+                }
+            self.assertEqual("worker_initialization_failed", operation)
+            observed_ref = payload["operation"]["host_evidence_ref"]
+            self.assertIsNotNone(store.get(observed_ref))
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {
+                    "status": "WORKER_INITIALIZATION_FAILURE_RECORDED"
+                },
+            }
+
+        class FailingDispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, _request):
+                raise WorkerDispatchError(
+                    "TASK_FRAME_INITIALIZATION_FAILED",
+                    "WORKER_ADAPTER",
+                    "approval request failed",
+                )
+
+        dispatcher = FailingDispatcher(
+            self.root,
+            post=post,
+            failure_evidence_store=store,
+        )
+        with self.assertRaises(WorkerDispatchError) as captured:
+            dispatcher.dispatch(self._dispatch_request())
+
+        self.assertEqual("TASK_FRAME_INITIALIZATION_FAILED", captured.exception.code)
+        self.assertTrue(observed_ref)
+        self.assertEqual(
+            "WORKER_INITIALIZATION_FAILURE_RECORDED",
+            captured.exception.recovery_status,
+        )
+        evidence = store.get(observed_ref)
+        assert evidence is not None
+        self.assertEqual("session-1", evidence["session_id"])
+        self.assertEqual("frame-1", evidence["frame_id"])
+        self.assertEqual("turn-1", evidence["turn_id"])
+
+    def test_recovery_rejection_preserves_durable_evidence_ref(self) -> None:
+        store = WorkerFailureEvidenceStore(self.root / "universe.sqlite3")
+
+        def post(_endpoint, _token, _path, payload):
+            operation = payload["operation"]["operation"]
+            if operation == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            if operation == "claim_turn":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {"status": "TURN_CLAIMED"},
+                }
+            return {
+                "status": "TASK_FRAME_OPERATION_REJECTED",
+                "output": {"status": "TASK_FRAME_OPERATION_UNKNOWN"},
+            }
+
+        class FailingDispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, _request):
+                raise WorkerDispatchError(
+                    "TASK_FRAME_INITIALIZATION_FAILED",
+                    "WORKER_ADAPTER",
+                    "approval request failed",
+                )
+
+        with self.assertRaises(WorkerDispatchError) as captured:
+            FailingDispatcher(
+                self.root,
+                post=post,
+                failure_evidence_store=store,
+            ).dispatch(self._dispatch_request())
+
+        self.assertEqual(
+            "WORKER_INITIALIZATION_RECOVERY_FAILED", captured.exception.code
+        )
+        self.assertEqual(
+            "TASK_FRAME_OPERATION_UNKNOWN", captured.exception.recovery_status
+        )
+        self.assertIsNotNone(store.get(captured.exception.host_evidence_ref))
 
 
 if __name__ == "__main__":

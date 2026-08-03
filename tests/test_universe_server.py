@@ -462,6 +462,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def test_runtime_host_uses_the_universe_database_for_failure_evidence(self) -> None:
+        evidence_store = self.server.runtime_host.worker_dispatcher.failure_evidence_store
+        self.assertIsNotNone(evidence_store)
+        self.assertEqual(
+            self.server.store.database_path,
+            evidence_store.database_path,
+        )
+
     def test_loopback_health_and_project_data_do_not_require_a_token(self) -> None:
         status, result = self.request("GET", "/health")
         self.assertEqual(200, status)

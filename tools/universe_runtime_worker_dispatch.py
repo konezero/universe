@@ -22,6 +22,10 @@ from agent_session_gateway import (
 )
 from host_profile import resolve_host_tool
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
+from worker_failure_evidence import (
+    WorkerFailureEvidenceError,
+    WorkerFailureEvidenceStore,
+)
 
 
 DISPATCH_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
@@ -34,9 +38,16 @@ class WorkerDispatchError(Exception):
     code: str
     stage: str
     reason: str
+    host_evidence_ref: str = ""
+    recovery_status: str = ""
 
     def __str__(self) -> str:
-        return f"{self.stage}: {self.reason}"
+        detail = f"{self.stage}: {self.reason}"
+        if self.host_evidence_ref:
+            detail += f" [host_evidence_ref={self.host_evidence_ref}]"
+        if self.recovery_status:
+            detail += f" [recovery_status={self.recovery_status}]"
+        return detail
 
 
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
@@ -182,10 +193,12 @@ class RuntimeWorkerDispatcher:
         *,
         native_runner: NativeRunner = run_native_cli,
         post: PostJson = post_json,
+        failure_evidence_store: WorkerFailureEvidenceStore | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve()
         self.native_runner = native_runner
         self.post = post
+        self.failure_evidence_store = failure_evidence_store
 
     def provider_capability(self, provider: str) -> dict[str, str]:
         normalized = _required_text(provider, "provider").upper()
@@ -288,6 +301,7 @@ class RuntimeWorkerDispatcher:
             )
 
         skill_bindings = self._skill_bindings(planned_invocation)
+        worker_id = f"universe-runtime-worker:{uuid4().hex}"
         worker_run_ref = f"universe-runtime-host:{uuid4().hex}"
         worker_request = {
             "schema": {
@@ -299,6 +313,7 @@ class RuntimeWorkerDispatcher:
             "model": planned_model,
             "task_frame_id": request["frame_id"],
             "turn_id": request["turn_id"],
+            "worker_id": worker_id,
             "worker_run_ref": worker_run_ref,
             "repository_write_scope": "NONE",
             "mutation_scope": {"operations": [], "targets": []},
@@ -307,54 +322,6 @@ class RuntimeWorkerDispatcher:
             "max_turns": request["max_turns"],
             "result_mode": request["result_mode"],
         }
-
-        started = time.monotonic()
-        worker = self._invoke_provider(provider, worker_request)
-        duration_ms = round((time.monotonic() - started) * 1000, 3)
-        if worker.get("status") != "COMPLETED":
-            raise WorkerDispatchError(
-                "WORKER_PROVIDER_FAILED",
-                "WORKER_ADAPTER",
-                "WORKER_DID_NOT_COMPLETE",
-            )
-        if worker.get("worker_run_ref") != worker_run_ref:
-            raise WorkerDispatchError(
-                "WORKER_RUN_REF_MISMATCH",
-                "WORKER_ADAPTER",
-                "WORKER_RUN_REF_MISMATCH",
-            )
-        if (
-            worker.get("session_persistence") != "EPHEMERAL"
-            or worker.get("persistent_session_ref") != "UNKNOWN"
-            or worker.get("universe_coordinate_persisted") is not False
-        ):
-            raise WorkerDispatchError(
-                "WORKER_SESSION_BOUNDARY_INVALID",
-                "WORKER_ADAPTER",
-                "EPHEMERAL_SESSION_ATTESTATION_REQUIRED",
-            )
-
-        recorded_result: Any = worker.get("result")
-        structured_result: dict[str, Any] | None = None
-        if request["result_mode"] == "STRUCTURED_JSON":
-            result_object = _mapping(worker.get("result"), "worker.result")
-            text = _required_text(result_object.get("text"), "worker.result.text")
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as error:
-                raise WorkerDispatchError(
-                    "WORKER_STRUCTURED_RESULT_INVALID",
-                    "WORKER_ADAPTER",
-                    "WORKER_RESULT_JSON_INVALID",
-                ) from error
-            if not isinstance(parsed, dict):
-                raise WorkerDispatchError(
-                    "WORKER_STRUCTURED_RESULT_INVALID",
-                    "WORKER_ADAPTER",
-                    "WORKER_RESULT_OBJECT_REQUIRED",
-                )
-            structured_result = parsed
-            recorded_result = structured_result
 
         claim = self.post(
             request["endpoint"],
@@ -366,7 +333,7 @@ class RuntimeWorkerDispatcher:
                 "operation": {
                     "operation": "claim_turn",
                     "turn_id": request["turn_id"],
-                    "worker_id": worker["worker_id"],
+                    "worker_id": worker_id,
                     "worker_run_ref": worker_run_ref,
                     "capability_evidence_ref": capability["capability_evidence_ref"],
                     "invoker_actor_ref": request["invoker_actor_ref"],
@@ -385,50 +352,120 @@ class RuntimeWorkerDispatcher:
                 "TURN_CLAIM_REJECTED",
             )
 
-        model = planned_model
-        model_ref = f"provider://{provider}/model/{quote(model, safe='')}"
-        observations = [
-            {
-                "skill_binding_digest": _required_text(
-                    binding.get("skill_binding_digest"),
-                    "skill_binding_digest",
-                ),
-                "model_ref": model_ref,
-                "outcome": "SUCCEEDED",
-                "validation_state": "NOT_RUN",
+        try:
+            started = time.monotonic()
+            worker = self._invoke_provider(provider, worker_request)
+            duration_ms = round((time.monotonic() - started) * 1000, 3)
+            if worker.get("status") != "COMPLETED":
+                raise WorkerDispatchError(
+                    "WORKER_PROVIDER_FAILED",
+                    "WORKER_ADAPTER",
+                    "WORKER_DID_NOT_COMPLETE",
+                )
+            if worker.get("worker_run_ref") != worker_run_ref:
+                raise WorkerDispatchError(
+                    "WORKER_RUN_REF_MISMATCH",
+                    "WORKER_ADAPTER",
+                    "WORKER_RUN_REF_MISMATCH",
+                )
+            if (
+                worker.get("session_persistence") != "EPHEMERAL"
+                or worker.get("persistent_session_ref") != "UNKNOWN"
+                or worker.get("universe_coordinate_persisted") is not False
+            ):
+                raise WorkerDispatchError(
+                    "WORKER_SESSION_BOUNDARY_INVALID",
+                    "WORKER_ADAPTER",
+                    "EPHEMERAL_SESSION_ATTESTATION_REQUIRED",
+                )
+            provider_worker_ref = _required_text(
+                worker.get("worker_id"), "worker.worker_id"
+            )
+
+            recorded_result: Any = worker.get("result")
+            structured_result: dict[str, Any] | None = None
+            if request["result_mode"] == "STRUCTURED_JSON":
+                result_object = _mapping(worker.get("result"), "worker.result")
+                text = _required_text(result_object.get("text"), "worker.result.text")
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError as error:
+                    raise WorkerDispatchError(
+                        "WORKER_STRUCTURED_RESULT_INVALID",
+                        "WORKER_ADAPTER",
+                        "WORKER_RESULT_JSON_INVALID",
+                    ) from error
+                if not isinstance(parsed, dict):
+                    raise WorkerDispatchError(
+                        "WORKER_STRUCTURED_RESULT_INVALID",
+                        "WORKER_ADAPTER",
+                        "WORKER_RESULT_OBJECT_REQUIRED",
+                    )
+                structured_result = parsed
+                recorded_result = structured_result
+
+            model = planned_model
+            model_ref = f"provider://{provider}/model/{quote(model, safe='')}"
+            observations = [
+                {
+                    "skill_binding_digest": _required_text(
+                        binding.get("skill_binding_digest"),
+                        "skill_binding_digest",
+                    ),
+                    "model_ref": model_ref,
+                    "outcome": "SUCCEEDED",
+                    "validation_state": "NOT_RUN",
+                    "evidence_refs": [worker["result_receipt_ref"]],
+                    "metrics": {"duration_ms": duration_ms},
+                }
+                for binding in skill_bindings
+            ]
+            envelope = {
+                "turn_id": request["turn_id"],
+                "worker_id": worker_id,
+                "worker_run_ref": worker_run_ref,
+                "result_receipt_ref": worker["result_receipt_ref"],
+                "status": worker["status"],
                 "evidence_refs": [worker["result_receipt_ref"]],
-                "metrics": {"duration_ms": duration_ms},
+                "result": recorded_result,
+                "review_decision": "",
             }
-            for binding in skill_bindings
-        ]
-        envelope = {
-            "turn_id": request["turn_id"],
-            "worker_id": worker["worker_id"],
-            "worker_run_ref": worker_run_ref,
-            "result_receipt_ref": worker["result_receipt_ref"],
-            "status": worker["status"],
-            "evidence_refs": [worker["result_receipt_ref"]],
-            "result": recorded_result,
-            "review_decision": "",
-        }
-        if observations:
-            envelope["skill_run_observations"] = observations
-        result = self.post(
-            request["endpoint"],
-            request["token"],
-            "/v1/task-frame/worker-result",
-            {
-                "session_id": request["session_id"],
-                "frame_id": request["frame_id"],
-                "envelope": envelope,
-                "observed_at": _utc_now(),
-            },
-        )
+            if observations:
+                envelope["skill_run_observations"] = observations
+            result = self.post(
+                request["endpoint"],
+                request["token"],
+                "/v1/task-frame/worker-result",
+                {
+                    "session_id": request["session_id"],
+                    "frame_id": request["frame_id"],
+                    "envelope": envelope,
+                    "observed_at": _utc_now(),
+                },
+            )
+        except Exception as error:
+            failure = (
+                error
+                if isinstance(error, WorkerDispatchError)
+                else WorkerDispatchError(
+                    "WORKER_INITIALIZATION_UNEXPECTED_FAILURE",
+                    "WORKER_ADAPTER",
+                    type(error).__name__,
+                )
+            )
+            raise self._recover_claim_failure(
+                request=request,
+                worker_id=worker_id,
+                worker_run_ref=worker_run_ref,
+                failure=failure,
+            ) from error
+
         response = {
             "status": result.get("status", "WORKER_PROVIDER_FAILED"),
             "provider": provider,
             "model_ref": model_ref,
-            "worker_id": worker["worker_id"],
+            "worker_id": worker_id,
+            "provider_worker_ref": provider_worker_ref,
             "result_receipt_ref": worker["result_receipt_ref"],
             "result": recorded_result,
             "skill_run_observation_count": len(observations),
@@ -446,6 +483,116 @@ class RuntimeWorkerDispatcher:
         if structured_result is not None:
             response["structured_result"] = structured_result
         return response
+
+    def _recover_claim_failure(
+        self,
+        *,
+        request: Mapping[str, Any],
+        worker_id: str,
+        worker_run_ref: str,
+        failure: WorkerDispatchError,
+    ) -> WorkerDispatchError:
+        observed_at = _utc_now()
+        source = json.dumps(
+            {
+                "code": failure.code,
+                "stage": failure.stage,
+                "reason": failure.reason,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if self.failure_evidence_store is None:
+            return WorkerDispatchError(
+                "WORKER_FAILURE_EVIDENCE_UNAVAILABLE",
+                "HOST_FAILURE_EVIDENCE",
+                "durable failure evidence store is not configured",
+            )
+        try:
+            evidence = self.failure_evidence_store.record_live_failure(
+                repository_ref=self.repository_root.as_uri(),
+                session_id=str(request["session_id"]),
+                frame_id=str(request["frame_id"]),
+                turn_id=str(request["turn_id"]),
+                worker_id=worker_id,
+                worker_run_ref=worker_run_ref,
+                failure_code=failure.code,
+                failure_detail=f"{failure.stage}: {failure.reason}",
+                source_locator=(
+                    "universe://runtime-worker-failure/"
+                    f"{quote(str(request['frame_id']), safe='')}/"
+                    f"{quote(str(request['turn_id']), safe='')}/"
+                    f"{quote(worker_run_ref, safe='')}"
+                ),
+                source_content=source,
+                failure_observed_at=observed_at,
+            )
+        except WorkerFailureEvidenceError as error:
+            return WorkerDispatchError(
+                "WORKER_FAILURE_EVIDENCE_WRITE_FAILED",
+                "HOST_FAILURE_EVIDENCE",
+                str(error),
+            )
+
+        host_evidence_ref = str(evidence["host_evidence_ref"])
+        try:
+            recovery = self.post(
+                str(request["endpoint"]),
+                str(request["token"]),
+                "/v1/task-frame/operation",
+                {
+                    "session_id": request["session_id"],
+                    "frame_id": request["frame_id"],
+                    "operation": {
+                        "operation": "worker_initialization_failed",
+                        "turn_id": request["turn_id"],
+                        "worker_id": worker_id,
+                        "worker_run_ref": worker_run_ref,
+                        "failure_code": failure.code,
+                        "failure_detail": f"{failure.stage}: {failure.reason}",
+                        "host_evidence_ref": host_evidence_ref,
+                        "observed_at": observed_at,
+                    },
+                },
+            )
+        except Exception as error:
+            return WorkerDispatchError(
+                "WORKER_INITIALIZATION_RECOVERY_FAILED",
+                "TASK_FRAME_RECOVERY",
+                type(error).__name__,
+                host_evidence_ref=host_evidence_ref,
+                recovery_status="RECOVERY_TRANSPORT_FAILED",
+            )
+
+        output = recovery.get("output")
+        recovery_status = (
+            str(output.get("status"))
+            if isinstance(output, Mapping)
+            else str(recovery.get("status") or "UNKNOWN")
+        )
+        if (
+            recovery.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+            or recovery_status
+            not in {
+                "WORKER_INITIALIZATION_FAILURE_RECORDED",
+                "WORKER_INITIALIZATION_FAILURE_REPLAYED",
+            }
+        ):
+            return WorkerDispatchError(
+                "WORKER_INITIALIZATION_RECOVERY_FAILED",
+                "TASK_FRAME_RECOVERY",
+                recovery_status,
+                host_evidence_ref=host_evidence_ref,
+                recovery_status=recovery_status,
+            )
+        return WorkerDispatchError(
+            failure.code,
+            failure.stage,
+            failure.reason,
+            host_evidence_ref=host_evidence_ref,
+            recovery_status=recovery_status,
+        )
 
     def _normalize_request(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         if raw.get("schema") != DISPATCH_SCHEMA:

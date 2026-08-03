@@ -20,6 +20,7 @@ from universe_runtime_worker_dispatch import (
     RuntimeWorkerDispatcher,
     WorkerDispatchError,
 )
+from worker_failure_evidence import WorkerFailureEvidenceStore
 
 RUNTIME_WORKER_REQUEST_SCHEMA = "universe.runtime-worker-invocation-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
@@ -347,11 +348,17 @@ class UniverseRuntimeHost:
         repository_root: Path,
         runner: Callable[..., Any] | None = None,
         worker_dispatcher: RuntimeWorkerDispatcher | None = None,
+        failure_evidence_database: Path | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve()
         self.runner = runner or subprocess.run
         self.worker_dispatcher = worker_dispatcher or RuntimeWorkerDispatcher(
-            self.repository_root
+            self.repository_root,
+            failure_evidence_store=(
+                WorkerFailureEvidenceStore(failure_evidence_database)
+                if failure_evidence_database is not None
+                else None
+            ),
         )
 
     def provider_capabilities(self) -> list[dict[str, str]]:
@@ -1083,7 +1090,7 @@ class UniverseRuntimeHost:
         except WorkerDispatchError as error:
             raise RuntimeHostError(
                 error.code,
-                f"{error.stage}: {error.reason}",
+                str(error),
             ) from error
 
     def _invoke_json_command(

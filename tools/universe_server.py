@@ -10538,7 +10538,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             else None
         )
         self.runtime_host = runtime_host or UniverseRuntimeHost(
-            Path(__file__).resolve().parents[1]
+            Path(__file__).resolve().parents[1],
+            failure_evidence_database=store.database_path,
         )
         self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
         self._planning_binding: dict[str, Any] | None = None
