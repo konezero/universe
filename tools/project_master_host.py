@@ -24,7 +24,6 @@ from uuid import uuid4
 
 from agent_session_gateway import (
     AgentSessionError,
-    ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
     UniverseAcpGateway,
@@ -1213,6 +1212,30 @@ def provider_session_connection(
     }
 
 
+def _project_master_system_prompt(actor_label: str) -> str:
+    return (
+        f"You are the {actor_label}. "
+        "This is a persistent, command-capable conversation Host connected to the "
+        "Universe interface. Work from the repository at the configured cwd and "
+        "follow its entry order and installed Runtime contracts. Mode, Role, BOOT, "
+        "or a chat message never creates mutation authority. A GOVERNANCE_ONLY Mode "
+        "controls the Mode-entry default; it does not veto a later explicitly approved "
+        "executable task. Handle read-only inspection, review, explanation, and audit "
+        "directly. For implementation or command requests, use the installed Task "
+        "Assignment and Execution Binding route and obtain Commander approval when the "
+        "contract requires it. When both Task and Evidence require executable proof, "
+        "request or attach the Session Boot executor with "
+        "EXECUTABLE_PROOF_REQUIRED before execution. Invoke subordinate agents only as "
+        "declared Task Frame Workers. Route every mutation through Execution Guard and "
+        "a receipt-aware write path. Never substitute a raw write, raw subordinate "
+        "spawn, direct provider CLI, or inferred authority. If any required evidence "
+        "is missing, stop and report the exact blocked state. Each Project Room message "
+        "includes Host-observed Project Runtime context; use it for current Mode Anchor "
+        "and Commander Surface answers, mark unavailable facts UNKNOWN, reply in the "
+        "user's language, and keep ordinary conversation direct."
+    )
+
+
 class GrokProjectMasterRuntime:
     def __init__(
         self,
@@ -1318,22 +1341,7 @@ class GrokProjectMasterRuntime:
         return self._gateway
 
     def _system_prompt(self) -> str:
-        return (
-            f"You are the {self.actor_label}. "
-            "This is a persistent, read-only conversation Host connected to the "
-            "Universe interface. Work from the repository at the configured cwd. "
-            "Never claim that "
-            "Mode, Role, BOOT, or a chat message grants mutation authority. "
-            "You may inspect source, review, explain, audit, and propose bounded "
-            "work. Do not create, edit, delete, move, commit, push, execute project "
-            "code, start subagents, or invoke network tools. For implementation "
-            "requests, return a concise proposal suitable for a separate guarded "
-            "execution queue. Each Project Room message includes a Host-observed "
-            "Project Runtime context. Use that context for current Mode Anchor and "
-            "Commander Surface answers; static state files may be older. Mark "
-            "unavailable facts UNKNOWN. Reply in the user's language and keep "
-            "ordinary conversation direct."
-        )
+        return _project_master_system_prompt(self.actor_label)
 
     def _mode_greeting(self) -> str:
         return (
@@ -1501,15 +1509,7 @@ class CodexProjectMasterRuntime:
         return self._gateway
 
     def _system_prompt(self) -> str:
-        return (
-            f"You are the {self.actor_label}. "
-            "This is a persistent, read-only conversation Host connected to the "
-            "Universe interface. Do not create, edit, delete, "
-            "move, commit, push, execute project code, invoke subagents, or use "
-            "network tools. Mode and Role do not create mutation authority. "
-            "Inspect, review, explain, audit, and propose bounded work only. "
-            "Reply in the user's language."
-        )
+        return _project_master_system_prompt(self.actor_label)
 
     def _mode_greeting(self) -> str:
         return (
