@@ -141,6 +141,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             host_profile=HostProfileStore(temp_root / "host.json"),
             service_state_path=temp_root / "server.json",
             remote_gateway_state_path=temp_root / "remote-gateway.json",
+            remote_connector_state_path=temp_root / "remote-connector.json",
+            remote_connector_config_path=temp_root / "remote-connector-config.json",
         )
         self.host_tool_patchers = [
             patch(
@@ -707,6 +709,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/settings/host-tools", script)
             self.assertIn("/v1/settings/remote-access", script)
             self.assertIn("renderRemoteAccessSettings", script)
+            self.assertIn("SSH_REVERSE_TUNNEL", script)
+            self.assertIn("remote-public-url", body)
+            self.assertIn("remote-identity-file", body)
             self.assertIn("requestedPermissionSummary", script)
             self.assertIn(
                 "/v1/conductor-room/agent-session/permissions/",
@@ -734,6 +739,60 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("LOCAL_OPERATOR_REQUIRED", blocked["error_code"])
+
+    def test_internet_access_starts_loopback_gateway_then_ssh_connector(self) -> None:
+        identity = self.temp_root / "universe_ed25519"
+        known_hosts = self.temp_root / "known_hosts"
+        identity.write_text("private key placeholder", encoding="utf-8")
+        known_hosts.write_text("known host placeholder", encoding="utf-8")
+        body = {
+            "transport_kind": "SSH_REVERSE_TUNNEL",
+            "public_base_url": "https://universe.example.test",
+            "ssh_host": "server.example.test",
+            "ssh_port": 22,
+            "ssh_user": "universe-tunnel",
+            "remote_port": 18443,
+            "identity_file": str(identity),
+            "known_hosts_file": str(known_hosts),
+        }
+        gateway = {
+            "schema": "universe.remote-gateway.v1",
+            "status": "READY",
+            "listen_host": "127.0.0.1",
+            "port": 52742,
+            "control_endpoint": "http://127.0.0.1:52742",
+            "public_base_url": body["public_base_url"],
+            "control_token": "redacted",
+        }
+        connector = {
+            "schema": "universe.remote-connector.v1",
+            "status": "READY",
+            "transport_kind": "SSH_REVERSE_TUNNEL",
+            "public_base_url": body["public_base_url"],
+        }
+        with (
+            patch("universe_server.gateway_status", return_value={"status": "OFFLINE"}),
+            patch("universe_server.connector_status", return_value={"status": "OFFLINE"}),
+            patch("universe_server.start_gateway", return_value=gateway) as start_gateway,
+            patch("universe_server.start_connector", return_value=connector) as start_connector,
+        ):
+            status, result = self.request(
+                "POST", "/v1/settings/remote-access/start", body
+            )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("REMOTE_ACCESS_STARTED", result["status"])
+        self.assertEqual("READY", result["connector"]["status"])
+        self.assertNotIn("control_token", result["gateway"])
+        self.assertEqual("127.0.0.1", start_gateway.call_args.kwargs["listen_host"])
+        self.assertEqual(
+            "http://127.0.0.1:52742",
+            start_connector.call_args.kwargs["gateway_endpoint"],
+        )
+        self.assertEqual(
+            "SSH_REVERSE_TUNNEL",
+            start_connector.call_args.kwargs["config"]["transport_kind"],
+        )
 
     def test_conductor_fresh_project_draft_is_partial_and_review_only(self) -> None:
         action = normalize_conductor_ui_action(

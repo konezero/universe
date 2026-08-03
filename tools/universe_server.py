@@ -114,6 +114,16 @@ from universe_remote_gateway import (
     start_gateway,
     stop_gateway,
 )
+from universe_remote_connector import (
+    RemoteConnectorError,
+    connector_status,
+    default_connector_config_path,
+    default_connector_state_path,
+    load_connector_config,
+    normalize_connector_config,
+    start_connector,
+    stop_connector,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -10515,6 +10525,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         host_profile: HostProfileStore | None = None,
         service_state_path: Path | None = None,
         remote_gateway_state_path: Path | None = None,
+        remote_connector_state_path: Path | None = None,
+        remote_connector_config_path: Path | None = None,
     ):
         self.store = store
         self.session_supervisor = SessionSupervisorStore(store.database_path)
@@ -10522,6 +10534,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.service_state_path = (service_state_path or default_state_path()).resolve()
         self.remote_gateway_state_path = (
             remote_gateway_state_path or default_gateway_state_path()
+        ).resolve()
+        self.remote_connector_state_path = (
+            remote_connector_state_path or default_connector_state_path()
+        ).resolve()
+        self.remote_connector_config_path = (
+            remote_connector_config_path or default_connector_config_path()
         ).resolve()
         self.host_profile = host_profile or HostProfileStore()
         try:
@@ -10654,14 +10672,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
 
-    def remote_access_status(self) -> dict[str, Any]:
+    def remote_access_status(
+        self, *, include_configuration: bool = False
+    ) -> dict[str, Any]:
         gateway = gateway_status(self.remote_gateway_state_path)
         gateway.pop("control_token", None)
+        connector = connector_status(
+            self.remote_connector_state_path,
+            include_config=include_configuration,
+            config_path=self.remote_connector_config_path,
+        )
         snapshot = self.store.remote_access.snapshot()
         return {
             **snapshot,
             "status": "REMOTE_ACCESS_STATUS_COLLECTED",
             "gateway": gateway,
+            "connector": connector,
         }
 
     def start_remote_access(self, value: Any) -> dict[str, Any]:
@@ -10669,6 +10695,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(
                 "REMOTE_ACCESS_REQUEST_INVALID", "remote access body must be an object"
             )
+        transport_kind = str(value.get("transport_kind") or "LAN").strip().upper()
+        if transport_kind == "SAVED":
+            try:
+                saved = load_connector_config(self.remote_connector_config_path)
+            except RemoteConnectorError as error:
+                raise UniverseError(error.code, error.detail, error.status) from error
+            value = saved
+            transport_kind = saved["transport_kind"]
+        if transport_kind not in {"LAN", "SSH_REVERSE_TUNNEL"}:
+            raise UniverseError(
+                "REMOTE_ACCESS_REQUEST_INVALID",
+                "transport_kind must be LAN, SSH_REVERSE_TUNNEL, or SAVED",
+            )
+        if transport_kind == "SSH_REVERSE_TUNNEL":
+            try:
+                value = normalize_connector_config(value)
+            except RemoteConnectorError as error:
+                raise UniverseError(error.code, error.detail, error.status) from error
         raw_port = value.get("port", 0)
         if isinstance(raw_port, bool) or not isinstance(raw_port, int):
             raise UniverseError(
@@ -10682,16 +10726,69 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "verified native Python is required to start mobile access",
                 HTTPStatus.CONFLICT,
             )
+        existing_gateway = gateway_status(self.remote_gateway_state_path)
+        existing_connector = connector_status(self.remote_connector_state_path)
+        if transport_kind == "LAN" and existing_connector.get("status") == "READY":
+            raise UniverseError(
+                "REMOTE_CONNECTOR_ALREADY_RUNNING",
+                "stop Internet access before starting LAN access",
+                HTTPStatus.CONFLICT,
+            )
+        if (
+            transport_kind == "SSH_REVERSE_TUNNEL"
+            and existing_gateway.get("status") in {"READY", "HOST_OFFLINE"}
+            and (
+                existing_gateway.get("listen_host") != "127.0.0.1"
+                or existing_gateway.get("public_base_url") != public_base_url
+            )
+        ):
+            stop_connector(self.remote_connector_state_path)
+            stop_gateway(self.remote_gateway_state_path)
         try:
             gateway = start_gateway(
                 upstream_state=self.service_state_path,
                 database_path=self.store.database_path,
                 state_path=self.remote_gateway_state_path,
+                listen_host=(
+                    "127.0.0.1" if transport_kind == "SSH_REVERSE_TUNNEL" else ""
+                ),
                 port=raw_port,
                 public_base_url=public_base_url,
                 python_executable=python_tool.executable,
             )
-        except (OSError, GatewayError, RemoteAccessError) as error:
+            connector = {"status": "OFFLINE"}
+            if transport_kind == "SSH_REVERSE_TUNNEL":
+                ssh_tool = self.host_profile.resolve("ssh")
+                if ssh_tool is None:
+                    raise RemoteConnectorError(
+                        "REMOTE_CONNECTOR_SSH_UNAVAILABLE",
+                        "verified native ssh.exe is required for Internet access",
+                        HTTPStatus.CONFLICT,
+                    )
+                connector = start_connector(
+                    config=value,
+                    gateway_endpoint=str(gateway["control_endpoint"]),
+                    ssh_executable=ssh_tool.executable,
+                    python_executable=python_tool.executable,
+                    state_path=self.remote_connector_state_path,
+                    config_path=self.remote_connector_config_path,
+                )
+                if connector.get("status") != "READY":
+                    stop_gateway(self.remote_gateway_state_path)
+                    raise RemoteConnectorError(
+                        "REMOTE_CONNECTOR_START_FAILED",
+                        "SSH connector did not become ready",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+        except (
+            OSError,
+            GatewayError,
+            RemoteAccessError,
+            RemoteConnectorError,
+        ) as error:
+            if transport_kind == "SSH_REVERSE_TUNNEL":
+                stop_connector(self.remote_connector_state_path)
+                stop_gateway(self.remote_gateway_state_path)
             raise UniverseError(
                 getattr(error, "code", "REMOTE_GATEWAY_START_FAILED"),
                 getattr(error, "detail", str(error)),
@@ -10702,14 +10799,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "schema": API_SCHEMA,
             "status": "REMOTE_ACCESS_STARTED",
             "gateway": gateway,
+            "connector": connector,
         }
 
     def stop_remote_access(self) -> dict[str, Any]:
+        connector = stop_connector(self.remote_connector_state_path)
         gateway = stop_gateway(self.remote_gateway_state_path)
         return {
             "schema": API_SCHEMA,
             "status": "REMOTE_ACCESS_STOPPED",
             "gateway": gateway,
+            "connector": connector,
         }
 
     def create_remote_pairing(self, value: Any) -> dict[str, Any]:
@@ -11916,7 +12016,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, settings)
             return
         if path == "/v1/settings/remote-access":
-            self._send(HTTPStatus.OK, self.server.remote_access_status())
+            self._send(
+                HTTPStatus.OK,
+                self.server.remote_access_status(
+                    include_configuration=(
+                        self.headers.get("X-Universe-Access-Surface")
+                        != "REMOTE_BROWSER"
+                    )
+                ),
+            )
             return
         if path == "/v1/settings/host-tools":
             try:
@@ -13992,6 +14100,8 @@ def create_server(
     host_profile: HostProfileStore | None = None,
     service_state_path: Path | None = None,
     remote_gateway_state_path: Path | None = None,
+    remote_connector_state_path: Path | None = None,
+    remote_connector_config_path: Path | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -14018,6 +14128,8 @@ def create_server(
         host_profile=host_profile,
         service_state_path=service_state_path,
         remote_gateway_state_path=remote_gateway_state_path,
+        remote_connector_state_path=remote_connector_state_path,
+        remote_connector_config_path=remote_connector_config_path,
     )
 
 

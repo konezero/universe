@@ -286,7 +286,7 @@
         <div class="settings-section-heading">
           <div>
             <strong>Mobile access</strong>
-            <small>Paired browsers on the same network</small>
+            <small>Paired browsers over LAN or your trusted server</small>
           </div>
           <span id="remote-access-status" class="remote-access-status" data-state="OFFLINE">
             Offline
@@ -296,6 +296,45 @@
           Universe stays on loopback. A separate fixed-origin gateway exposes this UI only
           after one-time pairing and desktop approval.
         </p>
+        <div class="remote-access-configuration">
+          <label for="remote-access-transport">
+            Connection
+            <select id="remote-access-transport" name="remote_access_transport">
+              <option value="LAN">Local network</option>
+              <option value="SSH_REVERSE_TUNNEL">Internet through my server</option>
+            </select>
+          </label>
+          <div id="remote-connector-fields" class="remote-access-form-grid hidden">
+            <label for="remote-public-url">
+              Public HTTPS URL
+              <input id="remote-public-url" type="url" placeholder="https://universe.example.com">
+            </label>
+            <label for="remote-ssh-host">
+              SSH server
+              <input id="remote-ssh-host" type="text" autocomplete="off" placeholder="server.example.com">
+            </label>
+            <label for="remote-ssh-user">
+              SSH user
+              <input id="remote-ssh-user" type="text" autocomplete="off" placeholder="universe-tunnel">
+            </label>
+            <label for="remote-ssh-port">
+              SSH port
+              <input id="remote-ssh-port" type="number" min="1" max="65535" value="22">
+            </label>
+            <label for="remote-forward-port">
+              Server loopback port
+              <input id="remote-forward-port" type="number" min="1024" max="65535" value="18443">
+            </label>
+            <label for="remote-identity-file">
+              Private key file
+              <input id="remote-identity-file" type="text" autocomplete="off" placeholder="C:\Users\me\.ssh\universe_ed25519">
+            </label>
+            <label for="remote-known-hosts-file">
+              Known hosts file
+              <input id="remote-known-hosts-file" type="text" autocomplete="off" placeholder="C:\Users\me\.ssh\known_hosts">
+            </label>
+          </div>
+        </div>
         <div class="remote-access-actions">
           <button id="start-remote-access-button" type="button" class="primary-button">
             Start mobile access

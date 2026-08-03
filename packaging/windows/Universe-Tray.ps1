@@ -44,7 +44,6 @@ if ([System.IO.Path]::GetExtension($python) -ne ".exe") {
   throw "native python executable required: $python"
 }
 $serverPy = Join-Path $UniverseRoot "tools\universe_server.py"
-$gatewayPy = Join-Path $UniverseRoot "tools\universe_remote_gateway.py"
 $iconPath = Join-Path $UniverseRoot "packaging\windows\Universe.ico"
 if (-not (Test-Path $serverPy)) {
   throw "universe_server.py not found: $serverPy"
@@ -85,36 +84,36 @@ function Get-UniverseStatusObject {
   }
 }
 
-function Invoke-RemoteGatewayCli {
-  param([Parameter(Mandatory = $true)][string[]]$Args)
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $python
-  $argList = @($gatewayPy) + $Args
-  $psi.Arguments = ($argList | ForEach-Object {
-      if ($_ -match '\s') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
-    }) -join " "
-  $psi.WorkingDirectory = $UniverseRoot
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
-  $psi.CreateNoWindow = $true
-  $proc = [System.Diagnostics.Process]::Start($psi)
-  $stdout = $proc.StandardOutput.ReadToEnd()
-  $stderr = $proc.StandardError.ReadToEnd()
-  $proc.WaitForExit(120000) | Out-Null
-  return [pscustomobject]@{
-    ExitCode = $proc.ExitCode
-    StdOut   = $stdout
-    StdErr   = $stderr
+function Invoke-RemoteAccessApi {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("GET", "POST")][string]$Method,
+    [Parameter(Mandatory = $true)][string]$Path,
+    [hashtable]$Body = @{}
+  )
+  $status = Get-UniverseStatusObject
+  if ($status.status -ne "READY" -or -not $status.endpoint) {
+    throw "Universe service is not ready."
+  }
+  $uri = $status.endpoint.TrimEnd("/") + $Path
+  try {
+    if ($Method -eq "GET") {
+      return Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 10
+    }
+    $json = $Body | ConvertTo-Json -Compress
+    return Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $json -TimeoutSec 30
+  } catch {
+    throw $_.Exception.Message
   }
 }
 
 function Get-RemoteGatewayStatusObject {
-  $result = Invoke-RemoteGatewayCli -Args @("status")
   try {
-    return ($result.StdOut | ConvertFrom-Json)
+    return Invoke-RemoteAccessApi -Method GET -Path "/v1/settings/remote-access"
   } catch {
-    return [pscustomobject]@{ status = "UNKNOWN"; public_base_url = $null }
+    return [pscustomobject]@{
+      gateway = [pscustomobject]@{ status = "UNKNOWN"; public_base_url = $null }
+      connector = [pscustomobject]@{ status = "UNKNOWN" }
+    }
   }
 }
 
@@ -156,7 +155,7 @@ $itemStart = $menu.Items.Add("Start service")
 $itemStop = $menu.Items.Add("Stop service")
 $itemRestart = $menu.Items.Add("Restart service")
 [void]$menu.Items.Add("-")
-$itemRemoteStart = $menu.Items.Add("Start mobile access")
+$itemRemoteStart = $menu.Items.Add("Start saved remote access")
 $itemRemoteOpen = $menu.Items.Add("Open mobile URL")
 $itemRemoteStop = $menu.Items.Add("Stop mobile access")
 [void]$menu.Items.Add("-")
@@ -213,20 +212,25 @@ $itemRemoteStart.Add_Click({
       Invoke-UniverseCli -Args @("start", "--no-open-ui") | Out-Null
       Start-Sleep -Seconds 1
     }
-    $remote = Invoke-RemoteGatewayCli -Args @("start")
+    try {
+      $remote = Invoke-RemoteAccessApi -Method POST -Path "/v1/settings/remote-access/start" -Body @{ transport_kind = "SAVED" }
+    } catch {
+      $remote = $null
+      $remoteError = $_.Exception.Message
+    }
     $notify.BalloonTipTitle = "Universe mobile access"
-    $notify.BalloonTipText = if ($remote.ExitCode -eq 0) {
-      (($remote.StdOut | ConvertFrom-Json).public_base_url)
+    $notify.BalloonTipText = if ($remote) {
+      $remote.gateway.public_base_url
     } else {
-      $remote.StdErr
+      $remoteError
     }
     $notify.ShowBalloonTip(3000)
   })
 
 $itemRemoteOpen.Add_Click({
     $remote = Get-RemoteGatewayStatusObject
-    if ($remote.public_base_url) {
-      Start-Process $remote.public_base_url
+    if ($remote.gateway.public_base_url) {
+      Start-Process $remote.gateway.public_base_url
     } else {
       $notify.BalloonTipTitle = "Universe mobile access"
       $notify.BalloonTipText = "Mobile gateway is offline."
@@ -235,7 +239,13 @@ $itemRemoteOpen.Add_Click({
   })
 
 $itemRemoteStop.Add_Click({
-    Invoke-RemoteGatewayCli -Args @("stop") | Out-Null
+    try {
+      Invoke-RemoteAccessApi -Method POST -Path "/v1/settings/remote-access/stop" | Out-Null
+    } catch {
+      $notify.BalloonTipTitle = "Universe mobile access"
+      $notify.BalloonTipText = $_.Exception.Message
+      $notify.ShowBalloonTip(2500)
+    }
   })
 
 $itemExit.Add_Click({

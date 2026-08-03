@@ -80,7 +80,7 @@ use `--tools ""` and `--no-session-persistence`. Exact argv boundaries,
 non-ASCII protocol text, structured results, and provider permission boundaries
 are covered by Runtime Host regression tests.
 
-Python, Git, Grok, Codex, and Claude must resolve to native executables. `.bat`,
+Python, Git, OpenSSH, Grok, Codex, and Claude must resolve to native executables. `.bat`,
 `.cmd`, and `.ps1` entrypoints are rejected. The Profile stores executable paths,
 versions, verification timestamps, discovery sources, and the non-secret
 `GROK_HOME` launch environment. Tokens, credentials, and provider sessions are

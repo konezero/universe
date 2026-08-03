@@ -93,8 +93,8 @@ provider that is unavailable fails visibly and is never replaced after the
 request has started.
 
 Provider selection is separate from Host executable resolution. Runtime
-Settings exposes the central Host Profile for Python, Git, Codex, Grok, and
-Claude.
+Settings exposes the central Host Profile for Python, Git, OpenSSH, Codex, Grok,
+and Claude.
 The service initializes this Profile before Runtime providers or resident
 Project Masters start. Discover, select, and verify operations update the same
 local Profile consumed by all Runtime callers. They do not create authority,

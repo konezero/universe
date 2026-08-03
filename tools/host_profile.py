@@ -15,9 +15,9 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
 PROFILE_SCHEMA = "ai-career.host-profile.v1"
-PROFILE_REVISION = 2
+PROFILE_REVISION = 3
 PROFILE_ENVIRONMENT = "AI_CAREER_HOST_PROFILE"
-SUPPORTED_TOOLS = ("python", "git", "codex", "grok", "claude")
+SUPPORTED_TOOLS = ("python", "git", "ssh", "codex", "grok", "claude")
 REQUIRED_TOOLS = frozenset({"python", "git"})
 PROVIDER_TOOLS = frozenset({"codex", "grok", "claude"})
 DEFAULT_TOOL_MODELS = {
@@ -380,6 +380,7 @@ class HostProfileStore:
         names = {
             "python": ("python.exe", "python"),
             "git": ("git.exe", "git"),
+            "ssh": ("ssh.exe", "ssh"),
             "codex": ("codex.exe", "codex"),
             "grok": ("grok.exe", "grok"),
             "claude": ("claude.exe", "claude"),
@@ -420,7 +421,7 @@ class HostProfileStore:
             result = self.native_runner(
                 NativeCliRequest(
                     executable=executable,
-                    arguments=("--version",),
+                    arguments=("-V",) if tool == "ssh" else ("--version",),
                     timeout_seconds=20,
                     environment=environment,
                 )

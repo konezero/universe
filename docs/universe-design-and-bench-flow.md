@@ -389,9 +389,14 @@ relations remain distinct from observed evidence. Career adoption is separate.
     fixed-origin gateway forwards the same SPA, HTTP API, and SSE streams while
     the canonical service stays loopback-only. One-time pairing, local approval,
     paired-device sessions, revocation, Settings controls, and Windows tray
-    controls are implemented. The outbound HTTPS tunnel remains the next
-    deployment adapter; OAuth, P2P, and Universe peer networking remain later
-    adapters. The next network slice adds a minimal Universe Rendezvous Registry:
+    controls are implemented. The first Internet dogfood adapter now keeps the
+    Gateway on PC loopback and opens a key-only, strict-host-key SSH reverse
+    tunnel to one trusted server loopback port. OpenSSH resolves through the
+    central Host Profile; connector status, saved configuration, UI controls,
+    tray restart, fixed routing, and SSE regression coverage are included. The
+    public HTTPS reverse proxy remains user-operated deployment configuration.
+    OAuth, P2P, and Universe peer networking remain later adapters. The next
+    network slice adds a minimal Universe Rendezvous Registry:
     each Universe registers only its stable `universe_id`, rotatable
     `remote_route_id`, public key, signed public manifest, expiring endpoint
     candidates, and presence. A mobile browser resolves a known route UUID and

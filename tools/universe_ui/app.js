@@ -177,6 +177,15 @@ const elements = {
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
   remoteAccessStatus: document.querySelector("#remote-access-status"),
   remoteAccessEndpoint: document.querySelector("#remote-access-endpoint"),
+  remoteAccessTransport: document.querySelector("#remote-access-transport"),
+  remoteConnectorFields: document.querySelector("#remote-connector-fields"),
+  remotePublicUrl: document.querySelector("#remote-public-url"),
+  remoteSshHost: document.querySelector("#remote-ssh-host"),
+  remoteSshPort: document.querySelector("#remote-ssh-port"),
+  remoteSshUser: document.querySelector("#remote-ssh-user"),
+  remoteForwardPort: document.querySelector("#remote-forward-port"),
+  remoteIdentityFile: document.querySelector("#remote-identity-file"),
+  remoteKnownHostsFile: document.querySelector("#remote-known-hosts-file"),
   remotePairingInvite: document.querySelector("#remote-pairing-invite"),
   remotePairingList: document.querySelector("#remote-pairing-list"),
   remoteDeviceList: document.querySelector("#remote-device-list"),
@@ -1542,16 +1551,43 @@ function renderRemoteAccessSettings() {
   if (!elements.remoteAccessStatus) return;
   const remote = state.remoteAccess || {};
   const gateway = remote.gateway || { status: "OFFLINE" };
+  const connector = remote.connector || { status: "OFFLINE" };
   const online = gateway.status === "READY" || gateway.status === "HOST_OFFLINE";
+  const internetReady = connector.status === "READY";
   const localOperator = state.accessSurface !== "REMOTE_BROWSER";
-  elements.remoteAccessStatus.textContent = gateway.status || "OFFLINE";
-  elements.remoteAccessStatus.dataset.state = gateway.status || "OFFLINE";
+  const configuration = connector.configuration || null;
+  const transport =
+    connector.transport_kind === "SSH_REVERSE_TUNNEL" || configuration
+      ? "SSH_REVERSE_TUNNEL"
+      : elements.remoteAccessTransport.value || "LAN";
+  elements.remoteAccessTransport.value = transport;
+  elements.remoteConnectorFields.classList.toggle(
+    "hidden",
+    transport !== "SSH_REVERSE_TUNNEL"
+  );
+  if (configuration) {
+    elements.remotePublicUrl.value = configuration.public_base_url || "";
+    elements.remoteSshHost.value = configuration.ssh_host || "";
+    elements.remoteSshPort.value = configuration.ssh_port || 22;
+    elements.remoteSshUser.value = configuration.ssh_user || "";
+    elements.remoteForwardPort.value = configuration.remote_port || 18443;
+    elements.remoteIdentityFile.value = configuration.identity_file || "";
+    elements.remoteKnownHostsFile.value = configuration.known_hosts_file || "";
+  }
+  const visibleStatus =
+    transport === "SSH_REVERSE_TUNNEL" ? connector.status : gateway.status;
+  elements.remoteAccessStatus.textContent = visibleStatus || "OFFLINE";
+  elements.remoteAccessStatus.dataset.state = visibleStatus || "OFFLINE";
   elements.remoteAccessEndpoint.textContent = gateway.public_base_url
-    ? `Mobile URL: ${gateway.public_base_url}`
+    ? `${internetReady ? "Internet" : "Mobile"} URL: ${gateway.public_base_url}`
     : "Mobile gateway is stopped.";
   elements.startRemoteAccess.disabled = online || !localOperator;
   elements.stopRemoteAccess.disabled = !online || !localOperator;
-  elements.createPairing.disabled = !online || !localOperator;
+  elements.createPairing.disabled =
+    !online ||
+    !localOperator ||
+    (transport === "SSH_REVERSE_TUNNEL" && !internetReady);
+  elements.remoteAccessTransport.disabled = online || !localOperator;
 
   elements.remotePairingList.replaceChildren();
   const pending = (remote.pairings || []).filter(
@@ -1609,9 +1645,23 @@ async function refreshRemoteAccessSettings() {
 
 async function setRemoteAccess(operation) {
   elements.settingsError.textContent = "";
+  const transport = elements.remoteAccessTransport.value;
+  const body =
+    operation !== "start" || transport === "LAN"
+      ? { transport_kind: transport }
+      : {
+          transport_kind: "SSH_REVERSE_TUNNEL",
+          public_base_url: elements.remotePublicUrl.value.trim(),
+          ssh_host: elements.remoteSshHost.value.trim(),
+          ssh_port: Number(elements.remoteSshPort.value),
+          ssh_user: elements.remoteSshUser.value.trim(),
+          remote_port: Number(elements.remoteForwardPort.value),
+          identity_file: elements.remoteIdentityFile.value.trim(),
+          known_hosts_file: elements.remoteKnownHostsFile.value.trim(),
+        };
   await api(`/v1/settings/remote-access/${operation}`, {
     method: "POST",
-    body: {},
+    body,
   });
   await refreshRemoteAccessSettings();
   toast(operation === "start" ? "Mobile access started" : "Mobile access stopped");
@@ -5102,6 +5152,12 @@ function bindEvents() {
   });
   elements.discoverHostTools.addEventListener("click", () => {
     discoverHostTools().catch((error) => toast(error.message, true));
+  });
+  elements.remoteAccessTransport.addEventListener("change", () => {
+    elements.remoteConnectorFields.classList.toggle(
+      "hidden",
+      elements.remoteAccessTransport.value !== "SSH_REVERSE_TUNNEL"
+    );
   });
   elements.startRemoteAccess.addEventListener("click", () => {
     setRemoteAccess("start").catch((error) => {

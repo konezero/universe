@@ -1409,6 +1409,26 @@ dialog {
   flex-wrap: wrap;
 }
 
+.remote-access-configuration,
+.remote-access-form-grid {
+  display: grid;
+  gap: 9px;
+}
+
+.remote-access-form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+}
+
+.remote-access-form-grid label:first-child,
+.remote-access-form-grid label:nth-child(6),
+.remote-access-form-grid label:nth-child(7) {
+  grid-column: 1 / -1;
+}
+
 .remote-access-endpoint,
 .remote-pairing-invite {
   overflow-wrap: anywhere;
@@ -3571,5 +3591,13 @@ body {
 
   .remote-access-grid {
     grid-template-columns: 1fr;
+  }
+
+  .remote-access-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-access-form-grid label {
+    grid-column: 1 !important;
   }
 }

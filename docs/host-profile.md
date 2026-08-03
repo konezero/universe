@@ -27,13 +27,15 @@ Revision 2 manages:
 ```text
 python
 git
+ssh
 codex
 grok
 claude
 ```
 
-Python and Git are required for a ready base Profile. Codex, Grok, and Claude
-are optional provider capabilities. Each record contains:
+Python and Git are required for a ready base Profile. OpenSSH is an optional
+transport capability. Codex, Grok, and Claude are optional provider
+capabilities. Each record contains:
 
 ```text
 status

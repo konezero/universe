@@ -37,6 +37,10 @@ class WindowsTrayContractTests(unittest.TestCase):
         self.assertIn("Universe.ico", script)
         self.assertIn("Local\\Universe.Tray", script)
         self.assertIn("ShowBalloonTip", script)
+        self.assertIn("Start saved remote access", script)
+        self.assertIn('transport_kind = "SAVED"', script)
+        self.assertIn("/v1/settings/remote-access/start", script)
+        self.assertNotIn("universe_remote_gateway.py", script)
         self.assertNotIn("Get-Command python -", script)
 
     def test_windows_shortcuts_use_the_universe_icon(self) -> None:

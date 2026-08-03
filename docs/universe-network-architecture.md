@@ -128,6 +128,36 @@ paired mobile browser on the same network
 This slice proves access and pairing. It is not a substitute for TLS, an
 outbound connector, or a deployed Internet rendezvous service.
 
+## SSH Outbound Dogfood Connector
+
+The first Internet transport reuses the paired Gateway and adds one
+Universe-owned resident connector:
+
+```text
+trusted HTTPS reverse proxy on the user's server
+  -> server loopback port
+  -> SSH reverse tunnel opened outbound by the Universe PC
+  -> paired Gateway bound to PC loopback
+  -> canonical Universe loopback service
+```
+
+- `tools/universe_remote_connector.py` owns the hidden SSH child and exposes a
+  token-protected loopback control endpoint for status and shutdown.
+- OpenSSH resolves through the central Host Profile. The connector uses exact
+  argv, key-only batch authentication, strict host-key checking, remote-forward
+  failure detection, keepalives, and a fixed loopback-to-loopback route.
+- The SSH server listener is fixed to `127.0.0.1`; a separately configured HTTPS
+  reverse proxy is the only public listener.
+- The local Gateway changes from its LAN address to loopback before the Internet
+  connector starts. A stale LAN listener is not silently reused.
+- Connector configuration is local. The private key contents are never read or
+  persisted by Universe, and the paired browser never receives local paths.
+- `Stop` terminates the connector-owned SSH child before stopping the Gateway.
+- This adapter is the initial Gabia/self-hosted dogfood path. It implements the
+  outbound transport boundary without claiming UUID Rendezvous or Relay.
+
+Deployment and verification are defined in `docs/external-access-dogfood.md`.
+
 ## Components
 
 ### Local Universe HTTP service
@@ -412,10 +442,12 @@ from the first remote release.
 
 ### Slice 2: Outbound tunnel and Host presence
 
-- add a desktop connector that opens an outbound persistent tunnel;
-- add a minimal access gateway that maps one remote URL to one connector;
-- expose health and `HOST_OFFLINE` behavior;
-- keep pairing disabled and use a development-only credential.
+- **Implemented for self-hosted dogfood:** a desktop SSH connector opens an
+  outbound persistent tunnel to one configured server loopback port.
+- The existing paired Gateway maps the remote URL to one fixed local Universe
+  origin and exposes local Host availability.
+- UUID Rendezvous presence and a product-operated Relay remain the next
+  transport adapter; they do not replace or weaken pairing.
 
 ### Slice 3: Device pairing
 
@@ -432,7 +464,7 @@ from the first remote release.
 
 ### Slice 5: Packaging and hardening
 
-- start the connector with the Universe tray application;
+- restart saved connector configuration from the Universe tray application;
 - add gateway URL and remote enablement configuration;
 - define trusted-gateway deployment and operational monitoring;
 - separately design an end-to-end tunnel before claiming Relay confidentiality.

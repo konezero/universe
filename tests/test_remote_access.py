@@ -97,6 +97,17 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         type(self).observed_headers = {key: value for key, value in self.headers.items()}
+        if self.path == "/events":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"id: 1\ndata: first\n\n")
+            self.wfile.flush()
+            self.wfile.write(b"id: 2\ndata: second\n\n")
+            self.wfile.flush()
+            return
         if self.path == "/health":
             body = json.dumps({"status": "READY"}).encode("utf-8")
             content_type = "application/json"
@@ -206,6 +217,21 @@ class RemoteGatewayTests(unittest.TestCase):
             _UpstreamHandler.observed_headers["X-Universe-Access-Surface"],
         )
         self.assertNotIn("Authorization", _UpstreamHandler.observed_headers)
+
+        with self._open(
+            Request(
+                self.endpoint + "/events",
+                method="GET",
+                headers={"Accept": "text/event-stream", "Last-Event-ID": "0"},
+            )
+        ) as response:
+            events = response.read()
+            self.assertEqual("text/event-stream", response.headers.get_content_type())
+        self.assertEqual(
+            b"id: 1\ndata: first\n\nid: 2\ndata: second\n\n",
+            events,
+        )
+        self.assertEqual("0", _UpstreamHandler.observed_headers["Last-Event-ID"])
 
         device = self.store.snapshot()["devices"][0]
         self.store.revoke_device(device["device_id"])

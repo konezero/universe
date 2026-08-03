@@ -53,14 +53,16 @@ class HostProfileTests(unittest.TestCase):
             profile_path = root / "host.json"
             python = root / "python.exe"
             git = root / "git.exe"
+            ssh = root / "ssh.exe"
             codex_batch = root / "codex.cmd"
             grok = root / "grok.exe"
             claude = root / ".local" / "bin" / "claude.exe"
             claude.parent.mkdir(parents=True)
-            for path in (python, git, codex_batch, grok, claude):
+            for path in (python, git, ssh, codex_batch, grok, claude):
                 path.write_bytes(b"placeholder")
             lookup = {
                 "git.exe": str(git),
+                "ssh.exe": str(ssh),
                 "codex.exe": str(codex_batch),
                 "grok.exe": str(grok),
             }
@@ -83,6 +85,7 @@ class HostProfileTests(unittest.TestCase):
             self.assertEqual("HOST_PROFILE_READY", result["status"])
             self.assertEqual("AVAILABLE", result["tools"]["python"]["status"])
             self.assertEqual("AVAILABLE", result["tools"]["git"]["status"])
+            self.assertEqual("AVAILABLE", result["tools"]["ssh"]["status"])
             self.assertEqual("UNAVAILABLE", result["tools"]["codex"]["status"])
             self.assertEqual("AVAILABLE", result["tools"]["grok"]["status"])
             self.assertEqual("AVAILABLE", result["tools"]["claude"]["status"])
@@ -213,7 +216,14 @@ class HostProfileTests(unittest.TestCase):
                                 "evidence_ref": "test://claude" if tool == "claude" else "UNKNOWN",
                                 "reason": f"{tool.upper()}_NOT_DISCOVERED",
                             }
-                            for tool in ("python", "git", "codex", "grok", "claude")
+                            for tool in (
+                                "python",
+                                "git",
+                                "ssh",
+                                "codex",
+                                "grok",
+                                "claude",
+                            )
                         },
                     }
                 ),
@@ -234,6 +244,35 @@ class HostProfileTests(unittest.TestCase):
             self.assertEqual("default", result["tools"]["claude"]["model"])
             self.assertEqual("grok-build", result["tools"]["grok"]["model"])
             self.assertEqual("NOT_APPLICABLE", result["tools"]["git"]["model"])
+
+    def test_ssh_discovery_uses_native_version_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = root / "host.json"
+            python = root / "python.exe"
+            ssh = root / "ssh.exe"
+            python.write_bytes(b"placeholder")
+            ssh.write_bytes(b"placeholder")
+            arguments: list[tuple[str, ...]] = []
+
+            def runner(request):
+                if request.executable == ssh.resolve():
+                    arguments.append(request.arguments)
+                return completed("OpenSSH test")
+
+            store = HostProfileStore(
+                profile_path,
+                environment={},
+                path_lookup=lambda name: str(ssh) if name == "ssh.exe" else None,
+                native_runner=runner,
+                current_python=python,
+                home=root,
+            )
+
+            result = store.discover()
+
+            self.assertEqual("AVAILABLE", result["tools"]["ssh"]["status"])
+            self.assertEqual([("-V",)], arguments)
 
     def test_provider_model_is_validated_and_preserved_by_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
