@@ -28,6 +28,7 @@ JsonObject = dict[str, Any]
 
 from core_release import build_release  # noqa: E402
 from host_profile import HostProfileStore  # noqa: E402
+from project_master_host import ProjectTaskProposalAdapter  # noqa: E402
 from project_seed_assets import materialize_project_seed_assets  # noqa: E402
 from universe_server import (  # noqa: E402
     ConductorPermissionBridge,
@@ -210,6 +211,67 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         value.update(overrides)
         return value
+
+    def create_task_proposal_fixture(self) -> JsonObject:
+        database_path = (
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "task_frames"
+            / "task-proposals.sqlite3"
+        )
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        proposal_digest = "a" * 64
+        proposal: JsonObject = {
+            "schema": "ai-career.task-proposal.v1",
+            "status": "TASK_PROPOSAL_CREATED",
+            "proposal_id": "task_proposal_test_001",
+            "proposal_digest": proposal_digest,
+            "repository_ref": str(self.project_root),
+            "task_summary": "Implement the rendezvous endpoint",
+            "boundary": "tools and tests only",
+            "request_ref": "universe://project-room/messages/request-001",
+            "scope": {"operations": ["MODIFY"], "roots": ["tools", "tests"]},
+            "source_ref": "git:" + "b" * 40,
+            "created_at": "2026-08-03T00:00:00Z",
+            "approval_required": True,
+            "authority_created": False,
+            "repository_write": False,
+        }
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    proposal_digest TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    approved_at TEXT,
+                    approval_json TEXT,
+                    completed_at TEXT
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO proposal(
+                    proposal_id, proposal_digest, proposal_json, state,
+                    created_at, approved_at, approval_json, completed_at
+                ) VALUES (?, ?, ?, 'PROPOSED', ?, NULL, NULL, NULL)
+                """,
+                (
+                    proposal["proposal_id"],
+                    proposal_digest,
+                    json.dumps(proposal, sort_keys=True, separators=(",", ":")),
+                    proposal["created_at"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return proposal
 
     @staticmethod
     def digest(path: Path) -> str:
@@ -2392,10 +2454,162 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("SNAPSHOT", envelope["payload"]["type"])
         self.assertEqual(1, len(envelope["payload"]["messages"]))
         self.assertEqual([], envelope["payload"]["permissions"])
+        self.assertEqual([], envelope["payload"]["governance_proposals"])
         self.assertEqual(
             "Stream this room.",
             envelope["payload"]["messages"][0]["body"],
         )
+
+    def test_governance_proposal_is_durable_visible_and_approved_by_one_api(
+        self,
+    ) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+
+        class ApprovingAdapter(ProjectTaskProposalAdapter):
+            def approve(
+                inner_self,
+                project_root: Path,
+                *,
+                proposal_id: str,
+                proposal_digest: str,
+                evidence_ref: str,
+            ) -> JsonObject:
+                database_path = (
+                    project_root
+                    / ".ai"
+                    / "runtime"
+                    / "task_frames"
+                    / "task-proposals.sqlite3"
+                )
+                approval = {
+                    "schema": "ai-career.task-proposal-approval.v1",
+                    "status": "APPROVED",
+                    "proposal_id": proposal_id,
+                    "proposal_digest": proposal_digest,
+                    "evidence_ref": evidence_ref,
+                    "approved_at": "2026-08-03T00:01:00Z",
+                }
+                connection = sqlite3.connect(database_path)
+                try:
+                    connection.execute(
+                        """
+                        UPDATE proposal
+                        SET state = 'APPROVED', approved_at = ?, approval_json = ?
+                        WHERE proposal_id = ? AND proposal_digest = ?
+                        """,
+                        (
+                            approval["approved_at"],
+                            json.dumps(approval, sort_keys=True, separators=(",", ":")),
+                            proposal_id,
+                            proposal_digest,
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                return {
+                    "status": "TASK_PROPOSAL_APPROVED",
+                    "approval": approval,
+                }
+
+        self.server.project_task_proposals = ApprovingAdapter()
+        status, listed = self.request(
+            "GET",
+            "/v1/projects/GCS/governance-proposals",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("PROPOSED", listed["proposals"][0]["state"])
+        self.assertFalse(listed["proposals"][0]["platform_permission"])
+        status, inbox = self.request(
+            "GET",
+            "/v1/governance-proposals",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("GOVERNANCE_PROPOSAL_INBOX_COLLECTED", inbox["status"])
+        self.assertEqual("GCS", inbox["proposals"][0]["project_id"])
+        self.assertEqual("PROPOSED", inbox["proposals"][0]["state"])
+
+        status, approved = self.request(
+            "POST",
+            "/v1/projects/GCS/governance-proposals/task_proposal_test_001/decision",
+            {
+                "decision": "APPROVE",
+                "proposal_digest": proposal["proposal_digest"],
+                "source": "NATURAL_LANGUAGE",
+                "commander_surface": "UNIVERSE_UI",
+                "idempotency_key": "approve-task-proposal-test-001",
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("GOVERNANCE_PROPOSAL_APPROVED", approved["status"])
+        self.assertEqual("APPROVED", approved["proposal"]["state"])
+        self.assertEqual("APPLIED", approved["decision"]["state"])
+        self.assertIn(
+            "governance-proposals/task_proposal_test_001/decisions/",
+            approved["decision"]["evidence_ref"],
+        )
+        self.assertEqual("NATURAL_LANGUAGE", approved["decision"]["source"])
+        self.assertIn(
+            "universe.project-master-governance-approval.v1",
+            approved["message"]["body"],
+        )
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/projects/GCS/governance-proposals/task_proposal_test_001/decision",
+            {
+                "decision": "APPROVE",
+                "proposal_digest": proposal["proposal_digest"],
+                "source": "NATURAL_LANGUAGE",
+                "commander_surface": "UNIVERSE_UI",
+                "idempotency_key": "approve-task-proposal-test-001",
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "GOVERNANCE_PROPOSAL_ALREADY_APPROVED", repeated["status"]
+        )
+
+    def test_governance_proposal_decision_rejects_digest_mismatch(self) -> None:
+        self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, response = self.request(
+            "POST",
+            "/v1/projects/GCS/governance-proposals/task_proposal_test_001/decision",
+            {
+                "decision": "APPROVE",
+                "proposal_digest": "c" * 64,
+                "source": "BUTTON",
+                "idempotency_key": "approve-task-proposal-test-mismatch",
+            },
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH", response["error_code"]
+        )
+
+    def test_governance_approval_does_not_resolve_platform_permission(self) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, response = self.request(
+            "POST",
+            "/v1/projects/GCS/governance-proposals/permission_test_001/decision",
+            {
+                "decision": "APPROVE",
+                "proposal_digest": proposal["proposal_digest"],
+                "source": "BUTTON",
+                "idempotency_key": "do-not-cross-permission-boundary",
+            },
+            self.token,
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("GOVERNANCE_PROPOSAL_NOT_FOUND", response["error_code"])
 
     def test_release_import_and_project_plan_are_durable_and_read_only(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

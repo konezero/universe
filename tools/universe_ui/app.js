@@ -31,6 +31,8 @@ const state = {
   projectRoomStreamProjectId: null,
   projectStreamReplies: {},
   projectPermissions: [],
+  governanceProposals: [],
+  governanceProposalInbox: [],
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
@@ -703,6 +705,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
       todoResult,
       releaseResult,
       conductorRoomResult,
+      governanceProposalInboxResult,
       providerSettings,
       hostTools,
     ] =
@@ -711,6 +714,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
       api("/v1/todos"),
       api("/v1/releases"),
       api("/v1/conductor-room/messages"),
+      api("/v1/governance-proposals"),
       api("/v1/settings/providers"),
       api("/v1/settings/host-tools"),
     ]);
@@ -721,6 +725,8 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.conductorPermissions = conductorRoomResult.permissions || [];
     state.conductorRuntimeBinding =
       conductorRoomResult.runtime_binding || null;
+    state.governanceProposalInbox =
+      governanceProposalInboxResult.proposals || [];
     state.providerSettings = providerSettings;
     state.hostTools = hostTools;
     try {
@@ -787,6 +793,11 @@ function renderProjects() {
       (todo) =>
         todo.project_id === project.project_id && todo.state !== "DONE"
     ).length;
+    const pendingApprovalCount = state.governanceProposalInbox.filter(
+      (proposal) =>
+        proposal.project_id === project.project_id &&
+        proposal.state === "PROPOSED"
+    ).length;
     copy.append(
       node("span", "project-name", project.project_id),
       node(
@@ -794,10 +805,22 @@ function renderProjects() {
         "project-meta",
         `${project.metadata.label || project.refs.mode_registry}${
           openTodoCount ? ` / ${openTodoCount} open` : ""
+        }${
+          pendingApprovalCount ? ` / ${pendingApprovalCount} approval` : ""
         }`
       )
     );
     button.append(avatar, copy);
+    if (pendingApprovalCount) {
+      button.append(
+        node(
+          "span",
+          "project-approval-badge",
+          pendingApprovalCount > 99 ? "99+" : String(pendingApprovalCount)
+        )
+      );
+      button.title = `${pendingApprovalCount} governance Proposal approval required`;
+    }
     button.addEventListener("click", () => selectProject(project.project_id));
     elements.projectList.append(button);
   }
@@ -932,6 +955,7 @@ async function selectProject(
     roomResult,
     bridgeResult,
     permissionResult,
+    governanceProposalResult,
     handoffResult,
     skillPlanAdoptionResult,
     observationResult,
@@ -952,6 +976,9 @@ async function selectProject(
     api(`/v1/projects/${encodeURIComponent(projectId)}/master-bridge`).catch(() => ({ bridge: null })),
     api(`/v1/projects/${encodeURIComponent(projectId)}/agent-session/permissions`).catch(
       () => ({ permissions: [] })
+    ),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/governance-proposals`).catch(
+      () => ({ proposals: [] })
     ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/master-handoffs`).catch(
       () => ({ handoffs: [] })
@@ -994,6 +1021,8 @@ async function selectProject(
   state.roomMessages = roomResult.messages || [];
   state.masterBridge = bridgeResult.bridge || null;
   state.projectPermissions = permissionResult.permissions || [];
+  state.governanceProposals = governanceProposalResult.proposals || [];
+  mergeGovernanceProposalInbox(projectId, state.governanceProposals);
   state.masterHandoffs = handoffResult.handoffs || [];
   state.skillPlanAdoptions = skillPlanAdoptionResult.adoptions || [];
   state.skillObservations = observationResult.observations || [];
@@ -1023,6 +1052,15 @@ async function selectProject(
   renderTodos();
 }
 
+function mergeGovernanceProposalInbox(projectId, proposals) {
+  state.governanceProposalInbox = [
+    ...(proposals || []),
+    ...state.governanceProposalInbox.filter(
+      (item) => item.project_id !== projectId
+    ),
+  ];
+}
+
 
 function conversationMessageCount() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
@@ -1030,12 +1068,18 @@ function conversationMessageCount() {
       (state.conductorMessages || []).length +
       (state.conductorPermissions || []).filter(
         (item) => item.state === "PENDING"
+      ).length +
+      (state.governanceProposalInbox || []).filter(
+        (item) => item.state === "PROPOSED"
       ).length
     );
   }
   return (
     (state.roomMessages || []).length +
-    (state.projectPermissions || []).filter((item) => item.state === "PENDING").length
+    (state.projectPermissions || []).filter((item) => item.state === "PENDING").length +
+    (state.governanceProposals || []).filter(
+      (item) => item.state === "PROPOSED"
+    ).length
   );
 }
 
@@ -1067,13 +1111,33 @@ function expandConversationLayer() {
   }
 }
 
+function scrollRoomToPendingAction() {
+  const pending = elements.roomMessageList.querySelector(
+    ".governance-proposal-request, .permission-request"
+  );
+  if (!pending) {
+    elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+    return;
+  }
+  const listBox = elements.roomMessageList.getBoundingClientRect();
+  const pendingBox = pending.getBoundingClientRect();
+  elements.roomMessageList.scrollTop += pendingBox.top - listBox.top;
+}
+
 function renderRoomMessages() {
   elements.roomMessageList.replaceChildren();
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     const pendingPermissions = state.conductorPermissions.filter(
       (item) => item.state === "PENDING"
     );
-    if (!state.conductorMessages.length && !pendingPermissions.length) {
+    const pendingProposals = state.governanceProposalInbox.filter(
+      (item) => item.state === "PROPOSED"
+    );
+    if (
+      !state.conductorMessages.length &&
+      !pendingPermissions.length &&
+      !pendingProposals.length
+    ) {
       const item = node("article", "room-message conductor-message");
       item.append(
         node("strong", "", "UNIVERSE / CONDUCTOR"),
@@ -1119,19 +1183,24 @@ function renderRoomMessages() {
       }
       elements.roomMessageList.append(item);
     }
+    for (const proposal of pendingProposals) {
+      elements.roomMessageList.append(renderGovernanceProposalCard(proposal));
+    }
     for (const permission of pendingPermissions) {
       elements.roomMessageList.append(renderPermissionCard(permission));
     }
-    elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+    scrollRoomToPendingAction();
     updateConversationBadge();
     return;
   }
-  for (const permission of state.projectPermissions.filter(
-    (item) => item.state === "PENDING"
-  )) {
-    elements.roomMessageList.append(renderPermissionCard(permission));
-  }
-  if (!state.roomMessages.length) {
+  const pendingProposals = state.governanceProposals.filter(
+    (item) => item.state === "PROPOSED"
+  );
+  if (
+    !state.roomMessages.length &&
+    !pendingProposals.length &&
+    !state.projectPermissions.some((item) => item.state === "PENDING")
+  ) {
     elements.roomMessageList.append(
       node(
         "p",
@@ -1160,8 +1229,138 @@ function renderRoomMessages() {
     );
     elements.roomMessageList.append(item);
   }
-  elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
+  for (const proposal of pendingProposals) {
+    elements.roomMessageList.append(renderGovernanceProposalCard(proposal));
+  }
+  for (const permission of state.projectPermissions.filter(
+    (item) => item.state === "PENDING"
+  )) {
+    elements.roomMessageList.append(renderPermissionCard(permission));
+  }
+  scrollRoomToPendingAction();
   updateConversationBadge();
+}
+
+function renderGovernanceProposalCard(proposal) {
+  const item = node("article", "room-message governance-proposal-request");
+  const summary = proposal.task_summary || "Project task proposal";
+  const digest = String(proposal.proposal_digest || "UNKNOWN");
+  const scope = proposal.scope && Object.keys(proposal.scope).length
+    ? JSON.stringify(proposal.scope)
+    : proposal.boundary || "Project scope";
+  item.append(
+    node(
+      "strong",
+      "",
+      `GOVERNANCE / ${proposal.project_id} / APPROVAL REQUIRED`
+    ),
+    node("p", "proposal-title", summary),
+    node("small", "proposal-boundary", proposal.boundary || "Scope recorded"),
+    node("small", "proposal-coordinate", `ID ${proposal.proposal_id}`),
+    node("small", "proposal-coordinate", `Digest ${digest.slice(0, 16)}...`),
+    node("small", "proposal-scope", scope)
+  );
+  const actions = node("div", "proposal-actions");
+  const approve = node("button", "proposal-approve", "Approve");
+  approve.type = "button";
+  approve.title = `Approve ${proposal.proposal_id}`;
+  approve.addEventListener("click", () =>
+    decideGovernanceProposal(proposal, "BUTTON")
+  );
+  actions.append(approve);
+  item.append(actions);
+  return item;
+}
+
+async function decideGovernanceProposal(proposal, source) {
+  if (!state.projects.some((project) => project.project_id === proposal.project_id)) {
+    toast("Proposal project is no longer attached", true);
+    return false;
+  }
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(
+        proposal.project_id
+      )}/governance-proposals/${encodeURIComponent(
+        proposal.proposal_id
+      )}/decision`,
+      {
+        method: "POST",
+        body: {
+          decision: "APPROVE",
+          proposal_digest: proposal.proposal_digest,
+          source,
+          commander_surface: "UNIVERSE_UI",
+          idempotency_key: crypto.randomUUID(),
+        },
+      }
+    );
+    state.governanceProposals = [
+      ...(state.selectedProject?.project_id === result.proposal.project_id
+        ? [result.proposal]
+        : []),
+      ...state.governanceProposals.filter(
+        (item) => item.proposal_id !== result.proposal.proposal_id
+      ),
+    ];
+    mergeGovernanceProposalInbox(result.proposal.project_id, [
+      result.proposal,
+      ...state.governanceProposalInbox.filter(
+        (item) =>
+          item.project_id === result.proposal.project_id &&
+          item.proposal_id !== result.proposal.proposal_id
+      ),
+    ]);
+    if (
+      result.message &&
+      state.selectedProject?.project_id === result.proposal.project_id
+    ) {
+      state.roomMessages = [
+        ...state.roomMessages.filter(
+          (message) => message.message_id !== result.message.message_id
+        ),
+        result.message,
+      ];
+    }
+    renderProjects();
+    renderRoomMessages();
+    toast("Governance Proposal approved and delivered to Project Master");
+    return true;
+  } catch (error) {
+    toast(error.message, true);
+    return false;
+  }
+}
+
+const GOVERNANCE_APPROVAL_COMMANDS = new Set([
+  "\uc2b9\uc778",
+  "\uc9c4\ud589",
+  "\uace0\uace0",
+  "\uc2b9\uc778\ud574",
+  "\uc9c4\ud589\ud574",
+  "\uace0\uace0\ud574",
+]);
+
+async function resolveNaturalLanguageGovernanceApproval(instruction) {
+  if (
+    state.conversationTarget.kind !== "PROJECT_MASTER" ||
+    !GOVERNANCE_APPROVAL_COMMANDS.has(String(instruction || "").trim())
+  ) {
+    return false;
+  }
+  const projectId = state.conversationTarget.projectId;
+  const pending = state.governanceProposals.filter(
+    (item) => item.project_id === projectId && item.state === "PROPOSED"
+  );
+  if (!pending.length) return false;
+  if (pending.length > 1) {
+    expandConversationLayer();
+    renderRoomMessages();
+    toast("Select one Proposal card; nothing was approved", true);
+    return true;
+  }
+  await decideGovernanceProposal(pending[0], "NATURAL_LANGUAGE");
+  return true;
 }
 
 function requestedPermissionSummary(value) {
@@ -1879,6 +2078,11 @@ function openProjectRoomStream(projectId) {
       state.projectPermissions = Array.isArray(payload.permissions)
         ? payload.permissions
         : state.projectPermissions;
+      state.governanceProposals = Array.isArray(payload.governance_proposals)
+        ? payload.governance_proposals
+        : state.governanceProposals;
+      mergeGovernanceProposalInbox(projectId, state.governanceProposals);
+      renderProjects();
       if (payload.type === "ROOM_CHANGED") {
         state.projectStreamReplies = {};
       }
@@ -3047,6 +3251,11 @@ async function submitDispatch(event) {
     } finally {
       elements.dispatchSubmit.disabled = false;
     }
+    return;
+  }
+  if (await resolveNaturalLanguageGovernanceApproval(form.get("instruction"))) {
+    elements.dispatchForm.reset();
+    renderComposerState();
     return;
   }
   const targetProject = state.projects.find(

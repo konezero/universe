@@ -61,6 +61,9 @@ PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
 PROJECT_MASTER_SESSION_SCHEMA = "universe.project-master-session.v1"
 PROVIDER_SESSION_CONNECTION_SCHEMA = "universe.provider-session-connection.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
+TASK_PROPOSAL_DATABASE_RELATIVE_PATH = Path(
+    ".ai/runtime/task_frames/task-proposals.sqlite3"
+)
 
 
 class ProjectMasterHostError(RuntimeError):
@@ -713,6 +716,171 @@ class ProjectModeCoordinator:
         return source_commit.lower()
 
 
+class ProjectTaskProposalAdapter:
+    """Read and approve the installed Runtime's durable Task Proposals."""
+
+    def __init__(self, *, native_runner: NativeRunner = run_native_cli) -> None:
+        self.native_runner = native_runner
+
+    def list(
+        self,
+        project_root: Path,
+        project_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        root = project_root.expanduser().resolve(strict=True)
+        normalized_project_id = _text(project_id, "project_id")
+        database_path = root / TASK_PROPOSAL_DATABASE_RELATIVE_PATH
+        if not database_path.is_file():
+            return []
+        bounded_limit = max(1, min(int(limit), 500))
+        try:
+            connection = sqlite3.connect(
+                f"{database_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=2,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT proposal_id, proposal_digest, proposal_json, state,
+                           created_at, approved_at, approval_json, completed_at
+                    FROM proposal
+                    ORDER BY created_at DESC, proposal_id DESC
+                    LIMIT ?
+                    """,
+                    (bounded_limit,),
+                ).fetchall()
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            raise ProjectMasterHostError(
+                "PROJECT_TASK_PROPOSAL_JOURNAL_INVALID"
+            ) from error
+        return [
+            self._proposal_row(normalized_project_id, row)
+            for row in rows
+        ]
+
+    def approve(
+        self,
+        project_root: Path,
+        *,
+        proposal_id: str,
+        proposal_digest: str,
+        evidence_ref: str,
+    ) -> dict[str, Any]:
+        root = project_root.expanduser().resolve(strict=True)
+        runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        if not runtime_cli.is_file():
+            raise ProjectMasterHostError("PROJECT_RUNTIME_CLI_UNAVAILABLE")
+        request_path = _runtime_tmp() / f"project-task-approval-{uuid4().hex}.json"
+        request_path.write_text(
+            json.dumps(
+                {
+                    "proposal_id": _text(proposal_id, "proposal_id"),
+                    "proposal_digest": _text(
+                        proposal_digest, "proposal_digest"
+                    ),
+                    "evidence_ref": _text(evidence_ref, "evidence_ref"),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        try:
+            result = self.native_runner(
+                NativeCliRequest(
+                    executable=_required_host_executable("python"),
+                    arguments=(
+                        str(runtime_cli),
+                        "task-proposal",
+                        "approve",
+                        "--repo-root",
+                        str(root),
+                        "--request",
+                        str(request_path),
+                    ),
+                    cwd=root,
+                    timeout_seconds=30,
+                )
+            )
+        finally:
+            request_path.unlink(missing_ok=True)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ProjectMasterHostError(
+                "PROJECT_TASK_PROPOSAL_APPROVAL_RESULT_INVALID"
+            ) from error
+        if (
+            result.status != "COMPLETED"
+            or result.return_code != 0
+            or not isinstance(payload, Mapping)
+            or payload.get("status") != "TASK_PROPOSAL_APPROVED"
+        ):
+            error_code = (
+                str(payload.get("error_code") or "").strip()
+                if isinstance(payload, Mapping)
+                else ""
+            )
+            raise ProjectMasterHostError(
+                error_code or "PROJECT_TASK_PROPOSAL_APPROVAL_FAILED"
+            )
+        return dict(payload)
+
+    @staticmethod
+    def _proposal_row(project_id: str, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            proposal = json.loads(str(row["proposal_json"]))
+            approval = (
+                None
+                if row["approval_json"] is None
+                else json.loads(str(row["approval_json"]))
+            )
+        except json.JSONDecodeError as error:
+            raise ProjectMasterHostError(
+                "PROJECT_TASK_PROPOSAL_JOURNAL_INVALID"
+            ) from error
+        if not isinstance(proposal, Mapping) or (
+            approval is not None and not isinstance(approval, Mapping)
+        ):
+            raise ProjectMasterHostError(
+                "PROJECT_TASK_PROPOSAL_JOURNAL_INVALID"
+            )
+        state = str(row["state"])
+        return {
+            "schema": "universe.governance-proposal.v1",
+            "proposal_kind": "TASK_PROPOSAL",
+            "project_id": project_id,
+            "proposal_id": str(row["proposal_id"]),
+            "proposal_digest": str(row["proposal_digest"]),
+            "state": state,
+            "approval_required": state == "PROPOSED",
+            "platform_permission": False,
+            "task_summary": str(proposal.get("task_summary") or ""),
+            "boundary": str(proposal.get("boundary") or ""),
+            "scope": (
+                dict(proposal["scope"])
+                if isinstance(proposal.get("scope"), Mapping)
+                else {}
+            ),
+            "request_ref": str(proposal.get("request_ref") or "UNKNOWN"),
+            "source_ref": str(proposal.get("source_ref") or "UNKNOWN"),
+            "created_at": str(row["created_at"]),
+            "approved_at": (
+                None if row["approved_at"] is None else str(row["approved_at"])
+            ),
+            "completed_at": (
+                None if row["completed_at"] is None else str(row["completed_at"])
+            ),
+            "approval": None if approval is None else dict(approval),
+        }
+
+
 class ProjectMasterSessionStore:
     def __init__(
         self,
@@ -1221,9 +1389,15 @@ def _project_master_system_prompt(actor_label: str) -> str:
         "or a chat message never creates mutation authority. A GOVERNANCE_ONLY Mode "
         "controls the Mode-entry default; it does not veto a later explicitly approved "
         "executable task. Handle read-only inspection, review, explanation, and audit "
-        "directly. For implementation or command requests, use the installed Task "
-        "Assignment and Execution Binding route and obtain Commander approval when the "
-        "contract requires it. When both Task and Evidence require executable proof, "
+        "directly. For implementation or command requests that require Commander "
+        "approval, create or reuse the installed durable Task Proposal first and stop "
+        "after reporting its proposal_id, proposal_digest, scope, and boundary. Do not "
+        "create an Execution Assignment or Binding until a structured Universe Task "
+        "Proposal approval packet for that exact id and digest arrives. A plain platform "
+        "tool permission response is never that approval. After exact approval, use the "
+        "installed Task Assignment and Execution Binding route; the approved Task "
+        "Proposal evidence covers internal steps that remain within its unchanged scope. "
+        "When both Task and Evidence require executable proof, "
         "request or attach the Session Boot executor with "
         "EXECUTABLE_PROOF_REQUIRED before execution. Invoke subordinate agents only as "
         "declared Task Frame Workers. Route every mutation through Execution Guard and "

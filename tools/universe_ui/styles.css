@@ -764,6 +764,65 @@ body.inspector-open .graph-hint {
   font-family: var(--mono);
 }
 
+.governance-proposal-request {
+  border: 1px solid rgba(86, 205, 190, 0.55);
+  border-left: 3px solid var(--teal);
+  background: rgba(6, 35, 38, 0.82);
+}
+
+.project-approval-badge {
+  flex: 0 0 auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid rgba(111, 230, 211, 0.7);
+  border-radius: 10px;
+  color: #031412;
+  background: #6fe6d3;
+  font: 700 11px/18px var(--mono);
+  text-align: center;
+}
+
+.governance-proposal-request .proposal-title {
+  color: #e9fffb;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.governance-proposal-request .proposal-boundary,
+.governance-proposal-request .proposal-coordinate,
+.governance-proposal-request .proposal-scope {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.governance-proposal-request .proposal-coordinate,
+.governance-proposal-request .proposal-scope {
+  color: #9fd8d1;
+  font-family: var(--mono);
+}
+
+.proposal-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 9px;
+}
+
+.proposal-approve {
+  min-height: 31px;
+  padding: 5px 12px;
+  border: 1px solid rgba(111, 230, 211, 0.7);
+  border-radius: 5px;
+  color: #031412;
+  background: #6fe6d3;
+  font-weight: 700;
+}
+
+.proposal-approve:hover {
+  background: #9af0e3;
+}
+
 .room-message-actions {
   display: flex;
   justify-content: flex-end;

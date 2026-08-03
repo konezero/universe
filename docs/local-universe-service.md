@@ -605,6 +605,35 @@ option, repeated conflicting decision, or stale request is rejected. An ACP
 permission decision is not ai-career authority, an Execution Assignment, or a
 repository mutation receipt.
 
+### Governance Task Proposal Approval
+
+Provider permission and governance approval are separate Project Room
+surfaces. Provider permission cards remain bound to one resident provider
+session and tool request. Governance cards are read from the installed
+Project Runtime's durable `task-proposals.sqlite3` journal and display the
+Proposal ID, digest, boundary, scope, and state. Reloading Universe or opening
+the Project Room again restores pending governance cards from that journal.
+The Conductor conversation is the cross-Project approval inbox: it lists every
+pending attached-Project Proposal, includes the owning Project on each card,
+counts them in the conversation badge, and marks each Project rail item with
+its pending approval count.
+
+The card button and an exact short approval command (`승인`, `진행`, or `고고`,
+including their short imperative forms) call the same digest-bound decision
+API. Natural-language approval is accepted only when the active Project has
+exactly one pending Proposal. With multiple pending Proposals, Universe
+approves none and requires card selection. With no pending Proposal, the text
+remains an ordinary Project Master message. A failed approval request is
+consumed and reported rather than falling through as free-form chat.
+
+Universe records the decision and its durable evidence reference before it
+invokes the installed Runtime's `task-proposal approve` command. It then sends
+one structured approval packet to the same resident Project Master room. This
+decision cannot resolve an ACP permission request, and an ACP permission choice
+cannot approve a governance Proposal. Execution Guard receipts remain internal
+and do not create an additional user confirmation within the exact unchanged
+approved scope.
+
 The current web service is the UI transport adapter for the Universe-owned ACP
 Gateway. It is not advertised as a general external ACP stdio or socket endpoint
 and does not claim an unimplemented `session/cancel` surface in this slice.

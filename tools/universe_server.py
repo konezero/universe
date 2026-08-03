@@ -82,6 +82,7 @@ from project_release_apply import (
 )
 from project_master_host import (
     ProjectMasterHostError,
+    ProjectTaskProposalAdapter,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
 )
@@ -169,6 +170,9 @@ PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 PROJECT_MASTER_STREAM_SCHEMA = "universe.project-master-stream-event.v1"
 PROJECT_ROOM_STREAM_SCHEMA = "universe.project-room-stream.v1"
+GOVERNANCE_PROPOSAL_DECISION_SCHEMA = (
+    "universe.governance-proposal-decision.v1"
+)
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
 SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA = (
     "universe.skill-observation-publication-approval.v1"
@@ -2870,6 +2874,50 @@ def normalize_permission_decision(value: Any) -> dict[str, str]:
     }
 
 
+def normalize_governance_proposal_decision(value: Any) -> dict[str, str]:
+    request = _exact_object_fields(
+        value,
+        field="governance_proposal_decision",
+        required=frozenset(
+            {"decision", "proposal_digest", "source", "idempotency_key"}
+        ),
+        optional=frozenset({"commander_surface"}),
+    )
+    decision = _identifier(
+        request["decision"], "governance_proposal_decision.decision"
+    ).upper()
+    if decision != "APPROVE":
+        raise UniverseError(
+            "GOVERNANCE_PROPOSAL_DECISION_UNSUPPORTED",
+            "the current Runtime Task Proposal journal supports APPROVE only",
+            HTTPStatus.CONFLICT,
+        )
+    source = _identifier(
+        request["source"], "governance_proposal_decision.source"
+    ).upper()
+    if source not in {"BUTTON", "NATURAL_LANGUAGE"}:
+        raise UniverseError(
+            "GOVERNANCE_PROPOSAL_DECISION_SOURCE_INVALID",
+            "source must be BUTTON or NATURAL_LANGUAGE",
+        )
+    return {
+        "schema": GOVERNANCE_PROPOSAL_DECISION_SCHEMA,
+        "decision": decision,
+        "proposal_digest": _sha256(
+            request["proposal_digest"], "governance_proposal_decision.proposal_digest"
+        ),
+        "source": source,
+        "commander_surface": _identifier(
+            request.get("commander_surface", "UNIVERSE_UI"),
+            "governance_proposal_decision.commander_surface",
+        ).upper(),
+        "idempotency_key": _required_text(
+            request["idempotency_key"],
+            "governance_proposal_decision.idempotency_key",
+        ),
+    }
+
+
 def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
     degree = {node["node_id"]: 0 for node in seed["nodes"]}
     missing_connections: list[dict[str, Any]] = []
@@ -3917,6 +3965,32 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS agent_permission_project_time
                 ON agent_permission_request(project_id, requested_at, request_id);
+
+                CREATE TABLE IF NOT EXISTS governance_proposal_decision (
+                    decision_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    proposal_id TEXT NOT NULL,
+                    proposal_digest TEXT NOT NULL,
+                    decision TEXT NOT NULL CHECK(decision = 'APPROVE'),
+                    source TEXT NOT NULL
+                        CHECK(source IN ('BUTTON', 'NATURAL_LANGUAGE')),
+                    commander_surface TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    evidence_ref TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('RECORDED', 'APPLIED', 'FAILED')),
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    UNIQUE(project_id, proposal_id),
+                    UNIQUE(project_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS governance_proposal_decision_project_time
+                ON governance_proposal_decision(project_id, created_at, decision_id);
 
                 CREATE TABLE IF NOT EXISTS conductor_room_message (
                     message_id TEXT PRIMARY KEY,
@@ -8699,6 +8773,187 @@ class UniverseStore:
             "resolved_at": row["resolved_at"],
         }
 
+    def record_governance_proposal_decision(
+        self,
+        project_id: str,
+        proposal: Mapping[str, Any],
+        request: Mapping[str, str],
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        proposal_id = _identifier(proposal.get("proposal_id"), "proposal_id")
+        proposal_digest = _sha256(
+            proposal.get("proposal_digest"), "proposal_digest"
+        )
+        if proposal_digest != request["proposal_digest"]:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH",
+                "decision does not bind the current Proposal digest",
+                HTTPStatus.CONFLICT,
+            )
+        material = {
+            "project_id": project["project_id"],
+            "proposal_id": proposal_id,
+            "proposal_digest": proposal_digest,
+            "decision": request["decision"],
+            "source": request["source"],
+            "commander_surface": request["commander_surface"],
+            "idempotency_key": request["idempotency_key"],
+        }
+        decision_id = "governance_decision_" + _json_sha256(material)[:24]
+        evidence_ref = (
+            f"universe://projects/{quote(project['project_id'], safe='')}/"
+            f"governance-proposals/{quote(proposal_id, safe='')}/"
+            f"decisions/{decision_id}"
+        )
+        created_at = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM governance_proposal_decision
+                WHERE project_id = ?
+                  AND (proposal_id = ? OR idempotency_key = ?)
+                """,
+                (
+                    project["project_id"],
+                    proposal_id,
+                    request["idempotency_key"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                current = self._governance_proposal_decision_row(existing)
+                comparable = {
+                    key: current[key]
+                    for key in (
+                        "project_id",
+                        "proposal_id",
+                        "proposal_digest",
+                        "decision",
+                        "source",
+                        "commander_surface",
+                        "idempotency_key",
+                    )
+                }
+                if comparable != material:
+                    raise UniverseError(
+                        "GOVERNANCE_PROPOSAL_DECISION_CONFLICT",
+                        "Proposal or idempotency key is already bound to another decision",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            connection.execute(
+                """
+                INSERT INTO governance_proposal_decision(
+                    decision_id, project_id, proposal_id, proposal_digest,
+                    decision, source, commander_surface, idempotency_key,
+                    evidence_ref, state, result_json, error_code,
+                    created_at, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', '{}', NULL, ?, NULL)
+                """,
+                (
+                    decision_id,
+                    project["project_id"],
+                    proposal_id,
+                    proposal_digest,
+                    request["decision"],
+                    request["source"],
+                    request["commander_surface"],
+                    request["idempotency_key"],
+                    evidence_ref,
+                    created_at,
+                ),
+            )
+        return self.get_governance_proposal_decision(decision_id), True
+
+    def get_governance_proposal_decision(
+        self, decision_id: str
+    ) -> dict[str, Any]:
+        normalized = _identifier(decision_id, "decision_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM governance_proposal_decision WHERE decision_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DECISION_NOT_FOUND",
+                "governance Proposal decision does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._governance_proposal_decision_row(row)
+
+    def find_governance_proposal_decision(
+        self, project_id: str, proposal_id: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM governance_proposal_decision
+                WHERE project_id = ? AND proposal_id = ?
+                """,
+                (
+                    project["project_id"],
+                    _identifier(proposal_id, "proposal_id"),
+                ),
+            ).fetchone()
+        return None if row is None else self._governance_proposal_decision_row(row)
+
+    def complete_governance_proposal_decision(
+        self,
+        decision_id: str,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        normalized = _identifier(decision_id, "decision_id")
+        applied_at = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE governance_proposal_decision
+                SET state = 'APPLIED', result_json = ?, error_code = NULL,
+                    applied_at = ?
+                WHERE decision_id = ? AND state IN ('RECORDED', 'FAILED')
+                """,
+                (_canonical_json(dict(result)), applied_at, normalized),
+            )
+        return self.get_governance_proposal_decision(normalized)
+
+    def fail_governance_proposal_decision(
+        self,
+        decision_id: str,
+        error_code: str,
+    ) -> dict[str, Any]:
+        normalized = _identifier(decision_id, "decision_id")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE governance_proposal_decision
+                SET state = 'FAILED', error_code = ?, applied_at = NULL
+                WHERE decision_id = ? AND state = 'RECORDED'
+                """,
+                (_identifier(error_code, "error_code"), normalized),
+            )
+        return self.get_governance_proposal_decision(normalized)
+
+    @staticmethod
+    def _governance_proposal_decision_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOVERNANCE_PROPOSAL_DECISION_SCHEMA,
+            "decision_id": row["decision_id"],
+            "project_id": row["project_id"],
+            "proposal_id": row["proposal_id"],
+            "proposal_digest": row["proposal_digest"],
+            "decision": row["decision"],
+            "source": row["source"],
+            "commander_surface": row["commander_surface"],
+            "idempotency_key": row["idempotency_key"],
+            "evidence_ref": row["evidence_ref"],
+            "state": row["state"],
+            "result": json.loads(row["result_json"]),
+            "error_code": row["error_code"],
+            "created_at": row["created_at"],
+            "applied_at": row["applied_at"],
+        }
+
     def _update_room_delivery(
         self,
         message: dict[str, Any],
@@ -10529,6 +10784,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         remote_connector_config_path: Path | None = None,
     ):
         self.store = store
+        self.project_task_proposals = ProjectTaskProposalAdapter()
         self.session_supervisor = SessionSupervisorStore(store.database_path)
         self.token = token
         self.service_state_path = (service_state_path or default_state_path()).resolve()
@@ -11454,8 +11710,141 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "type": "ROOM_CHANGED",
                 "messages": self.store.list_room_messages(project_id),
                 "permissions": self.store.list_agent_permissions(project_id),
+                "governance_proposals": self.list_project_governance_proposals(
+                    project_id
+                ),
             },
         )
+
+    def list_project_governance_proposals(
+        self, project_id: str
+    ) -> list[dict[str, Any]]:
+        project = self.store.get_project(project_id)
+        try:
+            return self.project_task_proposals.list(
+                Path(project["project_root"]),
+                project["project_id"],
+            )
+        except ProjectMasterHostError as error:
+            raise UniverseError(
+                "PROJECT_GOVERNANCE_PROPOSALS_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+
+    def list_governance_proposal_inbox(self) -> list[dict[str, Any]]:
+        proposals: list[dict[str, Any]] = []
+        for project in self.store.list_projects():
+            proposals.extend(
+                self.list_project_governance_proposals(project["project_id"])
+            )
+        return sorted(
+            proposals,
+            key=lambda item: (item["created_at"], item["project_id"], item["proposal_id"]),
+            reverse=True,
+        )
+
+    def decide_project_governance_proposal(
+        self,
+        project_id: str,
+        proposal_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = normalize_governance_proposal_decision(value)
+        project = self.store.get_project(project_id)
+        proposals = self.list_project_governance_proposals(project["project_id"])
+        proposal = next(
+            (item for item in proposals if item["proposal_id"] == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        existing = self.store.find_governance_proposal_decision(
+            project["project_id"], proposal_id
+        )
+        if existing is not None and existing["state"] == "APPLIED":
+            if (
+                existing["proposal_digest"] != request["proposal_digest"]
+                or existing["decision"] != request["decision"]
+            ):
+                raise UniverseError(
+                    "GOVERNANCE_PROPOSAL_DECISION_CONFLICT",
+                    "Proposal already has another durable decision",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "status": "GOVERNANCE_PROPOSAL_ALREADY_APPROVED",
+                "proposal": proposal,
+                "decision": existing,
+                "message": None,
+            }
+        if proposal["state"] != "PROPOSED":
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_STATE_INVALID",
+                f"Proposal is not awaiting approval: {proposal['state']}",
+                HTTPStatus.CONFLICT,
+            )
+        decision, _created = self.store.record_governance_proposal_decision(
+            project["project_id"], proposal, request
+        )
+        try:
+            approval_result = self.project_task_proposals.approve(
+                Path(project["project_root"]),
+                proposal_id=proposal["proposal_id"],
+                proposal_digest=proposal["proposal_digest"],
+                evidence_ref=decision["evidence_ref"],
+            )
+        except ProjectMasterHostError as error:
+            failed = self.store.fail_governance_proposal_decision(
+                decision["decision_id"],
+                str(error) or "PROJECT_TASK_PROPOSAL_APPROVAL_FAILED",
+            )
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_APPROVAL_FAILED",
+                failed["error_code"],
+                HTTPStatus.CONFLICT,
+            ) from error
+        decision = self.store.complete_governance_proposal_decision(
+            decision["decision_id"], approval_result
+        )
+        approval_packet = {
+            "schema": "universe.project-master-governance-approval.v1",
+            "decision": "APPROVED",
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "scope": proposal["scope"],
+            "boundary": proposal["boundary"],
+            "commander_surface": decision["commander_surface"],
+            "evidence_ref": decision["evidence_ref"],
+            "source": decision["source"],
+        }
+        message, _created_message = self.send_project_room_message(
+            project["project_id"],
+            {
+                "kind": "STATUS",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": (
+                    "Governance Task Proposal approval packet\n"
+                    + _canonical_json(approval_packet)
+                ),
+                "idempotency_key": decision["decision_id"],
+            },
+        )
+        refreshed = self.list_project_governance_proposals(project["project_id"])
+        approved = next(
+            (item for item in refreshed if item["proposal_id"] == proposal_id),
+            proposal,
+        )
+        return {
+            "status": "GOVERNANCE_PROPOSAL_APPROVED",
+            "proposal": approved,
+            "decision": decision,
+            "message": message,
+        }
 
     def publish_agent_permission(
         self,
@@ -11905,6 +12294,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._authorize():
             return
+        if path == "/v1/governance-proposals":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "GOVERNANCE_PROPOSAL_INBOX_COLLECTED",
+                    "proposals": self.server.list_governance_proposal_inbox(),
+                },
+            )
+            return
         if path == "/v1/supervisor/sessions":
             query = parse_qs(urlsplit(self.path).query)
             self._send(
@@ -12260,6 +12659,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "AGENT_PERMISSIONS_COLLECTED",
                         "project_id": project_id,
                         "permissions": self.server.store.list_agent_permissions(
+                            project_id
+                        ),
+                    },
+                )
+                return
+            if suffix == "/governance-proposals":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOVERNANCE_PROPOSALS_COLLECTED",
+                        "project_id": project_id,
+                        "proposals": self.server.list_project_governance_proposals(
                             project_id
                         ),
                     },
@@ -13123,6 +13535,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            governance_parts = self._governance_proposal_decision_path(path)
+            if governance_parts is not None:
+                result = self.server.decide_project_governance_proposal(
+                    governance_parts[0],
+                    governance_parts[1],
+                    body,
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {"schema": API_SCHEMA, **result},
+                )
+                return
             parts = self._project_path(path)
             if parts is not None and parts[1] == "/master-session/prepare":
                 self._send(
@@ -13828,6 +14252,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-bridge",
             "/master-session/prepare",
             "/agent-session/permissions",
+            "/governance-proposals",
             "/provider-setting",
             "/room/stream",
             "/room/messages",
@@ -13892,6 +14317,31 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not project_id or "/" in project_id or not request_id or "/" in request_id:
             return None
         return unquote(project_id), unquote(request_id)
+
+    @staticmethod
+    def _governance_proposal_decision_path(
+        path: str,
+    ) -> tuple[str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/governance-proposals/"
+        suffix = "/decision"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, proposal_path = remainder.split(marker, 1)
+        proposal_id = proposal_path[: -len(suffix)]
+        if (
+            not project_id
+            or "/" in project_id
+            or not proposal_id
+            or "/" in proposal_id
+        ):
+            return None
+        return unquote(project_id), unquote(proposal_id)
 
     @staticmethod
     def _release_path(path: str) -> str | None:
@@ -14009,6 +14459,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "messages": self.server.store.list_room_messages(project_id),
                         "permissions": self.server.store.list_agent_permissions(
                             project_id
+                        ),
+                        "governance_proposals": (
+                            self.server.list_project_governance_proposals(project_id)
                         ),
                     },
                 },
