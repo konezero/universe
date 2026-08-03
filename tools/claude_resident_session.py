@@ -61,24 +61,17 @@ CLAUDE_FORBIDDEN_ARGUMENTS = frozenset(
     }
 )
 
-# Shared lifecycle states across Codex / Grok / Claude resident sessions.
-SESSION_CONNECTING = "CONNECTING"
-SESSION_READY = "READY"
-SESSION_BUSY = "BUSY"
-SESSION_WAITING_APPROVAL = "WAITING_APPROVAL"
-SESSION_QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
-SESSION_FAILED = "FAILED"
-SESSION_STOPPED = "STOPPED"
-SESSION_STATES = frozenset(
-    {
-        SESSION_CONNECTING,
-        SESSION_READY,
-        SESSION_BUSY,
-        SESSION_WAITING_APPROVAL,
-        SESSION_QUOTA_EXHAUSTED,
-        SESSION_FAILED,
-        SESSION_STOPPED,
-    }
+# Lifecycle states are owned by the shared gateway contract, not redefined
+# here, so Codex / Grok / Claude report one vocabulary upward.
+from agent_session_gateway import (  # noqa: E402
+    SESSION_BUSY,
+    SESSION_CONNECTING,
+    SESSION_FAILED,
+    SESSION_QUOTA_EXHAUSTED,
+    SESSION_READY,
+    SESSION_STATES,
+    SESSION_STOPPED,
+    SESSION_WAITING_APPROVAL,
 )
 
 # Result subtypes and retry categories that mean the account limit is spent.

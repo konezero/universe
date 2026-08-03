@@ -112,6 +112,33 @@ def permission_bridge_status(provider: str) -> dict[str, Any]:
     }
 
 
+# Shared lifecycle states for every provider session. Codex, Grok, and Claude
+# report the same vocabulary upward even though each adapter keeps its own
+# transport internally.
+SESSION_CONNECTING = "CONNECTING"
+SESSION_READY = "READY"
+SESSION_BUSY = "BUSY"
+SESSION_WAITING_APPROVAL = "WAITING_APPROVAL"
+SESSION_QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+SESSION_FAILED = "FAILED"
+SESSION_STOPPED = "STOPPED"
+SESSION_STATES = frozenset(
+    {
+        SESSION_CONNECTING,
+        SESSION_READY,
+        SESSION_BUSY,
+        SESSION_WAITING_APPROVAL,
+        SESSION_QUOTA_EXHAUSTED,
+        SESSION_FAILED,
+        SESSION_STOPPED,
+    }
+)
+
+# Who may hold a resident session, and who must stay bounded.
+RESIDENT_ROLES = frozenset({"UNIVERSE_CONDUCTOR", "UNIVERSE_MASTER", "PROJECT_MASTER"})
+EPHEMERAL_ROLES = frozenset({"TASK_FRAME_BOSS", "TASK_FRAME_WORKER", "PROBE"})
+
+
 class PermissionRequester(Protocol):
     def __call__(self, request: Mapping[str, Any]) -> str | None: ...
 
@@ -123,6 +150,38 @@ class AgentSession(Protocol):
     def prompt(self, text: str, on_delta: Callable[[str], None]) -> str: ...
 
     def close(self) -> None: ...
+
+
+class BoundedSession(Protocol):
+    """The lifetime contract every provider adapter must expose.
+
+    ``ephemeral`` is the single external switch that separates a bounded Task
+    Frame worker from a resident Conductor or Master session. Each adapter
+    keeps its own transport (app-server, ACP, stream-json) behind it.
+    """
+
+    ephemeral: bool
+    session_id: str | None
+
+    @property
+    def session_ref(self) -> str: ...
+
+    def prompt(self, text: str, on_delta: Callable[[str], None]) -> str: ...
+
+    def close(self) -> None: ...
+
+
+def worker_session_contract(session: Any) -> dict[str, Any]:
+    """Describe one session's lifetime for uniform assertions across providers."""
+
+    ephemeral = bool(getattr(session, "ephemeral", False))
+    return {
+        "ephemeral": ephemeral,
+        "resident": not ephemeral,
+        # A bounded session must never carry a resumable coordinate.
+        "resumable": bool(getattr(session, "session_id", None)) and not ephemeral,
+        "session_ref": str(getattr(session, "session_ref", "UNKNOWN")),
+    }
 
 
 @dataclass
@@ -417,10 +476,14 @@ class GrokAcpSession:
         model: str = "default",
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
+        ephemeral: bool = False,
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
-        self.session_id = session_id
+        # An ephemeral session is bounded: it never resumes a stored session
+        # and never reports its id back, so nothing can be resumed later.
+        self.ephemeral = bool(ephemeral)
+        self.session_id = None if self.ephemeral else session_id
         self.model = _text(model, "model")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
@@ -516,7 +579,7 @@ class GrokAcpSession:
             capabilities.get("loadSession")
         )
         session_result: Any = None
-        if self.session_id and can_load:
+        if self.session_id and can_load and not self.ephemeral:
             try:
                 session_result = self._transport.request(
                     "session/load",
@@ -543,7 +606,9 @@ class GrokAcpSession:
             raise AgentSessionError("GROK_ACP_SESSION_INVALID")
         session_id = _text(session_result.get("sessionId"), "sessionId")
         self.session_id = session_id
-        self.session_observer(session_id)
+        if not self.ephemeral:
+            # A bounded worker must not persist a resumable coordinate.
+            self.session_observer(session_id)
 
     def _handle_notification(self, method: str, params: Mapping[str, Any]) -> None:
         if method != "session/update" or self._active_delta is None:

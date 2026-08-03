@@ -566,6 +566,7 @@ class RuntimeWorkerDispatcher:
                     session_id=None,
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
+                    ephemeral=True,
                 )
             )
             try:
