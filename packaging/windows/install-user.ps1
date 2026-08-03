@@ -17,6 +17,7 @@ param(
 $ErrorActionPreference = "Stop"
 $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Universe"
 $launcher = Join-Path $UniverseRoot "packaging\windows\Start-Universe.cmd"
+$iconPath = Join-Path $UniverseRoot "packaging\windows\Universe.ico"
 $python = (Get-Command python -ErrorAction Stop).Source
 
 if (-not (Test-Path $launcher)) {
@@ -32,6 +33,9 @@ $shortcut.TargetPath = $launcher
 $shortcut.WorkingDirectory = $UniverseRoot
 $shortcut.WindowStyle = 7
 $shortcut.Description = "Start local Universe service and open UI"
+if (Test-Path -LiteralPath $iconPath -PathType Leaf) {
+  $shortcut.IconLocation = "$iconPath,0"
+}
 $shortcut.Save()
 
 $statusShortcutPath = Join-Path $startMenu "Universe Status.lnk"
@@ -41,6 +45,9 @@ $statusShortcut.Arguments = "`"$UniverseRoot\tools\universe_server.py`" status"
 $statusShortcut.WorkingDirectory = $UniverseRoot
 $statusShortcut.WindowStyle = 1
 $statusShortcut.Description = "Show local Universe service status"
+if (Test-Path -LiteralPath $iconPath -PathType Leaf) {
+  $statusShortcut.IconLocation = "$iconPath,0"
+}
 $statusShortcut.Save()
 
 $trayLauncher = Join-Path $UniverseRoot "packaging\windows\Start-Universe-Tray.cmd"
@@ -50,6 +57,9 @@ $trayShortcut.TargetPath = $trayLauncher
 $trayShortcut.WorkingDirectory = $UniverseRoot
 $trayShortcut.WindowStyle = 7
 $trayShortcut.Description = "Universe system tray (status / start / stop / open UI)"
+if (Test-Path -LiteralPath $iconPath -PathType Leaf) {
+  $trayShortcut.IconLocation = "$iconPath,0"
+}
 $trayShortcut.Save()
 
 $enableAutostart = $Autostart.IsPresent -and -not $NoAutostart.IsPresent

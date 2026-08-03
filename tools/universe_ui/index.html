@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -280,6 +281,44 @@
         <small id="memory-maintain-status" class="provider-setting-status">
           0 = off. Server process runs HEURISTIC maintain when &gt; 0.
         </small>
+      </section>
+      <section class="settings-section remote-access-section">
+        <div class="settings-section-heading">
+          <div>
+            <strong>Mobile access</strong>
+            <small>Paired browsers on the same network</small>
+          </div>
+          <span id="remote-access-status" class="remote-access-status" data-state="OFFLINE">
+            Offline
+          </span>
+        </div>
+        <p class="settings-help">
+          Universe stays on loopback. A separate fixed-origin gateway exposes this UI only
+          after one-time pairing and desktop approval.
+        </p>
+        <div class="remote-access-actions">
+          <button id="start-remote-access-button" type="button" class="primary-button">
+            Start mobile access
+          </button>
+          <button id="stop-remote-access-button" type="button" class="secondary-button">
+            Stop
+          </button>
+          <button id="create-pairing-button" type="button" class="secondary-button">
+            Pair device
+          </button>
+        </div>
+        <div id="remote-access-endpoint" class="remote-access-endpoint"></div>
+        <div id="remote-pairing-invite" class="remote-pairing-invite hidden"></div>
+        <div class="remote-access-grid">
+          <div>
+            <strong class="settings-subheading">Pending approval</strong>
+            <div id="remote-pairing-list" class="remote-access-list"></div>
+          </div>
+          <div>
+            <strong class="settings-subheading">Paired devices</strong>
+            <div id="remote-device-list" class="remote-access-list"></div>
+          </div>
+        </div>
       </section>
       <section class="settings-section">
         <div class="settings-section-heading">

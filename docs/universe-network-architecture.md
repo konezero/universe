@@ -1,6 +1,6 @@
 # Universe Network Architecture
 
-Status: DESIGN SOURCE
+Status: ACTIVE DESIGN AND LAN DOGFOOD IMPLEMENTATION
 Scope: access to the existing local Universe HTTP service
 Active delivery target: open the local Universe Web UI from a paired mobile browser
 
@@ -94,9 +94,39 @@ capabilities:
   arbitrary_upstream: false
 ```
 
-`HTTP_TUNNEL` and `DEVICE_PAIRING` remain design vocabulary until their
-Registry and validation code are implemented. An unimplemented remote profile
-must fail closed and must not fall back to a public unauthenticated listener.
+`DEVICE_PAIRING` is implemented by the LAN dogfood gateway. The Internet-facing
+`HTTP_TUNNEL` connector remains a deployment adapter and must fail closed until
+a trusted HTTPS gateway is configured.
+
+## LAN Dogfood Gateway
+
+The first executable slice is intentionally narrower than the final Internet
+tunnel:
+
+```text
+paired mobile browser on the same network
+  -> LAN_DOGFOOD_GATEWAY
+  -> fixed loopback Universe origin
+```
+
+- `tools/universe_remote_gateway.py` is a separate process; the canonical
+  Universe service still listens only on loopback.
+- The gateway accepts no arbitrary upstream and strips browser Authorization,
+  Cookie, Host, and hop-by-hop headers before forwarding.
+- A one-time, expiring code creates an approval request. Only the local desktop
+  settings surface may approve, deny, or revoke a device.
+- The browser receives an HttpOnly, SameSite=Strict device session. HTTPS adds
+  the Secure attribute; LAN HTTP is dogfood-only.
+- The same SPA, API, and SSE paths are streamed through the fixed gateway.
+- Stopping the local service yields `HOST_OFFLINE`; requests are not queued.
+- Windows tray controls can start, inspect, open, and stop the gateway.
+- Automatic LAN start binds one detected RFC1918 private IPv4 address, never
+  `0.0.0.0` or a public address. When no private IPv4 address exists, start
+  fails with `SAFE_LAN_ADDRESS_UNAVAILABLE`; that Host needs the later trusted
+  HTTPS outbound connector rather than an inbound HTTP listener.
+
+This slice proves access and pairing. It is not a substitute for TLS, an
+outbound connector, or a deployed Internet rendezvous service.
 
 ## Components
 

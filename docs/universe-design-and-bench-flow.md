@@ -385,11 +385,23 @@ relations remain distinct from observed evidence. Career adoption is separate.
     of independently searching process state. Runtime Settings exposes
     discovery, exact executable selection, and verification. Installer and tray
     packaging will set the Profile pointer and reuse this same settings surface.
-13. Add paired remote browser access to the existing local Universe HTTP
-    service. The desktop opens an outbound fixed-origin tunnel; the remote path
-    forwards the same SPA, HTTP API, and SSE streams without adding a mobile
-    backend or command protocol. OAuth, P2P, and Universe peer networking remain
-    later adapters. See `docs/universe-network-architecture.md`.
+13. Paired remote browser access now has a LAN dogfood slice. A separate
+    fixed-origin gateway forwards the same SPA, HTTP API, and SSE streams while
+    the canonical service stays loopback-only. One-time pairing, local approval,
+    paired-device sessions, revocation, Settings controls, and Windows tray
+    controls are implemented. The outbound HTTPS tunnel remains the next
+    deployment adapter; OAuth, P2P, and Universe peer networking remain later
+    adapters. The next network slice adds a minimal Universe Rendezvous Registry:
+    each Universe registers only its stable `universe_id`, rotatable
+    `remote_route_id`, public key, signed public manifest, expiring endpoint
+    candidates, and presence. A mobile browser resolves a known route UUID and
+    then pairs with the target Universe; users, Projects, Rooms, conversation
+    content, Provider credentials, local API tokens, and Runtime receipts are
+    never Registry records. Endpoint negotiation prefers LAN or safe direct
+    access and falls back to an outbound tunnel or later Relay adapter. The same
+    signed identity and resolution contract may later locate another Universe,
+    but peer trust must not reuse a paired-browser credential. See
+    `docs/universe-network-architecture.md`.
 
 14. Separate provider execution capability from three-tier model binding.
     Host Profile retains executable, authentication availability, and transport

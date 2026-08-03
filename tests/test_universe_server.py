@@ -35,6 +35,7 @@ from universe_server import (  # noqa: E402
     HttpUniverseTransport,
     UniverseError,
     UniverseStore,
+    attach_supervisor_session,
     load_server_state,
     load_universe_mode_registry,
     auth_provider_for,
@@ -138,6 +139,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 }
             ),
             host_profile=HostProfileStore(temp_root / "host.json"),
+            service_state_path=temp_root / "server.json",
+            remote_gateway_state_path=temp_root / "remote-gateway.json",
         )
         self.host_tool_patchers = [
             patch(
@@ -665,6 +668,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="worker-binding-scope"', body)
             self.assertIn('id="worker-binding-settings"', body)
             self.assertIn('id="host-tool-settings"', body)
+            self.assertIn('id="remote-access-status"', body)
+            self.assertIn('id="create-pairing-button"', body)
+            self.assertIn('id="remote-device-list"', body)
             self.assertIn('id="discover-host-tools-button"', body)
             self.assertIn('id="session-observatory-dialog"', body)
             self.assertIn('id="session-observatory-topbar-button"', body)
@@ -691,6 +697,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/settings/worker-bindings", script)
             self.assertIn("renderWorkerBindingSettings", script)
             self.assertIn("/v1/settings/host-tools", script)
+            self.assertIn("/v1/settings/remote-access", script)
+            self.assertIn("renderRemoteAccessSettings", script)
+            self.assertIn("requestedPermissionSummary", script)
             self.assertIn(
                 "/v1/conductor-room/agent-session/permissions/",
                 script,
@@ -703,6 +712,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("refreshSupervisorSessions", script)
             self.assertIn("/v1/supervisor/legacy-executors", script)
             self.assertNotIn(self.token, script)
+
+    def test_remote_access_control_is_local_operator_only(self) -> None:
+        status, current = self.request("GET", "/v1/settings/remote-access")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("OFFLINE", current["gateway"]["status"])
+
+        status, blocked = self.request(
+            "POST",
+            "/v1/settings/remote-access/pairings",
+            {"ttl_seconds": 600},
+            extra_headers={"X-Universe-Access-Surface": "REMOTE_BROWSER"},
+        )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("LOCAL_OPERATOR_REQUIRED", blocked["error_code"])
 
     def test_conductor_fresh_project_draft_is_partial_and_review_only(self) -> None:
         action = normalize_conductor_ui_action(
@@ -1019,6 +1042,56 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "NOT_PERFORMED",
             recovered["result"]["recovery"]["process_termination"],
         )
+
+    def test_attach_current_codex_thread_as_default_conductor_session(self) -> None:
+        status, attached = attach_supervisor_session(
+            endpoint=self.endpoint,
+            token=self.token,
+            node="CONDUCTOR",
+            mode="CONDUCTOR",
+            provider="CODEX",
+            alias="Universe Main Conductor",
+            environment={"CODEX_THREAD_ID": "thread-current-codex"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("SUPERVISOR_SESSION_ATTACHED", attached["status"])
+        self.assertEqual("CODEX_THREAD_ID", attached["provider_session_ref_source"])
+        self.assertEqual("REQUIRED", attached["resident_runtime_reload"])
+        self.assertTrue(attached["session"]["is_default"])
+
+        status, sessions = self.request(
+            "GET",
+            "/v1/supervisor/sessions?node=CONDUCTOR&mode=CONDUCTOR",
+            token=self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        selected = next(item for item in sessions["sessions"] if item["is_default"])
+        self.assertEqual("thread-current-codex", selected["provider_session_ref"])
+        self.assertEqual("Universe Main Conductor", selected["alias"])
+
+        status, repeated = attach_supervisor_session(
+            endpoint=self.endpoint,
+            token=self.token,
+            node="CONDUCTOR",
+            mode="CONDUCTOR",
+            provider="CODEX",
+            alias="Universe Main Conductor",
+            environment={"CODEX_THREAD_ID": "thread-current-codex"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("NOT_REQUIRED", repeated["resident_runtime_reload"])
+
+    def test_attach_session_requires_explicit_ref_outside_codex_desktop(self) -> None:
+        with self.assertRaises(UniverseError) as raised:
+            attach_supervisor_session(
+                endpoint=self.endpoint,
+                token=self.token,
+                node="CONDUCTOR",
+                mode="CONDUCTOR",
+                provider="CLAUDE",
+                environment={},
+            )
+        self.assertEqual("PROVIDER_SESSION_REF_REQUIRED", raised.exception.code)
 
     def test_supervisor_privileged_mutations_require_service_token(self) -> None:
         status, denied = self.request(

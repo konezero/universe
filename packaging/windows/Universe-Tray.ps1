@@ -18,6 +18,17 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$createdNew = $false
+$trayMutex = [System.Threading.Mutex]::new(
+  $true,
+  "Local\Universe.Tray",
+  [ref]$createdNew
+)
+if (-not $createdNew) {
+  $trayMutex.Dispose()
+  exit 0
+}
+
 if (-not $PythonExecutable) {
   if ($env:UNIVERSE_PYTHON) {
     $PythonExecutable = $env:UNIVERSE_PYTHON.Trim('"')
@@ -33,6 +44,8 @@ if ([System.IO.Path]::GetExtension($python) -ne ".exe") {
   throw "native python executable required: $python"
 }
 $serverPy = Join-Path $UniverseRoot "tools\universe_server.py"
+$gatewayPy = Join-Path $UniverseRoot "tools\universe_remote_gateway.py"
+$iconPath = Join-Path $UniverseRoot "packaging\windows\Universe.ico"
 if (-not (Test-Path $serverPy)) {
   throw "universe_server.py not found: $serverPy"
 }
@@ -72,6 +85,39 @@ function Get-UniverseStatusObject {
   }
 }
 
+function Invoke-RemoteGatewayCli {
+  param([Parameter(Mandatory = $true)][string[]]$Args)
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $python
+  $argList = @($gatewayPy) + $Args
+  $psi.Arguments = ($argList | ForEach-Object {
+      if ($_ -match '\s') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+    }) -join " "
+  $psi.WorkingDirectory = $UniverseRoot
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $stdout = $proc.StandardOutput.ReadToEnd()
+  $stderr = $proc.StandardError.ReadToEnd()
+  $proc.WaitForExit(120000) | Out-Null
+  return [pscustomobject]@{
+    ExitCode = $proc.ExitCode
+    StdOut   = $stdout
+    StdErr   = $stderr
+  }
+}
+
+function Get-RemoteGatewayStatusObject {
+  $result = Invoke-RemoteGatewayCli -Args @("status")
+  try {
+    return ($result.StdOut | ConvertFrom-Json)
+  } catch {
+    return [pscustomobject]@{ status = "UNKNOWN"; public_base_url = $null }
+  }
+}
+
 function Open-UniverseUi {
   param($Status)
   if ($Status -and $Status.endpoint) {
@@ -82,17 +128,24 @@ function Open-UniverseUi {
   Invoke-UniverseCli -Args @("start", "--open-ui") | Out-Null
 }
 
+$ownsIcon = $false
+if (Test-Path -LiteralPath $iconPath -PathType Leaf) {
+  $icon = [System.Drawing.Icon]::new($iconPath)
+  $ownsIcon = $true
+} else {
+  $icon = [System.Drawing.SystemIcons]::Application
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Universe Tray"
 $form.ShowInTaskbar = $false
 $form.WindowState = "Minimized"
 $form.Visible = $false
 $form.Opacity = 0
+$form.Icon = $icon
 
-$icon = [System.Drawing.SystemIcons]::Application
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = $icon
-$notify.Visible = $true
 $notify.Text = "Universe"
 $notify.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
 
@@ -103,8 +156,13 @@ $itemStart = $menu.Items.Add("Start service")
 $itemStop = $menu.Items.Add("Stop service")
 $itemRestart = $menu.Items.Add("Restart service")
 [void]$menu.Items.Add("-")
+$itemRemoteStart = $menu.Items.Add("Start mobile access")
+$itemRemoteOpen = $menu.Items.Add("Open mobile URL")
+$itemRemoteStop = $menu.Items.Add("Stop mobile access")
+[void]$menu.Items.Add("-")
 $itemExit = $menu.Items.Add("Exit tray")
 $notify.ContextMenuStrip = $menu
+$notify.Visible = $true
 
 function Update-TrayStatus {
   $status = Get-UniverseStatusObject
@@ -149,6 +207,37 @@ $itemRestart.Add_Click({
     Update-TrayStatus | Out-Null
   })
 
+$itemRemoteStart.Add_Click({
+    $status = Get-UniverseStatusObject
+    if ($status.status -ne "READY") {
+      Invoke-UniverseCli -Args @("start", "--no-open-ui") | Out-Null
+      Start-Sleep -Seconds 1
+    }
+    $remote = Invoke-RemoteGatewayCli -Args @("start")
+    $notify.BalloonTipTitle = "Universe mobile access"
+    $notify.BalloonTipText = if ($remote.ExitCode -eq 0) {
+      (($remote.StdOut | ConvertFrom-Json).public_base_url)
+    } else {
+      $remote.StdErr
+    }
+    $notify.ShowBalloonTip(3000)
+  })
+
+$itemRemoteOpen.Add_Click({
+    $remote = Get-RemoteGatewayStatusObject
+    if ($remote.public_base_url) {
+      Start-Process $remote.public_base_url
+    } else {
+      $notify.BalloonTipTitle = "Universe mobile access"
+      $notify.BalloonTipText = "Mobile gateway is offline."
+      $notify.ShowBalloonTip(2500)
+    }
+  })
+
+$itemRemoteStop.Add_Click({
+    Invoke-RemoteGatewayCli -Args @("stop") | Out-Null
+  })
+
 $itemExit.Add_Click({
     $notify.Visible = $false
     [System.Windows.Forms.Application]::Exit()
@@ -181,4 +270,20 @@ $notify.BalloonTipText = if ($initialStatus.status -eq "READY") {
   "Tray controls are ready; service status is $($initialStatus.status)."
 }
 $notify.ShowBalloonTip(2500)
-[System.Windows.Forms.Application]::Run()
+try {
+  [System.Windows.Forms.Application]::Run()
+} finally {
+  $timer.Stop()
+  $timer.Dispose()
+  $notify.Visible = $false
+  $notify.Dispose()
+  $menu.Dispose()
+  $form.Dispose()
+  if ($ownsIcon) {
+    $icon.Dispose()
+  }
+  if ($createdNew) {
+    $trayMutex.ReleaseMutex()
+  }
+  $trayMutex.Dispose()
+}

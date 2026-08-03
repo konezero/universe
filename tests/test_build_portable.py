@@ -32,6 +32,9 @@ class BuildPortableTests(unittest.TestCase):
                 ).is_file()
             )
             self.assertTrue((package / "Start-Universe.cmd").is_file())
+            self.assertTrue(
+                (package / "packaging" / "windows" / "Universe.ico").is_file()
+            )
             self.assertTrue((package / "data" / ".gitkeep").is_file())
             self.assertTrue((package / "VERSION.txt").is_file())
             version = json.loads((package / "VERSION.txt").read_text(encoding="utf-8"))

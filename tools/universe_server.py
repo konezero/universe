@@ -45,6 +45,7 @@ from agent_session_gateway import (
     normalize_permission_request,
 )
 from host_profile import HostProfileError, HostProfileStore
+from remote_access import RemoteAccessError, RemoteAccessStore
 from legacy_executor_classifier import (
     classify_inventory,
     collect_windows_session_boot_executors,
@@ -105,6 +106,13 @@ from universe_runtime_host import (
 from universe_conductor_runtime import (
     UniverseConductorRuntime,
     UniverseConductorRuntimeError,
+)
+from universe_remote_gateway import (
+    GatewayError,
+    default_gateway_state_path,
+    gateway_status,
+    start_gateway,
+    stop_gateway,
 )
 
 API_SCHEMA = "universe.local-service.v1"
@@ -3397,6 +3405,7 @@ class UniverseStore:
         self.release_artifact_root = self.database_path.parent / "release-artifacts"
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self.remote_access = RemoteAccessStore(self.database_path)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=5)
@@ -10504,10 +10513,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
         host_profile: HostProfileStore | None = None,
+        service_state_path: Path | None = None,
+        remote_gateway_state_path: Path | None = None,
     ):
         self.store = store
         self.session_supervisor = SessionSupervisorStore(store.database_path)
         self.token = token
+        self.service_state_path = (service_state_path or default_state_path()).resolve()
+        self.remote_gateway_state_path = (
+            remote_gateway_state_path or default_gateway_state_path()
+        ).resolve()
         self.host_profile = host_profile or HostProfileStore()
         try:
             self.host_profile.ensure_initialized()
@@ -10637,6 +10652,98 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._supervisor_maintenance_worker.start()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
+
+    def remote_access_status(self) -> dict[str, Any]:
+        gateway = gateway_status(self.remote_gateway_state_path)
+        gateway.pop("control_token", None)
+        snapshot = self.store.remote_access.snapshot()
+        return {
+            **snapshot,
+            "status": "REMOTE_ACCESS_STATUS_COLLECTED",
+            "gateway": gateway,
+        }
+
+    def start_remote_access(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "REMOTE_ACCESS_REQUEST_INVALID", "remote access body must be an object"
+            )
+        raw_port = value.get("port", 0)
+        if isinstance(raw_port, bool) or not isinstance(raw_port, int):
+            raise UniverseError(
+                "REMOTE_ACCESS_REQUEST_INVALID", "port must be an integer"
+            )
+        public_base_url = str(value.get("public_base_url") or "").strip()
+        python_tool = self.host_profile.resolve("python")
+        if python_tool is None:
+            raise UniverseError(
+                "REMOTE_GATEWAY_PYTHON_UNAVAILABLE",
+                "verified native Python is required to start mobile access",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            gateway = start_gateway(
+                upstream_state=self.service_state_path,
+                database_path=self.store.database_path,
+                state_path=self.remote_gateway_state_path,
+                port=raw_port,
+                public_base_url=public_base_url,
+                python_executable=python_tool.executable,
+            )
+        except (OSError, GatewayError, RemoteAccessError) as error:
+            raise UniverseError(
+                getattr(error, "code", "REMOTE_GATEWAY_START_FAILED"),
+                getattr(error, "detail", str(error)),
+                HTTPStatus.CONFLICT,
+            ) from error
+        gateway.pop("control_token", None)
+        return {
+            "schema": API_SCHEMA,
+            "status": "REMOTE_ACCESS_STARTED",
+            "gateway": gateway,
+        }
+
+    def stop_remote_access(self) -> dict[str, Any]:
+        gateway = stop_gateway(self.remote_gateway_state_path)
+        return {
+            "schema": API_SCHEMA,
+            "status": "REMOTE_ACCESS_STOPPED",
+            "gateway": gateway,
+        }
+
+    def create_remote_pairing(self, value: Any) -> dict[str, Any]:
+        if value is not None and not isinstance(value, Mapping):
+            raise UniverseError(
+                "REMOTE_ACCESS_REQUEST_INVALID", "pairing body must be an object"
+            )
+        gateway = gateway_status(self.remote_gateway_state_path)
+        if gateway.get("status") not in {"READY", "HOST_OFFLINE"}:
+            raise UniverseError(
+                "REMOTE_GATEWAY_OFFLINE",
+                "start mobile access before creating a pairing code",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            return self.store.remote_access.create_pairing(
+                public_base_url=str(gateway["public_base_url"]),
+                ttl_seconds=int((value or {}).get("ttl_seconds", 600)),
+            )
+        except RemoteAccessError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def decide_remote_pairing(self, pairing_id: str, *, approve: bool) -> dict[str, Any]:
+        try:
+            return self.store.remote_access.decide_pairing(
+                pairing_id, approve=approve
+            )
+        except RemoteAccessError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def revoke_remote_device(self, device_id: str) -> dict[str, Any]:
+        try:
+            return self.store.remote_access.revoke_device(device_id)
+        except RemoteAccessError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
 
     def run_supervisor_maintenance_once(
         self, *, idle_seconds: float = 300.0
@@ -11807,6 +11914,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             settings["worker"] = self.server.memory_maintain_worker_status()
             self._send(HTTPStatus.OK, settings)
             return
+        if path == "/v1/settings/remote-access":
+            self._send(HTTPStatus.OK, self.server.remote_access_status())
+            return
         if path == "/v1/settings/host-tools":
             try:
                 self._send(
@@ -12279,6 +12389,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        if path.startswith("/v1/settings/remote-access/") and not (
+            self._authorize_local_operator()
+        ):
+            return
         if path == "/v1/service/shutdown" and not self._authorize_service_control():
             return
         privileged_supervisor_match = re.fullmatch(
@@ -12409,6 +12523,54 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 settings = self.server.store.set_service_settings(body)
                 self.server.notify_maintain_settings_changed()
                 self._send(HTTPStatus.OK, settings)
+                return
+            if path == "/v1/settings/remote-access/start":
+                self._send(HTTPStatus.OK, self.server.start_remote_access(body))
+                return
+            if path == "/v1/settings/remote-access/stop":
+                self._send(HTTPStatus.OK, self.server.stop_remote_access())
+                return
+            if path == "/v1/settings/remote-access/pairings":
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "REMOTE_PAIRING_CREATED",
+                        "pairing": self.server.create_remote_pairing(body),
+                    },
+                )
+                return
+            pairing_match = re.fullmatch(
+                r"/v1/settings/remote-access/pairings/([^/]+)/(approve|deny)",
+                path,
+            )
+            if pairing_match is not None:
+                pairing_id, decision = pairing_match.groups()
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "REMOTE_PAIRING_DECIDED",
+                        "pairing": self.server.decide_remote_pairing(
+                            unquote(pairing_id), approve=decision == "approve"
+                        ),
+                    },
+                )
+                return
+            device_match = re.fullmatch(
+                r"/v1/settings/remote-access/devices/([^/]+)/revoke", path
+            )
+            if device_match is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "REMOTE_DEVICE_REVOKED",
+                        "device": self.server.revoke_remote_device(
+                            unquote(device_match.group(1))
+                        ),
+                    },
+                )
                 return
             if path == "/v1/settings/providers/universe":
                 self._send(
@@ -13485,6 +13647,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
     def _authorize_service_control(self) -> bool:
         return self._authorize_control_token("SERVICE_CONTROL_TOKEN_REQUIRED")
 
+    def _authorize_local_operator(self) -> bool:
+        if self.headers.get("X-Universe-Access-Surface") == "REMOTE_BROWSER":
+            self._drain_bounded_request_body()
+            self._send(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "FORBIDDEN",
+                    "error_code": "LOCAL_OPERATOR_REQUIRED",
+                },
+            )
+            return False
+        return True
+
+    def _drain_bounded_request_body(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            return
+        if 0 < length <= MAX_BODY_BYTES:
+            self.rfile.read(length)
+
     def _authorize_supervisor_control(self) -> bool:
         return self._authorize_control_token("SUPERVISOR_CONTROL_TOKEN_REQUIRED")
 
@@ -13805,6 +13989,8 @@ def create_server(
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
     host_profile: HostProfileStore | None = None,
+    service_state_path: Path | None = None,
+    remote_gateway_state_path: Path | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -13829,6 +14015,8 @@ def create_server(
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
         host_profile=host_profile,
+        service_state_path=service_state_path,
+        remote_gateway_state_path=remote_gateway_state_path,
     )
 
 
@@ -13893,6 +14081,123 @@ def request_json(
         auth_provider_for(profile, token),
     )
     return transport.request_json(method=method, path=path, payload=payload)
+
+
+def attach_supervisor_session(
+    *,
+    endpoint: str,
+    token: str,
+    node: str,
+    mode: str,
+    provider: str,
+    provider_session_ref: str = "",
+    alias: str = "",
+    make_default: bool = True,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    normalized_node = _required_text(node, "node")
+    normalized_mode = _required_text(mode, "mode").upper()
+    normalized_provider = _required_text(provider, "provider").upper()
+    if normalized_provider not in {"CLAUDE", "CODEX", "GROK"}:
+        raise UniverseError(
+            "SESSION_PROVIDER_INVALID",
+            f"unsupported session provider: {normalized_provider}",
+        )
+    normalized_ref = str(provider_session_ref or "").strip()
+    ref_source = "EXPLICIT"
+    if not normalized_ref:
+        env = os.environ if environment is None else environment
+        environment_key = {"CODEX": "CODEX_THREAD_ID"}.get(normalized_provider)
+        if environment_key:
+            normalized_ref = str(env.get(environment_key) or "").strip()
+            ref_source = environment_key
+    if not normalized_ref:
+        raise UniverseError(
+            "PROVIDER_SESSION_REF_REQUIRED",
+            "provider session ref is required; Codex Desktop may supply CODEX_THREAD_ID",
+        )
+    material = json.dumps(
+        {
+            "node": normalized_node,
+            "mode": normalized_mode,
+            "provider": normalized_provider,
+            "provider_session_ref": normalized_ref,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    session_id = "session_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    normalized_alias = str(alias or "").strip() or (
+        f"{normalized_node} {normalized_mode} | {normalized_provider}"
+    )
+    profile = local_connection_profile(endpoint)
+    supervisor_transport = HttpUniverseTransport(
+        profile,
+        LocalTokenAuthProvider(token),
+    )
+    status, response = supervisor_transport.request_json(
+        method="POST",
+        path="/v1/supervisor/sessions",
+        payload={
+            "session_id": session_id,
+            "node": normalized_node,
+            "mode": normalized_mode,
+            "provider": normalized_provider,
+            "provider_session_ref": normalized_ref,
+            "alias": normalized_alias,
+            "state": "DISCONNECTED",
+            "currentness": "UNKNOWN",
+            "bounded_summary": "Externally opened persistent Mode session coordinate",
+        },
+    )
+    if not 200 <= status < 300:
+        return status, response
+    session = response.get("session")
+    if not isinstance(session, Mapping):
+        raise UniverseError(
+            "SUPERVISOR_SESSION_RESPONSE_INVALID",
+            "session registration response did not contain a session",
+        )
+    default_selection: Mapping[str, Any] | None = None
+    if make_default and not bool(session.get("is_default")):
+        status, default_response = supervisor_transport.request_json(
+            method="POST",
+            path=(
+                "/v1/supervisor/sessions/"
+                + quote(session_id, safe="")
+                + "/default"
+            ),
+            payload={
+                "expected_pointer_version": session.get("default_pointer_version")
+            },
+        )
+        if not 200 <= status < 300:
+            return status, default_response
+        result = default_response.get("result")
+        if not isinstance(result, Mapping):
+            raise UniverseError(
+                "SUPERVISOR_DEFAULT_RESPONSE_INVALID",
+                "default selection response did not contain a result",
+            )
+        default_selection = result
+    attached_session = dict(session)
+    if default_selection is not None:
+        attached_session["is_default"] = True
+        attached_session["default_pointer_version"] = default_selection.get(
+            "pointer_version"
+        )
+    return HTTPStatus.OK, {
+        "schema": API_SCHEMA,
+        "status": "SUPERVISOR_SESSION_ATTACHED",
+        "session": attached_session,
+        "provider_session_ref_source": ref_source,
+        "default_selection": (
+            dict(default_selection) if default_selection is not None else None
+        ),
+        "resident_runtime_reload": (
+            "REQUIRED" if make_default and default_selection is not None else "NOT_REQUIRED"
+        ),
+    }
 
 
 def publish_skill_observation(
@@ -14187,6 +14492,28 @@ def parser() -> argparse.ArgumentParser:
         help="Start the local service when the tray opens",
     )
 
+    attach_session = commands.add_parser(
+        "attach-session",
+        help="Attach an existing provider session to the Universe Supervisor",
+    )
+    attach_session.add_argument("--node", default="CONDUCTOR")
+    attach_session.add_argument("--mode", default="CONDUCTOR")
+    attach_session.add_argument("--provider", default="CODEX")
+    attach_session.add_argument("--provider-session-ref", default="")
+    attach_session.add_argument("--alias", default="Universe Main Conductor")
+    attach_session.add_argument(
+        "--make-default", dest="make_default", action="store_true"
+    )
+    attach_session.add_argument(
+        "--no-make-default", dest="make_default", action="store_false"
+    )
+    attach_session.set_defaults(make_default=True)
+    attach_session.add_argument("--endpoint", default="")
+    attach_session.add_argument("--token", default="")
+    attach_session.add_argument(
+        "--state-file", type=Path, default=default_state_path()
+    )
+
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)
     register.add_argument("--project-root", type=Path, required=True)
@@ -14244,6 +14571,7 @@ def _windows_tray_command(
     command = [
         powershell,
         "-NoProfile",
+        "-STA",
         "-ExecutionPolicy",
         "Bypass",
         "-WindowStyle",
@@ -14378,6 +14706,7 @@ def main() -> int:
                 port=args.port,
                 mode_contract=mode_contract,
                 auto_start_conductor_runtime=True,
+                service_state_path=args.state_file,
             )
             host, port = server.server_address[:2]
             host_text = host.decode("ascii") if isinstance(host, bytes) else host
@@ -14431,7 +14760,18 @@ def main() -> int:
             status: int = HTTPStatus.OK
         else:
             endpoint, token = _connection_options(args)
-            if args.command == "register":
+            if args.command == "attach-session":
+                status, result = attach_supervisor_session(
+                    endpoint=endpoint,
+                    token=token,
+                    node=args.node,
+                    mode=args.mode,
+                    provider=args.provider,
+                    provider_session_ref=args.provider_session_ref,
+                    alias=args.alias,
+                    make_default=bool(args.make_default),
+                )
+            elif args.command == "register":
                 status, result = request_json(
                     endpoint=endpoint,
                     token=token,

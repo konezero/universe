@@ -26,6 +26,7 @@ class WindowsTrayContractTests(unittest.TestCase):
         )
         index = command.index("-PythonExecutable")
         self.assertEqual(str(python.resolve()), command[index + 1])
+        self.assertIn("-STA", command)
         self.assertEqual("-StartService", command[-1])
 
     def test_tray_script_rejects_shell_shims(self) -> None:
@@ -33,8 +34,19 @@ class WindowsTrayContractTests(unittest.TestCase):
             ROOT / "packaging" / "windows" / "Universe-Tray.ps1"
         ).read_text(encoding="utf-8")
         self.assertIn("native python executable required", script)
+        self.assertIn("Universe.ico", script)
+        self.assertIn("Local\\Universe.Tray", script)
         self.assertIn("ShowBalloonTip", script)
         self.assertNotIn("Get-Command python -", script)
+
+    def test_windows_shortcuts_use_the_universe_icon(self) -> None:
+        for relative_path in (
+            Path("packaging/windows/install-user.ps1"),
+            Path("packaging/windows/Install-Portable-User.ps1"),
+        ):
+            script = (ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("Universe.ico", script)
+            self.assertIn("IconLocation", script)
 
     def test_tray_stays_attached_to_the_user_desktop(self) -> None:
         flags = _windows_tray_creationflags()

@@ -43,6 +43,7 @@ if ($sourcePath.Path.ToLower().EndsWith(".zip")) {
 $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Universe"
 New-Item -ItemType Directory -Force -Path $startMenu | Out-Null
 $shell = New-Object -ComObject WScript.Shell
+$iconPath = Join-Path $InstallDir "packaging\windows\Universe.ico"
 
 function New-LauncherShortcut([string]$Name, [string]$Target) {
   $path = Join-Path $startMenu $Name
@@ -50,6 +51,9 @@ function New-LauncherShortcut([string]$Name, [string]$Target) {
   $sc.TargetPath = $Target
   $sc.WorkingDirectory = $InstallDir
   $sc.WindowStyle = 7
+  if (Test-Path -LiteralPath $iconPath -PathType Leaf) {
+    $sc.IconLocation = "$iconPath,0"
+  }
   $sc.Save()
   return $path
 }

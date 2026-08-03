@@ -36,6 +36,8 @@ const state = {
   providerSettings: null,
   workerBindings: null,
   hostTools: null,
+  remoteAccess: null,
+  accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
   supervisorEvents: [],
   legacyExecutors: [],
@@ -173,6 +175,14 @@ const elements = {
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
+  remoteAccessStatus: document.querySelector("#remote-access-status"),
+  remoteAccessEndpoint: document.querySelector("#remote-access-endpoint"),
+  remotePairingInvite: document.querySelector("#remote-pairing-invite"),
+  remotePairingList: document.querySelector("#remote-pairing-list"),
+  remoteDeviceList: document.querySelector("#remote-device-list"),
+  startRemoteAccess: document.querySelector("#start-remote-access-button"),
+  stopRemoteAccess: document.querySelector("#stop-remote-access-button"),
+  createPairing: document.querySelector("#create-pairing-button"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
@@ -664,13 +674,18 @@ function updateGraphChrome() {
 
 async function refresh({ syncSelectedProject = false } = {}) {
   try {
-    const health = await fetch("/health", { cache: "no-store" }).then((response) =>
-      response.json()
-    );
+    const healthResponse = await fetch("/health", { cache: "no-store" });
+    const health = await healthResponse.json();
+    state.accessSurface =
+      healthResponse.headers.get("X-Universe-Access-Surface") || "LOCAL_BROWSER";
     state.health = health;
     elements.serviceStatus.dataset.state = health.status === "READY" ? "ready" : "error";
     elements.serviceStatus.textContent =
-      health.status === "READY" ? "Local service" : health.status;
+      health.status === "READY"
+        ? state.accessSurface === "REMOTE_BROWSER"
+          ? "Paired mobile"
+          : "Local service"
+        : health.status;
     state.modeContract = health.mode_contract || null;
     renderModeStatus();
 
@@ -1140,6 +1155,34 @@ function renderRoomMessages() {
   updateConversationBadge();
 }
 
+function requestedPermissionSummary(value) {
+  if (!value || typeof value !== "object") return "";
+  const parts = [];
+  if (value.network?.enabled === true) {
+    parts.push("Network access");
+  }
+  const fileSystem = value.fileSystem;
+  if (fileSystem && typeof fileSystem === "object") {
+    for (const entry of fileSystem.entries || []) {
+      const pathValue = entry?.path || {};
+      const label =
+        pathValue.path ||
+        pathValue.pattern ||
+        pathValue.value?.subpath ||
+        pathValue.value?.kind ||
+        "filesystem";
+      parts.push(`${entry?.access || "access"}: ${label}`);
+    }
+    for (const path of fileSystem.read || []) {
+      parts.push(`read: ${path}`);
+    }
+    for (const path of fileSystem.write || []) {
+      parts.push(`write: ${path}`);
+    }
+  }
+  return parts.join(" · ") || "Additional permissions requested";
+}
+
 function renderPermissionCard(permission) {
   const item = node("article", "room-message permission-request");
   const toolCall = permission.tool_call || {};
@@ -1157,6 +1200,15 @@ function renderPermissionCard(permission) {
       toolCall.reason || "The agent is waiting for your decision."
     )
   );
+  if (toolCall.requestedPermissions) {
+    item.append(
+      node(
+        "small",
+        "permission-scope",
+        requestedPermissionSummary(toolCall.requestedPermissions)
+      )
+    );
+  }
   const actions = node("div", "permission-actions");
   for (const option of permission.options || []) {
     const button = node("button", `permission-option ${option.kind}`, option.name);
@@ -1486,6 +1538,119 @@ function renderLocalServiceStatus() {
   if (typeof refreshLawStrip === "function") refreshLawStrip();
 }
 
+function renderRemoteAccessSettings() {
+  if (!elements.remoteAccessStatus) return;
+  const remote = state.remoteAccess || {};
+  const gateway = remote.gateway || { status: "OFFLINE" };
+  const online = gateway.status === "READY" || gateway.status === "HOST_OFFLINE";
+  const localOperator = state.accessSurface !== "REMOTE_BROWSER";
+  elements.remoteAccessStatus.textContent = gateway.status || "OFFLINE";
+  elements.remoteAccessStatus.dataset.state = gateway.status || "OFFLINE";
+  elements.remoteAccessEndpoint.textContent = gateway.public_base_url
+    ? `Mobile URL: ${gateway.public_base_url}`
+    : "Mobile gateway is stopped.";
+  elements.startRemoteAccess.disabled = online || !localOperator;
+  elements.stopRemoteAccess.disabled = !online || !localOperator;
+  elements.createPairing.disabled = !online || !localOperator;
+
+  elements.remotePairingList.replaceChildren();
+  const pending = (remote.pairings || []).filter(
+    (item) => item.state === "AWAITING_APPROVAL"
+  );
+  if (!pending.length) {
+    elements.remotePairingList.append(node("p", "empty-copy", "No pending devices"));
+  }
+  for (const pairing of pending) {
+    const row = node("div", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", pairing.device_name || "Unnamed browser"),
+      node("small", "", `Requested ${pairing.requested_at || "UNKNOWN"}`)
+    );
+    const actions = node("div", "remote-access-row-actions");
+    const approve = node("button", "primary-button compact-action", "Approve");
+    approve.type = "button";
+    approve.dataset.pairingId = pairing.pairing_id;
+    approve.dataset.decision = "approve";
+    const deny = node("button", "icon-button remote-pairing-decision", "×");
+    deny.type = "button";
+    deny.title = "Deny pairing";
+    deny.dataset.pairingId = pairing.pairing_id;
+    deny.dataset.decision = "deny";
+    actions.append(approve, deny);
+    row.append(copy, actions);
+    elements.remotePairingList.append(row);
+  }
+
+  elements.remoteDeviceList.replaceChildren();
+  const devices = (remote.devices || []).filter((item) => item.state !== "REVOKED");
+  if (!devices.length) {
+    elements.remoteDeviceList.append(node("p", "empty-copy", "No paired devices"));
+  }
+  for (const device of devices) {
+    const row = node("div", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", device.display_name),
+      node("small", "", `Last seen ${device.last_seen_at}`)
+    );
+    const revoke = node("button", "secondary-button compact-action", "Revoke");
+    revoke.type = "button";
+    revoke.dataset.deviceId = device.device_id;
+    row.append(copy, revoke);
+    elements.remoteDeviceList.append(row);
+  }
+}
+
+async function refreshRemoteAccessSettings() {
+  state.remoteAccess = await api("/v1/settings/remote-access");
+  renderRemoteAccessSettings();
+}
+
+async function setRemoteAccess(operation) {
+  elements.settingsError.textContent = "";
+  await api(`/v1/settings/remote-access/${operation}`, {
+    method: "POST",
+    body: {},
+  });
+  await refreshRemoteAccessSettings();
+  toast(operation === "start" ? "Mobile access started" : "Mobile access stopped");
+}
+
+async function createRemotePairing() {
+  elements.settingsError.textContent = "";
+  const result = await api("/v1/settings/remote-access/pairings", {
+    method: "POST",
+    body: { ttl_seconds: 600 },
+  });
+  const pairing = result.pairing;
+  elements.remotePairingInvite.classList.remove("hidden");
+  elements.remotePairingInvite.replaceChildren(
+    node("strong", "", pairing.code),
+    node("span", "", pairing.pair_url),
+    node("small", "", `Expires ${pairing.expires_at}`)
+  );
+  await refreshRemoteAccessSettings();
+}
+
+async function decideRemotePairing(pairingId, decision) {
+  await api(
+    `/v1/settings/remote-access/pairings/${encodeURIComponent(pairingId)}/${decision}`,
+    { method: "POST", body: {} }
+  );
+  await refreshRemoteAccessSettings();
+  toast(decision === "approve" ? "Device approved" : "Pairing denied");
+}
+
+async function revokeRemoteDevice(deviceId) {
+  await api(
+    `/v1/settings/remote-access/devices/${encodeURIComponent(deviceId)}/revoke`,
+    { method: "POST", body: {} }
+  );
+  await refreshRemoteAccessSettings();
+  toast("Device revoked");
+}
+
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
   [
@@ -1493,11 +1658,13 @@ async function openProviderSettings() {
     state.workerBindings,
     state.hostTools,
     state.serviceSettings,
+    state.remoteAccess,
   ] = await Promise.all([
     api("/v1/settings/providers"),
     api("/v1/settings/worker-bindings"),
     api("/v1/settings/host-tools"),
     api("/v1/settings/service").catch(() => null),
+    api("/v1/settings/remote-access"),
   ]);
   if (elements.memoryMaintainInterval && state.serviceSettings?.memory_maintain) {
     elements.memoryMaintainInterval.value = String(
@@ -1515,6 +1682,7 @@ async function openProviderSettings() {
   renderWorkerBindingSettings();
   renderHostToolSettings();
   renderLocalServiceStatus();
+  renderRemoteAccessSettings();
   elements.settingsDialog.showModal();
 }
 
@@ -4934,6 +5102,37 @@ function bindEvents() {
   });
   elements.discoverHostTools.addEventListener("click", () => {
     discoverHostTools().catch((error) => toast(error.message, true));
+  });
+  elements.startRemoteAccess.addEventListener("click", () => {
+    setRemoteAccess("start").catch((error) => {
+      elements.settingsError.textContent = error.message;
+    });
+  });
+  elements.stopRemoteAccess.addEventListener("click", () => {
+    setRemoteAccess("stop").catch((error) => {
+      elements.settingsError.textContent = error.message;
+    });
+  });
+  elements.createPairing.addEventListener("click", () => {
+    createRemotePairing().catch((error) => {
+      elements.settingsError.textContent = error.message;
+    });
+  });
+  elements.remotePairingList.addEventListener("click", (event) => {
+    const action = event.target.closest("[data-pairing-id]");
+    if (!action) return;
+    decideRemotePairing(action.dataset.pairingId, action.dataset.decision).catch(
+      (error) => {
+        elements.settingsError.textContent = error.message;
+      }
+    );
+  });
+  elements.remoteDeviceList.addEventListener("click", (event) => {
+    const action = event.target.closest("[data-device-id]");
+    if (!action) return;
+    revokeRemoteDevice(action.dataset.deviceId).catch((error) => {
+      elements.settingsError.textContent = error.message;
+    });
   });
   elements.hostToolSettings.addEventListener("click", (event) => {
     const action = event.target.closest(
