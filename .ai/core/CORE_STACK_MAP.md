@@ -70,6 +70,23 @@ Result / Durable Artifact / Completion State
 
 When the command or mission is `OS_UPDATE`, route directly to Runtime Commands and Runtime Instruction Set after Core Stack Map, then localize through Project Anchor and record validation evidence.
 
+This is a durable Project Runtime lifecycle route. It is selected before
+Session Boot and before ordinary Execution Guard classification. After
+`OS_UPDATE` intent is confirmed, the Host must not start or require `BOOT`,
+construct a normal Execution Guard request, or offer either path as an
+alternative to the Host Runtime Lifecycle adapter.
+
+```text
+OS_UPDATE intent confirmed
+  -> Runtime Commands
+  -> OS Management Skill
+  -> read-only target classification and exact proposal
+  -> approval
+  -> Host Runtime Lifecycle adapter
+  -> validate / status / READY_FOR_BOOT
+  -> stop
+```
+
 ```text
 README.md
   -> .ai/README.md
@@ -238,6 +255,7 @@ Strong context / competing triggers / stale assumptions
 | Anchor Frame Constraint | `RUNTIME_ANCHOR_FRAME_ROUTING_CONSTRAINT.md` | constrains | Requires runtime routing and execution to originate from the active Runtime Anchor Frame and source-backed runtime evidence |
 | Entry | `RUNTIME_COMMANDS.md` | routes | Defines runtime command entry points and first-route decisions such as OS_UPDATE Fast Path inside the lifecycle |
 | Mode Registry | `MODE_REGISTRY.md` | resolves | Defines the source-backed Mode allow-list, immutable ai-career Modes, and MASTER-managed project Mode boundaries |
+| Local Supervisor | `LOCAL_SESSION_SUPERVISOR.md` | supervises | Defines persistent Mode Session registration, exact process leases, Provider resume routing, local continuity flushes, and observe-only legacy migration |
 | Bootstrap | `SESSION_RUNTIME_BOOTSTRAP.md` | reconstructs | Derives a Current Interpretation Basis and fresh Session Boot Anchor from current source-backed evidence without reactivating historical Anchors |
 | State Trust | `RUNTIME_STATE_TRUST_GATE.md` | verifies | Protects active `*_ING` state, state provenance, narrative time, and evidence priority before continuation |
 | Anchor Time | `ANCHOR_TEMPORAL_COORDINATE.md` | advances | Defines Host-time input observation, forward-only Current Anchor time, Beyond footprints, and Current-Basis-gated recall adoption |
@@ -277,30 +295,31 @@ For full Core boot or policy work:
 1. .ai/core/README.md
 2. .ai/core/CORE_STACK_MAP.md
 3. .ai/core/MODE_REGISTRY.md
-4. .ai/core/RUNTIME_LIFECYCLE.md
-5. .ai/core/INTENT_FIRST_ROUTING_GATE.md
-6. .ai/core/COMMANDER_WAIT_BUFFER_RULE.md
-7. .ai/core/RUNTIME_ANCHOR_FRAME_ROUTING_CONSTRAINT.md
-8. .ai/core/RUNTIME_COMMANDS.md
-9. .ai/core/SESSION_RUNTIME_BOOTSTRAP.md
-10. .ai/core/RUNTIME_STATE_TRUST_GATE.md
-11. .ai/core/ANCHOR_TEMPORAL_COORDINATE.md
-12. .ai/core/RUNTIME_IMAGE_ASSEMBLY_CONTRACT.md
-13. .ai/core/RUNTIME_AUTHORITY_CERTIFICATE.md
-14. .ai/core/RUNTIME_AUTHORITY_EXECUTION_BINDING.md
-15. .ai/core/PRE_EXECUTION_VERIFICATION.md
-16. .ai/core/AI_RUNTIME_GOVERNANCE.md
-17. .ai/core/SESSION_FRAMEWORK.md
-18. .ai/core/RUNTIME_PREFLIGHT.md
-19. .ai/core/RUNTIME_INSTRUCTION_SET.md
-20. .ai/core/PROJECT_ANCHOR.md
-21. .ai/core/OS_VALIDATION_EVIDENCE.md
-22. .ai/core/RUNTIME_MODEL.md
-23. .ai/core/TASK_FRAME_ORCHESTRATION.md
-24. .ai/core/RUNTIME_ORCHESTRATOR.md
-25. .ai/core/CORE_SERVICES.md
-26. .ai/core/PERSISTENCE_MODEL.md
-27. .ai/core/AI_CORE.md
+4. .ai/core/LOCAL_SESSION_SUPERVISOR.md
+5. .ai/core/RUNTIME_LIFECYCLE.md
+6. .ai/core/INTENT_FIRST_ROUTING_GATE.md
+7. .ai/core/COMMANDER_WAIT_BUFFER_RULE.md
+8. .ai/core/RUNTIME_ANCHOR_FRAME_ROUTING_CONSTRAINT.md
+9. .ai/core/RUNTIME_COMMANDS.md
+10. .ai/core/SESSION_RUNTIME_BOOTSTRAP.md
+11. .ai/core/RUNTIME_STATE_TRUST_GATE.md
+12. .ai/core/ANCHOR_TEMPORAL_COORDINATE.md
+13. .ai/core/RUNTIME_IMAGE_ASSEMBLY_CONTRACT.md
+14. .ai/core/RUNTIME_AUTHORITY_CERTIFICATE.md
+15. .ai/core/RUNTIME_AUTHORITY_EXECUTION_BINDING.md
+16. .ai/core/PRE_EXECUTION_VERIFICATION.md
+17. .ai/core/AI_RUNTIME_GOVERNANCE.md
+18. .ai/core/SESSION_FRAMEWORK.md
+19. .ai/core/RUNTIME_PREFLIGHT.md
+20. .ai/core/RUNTIME_INSTRUCTION_SET.md
+21. .ai/core/PROJECT_ANCHOR.md
+22. .ai/core/OS_VALIDATION_EVIDENCE.md
+23. .ai/core/RUNTIME_MODEL.md
+24. .ai/core/TASK_FRAME_ORCHESTRATION.md
+25. .ai/core/RUNTIME_ORCHESTRATOR.md
+26. .ai/core/CORE_SERVICES.md
+27. .ai/core/PERSISTENCE_MODEL.md
+28. .ai/core/AI_CORE.md
 ```
 
 For lightweight work, read only the smallest slice required.

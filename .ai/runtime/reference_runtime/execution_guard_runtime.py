@@ -446,13 +446,21 @@ def _normalize_request(
     task_frame_lineage_verification: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     request = _mapping_copy(value, "request")
+    project_source_work = _is_project_source_work(snapshot)
+    boundary = request.get("boundary")
+    if boundary is None and project_source_work:
+        assignment = _mapping_copy(
+            snapshot.get("execution_assignment"),
+            "snapshot.execution_assignment",
+        )
+        boundary = assignment.get("boundary")
     normalized = {
         "session_id": _required_text(request.get("session_id"), "request.session_id"),
         "frame_id": _required_text(request.get("frame_id"), "request.frame_id"),
         "anchor_id": _required_text(request.get("anchor_id"), "request.anchor_id"),
         "operation": _required_text(request.get("operation"), "request.operation").upper(),
         "target": _absolute_target(request.get("target")),
-        "boundary": _required_text(request.get("boundary"), "request.boundary"),
+        "boundary": _required_text(boundary, "request.boundary"),
         "source_commit": _required_text(
             request.get("source_commit"), "request.source_commit"
         ),
@@ -483,7 +491,7 @@ def _normalize_request(
             "verified Task Frame lineage requires request.task_frame_lineage",
         )
     approval = request.get("approval")
-    if approval is None and _is_project_source_work(snapshot):
+    if approval is None and project_source_work:
         normalized["approval"] = _derived_work_receipt_approval(
             snapshot=snapshot, request=normalized
         )

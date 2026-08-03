@@ -38,6 +38,15 @@ Node: universe
 
 ## Commands
 
+`OS_UPDATE` routes before `BOOT`, Session Boot, or ordinary
+Execution Guard classification. It follows
+`.ai/skills/common/os-management/SKILL.md`, performs read-only
+target classification, presents one exact proposal, and uses the
+Host Runtime Lifecycle adapter after approval. Do not start or
+require a Session Boot executor, construct an ordinary Execution
+Guard request, offer alternate update paths, or invoke the
+low-level installer directly. After validate/status returns
+`READY_FOR_BOOT`, stop without inferring `BOOT`.
 `BOOT` reads `.ai/START_HERE.md`, follows
 `.ai/skills/common/boot/SKILL.md`, and executes the installed
 Session Boot Executor when Host capability is available.
@@ -73,7 +82,8 @@ Runtime Image documents remain observed references.
 `.ai/skills/common/anchor-currentness/SKILL.md`.
 `MODE LIST`, `MODE SHOW`, `MODE ADD`, `MODE MODIFY`, and `MODE DELETE`
 follow `.ai/skills/common/master-mode-registry/SKILL.md`.
-Any mutation follows `.ai/skills/common/execution-guard/SKILL.md`
+Any mutation outside the `OS_INSTALL` / `OS_UPDATE` Host Runtime
+Lifecycle route follows `.ai/skills/common/execution-guard/SKILL.md`
 before a file, shell, API, database, Git, or external write tool runs.
 Exact single-occurrence text replacement on an existing file follows
 `.ai/skills/common/receipt-aware-text-edit/SKILL.md`.

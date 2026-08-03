@@ -38,6 +38,26 @@ This file maps short commands to the project's existing boot procedure.
 
 ## Command Entry Rules
 
+### OS_UPDATE Pre-Route
+
+After intent classification confirms `OS_UPDATE`, route to
+`.ai/skills/common/os-management/SKILL.md` before `BOOT`, Session Boot, or the
+ordinary Execution Guard path.
+
+```text
+OS_UPDATE
+  -> OS Management Skill
+  -> read-only target classification
+  -> exact proposal and approval
+  -> Host Runtime Lifecycle adapter
+  -> validate / status / READY_FOR_BOOT
+  -> stop
+```
+
+Do not start or require a Session Boot executor for `OS_UPDATE`. Do not offer
+`BOOT` or an ordinary Execution Guard request as an alternative update route.
+Do not invoke the low-level installer directly.
+
 ### Intent-First Routing
 
 Intent classification must happen before command or mode routing.

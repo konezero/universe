@@ -31,6 +31,8 @@ GENERIC BOOT / REBOOT REHYDRATE GOVERNANCE CONTEXT FROM ANCHOR SNAPSHOT EVIDENCE
 
 OS_UPDATE ROUTES TO RUNTIME_INSTRUCTION_SET FIRST.
 OS_UPDATE UPDATES THE DURABLE PROJECT RUNTIME.
+OS_UPDATE ROUTING PRECEDES SESSION BOOT AND ORDINARY EXECUTION GUARD CLASSIFICATION.
+DO NOT OFFER BOOT OR EXECUTION GUARD AS AN ALTERNATIVE OS_UPDATE PATH.
 
 CONDUCTOR RESUME IS NOT THE DEFAULT PATH FOR OS_UPDATE.
 
@@ -108,7 +110,13 @@ Command: OS_INSTALL
 
 Command: OS_UPDATE
   -> route to Runtime Instruction Set
-  -> update project-local or repository runtime surfaces only with write scope
+  -> follow `.ai/skills/common/os-management/SKILL.md`
+  -> classify the target and present the exact lifecycle proposal
+  -> use the Host Runtime Lifecycle adapter after approval
+  -> do not start or require BOOT for the update
+  -> do not construct an ordinary Execution Guard request for the update
+  -> update project-local or repository runtime surfaces only within the approved lifecycle scope
+  -> validate, report READY_FOR_BOOT, and stop
 ```
 
 ## Primary Runtime Commands

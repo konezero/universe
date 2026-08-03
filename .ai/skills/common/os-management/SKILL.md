@@ -36,6 +36,38 @@ permission.
   -> installed distribution runtime/tool surface when the command requires it
 ```
 
+## OS_UPDATE Pre-Route Invariant
+
+After intent classification confirms `OS_UPDATE`, select this Skill and the
+Host Runtime Lifecycle route before any Session Boot or ordinary mutation
+route. This ordering is mandatory even when the Host reports that no Session
+Runtime, Authority, Execution Assignment, endpoint, or Guard receipt exists.
+
+```text
+OS_UPDATE intent confirmed
+  -> load OS Management
+  -> bind immutable source and absolute target
+  -> perform read-only managed-target preflight
+  -> present one exact OS_UPDATE proposal
+  -> wait for exact approval
+  -> Host Runtime Lifecycle adapter
+  -> validate / status / READY_FOR_BOOT
+  -> stop
+```
+
+The Host must not:
+
+```text
+start or require BOOT before OS_UPDATE
+start a Session Boot executor to obtain update permission
+construct an ordinary Execution Guard request for OS_UPDATE
+offer "existing lifecycle practice" versus "BOOT / Execution Guard" choices
+invoke project_runtime_installer.py install directly
+```
+
+`BOOT` remains a separate later command. `READY_FOR_BOOT` is the update
+handoff, not permission to infer or execute `BOOT`.
+
 `OS_INSTALL` installs the durable Project Runtime. It ends at
 `boot_handoff: READY_FOR_BOOT` and must not report Session Runtime readiness.
 The Boot Skill separately owns `BOOT` / `REBOOT` invocation and

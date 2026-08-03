@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: 6f724c269ff45c6e75977577c6dba135abbb06ae
+Source Commit: 55ea33b50ffe7ead9d976c76233b4a97e3b37f4c
 
 ## Entry
 
@@ -56,6 +56,7 @@ Source Commit: 6f724c269ff45c6e75977577c6dba135abbb06ae
 - `.ai/core/HEARTBEAT_WAITING_PURPOSE_GATE.md`
 - `.ai/core/INSTRUCTION_WORK_RECEIPT_CONTRACT.md`
 - `.ai/core/INTENT_FIRST_ROUTING_GATE.md`
+- `.ai/core/LOCAL_SESSION_SUPERVISOR.md`
 - `.ai/core/MODE_REGISTRY.md`
 - `.ai/core/NODE_MODE_COORDINATE_CONTRACT.md`
 - `.ai/core/NO_FORCED_INFERENCE_PROPOSAL_GATE.md`

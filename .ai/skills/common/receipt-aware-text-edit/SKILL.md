@@ -21,6 +21,13 @@ It does not create Authority, Write Scope, Execution Assignment, Host
 capability, approval, currentness, or permission. It reuses the existing
 Execution Guard and mutation-gateway contracts only.
 
+When an active `PROJECT_SOURCE_WORK` assignment already carries an Instruction
+Receipt and Work Receipt, omit `boundary` and `approval`. The Execution Guard
+inherits the exact boundary, receipt identities, commander surface, and evidence
+from that active assignment. Each concrete write still receives and immediately
+consumes its own one-time Mutation Receipt; that internal receipt is not another
+user approval prompt.
+
 ## When To Use
 
 Use this Skill instead of a raw editor write when the intended change is an
@@ -65,7 +72,6 @@ installed. Delete transport files after the command completes.
   "frame_id": "<active-frame-id>",
   "anchor_id": "<active-anchor-id>",
   "target": "<absolute-target-file>",
-  "boundary": "<exact-boundary>",
   "source_commit": "<active-source-commit>",
   "validation_ref": "<active-validation-evidence-ref>",
   "old_text": "<exact text to replace once>",
@@ -74,12 +80,22 @@ installed. Delete transport files after the command completes.
     "filesystem_write": "AVAILABLE",
     "pre_write_hook": "AVAILABLE",
     "evidence_ref": "<host-evidence-ref>"
-  },
+  }
+}
+```
+
+The example above is the normal active `PROJECT_SOURCE_WORK` route. For a
+strict exact Execution Assignment, provide both fields below and bind them to
+that assignment exactly; omitting either remains fail closed.
+
+```json
+{
+  "boundary": "<exact-assignment-boundary>",
   "approval": {
     "status": "APPROVED",
     "operation": "MODIFY",
     "target": "<absolute-target-file>",
-    "boundary": "<exact-boundary>",
+    "boundary": "<exact-assignment-boundary>",
     "evidence_ref": "<approval-ref>"
   }
 }

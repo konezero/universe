@@ -253,13 +253,13 @@ def build_mutation_request(
     frame_id: str,
     anchor_id: str,
     target: str,
-    boundary: str,
+    boundary: str | None,
     source_commit: str,
     validation_ref: str,
     payload_sha256: str,
     preimage: Mapping[str, str],
     host_capability: Mapping[str, Any],
-    approval: Mapping[str, Any],
+    approval: Mapping[str, Any] | None,
     task_frame_lineage: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     request: dict[str, Any] = {
@@ -268,14 +268,16 @@ def build_mutation_request(
         "anchor_id": anchor_id,
         "operation": "MODIFY",
         "target": target,
-        "boundary": boundary,
         "source_commit": source_commit,
         "validation_ref": validation_ref,
         "payload_sha256": payload_sha256,
         "target_preimage": dict(preimage),
         "host_capability": dict(host_capability),
-        "approval": dict(approval),
     }
+    if boundary is not None:
+        request["boundary"] = boundary
+    if approval is not None:
+        request["approval"] = dict(approval)
     if task_frame_lineage is not None:
         request["task_frame_lineage"] = dict(task_frame_lineage)
     return request
@@ -304,7 +306,12 @@ def run_text_edit(
         frame_id = _require_string(request.get("frame_id"), "frame_id")
         anchor_id = _require_string(request.get("anchor_id"), "anchor_id")
         target_raw = _require_string(request.get("target"), "target")
-        boundary = _require_string(request.get("boundary"), "boundary")
+        boundary_raw = request.get("boundary")
+        boundary = (
+            _require_string(boundary_raw, "boundary")
+            if boundary_raw is not None
+            else None
+        )
         source_commit = _require_string(request.get("source_commit"), "source_commit")
         validation_ref = _require_string(
             request.get("validation_ref"), "validation_ref"
@@ -318,7 +325,12 @@ def run_text_edit(
         host_capability = _require_mapping(
             request.get("host_capability"), "host_capability"
         )
-        approval = _require_mapping(request.get("approval"), "approval")
+        approval_raw = request.get("approval")
+        approval = (
+            _require_mapping(approval_raw, "approval")
+            if approval_raw is not None
+            else None
+        )
         lineage_raw = request.get("task_frame_lineage")
         task_frame_lineage = (
             _require_mapping(lineage_raw, "task_frame_lineage")
