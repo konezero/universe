@@ -525,6 +525,65 @@ class ProjectMasterHostTests(unittest.TestCase):
         finally:
             host.close()
 
+    def test_resident_mode_session_reopens_when_default_session_changes(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "supervisor.sqlite3")
+        first, _ = supervisor.register_session(
+            {
+                "session_id": "session-conductor-one",
+                "node": "CONDUCTOR",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "thread-one",
+                "state": "DISCONNECTED",
+            }
+        )
+        supervisor.set_default(
+            first["session_id"],
+            expected_pointer_version=first["default_pointer_version"],
+        )
+        created: list[PreparedFakeProvider] = []
+
+        def factory(provider, _root, _target, store, _mode, _actor):
+            instance = PreparedFakeProvider()
+            instance.session_id = store.session_ref_for(provider)
+            instance.session_ref = f"codex-app-server:{instance.session_id}"
+            created.append(instance)
+            return instance
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-selected.sqlite",
+            actor_label="Universe Conductor",
+            session_supervisor=supervisor,
+            provider_factory=factory,
+        )
+        try:
+            host.prepare("CODEX")
+            second, _ = supervisor.register_session(
+                {
+                    "session_id": "session-conductor-two",
+                    "node": "CONDUCTOR",
+                    "mode": "CONDUCTOR",
+                    "provider": "CODEX",
+                    "provider_session_ref": "thread-two",
+                    "state": "DISCONNECTED",
+                }
+            )
+            supervisor.set_default(
+                second["session_id"],
+                expected_pointer_version=second["default_pointer_version"],
+            )
+            host.prepare("CODEX")
+        finally:
+            host.close()
+
+        self.assertEqual(2, len(created))
+        self.assertEqual("thread-one", created[0].session_id)
+        self.assertEqual("thread-two", created[1].session_id)
+        self.assertTrue(created[0].closed)
+
     def test_resident_mode_session_saves_idle_and_preserves_provider_on_close(
         self,
     ) -> None:

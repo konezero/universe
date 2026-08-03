@@ -4,6 +4,8 @@ import hashlib
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,7 +14,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 from legacy_executor_classifier import (  # noqa: E402
     classify_executor,
     classify_inventory,
+    collect_windows_session_boot_executors,
 )
+import legacy_executor_classifier  # noqa: E402
 
 
 def identity(**overrides: object) -> dict[str, object]:
@@ -77,6 +81,32 @@ class LegacyExecutorClassifierTests(unittest.TestCase):
     def test_non_session_boot_process_is_excluded(self) -> None:
         ordinary = identity(command=["python", "-m", "pytest"])
         self.assertEqual([], classify_inventory([ordinary], [session()]))
+
+    def test_windows_inventory_hides_the_powershell_process_window(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def runner(*_args: object, **kwargs: object) -> SimpleNamespace:
+            calls.append(kwargs)
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+        with (
+            patch.object(legacy_executor_classifier.os, "name", "nt"),
+            patch.object(
+                legacy_executor_classifier.shutil,
+                "which",
+                return_value="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            ),
+            patch.object(
+                legacy_executor_classifier.subprocess,
+                "CREATE_NO_WINDOW",
+                0x08000000,
+                create=True,
+            ),
+        ):
+            result = collect_windows_session_boot_executors(runner=runner)
+
+        self.assertEqual("HOST_INVENTORY_OBSERVED", result["status"])
+        self.assertEqual(0x08000000, calls[0]["creationflags"])
 
 
 if __name__ == "__main__":

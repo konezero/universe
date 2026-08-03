@@ -122,7 +122,9 @@ def classify_inventory(
     ]
 
 
-def collect_windows_session_boot_executors() -> dict[str, Any]:
+def collect_windows_session_boot_executors(
+    *, runner: Any = subprocess.run
+) -> dict[str, Any]:
     if os.name != "nt":
         return {
             "status": "HOST_INVENTORY_UNAVAILABLE",
@@ -149,7 +151,7 @@ def collect_windows_session_boot_executors() -> dict[str, Any]:
         "$items | ConvertTo-Json -Compress -Depth 3"
     )
     # The executable is resolved to an absolute path and the script is fixed.
-    result = subprocess.run(  # nosec B603
+    result = runner(  # nosec B603
         [
             powershell,
             "-NoLogo",
@@ -164,6 +166,7 @@ def collect_windows_session_boot_executors() -> dict[str, Any]:
         encoding="utf-8",
         errors="replace",
         timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         return {
