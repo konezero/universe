@@ -224,6 +224,18 @@ AUTH_TYPES = frozenset({"NONE", "LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 SKILL_OPERATION_CLASSES = frozenset({"READ", "PROPOSE", "EXECUTE"})
 SKILL_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "UNKNOWN"})
 SKILL_VALIDATION_STATES = frozenset({"PASS", "FAIL", "NOT_RUN", "UNKNOWN"})
+SKILL_FAILURE_KINDS = frozenset(
+    {
+        "NONE",
+        "PROVIDER_QUOTA",
+        "PROVIDER_ERROR",
+        "VALIDATION",
+        "TIMEOUT",
+        "CANCELLED",
+        "UNKNOWN",
+    }
+)
+SKILL_QUOTA_STATES = frozenset({"AVAILABLE", "WARNING", "EXHAUSTED", "UNKNOWN"})
 TODO_SCOPE_KINDS = frozenset({"UNIVERSE", "PROJECT", "NODE"})
 TODO_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
 TODO_STATES = frozenset(
@@ -1249,6 +1261,7 @@ def normalize_skill_observation_candidate(
                     "metrics",
                 }
             ),
+            optional=frozenset({"execution_context"}),
         )
         skill = _exact_object_fields(
             observation["skill"],
@@ -1278,6 +1291,67 @@ def normalize_skill_observation_candidate(
                 "SKILL_VALIDATION_STATE_INVALID",
                 f"{field}.validation_state is unsupported",
             )
+        raw_execution_context = observation.get("execution_context")
+        if raw_execution_context is None:
+            execution_context = {
+                "provider_ref": provider_ref_from_model_ref(
+                    _required_text(observation["model_ref"], f"{field}.model_ref")
+                ),
+                "worker_role": "UNKNOWN",
+                "task_kind": operation_class,
+                "node_ref": "UNKNOWN",
+                "failure_kind": "NONE" if outcome == "SUCCEEDED" else "UNKNOWN",
+                "quota_state": "UNKNOWN",
+            }
+        else:
+            context = _exact_object_fields(
+                raw_execution_context,
+                field=f"{field}.execution_context",
+                required=frozenset(
+                    {
+                        "provider_ref",
+                        "worker_role",
+                        "task_kind",
+                        "node_ref",
+                        "failure_kind",
+                        "quota_state",
+                    }
+                ),
+            )
+            failure_kind = _required_text(
+                context["failure_kind"], f"{field}.execution_context.failure_kind"
+            ).upper()
+            quota_state = _required_text(
+                context["quota_state"], f"{field}.execution_context.quota_state"
+            ).upper()
+            if failure_kind not in SKILL_FAILURE_KINDS:
+                raise UniverseError(
+                    "SKILL_FAILURE_KIND_INVALID",
+                    f"{field}.execution_context.failure_kind is unsupported",
+                )
+            if quota_state not in SKILL_QUOTA_STATES:
+                raise UniverseError(
+                    "SKILL_QUOTA_STATE_INVALID",
+                    f"{field}.execution_context.quota_state is unsupported",
+                )
+            execution_context = {
+                "provider_ref": _required_text(
+                    context["provider_ref"],
+                    f"{field}.execution_context.provider_ref",
+                ),
+                "worker_role": _required_text(
+                    context["worker_role"],
+                    f"{field}.execution_context.worker_role",
+                ).upper(),
+                "task_kind": _required_text(
+                    context["task_kind"], f"{field}.execution_context.task_kind"
+                ).upper(),
+                "node_ref": _required_text(
+                    context["node_ref"], f"{field}.execution_context.node_ref"
+                ),
+                "failure_kind": failure_kind,
+                "quota_state": quota_state,
+            }
         observation_digest = _sha256(
             observation["observation_digest"], f"{field}.observation_digest"
         )
@@ -1315,6 +1389,7 @@ def normalize_skill_observation_candidate(
                     observation["evidence_refs"], f"{field}.evidence_refs"
                 ),
                 "metrics": _skill_metrics(observation["metrics"], f"{field}.metrics"),
+                "execution_context": execution_context,
             }
         )
     normalized_candidate = {
@@ -3566,8 +3641,14 @@ class UniverseStore:
                     operation_class TEXT NOT NULL,
                     context_pack_digest TEXT NOT NULL,
                     model_ref TEXT NOT NULL,
+                    provider_ref TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    worker_role TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    task_kind TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    node_ref TEXT NOT NULL DEFAULT 'UNKNOWN',
                     outcome TEXT NOT NULL,
                     validation_state TEXT NOT NULL,
+                    failure_kind TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    quota_state TEXT NOT NULL DEFAULT 'UNKNOWN',
                     evidence_refs_json TEXT NOT NULL,
                     metrics_json TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
@@ -4226,6 +4307,25 @@ class UniverseStore:
                     "ADD COLUMN publication_approval_json "
                     "TEXT NOT NULL DEFAULT '{}'"
                 )
+            observation_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(skill_run_observation)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "provider_ref": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                "worker_role": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                "task_kind": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                "node_ref": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                "failure_kind": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                "quota_state": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            }.items():
+                if column not in observation_columns:
+                    connection.execute(
+                        f"ALTER TABLE skill_run_observation "
+                        f"ADD COLUMN {column} {definition}"
+                    )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO universe_identity(
@@ -5069,10 +5169,11 @@ class UniverseStore:
                         observation_id, project_id, candidate_id, candidate_digest,
                         task_frame_ref, source_ref, observation_digest,
                         skill_binding_digest, skill_id, skill_version,
-                        operation_class, context_pack_digest, model_ref, outcome,
-                        validation_state, evidence_refs_json, metrics_json,
+                        operation_class, context_pack_digest, model_ref, provider_ref,
+                        worker_role, task_kind, node_ref, outcome, validation_state,
+                        failure_kind, quota_state, evidence_refs_json, metrics_json,
                         observed_at, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         observation_id,
@@ -5088,8 +5189,14 @@ class UniverseStore:
                         skill["operation_class"],
                         skill["context_pack_digest"],
                         observation["model_ref"],
+                        observation["execution_context"]["provider_ref"],
+                        observation["execution_context"]["worker_role"],
+                        observation["execution_context"]["task_kind"],
+                        observation["execution_context"]["node_ref"],
                         observation["outcome"],
                         observation["validation_state"],
+                        observation["execution_context"]["failure_kind"],
+                        observation["execution_context"]["quota_state"],
                         _canonical_json(observation["evidence_refs"]),
                         _canonical_json(observation["metrics"]),
                         candidate["observed_at"],
@@ -5339,17 +5446,22 @@ class UniverseStore:
                          observed_at, observation_id
                 """
             ).fetchall()
-        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        grouped: dict[tuple[str, str, str, str, str, str, str], dict[str, Any]] = {}
         for row in rows:
             item = self._skill_observation_row(row)
             skill = item["skill"]
-            provider_ref = provider_ref_from_model_ref(item["model_ref"])
+            execution_context = item["execution_context"]
+            provider_ref = execution_context["provider_ref"]
+            if provider_ref == "UNKNOWN":
+                provider_ref = provider_ref_from_model_ref(item["model_ref"])
             key = (
                 skill["skill_id"],
                 skill["skill_version"],
                 skill["operation_class"],
                 item["model_ref"],
                 provider_ref,
+                execution_context["worker_role"],
+                execution_context["task_kind"],
             )
             group = grouped.setdefault(
                 key,
@@ -5358,10 +5470,18 @@ class UniverseStore:
                     "skill": skill,
                     "model_ref": item["model_ref"],
                     "provider_ref": provider_ref,
+                    "worker_role": execution_context["worker_role"],
+                    "task_kind": execution_context["task_kind"],
                     "observation_count": 0,
                     "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
                     "validation_states": {
                         state: 0 for state in sorted(SKILL_VALIDATION_STATES)
+                    },
+                    "failure_kinds": {
+                        state: 0 for state in sorted(SKILL_FAILURE_KINDS)
+                    },
+                    "quota_states": {
+                        state: 0 for state in sorted(SKILL_QUOTA_STATES)
                     },
                     "metric_totals": {},
                     "first_observed_at": item["observed_at"],
@@ -5371,6 +5491,8 @@ class UniverseStore:
             group["observation_count"] += 1
             group["outcomes"][item["outcome"]] += 1
             group["validation_states"][item["validation_state"]] += 1
+            group["failure_kinds"][execution_context["failure_kind"]] += 1
+            group["quota_states"][execution_context["quota_state"]] += 1
             group["first_observed_at"] = min(
                 group["first_observed_at"], item["observed_at"]
             )
@@ -6859,7 +6981,8 @@ class UniverseStore:
                 SELECT observation_id, project_id, candidate_id, candidate_digest, task_frame_ref,
                        source_ref, observation_digest, skill_binding_digest,
                        skill_id, skill_version, operation_class, context_pack_digest,
-                       model_ref, outcome, validation_state, evidence_refs_json,
+                       model_ref, provider_ref, worker_role, task_kind, node_ref,
+                       failure_kind, quota_state, outcome, validation_state, evidence_refs_json,
                        metrics_json, observed_at, recorded_at
                 FROM skill_run_observation
                 WHERE project_id = ?
@@ -7695,13 +7818,21 @@ class UniverseStore:
     def compare_skill_bench(
         self, *, group_by: str = "skill", limit: int = 50
     ) -> dict[str, Any]:
-        """Compare Skill observations by skill, model, provider, or project."""
+        """Compare Skill observations by Skill and bounded execution context."""
 
         normalized = str(group_by or "skill").strip().lower()
-        if normalized not in {"skill", "model", "provider", "project"}:
+        if normalized not in {
+            "skill",
+            "model",
+            "provider",
+            "project",
+            "worker",
+            "task",
+            "node",
+        }:
             raise UniverseError(
                 "BENCH_COMPARE_GROUP_INVALID",
-                "group_by must be skill, model, provider, or project",
+                "group_by must be skill, model, provider, project, worker, task, or node",
             )
         bounded = max(1, min(int(limit), 200))
         with self._connection() as connection:
@@ -7716,7 +7847,10 @@ class UniverseStore:
         for row in rows:
             item = self._skill_observation_row(row)
             skill = item["skill"]
-            provider_ref = provider_ref_from_model_ref(item["model_ref"])
+            execution_context = item["execution_context"]
+            provider_ref = execution_context["provider_ref"]
+            if provider_ref == "UNKNOWN":
+                provider_ref = provider_ref_from_model_ref(item["model_ref"])
             if normalized == "skill":
                 key = f"{skill['skill_id']}@{skill['skill_version']}"
                 label = {
@@ -7730,9 +7864,28 @@ class UniverseStore:
             elif normalized == "provider":
                 key = provider_ref
                 label = {"provider_ref": provider_ref}
-            else:
+            elif normalized == "project":
                 key = str(item.get("project_id") or "UNKNOWN")
                 label = {"project_id": item.get("project_id")}
+            elif normalized == "worker":
+                key = "|".join(
+                    (
+                        provider_ref,
+                        str(item["model_ref"] or "UNKNOWN"),
+                        execution_context["worker_role"],
+                    )
+                )
+                label = {
+                    "provider_ref": provider_ref,
+                    "model_ref": item["model_ref"],
+                    "worker_role": execution_context["worker_role"],
+                }
+            elif normalized == "task":
+                key = execution_context["task_kind"]
+                label = {"task_kind": execution_context["task_kind"]}
+            else:
+                key = execution_context["node_ref"]
+                label = {"node_ref": execution_context["node_ref"]}
             group = groups.setdefault(
                 key,
                 {
@@ -7744,10 +7897,19 @@ class UniverseStore:
                     "validation_states": {
                         state: 0 for state in sorted(SKILL_VALIDATION_STATES)
                     },
+                    "failure_kinds": {
+                        state: 0 for state in sorted(SKILL_FAILURE_KINDS)
+                    },
+                    "quota_states": {
+                        state: 0 for state in sorted(SKILL_QUOTA_STATES)
+                    },
                     "skills": set(),
                     "models": set(),
                     "providers": set(),
                     "projects": set(),
+                    "worker_roles": set(),
+                    "task_kinds": set(),
+                    "node_refs": set(),
                     "metric_totals": {},
                     "duration_samples": [],
                 },
@@ -7755,12 +7917,17 @@ class UniverseStore:
             group["observation_count"] += 1
             group["outcomes"][item["outcome"]] += 1
             group["validation_states"][item["validation_state"]] += 1
+            group["failure_kinds"][execution_context["failure_kind"]] += 1
+            group["quota_states"][execution_context["quota_state"]] += 1
             group["skills"].add(
                 f"{skill['skill_id']}@{skill['skill_version']}"
             )
             group["models"].add(str(item["model_ref"] or "UNKNOWN"))
             group["providers"].add(provider_ref)
             group["projects"].add(str(item.get("project_id") or "UNKNOWN"))
+            group["worker_roles"].add(execution_context["worker_role"])
+            group["task_kinds"].add(execution_context["task_kind"])
+            group["node_refs"].add(execution_context["node_ref"])
             for metric_key, metric_value in item["metrics"].items():
                 if isinstance(metric_value, (int, float)) and not isinstance(
                     metric_value, bool
@@ -7790,6 +7957,8 @@ class UniverseStore:
                     "observation_count": group["observation_count"],
                     "outcomes": group["outcomes"],
                     "validation_states": group["validation_states"],
+                    "failure_kinds": group["failure_kinds"],
+                    "quota_states": group["quota_states"],
                     "success_rate": success_rate,
                     "avg_duration_ms": avg_duration,
                     "metric_totals": group["metric_totals"],
@@ -7797,6 +7966,9 @@ class UniverseStore:
                     "distinct_models": len(group["models"]),
                     "distinct_providers": len(group["providers"]),
                     "distinct_projects": len(group["projects"]),
+                    "distinct_worker_roles": len(group["worker_roles"]),
+                    "distinct_task_kinds": len(group["task_kinds"]),
+                    "distinct_node_refs": len(group["node_refs"]),
                 }
             )
         comparisons.sort(
@@ -8031,6 +8203,14 @@ class UniverseStore:
             "model_ref": row["model_ref"],
             "outcome": row["outcome"],
             "validation_state": row["validation_state"],
+            "execution_context": {
+                "provider_ref": row["provider_ref"],
+                "worker_role": row["worker_role"],
+                "task_kind": row["task_kind"],
+                "node_ref": row["node_ref"],
+                "failure_kind": row["failure_kind"],
+                "quota_state": row["quota_state"],
+            },
             "evidence_refs": json.loads(row["evidence_refs_json"]),
             "metrics": json.loads(row["metrics_json"]),
             "observed_at": row["observed_at"],
@@ -8710,6 +8890,21 @@ class UniverseStore:
             ).fetchall()
         return [self._agent_permission_row(row, row["request_id"]) for row in rows]
 
+    def list_all_agent_permissions(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT request_id, project_id, in_reply_to, provider, session_id,
+                       tool_call_json, options_json, state,
+                       selected_option_id, requested_at, resolved_at
+                FROM agent_permission_request
+                ORDER BY requested_at DESC, request_id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [self._agent_permission_row(row, row["request_id"]) for row in rows]
+
     def resolve_agent_permission(
         self,
         project_id: str,
@@ -8758,6 +8953,16 @@ class UniverseStore:
         row: sqlite3.Row,
         request_id: str,
     ) -> dict[str, Any]:
+        options = json.loads(row["options_json"])
+        selected_option_id = row["selected_option_id"]
+        selected = next(
+            (
+                option
+                for option in options
+                if option.get("optionId") == selected_option_id
+            ),
+            None,
+        )
         return {
             "schema": PERMISSION_REQUEST_SCHEMA,
             "request_id": request_id,
@@ -8766,9 +8971,12 @@ class UniverseStore:
             "provider": row["provider"],
             "session_id": row["session_id"],
             "tool_call": json.loads(row["tool_call_json"]),
-            "options": json.loads(row["options_json"]),
+            "options": options,
             "state": row["state"],
-            "selected_option_id": row["selected_option_id"],
+            "selected_option_id": selected_option_id,
+            "selected_option_kind": (
+                selected.get("kind") if isinstance(selected, Mapping) else None
+            ),
             "requested_at": row["requested_at"],
             "resolved_at": row["resolved_at"],
         }
@@ -11591,6 +11799,128 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
 
+    def runtime_preflight(self) -> dict[str, Any]:
+        profile = self.host_tool_settings()
+        provider_settings = self.provider_settings()
+        capabilities = {
+            item["provider"]: item
+            for item in provider_settings.get("available_providers", [])
+            if isinstance(item, Mapping) and isinstance(item.get("provider"), str)
+        }
+        suggestions: list[dict[str, str]] = []
+        tools = profile.get("tools", {})
+        for tool_name in ("python", "git"):
+            setting = tools.get(tool_name, {}) if isinstance(tools, Mapping) else {}
+            if setting.get("status") != "AVAILABLE":
+                suggestions.append(
+                    {
+                        "severity": "BLOCKING",
+                        "target": tool_name.upper(),
+                        "action": "SELECT_AND_VERIFY_EXECUTABLE",
+                        "reason": str(setting.get("reason") or "HOST_TOOL_UNAVAILABLE"),
+                    }
+                )
+        providers: list[dict[str, Any]] = []
+        for provider in ("GROK", "CODEX", "CLAUDE"):
+            tool_setting = (
+                tools.get(provider.lower(), {}) if isinstance(tools, Mapping) else {}
+            )
+            capability = capabilities.get(provider, {})
+            provider_status = {
+                "provider": provider,
+                "tool_status": tool_setting.get("status", "UNAVAILABLE"),
+                "executable": tool_setting.get("executable", "UNKNOWN"),
+                "model": capability.get(
+                    "model", tool_setting.get("model", "default")
+                ),
+                "runtime_status": capability.get("status", "UNAVAILABLE"),
+                "cli_auto_approve": capability.get("cli_auto_approve", "UNKNOWN"),
+                "reason": capability.get("reason") or tool_setting.get("reason"),
+            }
+            providers.append(provider_status)
+            if provider_status["tool_status"] != "AVAILABLE":
+                suggestions.append(
+                    {
+                        "severity": "ACTION",
+                        "target": provider,
+                        "action": "SELECT_AND_VERIFY_EXECUTABLE",
+                        "reason": str(provider_status["reason"] or "CLI_UNAVAILABLE"),
+                    }
+                )
+            elif provider_status["runtime_status"] != "AVAILABLE":
+                suggestions.append(
+                    {
+                        "severity": "ACTION",
+                        "target": provider,
+                        "action": "VERIFY_PROVIDER_RUNTIME",
+                        "reason": str(provider_status["reason"] or "RUNTIME_UNAVAILABLE"),
+                    }
+                )
+            elif provider_status["cli_auto_approve"] == "UNKNOWN":
+                suggestions.append(
+                    {
+                        "severity": "INFO",
+                        "target": provider,
+                        "action": "REVIEW_PERMISSION_MODE",
+                        "reason": "CLI_PERMISSION_MODE_UNKNOWN",
+                    }
+                )
+        required_ready = all(
+            isinstance(tools.get(tool), Mapping)
+            and tools[tool].get("status") == "AVAILABLE"
+            for tool in ("python", "git")
+        )
+        provider_ready = any(
+            item["runtime_status"] == "AVAILABLE" for item in providers
+        )
+        return {
+            "schema": "universe.runtime-preflight.v1",
+            "status": (
+                "READY" if required_ready and provider_ready else "CONFIGURATION_REQUIRED"
+            ),
+            "observed_at": utc_now(),
+            "host_profile_path": profile.get("profile_path", "UNKNOWN"),
+            "required_tools_ready": required_ready,
+            "provider_ready": provider_ready,
+            "providers": providers,
+            "suggestions": suggestions,
+        }
+
+    def runtime_audit(self) -> dict[str, Any]:
+        continuity: list[dict[str, Any]] = []
+        if self.continuity_coordinator is not None:
+            for project in self.store.list_projects():
+                state = self.continuity_coordinator.status(Path(project["project_root"]))
+                continuity.append(
+                    {
+                        "project_id": project["project_id"],
+                        "project_root": project["project_root"],
+                        "state": state,
+                    }
+                )
+        conductor_permissions = self.conductor_permissions.list_requests(limit=100)
+        project_permissions = self.store.list_all_agent_permissions(limit=200)
+        worker_bench = self.store.compare_skill_bench(group_by="worker", limit=50)
+        return {
+            "schema": "universe.runtime-audit.v1",
+            "status": "RUNTIME_AUDIT_COLLECTED",
+            "observed_at": utc_now(),
+            "preflight": self.runtime_preflight(),
+            "sessions": self.session_supervisor.list_sessions()[:200],
+            "recent_events": self.session_supervisor.list_events(limit=100),
+            "platform_approvals": {
+                "pending_count": sum(
+                    1
+                    for item in [*conductor_permissions, *project_permissions]
+                    if item.get("state") == "PENDING"
+                ),
+                "conductor": conductor_permissions,
+                "projects": project_permissions,
+            },
+            "continuity": continuity,
+            "worker_bench": worker_bench,
+        }
+
     def discover_host_tools(self) -> dict[str, Any]:
         try:
             return self.host_profile.discover()
@@ -12396,6 +12726,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "providers": self.server.runtime_host.provider_capabilities(),
                 },
             )
+            return
+        if path == "/v1/runtime/preflight":
+            try:
+                self._send(HTTPStatus.OK, self.server.runtime_preflight())
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        if path == "/v1/runtime/audit":
+            try:
+                self._send(HTTPStatus.OK, self.server.runtime_audit())
+            except UniverseError as error:
+                self._send_error(error)
             return
         if path == "/v1/settings/providers":
             self._send(

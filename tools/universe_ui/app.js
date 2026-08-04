@@ -38,6 +38,8 @@ const state = {
   providerSettings: null,
   workerBindings: null,
   hostTools: null,
+  runtimePreflight: null,
+  runtimeAudit: null,
   remoteAccess: null,
   accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
@@ -144,6 +146,7 @@ const elements = {
   sessionObservatoryList: document.querySelector("#session-observatory-list"),
   legacyExecutorList: document.querySelector("#legacy-executor-list"),
   sessionEventList: document.querySelector("#session-event-list"),
+  runtimeAuditGrid: document.querySelector("#runtime-audit-grid"),
   refreshSessionsButton: document.querySelector("#refresh-sessions-button"),
   primaryNav: document.querySelector("#primary-nav"),
   metricProjects: document.querySelector("#metric-projects"),
@@ -177,6 +180,8 @@ const elements = {
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
+  runtimePreflightSummary: document.querySelector("#runtime-preflight-summary"),
+  runtimePreflightList: document.querySelector("#runtime-preflight-list"),
   remoteAccessStatus: document.querySelector("#remote-access-status"),
   remoteAccessEndpoint: document.querySelector("#remote-access-endpoint"),
   remoteAccessTransport: document.querySelector("#remote-access-transport"),
@@ -273,6 +278,13 @@ function node(tag, className, text) {
   return item;
 }
 
+function compactModelRef(value) {
+  const modelRef = typeof value === "string" ? value.trim() : "";
+  if (!modelRef) return "UNKNOWN";
+  const segments = modelRef.split("/").filter(Boolean);
+  return segments.at(-1) || modelRef;
+}
+
 function sessionDisplayName(session) {
   if (session.alias) return session.alias;
   const parts = [session.node, session.mode].filter(Boolean);
@@ -305,14 +317,16 @@ async function api(path, options = {}) {
 }
 
 async function refreshSupervisorSessions() {
-  const [sessions, events, legacy] = await Promise.all([
-    api("/v1/supervisor/sessions"),
-    api("/v1/supervisor/events?limit=40"),
+  const [audit, legacy] = await Promise.all([
+    api("/v1/runtime/audit"),
     api("/v1/supervisor/legacy-executors"),
   ]);
-  state.supervisorSessions = sessions.sessions || [];
-  state.supervisorEvents = events.events || [];
+  state.runtimeAudit = audit;
+  state.runtimePreflight = audit.preflight || null;
+  state.supervisorSessions = audit.sessions || [];
+  state.supervisorEvents = audit.recent_events || [];
   state.legacyExecutors = legacy.executors || [];
+  renderRuntimePreflight();
   renderSessionObservatory();
 }
 
@@ -322,7 +336,7 @@ function renderSessionObservatory() {
   const live = sessions.filter((item) => item.state === "LIVE").length;
   const unknown = sessions.filter((item) => item.state === "UNKNOWN").length;
   elements.sessionObservatorySummary.textContent =
-    `${sessions.length} sessions · ${live} live · ${unknown} unknown`;
+    `${sessions.length} sessions / ${live} live / ${unknown} unknown / ${state.runtimeAudit?.platform_approvals?.pending_count || 0} approvals`;
   elements.sessionObservatoryList.replaceChildren();
   if (!sessions.length) {
     elements.sessionObservatoryList.append(
@@ -447,6 +461,7 @@ function renderSessionObservatory() {
       node("p", "empty-copy", "No Supervisor event has been recorded.")
     );
   }
+  renderRuntimeAudit();
 
   const conductor = sessions.find(
     (session) => session.is_default && session.mode === "CONDUCTOR"
@@ -990,7 +1005,7 @@ async function selectProject(
       `/v1/projects/${encodeURIComponent(projectId)}/skill-observations`
     ).catch(() => ({ observations: [] })),
     api("/v1/bench/skills").catch(() => ({ bench: [] })),
-    api("/v1/bench/compare?group_by=skill&limit=20").catch(() => ({
+    api("/v1/bench/compare?group_by=worker&limit=20").catch(() => ({
       comparisons: [],
     })),
     api(
@@ -1674,6 +1689,127 @@ function renderHostToolSettings() {
   }
 }
 
+function renderRuntimePreflight() {
+  if (!elements.runtimePreflightList || !elements.runtimePreflightSummary) return;
+  const preflight = state.runtimePreflight;
+  elements.runtimePreflightList.replaceChildren();
+  if (!preflight) {
+    elements.runtimePreflightSummary.textContent = "Runtime preflight unavailable";
+    return;
+  }
+  elements.runtimePreflightSummary.textContent =
+    `${preflight.status} / ${preflight.suggestions?.length || 0} suggestions`;
+  for (const provider of preflight.providers || []) {
+    const row = node("div", "runtime-preflight-row");
+    row.dataset.state = provider.runtime_status || "UNAVAILABLE";
+    row.append(
+      node("strong", "", provider.provider),
+      node("span", "", provider.model || "default"),
+      node(
+        "small",
+        "",
+        `${provider.runtime_status || "UNKNOWN"} / approval ${provider.cli_auto_approve || "UNKNOWN"}`
+      )
+    );
+    elements.runtimePreflightList.append(row);
+  }
+  for (const suggestion of preflight.suggestions || []) {
+    elements.runtimePreflightList.append(
+      node(
+        "p",
+        "runtime-preflight-suggestion",
+        `${suggestion.target}: ${suggestion.action} (${suggestion.reason})`
+      )
+    );
+  }
+}
+
+function renderRuntimeAudit() {
+  if (!elements.runtimeAuditGrid) return;
+  elements.runtimeAuditGrid.replaceChildren();
+  const audit = state.runtimeAudit;
+  if (!audit) {
+    elements.runtimeAuditGrid.append(
+      node("p", "empty-copy", "Runtime audit is not available.")
+    );
+    return;
+  }
+  const approvals = audit.platform_approvals || {};
+  const approvalRows = [
+    ...(approvals.conductor || []),
+    ...(approvals.projects || []),
+  ].slice(0, 4);
+  const approvalPanel = node("article", "runtime-audit-panel");
+  approvalPanel.append(
+    node("strong", "", `Platform approvals (${approvals.pending_count || 0} pending)`)
+  );
+  for (const approval of approvalRows) {
+    approvalPanel.append(
+      node(
+        "small",
+        "",
+        `${approval.provider || "UNKNOWN"} / ${approval.state || "UNKNOWN"} / ${approval.selected_option_kind || "waiting"}`
+      )
+    );
+  }
+  if (!approvalRows.length) {
+    approvalPanel.append(node("small", "", "No approval events"));
+  }
+
+  const continuityPanel = node("article", "runtime-audit-panel");
+  continuityPanel.append(node("strong", "", "Automatic continuity"));
+  for (const item of (audit.continuity || []).slice(0, 5)) {
+    continuityPanel.append(
+      node(
+        "small",
+        "",
+        `${item.project_id}: ${item.state?.last_status || "NOT_SAVED"} / ${item.state?.last_trigger || "NONE"}`
+      )
+    );
+  }
+  if (!(audit.continuity || []).length) {
+    continuityPanel.append(node("small", "", "No connected project continuity state"));
+  }
+
+  const workerPanel = node("article", "runtime-audit-panel");
+  workerPanel.append(node("strong", "", "Worker performance"));
+  for (const row of (audit.worker_bench?.comparisons || []).slice(0, 5)) {
+    const rate =
+      row.success_rate == null ? "n/a" : `${Math.round(row.success_rate * 100)}%`;
+    workerPanel.append(
+      node(
+        "small",
+        "",
+        `${row.label?.provider_ref || "UNKNOWN"} / ${compactModelRef(row.label?.model_ref)} / ${row.label?.worker_role || "UNKNOWN"}: ${rate} (${row.observation_count || 0})`
+      )
+    );
+  }
+  if (!(audit.worker_bench?.comparisons || []).length) {
+    workerPanel.append(node("small", "", "No Worker observations"));
+  }
+
+  const preflightPanel = node("article", "runtime-audit-panel");
+  preflightPanel.append(
+    node("strong", "", `Preflight ${audit.preflight?.status || "UNKNOWN"}`),
+    node(
+      "small",
+      "",
+      `${audit.preflight?.providers?.filter((item) => item.runtime_status === "AVAILABLE").length || 0} providers available`
+    ),
+    node(
+      "small",
+      "",
+      `${audit.preflight?.suggestions?.length || 0} configuration suggestions`
+    )
+  );
+  elements.runtimeAuditGrid.append(
+    preflightPanel,
+    approvalPanel,
+    continuityPanel,
+    workerPanel
+  );
+}
+
 async function discoverHostTools() {
   elements.settingsError.textContent = "";
   elements.discoverHostTools.disabled = true;
@@ -1908,12 +2044,14 @@ async function openProviderSettings() {
     state.hostTools,
     state.serviceSettings,
     state.remoteAccess,
+    state.runtimePreflight,
   ] = await Promise.all([
     api("/v1/settings/providers"),
     api("/v1/settings/worker-bindings"),
     api("/v1/settings/host-tools"),
     api("/v1/settings/service").catch(() => null),
     api("/v1/settings/remote-access"),
+    api("/v1/runtime/preflight").catch(() => null),
   ]);
   if (elements.memoryMaintainInterval && state.serviceSettings?.memory_maintain) {
     elements.memoryMaintainInterval.value = String(
@@ -1930,6 +2068,7 @@ async function openProviderSettings() {
   renderProviderSettings();
   renderWorkerBindingSettings();
   renderHostToolSettings();
+  renderRuntimePreflight();
   renderLocalServiceStatus();
   renderRemoteAccessSettings();
   elements.settingsDialog.showModal();
@@ -4566,7 +4705,7 @@ function renderBench() {
         node(
           "li",
           "",
-          `${observation.outcome || "UNKNOWN"} · ${observation.skill?.skill_id || "skill"} · ${observation.validation_state || "NOT_RUN"} · ${observation.observed_at || ""}`
+          `${observation.outcome || "UNKNOWN"} / ${observation.skill?.skill_id || "skill"} / ${observation.execution_context?.worker_role || "UNKNOWN"} / ${observation.execution_context?.node_ref || "UNKNOWN"} / ${observation.execution_context?.failure_kind || "UNKNOWN"} / ${observation.observed_at || ""}`
         )
       );
     }
@@ -4606,12 +4745,12 @@ function renderBench() {
       const failed = row.outcomes?.FAILED ?? 0;
       const duration = row.metric_totals?.duration_ms;
       const durationText =
-        typeof duration === "number" ? ` · ${Math.round(duration)}ms` : "";
+        typeof duration === "number" ? ` / ${Math.round(duration)}ms` : "";
       list.append(
         node(
           "li",
           "",
-          `${row.skill?.skill_id || "skill"} · ${row.provider_ref || "UNKNOWN"} · n=${row.observation_count || 0} · ok=${succeeded} fail=${failed}${durationText}`
+          `${row.skill?.skill_id || "skill"} / ${row.provider_ref || "UNKNOWN"} / ${row.worker_role || "UNKNOWN"} / ${row.task_kind || "UNKNOWN"} / n=${row.observation_count || 0} / ok=${succeeded} fail=${failed} quota=${row.quota_states?.EXHAUSTED || 0}${durationText}`
         )
       );
     }
@@ -4640,14 +4779,14 @@ function renderBench() {
   const compareGroup = node("div", "detail-group");
   const comparisons = state.benchComparisons || [];
   compareGroup.append(
-    node("h3", "", `Skill/model compare (${comparisons.length})`)
+    node("h3", "", `Worker and Skill compare (${comparisons.length})`)
   );
   if (!comparisons.length) {
     compareGroup.append(
       node(
         "p",
         "empty-copy",
-        "No comparison rows yet. Comparisons aggregate redacted Skill observations by skill, model, or provider."
+        "No comparison rows yet. Comparisons aggregate redacted Skill observations by Worker, task, node, skill, model, provider, or project."
       )
     );
   } else {
@@ -4659,25 +4798,30 @@ function renderBench() {
           : `${Math.round(row.success_rate * 100)}%`;
       const dur =
         typeof row.avg_duration_ms === "number"
-          ? ` · avg ${Math.round(row.avg_duration_ms)}ms`
+          ? ` / avg ${Math.round(row.avg_duration_ms)}ms`
           : "";
       const label =
-        row.label?.skill_id ||
-        row.label?.model_ref ||
-        row.label?.provider_ref ||
-        row.label?.project_id ||
-        row.group_key ||
-        "group";
+        row.group_by === "worker"
+          ? `${row.label?.provider_ref || "UNKNOWN"}/${compactModelRef(row.label?.model_ref)}/${row.label?.worker_role || "UNKNOWN"}`
+          : row.label?.skill_id ||
+            row.label?.model_ref ||
+            row.label?.provider_ref ||
+            row.label?.worker_role ||
+            row.label?.task_kind ||
+            row.label?.node_ref ||
+            row.label?.project_id ||
+            row.group_key ||
+            "group";
       list.append(
         node(
           "li",
           "",
-          `${label} · n=${row.observation_count || 0} · success=${rate}${dur}`
+          `${label} / n=${row.observation_count || 0} / success=${rate} / quota=${row.quota_exhausted_count || 0}${dur}`
         )
       );
     }
     compareGroup.append(list);
-    const groups = ["skill", "model", "provider", "project"];
+    const groups = ["worker", "task", "node", "skill", "model", "provider", "project"];
     for (const group of groups) {
       const btn = node(
         "button",

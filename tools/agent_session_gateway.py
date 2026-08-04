@@ -498,6 +498,25 @@ class UniverseAcpGateway:
     def set_permission_requester(self, requester: PermissionRequester) -> None:
         self.session.set_permission_requester(requester)
 
+    def runtime_observation(self) -> dict[str, Any]:
+        observer = getattr(self.session, "runtime_observation", None)
+        if callable(observer):
+            observed = observer()
+            if isinstance(observed, Mapping):
+                return dict(observed)
+        status_reader = getattr(self.session, "session_status", None)
+        state = str(status_reader()).strip() if callable(status_reader) else "UNKNOWN"
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": str(getattr(self.session, "provider", "UNKNOWN")),
+            "session_ref": self.session_ref,
+            "state": state or "UNKNOWN",
+            "quota_state": (
+                "EXHAUSTED" if state == SESSION_QUOTA_EXHAUSTED else "UNKNOWN"
+            ),
+            "usage": {},
+        }
+
     def close(self) -> None:
         self.session.close()
 

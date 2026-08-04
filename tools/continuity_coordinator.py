@@ -16,7 +16,15 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 AUTO_CONTINUITY_SCHEMA = "universe.auto-continuity.v1"
 CONTINUITY_TARGET = "sqlite://.ai/runtime/continuity/continuity.sqlite"
 AUTO_SAVE_TRIGGERS = frozenset(
-    {"TASK_COMPLETED", "NORMAL_STOP", "PROVIDER_SWITCH", "MODE_SWITCH", "IDLE"}
+    {
+        "TASK_COMPLETED",
+        "NORMAL_STOP",
+        "PROVIDER_SWITCH",
+        "SESSION_SELECTION_CHANGED",
+        "MODE_SWITCH",
+        "PROVIDER_QUOTA",
+        "IDLE",
+    }
 )
 
 

@@ -4,6 +4,20 @@ Status: OPEN
 Scope: provider session lifetime validation and residual bootstrap hardening
 Reference commits: `7533c1e` through `503e873`
 
+## Completed - quota continuity and local preflight
+
+- [x] Preserve the resident Provider session and active Task Frame when a
+  Provider reports quota exhaustion.
+- [x] Save an automatic `PROVIDER_QUOTA` continuity record with bounded usage
+  metadata and without a dirty-end claim.
+- [x] Expose read-only local executable/authentication preflight suggestions in
+  Runtime Settings before starting a Provider session.
+- [x] Expose Provider usage/quota, pending approvals, continuity, and Worker
+  Bench state in the Runtime Audit UI.
+
+These surfaces report evidence and suggested configuration only. They do not
+grant a platform permission, Runtime Assignment, or Provider entitlement.
+
 ## P1 - Grok bounded-session CLI probe
 
 - [ ] Run a real Grok CLI bounded Worker session after provider quota resets.
@@ -20,6 +34,14 @@ Acceptance evidence must come from the actual Grok CLI process. Structural and c
 - [ ] Verify an exchanged or stale bootstrap cannot authorize a later request and is absent from durable logs and receipts.
 
 The current one-time exchange already invalidates the bootstrap token. This item reduces residual file exposure and operational clutter.
+
+## P2 - long-running Provider recovery probes
+
+- [ ] Exhaust or simulate each Provider's bounded quota in a controlled account.
+- [ ] Restart Universe and prove the same Node/Mode session coordinate and Task
+  Frame are selected after reset.
+- [ ] Verify retry, explicit Provider rebinding, and user cancellation remain
+  distinct audit outcomes.
 
 ## Deferred boundary
 

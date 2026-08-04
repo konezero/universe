@@ -132,3 +132,28 @@ P2 확장                                                    : NOT_STARTED
 | 2026-07-31 | portable package: `tools/build_portable.py` + data/ env overrides |
 | 2026-07-31 | Memory RAG API/UI + Future tab + Bench/Context Pack polish |
 | 2026-07-31 | portable --with-python embed + Install-Portable-User.ps1 |
+| 2026-08-05 | Worker Bench vertical slice: redacted execution context, Project queue ingestion, Worker/Task/Node comparisons, quota continuity, Runtime preflight/audit UI |
+
+### 7) 2026-08-05 Dogfood follow-up
+
+Completed in the current vertical slice:
+
+- Redacted Skill observations now keep Provider, Model, Skill, Worker Role,
+  Task Kind, Node, duration/token metrics, outcome, validation, failure, quota,
+  source/evidence references, and Context Pack digest without prompt/source/
+  command payloads.
+- Universe stores and compares cumulative Project-local observations by Worker,
+  Task, Node, Skill, Model, Provider, and Project.
+- Provider quota exhaustion preserves the resident session and Task Frame,
+  writes a `PROVIDER_QUOTA` continuity record, and appears in Runtime Audit.
+- Runtime Settings shows non-mutating local executable/authentication preflight
+  findings and configuration suggestions before Provider startup.
+
+Still open:
+
+- Real Grok bounded-session probe after quota reset and long-running recovery
+  probes for every Provider.
+- Multi-Project publication dogfood with enough samples to evaluate local
+  binding quality against external benchmark priors.
+- Desktop/mobile visual QA and accessibility pass for the Runtime Audit and
+  Worker Bench surfaces.

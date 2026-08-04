@@ -325,6 +325,50 @@ class ClaudeResidentSession:
     def stream_events(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._events)
 
+    def runtime_observation(self) -> dict[str, Any]:
+        quota_state = "UNKNOWN"
+        if self.session_status() == SESSION_QUOTA_EXHAUSTED:
+            quota_state = "EXHAUSTED"
+        elif self.last_rate_limit_status == "allowed_warning":
+            quota_state = "WARNING"
+        elif self.last_rate_limit_status == "allowed":
+            quota_state = "AVAILABLE"
+        result = next(
+            (event for event in reversed(self._events) if event.get("type") == "result"),
+            {},
+        )
+        usage: dict[str, int | float] = {}
+        raw_usage = result.get("usage") if isinstance(result, Mapping) else None
+        if isinstance(raw_usage, Mapping):
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                value = raw_usage.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[key] = value
+        if isinstance(result, Mapping):
+            for source_key, target_key in (
+                ("duration_ms", "duration_ms"),
+                ("duration_api_ms", "duration_api_ms"),
+                ("total_cost_usd", "cost_usd"),
+                ("num_turns", "turn_count"),
+            ):
+                value = result.get(source_key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[target_key] = value
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": self.provider,
+            "session_ref": self.session_ref,
+            "state": self.session_status(),
+            "quota_state": quota_state,
+            "rate_limit_status": self.last_rate_limit_status or "UNKNOWN",
+            "usage": usage,
+        }
+
     def start_or_resume(self) -> str:
         """Start the resident process, or reuse the live one."""
 

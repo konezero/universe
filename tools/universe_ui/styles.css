@@ -2977,6 +2977,82 @@ body {
   gap: 10px;
 }
 
+.runtime-audit-section {
+  margin-bottom: 18px;
+}
+
+.runtime-audit-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-audit-panel {
+  display: flex;
+  min-width: 0;
+  min-height: 96px;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(5, 14, 28, 0.62);
+}
+
+.runtime-audit-panel strong {
+  color: var(--text-1);
+  font-size: 11px;
+}
+
+.runtime-audit-panel small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-3);
+  font-size: 9px;
+}
+
+.runtime-preflight-list {
+  display: grid;
+  gap: 7px;
+}
+
+.runtime-preflight-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(100px, 0.8fr) minmax(0, 2fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--text-3);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+  color: var(--text-3);
+  font-size: 10px;
+}
+
+.runtime-preflight-row[data-state="AVAILABLE"] {
+  border-left-color: var(--teal);
+}
+
+.runtime-preflight-row[data-state="UNAVAILABLE"],
+.runtime-preflight-row[data-state="INVALID"] {
+  border-left-color: #e46f78;
+}
+
+.runtime-preflight-row code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-preflight-suggestion {
+  padding: 7px 10px;
+  border-left: 2px solid #f0b45d;
+  color: var(--text-2);
+  font-size: 10px;
+}
+
 .supervisor-session-card {
   min-width: 0;
   padding: 13px;
@@ -3087,6 +3163,8 @@ body {
 .session-event-row time { margin-left: auto; white-space: nowrap; }
 
 @media (max-width: 720px) {
+  .runtime-audit-grid { grid-template-columns: 1fr; }
+  .runtime-preflight-row { grid-template-columns: 1fr; }
   .session-observatory-list { grid-template-columns: 1fr; }
   .session-observatory-dialog {
     width: calc(100vw - 16px);

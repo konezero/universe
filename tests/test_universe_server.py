@@ -46,6 +46,7 @@ from universe_server import (  # noqa: E402
     local_connection_profile,
     normalize_conductor_ui_action,
     normalize_planning_runtime_binding,
+    normalize_skill_observation_candidate,
     provider_ref_from_model_ref,
     publish_skill_observation,
     prepare_skill_observation_archive,
@@ -504,14 +505,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def skill_observation_publication_approval(
         self, prepared: JsonObject, **overrides: object
     ) -> JsonObject:
-        candidate_digest = hashlib.sha256(
-            json.dumps(
-                prepared["candidate"],
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
+        candidate_digest = normalize_skill_observation_candidate(
+            "GCS",
+            {
+                "candidate_id": prepared["candidate_id"],
+                "candidate": prepared["candidate"],
+            },
+        )["candidate_digest"]
         value: JsonObject = {
             "schema": "universe.skill-observation-publication-approval.v1",
             "status": "APPROVED",
@@ -740,6 +740,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="worker-binding-scope"', body)
             self.assertIn('id="worker-binding-settings"', body)
             self.assertIn('id="host-tool-settings"', body)
+            self.assertIn('id="runtime-preflight-summary"', body)
+            self.assertIn('id="runtime-preflight-list"', body)
             self.assertIn('id="remote-access-status"', body)
             self.assertIn('id="create-pairing-button"', body)
             self.assertIn('id="remote-device-list"', body)
@@ -747,6 +749,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="session-observatory-dialog"', body)
             self.assertIn('id="session-observatory-topbar-button"', body)
             self.assertIn('id="session-observatory-list"', body)
+            self.assertIn('id="runtime-audit-grid"', body)
             self.assertIn('id="legacy-executor-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
@@ -769,6 +772,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("/v1/settings/worker-bindings", script)
             self.assertIn("renderWorkerBindingSettings", script)
             self.assertIn("/v1/settings/host-tools", script)
+            self.assertIn("/v1/runtime/preflight", script)
+            self.assertIn("/v1/runtime/audit", script)
+            self.assertIn("group_by=worker", script)
+            self.assertIn("renderRuntimePreflight", script)
+            self.assertIn("renderRuntimeAudit", script)
             self.assertIn("/v1/settings/remote-access", script)
             self.assertIn("renderRemoteAccessSettings", script)
             self.assertIn("SSH_REVERSE_TUNNEL", script)
@@ -2841,6 +2849,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
     ) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         candidate = self.skill_observation_candidate()
+        candidate["candidate"]["observations"][0]["execution_context"] = {
+            "provider_ref": "OPENAI",
+            "worker_role": "SUB_REVIEWER",
+            "task_kind": "READ",
+            "node_ref": "broker-client",
+            "failure_kind": "NONE",
+            "quota_state": "AVAILABLE",
+        }
         status, result = self.request(
             "POST",
             "/v1/projects/GCS/skill-observations",
@@ -2868,6 +2884,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(observations["observations"]))
         self.assertNotIn("skill_ref", observations["observations"][0]["skill"])
+        self.assertEqual(
+            "SUB_REVIEWER",
+            observations["observations"][0]["execution_context"]["worker_role"],
+        )
+        self.assertEqual(
+            "broker-client",
+            observations["observations"][0]["execution_context"]["node_ref"],
+        )
 
         status, bench = self.request("GET", "/v1/bench/skills", token=self.token)
         self.assertEqual(200, status)
@@ -2879,6 +2903,32 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, entry["observation_count"])
         self.assertEqual(1, entry["outcomes"]["SUCCEEDED"])
         self.assertEqual(12, entry["metric_totals"]["duration_ms"])
+        self.assertEqual("SUB_REVIEWER", entry["worker_role"])
+        self.assertEqual(1, entry["quota_states"]["AVAILABLE"])
+
+        status, worker_bench = self.request(
+            "GET", "/v1/bench/compare?group_by=worker", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("worker", worker_bench["group_by"])
+        worker_entry = worker_bench["comparisons"][0]
+        self.assertEqual("SUB_REVIEWER", worker_entry["label"]["worker_role"])
+        self.assertEqual(1.0, worker_entry["success_rate"])
+        self.assertEqual(1, worker_entry["failure_kinds"]["NONE"])
+
+        status, audit = self.request("GET", "/v1/runtime/audit", token=self.token)
+        self.assertEqual(200, status)
+        self.assertEqual("RUNTIME_AUDIT_COLLECTED", audit["status"])
+        self.assertEqual("worker", audit["worker_bench"]["group_by"])
+        self.assertEqual(1, len(audit["worker_bench"]["comparisons"]))
+        self.assertEqual(0, audit["platform_approvals"]["pending_count"])
+
+        status, preflight = self.request(
+            "GET", "/v1/runtime/preflight", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertIn(preflight["status"], {"READY", "CONFIGURATION_REQUIRED"})
+        self.assertEqual(3, len(preflight["providers"]))
 
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(1, len(reopened.list_skill_observations("GCS")))

@@ -1515,6 +1515,18 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError(str(error)) from error
         return self.session_ref
 
+    def runtime_observation(self) -> dict[str, Any]:
+        if self._gateway is not None:
+            return self._gateway.runtime_observation()
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "GROK",
+            "session_ref": self.session_ref,
+            "state": "STOPPED",
+            "quota_state": "UNKNOWN",
+            "usage": {},
+        }
+
     def close(self) -> None:
         if self._gateway is not None:
             self._gateway.close()
@@ -1633,6 +1645,18 @@ class CodexProjectMasterRuntime:
 
     def reply(self, message: Mapping[str, Any]) -> str:
         return self.reply_stream(message, lambda _delta: None)
+
+    def runtime_observation(self) -> dict[str, Any]:
+        if self._gateway is not None:
+            return self._gateway.runtime_observation()
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "CODEX",
+            "session_ref": self.session_ref,
+            "state": "STOPPED",
+            "quota_state": "UNKNOWN",
+            "usage": {},
+        }
 
     def reply_stream(
         self,
@@ -1922,9 +1946,15 @@ class ResidentModeSessionHost:
             try:
                 text = active.reply(message)
             except Exception as error:
-                self._mark_dirty_end(
-                    f"{normalized_provider}_REPLY_FAILED:{type(error).__name__}"
-                )
+                if self._is_quota_exhaustion(error):
+                    if not self._save_quota_continuity(active, normalized_provider):
+                        self._mark_dirty_end(
+                            f"{normalized_provider}_QUOTA_CONTINUITY_UNAVAILABLE"
+                        )
+                else:
+                    self._mark_dirty_end(
+                        f"{normalized_provider}_REPLY_FAILED:{type(error).__name__}"
+                    )
                 raise
             self._last_interaction = {
                 "target_id": self.target_id,
@@ -1936,7 +1966,7 @@ class ResidentModeSessionHost:
             connection_state = str(
                 getattr(active, "connection_state", "UNKNOWN")
             )
-            return {
+            result: dict[str, Any] = {
                 "provider": normalized_provider,
                 "session_ref": active.session_ref,
                 "connection_state": connection_state,
@@ -1944,6 +1974,8 @@ class ResidentModeSessionHost:
                 "session_persistence": "LAST_COORDINATE",
                 "text": text,
             }
+            result["runtime_observation"] = self._runtime_observation(active)
+            return result
 
     def close(self) -> None:
         with self._lock:
@@ -2061,6 +2093,68 @@ class ResidentModeSessionHost:
         except Exception:
             return
 
+    def _save_quota_continuity(
+        self,
+        provider: MasterProvider,
+        provider_name: str,
+    ) -> bool:
+        if self.continuity_coordinator is None:
+            return False
+        observation = self._runtime_observation(provider)
+        context = {
+            "target_id": self.target_id,
+            "mode": self.requested_mode,
+            "provider": provider_name,
+            "provider_session_ref": str(getattr(provider, "session_ref", "UNKNOWN")),
+            "transition": "PROVIDER_QUOTA",
+            "quota_state": observation.get("quota_state", "UNKNOWN"),
+            "usage": observation.get("usage", {}),
+        }
+        try:
+            saved = self.continuity_coordinator.save(
+                project_root=self.repository_root,
+                trigger="PROVIDER_QUOTA",
+                compressed_context=json.dumps(
+                    context,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                summary=(
+                    f"{self.target_id} {self.requested_mode} provider quota checkpoint"
+                ),
+                runtime_coordinate=self._runtime_coordinate(),
+            )
+        except Exception:
+            return False
+        return str(saved.get("status", "")) in {
+            "AUTO_CONTINUITY_SAVED",
+            "AUTO_CONTINUITY_ALREADY_SAVED",
+        }
+
+    @staticmethod
+    def _is_quota_exhaustion(error: Exception) -> bool:
+        value = str(error).upper()
+        return "QUOTA" in value and any(
+            marker in value for marker in ("EXHAUSTED", "RATE_LIMIT", "LIMIT_REACHED")
+        )
+
+    @staticmethod
+    def _runtime_observation(provider: MasterProvider) -> dict[str, Any]:
+        observer = getattr(provider, "runtime_observation", None)
+        if callable(observer):
+            observed = observer()
+            if isinstance(observed, Mapping):
+                return dict(observed)
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "UNKNOWN",
+            "session_ref": str(getattr(provider, "session_ref", "UNKNOWN")),
+            "state": str(getattr(provider, "connection_state", "UNKNOWN")),
+            "quota_state": "UNKNOWN",
+            "usage": {},
+        }
+
     def _runtime_coordinate(self) -> Mapping[str, Any] | None:
         if self.coordinate_resolver is None:
             return None
@@ -2125,7 +2219,7 @@ class ResidentModeSessionHost:
             if active is not None
             else None
         )
-        return provider_session_connection(
+        status = provider_session_connection(
             target_kind="UNIVERSE_CONDUCTOR",
             target_id=self.target_id,
             requested_mode=self.requested_mode,
@@ -2133,6 +2227,10 @@ class ResidentModeSessionHost:
             resident=active is not None,
             connection_state=state if state and state != "UNKNOWN" else None,
         )
+        status["runtime_observation"] = (
+            self._runtime_observation(active) if active is not None else None
+        )
+        return status
 
 
 class ProjectMasterConversationWorker:

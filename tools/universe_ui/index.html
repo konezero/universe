@@ -371,6 +371,15 @@
         </div>
         <div id="host-tool-settings" class="host-tool-settings"></div>
       </section>
+      <section class="settings-section runtime-preflight-section">
+        <div class="settings-section-heading">
+          <div>
+            <strong>Runtime preflight</strong>
+            <small id="runtime-preflight-summary">Checking local execution settings...</small>
+          </div>
+        </div>
+        <div id="runtime-preflight-list" class="runtime-preflight-list"></div>
+      </section>
       <section class="settings-section">
         <label for="universe-provider-setting">Universe Conductor</label>
         <select id="universe-provider-setting" name="universe_provider">
@@ -428,6 +437,10 @@
       <span id="session-observatory-summary">Loading sessions…</span>
       <button id="refresh-sessions-button" class="secondary-button" type="button">Refresh</button>
     </div>
+    <section class="runtime-audit-section">
+      <div class="section-heading"><span>Runtime audit</span></div>
+      <div id="runtime-audit-grid" class="runtime-audit-grid"></div>
+    </section>
     <div id="session-observatory-list" class="session-observatory-list"></div>
     <section class="legacy-executor-section">
       <div class="section-heading"><span>Legacy executors</span></div>

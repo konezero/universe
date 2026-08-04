@@ -421,13 +421,32 @@ relations remain distinct from observed evidence. Career adoption is separate.
     negotiation: Grok uses native ACP; Codex uses a pinned `codex-acp` or
     equivalent validated app-server adapter; Claude uses a pinned
     `claude-agent-acp` adapter. Print-mode CLI remains `LEGACY_LIMITED` and must
-    not claim ACP parity. Usage/quota HUD state and provider-limit rebinding
-    belong to this binding layer.
+    not claim ACP parity. Runtime preflight and audit surfaces report executable
+    availability, approval state, continuity, bounded usage, and Provider quota
+    state without creating execution authority. A quota stop preserves the
+    resident Provider session and active Task Frame for an explicit retry or
+    rebinding decision; it is not recorded as a dirty session end.
+
+15. Treat public coding-agent benchmarks as an initial Worker Binding prior,
+    never as a final ranking. Project Task Frames publish redacted
+    `SkillRunObservation` records containing Provider, Model, Skill, Worker Role,
+    Task Kind, Node reference, duration/token metrics, outcome, validation,
+    failure kind, quota state, source reference, evidence reference, and Context
+    Pack digest. Universe ingests them from the Project-local queue, keeps the
+    Project boundary, and exposes comparisons by Worker, Task, Node, Skill,
+    Model, Provider, and Project. Prompts, source text, command text, credentials,
+    and raw provider responses are not observation fields. As local samples grow,
+    Node-local evidence may outweigh the external prior; an automatic binding
+    change still requires a candidate, shadow evidence, and the normal adoption
+    boundary.
 
 ## Runtime Boundary
 
 Universe consumes the installed ai-career Skill binding and observation
 contract without taking ownership of Project execution. The current contract
-uses a canonical provider-bearing `model_ref`; adding an independent
-`provider_ref` field remains an ai-career schema migration and is not inferred
-into existing Project Runtime records.
+keeps canonical `model_ref` and adds a bounded `execution_context` with
+`provider_ref`, `worker_role`, `task_kind`, `node_ref`, `failure_kind`, and
+`quota_state`. ai-career derives Role and Task Kind from the declared Task Frame
+turn and Skill binding; a Worker cannot redefine them. Older observations remain
+readable with `UNKNOWN` defaults, while new observations carry explicit context
+into the Project queue and Universe Bench DB.

@@ -107,9 +107,11 @@ alternative sessions remain visible.
 
 Automatic continuity saves are project-local and target each project's
 `.ai/runtime/continuity/continuity.sqlite`. Triggers are bounded idle, normal
-stop, provider or Mode switch, and completed work. Saves are debounced and
-idempotent across process restarts. Crash handling records dirty-end evidence
-and preserves the last good save; it never invents a summary.
+stop, provider or Mode switch, provider quota exhaustion, and completed work.
+Saves are debounced and idempotent across process restarts. A quota stop keeps
+the resident session and active Task Frame available for retry and does not
+claim a dirty end. Crash handling records dirty-end evidence and preserves the
+last good save; it never invents a summary.
 
 This lifecycle flush is separate from the explicit `RESUME_SAVE` user command.
 It reuses Runtime validation and storage without manufacturing a user command,
@@ -129,6 +131,8 @@ The loopback service exposes:
 - `GET /v1/supervisor/sessions/{session_id}`
 - `GET /v1/supervisor/events`
 - `GET /v1/supervisor/legacy-executors`
+- `GET /v1/runtime/preflight`
+- `GET /v1/runtime/audit`
 - `POST /v1/supervisor/sessions`
 - `POST /v1/supervisor/sessions/{session_id}/bind`
 - `POST /v1/supervisor/sessions/{session_id}/lease`

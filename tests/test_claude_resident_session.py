@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 import threading
@@ -13,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from claude_resident_session import (  # noqa: E402
-    SESSION_BUSY,
     SESSION_QUOTA_EXHAUSTED,
     SESSION_READY,
     SESSION_STOPPED,
@@ -278,6 +276,9 @@ class ClaudeResidentSessionTests(unittest.TestCase):
             session.send_message("go", lambda _d: None)
         self.assertIn("CLAUDE_QUOTA_EXHAUSTED", str(caught.exception))
         self.assertEqual(SESSION_QUOTA_EXHAUSTED, session.session_status())
+        observation = session.runtime_observation()
+        self.assertEqual("CLAUDE", observation["provider"])
+        self.assertEqual("EXHAUSTED", observation["quota_state"])
 
         # A second request must not launch another process.
         with self.assertRaises(ClaudeResidentError):
