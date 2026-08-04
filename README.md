@@ -1,16 +1,65 @@
 # Universe
 
-Universe is a local-first environment for connecting independent software
-projects, recalling their proven histories, and proposing possible future work
-paths.
+Universe is a local-first environment for connecting independent software projects,
+recalling their proven histories, and proposing possible future work paths.
 
-The first implementation surface is the Official Development Seed. It solves
-the cold-start problem before a user has accumulated enough project history to
-support useful path recall.
+It treats each project as a navigable world:
 
-Each local Universe database receives one immutable UUID on first creation.
-The same database preserves the ID across restarts, while a separate database
-represents a separate Universe.
+- users direct goals through Universe;
+- project Masters, Bosses, and Workers carry out bounded work;
+- evidence, decisions, and memories remain connected to their origin;
+- model sessions may change without losing project continuity.
+
+Universe owns the project network, continuity, relationships, and experience
+surface. Projects retain ownership of their repositories and artifacts. Career
+is a separate governance and validation foundation that Universe consumes for
+trusted rules, Seeds, and release/runtime lifecycle. Career is not the project
+UI or the project data store.
+
+## The Universe Today
+
+The repository currently focuses on:
+
+- persistent local Universe identity and SQLite-backed project state;
+- registering and inspecting independent project worlds;
+- an Official Development Seed for cold-start path candidates;
+- local observations, memories, evidence references, and project dispatches;
+- local server, UI, and Windows packaging for dogfooding.
+
+Every suggestion is a candidate. Universe can propose a path, but it must not
+silently change a project's source or create execution authority.
+
+## The Universe Next
+
+The next stage is to make the project graph a live operational map:
+
+- show active Work, project ownership, model sessions, and execution hosts;
+- attach decisions, memories, and evidence to project nodes;
+- connect persistent Conductor and Project Master sessions to the worlds they operate;
+- compare current project states with proven histories and suggest future branches;
+- support approved remote access and projections between independent Universes.
+
+These are product directions; the current repository should not be read as
+claiming all of them are complete.
+
+## Career Boundary
+
+Career supplies reusable governance, validation rules, Seeds, and release/runtime
+lifecycle. Universe uses those rules to connect and evolve project worlds. Projects
+remain the owners of their source repositories, artifacts, and execution results.
+
+```text
+User
+  -> Universe
+       -> Project worlds
+            -> Masters
+                 -> Bosses
+                      -> Workers
+       -> Work -> Evidence -> Knowledge lineage
+
+Career
+  -> governance, validation, Seeds, and release/runtime lifecycle
+```
 
 ## Official Development Seed v0
 
