@@ -32,6 +32,7 @@ from project_master_host import (  # noqa: E402
     ProjectMasterHostError,
     ProjectMasterConversationWorker,
     ProjectModeCoordinator,
+    _WindowsKillOnCloseJob,
     ProjectMasterSessionStore,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
@@ -285,6 +286,39 @@ class ProjectMasterHostTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_runtime_job_kills_children_when_host_handle_closes(self) -> None:
+        class FakeProcess:
+            _handle = 123
+
+        class FakeKernel:
+            def __init__(self) -> None:
+                self.closed = 0
+                self.assigned = []
+
+            def CreateJobObjectW(self, _security, _name):
+                return 456
+
+            def SetInformationJobObject(self, *_args):
+                return 1
+
+            def AssignProcessToJobObject(self, handle, process_handle):
+                self.assigned.append((handle, process_handle))
+                return 1
+
+            def CloseHandle(self, _handle):
+                self.closed += 1
+
+        kernel = FakeKernel()
+        with patch("project_master_host.os.name", "nt"), patch(
+            "process_identity.ctypes.WinDLL", return_value=kernel
+        ):
+            job = _WindowsKillOnCloseJob(FakeProcess())
+            job.close()
+            job.close()
+
+        self.assertEqual([(456, 123)], kernel.assigned)
+        self.assertEqual(1, kernel.closed)
 
     def test_provider_session_store_keeps_one_last_coordinate(self) -> None:
         self.assertIsNone(self.state.last_provider_session())

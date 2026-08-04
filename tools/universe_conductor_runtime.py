@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping, Protocol, TextIO
 from uuid import uuid4
 
 from host_profile import resolve_host_tool
-from process_identity import launched_process_identity
+from process_identity import WindowsKillOnCloseJob, launched_process_identity
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
@@ -74,6 +74,7 @@ class UniverseConductorRuntime:
         if not self.runtime_cli.is_file():
             raise UniverseConductorRuntimeError("UNIVERSE_RUNTIME_CLI_UNAVAILABLE")
         self._process: RuntimeProcess | None = None
+        self._runtime_job: WindowsKillOnCloseJob | None = None
         self._binding: dict[str, Any] | None = None
         self._stderr: deque[str] = deque(maxlen=40)
         self._supervisor_session_id: str | None = None
@@ -85,6 +86,9 @@ class UniverseConductorRuntime:
         if self._binding is not None and self._process is not None:
             if self._process.poll() is None:
                 return dict(self._binding)
+            if self._runtime_job is not None:
+                self._runtime_job.close()
+                self._runtime_job = None
             self._binding = None
             self._process = None
 
@@ -164,6 +168,8 @@ class UniverseConductorRuntime:
             ) from error
         self._process = process
         try:
+            runtime_job = WindowsKillOnCloseJob(process)
+            self._runtime_job = runtime_job
             startup = self._read_startup(process)
             host_adapter = startup.get("host_adapter")
             runtime_state = startup.get("runtime_state")
@@ -239,13 +245,18 @@ class UniverseConductorRuntime:
 
     def stop(self) -> None:
         process = self._process
+        job = self._runtime_job
         if process is None or process.poll() is not None:
             self._process = None
+            self._runtime_job = None
             self._binding = None
+            if job is not None:
+                job.close()
             self._mark_stale_if_owned("PROCESS_NOT_RUNNING_AT_STOP")
             return
         stop_receipt = self._authorize_supervised_stop()
         self._process = None
+        self._runtime_job = None
         self._binding = None
         process.terminate()
         try:
@@ -253,6 +264,8 @@ class UniverseConductorRuntime:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        if job is not None:
+            job.close()
         self._complete_supervised_stop(stop_receipt)
 
     def reconcile(self) -> str:
@@ -262,6 +275,9 @@ class UniverseConductorRuntime:
         if process.poll() is None:
             return "LIVE"
         self._process = None
+        if self._runtime_job is not None:
+            self._runtime_job.close()
+            self._runtime_job = None
         self._binding = None
         self._mark_stale_if_owned("PROCESS_EXITED_UNEXPECTEDLY")
         return "EXITED"

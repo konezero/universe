@@ -7,6 +7,7 @@ import queue
 import subprocess  # nosec B404
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
@@ -50,6 +51,7 @@ CLAUDE_FORBIDDEN_ARGUMENTS = frozenset(
 CLAUDE_FORBIDDEN_PERMISSION_MODES = frozenset(
     {"acceptEdits", "auto", "bypassPermissions", "dontAsk"}
 )
+PLATFORM_APPROVAL_EVIDENCE_SCHEMA = "ai-career.platform-approval-evidence.v1"
 
 
 class AgentSessionError(RuntimeError):
@@ -236,6 +238,37 @@ def normalize_permission_request(value: Mapping[str, Any]) -> dict[str, Any]:
         "session_id": session_id,
         "tool_call": _json_object(tool_call),
         "options": normalized_options,
+    }
+
+
+def build_platform_approval_evidence(
+    request: Mapping[str, Any], option_id: str | None
+) -> dict[str, Any]:
+    """Create a provider-neutral evidence envelope for one approval event."""
+
+    normalized = normalize_permission_request(request)
+    selected = next(
+        (
+            option
+            for option in normalized["options"]
+            if option["optionId"] == option_id
+        ),
+        None,
+    )
+    decision = "REJECTED" if selected is None else selected["kind"].upper()
+    request_id = normalized["request_id"]
+    provider = normalized["provider"]
+    return {
+        "schema": PLATFORM_APPROVAL_EVIDENCE_SCHEMA,
+        "evidence_ref": f"platform-approval://{provider}/{request_id}",
+        "provider": provider,
+        "request_id": request_id,
+        "session_id": normalized["session_id"],
+        "decision": decision,
+        "option_id": option_id or "NONE",
+        "observed_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
     }
 
 
@@ -492,6 +525,7 @@ class GrokAcpSession:
         self.model = _text(model, "model")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
+        self.last_platform_approval_evidence: dict[str, Any] | None = None
         self._active_delta: Callable[[str], None] | None = None
         self._transport = JsonRpcStdioProcess(
             executable=executable,
@@ -645,6 +679,9 @@ class GrokAcpSession:
             }
         )
         option_id = self.permission_requester(request)
+        self.last_platform_approval_evidence = build_platform_approval_evidence(
+            request, option_id
+        )
         if option_id is None:
             return {"outcome": {"outcome": "cancelled"}}
         if option_id not in {option["optionId"] for option in request["options"]}:
@@ -677,6 +714,7 @@ class CodexAppServerSession:
         self.model = _text(model, "model")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
+        self.last_platform_approval_evidence: dict[str, Any] | None = None
         self.ephemeral = bool(ephemeral)
         self._active_delta: Callable[[str], None] | None = None
         self._active_final_text: str | None = None
@@ -919,6 +957,9 @@ class CodexAppServerSession:
         option_id = self.permission_requester(request)
         if option_id is None:
             option_id = "cancel"
+        self.last_platform_approval_evidence = build_platform_approval_evidence(
+            request, option_id
+        )
         if option_id not in {option["optionId"] for option in request["options"]}:
             raise AgentSessionError("AGENT_PERMISSION_OPTION_UNKNOWN")
         return {"decision": option_id}
@@ -965,6 +1006,9 @@ class CodexAppServerSession:
             }
         )
         option_id = self.permission_requester(request) or "decline"
+        self.last_platform_approval_evidence = build_platform_approval_evidence(
+            request, option_id
+        )
         if option_id == "grantForTurn":
             return {"permissions": requested_permissions, "scope": "turn"}
         if option_id == "grantForSession":

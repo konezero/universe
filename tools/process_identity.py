@@ -12,6 +12,63 @@ class ProcessIdentityError(RuntimeError):
     pass
 
 
+class WindowsKillOnCloseJob:
+    """Attach a runtime child to a Windows Job owned by its parent host."""
+
+    def __init__(self, process: Any) -> None:
+        self._handle: Any | None = None
+        if os.name != "nt" or not getattr(process, "_handle", None):
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_void_p),
+                ("MaximumWorkingSetSize", ctypes.c_void_p),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_void_p),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [("values", ctypes.c_ulonglong * 6)]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_void_p),
+                ("JobMemoryLimit", ctypes.c_void_p),
+                ("PeakProcessMemoryUsed", ctypes.c_void_p),
+                ("PeakJobMemoryUsed", ctypes.c_void_p),
+            ]
+
+        limits = ExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = 0x2000
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            kernel32.CloseHandle(handle)
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        if not kernel32.AssignProcessToJobObject(handle, process._handle):
+            kernel32.CloseHandle(handle)
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
 class OwnedProcess(Protocol):
     pid: int
 

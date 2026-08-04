@@ -17,6 +17,7 @@ from agent_session_gateway import (  # noqa: E402
     ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
+    build_platform_approval_evidence,
     cli_auto_approve_status,
     normalize_permission_request,
 )
@@ -149,6 +150,35 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("universe.agent-permission-request.v1", request["schema"])
         self.assertEqual("GROK", request["provider"])
         self.assertEqual("allow_once", request["options"][0]["kind"])
+
+    def test_platform_approval_evidence_is_provider_neutral(self) -> None:
+        request = normalize_permission_request(
+            {
+                "request_id": "permission_codex_001",
+                "provider": "CODEX",
+                "session_id": "thread-001",
+                "tool_call": {"command": "python secret-operation.py"},
+                "options": [
+                    {
+                        "optionId": "accept",
+                        "name": "Allow once",
+                        "kind": "allow_once",
+                    }
+                ],
+            }
+        )
+
+        evidence = build_platform_approval_evidence(request, "accept")
+
+        self.assertEqual(
+            "ai-career.platform-approval-evidence.v1", evidence["schema"]
+        )
+        self.assertEqual(
+            "platform-approval://CODEX/permission_codex_001",
+            evidence["evidence_ref"],
+        )
+        self.assertEqual("ALLOW_ONCE", evidence["decision"])
+        self.assertNotIn("secret-operation.py", evidence)
 
     def test_cli_auto_approve_status_uses_effective_universe_policy(self) -> None:
         self.assertEqual("OFF", cli_auto_approve_status("GROK"))
@@ -513,6 +543,11 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertNotIn('model="default"', transport.arguments)
         self.assertEqual("CODEX", selected[0]["provider"])
         self.assertEqual("allow_once", selected[0]["options"][0]["kind"])
+        self.assertTrue(
+            session.last_platform_approval_evidence["evidence_ref"].startswith(
+                "platform-approval://CODEX/permission_"
+            )
+        )
         start = next(
             params
             for method, params in transport.requests

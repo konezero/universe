@@ -53,7 +53,7 @@ from project_skill_plan_apply import (
     build_project_skill_plan_context,
     project_skill_plan_receipt,
 )
-from process_identity import launched_process_identity
+from process_identity import WindowsKillOnCloseJob, launched_process_identity
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
@@ -68,6 +68,9 @@ TASK_PROPOSAL_DATABASE_RELATIVE_PATH = Path(
 
 class ProjectMasterHostError(RuntimeError):
     pass
+
+
+_WindowsKillOnCloseJob = WindowsKillOnCloseJob
 
 
 class MasterProvider(Protocol):
@@ -134,6 +137,7 @@ class ProjectModeCoordinator:
             raise ProjectMasterHostError("PROJECT_RUNTIME_CLI_UNAVAILABLE")
         self._prepared: dict[str, Any] | None = None
         self._runtime_process: subprocess.Popen[str] | None = None
+        self._runtime_job: _WindowsKillOnCloseJob | None = None
         self._runtime_binding: dict[str, str] | None = None
         self._runtime_stderr: deque[str] = deque(maxlen=40)
         self._runtime_lock = threading.RLock()
@@ -327,15 +331,20 @@ class ProjectModeCoordinator:
     def close(self) -> None:
         with self._runtime_lock:
             process = self._runtime_process
+            job = self._runtime_job
         if process is None or process.poll() is not None:
             with self._runtime_lock:
                 self._runtime_process = None
+                self._runtime_job = None
                 self._runtime_binding = None
+            if job is not None:
+                job.close()
             self._mark_stale_if_owned("PROCESS_NOT_RUNNING_AT_STOP")
             return
         stop_receipt = self._authorize_supervised_stop()
         with self._runtime_lock:
             self._runtime_process = None
+            self._runtime_job = None
             self._runtime_binding = None
         process.terminate()
         try:
@@ -343,6 +352,8 @@ class ProjectModeCoordinator:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+        if job is not None:
+            job.close()
         self._complete_supervised_stop(stop_receipt)
 
     def reconcile(self) -> str:
@@ -353,7 +364,11 @@ class ProjectModeCoordinator:
             if process.poll() is None:
                 return "LIVE"
             self._runtime_process = None
+            job = self._runtime_job
+            self._runtime_job = None
             self._runtime_binding = None
+        if job is not None:
+            job.close()
         self._mark_stale_if_owned("PROCESS_EXITED_UNEXPECTEDLY")
         return "EXITED"
 
@@ -447,6 +462,7 @@ class ProjectModeCoordinator:
                 options["creationflags"] = subprocess.CREATE_NO_WINDOW
             try:
                 process = subprocess.Popen(command, **options)  # nosec B603
+                runtime_job = _WindowsKillOnCloseJob(process)
                 startup = self._read_runtime_startup(process)
                 host_adapter = startup.get("host_adapter")
                 runtime_state = startup.get("runtime_state")
@@ -469,8 +485,11 @@ class ProjectModeCoordinator:
                 if "process" in locals() and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
+                if "runtime_job" in locals():
+                    runtime_job.close()
                 raise
             self._runtime_process = process
+            self._runtime_job = runtime_job
             self._runtime_binding = {
                 "endpoint": endpoint,
                 "token": token,
@@ -481,12 +500,27 @@ class ProjectModeCoordinator:
                     runtime_state["executable_runtime_currentness"]
                 ),
             }
-            self._register_process_lease(
-                process=process,
-                command=command,
-                endpoint=endpoint,
-                token=token,
-            )
+            try:
+                self._register_process_lease(
+                    process=process,
+                    command=command,
+                    endpoint=endpoint,
+                    token=token,
+                )
+            except Exception:
+                with self._runtime_lock:
+                    self._runtime_process = None
+                    self._runtime_job = None
+                    self._runtime_binding = None
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                runtime_job.close()
+                raise
             return dict(self._runtime_binding)
 
     def _register_process_lease(
