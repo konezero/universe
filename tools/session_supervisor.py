@@ -1175,6 +1175,110 @@ class SessionSupervisorStore:
                 ).fetchall()
             return [self._session_material(connection, row) for row in rows]
 
+    def sweep_stale_live_sessions(self) -> dict[str, Any]:
+        """Demote LIVE/STARTING sessions that have no living process.
+
+        - OWNED lease + PID gone / PID reused / process exited → DISCONNECTED
+        - LIVE/STARTING with no lease or non-OWNED lease → DISCONNECTED
+          (cannot prove a live host process; avoids "zombie LIVE" in Observatory)
+
+        Does not kill processes. Uses the same PID+creation-time observer as
+        lease recovery.
+        """
+        now = utc_now()
+        demoted: list[dict[str, Any]] = []
+        kept_live = 0
+        unknown_probe = 0
+        with self._connection(immediate=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM session_record
+                WHERE state IN ('LIVE', 'STARTING')
+                ORDER BY updated_at DESC, session_id
+                """
+            ).fetchall()
+            for row in rows:
+                session_id = str(row["session_id"])
+                prior = str(row["state"])
+                lease = connection.execute(
+                    "SELECT * FROM process_lease WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                reason = None
+                observation: dict[str, Any] | None = None
+                if lease is None or str(lease["lease_state"]) != "OWNED":
+                    reason = (
+                        "NO_PROCESS_LEASE"
+                        if lease is None
+                        else f"LEASE_NOT_OWNED:{lease['lease_state']}"
+                    )
+                else:
+                    identity = self._lease_identity(lease)
+                    observation = self._observe_process_instance(identity)
+                    status = str(observation.get("status") or "UNKNOWN")
+                    if status == "PROCESS_PRESENT_EXACT":
+                        kept_live += 1
+                        continue
+                    if status == "ORIGINAL_PROCESS_ABSENT":
+                        reason = str(
+                            observation.get("reason") or "ORIGINAL_PROCESS_ABSENT"
+                        )
+                        connection.execute(
+                            """
+                            UPDATE process_lease
+                            SET lease_state = 'STALE',
+                                lease_version = lease_version + 1,
+                                updated_at = ?
+                            WHERE session_id = ?
+                            """,
+                            (now, session_id),
+                        )
+                    else:
+                        # Probe failed — do not invent death, keep state
+                        unknown_probe += 1
+                        continue
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET state = 'DISCONNECTED',
+                        row_version = row_version + 1,
+                        updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (now, session_id),
+                )
+                self._event(
+                    connection,
+                    session_id=session_id,
+                    event_type="LIVE_SESSION_SWEPT_STALE",
+                    prior_state=prior,
+                    state="DISCONNECTED",
+                    reason=reason,
+                    details={
+                        "host_process_observation": observation,
+                        "process_termination": "NOT_PERFORMED",
+                    },
+                )
+                demoted.append(
+                    {
+                        "session_id": session_id,
+                        "prior_state": prior,
+                        "state": "DISCONNECTED",
+                        "reason": reason,
+                        "node": row["node"],
+                        "mode": row["mode"],
+                        "provider": row["provider"],
+                    }
+                )
+        return {
+            "schema": SESSION_SUPERVISOR_SCHEMA,
+            "status": "LIVE_SESSION_SWEEP_COMPLETED",
+            "demoted_count": len(demoted),
+            "kept_live_count": kept_live,
+            "unknown_probe_count": unknown_probe,
+            "demoted": demoted,
+        }
+
     def list_events(
         self, *, session_id: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:

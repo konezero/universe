@@ -86,8 +86,51 @@ Unavailable transition capability remains `UNKNOWN`; missing Registry evidence
 returns `MODE_REGISTRY_UNAVAILABLE`. Prior Mode context is not used as a
 substitute. Mode preparation does not require execution authority.
 
+If the same user turn also contains an explicit implementation intent, preserve
+the Mode's Registry-resolved `GOVERNANCE_ONLY` profile and pass
+`execution_intent: IMPLEMENTATION` to `prepare-session`. The result must expose
+an executable-runtime start proposal instead of silently ending at governance
+preparation. The Host still waits for approval, then re-evaluates with the
+required executable Task and Evidence profiles before starting the executor.
+
 A process-local transition proposal may remain read-only. If the transition is
 persisted to session files, an Anchor surface, a database, or another durable
 target, execute `.ai/skills/common/execution-guard/SKILL.md` first. A selected
 Mode or Role never supplies the missing Authority, Write Scope, Assignment, or
 approval.
+
+## Post-MODE_CHANGE: Universe session-ref inject (product)
+
+After Registry resolution succeeds and the Host knows (or can observe) a
+provider session coordinate, run a **best-effort** Universe inject. This is a
+product continuity step, not governance permission.
+
+```text
+MODE_CHANGE succeeds
+  -> optional Host observation: provider + session_ref
+  -> python tools/universe_session_inject_hook.py
+       --repo-root <project-root>
+       --trigger mode_change
+       [--provider ...] [--session-ref ...]
+       [--update-session-md]
+  -> Universe OFFLINE / SKIPPED must not fail MODE_CHANGE
+```
+
+Rules:
+
+1. Inject only when `provider` + `session_ref` + `project_id` resolve.
+2. Default exit is non-blocking (`SKIPPED` / `OFFLINE` / `INJECTED` all exit 0).
+3. Does **not** create Authority, Execution Assignment, or write scope.
+4. Prefer hook observation under `.ai/runtime/tmp/last_provider_session_observation.json`.
+5. `--update-session-md` may patch `Last Provider*` observation lines only; that
+   is still not authority. Durable governance writes remain Guard-gated.
+
+Harness transport:
+
+- Claude Code: project `.claude/settings.json` `SessionStart` → same hook with
+  `--from-stdin` (reads `session_id`).
+- Codex: env `CODEX_THREAD_ID` + same hook after Mode context is active.
+- Manual / skill: `.ai/skills/common/session-ref-inject/SKILL.md`.
+
+See `tools/universe_session_inject_hook.py` and
+`.ai/skills/common/session-ref-inject/SKILL.md`.

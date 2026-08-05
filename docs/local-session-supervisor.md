@@ -9,6 +9,16 @@ Mode-session and process metadata. It allows the Universe tray and Web UI to
 observe and reconnect persistent sessions without treating a provider process,
 chat transcript, Mode label, or PID as sufficient identity.
 
+Room attach, multi-room chat product rules, and harness session-ref inject are
+specified in `docs/multi-room-chat-architecture.md` and
+`docs/room-session-attach-streaming.md`. The Supervisor stores coordinates and
+bindings, not full vendor transcripts.
+
+`POST /v1/sessions/inject` (and CLI `inject-session`) registers a Supervisor
+session (stable id from node/mode/provider/ref), optionally sets the
+`(node, mode)` default, then attaches the multi-room slot. Skill:
+`.ai/skills/common/session-ref-inject/SKILL.md`.
+
 The Supervisor does not decide project currentness. A resumed project session
 rehydrates its own Runtime and reports its observed currentness. Universe stores
 and displays that report without manufacturing it.

@@ -1506,6 +1506,18 @@ class TaskFrameRuntime:
                     "result_receipt_ref": str(row["result_receipt_ref"]),
                     "envelope": json.loads(str(row["worker_result_envelope_json"])),
                 }
+        failure_rows = self.conn.execute(
+            """
+            SELECT details_json
+            FROM task_journal
+            WHERE event_type = 'WORKER_INITIALIZATION_FAILED'
+            """
+        ).fetchall()
+        for row in failure_rows:
+            details = json.loads(str(row["details_json"]))
+            worker_run_ref = str(details.get("worker_run_ref", "")).strip()
+            if worker_run_ref:
+                self.worker_run_refs.add(worker_run_ref)
         observation_rows = self.conn.execute(
             """
             SELECT turn_id, observation_json
@@ -1988,6 +2000,20 @@ class TaskFrameRuntime:
                 return {"status": "WORKER_CAPABILITY_EVIDENCE_MISMATCH"}
             if normalized_invoker_ref != planned["invoker_actor_ref"]:
                 return {"status": "WORKER_INVOKER_ACTOR_MISMATCH"}
+            failed_actor_rows = self.conn.execute(
+                """
+                SELECT details_json
+                FROM task_journal
+                WHERE event_type = 'WORKER_INITIALIZATION_FAILED' AND turn_id = ?
+                """,
+                (normalized_turn_id,),
+            ).fetchall()
+            if any(
+                str(json.loads(str(row["details_json"])).get("worker_id", ""))
+                == normalized_worker_id
+                for row in failed_actor_rows
+            ):
+                return {"status": "WORKER_ACTOR_RETIRED"}
             if normalized_run_ref in self.worker_run_refs:
                 return {"status": "WORKER_RUN_REF_REUSED"}
             worker_slot_ref = planned["worker_slot_ref"]
@@ -2075,6 +2101,150 @@ class TaskFrameRuntime:
             self._hydrate_worker_execution_state()
             raise
         return {"status": "TURN_CLAIMED", "turn": self.turn_snapshot(normalized_turn_id)}
+
+    def worker_initialization_failed(
+        self,
+        *,
+        turn_id: str,
+        worker_id: str,
+        worker_run_ref: str,
+        failure_code: str,
+        failure_detail: str,
+        host_evidence_ref: str,
+        observed_at: str,
+    ) -> dict[str, Any]:
+        """Release one claimed turn when its Worker could not initialize."""
+
+        timestamp = self._normalize_timestamp(observed_at)
+        normalized_turn_id = turn_id.strip()
+        normalized_worker_id = worker_id.strip()
+        normalized_run_ref = worker_run_ref.strip()
+        normalized_failure_code = failure_code.strip().upper()
+        normalized_failure_detail = failure_detail.strip()
+        normalized_evidence_ref = host_evidence_ref.strip()
+        if not timestamp:
+            return {"status": "OBSERVED_AT_INVALID"}
+        if not normalized_turn_id:
+            return {"status": "TURN_ID_REQUIRED"}
+        if not normalized_worker_id:
+            return {"status": "WORKER_ID_REQUIRED"}
+        if not normalized_run_ref or normalized_run_ref.upper() == "UNKNOWN":
+            return {"status": "WORKER_RUN_REF_REQUIRED"}
+        if not normalized_failure_code or normalized_failure_code == "UNKNOWN":
+            return {"status": "WORKER_INITIALIZATION_FAILURE_CODE_REQUIRED"}
+        if not normalized_failure_detail:
+            return {"status": "WORKER_INITIALIZATION_FAILURE_DETAIL_REQUIRED"}
+        if not normalized_evidence_ref or normalized_evidence_ref.upper() == "UNKNOWN":
+            return {"status": "WORKER_INITIALIZATION_FAILURE_EVIDENCE_REQUIRED"}
+        if self.execution_gate is None:
+            return {"status": "WORKER_INITIALIZATION_FAILURE_NOT_APPLICABLE"}
+
+        turn = self.turn_snapshot(normalized_turn_id)
+        if turn is None:
+            return {"status": "TURN_NOT_FOUND"}
+
+        prior_failures = []
+        for row in self.conn.execute(
+            """
+            SELECT details_json
+            FROM task_journal
+            WHERE event_type = 'WORKER_INITIALIZATION_FAILED' AND turn_id = ?
+            ORDER BY event_ordinal
+            """,
+            (normalized_turn_id,),
+        ).fetchall():
+            prior_failures.append(json.loads(str(row["details_json"])))
+        same_run = next(
+            (
+                details
+                for details in prior_failures
+                if str(details.get("worker_run_ref", "")) == normalized_run_ref
+            ),
+            None,
+        )
+        if turn["state"] == "READY" and same_run is not None:
+            if (
+                str(same_run.get("worker_id", "")) == normalized_worker_id
+                and str(same_run.get("failure_code", "")) == normalized_failure_code
+                and str(same_run.get("failure_detail", "")) == normalized_failure_detail
+                and str(same_run.get("host_evidence_ref", ""))
+                == normalized_evidence_ref
+            ):
+                return {
+                    "status": "WORKER_INITIALIZATION_FAILURE_REPLAYED",
+                    "retry_generation": int(same_run["retry_generation"]),
+                    "turn": turn,
+                }
+            return {"status": "WORKER_INITIALIZATION_FAILURE_ALREADY_RECORDED"}
+
+        if turn["state"] != "CLAIMED" or turn["claimed_by"] != normalized_worker_id:
+            return {"status": "TURN_NOT_CLAIMED_BY_WORKER", "turn": turn}
+        claim_evidence = self.worker_claim_evidence.get(normalized_turn_id)
+        if claim_evidence is None:
+            return {"status": "WORKER_RUN_REF_REQUIRED"}
+        if claim_evidence["worker_actor_ref"] != normalized_worker_id:
+            return {"status": "WORKER_ACTOR_MISMATCH"}
+        if claim_evidence["worker_run_ref"] != normalized_run_ref:
+            return {"status": "WORKER_RUN_REF_MISMATCH"}
+        if normalized_turn_id in self.worker_result_envelopes:
+            return {"status": "WORKER_RESULT_ENVELOPE_ALREADY_RECORDED"}
+
+        retry_generation = len(prior_failures) + 1
+        failure_details = {
+            "worker_id": normalized_worker_id,
+            "worker_run_ref": normalized_run_ref,
+            "worker_slot_ref": claim_evidence["worker_slot_ref"],
+            "failure_code": normalized_failure_code,
+            "failure_detail": normalized_failure_detail,
+            "host_evidence_ref": normalized_evidence_ref,
+            "retry_generation": retry_generation,
+        }
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.conn.execute(
+                """
+                UPDATE task_turns
+                SET state = 'READY', claimed_by = '', claimed_at = ''
+                WHERE turn_id = ? AND state = 'CLAIMED' AND claimed_by = ?
+                """,
+                (normalized_turn_id, normalized_worker_id),
+            )
+            if cursor.rowcount != 1:
+                self.conn.execute("ROLLBACK")
+                return {
+                    "status": "TURN_NOT_CLAIMED_BY_WORKER",
+                    "turn": self.turn_snapshot(normalized_turn_id),
+                }
+            self.conn.execute(
+                """
+                UPDATE worker_execution_state
+                SET worker_actor_ref = '', worker_run_ref = '',
+                    worker_result_digest = '', result_receipt_ref = '',
+                    worker_result_envelope_json = ''
+                WHERE turn_id = ?
+                """,
+                (normalized_turn_id,),
+            )
+            self._append_journal(
+                "WORKER_INITIALIZATION_FAILED",
+                normalized_turn_id,
+                failure_details,
+                timestamp,
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+        self.worker_claim_evidence.pop(normalized_turn_id, None)
+        self.worker_slot_actors.pop(claim_evidence["worker_slot_ref"], None)
+        self.worker_run_refs.add(normalized_run_ref)
+        return {
+            "status": "WORKER_INITIALIZATION_FAILURE_RECORDED",
+            "retry_generation": retry_generation,
+            "turn": self.turn_snapshot(normalized_turn_id),
+        }
 
     def complete_turn(
         self,

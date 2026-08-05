@@ -183,6 +183,15 @@ Using the Parent actor under a Worker-like label is
 20. Return the Boss final envelope and Result Packet to the current Parent for
     separate review. The Parent relays it without adding debate content.
 
+If a claimed Worker fails during initialization before a terminal envelope can
+exist, the Host must call `worker_initialization_failed` with the exact
+`turn_id`, `worker_id`, `worker_run_ref`, a concrete failure code and detail,
+and a durable Host evidence reference. The Runtime records the failed attempt,
+releases only that claim, and returns the same turn to `READY`. The failed run
+reference remains retired after reopen. A retry must use a new Worker actor and
+new run reference; a late result from the retired run is rejected. The caller
+must reuse the existing Frame, proposal, approval, assignment, and binding.
+
 The Parent may return to the Commander conversation after Frame creation when
 the Host has concrete nonblocking Worker capability. It may append later user
 constraints to the instruction ledger, observe status, or cancel the Frame,

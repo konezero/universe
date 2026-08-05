@@ -359,6 +359,92 @@
           </div>
         </div>
       </section>
+      <section class="settings-section remote-access-section">
+        <div class="settings-section-heading">
+          <div>
+            <strong>Multi-room (function-first)</strong>
+            <small>Project / Boss / Meeting — thin chrome for later UI redesign</small>
+          </div>
+        </div>
+        <p class="settings-help">
+          Rooms API S1–S5: list, open snapshot, post (role-checked), inject session ref.
+          See docs/multi-room-implementation-status.md.
+        </p>
+        <div class="remote-access-actions">
+          <button id="refresh-rooms-button" type="button" class="secondary-button">
+            Refresh rooms
+          </button>
+          <button id="create-meeting-room-button" type="button" class="secondary-button">
+            New meeting room
+          </button>
+        </div>
+        <label for="inject-project-id">
+          Project id
+          <input id="inject-project-id" type="text" placeholder="selected project if empty" autocomplete="off" />
+        </label>
+        <label for="inject-provider">
+          Provider
+          <select id="inject-provider">
+            <option value="CODEX">CODEX</option>
+            <option value="CLAUDE">CLAUDE</option>
+            <option value="GROK">GROK</option>
+          </select>
+        </label>
+        <label for="inject-session-ref">
+          Session ref
+          <input id="inject-session-ref" type="text" placeholder="thread / session id" autocomplete="off" />
+        </label>
+        <div class="remote-access-actions">
+          <button id="inject-session-ref-button" type="button" class="primary-button">
+            Inject session ref
+          </button>
+          <small class="settings-help">
+            Supervisor register + default (PROJECT/MASTER) + room attach. No Observatory.
+          </small>
+        </div>
+        <div id="multi-room-list" class="remote-access-list"></div>
+        <div id="multi-room-detail" class="remote-access-endpoint"></div>
+        <label for="multi-room-message">
+          Message (role enforced server-side)
+          <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>
+        </label>
+        <div class="remote-access-actions">
+          <button id="post-room-message-button" type="button" class="primary-button">
+            Post as USER
+          </button>
+          <button id="call-master-button" type="button" class="secondary-button">
+            Call master (boss rooms)
+          </button>
+        </div>
+      </section>
+      <section class="settings-section remote-access-section">
+        <div class="settings-section-heading">
+          <div>
+            <strong>Rendezvous join</strong>
+            <small>Internet /pair page → local Universe approval</small>
+          </div>
+          <span id="rendezvous-status" class="remote-access-status" data-state="OFFLINE">
+            Inactive
+          </span>
+        </div>
+        <p class="settings-help">
+          Registers this Universe with the rendezvous broker for presence and join
+          requests. The broker never receives chat, source, or credentials.
+        </p>
+        <div id="rendezvous-summary" class="remote-access-endpoint"></div>
+        <div class="remote-access-actions">
+          <button id="refresh-rendezvous-button" type="button" class="secondary-button">
+            Refresh
+          </button>
+          <button id="stop-rendezvous-button" type="button" class="secondary-button">
+            Stop
+          </button>
+        </div>
+        <div>
+          <strong class="settings-subheading">Pending join requests</strong>
+          <div id="rendezvous-pending-list" class="remote-access-list"></div>
+        </div>
+      </section>
       <section class="settings-section">
         <div class="settings-section-heading">
           <div>

@@ -64,7 +64,10 @@ Hosts leave executable Runtime fields, endpoint, and Runtime Currentness
 Session image has been loaded. `SESSION_PREPARED` additionally requires
 Registry-backed Mode/Role/Scope/Profile resolution and loading that context.
 A Host session reference is optional observation provenance, not a preparation
-precondition.
+precondition. When Mode context is active and a provider session coordinate is
+known, Hosts should best-effort run
+`tools/universe_session_inject_hook.py` (see mode-change and session-ref-inject
+Skills). Universe offline must not block BOOT.
 
 PREPARING_SESSION and REBOOT rehydrate governance context from readable Anchor
 Snapshot evidence. In every source-only Mode, the snapshot is an
@@ -85,6 +88,16 @@ sets the Mode-entry default: `GOVERNANCE_ONLY` means that selecting the Mode
 alone does not start an executor. It does not veto a later explicitly approved
 task. When the current Task requirement and Evidence profile both require
 executable proof, an available Host routes to executor start.
+
+An explicit implementation request carries `execution_intent: IMPLEMENTATION`.
+When the Task and Evidence profiles are not yet bound, an available Host must
+return `EXECUTABLE_RUNTIME_START_PROPOSAL_REQUIRED` and keep the executor
+stopped. The Host presents the bounded start proposal for approval. After that
+approval is bound, it re-evaluates with both
+`task_requirement: EXECUTABLE_PROOF_REQUIRED` and
+`evidence_profile: EXECUTABLE_PROOF_REQUIRED`; only then does the result use
+`next_operation: EXECUTABLE_RUNTIME_START`. This transition does not grant
+authority or write permission.
 
 The Host first evaluates this with the deterministic Runtime surface:
 

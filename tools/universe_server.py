@@ -125,6 +125,14 @@ from universe_remote_connector import (
     start_connector,
     stop_connector,
 )
+from universe_rendezvous_client import (
+    RendezvousClientError,
+    UniverseRendezvousService,
+    config_from_environ,
+    default_rendezvous_config_path,
+    load_rendezvous_config,
+)
+from universe_multi_room import MultiRoomError, MultiRoomStore
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -11036,6 +11044,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_stop = threading.Event()
         self._conductor_session_error: dict[str, str] | None = None
         self.project_room_events = ProjectRoomEventHub()
+        self.multi_rooms = MultiRoomStore(str(store.database_path))
         self.conductor_permissions = ConductorPermissionBridge()
         super().__init__(address, UniverseRequestHandler)
         self.conductor_session_host = (
@@ -11133,8 +11142,152 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._supervisor_maintenance_worker.start()
+        self.rendezvous_service: UniverseRendezvousService | None = None
+        self._rendezvous_start_error: dict[str, str] | None = None
+        self._maybe_start_rendezvous()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
+
+    def _loopback_endpoint_url(self) -> str:
+        host, port = self.server_address[:2]
+        host_text = host.decode("ascii") if isinstance(host, bytes) else str(host)
+        if host_text in {"0.0.0.0", "::", ""}:
+            host_text = "127.0.0.1"
+        return f"http://{host_text}:{port}"
+
+    def _resolve_rendezvous_config(self) -> dict[str, Any] | None:
+        endpoint_url = (
+            os.environ.get("UNIVERSE_RENDEZVOUS_ENDPOINT_URL", "").strip() or None
+        )
+        if endpoint_url is None:
+            try:
+                connector = connector_status(
+                    self.remote_connector_state_path,
+                    include_config=True,
+                    config_path=self.remote_connector_config_path,
+                )
+                configuration = connector.get("configuration")
+                if isinstance(configuration, Mapping):
+                    public_base = str(configuration.get("public_base_url") or "").strip()
+                    if public_base:
+                        endpoint_url = public_base
+            except Exception:  # noqa: BLE001 - optional source
+                endpoint_url = None
+        if endpoint_url is None:
+            endpoint_url = self._loopback_endpoint_url()
+        try:
+            env_config = config_from_environ(endpoint_url=endpoint_url)
+            if env_config is not None:
+                return env_config
+        except RendezvousClientError:
+            raise
+        config_path = default_rendezvous_config_path()
+        if not config_path.is_file():
+            return None
+        config = load_rendezvous_config(config_path)
+        if not config.get("endpoint_url"):
+            config["endpoint_url"] = endpoint_url
+        return config
+
+    def _maybe_start_rendezvous(self) -> None:
+        try:
+            config = self._resolve_rendezvous_config()
+        except RendezvousClientError as error:
+            self.rendezvous_service = None
+            self._rendezvous_start_error = {
+                "code": error.code,
+                "detail": error.detail,
+            }
+            return
+        self._rendezvous_start_error = None
+        if config is None or not config.get("enabled", True):
+            return
+        try:
+            service = UniverseRendezvousService(config)
+            service.start()
+            self.rendezvous_service = service
+        except RendezvousClientError as error:
+            self.rendezvous_service = None
+            self._rendezvous_start_error = {
+                "code": error.code,
+                "detail": error.detail,
+            }
+
+    def rendezvous_status(self) -> dict[str, Any]:
+        if self.rendezvous_service is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "RENDEZVOUS_STATUS_COLLECTED",
+                "client": self.rendezvous_service.public_status(),
+            }
+        return {
+            "schema": API_SCHEMA,
+            "status": "RENDEZVOUS_STATUS_COLLECTED",
+            "client": {
+                "schema": "universe.rendezvous-client.v1",
+                "status": "RENDEZVOUS_INACTIVE",
+                "enabled": False,
+                "pending": [],
+                "pending_count": 0,
+                "last_error": self._rendezvous_start_error,
+            },
+        }
+
+    def start_rendezvous(self, value: Any | None = None) -> dict[str, Any]:
+        if self.rendezvous_service is not None:
+            self.rendezvous_service.stop()
+            self.rendezvous_service = None
+        config: dict[str, Any] | None
+        if isinstance(value, Mapping) and value:
+            from universe_rendezvous_client import normalize_rendezvous_config
+
+            config = normalize_rendezvous_config(value)
+        else:
+            config = self._resolve_rendezvous_config()
+        if config is None:
+            raise UniverseError(
+                "RENDEZVOUS_CONFIG_UNAVAILABLE",
+                "set UNIVERSE_RENDEZVOUS_URL or rendezvous-client-config.json",
+            )
+        try:
+            service = UniverseRendezvousService(config)
+            service.start()
+        except RendezvousClientError as error:
+            raise UniverseError(error.code, error.detail, error.status or 400) from error
+        self.rendezvous_service = service
+        self._rendezvous_start_error = None
+        return self.rendezvous_status()
+
+    def stop_rendezvous(self) -> dict[str, Any]:
+        if self.rendezvous_service is not None:
+            self.rendezvous_service.stop()
+            self.rendezvous_service = None
+        return self.rendezvous_status()
+
+    def decide_rendezvous_connect_request(
+        self, request_id: str, *, approve: bool
+    ) -> dict[str, Any]:
+        if self.rendezvous_service is None:
+            raise UniverseError(
+                "RENDEZVOUS_INACTIVE",
+                "rendezvous client is not active",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            result = (
+                self.rendezvous_service.approve(request_id)
+                if approve
+                else self.rendezvous_service.deny(request_id)
+            )
+        except RendezvousClientError as error:
+            raise UniverseError(error.code, error.detail, error.status or 400) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "RENDEZVOUS_CONNECT_REQUEST_DECIDED",
+            "decision": "APPROVED" if approve else "DENIED",
+            "result": result,
+            "client": self.rendezvous_service.public_status(),
+        }
 
     def remote_access_status(
         self, *, include_configuration: bool = False
@@ -11898,6 +12051,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "state": state,
                     }
                 )
+        # Drop zombie LIVE rows (dead PID / no owned lease) before Observatory reads.
+        try:
+            live_sweep = self.session_supervisor.sweep_stale_live_sessions()
+        except SessionSupervisorError as error:
+            live_sweep = {
+                "status": "LIVE_SESSION_SWEEP_FAILED",
+                "error_code": error.code,
+                "detail": str(error),
+            }
         conductor_permissions = self.conductor_permissions.list_requests(limit=100)
         project_permissions = self.store.list_all_agent_permissions(limit=200)
         worker_bench = self.store.compare_skill_bench(group_by="worker", limit=50)
@@ -11906,6 +12068,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "RUNTIME_AUDIT_COLLECTED",
             "observed_at": utc_now(),
             "preflight": self.runtime_preflight(),
+            "live_session_sweep": live_sweep,
             "sessions": self.session_supervisor.list_sessions()[:200],
             "recent_events": self.session_supervisor.list_events(limit=100),
             "platform_approvals": {
@@ -12008,6 +12171,38 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def prepare_project_master_session(self, project_id: str) -> dict[str, Any]:
         host = self.ensure_project_master(project_id)
+        multi_room = None
+        bridge_line = None
+        try:
+            room = self.multi_rooms.ensure_project_room(project_id)
+            connection = (
+                self.project_master_hosts.connection_status(project_id)
+                if self.project_master_hosts is not None
+                else None
+            )
+            if isinstance(connection, Mapping):
+                self.multi_rooms.attach_session(
+                    room["room_id"],
+                    {
+                        "slot_role": "MASTER",
+                        "provider": connection.get("provider")
+                        or connection.get("last_provider"),
+                        "provider_session_ref": connection.get("session_ref")
+                        or connection.get("last_session_ref")
+                        or connection.get("provider_session_ref"),
+                        "display_name": "Project Master",
+                    },
+                )
+            snap = self.multi_rooms.room_snapshot(room["room_id"])
+            multi_room = {
+                "room": snap["room"],
+                "bindings": snap["bindings"],
+                "messages": snap["messages"][-20:],
+            }
+            bridge_line = snap["bridge_line"]
+        except MultiRoomError:
+            multi_room = None
+            bridge_line = None
         return {
             "schema": API_SCHEMA,
             "status": "PROJECT_MASTER_SESSION_PREPARED",
@@ -12018,6 +12213,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if self.project_master_hosts is not None
                 else None
             ),
+            "multi_room": multi_room,
+            "bridge_line": bridge_line,
         }
 
     def send_project_room_message(
@@ -12584,6 +12781,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if self.conductor_runtime is not None:
             close_step("conductor_runtime", self.conductor_runtime.stop)
             self.conductor_runtime = None
+        if self.rendezvous_service is not None:
+            close_step("rendezvous_service", self.rendezvous_service.stop)
+            self.rendezvous_service = None
         close_step("http_server", super().server_close)
         print(
             json.dumps(
@@ -12636,11 +12836,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/supervisor/sessions":
             query = parse_qs(urlsplit(self.path).query)
+            try:
+                sweep = self.server.session_supervisor.sweep_stale_live_sessions()
+            except SessionSupervisorError as error:
+                sweep = {
+                    "status": "LIVE_SESSION_SWEEP_FAILED",
+                    "error_code": error.code,
+                    "detail": str(error),
+                }
             self._send(
                 HTTPStatus.OK,
                 {
                     "schema": API_SCHEMA,
                     "status": "SUPERVISOR_SESSIONS_COLLECTED",
+                    "live_session_sweep": sweep,
                     "sessions": self.server.session_supervisor.list_sessions(
                         node=query.get("node", [None])[0],
                         mode=query.get("mode", [None])[0],
@@ -12766,6 +12975,59 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     )
                 ),
             )
+            return
+        if path == "/v1/settings/rendezvous":
+            self._send(HTTPStatus.OK, self.server.rendezvous_status())
+            return
+        if path == "/v1/rooms":
+            try:
+                query_map = parse_qs(urlsplit(self.path).query)
+                project_id = (query_map.get("project_id") or [None])[0]
+                room_type = (query_map.get("room_type") or [None])[0]
+                rooms = self.server.multi_rooms.list_rooms(
+                    project_id=project_id or None,
+                    room_type=room_type or None,
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOMS_COLLECTED",
+                        "rooms": rooms,
+                    },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        room_get = re.fullmatch(r"/v1/rooms/([^/]+)$", path)
+        if room_get is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.multi_rooms.room_snapshot(unquote(room_get.group(1))),
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        room_stream = re.fullmatch(r"/v1/rooms/([^/]+)/stream$", path)
+        if room_stream is not None:
+            self._stream_multi_room(unquote(room_stream.group(1)))
+            return
+        room_messages = re.fullmatch(r"/v1/rooms/([^/]+)/messages$", path)
+        if room_messages is not None:
+            try:
+                room_id = unquote(room_messages.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOM_MESSAGES_COLLECTED",
+                        "room_id": room_id,
+                        "messages": self.server.multi_rooms.list_messages(room_id),
+                    },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
             return
         if path == "/v1/settings/host-tools":
             try:
@@ -13392,6 +13654,154 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/settings/remote-access/stop":
                 self._send(HTTPStatus.OK, self.server.stop_remote_access())
+                return
+            if path == "/v1/settings/rendezvous/start":
+                self._send(HTTPStatus.OK, self.server.start_rendezvous(body))
+                return
+            if path == "/v1/settings/rendezvous/stop":
+                self._send(HTTPStatus.OK, self.server.stop_rendezvous())
+                return
+            if path == "/v1/rooms":
+                try:
+                    room_type = str((body or {}).get("room_type") or "PROJECT").upper()
+                    if room_type == "MEETING":
+                        result = self.server.multi_rooms.create_meeting_room(body or {})
+                    elif room_type == "BOSS":
+                        result = {
+                            "status": "BOSS_ROOM_CREATED",
+                            "room": self.server.multi_rooms.create_boss_room(
+                                project_id=str((body or {}).get("project_id") or ""),
+                                task_frame_id=str(
+                                    (body or {}).get("task_frame_id") or ""
+                                ),
+                                title=(body or {}).get("title"),
+                                boss_session=(body or {}).get("boss_session"),
+                            ),
+                        }
+                    else:
+                        project_id = (body or {}).get("project_id")
+                        room = self.server.multi_rooms.create_room(
+                            room_type=room_type,
+                            title=str((body or {}).get("title") or "Room"),
+                            host_role=str((body or {}).get("host_role") or "MASTER"),
+                            project_id=project_id,
+                            task_frame_id=(body or {}).get("task_frame_id"),
+                            metadata=(body or {}).get("metadata"),
+                        )
+                        result = {"status": "ROOM_CREATED", "room": room}
+                    self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            if path == "/v1/sessions/inject":
+                try:
+                    result = perform_session_ref_inject(
+                        session_supervisor=self.server.session_supervisor,
+                        multi_rooms=self.server.multi_rooms,
+                        body=body or {},
+                    )
+                    self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                except SessionSupervisorError as error:
+                    self._send_supervisor_error(error)
+                except UniverseError as error:
+                    self._send_error(error)
+                return
+            room_attach = re.fullmatch(r"/v1/rooms/([^/]+)/attach$", path)
+            if room_attach is not None:
+                try:
+                    result = self.server.multi_rooms.attach_session(
+                        unquote(room_attach.group(1)), body or {}
+                    )
+                    self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_message_post = re.fullmatch(r"/v1/rooms/([^/]+)/messages$", path)
+            if room_message_post is not None:
+                try:
+                    message = self.server.multi_rooms.post_message(
+                        unquote(room_message_post.group(1)), body or {}
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_MESSAGE_RECORDED",
+                            "message": message,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_call_master = re.fullmatch(r"/v1/rooms/([^/]+)/call-master$", path)
+            if room_call_master is not None:
+                try:
+                    result = self.server.multi_rooms.call_master(
+                        unquote(room_call_master.group(1)), body or {}
+                    )
+                    self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_worker_report = re.fullmatch(r"/v1/rooms/([^/]+)/worker-report$", path)
+            if room_worker_report is not None:
+                try:
+                    result = self.server.multi_rooms.worker_report(
+                        unquote(room_worker_report.group(1)), body or {}
+                    )
+                    self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_close = re.fullmatch(r"/v1/rooms/([^/]+)/close$", path)
+            if room_close is not None:
+                try:
+                    room = self.server.multi_rooms.close_room(
+                        unquote(room_close.group(1))
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_CLOSED",
+                            "room": room,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            if path == "/v1/projects/ensure-room":
+                try:
+                    project_id = str((body or {}).get("project_id") or "")
+                    room = self.server.multi_rooms.ensure_project_room(project_id)
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "PROJECT_ROOM_READY",
+                            "room": room,
+                            "bridge_line": self.server.multi_rooms.room_snapshot(
+                                room["room_id"]
+                            )["bridge_line"],
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            rendezvous_decision = re.fullmatch(
+                r"/v1/settings/rendezvous/connect-requests/([^/]+)/(approve|deny)",
+                path,
+            )
+            if rendezvous_decision is not None:
+                request_id, decision = rendezvous_decision.groups()
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.decide_rendezvous_connect_request(
+                        unquote(request_id), approve=decision == "approve"
+                    ),
+                )
                 return
             if path == "/v1/settings/remote-access/pairings":
                 self._send(
@@ -14757,6 +15167,62 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _send_multi_room_error(self, error: MultiRoomError) -> None:
+        self._send(
+            HTTPStatus(error.status) if error.status in {400, 403, 404, 409} else HTTPStatus.BAD_REQUEST,
+            {
+                "schema": API_SCHEMA,
+                "status": "ERROR",
+                "error_code": error.code,
+                "detail": error.detail,
+            },
+        )
+
+    def _stream_multi_room(self, room_id: str) -> None:
+        try:
+            snapshot = self.server.multi_rooms.room_snapshot(room_id)
+        except MultiRoomError as error:
+            self._send_multi_room_error(error)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def write_event(event_name: str, payload: Mapping[str, Any]) -> None:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            chunk = f"event: {event_name}\ndata: {body}\n\n".encode("utf-8")
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+        write_event(
+            "snapshot",
+            {
+                "type": "SNAPSHOT",
+                "room": snapshot["room"],
+                "bindings": snapshot["bindings"],
+                "messages": snapshot["messages"],
+                "bridge_line": snapshot["bridge_line"],
+            },
+        )
+        cursor = self.server.multi_rooms.hub.cursor()
+        try:
+            while True:
+                events = self.server.multi_rooms.hub.wait(
+                    room_id,
+                    after_event_id=cursor,
+                    timeout_seconds=15.0,
+                )
+                if not events:
+                    write_event("ping", {"type": "PING", "at": utc_now()})
+                    continue
+                for event in events:
+                    cursor = max(cursor, int(event["event_id"]))
+                    write_event("room", event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
     def _send_error(self, error: UniverseError) -> None:
         self._send(
             error.status,
@@ -14991,6 +15457,177 @@ def request_json(
     return transport.request_json(method=method, path=path, payload=payload)
 
 
+def supervisor_session_id_for(
+    *,
+    node: str,
+    mode: str,
+    provider: str,
+    provider_session_ref: str,
+) -> str:
+    """Stable Supervisor session_id from (node, mode, provider, provider_session_ref)."""
+    material = json.dumps(
+        {
+            "node": node,
+            "mode": mode,
+            "provider": provider,
+            "provider_session_ref": provider_session_ref,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "session_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def perform_session_ref_inject(
+    *,
+    session_supervisor: SessionSupervisorStore,
+    multi_rooms: MultiRoomStore,
+    body: Mapping[str, Any],
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Harness boot inject: Supervisor register (+ optional default) then room attach.
+
+    Observatory is not required. Caller may omit room_id and pass project_id to
+    ensure/open the PROJECT multi-room and bind the MASTER (or other) slot.
+    """
+    if not isinstance(body, Mapping):
+        raise UniverseError(
+            "SESSION_INJECT_REQUEST_INVALID",
+            "request body must be an object",
+        )
+    normalized_provider = _required_text(
+        body.get("provider"), "provider"
+    ).upper()
+    if normalized_provider not in {"CLAUDE", "CODEX", "GROK"}:
+        raise UniverseError(
+            "SESSION_PROVIDER_INVALID",
+            f"unsupported session provider: {normalized_provider}",
+        )
+    normalized_ref = str(
+        body.get("provider_session_ref") or body.get("session_ref") or ""
+    ).strip()
+    ref_source = "EXPLICIT"
+    if not normalized_ref:
+        env = os.environ if environment is None else environment
+        environment_key = {"CODEX": "CODEX_THREAD_ID"}.get(normalized_provider)
+        if environment_key:
+            normalized_ref = str(env.get(environment_key) or "").strip()
+            if normalized_ref:
+                ref_source = environment_key
+    if not normalized_ref:
+        raise UniverseError(
+            "PROVIDER_SESSION_REF_REQUIRED",
+            "provider session ref is required; Codex Desktop may supply CODEX_THREAD_ID",
+        )
+
+    room_id = body.get("room_id")
+    project_id = body.get("project_id")
+    if not room_id and not project_id:
+        raise UniverseError(
+            "INJECT_TARGET_REQUIRED",
+            "room_id or project_id is required",
+        )
+    room_type = str(body.get("room_type") or "PROJECT").strip().upper() or "PROJECT"
+    slot_role = str(
+        body.get("slot_role") or body.get("role") or "MASTER"
+    ).strip().upper() or "MASTER"
+
+    # Resolve node/mode for Supervisor identity. Prefer explicit fields; else
+    # project room MASTER → (project_id, MASTER).
+    if room_id and not project_id:
+        try:
+            room = multi_rooms.get_room(str(room_id))
+            project_id = room.get("project_id")
+            room_type = str(room.get("room_type") or room_type).upper()
+        except MultiRoomError:
+            room = None
+    normalized_node = str(
+        body.get("node") or project_id or "CONDUCTOR"
+    ).strip()
+    if not normalized_node:
+        normalized_node = "CONDUCTOR"
+    normalized_mode = str(body.get("mode") or "MASTER").strip().upper() or "MASTER"
+
+    explicit_session_id = str(
+        body.get("supervisor_session_id") or body.get("session_id") or ""
+    ).strip()
+    session_id = explicit_session_id or supervisor_session_id_for(
+        node=normalized_node,
+        mode=normalized_mode,
+        provider=normalized_provider,
+        provider_session_ref=normalized_ref,
+    )
+    normalized_alias = str(body.get("alias") or "").strip() or (
+        f"{normalized_node} {normalized_mode} | {normalized_provider}"
+    )
+    make_default_raw = body.get("make_default")
+    if make_default_raw is None:
+        make_default = slot_role == "MASTER" and room_type == "PROJECT"
+    else:
+        make_default = bool(make_default_raw)
+
+    session, created = session_supervisor.register_session(
+        {
+            "session_id": session_id,
+            "node": normalized_node,
+            "mode": normalized_mode,
+            "provider": normalized_provider,
+            "provider_session_ref": normalized_ref,
+            "alias": normalized_alias,
+            "state": str(body.get("state") or "DISCONNECTED").strip().upper()
+            or "DISCONNECTED",
+            "currentness": "UNKNOWN",
+            "bounded_summary": str(
+                body.get("bounded_summary")
+                or "Harness inject of provider session ref"
+            ).strip(),
+        }
+    )
+    default_selection: Mapping[str, Any] | None = None
+    if make_default and not bool(session.get("is_default")):
+        default_selection = session_supervisor.set_default(
+            session_id,
+            expected_pointer_version=session.get("default_pointer_version"),
+        )
+        session = dict(session)
+        session["is_default"] = True
+        session["default_pointer_version"] = (
+            default_selection.get("pointer_version")
+            if isinstance(default_selection, Mapping)
+            else session.get("default_pointer_version")
+        )
+
+    room_result = multi_rooms.inject_session_ref(
+        {
+            "room_id": room_id,
+            "project_id": project_id,
+            "room_type": room_type,
+            "slot_role": slot_role,
+            "provider": normalized_provider,
+            "provider_session_ref": normalized_ref,
+            "supervisor_session_id": session_id,
+            "display_name": body.get("display_name") or normalized_alias,
+        }
+    )
+    return {
+        **room_result,
+        "schema": API_SCHEMA,
+        "status": "SESSION_REF_INJECTED",
+        "supervisor_session": session,
+        "supervisor_session_created": created,
+        "provider_session_ref_source": ref_source,
+        "make_default": make_default,
+        "default_selection": (
+            dict(default_selection) if default_selection is not None else None
+        ),
+        "resident_runtime_reload": (
+            "REQUIRED" if make_default and default_selection is not None else "NOT_REQUIRED"
+        ),
+        "authority": "UNASSIGNED",
+        "execution_assignment": "UNASSIGNED",
+    }
+
+
 def attach_supervisor_session(
     *,
     endpoint: str,
@@ -15024,17 +15661,12 @@ def attach_supervisor_session(
             "PROVIDER_SESSION_REF_REQUIRED",
             "provider session ref is required; Codex Desktop may supply CODEX_THREAD_ID",
         )
-    material = json.dumps(
-        {
-            "node": normalized_node,
-            "mode": normalized_mode,
-            "provider": normalized_provider,
-            "provider_session_ref": normalized_ref,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    session_id = supervisor_session_id_for(
+        node=normalized_node,
+        mode=normalized_mode,
+        provider=normalized_provider,
+        provider_session_ref=normalized_ref,
     )
-    session_id = "session_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
     normalized_alias = str(alias or "").strip() or (
         f"{normalized_node} {normalized_mode} | {normalized_provider}"
     )
@@ -15106,6 +15738,79 @@ def attach_supervisor_session(
             "REQUIRED" if make_default and default_selection is not None else "NOT_REQUIRED"
         ),
     }
+
+
+def request_session_ref_inject(
+    *,
+    endpoint: str,
+    token: str,
+    args: Any,
+) -> tuple[int, dict[str, Any]]:
+    """CLI/HTTP client for POST /v1/sessions/inject (Supervisor + room)."""
+    payload: dict[str, Any] = {}
+    seed_path = getattr(args, "seed_file", None)
+    if seed_path is not None:
+        path = Path(seed_path).expanduser()
+        raw = path.read_text(encoding="utf-8")
+        seed = json.loads(raw)
+        if not isinstance(seed, dict):
+            raise UniverseError(
+                "SESSION_INJECT_SEED_INVALID",
+                "seed file must be a JSON object",
+            )
+        payload.update(seed)
+    for key, attr in (
+        ("project_id", "project_id"),
+        ("room_id", "room_id"),
+        ("room_type", "room_type"),
+        ("slot_role", "slot_role"),
+        ("node", "node"),
+        ("mode", "mode"),
+        ("provider", "provider"),
+        ("alias", "alias"),
+        ("display_name", "display_name"),
+    ):
+        value = str(getattr(args, attr, "") or "").strip()
+        if value:
+            payload[key] = value
+    ref = str(
+        getattr(args, "provider_session_ref", "")
+        or getattr(args, "session_ref", "")
+        or ""
+    ).strip()
+    if ref:
+        payload["provider_session_ref"] = ref
+    elif "session_ref" in payload and "provider_session_ref" not in payload:
+        payload["provider_session_ref"] = payload["session_ref"]
+    make_default = getattr(args, "make_default", None)
+    if make_default is not None:
+        payload["make_default"] = bool(make_default)
+    if not payload.get("provider"):
+        raise UniverseError(
+            "SESSION_PROVIDER_INVALID",
+            "provider is required (flag or seed file)",
+        )
+    if not (
+        payload.get("provider_session_ref")
+        or payload.get("session_ref")
+        or os.environ.get("CODEX_THREAD_ID")
+    ):
+        raise UniverseError(
+            "PROVIDER_SESSION_REF_REQUIRED",
+            "provider session ref is required (flag, seed, or CODEX_THREAD_ID)",
+        )
+    if not payload.get("room_id") and not payload.get("project_id"):
+        raise UniverseError(
+            "INJECT_TARGET_REQUIRED",
+            "room_id or project_id is required (flag or seed file)",
+        )
+    return request_json(
+        endpoint=endpoint,
+        token=token,
+        method="POST",
+        path="/v1/sessions/inject",
+        payload=payload,
+    )
 
 
 def publish_skill_observation(
@@ -15422,6 +16127,43 @@ def parser() -> argparse.ArgumentParser:
         "--state-file", type=Path, default=default_state_path()
     )
 
+    inject_session = commands.add_parser(
+        "inject-session",
+        help=(
+            "Push provider session_ref into Supervisor + multi-room slot "
+            "(harness boot path; Observatory not required)"
+        ),
+    )
+    inject_session.add_argument("--project-id", default="")
+    inject_session.add_argument("--room-id", default="")
+    inject_session.add_argument("--room-type", default="PROJECT")
+    inject_session.add_argument("--slot-role", default="MASTER")
+    inject_session.add_argument("--node", default="")
+    inject_session.add_argument("--mode", default="MASTER")
+    inject_session.add_argument("--provider", default="CODEX")
+    inject_session.add_argument("--provider-session-ref", default="")
+    inject_session.add_argument("--session-ref", default="")
+    inject_session.add_argument("--alias", default="")
+    inject_session.add_argument("--display-name", default="")
+    inject_session.add_argument(
+        "--make-default", dest="make_default", action="store_true"
+    )
+    inject_session.add_argument(
+        "--no-make-default", dest="make_default", action="store_false"
+    )
+    inject_session.add_argument(
+        "--seed-file",
+        type=Path,
+        default=None,
+        help="Optional JSON seed with provider/session_ref/project_id fields",
+    )
+    inject_session.set_defaults(make_default=None)
+    inject_session.add_argument("--endpoint", default="")
+    inject_session.add_argument("--token", default="")
+    inject_session.add_argument(
+        "--state-file", type=Path, default=default_state_path()
+    )
+
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)
     register.add_argument("--project-root", type=Path, required=True)
@@ -15678,6 +16420,12 @@ def main() -> int:
                     provider_session_ref=args.provider_session_ref,
                     alias=args.alias,
                     make_default=bool(args.make_default),
+                )
+            elif args.command == "inject-session":
+                status, result = request_session_ref_inject(
+                    endpoint=endpoint,
+                    token=token,
+                    args=args,
                 )
             elif args.command == "register":
                 status, result = request_json(

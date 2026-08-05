@@ -419,6 +419,30 @@ def _task_operation(runtime: TaskFrameRuntime, value: Any, index: int) -> Any:
             ),
             observed_at=_required_text(payload, "observed_at", context),
         )
+    if operation == "worker_initialization_failed":
+        _exact_fields(
+            payload,
+            {
+                "operation",
+                "turn_id",
+                "worker_id",
+                "worker_run_ref",
+                "failure_code",
+                "failure_detail",
+                "host_evidence_ref",
+                "observed_at",
+            },
+            context,
+        )
+        return runtime.worker_initialization_failed(
+            turn_id=_required_text(payload, "turn_id", context),
+            worker_id=_required_text(payload, "worker_id", context),
+            worker_run_ref=_required_text(payload, "worker_run_ref", context),
+            failure_code=_required_text(payload, "failure_code", context),
+            failure_detail=_required_text(payload, "failure_detail", context),
+            host_evidence_ref=_required_text(payload, "host_evidence_ref", context),
+            observed_at=_required_text(payload, "observed_at", context),
+        )
     if operation == "submit_boss_allocations":
         _exact_fields(
             payload,
@@ -895,6 +919,7 @@ def _prepare_session(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
             "mode_profile",
             "task_requirement",
             "evidence_profile",
+            "execution_intent",
         },
         "request",
     )
@@ -946,6 +971,9 @@ def _prepare_session(args: Sequence[str]) -> tuple[int, Mapping[str, Any]]:
                 ),
                 evidence_profile=_optional_text(
                     request, "evidence_profile", "request", default="NONE"
+                ),
+                execution_intent=_optional_text(
+                    request, "execution_intent", "request", default="NONE"
                 ),
             ),
             mode_registry=registry,

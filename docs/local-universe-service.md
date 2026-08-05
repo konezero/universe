@@ -507,6 +507,12 @@ The first slice supports:
 
 ## Project Master Bridge
 
+Product multi-room architecture (Project room, Boss room, Meeting room,
+dashboard, session inject, continuity bridge) is specified in
+`docs/multi-room-chat-architecture.md`. Project Master session attach and
+streaming mirror for the Project room are detailed in
+`docs/room-session-attach-streaming.md`.
+
 A Project Room is durable Universe-side conversation history. It is not, by
 itself, a vendor chat session. A project may register one local Project Master
 Bridge to carry room messages to a separately running Project Host:

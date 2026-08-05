@@ -44,6 +44,12 @@ Secondary (implemented surfaces):
 MEMORY | FUTURE | BENCH | DISPATCH | SETTINGS
 ```
 
+Multi-room chat product model (Project / Boss / Meeting rooms, dashboard,
+function-first UI before major redesign) lives in
+`docs/multi-room-chat-architecture.md`. Session Observatory remains one session
+entry; session-ref inject and room attach are first-class and must not depend
+on Observatory discoverability alone.
+
 Current SPA mapping:
 
 | Design view | Current surface |

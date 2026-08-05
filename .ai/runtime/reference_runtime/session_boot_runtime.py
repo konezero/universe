@@ -42,6 +42,7 @@ HOST_EXECUTABLE_CAPABILITIES = frozenset({"AVAILABLE", "UNAVAILABLE", "UNKNOWN"}
 MODE_PROFILES = frozenset({"GOVERNANCE_ONLY", "EXECUTABLE_PROOF_REQUIRED"})
 TASK_REQUIREMENTS = frozenset({"NONE", "EXECUTABLE_PROOF_REQUIRED"})
 EVIDENCE_PROFILES = frozenset({"NONE", "EXECUTABLE_PROOF_REQUIRED"})
+EXECUTION_INTENTS = frozenset({"NONE", "IMPLEMENTATION"})
 
 INSTALLATION_MANIFEST_REF = ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
 RUNTIME_STATE_REF = ".ai/runtime/state/session.md"
@@ -82,6 +83,7 @@ class SessionPreparationRequest:
     mode_profile: str = "GOVERNANCE_ONLY"
     task_requirement: str = "NONE"
     evidence_profile: str = "NONE"
+    execution_intent: str = "NONE"
 
     def normalized(self) -> "SessionPreparationRequest":
         command = _required_text(self.command, "session_preparation.command").upper()
@@ -131,6 +133,14 @@ class SessionPreparationRequest:
                 "SESSION_PREPARATION_EVIDENCE_PROFILE_INVALID",
                 f"unsupported Evidence profile: {evidence_profile}",
             )
+        execution_intent = _required_text(
+            self.execution_intent, "session_preparation.execution_intent"
+        ).upper()
+        if execution_intent not in EXECUTION_INTENTS:
+            raise SessionBootError(
+                "SESSION_PREPARATION_EXECUTION_INTENT_INVALID",
+                f"unsupported execution intent: {execution_intent}",
+            )
         return SessionPreparationRequest(
             command=command,
             source_state=source_state,
@@ -155,6 +165,7 @@ class SessionPreparationRequest:
             mode_profile=mode_profile,
             task_requirement=task_requirement,
             evidence_profile=evidence_profile,
+            execution_intent=execution_intent,
         )
 
 
@@ -273,7 +284,11 @@ def _unknown_executable_runtime(request: SessionPreparationRequest) -> dict[str,
         request.task_requirement == "EXECUTABLE_PROOF_REQUIRED"
         and request.evidence_profile == "EXECUTABLE_PROOF_REQUIRED"
     )
-    if task_evidence_requires_execution:
+    implementation_intent_requires_proposal = (
+        request.execution_intent == "IMPLEMENTATION"
+        and not task_evidence_requires_execution
+    )
+    if task_evidence_requires_execution or implementation_intent_requires_proposal:
         decision = {
             "AVAILABLE": "EXECUTION_HOST_START_REQUIRED",
             "UNAVAILABLE": "EXECUTION_HOST_UNAVAILABLE",
@@ -293,8 +308,20 @@ def _unknown_executable_runtime(request: SessionPreparationRequest) -> dict[str,
         "host_executable_capability": request.host_executable_capability,
         "start_decision": decision,
         "next_operation": (
-            "EXECUTABLE_RUNTIME_START"
+            "EXECUTABLE_RUNTIME_START_PROPOSAL_REQUIRED"
+            if (
+                implementation_intent_requires_proposal
+                and decision == "EXECUTION_HOST_START_REQUIRED"
+            )
+            else "EXECUTABLE_RUNTIME_START"
             if decision == "EXECUTION_HOST_START_REQUIRED"
+            else "NONE"
+        ),
+        "execution_transition": (
+            "PROPOSAL_REQUIRED"
+            if implementation_intent_requires_proposal
+            else "PROFILE_BOUND"
+            if task_evidence_requires_execution
             else "NONE"
         ),
     }

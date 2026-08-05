@@ -199,6 +199,22 @@ const elements = {
   startRemoteAccess: document.querySelector("#start-remote-access-button"),
   stopRemoteAccess: document.querySelector("#stop-remote-access-button"),
   createPairing: document.querySelector("#create-pairing-button"),
+  rendezvousStatus: document.querySelector("#rendezvous-status"),
+  rendezvousSummary: document.querySelector("#rendezvous-summary"),
+  rendezvousPendingList: document.querySelector("#rendezvous-pending-list"),
+  refreshRendezvous: document.querySelector("#refresh-rendezvous-button"),
+  stopRendezvous: document.querySelector("#stop-rendezvous-button"),
+  multiRoomList: document.querySelector("#multi-room-list"),
+  multiRoomDetail: document.querySelector("#multi-room-detail"),
+  multiRoomMessage: document.querySelector("#multi-room-message"),
+  refreshRooms: document.querySelector("#refresh-rooms-button"),
+  createMeetingRoom: document.querySelector("#create-meeting-room-button"),
+  postRoomMessage: document.querySelector("#post-room-message-button"),
+  callMasterButton: document.querySelector("#call-master-button"),
+  injectProjectId: document.querySelector("#inject-project-id"),
+  injectProvider: document.querySelector("#inject-provider"),
+  injectSessionRef: document.querySelector("#inject-session-ref"),
+  injectSessionRefButton: document.querySelector("#inject-session-ref-button"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
@@ -2036,6 +2052,233 @@ async function revokeRemoteDevice(deviceId) {
   toast("Device revoked");
 }
 
+function renderRendezvousSettings() {
+  if (!elements.rendezvousStatus || !elements.rendezvousPendingList) {
+    return;
+  }
+  const payload = state.rendezvous || {};
+  const client = payload.client || {};
+  const active = client.status === "RENDEZVOUS_ACTIVE";
+  elements.rendezvousStatus.dataset.state = active ? "READY" : "OFFLINE";
+  elements.rendezvousStatus.textContent = active ? "Online" : "Inactive";
+  if (elements.rendezvousSummary) {
+    const parts = [];
+    if (client.universe_id) {
+      parts.push(`id ${client.universe_id}`);
+    }
+    if (client.endpoint_url) {
+      parts.push(client.endpoint_url);
+    }
+    if (client.last_error?.code) {
+      parts.push(`${client.last_error.code}: ${client.last_error.detail || ""}`);
+    }
+    elements.rendezvousSummary.textContent = parts.join(" · ") || "Not registered";
+  }
+  if (elements.stopRendezvous) {
+    elements.stopRendezvous.disabled = !active;
+  }
+  elements.rendezvousPendingList.replaceChildren();
+  const pending = client.pending || [];
+  if (!pending.length) {
+    elements.rendezvousPendingList.append(
+      node("p", "empty-copy", "No pending join requests")
+    );
+  }
+  for (const item of pending) {
+    const row = node("div", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", item.connect_request_id || "request"),
+      node(
+        "small",
+        "",
+        `expires ${item.expires_at != null ? item.expires_at : "UNKNOWN"}`
+      )
+    );
+    const actions = node("div", "remote-access-row-actions");
+    const approve = node("button", "primary-button compact-action", "Approve");
+    approve.type = "button";
+    approve.dataset.rendezvousRequestId = item.connect_request_id;
+    approve.dataset.decision = "approve";
+    const deny = node("button", "icon-button remote-pairing-decision", "×");
+    deny.type = "button";
+    deny.title = "Deny join";
+    deny.dataset.rendezvousRequestId = item.connect_request_id;
+    deny.dataset.decision = "deny";
+    actions.append(approve, deny);
+    row.append(copy, actions);
+    elements.rendezvousPendingList.append(row);
+  }
+}
+
+async function refreshRendezvousSettings() {
+  state.rendezvous = await api("/v1/settings/rendezvous");
+  renderRendezvousSettings();
+}
+
+async function stopRendezvousClient() {
+  await api("/v1/settings/rendezvous/stop", { method: "POST", body: {} });
+  await refreshRendezvousSettings();
+  toast("Rendezvous stopped");
+}
+
+async function decideRendezvousRequest(requestId, decision) {
+  await api(
+    `/v1/settings/rendezvous/connect-requests/${encodeURIComponent(requestId)}/${decision}`,
+    { method: "POST", body: {} }
+  );
+  await refreshRendezvousSettings();
+  toast(decision === "approve" ? "Join approved" : "Join denied");
+}
+
+let rendezvousRefreshTimer = null;
+
+function stopRendezvousRefreshTimer() {
+  if (rendezvousRefreshTimer != null) {
+    clearInterval(rendezvousRefreshTimer);
+    rendezvousRefreshTimer = null;
+  }
+}
+
+function startRendezvousRefreshTimer() {
+  stopRendezvousRefreshTimer();
+  rendezvousRefreshTimer = setInterval(() => {
+    if (!elements.settingsDialog?.open) {
+      stopRendezvousRefreshTimer();
+      return;
+    }
+    refreshRendezvousSettings().catch(() => {});
+  }, 4000);
+}
+
+async function refreshMultiRooms() {
+  if (!elements.multiRoomList) return;
+  const data = await api("/v1/rooms");
+  state.multiRooms = data.rooms || [];
+  elements.multiRoomList.replaceChildren();
+  if (!state.multiRooms.length) {
+    elements.multiRoomList.append(node("p", "empty-copy", "No multi-rooms yet"));
+    return;
+  }
+  for (const room of state.multiRooms) {
+    const row = node("div", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${room.room_type} · ${room.title}`),
+      node("small", "", room.room_id)
+    );
+    const open = node("button", "secondary-button compact-action", "Open");
+    open.type = "button";
+    open.addEventListener("click", () => {
+      openMultiRoom(room.room_id).catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+    row.append(copy, open);
+    elements.multiRoomList.append(row);
+  }
+}
+
+async function openMultiRoom(roomId) {
+  state.activeMultiRoomId = roomId;
+  const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
+  if (elements.multiRoomDetail) {
+    const lines = [
+      snap.bridge_line || "",
+      `write_roles=${(snap.write_roles || []).join(",")}`,
+      `user_may_write=${snap.user_may_write}`,
+      `messages=${(snap.messages || []).length}`,
+      ...(snap.messages || []).slice(-5).map(
+        (m) => `${m.author_role}: ${m.body_text}`
+      ),
+    ];
+    elements.multiRoomDetail.textContent = lines.join("\n");
+  }
+}
+
+async function createMeetingRoomThin() {
+  const project = state.selectedProjectId || state.projects?.[0]?.project_id || null;
+  await api("/v1/rooms", {
+    method: "POST",
+    body: {
+      room_type: "MEETING",
+      title: "Meeting",
+      topic: "function-first debate",
+      project_id: project,
+      models: [
+        { provider: "GROK", display_name: "Grok" },
+        { provider: "CLAUDE", display_name: "Claude" },
+      ],
+    },
+  });
+  await refreshMultiRooms();
+  toast("Meeting room created");
+}
+
+async function postActiveRoomAsUser() {
+  if (!state.activeMultiRoomId) {
+    throw new Error("Open a room first");
+  }
+  const text = elements.multiRoomMessage?.value?.trim() || "";
+  if (!text) throw new Error("Message required");
+  await api(`/v1/rooms/${encodeURIComponent(state.activeMultiRoomId)}/messages`, {
+    method: "POST",
+    body: { author_role: "USER", body_text: text },
+  });
+  elements.multiRoomMessage.value = "";
+  await openMultiRoom(state.activeMultiRoomId);
+  toast("Posted");
+}
+
+async function callMasterOnActiveRoom() {
+  if (!state.activeMultiRoomId) {
+    throw new Error("Open a boss room first");
+  }
+  await api(`/v1/rooms/${encodeURIComponent(state.activeMultiRoomId)}/call-master`, {
+    method: "POST",
+    body: { reason: "operator call", auto_attach_master: true },
+  });
+  await openMultiRoom(state.activeMultiRoomId);
+  toast("Master called");
+}
+
+async function injectSessionRefThin() {
+  const projectId =
+    elements.injectProjectId?.value?.trim() ||
+    state.selectedProjectId ||
+    state.projects?.[0]?.project_id ||
+    "";
+  const provider = elements.injectProvider?.value || "CODEX";
+  const sessionRef = elements.injectSessionRef?.value?.trim() || "";
+  if (!projectId) {
+    throw new Error("project id required (field or selected project)");
+  }
+  if (!sessionRef) {
+    throw new Error("session ref required");
+  }
+  const result = await api("/v1/sessions/inject", {
+    method: "POST",
+    body: {
+      project_id: projectId,
+      room_type: "PROJECT",
+      slot_role: "MASTER",
+      provider,
+      session_ref: sessionRef,
+      make_default: true,
+    },
+  });
+  const roomId = result.room?.room_id || result.binding?.room_id;
+  await refreshMultiRooms();
+  if (roomId) {
+    await openMultiRoom(roomId);
+  }
+  toast(
+    result.supervisor_session_created
+      ? "Session ref injected (registered)"
+      : "Session ref injected (reused)"
+  );
+}
+
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
   [
@@ -2044,6 +2287,7 @@ async function openProviderSettings() {
     state.hostTools,
     state.serviceSettings,
     state.remoteAccess,
+    state.rendezvous,
     state.runtimePreflight,
   ] = await Promise.all([
     api("/v1/settings/providers"),
@@ -2051,6 +2295,7 @@ async function openProviderSettings() {
     api("/v1/settings/host-tools"),
     api("/v1/settings/service").catch(() => null),
     api("/v1/settings/remote-access"),
+    api("/v1/settings/rendezvous").catch(() => null),
     api("/v1/runtime/preflight").catch(() => null),
   ]);
   if (elements.memoryMaintainInterval && state.serviceSettings?.memory_maintain) {
@@ -2071,7 +2316,10 @@ async function openProviderSettings() {
   renderRuntimePreflight();
   renderLocalServiceStatus();
   renderRemoteAccessSettings();
+  renderRendezvousSettings();
+  refreshMultiRooms().catch(() => {});
   elements.settingsDialog.showModal();
+  startRendezvousRefreshTimer();
 }
 
 async function submitProviderSettings(event) {
@@ -5543,6 +5791,67 @@ function bindEvents() {
       elements.settingsError.textContent = error.message;
     });
   });
+  if (elements.refreshRendezvous) {
+    elements.refreshRendezvous.addEventListener("click", () => {
+      refreshRendezvousSettings().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.stopRendezvous) {
+    elements.stopRendezvous.addEventListener("click", () => {
+      stopRendezvousClient().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.rendezvousPendingList) {
+    elements.rendezvousPendingList.addEventListener("click", (event) => {
+      const action = event.target.closest("[data-rendezvous-request-id]");
+      if (!action) return;
+      decideRendezvousRequest(
+        action.dataset.rendezvousRequestId,
+        action.dataset.decision
+      ).catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.refreshRooms) {
+    elements.refreshRooms.addEventListener("click", () => {
+      refreshMultiRooms().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.createMeetingRoom) {
+    elements.createMeetingRoom.addEventListener("click", () => {
+      createMeetingRoomThin().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.postRoomMessage) {
+    elements.postRoomMessage.addEventListener("click", () => {
+      postActiveRoomAsUser().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.callMasterButton) {
+    elements.callMasterButton.addEventListener("click", () => {
+      callMasterOnActiveRoom().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.injectSessionRefButton) {
+    elements.injectSessionRefButton.addEventListener("click", () => {
+      injectSessionRefThin().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
   elements.hostToolSettings.addEventListener("click", (event) => {
     const action = event.target.closest(
       ".host-tool-set, .host-tool-verify, .host-tool-model-set"

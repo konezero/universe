@@ -230,6 +230,13 @@ The exact caller flow is:
    one final Boss envelope;
 9. the Parent receives and relays the final Result Packet.
 
+If a claimed Boss or Sub Worker fails before initialization completes, submit
+`worker_initialization_failed` through the same file-backed Frame with the
+exact Worker actor, run reference, failure details, and Host evidence. Do not
+fabricate a Worker Result Envelope and do not create a replacement Frame. Once
+the Runtime returns the turn to `READY`, obtain a fresh invocation plan and
+claim it with a new actor/run pair. The retired run must not be resumed.
+
 Create the approved frame once through the file-backed Task Frame CLI, then
 submit each transition through `task-frame continue` against the same database:
 

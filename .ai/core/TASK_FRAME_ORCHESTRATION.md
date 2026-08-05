@@ -188,6 +188,14 @@ Parent or Boss must supply exact source references required by the bounded
 turn; missing context is returned as a bounded result rather than recovered by
 repository-wide policy discovery.
 
+If the Host claims a turn but the Worker fails before it can initialize and
+produce a result envelope, the Host must record that failure against the exact
+Worker actor and `worker_run_ref`. The Runtime may release only that claim and
+return the same turn to `READY`. It must retain the failed run as historical
+evidence, reject late results from it, and require a new actor/run claim for a
+retry. This recovery does not create a new Task Frame, approval, assignment, or
+authority.
+
 A Worker must not create or claim:
 
 ```text
