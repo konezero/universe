@@ -43,6 +43,9 @@ const state = {
   remoteAccess: null,
   accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
+  roomSessionBindings: [],
+  selectedSupervisorSessionId: null,
+  observatoryShowAll: false,
   supervisorEvents: [],
   legacyExecutors: [],
   conversationTarget: {
@@ -141,9 +144,18 @@ const elements = {
     "#session-observatory-topbar-button"
   ),
   sessionProviderLine: document.querySelector("#session-provider-line"),
+  sessionDot: document.querySelector(".session-block .session-dot"),
   sessionObservatoryDialog: document.querySelector("#session-observatory-dialog"),
   sessionObservatorySummary: document.querySelector("#session-observatory-summary"),
   sessionObservatoryList: document.querySelector("#session-observatory-list"),
+  sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
+  sessionObservatoryDetailMeta: document.querySelector(
+    "#session-observatory-detail-meta"
+  ),
+  sessionObservatoryDetailPreview: document.querySelector(
+    "#session-observatory-detail-preview"
+  ),
+  observatoryShowAllToggle: document.querySelector("#observatory-show-all"),
   legacyExecutorList: document.querySelector("#legacy-executor-list"),
   sessionEventList: document.querySelector("#session-event-list"),
   runtimeAuditGrid: document.querySelector("#runtime-audit-grid"),
@@ -215,6 +227,13 @@ const elements = {
   injectProvider: document.querySelector("#inject-provider"),
   injectSessionRef: document.querySelector("#inject-session-ref"),
   injectSessionRefButton: document.querySelector("#inject-session-ref-button"),
+  observatoryInjectProvider: document.querySelector("#observatory-inject-provider"),
+  observatoryInjectRef: document.querySelector("#observatory-inject-ref"),
+  observatoryInjectProject: document.querySelector("#observatory-inject-project"),
+  observatoryInjectMode: document.querySelector("#observatory-inject-mode"),
+  observatoryInjectButton: document.querySelector("#observatory-inject-button"),
+  observatoryInjectStatus: document.querySelector("#observatory-inject-status"),
+  roomSessionBindingList: document.querySelector("#room-session-binding-list"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
@@ -316,6 +335,222 @@ function sessionStateLabel(session) {
   return session.state === "LIVE" ? "SESSION LIVE" : (session.state || "UNKNOWN");
 }
 
+function parseSessionDate(value) {
+  if (!value || value === "UNKNOWN") return null;
+  const raw = String(value).trim();
+  const normalized = /Z$|[+-]\d{2}:\d{2}$/.test(raw) ? raw : `${raw}Z`;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatSessionTime(value, options = {}) {
+  const { withSeconds = true, relative = false } = options;
+  if (!value || value === "UNKNOWN") return "—";
+  const date = parseSessionDate(value);
+  const text = String(value);
+  const match = text.match(
+    /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d+))?/
+  );
+  let absolute = text.length > 22 ? `${text.slice(0, 19)}…` : text;
+  if (match) {
+    absolute = withSeconds
+      ? `${match[2]}-${match[3]} ${match[4]}:${match[5]}:${match[6] || "00"}`
+      : `${match[2]}-${match[3]} ${match[4]}:${match[5]}`;
+    if (match[7] && withSeconds) {
+      // sub-second when bulk rows share the same second
+      absolute += `.${match[7].slice(0, 3)}`;
+    }
+  }
+  if (!relative || !date) return absolute;
+  const deltaMs = Date.now() - date.getTime();
+  const abs = Math.abs(deltaMs);
+  const future = deltaMs < 0;
+  let rel = "just now";
+  if (abs >= 60_000 && abs < 3_600_000) {
+    rel = `${Math.round(abs / 60_000)}m`;
+  } else if (abs >= 3_600_000 && abs < 86_400_000) {
+    rel = `${Math.round(abs / 3_600_000)}h`;
+  } else if (abs >= 86_400_000) {
+    rel = `${Math.round(abs / 86_400_000)}d`;
+  } else if (abs >= 1_000 && abs < 60_000) {
+    rel = `${Math.round(abs / 1_000)}s`;
+  }
+  if (future && rel !== "just now") rel = `in ${rel}`;
+  else if (!future && rel !== "just now") rel = `${rel} ago`;
+  return `${rel} · ${absolute}`;
+}
+
+/** Distinct short tokens — never collapse ref and supervisor id into one. */
+function shortProviderRef(session) {
+  const fromApi = session.identity?.provider_ref_short;
+  if (fromApi) return fromApi;
+  const ref = String(session.provider_session_ref || "");
+  return ref ? ref.slice(-8) : "no-ref";
+}
+
+function shortSupervisorId(session) {
+  const fromApi = session.identity?.session_id_short;
+  if (fromApi) return fromApi;
+  const id = String(session.session_id || "").replace(/^session_/i, "");
+  return id ? id.slice(-8) : "no-sid";
+}
+
+function sessionFingerprint(session) {
+  return [
+    session.node || "?",
+    session.mode || "?",
+    session.provider || "?",
+    `ref…${shortProviderRef(session)}`,
+    `sid…${shortSupervisorId(session)}`,
+  ].join(" · ");
+}
+
+function observatoryVisibleSessions(sessions) {
+  const list = Array.isArray(sessions) ? sessions.slice() : [];
+  if (state.observatoryShowAll) return list;
+  // Default: hide STOPPED noise; keep LIVE / default / recent DISCONNECTED.
+  const kept = list.filter((session) => {
+    const stateName = String(session.state || "").toUpperCase();
+    if (stateName === "STOPPED") return false;
+    if (stateName === "LIVE" || session.is_default) return true;
+    const activity = parseSessionDate(
+      session.last_activity_at || session.updated_at
+    );
+    if (!activity) return stateName !== "DISCONNECTED";
+    // Keep disconnected only if touched in last 7 days.
+    return Date.now() - activity.getTime() < 7 * 86_400_000;
+  });
+  // One card per (node,mode,provider,provider_session_ref) — already unique by session_id,
+  // but collapse identical alias groups: keep LIVE/default/newest only when refs differ.
+  return kept;
+}
+
+function sessionPreviewSnippet(session) {
+  const lines = session?.preview?.lines || [];
+  // Only show chat when server marked it as tied to this exact session.
+  if (!session?.preview?.tied_to_session || !lines.length) {
+    return "";
+  }
+  const last = lines[lines.length - 1];
+  const role = last.author_role || "?";
+  const text = String(last.text || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return `${role}: ${text.length > 90 ? `${text.slice(0, 90)}…` : text}`;
+}
+
+function uniqueTimeRows(session) {
+  const rows = [
+    {
+      label: "Activity",
+      value: session.last_activity_at || session.updated_at,
+    },
+    { label: "Anchor", value: session.last_anchor_at },
+    { label: "Last message", value: session.last_message_at },
+    { label: "Updated", value: session.updated_at },
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const row of rows) {
+    if (!row.value || row.value === "UNKNOWN") continue;
+    const key = String(row.value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  if (!out.length && session.updated_at) {
+    out.push({ label: "Updated", value: session.updated_at });
+  }
+  return out;
+}
+
+function selectSupervisorSession(sessionId) {
+  state.selectedSupervisorSessionId = sessionId || null;
+  renderSessionObservatory();
+}
+
+function renderSelectedSessionDetail() {
+  const detail = elements.sessionObservatoryDetail;
+  const meta = elements.sessionObservatoryDetailMeta;
+  const preview = elements.sessionObservatoryDetailPreview;
+  if (!detail || !meta || !preview) return;
+  const session = (state.supervisorSessions || []).find(
+    (item) => item.session_id === state.selectedSupervisorSessionId
+  );
+  if (!session) {
+    detail.classList.add("hidden");
+    meta.replaceChildren();
+    preview.replaceChildren();
+    return;
+  }
+  detail.classList.remove("hidden");
+  meta.replaceChildren();
+  meta.append(
+    node("div", "session-detail-title", sessionFingerprint(session)),
+    node(
+      "div",
+      "",
+      `${session.state || "?"} · ${session.is_default ? "DEFAULT" : "alt"} · ${session.currentness || "UNKNOWN"}`
+    )
+  );
+  for (const row of uniqueTimeRows(session)) {
+    meta.append(
+      node(
+        "div",
+        "",
+        `${row.label} · ${formatSessionTime(row.value, {
+          withSeconds: true,
+          relative: true,
+        })}`
+      )
+    );
+  }
+  meta.append(
+    node(
+      "div",
+      "session-detail-ref",
+      session.provider_session_ref
+        ? `thread/ref ${session.provider_session_ref}`
+        : "ref not observed"
+    ),
+    node(
+      "div",
+      "session-detail-ref",
+      `supervisor ${session.session_id || "—"}`
+    )
+  );
+  preview.replaceChildren();
+  const lines = session.preview?.lines || [];
+  if (!lines.length || !session.preview?.tied_to_session) {
+    preview.append(
+      node(
+        "p",
+        "empty-copy",
+        "No durable turns bound to this exact session/ref. " +
+          "Shared project chat is intentionally not shown (avoids identical previews)."
+      )
+    );
+    return;
+  }
+  preview.append(
+    node(
+      "small",
+      "session-preview-source",
+      `Preview · ${session.preview?.source || "UNKNOWN"} · match ${session.preview?.match || "?"}`
+    )
+  );
+  for (const line of lines.slice(-2)) {
+    const row = node("div", "session-preview-line");
+    row.append(
+      node("strong", "", line.author_role || "?"),
+      node("span", "", String(line.text || "").replace(/\s+/g, " ").trim())
+    );
+    if (line.created_at) {
+      row.append(node("time", "", formatSessionTime(line.created_at)));
+    }
+    preview.append(row);
+  }
+}
+
 
 async function api(path, options = {}) {
   const headers = options.body ? { "Content-Type": "application/json" } : {};
@@ -340,31 +575,124 @@ async function refreshSupervisorSessions() {
   state.runtimeAudit = audit;
   state.runtimePreflight = audit.preflight || null;
   state.supervisorSessions = audit.sessions || [];
+  state.roomSessionBindings = audit.room_session_bindings || [];
   state.supervisorEvents = audit.recent_events || [];
   state.legacyExecutors = legacy.executors || [];
+  prefillsObservatoryInjectForm();
   renderRuntimePreflight();
   renderSessionObservatory();
 }
 
+function prefillsObservatoryInjectForm() {
+  if (!elements.observatoryInjectProject) return;
+  if (!elements.observatoryInjectProject.value.trim()) {
+    const selected =
+      state.selectedProjectId ||
+      state.projects?.[0]?.project_id ||
+      "CONDUCTOR";
+    elements.observatoryInjectProject.value = selected;
+  }
+  if (elements.observatoryInjectMode && selectedIsConductorProject()) {
+    // leave mode as user set; default MASTER for project ids
+  }
+}
+
+function selectedIsConductorProject() {
+  const project = (elements.observatoryInjectProject?.value || "").trim();
+  return project === "CONDUCTOR" || project === "universe";
+}
+
+async function injectSessionFromObservatory() {
+  const provider = elements.observatoryInjectProvider?.value || "CODEX";
+  const sessionRef = elements.observatoryInjectRef?.value?.trim() || "";
+  const projectId =
+    elements.observatoryInjectProject?.value?.trim() ||
+    state.selectedProjectId ||
+    "CONDUCTOR";
+  const mode = elements.observatoryInjectMode?.value || "MASTER";
+  if (!sessionRef) {
+    throw new Error("Session / thread ref is required");
+  }
+  if (elements.observatoryInjectStatus) {
+    elements.observatoryInjectStatus.textContent = "Injecting…";
+  }
+  const body = {
+    project_id: projectId,
+    node: projectId,
+    mode,
+    room_type: mode === "CONDUCTOR" ? "PROJECT" : "PROJECT",
+    slot_role: mode === "CONDUCTOR" ? "MASTER" : "MASTER",
+    provider,
+    session_ref: sessionRef,
+    make_default: true,
+  };
+  const result = await api("/v1/sessions/inject", {
+    method: "POST",
+    body,
+  });
+  if (elements.observatoryInjectStatus) {
+    const created = result.supervisor_session_created
+      ? "registered"
+      : "already registered";
+    elements.observatoryInjectStatus.textContent =
+      `Injected (${created}). ` +
+      (result.bridge_line || result.status || "");
+  }
+  elements.observatoryInjectRef.value = "";
+  await refreshSupervisorSessions();
+  toast("Session injected into Universe");
+}
+
 function renderSessionObservatory() {
   if (!elements.sessionObservatoryList) return;
-  const sessions = state.supervisorSessions || [];
-  const live = sessions.filter((item) => item.state === "LIVE").length;
-  const unknown = sessions.filter((item) => item.state === "UNKNOWN").length;
+  const allSessions = state.supervisorSessions || [];
+  const sessions = observatoryVisibleSessions(allSessions);
+  const live = allSessions.filter((item) => item.state === "LIVE").length;
+  const unknown = allSessions.filter((item) => item.state === "UNKNOWN").length;
+  const hidden = Math.max(0, allSessions.length - sessions.length);
   elements.sessionObservatorySummary.textContent =
-    `${sessions.length} sessions / ${live} live / ${unknown} unknown / ${state.runtimeAudit?.platform_approvals?.pending_count || 0} approvals`;
+    `${sessions.length} shown / ${allSessions.length} total · ${live} live · ${unknown} unknown` +
+    (hidden ? ` · ${hidden} hidden` : "") +
+    ` · ${state.runtimeAudit?.platform_approvals?.pending_count || 0} approvals`;
+  if (elements.observatoryShowAllToggle) {
+    elements.observatoryShowAllToggle.checked = Boolean(state.observatoryShowAll);
+  }
   elements.sessionObservatoryList.replaceChildren();
   if (!sessions.length) {
     elements.sessionObservatoryList.append(
-      node("p", "empty-copy", "No persistent Mode session has registered yet.")
+      node(
+        "p",
+        "empty-copy",
+        state.observatoryShowAll
+          ? "No persistent Mode session in Supervisor yet. Use “Register this session” above."
+          : "No recent/live sessions in the filtered list. Turn on “Show all” or inject a session."
+      )
     );
   }
   for (const session of sessions) {
     const card = node("article", "supervisor-session-card");
     card.dataset.default = String(Boolean(session.is_default));
+    card.dataset.selected = String(
+      session.session_id === state.selectedSupervisorSessionId
+    );
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.title = "Select to show last activity and recent turns";
+    card.addEventListener("click", (event) => {
+      if (event.target.closest("button, input, textarea, select, a")) return;
+      selectSupervisorSession(session.session_id);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectSupervisorSession(session.session_id);
+      }
+    });
     const heading = node("div", "session-card-heading");
     heading.append(
       node("strong", "", sessionDisplayName(session)),
+      node("span", "session-token-pill", `ref…${shortProviderRef(session)}`),
+      node("span", "session-token-pill sid", `sid…${shortSupervisorId(session)}`),
       node("span", "session-state-pill", sessionStateLabel(session))
     );
     heading.lastElementChild.dataset.state = session.state || "UNKNOWN";
@@ -372,13 +700,29 @@ function renderSessionObservatory() {
     meta.append(
       node("span", "", sessionCoordinateLabel(session)),
       node("span", "", session.provider || "UNKNOWN"),
-      node("span", "", session.currentness || "UNKNOWN"),
-      node("span", "", session.is_default ? "DEFAULT" : "ALTERNATIVE")
+      node("span", "", session.is_default ? "DEFAULT" : "ALTERNATIVE"),
+      node(
+        "span",
+        "session-activity-time",
+        formatSessionTime(session.last_activity_at || session.updated_at, {
+          withSeconds: true,
+          relative: true,
+        })
+      )
+    );
+    const snippetText = sessionPreviewSnippet(session);
+    const snippet = node(
+      "p",
+      "session-preview-snippet",
+      snippetText ||
+        "No chat tied to this session yet (other sessions' room history is not shared)"
     );
     const ref = node(
       "p",
       "session-ref-line",
-      session.provider_session_ref || "Provider session not observed"
+      session.provider_session_ref
+        ? `thread ${session.provider_session_ref}`
+        : "Provider session not observed"
     );
     const alias = document.createElement("input");
     alias.className = "session-alias-input";
@@ -436,9 +780,10 @@ function renderSessionObservatory() {
       }
     });
     actions.append(saveAlias, resume);
-    card.append(heading, meta, ref, alias, actions);
+    card.append(heading, meta, snippet, ref, alias, actions);
     elements.sessionObservatoryList.append(card);
   }
+  renderSelectedSessionDetail();
 
   if (elements.legacyExecutorList) {
     elements.legacyExecutorList.replaceChildren();
@@ -479,13 +824,70 @@ function renderSessionObservatory() {
   }
   renderRuntimeAudit();
 
-  const conductor = sessions.find(
-    (session) => session.is_default && session.mode === "CONDUCTOR"
-  );
+  const conductor =
+    sessions.find(
+      (session) => session.is_default && session.mode === "CONDUCTOR"
+    ) ||
+    sessions.find((session) => session.state === "LIVE") ||
+    sessions.find((session) => session.is_default);
   if (elements.sessionProviderLine) {
-    elements.sessionProviderLine.textContent = conductor
-      ? `${conductor.provider} · ${conductor.state}`
-      : "Provider · not registered";
+    if (conductor) {
+      const ref = conductor.provider_session_ref
+        ? String(conductor.provider_session_ref).slice(0, 12)
+        : "no-ref";
+      elements.sessionProviderLine.textContent = `${conductor.provider} · ${conductor.state} · ${ref}`;
+    } else {
+      elements.sessionProviderLine.textContent = "Provider · not registered";
+    }
+  }
+  if (elements.sessionDot && conductor) {
+    elements.sessionDot.dataset.state =
+      conductor.state === "LIVE" ? "ready" : "idle";
+  }
+
+  if (elements.roomSessionBindingList) {
+    elements.roomSessionBindingList.replaceChildren();
+    const bindings = state.roomSessionBindings || [];
+    if (!bindings.length) {
+      elements.roomSessionBindingList.append(
+        node("p", "empty-copy", "No active multi-room session attachments.")
+      );
+    }
+    for (const binding of bindings) {
+      const card = node("article", "supervisor-session-card");
+      const heading = node("div", "session-card-heading");
+      heading.append(
+        node(
+          "strong",
+          "",
+          `${binding.room_type || "ROOM"} · ${binding.slot_role || "?"}`
+        ),
+        node("span", "session-state-pill", binding.state || "ACTIVE")
+      );
+      const meta = node("div", "session-card-meta");
+      meta.append(
+        node(
+          "span",
+          "",
+          binding.room_title || binding.room_id || "room"
+        ),
+        node("span", "", binding.provider || "UNKNOWN"),
+        node(
+          "span",
+          "",
+          binding.room_project_id || binding.project_id || "—"
+        )
+      );
+      const ref = node(
+        "p",
+        "session-ref-line",
+        binding.provider_session_ref ||
+          binding.supervisor_session_id ||
+          "No provider session ref on this slot"
+      );
+      card.append(heading, meta, ref);
+      elements.roomSessionBindingList.append(card);
+    }
   }
 }
 
@@ -5850,6 +6252,24 @@ function bindEvents() {
       injectSessionRefThin().catch((error) => {
         elements.settingsError.textContent = error.message;
       });
+    });
+  }
+  if (elements.observatoryInjectButton) {
+    elements.observatoryInjectButton.addEventListener("click", () => {
+      injectSessionFromObservatory().catch((error) => {
+        if (elements.observatoryInjectStatus) {
+          elements.observatoryInjectStatus.textContent = error.message;
+        }
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.observatoryShowAllToggle) {
+    elements.observatoryShowAllToggle.addEventListener("change", () => {
+      state.observatoryShowAll = Boolean(
+        elements.observatoryShowAllToggle.checked
+      );
+      renderSessionObservatory();
     });
   }
   elements.hostToolSettings.addEventListener("click", (event) => {

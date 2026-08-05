@@ -116,6 +116,38 @@ class MultiRoomStoreTests(unittest.TestCase):
             "thread-99",
             injected["binding"]["provider_session_ref"],
         )
+        active = self.store.list_active_session_bindings()
+        self.assertEqual(1, len(active))
+        self.assertEqual("thread-99", active[0]["provider_session_ref"])
+        self.assertEqual("PROJECT", active[0]["room_type"])
+        room_id = injected["room"]["room_id"]
+        self.store.post_message(
+            room_id,
+            {"author_role": "USER", "body_text": "first line about security"},
+        )
+        self.store.post_message(
+            room_id,
+            {"author_role": "MASTER", "body_text": "second line reply on auth"},
+        )
+        preview = self.store.preview_for_session(
+            provider_session_ref="thread-99",
+            project_id="proj_inject",
+            limit=2,
+            allow_project_fallback=False,
+        )
+        self.assertEqual("MULTI_ROOM", preview["source"])
+        self.assertEqual("PROVIDER_REF", preview["match"])
+        self.assertEqual(2, len(preview["lines"]))
+        self.assertIn("second line", preview["lines"][-1]["text"])
+        # Unrelated session id must not inherit this room's chat.
+        orphan = self.store.preview_for_session(
+            supervisor_session_id="session_does_not_exist",
+            provider_session_ref="other-thread",
+            project_id="proj_inject",
+            allow_project_fallback=False,
+        )
+        self.assertEqual("NONE", orphan["source"])
+        self.assertEqual([], orphan["lines"])
 
     def test_full_session_ref_inject_registers_supervisor_and_default(self) -> None:
         injected = perform_session_ref_inject(

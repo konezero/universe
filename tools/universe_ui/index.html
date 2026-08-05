@@ -521,13 +521,63 @@
     </div>
     <div class="session-observatory-toolbar">
       <span id="session-observatory-summary">Loading sessions…</span>
+      <label class="session-observatory-filter">
+        <input id="observatory-show-all" type="checkbox" />
+        Show all (incl. STOPPED)
+      </label>
       <button id="refresh-sessions-button" class="secondary-button" type="button">Refresh</button>
     </div>
+    <section class="session-inject-section">
+      <div class="section-heading"><span>Register this session</span></div>
+      <p class="section-note">
+        External harness sessions (Claude / Codex / Grok) appear here only after
+        Supervisor register or inject. Paste the provider session / thread id.
+      </p>
+      <div class="session-inject-form">
+        <label>
+          Provider
+          <select id="observatory-inject-provider">
+            <option value="CODEX">CODEX</option>
+            <option value="CLAUDE">CLAUDE</option>
+            <option value="GROK">GROK</option>
+          </select>
+        </label>
+        <label>
+          Session / thread ref
+          <input id="observatory-inject-ref" type="text" placeholder="provider session id" autocomplete="off" />
+        </label>
+        <label>
+          Project / node
+          <input id="observatory-inject-project" type="text" placeholder="selected project or CONDUCTOR" autocomplete="off" />
+        </label>
+        <label>
+          Mode
+          <select id="observatory-inject-mode">
+            <option value="MASTER">MASTER</option>
+            <option value="CONDUCTOR">CONDUCTOR</option>
+          </select>
+        </label>
+        <button id="observatory-inject-button" type="button" class="primary-button">
+          Inject into Universe
+        </button>
+      </div>
+      <p id="observatory-inject-status" class="section-note"></p>
+    </section>
     <section class="runtime-audit-section">
       <div class="section-heading"><span>Runtime audit</span></div>
       <div id="runtime-audit-grid" class="runtime-audit-grid"></div>
     </section>
     <div id="session-observatory-list" class="session-observatory-list"></div>
+    <section id="session-observatory-detail" class="session-observatory-detail hidden">
+      <div class="section-heading"><span>Selected session</span></div>
+      <div id="session-observatory-detail-meta" class="session-detail-meta"></div>
+      <div id="session-observatory-detail-preview" class="session-detail-preview"></div>
+    </section>
+    <section class="room-session-section">
+      <div class="section-heading"><span>Multi-room attachments</span></div>
+      <p class="section-note">Active room slots (may exist before Supervisor register).</p>
+      <div id="room-session-binding-list" class="session-observatory-list"></div>
+    </section>
     <section class="legacy-executor-section">
       <div class="section-heading"><span>Legacy executors</span></div>
       <p class="section-note">Observed only. Partial identity never permits adoption or stop.</p>

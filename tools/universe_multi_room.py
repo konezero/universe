@@ -467,6 +467,33 @@ class MultiRoomStore:
                 ).fetchall()
             return [self._binding_row(row) for row in rows]
 
+    def list_active_session_bindings(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Active room slot bindings with room metadata (Observatory side channel)."""
+        cap = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT b.*, r.room_type, r.title AS room_title, r.project_id AS room_project_id,
+                       r.host_role AS room_host_role, r.state AS room_state
+                FROM chat_room_session b
+                JOIN chat_room r ON r.room_id = b.room_id
+                WHERE b.state = 'ACTIVE' AND r.state = 'OPEN'
+                ORDER BY b.updated_at DESC, b.binding_id DESC
+                LIMIT ?
+                """,
+                (cap,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                binding = self._binding_row(row)
+                binding["room_type"] = row["room_type"]
+                binding["room_title"] = row["room_title"]
+                binding["room_project_id"] = row["room_project_id"]
+                binding["room_host_role"] = row["room_host_role"]
+                binding["room_state"] = row["room_state"]
+                result.append(binding)
+            return result
+
     def post_message(self, room_id: str, value: Mapping[str, Any]) -> dict[str, Any]:
         room = self.get_room(room_id)
         if room["state"] != "OPEN":
@@ -568,6 +595,157 @@ class MultiRoomStore:
                 (rid, lim),
             ).fetchall()
             return [json.loads(row["message_json"]) for row in rows]
+
+    def list_recent_messages(
+        self, room_id: str, *, limit: int = 2
+    ) -> list[dict[str, Any]]:
+        """Newest-first then reversed to chronological order for display."""
+        rid = _text(room_id, "room_id", limit=80)
+        lim = max(1, min(50, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_json FROM chat_room_message
+                WHERE room_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (rid, lim),
+            ).fetchall()
+        messages = [json.loads(row["message_json"]) for row in rows]
+        messages.reverse()
+        return messages
+
+    def preview_for_session(
+        self,
+        *,
+        supervisor_session_id: str | None = None,
+        provider_session_ref: str | None = None,
+        project_id: str | None = None,
+        limit: int = 2,
+        allow_project_fallback: bool = False,
+    ) -> dict[str, Any]:
+        """Find multi-room lines tied to a *specific* session coordinate.
+
+        Strict by default: only ACTIVE bindings that match supervisor_session_id
+        and/or provider_session_ref. Project-level fallback is opt-in so
+        Observatory does not paste the same project chat onto every sibling
+        session with the same node.
+        """
+        sid = (supervisor_session_id or "").strip() or None
+        pref = (provider_session_ref or "").strip() or None
+        pid = (project_id or "").strip() or None
+        lim = max(1, min(10, int(limit)))
+        empty = {
+            "lines": [],
+            "source": "NONE",
+            "room_id": None,
+            "last_message_at": None,
+            "match": "NONE",
+        }
+        if not sid and not pref and not (allow_project_fallback and pid):
+            return empty
+        with self._connect() as connection:
+            rooms: list[Any] = []
+            if sid or pref:
+                # Prefer exact dual match, then single-key match. Never match by
+                # project alone in the strict path.
+                if sid and pref:
+                    rooms = connection.execute(
+                        """
+                        SELECT b.room_id, b.updated_at AS binding_updated_at,
+                               b.supervisor_session_id, b.provider_session_ref
+                        FROM chat_room_session b
+                        JOIN chat_room r ON r.room_id = b.room_id
+                        WHERE b.state = 'ACTIVE' AND r.state = 'OPEN'
+                          AND b.supervisor_session_id = ?
+                          AND b.provider_session_ref = ?
+                        ORDER BY b.updated_at DESC
+                        LIMIT 5
+                        """,
+                        (sid, pref),
+                    ).fetchall()
+                    match = "SESSION_AND_REF"
+                else:
+                    match = "SESSION_ID" if sid else "PROVIDER_REF"
+                    rooms = []
+                if not rooms and sid:
+                    rooms = connection.execute(
+                        """
+                        SELECT b.room_id, b.updated_at AS binding_updated_at,
+                               b.supervisor_session_id, b.provider_session_ref
+                        FROM chat_room_session b
+                        JOIN chat_room r ON r.room_id = b.room_id
+                        WHERE b.state = 'ACTIVE' AND r.state = 'OPEN'
+                          AND b.supervisor_session_id = ?
+                        ORDER BY b.updated_at DESC
+                        LIMIT 5
+                        """,
+                        (sid,),
+                    ).fetchall()
+                    if rooms:
+                        match = "SESSION_ID"
+                if not rooms and pref:
+                    rooms = connection.execute(
+                        """
+                        SELECT b.room_id, b.updated_at AS binding_updated_at,
+                               b.supervisor_session_id, b.provider_session_ref
+                        FROM chat_room_session b
+                        JOIN chat_room r ON r.room_id = b.room_id
+                        WHERE b.state = 'ACTIVE' AND r.state = 'OPEN'
+                          AND b.provider_session_ref = ?
+                        ORDER BY b.updated_at DESC
+                        LIMIT 5
+                        """,
+                        (pref,),
+                    ).fetchall()
+                    if rooms:
+                        match = "PROVIDER_REF"
+            else:
+                match = "NONE"
+                rooms = []
+        if not rooms and allow_project_fallback and pid:
+            for room in self.list_rooms(project_id=pid, room_type="PROJECT"):
+                rooms = [
+                    {
+                        "room_id": room["room_id"],
+                        "binding_updated_at": room.get("updated_at"),
+                    }
+                ]
+                match = "PROJECT_FALLBACK"
+                break
+        if not rooms:
+            return empty
+        room_id = str(rooms[0]["room_id"])
+        messages = self.list_recent_messages(room_id, limit=lim)
+        lines: list[dict[str, Any]] = []
+        last_at = None
+        for message in messages:
+            text = str(
+                message.get("body_text")
+                or message.get("body")
+                or message.get("text")
+                or ""
+            ).strip()
+            if not text:
+                continue
+            created = message.get("created_at")
+            if created:
+                last_at = created
+            lines.append(
+                {
+                    "author_role": message.get("author_role") or message.get("role") or "?",
+                    "text": text[:240],
+                    "created_at": created,
+                }
+            )
+        return {
+            "lines": lines,
+            "source": "MULTI_ROOM" if lines else "MULTI_ROOM_EMPTY",
+            "room_id": room_id,
+            "last_message_at": last_at,
+            "match": match,
+        }
 
     def ensure_project_room(self, project_id: str) -> dict[str, Any]:
         pid = _text(project_id, "project_id", limit=120)

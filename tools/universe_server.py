@@ -12063,13 +12063,44 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         conductor_permissions = self.conductor_permissions.list_requests(limit=100)
         project_permissions = self.store.list_all_agent_permissions(limit=200)
         worker_bench = self.store.compare_skill_bench(group_by="worker", limit=50)
+        room_bindings: list[dict[str, Any]] = []
+        try:
+            room_bindings = self.multi_rooms.list_active_session_bindings(limit=100)
+        except MultiRoomError:
+            room_bindings = []
+        sessions = self.session_supervisor.list_sessions()[:200]
+        # Prefer LIVE, then default, then newest (stable multi-pass).
+        sessions = sorted(
+            sessions,
+            key=lambda item: str(item.get("updated_at") or ""),
+            reverse=True,
+        )
+        sessions = sorted(
+            sessions, key=lambda item: 0 if item.get("is_default") else 1
+        )
+        sessions = sorted(
+            sessions,
+            key=lambda item: 0 if str(item.get("state") or "") == "LIVE" else 1,
+        )
+        continuity_by_project = {
+            str(item.get("project_id") or ""): item for item in continuity
+        }
+        enriched: list[dict[str, Any]] = []
+        for session in sessions:
+            enriched.append(
+                self._session_observatory_card(
+                    session,
+                    continuity_by_project=continuity_by_project,
+                )
+            )
         return {
             "schema": "universe.runtime-audit.v1",
             "status": "RUNTIME_AUDIT_COLLECTED",
             "observed_at": utc_now(),
             "preflight": self.runtime_preflight(),
             "live_session_sweep": live_sweep,
-            "sessions": self.session_supervisor.list_sessions()[:200],
+            "sessions": enriched,
+            "room_session_bindings": room_bindings,
             "recent_events": self.session_supervisor.list_events(limit=100),
             "platform_approvals": {
                 "pending_count": sum(
@@ -12083,6 +12114,131 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "continuity": continuity,
             "worker_bench": worker_bench,
         }
+
+    def _session_observatory_card(
+        self,
+        session: Mapping[str, Any],
+        *,
+        continuity_by_project: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Add last-activity + short chat preview for Observatory disambiguation."""
+        card = dict(session)
+        node = str(session.get("node") or "")
+        lease = session.get("process_lease") if isinstance(session.get("process_lease"), Mapping) else None
+        lease_at = str((lease or {}).get("updated_at") or "") or None
+        updated_at = str(session.get("updated_at") or "") or None
+        created_at = str(session.get("created_at") or "") or None
+
+        # Strict session match only — never share one project transcript across
+        # sibling sessions that only share node/mode.
+        multi_preview = self.multi_rooms.preview_for_session(
+            supervisor_session_id=str(session.get("session_id") or "") or None,
+            provider_session_ref=str(session.get("provider_session_ref") or "") or None,
+            project_id=None,
+            limit=2,
+            allow_project_fallback=False,
+        )
+        preview_lines = list(multi_preview.get("lines") or [])
+        preview_source = str(multi_preview.get("source") or "NONE")
+        preview_match = str(multi_preview.get("match") or "NONE")
+        last_message_at = multi_preview.get("last_message_at")
+        room_id = multi_preview.get("room_id")
+
+        # Classic Project Room turns only for the *default* session on that node
+        # (otherwise every DISCONNECTED twin shows the same last chat).
+        if not preview_lines and node and bool(session.get("is_default")):
+            try:
+                project_messages = self.store.list_room_messages(node, limit=500)
+            except UniverseError:
+                project_messages = []
+            if project_messages:
+                recent = project_messages[-2:]
+                for message in recent:
+                    text = str(
+                        message.get("body")
+                        or message.get("body_text")
+                        or message.get("text")
+                        or ""
+                    ).strip()
+                    if not text:
+                        continue
+                    preview_lines.append(
+                        {
+                            "author_role": message.get("role")
+                            or message.get("author_role")
+                            or message.get("speaker")
+                            or "?",
+                            "text": text[:240],
+                            "created_at": message.get("created_at")
+                            or message.get("updated_at"),
+                        }
+                    )
+                if preview_lines:
+                    preview_source = "PROJECT_ROOM_DEFAULT"
+                    preview_match = "DEFAULT_NODE"
+                    last_message_at = preview_lines[-1].get("created_at")
+                    room_id = f"project_room:{node}"
+
+        # Do NOT promote shared bounded_summary into fake chat lines — many
+        # inject rows use the same summary string and look identical.
+
+        continuity = continuity_by_project.get(node) if node else None
+        continuity_state = (
+            continuity.get("state") if isinstance(continuity, Mapping) else None
+        )
+        anchor_at = None
+        if isinstance(continuity_state, Mapping):
+            for key in (
+                "observed_at",
+                "anchor_observed_at",
+                "current_anchor_observed_at",
+                "updated_at",
+                "last_observed_at",
+            ):
+                value = continuity_state.get(key)
+                if isinstance(value, str) and value.strip():
+                    anchor_at = value.strip()
+                    break
+            if anchor_at is None:
+                # Nested common shapes
+                anchor = continuity_state.get("current_anchor") or continuity_state.get(
+                    "anchor"
+                )
+                if isinstance(anchor, Mapping):
+                    for key in ("observed_at", "updated_at", "entered_at"):
+                        value = anchor.get(key)
+                        if isinstance(value, str) and value.strip():
+                            anchor_at = value.strip()
+                            break
+
+        candidates = [
+            value
+            for value in (last_message_at, lease_at, updated_at, created_at, anchor_at)
+            if isinstance(value, str) and value
+        ]
+        last_activity_at = max(candidates) if candidates else updated_at
+
+        card["last_activity_at"] = last_activity_at
+        card["last_message_at"] = last_message_at
+        card["last_anchor_at"] = anchor_at
+        card["identity"] = {
+            "session_id": session.get("session_id"),
+            "session_id_short": str(session.get("session_id") or "")[-8:] or None,
+            "provider_session_ref": session.get("provider_session_ref"),
+            "provider_ref_short": (
+                str(session.get("provider_session_ref") or "")[-8:] or None
+            ),
+        }
+        card["preview"] = {
+            "source": preview_source,
+            "match": preview_match,
+            "room_id": room_id,
+            "lines": preview_lines,
+            "tied_to_session": bool(preview_lines)
+            and preview_source
+            in {"MULTI_ROOM", "PROJECT_ROOM_DEFAULT"},
+        }
+        return card
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
