@@ -479,12 +479,24 @@
               </label>
             </div>
             <div class="worker-binding-legend" aria-hidden="true">
-              <span>Role</span><span>Provider</span><span>Model</span><span>Effort</span><span>Skills</span>
+              <span>Role</span><span>Provider</span><span>Model</span><span>Custom</span><span>Effort</span><span>Skills</span>
             </div>
             <div id="worker-binding-settings" class="worker-binding-settings"></div>
             <small class="provider-setting-status">
-              AUTO keeps provider selection dynamic. Skill references are proposal inputs, not execution authority.
+              Model list = CLI discover + presets. Leave Host default empty, or pick a catalog model. Optional custom id overrides the select.
             </small>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Provider models</strong>
+                <small>Catalog from host start / Discover. User-added ids survive rediscover.</small>
+              </div>
+              <button id="refresh-provider-models-button" class="secondary-button" type="button">
+                Refresh models
+              </button>
+            </div>
+            <div id="provider-model-catalog" class="provider-model-catalog"></div>
           </section>
         </div>
 
@@ -821,9 +833,6 @@
                 <option value="P3">P3</option>
               </select>
             </label>
-            <button id="seed-worklist-button" class="secondary-button todo-seed-button" type="button" hidden>
-              Seed worklist
-            </button>
             <span id="todo-count" class="todo-count">0 items</span>
           </div>
           <div id="todo-list" class="todo-list" aria-live="polite"></div>
@@ -922,6 +931,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=nav-dedupe-7" defer></script>
+  <script src="/app.js?v=provider-models-9" defer></script>
 </body>
 </html>

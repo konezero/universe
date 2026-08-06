@@ -38,6 +38,8 @@ const state = {
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
+  /** CLI+preset model catalog from /v1/settings/provider-models */
+  providerModels: null,
   workerBindings: null,
   hostTools: null,
   runtimePreflight: null,
@@ -78,44 +80,6 @@ const state = {
   hoveredNodeId: null,
   inspectorDismissed: false,
 };
-
-const WORKLIST_SEED_TODOS = [
-  {
-    title: "Close seed discovery dispatch (QUEUED)",
-    detail:
-      "GCS project_dispatch is still QUEUED for seed discovery. Confirm Project Master inbox delivery and Project Seed publish path.",
-    priority: "P0",
-    state: "READY",
-  },
-  {
-    title: "Deliver one Project Master handoff end-to-end",
-    detail:
-      "Propose and DELIVER one adopted Skill Plan or Fresh Composition handoff. Confirm room message + delivery_state DELIVERED_TO_MASTER.",
-    priority: "P0",
-    state: "READY",
-  },
-  {
-    title: "Todo work map stays current for Master review",
-    detail:
-      "Keep PROJECT/NODE todos accurate. Use Send to Master for bounded questions; do not treat Todo as Task Frame execution.",
-    priority: "P1",
-    state: "IN_PROGRESS",
-  },
-  {
-    title: "Verify Project Master bridge / CLI provider",
-    detail:
-      "Bridge AVAILABLE or room-only path understood. Provider setting for this Project Master is intentional (AUTO/GROK/CODEX/CLAUDE).",
-    priority: "P1",
-    state: "READY",
-  },
-  {
-    title: "Capture first Experience Case after a Skill run",
-    detail:
-      "After a redacted Skill observation is ingested, record one Experience Case. Causal inference stays NOT_INFERRED.",
-    priority: "P2",
-    state: "BACKLOG",
-  },
-];
 
 const elements = {
   serviceStatus: document.querySelector("#service-status"),
@@ -200,6 +164,8 @@ const elements = {
   projectProviderSettings: document.querySelector("#project-provider-settings"),
   workerBindingScope: document.querySelector("#worker-binding-scope"),
   workerBindingSettings: document.querySelector("#worker-binding-settings"),
+  providerModelCatalog: document.querySelector("#provider-model-catalog"),
+  refreshProviderModels: document.querySelector("#refresh-provider-models-button"),
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
@@ -305,7 +271,7 @@ const elements = {
   todoList: document.querySelector("#todo-list"),
   todoCount: document.querySelector("#todo-count"),
   todoFormError: document.querySelector("#todo-form-error"),
-  seedWorklistButton: document.querySelector("#seed-worklist-button"),
+
   proposeMasterHandoffButton: document.querySelector(
     "#propose-master-handoff-button"
   ),
@@ -2289,6 +2255,35 @@ function renderProviderSettings() {
   }
 }
 
+function providerCatalogModels(provider) {
+  const key = String(provider || "").toUpperCase();
+  if (!key || key === "AUTO") return [];
+  const entry = state.providerModels?.providers?.[key];
+  return Array.isArray(entry?.models) ? entry.models : [];
+}
+
+function fillWorkerBindingModelSelect(select, provider, selectedValue) {
+  select.replaceChildren();
+  const hostDefault = node("option", "", "Host default");
+  hostDefault.value = "";
+  select.append(hostDefault);
+  const models = providerCatalogModels(provider);
+  const selected = String(selectedValue || "");
+  for (const modelId of models) {
+    const option = node("option", "", modelId);
+    option.value = modelId;
+    select.append(option);
+  }
+  if (selected && !models.includes(selected)) {
+    const option = node("option", "", `${selected} (current)`);
+    option.value = selected;
+    select.append(option);
+  }
+  select.value = selected && (models.includes(selected) || selected)
+    ? selected
+    : "";
+}
+
 function renderWorkerBindingSettings() {
   if (!elements.workerBindingScope || !elements.workerBindingSettings) return;
   const previousScope = elements.workerBindingScope.value || "UNIVERSE:UNIVERSE";
@@ -2339,10 +2334,20 @@ function renderWorkerBindingSettings() {
       provider.append(option);
     }
     provider.value = profile?.provider || "AUTO";
-    const model = node("input", "worker-binding-model");
-    model.type = "text";
-    model.placeholder = "Host default";
-    model.value = profile?.model_ref || "";
+    const model = node("select", "worker-binding-model");
+    fillWorkerBindingModelSelect(
+      model,
+      provider.value,
+      profile?.model_ref || ""
+    );
+    provider.addEventListener("change", () => {
+      fillWorkerBindingModelSelect(model, provider.value, model.value);
+    });
+    const modelCustom = node("input", "worker-binding-model-custom");
+    modelCustom.type = "text";
+    modelCustom.placeholder = "custom model id (optional)";
+    modelCustom.autocomplete = "off";
+    modelCustom.spellcheck = false;
     const effort = node("select", "worker-binding-effort");
     for (const value of ["AUTO", "LOW", "MEDIUM", "HIGH", "MAX"]) {
       const option = node("option", "", value[0] + value.slice(1).toLowerCase());
@@ -2354,8 +2359,118 @@ function renderWorkerBindingSettings() {
     skills.type = "text";
     skills.placeholder = "skill-a, skill-b";
     skills.value = (profile?.skill_refs || []).join(", ");
-    row.append(copy, provider, model, effort, skills);
+    row.append(copy, provider, model, modelCustom, effort, skills);
     elements.workerBindingSettings.append(row);
+  }
+  renderProviderModelCatalog();
+}
+
+function renderProviderModelCatalog() {
+  const root = elements.providerModelCatalog;
+  if (!root) return;
+  root.replaceChildren();
+  const catalog = state.providerModels;
+  if (!catalog?.providers) {
+    root.append(
+      node(
+        "p",
+        "empty-copy",
+        "No model catalog yet — Discover host tools or Refresh models"
+      )
+    );
+    return;
+  }
+  const meta = node("small", "provider-setting-status");
+  meta.textContent = [
+    catalog.catalog_path || "",
+    catalog.discovered_at ? `discovered ${catalog.discovered_at}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  root.append(meta);
+  for (const name of ["GROK", "CODEX", "CLAUDE"]) {
+    const entry = catalog.providers[name] || {};
+    const block = node("div", "provider-model-block");
+    block.dataset.provider = name;
+    const head = node("div", "settings-section-heading");
+    head.append(
+      node("strong", "", name),
+      node(
+        "small",
+        "",
+        `${entry.status || "UNKNOWN"} · ${entry.source || "—"} · default ${
+          entry.default || "—"
+        }`
+      )
+    );
+    const list = node("div", "provider-model-chips");
+    for (const modelId of entry.models || []) {
+      const chip = node("span", "provider-model-chip", modelId);
+      if ((entry.user_models || []).includes(modelId)) {
+        chip.classList.add("is-user");
+        chip.title = "User-added (kept on rediscover)";
+      }
+      list.append(chip);
+    }
+    const edit = node("div", "provider-model-edit");
+    const input = node("input", "provider-model-add-input");
+    input.type = "text";
+    input.placeholder = `Add ${name} model id`;
+    input.dataset.provider = name;
+    const add = node("button", "secondary-button", "Add");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      const value = input.value.trim();
+      if (!value) return;
+      const providers = {
+        ...(state.providerModels?.providers || {}),
+      };
+      const current = {
+        ...(providers[name] || {}),
+        user_models: [
+          ...new Set([...(providers[name]?.user_models || []), value]),
+        ],
+      };
+      providers[name] = current;
+      saveProviderModelCatalog({ providers }).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+    edit.append(input, add);
+    if (entry.note) {
+      block.append(head, node("small", "provider-setting-status", entry.note), list, edit);
+    } else {
+      block.append(head, list, edit);
+    }
+    root.append(block);
+  }
+}
+
+async function saveProviderModelCatalog(body) {
+  const result = await api("/v1/settings/provider-models", {
+    method: "POST",
+    body,
+  });
+  state.providerModels = result.catalog || result;
+  renderProviderModelCatalog();
+  renderWorkerBindingSettings();
+  toast("Model catalog updated");
+  return state.providerModels;
+}
+
+async function refreshProviderModels() {
+  elements.settingsError.textContent = "";
+  try {
+    const result = await api("/v1/settings/provider-models/discover", {
+      method: "POST",
+      body: {},
+    });
+    state.providerModels = result.catalog || result;
+    renderProviderModelCatalog();
+    renderWorkerBindingSettings();
+    toast("Provider models refreshed");
+  } catch (error) {
+    elements.settingsError.textContent = error.message;
   }
 }
 
@@ -2553,8 +2668,16 @@ async function discoverHostTools() {
       method: "POST",
       body: {},
     });
+    if (state.hostTools?.provider_models) {
+      state.providerModels = state.hostTools.provider_models;
+    } else {
+      const models = await api("/v1/settings/provider-models").catch(() => null);
+      if (models?.catalog) state.providerModels = models.catalog;
+    }
     renderHostToolSettings();
-    toast("Host tools discovered");
+    renderProviderModelCatalog();
+    renderWorkerBindingSettings();
+    toast("Host tools + provider models discovered");
   } catch (error) {
     elements.settingsError.textContent = error.message;
   } finally {
@@ -3095,6 +3218,7 @@ async function openProviderSettings() {
     state.remoteAccess,
     state.rendezvous,
     state.runtimePreflight,
+    state.providerModels,
   ] = await Promise.all([
     api("/v1/settings/providers"),
     api("/v1/settings/worker-bindings"),
@@ -3103,6 +3227,9 @@ async function openProviderSettings() {
     api("/v1/settings/remote-access"),
     api("/v1/settings/rendezvous").catch(() => null),
     api("/v1/runtime/preflight").catch(() => null),
+    api("/v1/settings/provider-models")
+      .then((result) => result.catalog || result)
+      .catch(() => null),
   ]);
   if (elements.memoryMaintainInterval && state.serviceSettings?.memory_maintain) {
     elements.memoryMaintainInterval.value = String(
@@ -3216,7 +3343,11 @@ async function submitProviderSettings(event) {
             worker_role: row.dataset.role,
             task_type: "*",
             provider: row.querySelector(".worker-binding-provider").value,
-            model_ref: row.querySelector(".worker-binding-model").value.trim(),
+            model_ref: (
+              row.querySelector(".worker-binding-model-custom")?.value ||
+              row.querySelector(".worker-binding-model")?.value ||
+              ""
+            ).trim(),
             effort: row.querySelector(".worker-binding-effort").value,
             skill_refs: row
               .querySelector(".worker-binding-skills")
@@ -5449,33 +5580,17 @@ function renderTodos() {
   elements.todoCount.textContent = `${todos.length} item${
     todos.length === 1 ? "" : "s"
   }`;
-  if (elements.seedWorklistButton) {
-    const projectId = state.selectedProject?.project_id;
-    const projectTodoCount = projectId
-      ? state.todos.filter((todo) => todo.project_id === projectId).length
-      : 0;
-    elements.seedWorklistButton.hidden = !projectId || projectTodoCount > 0;
-  }
   if (!todos.length) {
     const empty = node("div", "todo-empty-block");
     empty.append(
-      node("p", "empty-copy todo-empty", "No Todo matches this view")
-    );
-    if (
-      state.selectedProject &&
-      !state.todos.some(
-        (todo) => todo.project_id === state.selectedProject.project_id
+      node(
+        "p",
+        "empty-copy todo-empty",
+        state.selectedProject
+          ? "No Todo for this project yet — add one (docs only as references in detail)"
+          : "No Todo matches this view"
       )
-    ) {
-      const seed = node(
-        "button",
-        "secondary-button",
-        "Seed P0 worklist for this project"
-      );
-      seed.type = "button";
-      seed.addEventListener("click", seedWorklistTodos);
-      empty.append(seed);
-    }
+    );
     elements.todoList.append(empty);
     return;
   }
@@ -5640,53 +5755,6 @@ function undeliveredSkillPlanAdoptions() {
   return state.skillPlanAdoptions.filter(
     (adoption) => !deliveredAdoptionIds.has(adoption.adoption_id)
   );
-}
-
-async function seedWorklistTodos() {
-  if (!state.selectedProject) {
-    toast("Select a project first", true);
-    return;
-  }
-  const projectId = state.selectedProject.project_id;
-  const existing = state.todos.filter((todo) => todo.project_id === projectId);
-  if (existing.length) {
-    toast("Project already has todos; seed skipped", true);
-    return;
-  }
-  if (
-    !window.confirm(
-      `Create ${WORKLIST_SEED_TODOS.length} planning todos for ${projectId}?`
-    )
-  ) {
-    return;
-  }
-  try {
-    const created = [];
-    for (const [index, seed] of WORKLIST_SEED_TODOS.entries()) {
-      const result = await api("/v1/todos", {
-        method: "POST",
-        body: {
-          scope_kind: "PROJECT",
-          project_id: projectId,
-          title: seed.title,
-          detail: seed.detail,
-          priority: seed.priority,
-          state: seed.state,
-          source_kind: "USER",
-          sort_order: index,
-        },
-      });
-      created.push(result.todo);
-    }
-    state.todos = [...created, ...state.todos];
-    renderProjects();
-    renderTodos();
-    renderDetails();
-    drawGraph();
-    toast(`Seeded ${created.length} worklist todos`);
-  } catch (error) {
-    toast(error.message, true);
-  }
 }
 
 async function proposeSkillPlanHandoff(adoption) {
@@ -7188,9 +7256,7 @@ function bindEvents() {
   if (elements.todoPriorityFilter) {
     elements.todoPriorityFilter.addEventListener("change", renderTodos);
   }
-  if (elements.seedWorklistButton) {
-    elements.seedWorklistButton.addEventListener("click", seedWorklistTodos);
-  }
+
   if (elements.proposeMasterHandoffButton) {
     elements.proposeMasterHandoffButton.addEventListener(
       "click",
@@ -7266,6 +7332,11 @@ function bindEvents() {
   elements.discoverHostTools.addEventListener("click", () => {
     discoverHostTools().catch((error) => toast(error.message, true));
   });
+  if (elements.refreshProviderModels) {
+    elements.refreshProviderModels.addEventListener("click", () => {
+      refreshProviderModels().catch((error) => toast(error.message, true));
+    });
+  }
   elements.remoteAccessTransport.addEventListener("change", () => {
     elements.remoteConnectorFields.classList.toggle(
       "hidden",

@@ -250,6 +250,8 @@ universe work .
 - Session / anchor / handoff / inbox / memory as product uses them
 - Project-owned skills, adapters, policies
 - `.ai/universe/install_binding.json`
+- `.ai/universe/TODO_TRACKING_POLICY.md` — live work = Todo DB; docs = reference only  
+  (see `docs/universe-todo-tracking-policy.md`; plant from `templates/project-todo-tracking-policy.md`)
 - Projection seed under `.ai/universe/` when published
 
 ### Host / Career (shared)

@@ -2,8 +2,26 @@
 
 대화 내용 + 기존 문서(정본 2개 + 임시본 참고용) 기준으로 정렬한 목록입니다.
 
-**구현 수준 갱신:** 2026-07-31 (Todo UI + Master 전달 polish)  
-**대조 기준:** `tools/` · `tests/` · `docs/` · HEAD `7861684`+local · 로컬 DB `%LOCALAPPDATA%\Universe\universe.sqlite3`  
+### 운영 규약 (2026-08-06 고정)
+
+| 구분 | 역할 |
+|------|------|
+| **Todo 보드 (`project_todo`)** | **정본 작업 큐.** 프로젝트 스코프 + `detail`에 문서 경로 연결 |
+| **이 마크다운 워크리스트** | **이력·구현 수준 스냅샷 / 인덱스.** 일상 진행 추적용 아님 |
+| **Seed worklist 버튼** | **제거됨** (GCS 고정 템플릿이 전 프로젝트에 복제되던 경로). 항목은 Todo로 직접 추가 |
+
+열린 일은 UI Todo(또는 `GET /v1/todos`)에 넣고, 관련 문서는 `detail`에 경로로 적는다.  
+예: `docs/universe-install-mode.md`, `docs/universe-packaging.md`.  
+(정식 `document_ref` 필드는 후속; 현재는 detail 링크.)
+
+**전 프로젝트 심기:** `.ai/universe/TODO_TRACKING_POLICY.md`  
+정본: `docs/universe-todo-tracking-policy.md`  
+(마크다운 backlog 상태 추적 금지 → DB Todo + 문서 참조만.)
+
+universe 프로젝트 시드 예: install_mode 구현 Todo, packaging/E2E/Memory/Bench 등.
+
+**구현 수준 갱신:** 2026-08-06 (Todo = 정본 큐; install_mode 문서 고정) · 이전 2026-07-31  
+**대조 기준:** `tools/` · `tests/` · `docs/` · 로컬 DB `%LOCALAPPDATA%\Universe\universe.sqlite3`  
 **등급:**
 
 | 등급 | 의미 |

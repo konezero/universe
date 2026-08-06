@@ -45,6 +45,10 @@ from agent_session_gateway import (
     normalize_permission_request,
 )
 from host_profile import HostProfileError, HostProfileStore
+from provider_model_catalog import (
+    ProviderModelCatalogError,
+    ProviderModelCatalogStore,
+)
 from remote_access import RemoteAccessError, RemoteAccessStore
 from legacy_executor_classifier import (
     classify_inventory,
@@ -11126,6 +11130,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
         host_profile: HostProfileStore | None = None,
+        provider_model_catalog: ProviderModelCatalogStore | None = None,
         service_state_path: Path | None = None,
         remote_gateway_state_path: Path | None = None,
         remote_connector_state_path: Path | None = None,
@@ -11150,6 +11155,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
+        self.provider_model_catalog = provider_model_catalog or ProviderModelCatalogStore(
+            host_profile=self.host_profile
+        )
+        try:
+            self.provider_model_catalog.ensure_initialized()
+        except ProviderModelCatalogError:
+            # Catalog is best-effort; host boot must not fail if model list is empty.
+            pass
         python_tool = self.host_profile.resolve("python")
         self.continuity_coordinator = (
             ProjectContinuityCoordinator(
@@ -12501,9 +12514,50 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
-            return self.host_profile.discover()
+            profile = self.host_profile.discover()
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
+        try:
+            catalog = self.provider_model_catalog.discover(persist=True)
+        except ProviderModelCatalogError:
+            catalog = self.provider_model_catalog.snapshot()
+        return {
+            **profile,
+            "provider_models": catalog,
+        }
+
+    def provider_model_catalog_settings(self) -> dict[str, Any]:
+        try:
+            catalog = self.provider_model_catalog.snapshot()
+        except ProviderModelCatalogError as error:
+            raise UniverseError(error.code, str(error)) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROVIDER_MODELS_COLLECTED",
+            "catalog": catalog,
+        }
+
+    def discover_provider_models(self) -> dict[str, Any]:
+        try:
+            catalog = self.provider_model_catalog.discover(persist=True)
+        except ProviderModelCatalogError as error:
+            raise UniverseError(error.code, str(error)) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROVIDER_MODELS_DISCOVERED",
+            "catalog": catalog,
+        }
+
+    def save_provider_models(self, value: Any) -> dict[str, Any]:
+        try:
+            catalog = self.provider_model_catalog.save_user_edits(value)
+        except ProviderModelCatalogError as error:
+            raise UniverseError(error.code, str(error)) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROVIDER_MODELS_SAVED",
+            "catalog": catalog,
+        }
 
     def set_host_tool(self, tool: str, value: Any) -> dict[str, Any]:
         request = _exact_object_fields(
@@ -13453,6 +13507,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        if path == "/v1/settings/provider-models":
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.provider_model_catalog_settings(),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/runtime/planning-binding":
             self._send(
                 HTTPStatus.OK,
@@ -14318,6 +14381,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self.server.discover_host_tools(),
                 )
+                return
+            if path == "/v1/settings/provider-models/discover":
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.discover_provider_models(),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                return
+            if path == "/v1/settings/provider-models":
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.save_provider_models(body),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
                 return
             host_tool_match = re.fullmatch(
                 r"/v1/settings/host-tools/([^/]+)/(select|verify|model)",

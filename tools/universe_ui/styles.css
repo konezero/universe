@@ -1789,9 +1789,51 @@ dialog {
 .worker-binding-row {
   display: grid;
   grid-template-columns:
-    minmax(110px, 1.1fr) 105px minmax(130px, 1.3fr) 95px minmax(150px, 1.4fr);
+    minmax(100px, 1fr) 95px minmax(110px, 1.1fr) minmax(100px, 1fr) 90px minmax(120px, 1.2fr);
   gap: 8px;
   align-items: center;
+}
+
+.provider-model-catalog {
+  display: grid;
+  gap: 12px;
+}
+
+.provider-model-block {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+}
+
+.provider-model-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.provider-model-chip {
+  display: inline-flex;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(90, 160, 230, 0.35);
+  background: rgba(12, 28, 48, 0.85);
+  color: var(--text-2, #c5d8ec);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.provider-model-chip.is-user {
+  border-color: rgba(240, 184, 74, 0.55);
+  color: #f6e0a8;
+}
+
+.provider-model-edit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
 }
 
 .worker-binding-legend {

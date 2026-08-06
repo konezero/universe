@@ -54,6 +54,23 @@ explicit selection. Defaults are `default` for Codex and Claude and
 `grok-build` for Grok. Revision 1 Profiles are migrated in place without
 rediscovering or replacing an already selected executable.
 
+## Provider model catalog
+
+Universe also maintains a machine-local **model kind catalog** (not project git):
+
+```text
+%LOCALAPPDATA%\Universe\provider-models.json
+```
+
+On host start / `POST /v1/settings/host-tools/discover` / `POST /v1/settings/provider-models/discover`:
+
+1. CLI search (Grok: `grok models`; Codex: `~/.codex/config.toml` + presets; Claude: alias presets)
+2. Merge built-in presets
+3. Keep user-added model ids (`user_models`)
+4. Persist catalog
+
+Settings UI Worker bindings use the catalog as a **select** (Host default + kinds). Optional custom id field still allows overrides. `GET/POST /v1/settings/provider-models` reads and saves edits.
+
 Only `GROK_HOME` is permitted in the stored launch environment. Secrets,
 tokens, cookies, provider sessions, and arbitrary environment variables are
 invalid Profile content.
