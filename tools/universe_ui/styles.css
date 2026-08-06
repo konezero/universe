@@ -556,6 +556,43 @@ body.inspector-open .graph-hint {
   cursor: grabbing;
 }
 
+#universe-graph.is-hovering-node {
+  cursor: pointer;
+}
+
+.graph-node-tooltip {
+  position: absolute;
+  z-index: 8;
+  max-width: min(280px, 70%);
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(90, 200, 255, 0.45);
+  background: rgba(8, 18, 34, 0.94);
+  color: #e8f4ff;
+  font: 600 12px/1.35 "Segoe UI", system-ui, sans-serif;
+  letter-spacing: 0.01em;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(61, 224, 255, 0.08);
+  pointer-events: none;
+  transform: translate(-50%, calc(-100% - 12px));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph-node-tooltip .graph-tooltip-kind {
+  display: block;
+  margin-bottom: 2px;
+  color: rgba(160, 198, 230, 0.85);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.graph-node-tooltip.hidden {
+  display: none;
+}
+
 .graph-empty {
   position: absolute;
   inset: 0;
@@ -1336,46 +1373,73 @@ body.inspector-open .inspector {
 }
 
 .timeline {
-  display: grid;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
 }
 
 .timeline-item {
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr);
-  gap: 8px;
-  padding: 6px 0;
+  /* ::before is the first grid item (bullet); .timeline-copy is the body. */
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(90, 150, 210, 0.08);
 }
 
 .timeline-item::before {
   width: 8px;
   height: 8px;
-  margin-top: 4px;
-  border: 2px solid var(--surface);
+  margin-top: 5px;
+  border: 2px solid rgba(8, 18, 32, 0.9);
   border-radius: 50%;
-  background: var(--line-strong);
-  box-shadow: 0 0 0 1px var(--line-strong);
+  background: rgba(90, 200, 255, 0.75);
+  box-shadow: 0 0 0 1px rgba(90, 200, 255, 0.35);
   content: "";
+}
+
+.timeline-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+  width: 100%;
 }
 
 .timeline-copy strong,
 .timeline-copy small {
   display: block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .timeline-copy strong {
   font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-1, var(--text));
 }
 
 .timeline-copy small {
-  margin-top: 3px;
+  margin-top: 0;
   color: var(--muted);
   font-size: 10px;
-  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+
+.timeline-copy .status-badge {
+  align-self: flex-start;
 }
 
 .timeline-action {
-  margin-top: 7px;
+  margin-top: 4px;
   min-height: 28px;
   font-size: 11px;
 }
@@ -1410,7 +1474,8 @@ dialog {
 }
 
 .settings-dialog {
-  width: min(720px, calc(100vw - 28px));
+  width: min(840px, calc(100vw - 28px));
+  max-height: min(90vh, 920px);
 }
 
 .settings-dialog .dialog-heading {
@@ -1421,6 +1486,74 @@ dialog {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 11px;
+}
+
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 0 10px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 2px;
+}
+
+.settings-tab {
+  appearance: none;
+  border: 1px solid rgba(90, 160, 230, 0.22);
+  background: rgba(8, 22, 38, 0.72);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.settings-tab:hover {
+  border-color: rgba(90, 160, 230, 0.5);
+  color: var(--text-1);
+}
+
+.settings-tab.is-active {
+  border-color: rgba(78, 196, 255, 0.65);
+  background: linear-gradient(
+    165deg,
+    rgba(40, 110, 180, 0.45),
+    rgba(20, 60, 110, 0.55)
+  );
+  color: var(--text-1);
+  box-shadow: 0 0 0 1px rgba(78, 196, 255, 0.18);
+}
+
+.settings-tab-panels,
+.dialog-tab-panels {
+  min-height: 280px;
+  max-height: min(58vh, 560px);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.todo-tab-panels,
+.observatory-tab-panels {
+  max-height: min(62vh, 640px);
+}
+
+.settings-tab-panel[hidden] {
+  display: none !important;
+}
+
+.settings-tab-panel {
+  display: grid;
+  gap: 0;
+}
+
+.settings-tab-panel .settings-section:first-child {
+  border-top: none;
+  padding-top: 8px;
 }
 
 .settings-section {

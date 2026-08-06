@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css?v=activity-timeline-layout-6">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -103,6 +103,7 @@
       </div>
       <div class="canvas-wrap starfield">
         <canvas id="universe-graph" aria-label="Project system graph"></canvas>
+        <div id="graph-node-tooltip" class="graph-node-tooltip hidden" role="tooltip"></div>
         <div id="graph-empty" class="graph-empty">Universe multiverse map</div>
         <p id="graph-hint" class="graph-hint">Universe hub · projects around · click a project to expand nodes · pan/zoom</p>
         <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
@@ -250,259 +251,292 @@
     <form id="settings-form" method="dialog">
       <div class="dialog-heading">
         <div>
-          <h2>Runtime settings</h2>
-          <p>Choose control-room providers and verify local Host tools.</p>
+          <h2>Settings</h2>
+          <p>Service, remote access, rooms, providers, and host tools — one category per tab.</p>
         </div>
         <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
       </div>
-      <section class="settings-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Local service</strong>
-            <small>Loopback process lifecycle is CLI-managed</small>
-          </div>
+
+      <div class="settings-tabs" role="tablist" aria-label="Settings categories">
+        <button type="button" class="settings-tab is-active" role="tab" aria-selected="true" data-settings-tab="service">Service</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="remote">Remote</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="rooms">Rooms</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="providers">Providers</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-settings-tab="host">Host</button>
+      </div>
+
+      <div class="settings-tab-panels">
+        <!-- Service -->
+        <div class="settings-tab-panel is-active" data-settings-panel="service" role="tabpanel">
+          <section class="settings-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Local service</strong>
+                <small>Loopback process lifecycle is CLI-managed</small>
+              </div>
+            </div>
+            <div id="local-service-status" class="local-service-status">
+              <p class="empty-copy">Checking service…</p>
+            </div>
+            <p class="settings-help">
+              Use <code>python tools/universe_server.py status|start|stop|restart</code>,
+              the system tray, or Start Menu shortcuts from
+              <code>packaging/windows/install-user.ps1</code>.
+            </p>
+            <label for="memory-maintain-interval">Memory maintain interval (hours)</label>
+            <input
+              id="memory-maintain-interval"
+              name="memory_maintain_interval_hours"
+              type="number"
+              min="0"
+              max="720"
+              step="1"
+              value="0"
+            >
+            <small id="memory-maintain-status" class="provider-setting-status">
+              0 = off. Server process runs HEURISTIC maintain when &gt; 0.
+            </small>
+          </section>
         </div>
-        <div id="local-service-status" class="local-service-status">
-          <p class="empty-copy">Checking service…</p>
+
+        <!-- Remote access + rendezvous -->
+        <div class="settings-tab-panel" data-settings-panel="remote" role="tabpanel" hidden>
+          <section class="settings-section remote-access-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Mobile access</strong>
+                <small>Paired browsers over LAN or your trusted server</small>
+              </div>
+              <span id="remote-access-status" class="remote-access-status" data-state="OFFLINE">
+                Offline
+              </span>
+            </div>
+            <p class="settings-help">
+              Universe stays on loopback. A separate fixed-origin gateway exposes this UI only
+              after one-time pairing and desktop approval.
+            </p>
+            <div class="remote-access-configuration">
+              <label for="remote-access-transport">
+                Connection
+                <select id="remote-access-transport" name="remote_access_transport">
+                  <option value="LAN">Local network</option>
+                  <option value="SSH_REVERSE_TUNNEL">Internet through my server</option>
+                </select>
+              </label>
+              <div id="remote-connector-fields" class="remote-access-form-grid hidden">
+                <label for="remote-public-url">
+                  Public HTTPS URL
+                  <input id="remote-public-url" type="url" placeholder="https://universe.example.com">
+                </label>
+                <label for="remote-ssh-host">
+                  SSH server
+                  <input id="remote-ssh-host" type="text" autocomplete="off" placeholder="server.example.com">
+                </label>
+                <label for="remote-ssh-user">
+                  SSH user
+                  <input id="remote-ssh-user" type="text" autocomplete="off" placeholder="universe-tunnel">
+                </label>
+                <label for="remote-ssh-port">
+                  SSH port
+                  <input id="remote-ssh-port" type="number" min="1" max="65535" value="22">
+                </label>
+                <label for="remote-forward-port">
+                  Server loopback port
+                  <input id="remote-forward-port" type="number" min="1024" max="65535" value="18443">
+                </label>
+                <label for="remote-identity-file">
+                  Private key file
+                  <input id="remote-identity-file" type="text" autocomplete="off" placeholder="C:\Users\me\.ssh\universe_ed25519">
+                </label>
+                <label for="remote-known-hosts-file">
+                  Known hosts file
+                  <input id="remote-known-hosts-file" type="text" autocomplete="off" placeholder="C:\Users\me\.ssh\known_hosts">
+                </label>
+              </div>
+            </div>
+            <div class="remote-access-actions">
+              <button id="start-remote-access-button" type="button" class="primary-button">
+                Start mobile access
+              </button>
+              <button id="stop-remote-access-button" type="button" class="secondary-button">
+                Stop
+              </button>
+              <button id="create-pairing-button" type="button" class="secondary-button">
+                Pair device
+              </button>
+            </div>
+            <div id="remote-access-endpoint" class="remote-access-endpoint"></div>
+            <div id="remote-pairing-invite" class="remote-pairing-invite hidden"></div>
+            <div class="remote-access-grid">
+              <div>
+                <strong class="settings-subheading">Pending approval</strong>
+                <div id="remote-pairing-list" class="remote-access-list"></div>
+              </div>
+              <div>
+                <strong class="settings-subheading">Paired devices</strong>
+                <div id="remote-device-list" class="remote-access-list"></div>
+              </div>
+            </div>
+          </section>
+          <section class="settings-section remote-access-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Rendezvous join</strong>
+                <small>Internet /pair page → local Universe approval</small>
+              </div>
+              <span id="rendezvous-status" class="remote-access-status" data-state="OFFLINE">
+                Inactive
+              </span>
+            </div>
+            <p class="settings-help">
+              Registers this Universe with the rendezvous broker for presence and join
+              requests. The broker never receives chat, source, or credentials.
+            </p>
+            <div id="rendezvous-summary" class="remote-access-endpoint"></div>
+            <div class="remote-access-actions">
+              <button id="refresh-rendezvous-button" type="button" class="secondary-button">
+                Refresh
+              </button>
+              <button id="stop-rendezvous-button" type="button" class="secondary-button">
+                Stop
+              </button>
+            </div>
+            <div>
+              <strong class="settings-subheading">Pending join requests</strong>
+              <div id="rendezvous-pending-list" class="remote-access-list"></div>
+            </div>
+          </section>
         </div>
-        <p class="settings-help">
-          Use <code>python tools/universe_server.py status|start|stop|restart</code>
-          or Start Menu shortcuts from <code>packaging/windows/install-user.ps1</code>.
-        </p>
-        <label for="memory-maintain-interval">Memory maintain interval (hours)</label>
-        <input
-          id="memory-maintain-interval"
-          name="memory_maintain_interval_hours"
-          type="number"
-          min="0"
-          max="720"
-          step="1"
-          value="0"
-        >
-        <small id="memory-maintain-status" class="provider-setting-status">
-          0 = off. Server process runs HEURISTIC maintain when &gt; 0.
-        </small>
-      </section>
-      <section class="settings-section remote-access-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Mobile access</strong>
-            <small>Paired browsers over LAN or your trusted server</small>
-          </div>
-          <span id="remote-access-status" class="remote-access-status" data-state="OFFLINE">
-            Offline
-          </span>
+
+        <!-- Rooms -->
+        <div class="settings-tab-panel" data-settings-panel="rooms" role="tabpanel" hidden>
+          <section class="settings-section remote-access-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Multi-room</strong>
+                <small>Project / Boss / Meeting — inject and post without Observatory</small>
+              </div>
+            </div>
+            <p class="settings-help">
+              Rooms API: list, open snapshot, post (role-checked), inject session ref.
+              Prefer Session Observatory for day-to-day session pick; this tab is the
+              function-first control surface.
+            </p>
+            <div class="remote-access-actions">
+              <button id="refresh-rooms-button" type="button" class="secondary-button">
+                Refresh rooms
+              </button>
+              <button id="create-meeting-room-button" type="button" class="secondary-button">
+                New meeting room
+              </button>
+            </div>
+            <label for="inject-project-id">
+              Project id
+              <input id="inject-project-id" type="text" placeholder="selected project if empty" autocomplete="off" />
+            </label>
+            <label for="inject-provider">
+              Provider
+              <select id="inject-provider">
+                <option value="CODEX">CODEX</option>
+                <option value="CLAUDE">CLAUDE</option>
+                <option value="GROK">GROK</option>
+              </select>
+            </label>
+            <label for="inject-session-ref">
+              Session ref
+              <input id="inject-session-ref" type="text" placeholder="thread / session id" autocomplete="off" />
+            </label>
+            <div class="remote-access-actions">
+              <button id="inject-session-ref-button" type="button" class="primary-button">
+                Inject session ref
+              </button>
+              <small class="settings-help">
+                Supervisor register + default (PROJECT/MASTER) + room attach.
+              </small>
+            </div>
+            <div id="multi-room-list" class="remote-access-list"></div>
+            <div id="multi-room-detail" class="remote-access-endpoint"></div>
+            <label for="multi-room-message">
+              Message (role enforced server-side)
+              <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>
+            </label>
+            <div class="remote-access-actions">
+              <button id="post-room-message-button" type="button" class="primary-button">
+                Post as USER
+              </button>
+              <button id="call-master-button" type="button" class="secondary-button">
+                Call master (boss rooms)
+              </button>
+            </div>
+          </section>
         </div>
-        <p class="settings-help">
-          Universe stays on loopback. A separate fixed-origin gateway exposes this UI only
-          after one-time pairing and desktop approval.
-        </p>
-        <div class="remote-access-configuration">
-          <label for="remote-access-transport">
-            Connection
-            <select id="remote-access-transport" name="remote_access_transport">
-              <option value="LAN">Local network</option>
-              <option value="SSH_REVERSE_TUNNEL">Internet through my server</option>
+
+        <!-- Providers -->
+        <div class="settings-tab-panel" data-settings-panel="providers" role="tabpanel" hidden>
+          <section class="settings-section">
+            <label for="universe-provider-setting">Universe Conductor</label>
+            <select id="universe-provider-setting" name="universe_provider">
+              <option value="AUTO">Auto</option>
+              <option value="GROK">Grok</option>
+              <option value="CODEX">Codex</option>
+              <option value="CLAUDE">Claude</option>
             </select>
-          </label>
-          <div id="remote-connector-fields" class="remote-access-form-grid hidden">
-            <label for="remote-public-url">
-              Public HTTPS URL
-              <input id="remote-public-url" type="url" placeholder="https://universe.example.com">
-            </label>
-            <label for="remote-ssh-host">
-              SSH server
-              <input id="remote-ssh-host" type="text" autocomplete="off" placeholder="server.example.com">
-            </label>
-            <label for="remote-ssh-user">
-              SSH user
-              <input id="remote-ssh-user" type="text" autocomplete="off" placeholder="universe-tunnel">
-            </label>
-            <label for="remote-ssh-port">
-              SSH port
-              <input id="remote-ssh-port" type="number" min="1" max="65535" value="22">
-            </label>
-            <label for="remote-forward-port">
-              Server loopback port
-              <input id="remote-forward-port" type="number" min="1024" max="65535" value="18443">
-            </label>
-            <label for="remote-identity-file">
-              Private key file
-              <input id="remote-identity-file" type="text" autocomplete="off" placeholder="C:\Users\me\.ssh\universe_ed25519">
-            </label>
-            <label for="remote-known-hosts-file">
-              Known hosts file
-              <input id="remote-known-hosts-file" type="text" autocomplete="off" placeholder="C:\Users\me\.ssh\known_hosts">
-            </label>
-          </div>
+            <small id="universe-provider-status" class="provider-setting-status"></small>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-heading">
+              <strong>Project Masters</strong>
+              <small>Overrides apply when the Project Master is next called.</small>
+            </div>
+            <div id="project-provider-settings" class="project-provider-settings"></div>
+          </section>
+          <section class="settings-section worker-binding-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Worker bindings</strong>
+                <small>Defaults are sealed into the next Task Frame proposal snapshot.</small>
+              </div>
+              <label class="worker-binding-scope-label" for="worker-binding-scope">
+                Scope
+                <select id="worker-binding-scope"></select>
+              </label>
+            </div>
+            <div class="worker-binding-legend" aria-hidden="true">
+              <span>Role</span><span>Provider</span><span>Model</span><span>Effort</span><span>Skills</span>
+            </div>
+            <div id="worker-binding-settings" class="worker-binding-settings"></div>
+            <small class="provider-setting-status">
+              AUTO keeps provider selection dynamic. Skill references are proposal inputs, not execution authority.
+            </small>
+          </section>
         </div>
-        <div class="remote-access-actions">
-          <button id="start-remote-access-button" type="button" class="primary-button">
-            Start mobile access
-          </button>
-          <button id="stop-remote-access-button" type="button" class="secondary-button">
-            Stop
-          </button>
-          <button id="create-pairing-button" type="button" class="secondary-button">
-            Pair device
-          </button>
+
+        <!-- Host tools -->
+        <div class="settings-tab-panel" data-settings-panel="host" role="tabpanel" hidden>
+          <section class="settings-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Host tools</strong>
+                <small id="host-profile-path"></small>
+              </div>
+              <button id="discover-host-tools-button" type="button" class="secondary-button">
+                Discover
+              </button>
+            </div>
+            <div id="host-tool-settings" class="host-tool-settings"></div>
+          </section>
+          <section class="settings-section runtime-preflight-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Runtime preflight</strong>
+                <small id="runtime-preflight-summary">Checking local execution settings...</small>
+              </div>
+            </div>
+            <div id="runtime-preflight-list" class="runtime-preflight-list"></div>
+          </section>
         </div>
-        <div id="remote-access-endpoint" class="remote-access-endpoint"></div>
-        <div id="remote-pairing-invite" class="remote-pairing-invite hidden"></div>
-        <div class="remote-access-grid">
-          <div>
-            <strong class="settings-subheading">Pending approval</strong>
-            <div id="remote-pairing-list" class="remote-access-list"></div>
-          </div>
-          <div>
-            <strong class="settings-subheading">Paired devices</strong>
-            <div id="remote-device-list" class="remote-access-list"></div>
-          </div>
-        </div>
-      </section>
-      <section class="settings-section remote-access-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Multi-room (function-first)</strong>
-            <small>Project / Boss / Meeting — thin chrome for later UI redesign</small>
-          </div>
-        </div>
-        <p class="settings-help">
-          Rooms API S1–S5: list, open snapshot, post (role-checked), inject session ref.
-          See docs/multi-room-implementation-status.md.
-        </p>
-        <div class="remote-access-actions">
-          <button id="refresh-rooms-button" type="button" class="secondary-button">
-            Refresh rooms
-          </button>
-          <button id="create-meeting-room-button" type="button" class="secondary-button">
-            New meeting room
-          </button>
-        </div>
-        <label for="inject-project-id">
-          Project id
-          <input id="inject-project-id" type="text" placeholder="selected project if empty" autocomplete="off" />
-        </label>
-        <label for="inject-provider">
-          Provider
-          <select id="inject-provider">
-            <option value="CODEX">CODEX</option>
-            <option value="CLAUDE">CLAUDE</option>
-            <option value="GROK">GROK</option>
-          </select>
-        </label>
-        <label for="inject-session-ref">
-          Session ref
-          <input id="inject-session-ref" type="text" placeholder="thread / session id" autocomplete="off" />
-        </label>
-        <div class="remote-access-actions">
-          <button id="inject-session-ref-button" type="button" class="primary-button">
-            Inject session ref
-          </button>
-          <small class="settings-help">
-            Supervisor register + default (PROJECT/MASTER) + room attach. No Observatory.
-          </small>
-        </div>
-        <div id="multi-room-list" class="remote-access-list"></div>
-        <div id="multi-room-detail" class="remote-access-endpoint"></div>
-        <label for="multi-room-message">
-          Message (role enforced server-side)
-          <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>
-        </label>
-        <div class="remote-access-actions">
-          <button id="post-room-message-button" type="button" class="primary-button">
-            Post as USER
-          </button>
-          <button id="call-master-button" type="button" class="secondary-button">
-            Call master (boss rooms)
-          </button>
-        </div>
-      </section>
-      <section class="settings-section remote-access-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Rendezvous join</strong>
-            <small>Internet /pair page → local Universe approval</small>
-          </div>
-          <span id="rendezvous-status" class="remote-access-status" data-state="OFFLINE">
-            Inactive
-          </span>
-        </div>
-        <p class="settings-help">
-          Registers this Universe with the rendezvous broker for presence and join
-          requests. The broker never receives chat, source, or credentials.
-        </p>
-        <div id="rendezvous-summary" class="remote-access-endpoint"></div>
-        <div class="remote-access-actions">
-          <button id="refresh-rendezvous-button" type="button" class="secondary-button">
-            Refresh
-          </button>
-          <button id="stop-rendezvous-button" type="button" class="secondary-button">
-            Stop
-          </button>
-        </div>
-        <div>
-          <strong class="settings-subheading">Pending join requests</strong>
-          <div id="rendezvous-pending-list" class="remote-access-list"></div>
-        </div>
-      </section>
-      <section class="settings-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Host tools</strong>
-            <small id="host-profile-path"></small>
-          </div>
-          <button id="discover-host-tools-button" type="button" class="secondary-button">
-            Discover
-          </button>
-        </div>
-        <div id="host-tool-settings" class="host-tool-settings"></div>
-      </section>
-      <section class="settings-section runtime-preflight-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Runtime preflight</strong>
-            <small id="runtime-preflight-summary">Checking local execution settings...</small>
-          </div>
-        </div>
-        <div id="runtime-preflight-list" class="runtime-preflight-list"></div>
-      </section>
-      <section class="settings-section">
-        <label for="universe-provider-setting">Universe Conductor</label>
-        <select id="universe-provider-setting" name="universe_provider">
-          <option value="AUTO">Auto</option>
-          <option value="GROK">Grok</option>
-          <option value="CODEX">Codex</option>
-          <option value="CLAUDE">Claude</option>
-        </select>
-        <small id="universe-provider-status" class="provider-setting-status"></small>
-      </section>
-      <section class="settings-section">
-        <div class="settings-section-heading">
-          <strong>Project Masters</strong>
-          <small>Overrides apply when the Project Master is next called.</small>
-        </div>
-        <div id="project-provider-settings" class="project-provider-settings"></div>
-      </section>
-      <section class="settings-section worker-binding-section">
-        <div class="settings-section-heading">
-          <div>
-            <strong>Worker bindings</strong>
-            <small>Defaults are sealed into the next Task Frame proposal snapshot.</small>
-          </div>
-          <label class="worker-binding-scope-label" for="worker-binding-scope">
-            Scope
-            <select id="worker-binding-scope"></select>
-          </label>
-        </div>
-        <div class="worker-binding-legend" aria-hidden="true">
-          <span>Role</span><span>Provider</span><span>Model</span><span>Effort</span><span>Skills</span>
-        </div>
-        <div id="worker-binding-settings" class="worker-binding-settings"></div>
-        <small class="provider-setting-status">
-          AUTO keeps provider selection dynamic. Skill references are proposal inputs, not execution authority.
-        </small>
-      </section>
+      </div>
+
       <p id="settings-error" class="form-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
@@ -516,81 +550,102 @@
       <div>
         <span class="inspector-kicker">Local Supervisor</span>
         <h2>Session Observatory</h2>
-        <p>Persistent Mode sessions known to this Universe instance.</p>
+        <p>One active 1:1 per node/mode by default — register, attach, and audit elsewhere.</p>
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
     </div>
-    <div class="session-observatory-toolbar">
-      <span id="session-observatory-summary">Loading sessions…</span>
-      <label class="session-observatory-filter" title="Default shows one active 1:1 session per node/mode. Expand a card for older threads, or check this for the full Supervisor list including STOPPED.">
-        <input id="observatory-show-all" type="checkbox" />
-        Show all (every session id, incl. STOPPED)
-      </label>
-      <button id="cleanup-sessions-button" class="secondary-button" type="button" title="Remove DISCONNECTED/STOPPED sessions; LIVE kept. Re-register on boot/mode-change/inject.">
-        Clean sessions
-      </button>
-      <button id="refresh-sessions-button" class="secondary-button" type="button">Refresh</button>
+
+    <div class="dialog-tabs settings-tabs" role="tablist" aria-label="Observatory categories">
+      <button type="button" class="dialog-tab settings-tab is-active" role="tab" aria-selected="true" data-observatory-tab="sessions">Sessions</button>
+      <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="register">Register</button>
+      <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="attachments">Attachments</button>
+      <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="audit">Audit</button>
     </div>
-    <section class="session-inject-section">
-      <div class="section-heading"><span>Register this session</span></div>
-      <p class="section-note">
-        External harness sessions (Claude / Codex / Grok) appear here only after
-        Supervisor register or inject. Paste the provider session / thread id.
-      </p>
-      <div class="session-inject-form">
-        <label>
-          Provider
-          <select id="observatory-inject-provider">
-            <option value="CODEX">CODEX</option>
-            <option value="CLAUDE">CLAUDE</option>
-            <option value="GROK">GROK</option>
-          </select>
-        </label>
-        <label>
-          Session / thread ref
-          <input id="observatory-inject-ref" type="text" placeholder="provider session id" autocomplete="off" />
-        </label>
-        <label>
-          Project / node
-          <input id="observatory-inject-project" type="text" placeholder="selected project or CONDUCTOR" autocomplete="off" />
-        </label>
-        <label>
-          Mode
-          <select id="observatory-inject-mode">
-            <option value="MASTER">MASTER</option>
-            <option value="CONDUCTOR">CONDUCTOR</option>
-          </select>
-        </label>
-        <button id="observatory-inject-button" type="button" class="primary-button">
-          Inject into Universe
-        </button>
+
+    <div class="dialog-tab-panels settings-tab-panels observatory-tab-panels">
+      <div class="dialog-tab-panel settings-tab-panel is-active" data-observatory-panel="sessions" role="tabpanel">
+        <div class="session-observatory-toolbar">
+          <span id="session-observatory-summary">Loading sessions…</span>
+          <label class="session-observatory-filter" title="Default shows one active 1:1 session per node/mode. Expand a card for older threads, or check this for the full Supervisor list including STOPPED.">
+            <input id="observatory-show-all" type="checkbox" />
+            Show all (every session id, incl. STOPPED)
+          </label>
+          <button id="cleanup-sessions-button" class="secondary-button" type="button" title="Remove DISCONNECTED/STOPPED sessions; LIVE kept. Re-register on boot/mode-change/inject.">
+            Clean sessions
+          </button>
+          <button id="refresh-sessions-button" class="secondary-button" type="button">Refresh</button>
+        </div>
+        <div id="session-observatory-list" class="session-observatory-list"></div>
+        <section id="session-observatory-detail" class="session-observatory-detail hidden">
+          <div class="section-heading"><span>Selected session</span></div>
+          <div id="session-observatory-detail-meta" class="session-detail-meta"></div>
+          <div id="session-observatory-detail-preview" class="session-detail-preview"></div>
+        </section>
       </div>
-      <p id="observatory-inject-status" class="section-note"></p>
-    </section>
-    <section class="runtime-audit-section">
-      <div class="section-heading"><span>Runtime audit</span></div>
-      <div id="runtime-audit-grid" class="runtime-audit-grid"></div>
-    </section>
-    <div id="session-observatory-list" class="session-observatory-list"></div>
-    <section id="session-observatory-detail" class="session-observatory-detail hidden">
-      <div class="section-heading"><span>Selected session</span></div>
-      <div id="session-observatory-detail-meta" class="session-detail-meta"></div>
-      <div id="session-observatory-detail-preview" class="session-detail-preview"></div>
-    </section>
-    <section class="room-session-section">
-      <div class="section-heading"><span>Multi-room attachments</span></div>
-      <p class="section-note">Active room slots (may exist before Supervisor register).</p>
-      <div id="room-session-binding-list" class="session-observatory-list"></div>
-    </section>
-    <section class="legacy-executor-section">
-      <div class="section-heading"><span>Legacy executors</span></div>
-      <p class="section-note">Observed only. Partial identity never permits adoption or stop.</p>
-      <div id="legacy-executor-list" class="legacy-executor-list"></div>
-    </section>
-    <section class="session-event-section">
-      <div class="section-heading"><span>Recent Supervisor events</span></div>
-      <div id="session-event-list" class="session-event-list"></div>
-    </section>
+
+      <div class="dialog-tab-panel settings-tab-panel" data-observatory-panel="register" role="tabpanel" hidden>
+        <section class="session-inject-section">
+          <div class="section-heading"><span>Register this session</span></div>
+          <p class="section-note">
+            External harness sessions (Claude / Codex / Grok) appear under Sessions only after
+            Supervisor register or inject. Paste the provider session / thread id.
+          </p>
+          <div class="session-inject-form">
+            <label>
+              Provider
+              <select id="observatory-inject-provider">
+                <option value="CODEX">CODEX</option>
+                <option value="CLAUDE">CLAUDE</option>
+                <option value="GROK">GROK</option>
+              </select>
+            </label>
+            <label>
+              Session / thread ref
+              <input id="observatory-inject-ref" type="text" placeholder="provider session id" autocomplete="off" />
+            </label>
+            <label>
+              Project / node
+              <input id="observatory-inject-project" type="text" placeholder="selected project or CONDUCTOR" autocomplete="off" />
+            </label>
+            <label>
+              Mode
+              <select id="observatory-inject-mode">
+                <option value="MASTER">MASTER</option>
+                <option value="CONDUCTOR">CONDUCTOR</option>
+              </select>
+            </label>
+            <button id="observatory-inject-button" type="button" class="primary-button">
+              Inject into Universe
+            </button>
+          </div>
+          <p id="observatory-inject-status" class="section-note"></p>
+        </section>
+      </div>
+
+      <div class="dialog-tab-panel settings-tab-panel" data-observatory-panel="attachments" role="tabpanel" hidden>
+        <section class="room-session-section">
+          <div class="section-heading"><span>Multi-room attachments</span></div>
+          <p class="section-note">Active room slots (may exist before Supervisor register).</p>
+          <div id="room-session-binding-list" class="session-observatory-list"></div>
+        </section>
+      </div>
+
+      <div class="dialog-tab-panel settings-tab-panel" data-observatory-panel="audit" role="tabpanel" hidden>
+        <section class="runtime-audit-section">
+          <div class="section-heading"><span>Runtime audit</span></div>
+          <div id="runtime-audit-grid" class="runtime-audit-grid"></div>
+        </section>
+        <section class="legacy-executor-section">
+          <div class="section-heading"><span>Legacy executors</span></div>
+          <p class="section-note">Observed only. Partial identity never permits adoption or stop.</p>
+          <div id="legacy-executor-list" class="legacy-executor-list"></div>
+        </section>
+        <section class="session-event-section">
+          <div class="section-heading"><span>Recent Supervisor events</span></div>
+          <div id="session-event-list" class="session-event-list"></div>
+        </section>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="fresh-project-dialog" class="wide-dialog wizard-dialog">
@@ -754,87 +809,99 @@
         <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
       </div>
 
-      <section class="todo-create" aria-label="Create Todo">
-        <label class="todo-title-field">
-          Title
-          <input id="todo-title" name="title" maxlength="160" autocomplete="off" required>
-        </label>
-        <label>
-          Scope
-          <select id="todo-scope" name="scope_kind">
-            <option value="UNIVERSE">Universe</option>
-            <option value="PROJECT">Project</option>
-            <option value="NODE">Node</option>
-          </select>
-        </label>
-        <label>
-          Project
-          <select id="todo-project" name="project_id"></select>
-        </label>
-        <label>
-          Node
-          <select id="todo-node" name="node_ref"></select>
-        </label>
-        <label>
-          Priority
-          <select name="priority">
-            <option value="P0">P0 Critical</option>
-            <option value="P1" selected>P1 High</option>
-            <option value="P2">P2 Normal</option>
-            <option value="P3">P3 Low</option>
-          </select>
-        </label>
-        <label>
-          State
-          <select name="state">
-            <option value="BACKLOG">Backlog</option>
-            <option value="READY" selected>Ready</option>
-            <option value="IN_PROGRESS">In progress</option>
-            <option value="BLOCKED">Blocked</option>
-            <option value="DONE">Done</option>
-          </select>
-        </label>
-        <label class="todo-detail-field">
-          Detail
-          <textarea id="todo-detail" name="detail" rows="2" maxlength="4000" placeholder="Decision, acceptance boundary, or next action"></textarea>
-        </label>
-        <button class="primary-button todo-add-button" type="submit">Add Todo</button>
-      </section>
-
-      <div class="todo-toolbar">
-        <label>
-          Show
-          <select id="todo-scope-filter">
-            <option value="ALL">All scopes</option>
-            <option value="UNIVERSE">Universe</option>
-            <option value="PROJECT">Selected project</option>
-            <option value="NODE">Selected node</option>
-          </select>
-        </label>
-        <label>
-          State
-          <select id="todo-state-filter">
-            <option value="OPEN">Open</option>
-            <option value="ALL">All</option>
-            <option value="DONE">Done</option>
-          </select>
-        </label>
-        <label>
-          Priority
-          <select id="todo-priority-filter">
-            <option value="ALL">All</option>
-            <option value="P0">P0</option>
-            <option value="P1">P1</option>
-            <option value="P2">P2</option>
-            <option value="P3">P3</option>
-          </select>
-        </label>
-        <button id="seed-worklist-button" class="secondary-button todo-seed-button" type="button" hidden>
-          Seed worklist
-        </button>
-        <span id="todo-count" class="todo-count">0 items</span>
+      <div class="dialog-tabs settings-tabs" role="tablist" aria-label="Todo categories">
+        <button type="button" class="dialog-tab settings-tab is-active" role="tab" aria-selected="true" data-todo-tab="board">Board</button>
+        <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-todo-tab="create">Create</button>
       </div>
-      <div id="todo-list" class="todo-list" aria-live="polite"></div>
+
+      <div class="dialog-tab-panels settings-tab-panels todo-tab-panels">
+        <div class="dialog-tab-panel settings-tab-panel is-active" data-todo-panel="board" role="tabpanel">
+          <div class="todo-toolbar">
+            <label>
+              Show
+              <select id="todo-scope-filter" title="Selected project never shows other projects' todos (e.g. GCS worklist).">
+                <option value="PROJECT" selected>Selected project</option>
+                <option value="ALL">All (this project + Universe)</option>
+                <option value="UNIVERSE">Universe only</option>
+                <option value="NODE">Selected node</option>
+              </select>
+            </label>
+            <label>
+              State
+              <select id="todo-state-filter">
+                <option value="OPEN">Open</option>
+                <option value="ALL">All</option>
+                <option value="DONE">Done</option>
+              </select>
+            </label>
+            <label>
+              Priority
+              <select id="todo-priority-filter">
+                <option value="ALL">All</option>
+                <option value="P0">P0</option>
+                <option value="P1">P1</option>
+                <option value="P2">P2</option>
+                <option value="P3">P3</option>
+              </select>
+            </label>
+            <button id="seed-worklist-button" class="secondary-button todo-seed-button" type="button" hidden>
+              Seed worklist
+            </button>
+            <span id="todo-count" class="todo-count">0 items</span>
+          </div>
+          <div id="todo-list" class="todo-list" aria-live="polite"></div>
+        </div>
+
+        <div class="dialog-tab-panel settings-tab-panel" data-todo-panel="create" role="tabpanel" hidden>
+          <section class="todo-create" aria-label="Create Todo">
+            <label class="todo-title-field">
+              Title
+              <input id="todo-title" name="title" maxlength="160" autocomplete="off">
+            </label>
+            <label>
+              Scope
+              <select id="todo-scope" name="scope_kind">
+                <option value="UNIVERSE">Universe</option>
+                <option value="PROJECT">Project</option>
+                <option value="NODE">Node</option>
+              </select>
+            </label>
+            <label>
+              Project
+              <select id="todo-project" name="project_id"></select>
+            </label>
+            <label>
+              Node
+              <select id="todo-node" name="node_ref"></select>
+            </label>
+            <label>
+              Priority
+              <select name="priority">
+                <option value="P0">P0 Critical</option>
+                <option value="P1" selected>P1 High</option>
+                <option value="P2">P2 Normal</option>
+                <option value="P3">P3 Low</option>
+              </select>
+            </label>
+            <label>
+              State
+              <select name="state">
+                <option value="BACKLOG">Backlog</option>
+                <option value="READY" selected>Ready</option>
+                <option value="IN_PROGRESS">In progress</option>
+                <option value="BLOCKED">Blocked</option>
+                <option value="DONE">Done</option>
+              </select>
+            </label>
+            <label class="todo-detail-field">
+              Detail
+              <textarea id="todo-detail" name="detail" rows="2" maxlength="4000" placeholder="Decision, acceptance boundary, or next action"></textarea>
+            </label>
+            <button class="primary-button todo-add-button" type="submit">Add Todo</button>
+          </section>
+        </div>
+      </div>
+
       <p id="todo-form-error" class="form-error" role="alert"></p>
     </form>
   </dialog>
@@ -878,6 +945,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=activity-timeline-layout-6" defer></script>
 </body>
 </html>

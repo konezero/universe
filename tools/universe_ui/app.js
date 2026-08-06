@@ -5,6 +5,8 @@ const state = {
   todos: [],
   selectedProject: null,
   projection: null,
+  /** project_id -> projection; multiverse always expands from this cache */
+  projectionsByProject: {},
   dispatches: [],
   releases: [],
   releaseProposals: [],
@@ -48,6 +50,9 @@ const state = {
   observatoryShowAll: false,
   /** Expanded (node|mode) groups so operators can pick an alternate 1:1 session. */
   observatoryExpandedCoords: {},
+  settingsTab: "service",
+  observatoryTab: "sessions",
+  todoTab: "board",
   supervisorEvents: [],
   legacyExecutors: [],
   conversationTarget: {
@@ -69,6 +74,8 @@ const state = {
   },
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
   graphPan: null,
+  /** Hovered graph node id (for icon map tooltips). */
+  hoveredNodeId: null,
   inspectorDismissed: false,
 };
 
@@ -119,6 +126,7 @@ const elements = {
   canvas: document.querySelector("#universe-graph"),
   graphEmpty: document.querySelector("#graph-empty"),
   graphHint: document.querySelector("#graph-hint"),
+  graphTooltip: document.querySelector("#graph-node-tooltip"),
   graphZoomIn: document.querySelector("#graph-zoom-in"),
   graphZoomOut: document.querySelector("#graph-zoom-out"),
   graphFit: document.querySelector("#graph-fit"),
@@ -1399,6 +1407,8 @@ async function refresh({ syncSelectedProject = false } = {}) {
       renderSessionObservatory();
       console.warn("Session Supervisor refresh failed", error);
     }
+    // Multiverse keeps every project tree expanded — load all projections first.
+    await loadAllProjectProjections();
     renderProjects();
     renderComposerActions();
     renderReleaseCatalog();
@@ -1476,7 +1486,7 @@ function renderProjects() {
     const copy = node("span", "project-copy");
     const openTodoCount = state.todos.filter(
       (todo) =>
-        todo.project_id === project.project_id && todo.state !== "DONE"
+        todoBelongsToProject(todo, project.project_id) && todo.state !== "DONE"
     ).length;
     const pendingApprovalCount = state.governanceProposalInbox.filter(
       (proposal) =>
@@ -1701,6 +1711,12 @@ async function selectProject(
     ).catch(() => ({ proposals: [] })),
   ]);
   state.projection = projectionResult?.projection || null;
+  if (state.projection) {
+    state.projectionsByProject = {
+      ...state.projectionsByProject,
+      [projectId]: state.projection,
+    };
+  }
   state.dispatches = await Promise.all(
     dispatchResult.dispatches.map((item) =>
       api(
@@ -1740,6 +1756,11 @@ async function selectProject(
   renderReleaseCatalog();
   elements.todoProject.value = projectId;
   renderTodoScopeControls();
+  // Always pin board filter to the selected project so foreign PROJECT todos
+  // (e.g. GCS worklist) never remain visible under "All scopes".
+  if (elements.todoScopeFilter) {
+    elements.todoScopeFilter.value = "PROJECT";
+  }
   renderTodos();
 }
 
@@ -3065,8 +3086,62 @@ async function openProviderSettings() {
   renderRemoteAccessSettings();
   renderRendezvousSettings();
   refreshMultiRooms().catch(() => {});
+  setSettingsTab(state.settingsTab || "service");
   elements.settingsDialog.showModal();
   startRendezvousRefreshTimer();
+}
+
+function setDialogCategoryTab(root, { tabAttr, panelAttr, stateKey, allowed, fallback }) {
+  if (!root) return;
+  const activeId = allowed.has(state[stateKey]) ? state[stateKey] : fallback;
+  state[stateKey] = activeId;
+  for (const tab of root.querySelectorAll(`[${tabAttr}]`)) {
+    const active = tab.getAttribute(tabAttr) === activeId;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const panel of root.querySelectorAll(`[${panelAttr}]`)) {
+    const active = panel.getAttribute(panelAttr) === activeId;
+    panel.classList.toggle("is-active", active);
+    if (active) panel.removeAttribute("hidden");
+    else panel.setAttribute("hidden", "");
+  }
+}
+
+function setSettingsTab(tabId) {
+  const allowed = new Set(["service", "remote", "rooms", "providers", "host"]);
+  if (allowed.has(tabId)) state.settingsTab = tabId;
+  setDialogCategoryTab(elements.settingsDialog, {
+    tabAttr: "data-settings-tab",
+    panelAttr: "data-settings-panel",
+    stateKey: "settingsTab",
+    allowed,
+    fallback: "service",
+  });
+}
+
+function setObservatoryTab(tabId) {
+  const allowed = new Set(["sessions", "register", "attachments", "audit"]);
+  if (allowed.has(tabId)) state.observatoryTab = tabId;
+  setDialogCategoryTab(elements.sessionObservatoryDialog, {
+    tabAttr: "data-observatory-tab",
+    panelAttr: "data-observatory-panel",
+    stateKey: "observatoryTab",
+    allowed,
+    fallback: "sessions",
+  });
+}
+
+function setTodoTab(tabId) {
+  const allowed = new Set(["board", "create"]);
+  if (allowed.has(tabId)) state.todoTab = tabId;
+  setDialogCategoryTab(elements.todoDialog, {
+    tabAttr: "data-todo-tab",
+    panelAttr: "data-todo-panel",
+    stateKey: "todoTab",
+    allowed,
+    fallback: "board",
+  });
 }
 
 async function submitProviderSettings(event) {
@@ -3267,13 +3342,15 @@ function openProjectRoomStream(projectId) {
 
 function buildGraph() {
   elements.nodeBreadcrumb.classList.add("hidden");
-  // Multiverse map: Universe hub + projects (+ expanded project nodes).
-  if (state.view === "universe" || state.view === "implementation") {
-    if (state.focusedNodeId && state.selectedProject && state.view === "universe") {
-      buildNodeUniverseGraph();
-      return;
-    }
-    if (state.view === "implementation" && state.selectedProject) {
+  // Universe map: always full tree (hub → projects → systems). Depth = dim only.
+  // Timeline/Documents still use project-interior graphs. focusedNodeId dig-in
+  // is for non-universe views only (not multiverse).
+  if (state.view === "universe") {
+    buildMultiverseGraph();
+    return;
+  }
+  if (state.view === "implementation") {
+    if (state.selectedProject) {
       buildProjectInteriorGraph({ mode: "implementation" });
       return;
     }
@@ -3298,12 +3375,51 @@ function buildGraph() {
   buildProjectInteriorGraph({ mode: state.view });
 }
 
-/** Universe at center, registered projects around it; selected project's nodes radiate out. */
+/** Fetch projections for every attached project so multiverse can stay fully expanded. */
+async function loadAllProjectProjections() {
+  const projects = state.projects || [];
+  if (!projects.length) {
+    state.projectionsByProject = {};
+    return;
+  }
+  const results = await Promise.all(
+    projects.map((project) =>
+      api(
+        `/v1/projects/${encodeURIComponent(project.project_id)}/projection`
+      ).catch(() => null)
+    )
+  );
+  const next = { ...state.projectionsByProject };
+  projects.forEach((project, index) => {
+    const projection = results[index]?.projection;
+    if (projection) next[project.project_id] = projection;
+  });
+  state.projectionsByProject = next;
+}
+
+function projectionForProject(projectId) {
+  if (!projectId) return null;
+  if (state.projectionsByProject?.[projectId]) {
+    return state.projectionsByProject[projectId];
+  }
+  if (state.selectedProject?.project_id === projectId) {
+    return state.projection;
+  }
+  return null;
+}
+
+/**
+ * Universe map: always expanded hub → projects → systems.
+ * Selection never hides nodes; drawGraph uses dim alpha for current depth.
+ */
 function buildMultiverseGraph() {
   const hub = {
     id: "universe:hub",
     label: "Universe",
     kind: "universe",
+    depth: 0,
+    projectId: null,
+    parentId: null,
     data: {
       kind: "UNIVERSE_INSTANCE",
       label: "Local Universe",
@@ -3324,7 +3440,6 @@ function buildMultiverseGraph() {
     state.graph.scale = 1;
     state.graph.x = 0;
     state.graph.y = 0;
-    // Still show Universe hub; hint instead of full empty overlay.
     if (elements.graphEmpty) {
       elements.graphEmpty.classList.add("hidden");
     }
@@ -3337,22 +3452,31 @@ function buildMultiverseGraph() {
     return;
   }
 
+  // Room for always-expanded system fans around each project card.
+  const maxSystems = projects.reduce((max, project) => {
+    const count = (projectionForProject(project.project_id)?.nodes || []).length;
+    return Math.max(max, count);
+  }, 0);
+  const projectRadius = Math.max(230, 180 + maxSystems * 8);
+
   projects.forEach((project, index) => {
     const angle =
       (Math.PI * 2 * index) / Math.max(projects.length, 1) - Math.PI / 2;
-    // All attached roots are project nodes around the Universe hub.
-    // Career is a project (laws source), not a second center.
-    const radius = 210;
     const selected =
       state.selectedProject?.project_id === project.project_id;
     const id = `project:${project.project_id}`;
+    const px = Math.cos(angle) * projectRadius;
+    const py = Math.sin(angle) * projectRadius;
     graphNodes.push({
       id,
       label: projectDisplayName(project),
       kind: "project",
+      depth: 1,
+      projectId: project.project_id,
+      parentId: hub.id,
       data: project,
-      x: Math.cos(angle) * radius,
-      y: Math.sin(angle) * radius,
+      x: px,
+      y: py,
       selectedProject: selected,
     });
     graphEdges.push({
@@ -3360,53 +3484,178 @@ function buildMultiverseGraph() {
       to: id,
       kind: "project-link",
     });
-  });
 
-  // Expand selected project's functional nodes around that project card.
-  if (state.selectedProject && state.projection) {
-    const parentId = `project:${state.selectedProject.project_id}`;
-    const parent = graphNodes.find((item) => item.id === parentId);
-    const px = parent?.x || 0;
-    const py = parent?.y || 0;
-    const systems = state.projection.nodes || [];
-    systems.forEach((item, index) => {
-      const angle =
-        (Math.PI * 2 * index) / Math.max(systems.length, 1) - Math.PI / 2;
-      const r = 100 + (index % 2) * 18;
+    // Always expand this project's functional nodes (depth 2).
+    const projection = projectionForProject(project.project_id);
+    const systems = projection?.nodes || [];
+    const count = Math.max(systems.length, 1);
+    systems.forEach((item, systemIndex) => {
+      const systemAngle = (Math.PI * 2 * systemIndex) / count - Math.PI / 2;
+      const r = 96 + (systemIndex % 3) * 14;
+      const systemId = `node:${project.project_id}:${item.node_id}`;
+      // Prefer global node id when unique; fall back to project-scoped id to avoid collisions.
+      const plainId = `node:${item.node_id}`;
+      const idTaken = graphNodes.some((nodeItem) => nodeItem.id === plainId);
+      const nodeId = idTaken ? systemId : plainId;
       graphNodes.push({
-        id: `node:${item.node_id}`,
+        id: nodeId,
         label: item.title,
         kind: "system",
-        data: item,
-        x: px + Math.cos(angle) * r,
-        y: py + Math.sin(angle) * r,
+        depth: 2,
+        projectId: project.project_id,
+        parentId: id,
+        data: { ...item, project_id: project.project_id },
+        x: px + Math.cos(systemAngle) * r,
+        y: py + Math.sin(systemAngle) * r,
       });
       graphEdges.push({
-        from: parentId,
-        to: `node:${item.node_id}`,
+        from: id,
+        to: nodeId,
         kind: "contains",
       });
     });
-    for (const edge of state.projection.edges || []) {
-      graphEdges.push({
-        from: `node:${edge.from_node}`,
-        to: `node:${edge.to_node}`,
-        kind: edge.kind,
-      });
+    for (const edge of projection?.edges || []) {
+      const fromCandidates = [
+        `node:${edge.from_node}`,
+        `node:${project.project_id}:${edge.from_node}`,
+      ];
+      const toCandidates = [
+        `node:${edge.to_node}`,
+        `node:${project.project_id}:${edge.to_node}`,
+      ];
+      const fromId = fromCandidates.find((candidate) =>
+        graphNodes.some((nodeItem) => nodeItem.id === candidate)
+      );
+      const toId = toCandidates.find((candidate) =>
+        graphNodes.some((nodeItem) => nodeItem.id === candidate)
+      );
+      if (fromId && toId) {
+        graphEdges.push({
+          from: fromId,
+          to: toId,
+          kind: edge.kind || "related",
+        });
+      }
     }
-  }
+  });
 
   state.graph.nodes = graphNodes;
   state.graph.edges = graphEdges;
-  state.graph.scale = 1;
-  state.graph.x = 0;
-  state.graph.y = 0;
+  // Keep pan/zoom if user already moved; only reset when empty graph was shown.
+  if (!Number.isFinite(state.graph.scale) || state.graph.scale <= 0) {
+    state.graph.scale = 1;
+  }
   elements.graphEmpty.classList.add("hidden");
   if (elements.graphHint) {
-    elements.graphHint.textContent =
-      "Universe hub · projects around · select a project to expand its nodes";
+    const systemCount = graphNodes.filter((item) => item.kind === "system").length;
+    const focusLabel =
+      state.selectedNode?.label ||
+      (state.selectedProject
+        ? projectDisplayName(state.selectedProject)
+        : "Universe");
+    elements.graphHint.textContent = `Icons = projects · hover name · always expanded · ${projects.length} project(s) · ${systemCount} system(s) · focus: ${focusLabel}`;
   }
   drawGraph();
+}
+
+/**
+ * Dim style by current focus depth. Nodes stay visible; alpha encodes depth.
+ * - focus node: full
+ * - same depth (esp. same branch): bright
+ * - parent/child on path: medium-bright
+ * - other depths / branches: progressively dimmer
+ */
+function graphDepthStyle() {
+  const nodes = state.graph.nodes || [];
+  const byId = new Map();
+  let focus =
+    (state.selectedNode &&
+      nodes.find((item) => item.id === state.selectedNode.id)) ||
+    null;
+  if (!focus && state.selectedProject) {
+    focus = nodes.find(
+      (item) => item.id === `project:${state.selectedProject.project_id}`
+    );
+  }
+  if (!focus) {
+    for (const item of nodes) {
+      byId.set(item.id, {
+        alpha: 1,
+        selected: false,
+        emphasis: item.kind === "universe" || item.kind === "project",
+      });
+    }
+    return { hasFocus: false, focus: null, byId };
+  }
+
+  const focusDepth = Number.isFinite(focus.depth) ? focus.depth : 0;
+  const focusProjectId = focus.projectId || focus.data?.project_id || null;
+
+  for (const item of nodes) {
+    const depth = Number.isFinite(item.depth) ? item.depth : 0;
+    const depthDelta = Math.abs(depth - focusDepth);
+    const sameBranch =
+      item.id === focus.id ||
+      item.kind === "universe" ||
+      (focus.kind === "universe" && depth <= 1) ||
+      (focusProjectId &&
+        (item.projectId === focusProjectId ||
+          item.id === `project:${focusProjectId}`)) ||
+      (focus.parentId && item.id === focus.parentId) ||
+      item.parentId === focus.id;
+
+    let alpha;
+    if (item.id === focus.id) {
+      alpha = 1;
+    } else if (depthDelta === 0 && sameBranch) {
+      alpha = 0.95;
+    } else if (depthDelta === 0) {
+      // Same depth, other branch — still "current depth" but quieter.
+      alpha = 0.7;
+    } else if (depthDelta === 1 && sameBranch) {
+      alpha = 0.88;
+    } else if (depthDelta === 1) {
+      alpha = 0.48;
+    } else if (sameBranch) {
+      alpha = 0.55;
+    } else {
+      alpha = Math.max(0.3, 0.5 - depthDelta * 0.1);
+    }
+
+    byId.set(item.id, {
+      alpha,
+      selected: item.id === focus.id || Boolean(item.selectedProject && item.id === focus.id),
+      emphasis: alpha >= 0.85,
+    });
+  }
+  // Mark selected project card when focus is a system under it.
+  if (focusProjectId) {
+    const projectNodeId = `project:${focusProjectId}`;
+    const style = byId.get(projectNodeId);
+    if (style && focus.id !== projectNodeId) {
+      style.emphasis = true;
+      style.alpha = Math.max(style.alpha, 0.9);
+    }
+  }
+  return { hasFocus: true, focus, byId };
+}
+
+/** @deprecated use graphDepthStyle — kept as thin adapter for any leftover calls */
+function graphNeighborhood() {
+  const style = graphDepthStyle();
+  const focusIds = new Set();
+  const neighborIds = new Set();
+  const focusEdgeKeys = new Set();
+  if (style.focus) focusIds.add(style.focus.id);
+  for (const [id, item] of style.byId) {
+    if (item.emphasis || item.selected) neighborIds.add(id);
+  }
+  for (const edge of state.graph.edges || []) {
+    if (neighborIds.has(edge.from) && neighborIds.has(edge.to)) {
+      focusEdgeKeys.add(`${edge.from}=>${edge.to}`);
+    }
+  }
+  return { focusIds, neighborIds, focusEdgeKeys };
 }
 
 /** Single-project interior graph (timeline/documents/future/legacy). */
@@ -4009,6 +4258,7 @@ function drawGraph() {
   context.translate(centerX, centerY);
   context.scale(state.graph.scale, state.graph.scale);
   const byId = new Map(state.graph.nodes.map((item) => [item.id, item]));
+  const depthStyle = graphDepthStyle();
   for (const edge of state.graph.edges) {
     const from = byId.get(edge.from);
     const to = byId.get(edge.to);
@@ -4016,9 +4266,21 @@ function drawGraph() {
     const isDocumentLink = edge.kind === "documents";
     const isPredicted = edge.kind === "predicts";
     const isImplementationLink = edge.kind === "implementation-binding";
-    context.lineWidth = isDocumentLink ? 1.4 : 1.2;
     const isProjectLink = edge.kind === "project-link";
-    context.lineWidth = isDocumentLink ? 1.4 : isProjectLink ? 1.6 : 1.2;
+    const fromStyle = depthStyle.byId.get(edge.from) || { alpha: 1 };
+    const toStyle = depthStyle.byId.get(edge.to) || { alpha: 1 };
+    const edgeAlpha = Math.min(fromStyle.alpha, toStyle.alpha);
+    const emphasized = edgeAlpha >= 0.8;
+    context.globalAlpha = edgeAlpha;
+    context.lineWidth = isDocumentLink
+      ? 1.4
+      : emphasized && isProjectLink
+        ? 2.4
+        : isProjectLink
+          ? 1.6
+          : emphasized && edge.kind === "contains"
+            ? 1.8
+            : 1.2;
     context.strokeStyle = isPredicted
       ? "rgba(155, 124, 255, 0.75)"
       : isDocumentLink
@@ -4026,8 +4288,12 @@ function drawGraph() {
       : isImplementationLink
         ? "rgba(122, 106, 212, 0.7)"
         : isProjectLink
-          ? "rgba(90, 200, 255, 0.45)"
-          : "rgba(120, 180, 230, 0.35)";
+          ? emphasized
+            ? "rgba(90, 220, 255, 0.9)"
+            : "rgba(90, 200, 255, 0.45)"
+          : edge.kind === "contains" && emphasized
+            ? "rgba(100, 190, 255, 0.7)"
+          : "rgba(120, 180, 230, 0.4)";
     context.setLineDash(
       isPredicted
         ? [7, 6]
@@ -4043,72 +4309,141 @@ function drawGraph() {
     context.stroke();
   }
   context.setLineDash([]);
+  context.globalAlpha = 1;
   for (const item of state.graph.nodes) {
-    const selected = state.selectedNode?.id === item.id;
-    const color = {
-      universe: "#5ad0ff",
-      project: "#3d7ecf",
-      system: "#1769aa",
-      focus: "#4ec4ff",
-      related: "#61a8ff",
-      document: "#c48a2a",
-      implementation: "#7a6ad4",
-      predicted: "#c45b58",
-    }[item.kind] || "#3d7ecf";
-    const isHub = item.kind === "universe";
-    const isProjectLike = ["project", "focus", "universe"].includes(item.kind);
-    const widthValue = isHub ? 148 : isProjectLike ? 126 : 108;
-    const heightValue = isHub ? 48 : isProjectLike ? 42 : 36;
-    const x0 = item.x - widthValue / 2;
-    const y0 = item.y - heightValue / 2;
-    if (selected) {
-      context.shadowColor = "rgba(61, 224, 255, 0.55)";
-      context.shadowBlur = 18;
-    } else {
-      context.shadowColor = "rgba(61, 224, 255, 0.12)";
-      context.shadowBlur = 8;
-    }
-    context.fillStyle = selected
-      ? "rgba(12, 28, 52, 0.92)"
-      : item.kind === "focus"
-        ? "rgba(16, 34, 58, 0.9)"
-        : "rgba(10, 22, 42, 0.88)";
-    context.strokeStyle = selected ? "#3de0ff" : color;
-    context.lineWidth = selected ? 2.4 : 1.5;
-    roundedRect(context, x0, y0, widthValue, heightValue, 10);
-    context.fill();
-    context.stroke();
-    context.shadowBlur = 0;
-    context.fillStyle = selected ? "#eaf8ff" : "#d7e7f8";
-    context.font = `${
-      item.kind === "universe" || item.kind === "project" ? "600" : "500"
-    } 11px Segoe UI`;
-    context.textAlign = "center";
-    context.textBaseline = "middle";
-    context.fillText(
-      truncate(item.label, 18),
-      item.x,
-      item.y,
-      widthValue - 12
-    );
-    const todoCount = openTodosForGraphNode(item).length;
-    if (todoCount) {
-      context.fillStyle = "#f6c76a";
-      context.beginPath();
-      context.arc(
-        item.x + widthValue / 2 - 4,
-        item.y - heightValue / 2 + 4,
-        9,
-        0,
-        Math.PI * 2
-      );
-      context.fill();
-      context.fillStyle = "#111827";
-      context.font = "700 9px Segoe UI";
-      context.fillText(String(Math.min(todoCount, 99)), item.x + widthValue / 2 - 4, item.y - heightValue / 2 + 4);
-    }
+    drawGraphNodeIcon(context, item, depthStyle);
   }
   context.restore();
+}
+
+/** Stable HSL accent so projects read as different icons without full labels. */
+function projectAccentColor(projectId) {
+  const text = String(projectId || "project");
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+  }
+  const hue = hash % 360;
+  return {
+    fill: `hsla(${hue}, 52%, 42%, 0.92)`,
+    stroke: `hsla(${hue}, 70%, 68%, 0.95)`,
+    soft: `hsla(${hue}, 55%, 55%, 0.28)`,
+  };
+}
+
+function nodeMonogram(item) {
+  const label = String(item?.label || item?.data?.project_id || "?").trim();
+  if (!label) return "?";
+  if (item.kind === "universe") return "U";
+  const cleaned = label.replace(/[^A-Za-z0-9가-힣]+/g, " ").trim();
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+  }
+  return cleaned.slice(0, 2).toUpperCase();
+}
+
+/** Visual + hit metrics for multiverse icon nodes. */
+function graphNodeMetrics(item) {
+  if (item.kind === "universe") {
+    return { shape: "hub", radius: 28, hitR: 34 };
+  }
+  if (item.kind === "project") {
+    return { shape: "project", radius: 22, hitR: 28 };
+  }
+  if (item.kind === "system" || item.kind === "related" || item.kind === "focus") {
+    return { shape: "system", radius: 14, hitR: 18 };
+  }
+  return { shape: "other", radius: 16, hitR: 20 };
+}
+
+function drawGraphNodeIcon(context, item, depthStyle) {
+  const style = depthStyle.byId.get(item.id) || {
+    alpha: 1,
+    selected: false,
+    emphasis: false,
+  };
+  const selected =
+    style.selected ||
+    state.selectedNode?.id === item.id ||
+    state.hoveredNodeId === item.id ||
+    Boolean(item.selectedProject && depthStyle.focus?.id === item.id);
+  const emphasized = style.emphasis || selected;
+  const hovered = state.hoveredNodeId === item.id;
+  const metrics = graphNodeMetrics(item);
+  const accent = projectAccentColor(
+    item.projectId || item.data?.project_id || item.id
+  );
+  const r = metrics.radius * (selected ? 1.08 : hovered ? 1.05 : 1);
+  context.globalAlpha = style.alpha;
+  if (selected || hovered) {
+    context.shadowColor = "rgba(61, 224, 255, 0.8)";
+    context.shadowBlur = selected ? 20 : 14;
+  } else if (emphasized) {
+    context.shadowColor = accent.soft;
+    context.shadowBlur = 10;
+  } else {
+    context.shadowColor = "rgba(61, 224, 255, 0.06)";
+    context.shadowBlur = 4;
+  }
+
+  if (metrics.shape === "hub") {
+    // Universe hub: ringed disc with monogram.
+    context.beginPath();
+    context.arc(item.x, item.y, r + 6, 0, Math.PI * 2);
+    context.strokeStyle = selected ? "#3de0ff" : "rgba(90, 208, 255, 0.55)";
+    context.lineWidth = selected ? 2.4 : 1.5;
+    context.stroke();
+    context.beginPath();
+    context.arc(item.x, item.y, r, 0, Math.PI * 2);
+    context.fillStyle = selected ? "rgba(12, 32, 56, 0.98)" : "rgba(10, 24, 44, 0.94)";
+    context.fill();
+    context.strokeStyle = selected ? "#3de0ff" : "#5ad0ff";
+    context.lineWidth = selected ? 2.4 : 1.8;
+    context.stroke();
+  } else if (metrics.shape === "project") {
+    // Project: filled circle, color-coded by project id.
+    context.beginPath();
+    context.arc(item.x, item.y, r, 0, Math.PI * 2);
+    context.fillStyle = selected ? "rgba(12, 28, 52, 0.98)" : accent.fill;
+    context.fill();
+    context.strokeStyle = selected ? "#3de0ff" : accent.stroke;
+    context.lineWidth = selected ? 2.6 : emphasized ? 2 : 1.5;
+    context.stroke();
+  } else {
+    // System / leaf: smaller rounded square, accent ring from parent project.
+    const half = r;
+    roundedRect(context, item.x - half, item.y - half, half * 2, half * 2, 6);
+    context.fillStyle = selected ? "rgba(12, 28, 48, 0.96)" : "rgba(10, 22, 40, 0.92)";
+    context.fill();
+    context.strokeStyle = selected
+      ? "#3de0ff"
+      : emphasized
+        ? accent.stroke
+        : "rgba(120, 170, 210, 0.55)";
+    context.lineWidth = selected ? 2.2 : 1.4;
+    context.stroke();
+  }
+
+  context.shadowBlur = 0;
+  context.fillStyle = selected || hovered ? "#f2fbff" : "#e6f2ff";
+  context.font = `${metrics.shape === "system" ? "600 10px" : "700 12px"} Segoe UI`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(nodeMonogram(item), item.x, item.y + 0.5);
+
+  const todoCount = openTodosForGraphNode(item).length;
+  if (todoCount) {
+    const badgeX = item.x + r * 0.72;
+    const badgeY = item.y - r * 0.72;
+    context.beginPath();
+    context.arc(badgeX, badgeY, 8, 0, Math.PI * 2);
+    context.fillStyle = "#f6c76a";
+    context.fill();
+    context.fillStyle = "#111827";
+    context.font = "700 9px Segoe UI";
+    context.fillText(String(Math.min(todoCount, 99)), badgeX, badgeY + 0.5);
+  }
 }
 
 function roundedRect(context, x, y, width, height, radius) {
@@ -4133,74 +4468,171 @@ function graphPoint(event) {
   };
 }
 
+function hitTestGraphNode(point) {
+  return (
+    [...(state.graph.nodes || [])]
+      .reverse()
+      .find((item) => {
+        const { hitR } = graphNodeMetrics(item);
+        const dx = point.x - item.x;
+        const dy = point.y - item.y;
+        return dx * dx + dy * dy <= hitR * hitR;
+      }) || null
+  );
+}
+
+function graphNodeKindLabel(item) {
+  if (!item) return "";
+  if (item.kind === "universe") return "Universe";
+  if (item.kind === "project") return "Project";
+  if (item.kind === "system") return "System";
+  return item.kind || "Node";
+}
+
+function updateGraphHoverTooltip(event, hovered) {
+  const tip = elements.graphTooltip;
+  if (!tip) return;
+  if (!hovered) {
+    tip.classList.add("hidden");
+    tip.textContent = "";
+    elements.canvas?.classList.remove("is-hovering-node");
+    return;
+  }
+  elements.canvas?.classList.add("is-hovering-node");
+  const kind = graphNodeKindLabel(hovered);
+  const name = hovered.label || hovered.data?.project_id || hovered.id;
+  tip.replaceChildren();
+  const kindEl = document.createElement("span");
+  kindEl.className = "graph-tooltip-kind";
+  kindEl.textContent = kind;
+  const nameEl = document.createElement("span");
+  nameEl.textContent = name;
+  tip.append(kindEl, nameEl);
+  tip.classList.remove("hidden");
+  const wrap = elements.canvas?.parentElement;
+  if (!wrap || !event) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  let left = event.clientX - wrapRect.left;
+  let top = event.clientY - wrapRect.top;
+  // Keep tooltip inside the canvas wrap.
+  const tipWidth = tip.offsetWidth || 120;
+  left = Math.max(tipWidth / 2 + 8, Math.min(wrapRect.width - tipWidth / 2 - 8, left));
+  top = Math.max(28, top);
+  tip.style.left = `${left}px`;
+  tip.style.top = `${top}px`;
+}
+
+function handleGraphPointerHover(event) {
+  if (state.graphPan?.moved) {
+    if (state.hoveredNodeId) {
+      state.hoveredNodeId = null;
+      updateGraphHoverTooltip(null, null);
+      drawGraph();
+    }
+    return;
+  }
+  const point = graphPoint(event);
+  const hovered = hitTestGraphNode(point);
+  const nextId = hovered?.id || null;
+  if (nextId !== state.hoveredNodeId) {
+    state.hoveredNodeId = nextId;
+    drawGraph();
+  }
+  updateGraphHoverTooltip(event, hovered);
+}
+
 function selectGraphNode(event) {
   if (state.graphPan?.moved) return;
   const point = graphPoint(event);
-  const selected =
-    [...state.graph.nodes]
-      .reverse()
-      .find((item) => {
-        const hitX = item.kind === "universe" ? 78 : 58;
-        const hitY = item.kind === "universe" ? 28 : 24;
-        return (
-          Math.abs(point.x - item.x) <= hitX &&
-          Math.abs(point.y - item.y) <= hitY
-        );
-      }) || null;
+  const selected = hitTestGraphNode(point);
   if (!selected) return;
   state.inspectorDismissed = false;
   if (selected.kind === "universe") {
+    // Depth 0 focus — tree stays fully expanded; only dim shifts.
     state.focusedNodeId = null;
     state.selectedNode = selected;
-    buildGraph();
+    if (state.view === "universe") {
+      drawGraph();
+    } else {
+      buildGraph();
+    }
     renderDetails();
     showInspectorTab("details");
     return;
   }
   if (selected.kind === "project") {
+    // Depth 1 focus — always-expanded map; dim other depths/branches.
     state.focusedNodeId = null;
     state.selectedNode = selected;
-    const projectId = selected.data?.project_id;
+    const projectId = selected.data?.project_id || selected.projectId;
+    const afterSelect = () => {
+      state.view = "universe";
+      if (elements.viewModeSelect) {
+        elements.viewModeSelect.value = "universe";
+      }
+      document.querySelectorAll("[data-view]").forEach((button) =>
+        button.classList.toggle(
+          "selected",
+          button.getAttribute("data-view") === "universe"
+        )
+      );
+      state.focusedNodeId = null;
+      state.selectedNode = {
+        ...selected,
+        id: `project:${projectId}`,
+        kind: "project",
+        depth: 1,
+        projectId,
+      };
+      buildMultiverseGraph();
+      state.selectedNode =
+        state.graph.nodes.find((item) => item.id === `project:${projectId}`) ||
+        state.selectedNode;
+      drawGraph();
+      renderDetails();
+      showInspectorTab("details");
+    };
     if (projectId && state.selectedProject?.project_id !== projectId) {
       selectProject(projectId, { revealInspector: true, syncAssets: false })
-        .then(() => {
-          state.selectedNode = {
-            ...selected,
-            data:
-              state.projects.find((item) => item.project_id === projectId) ||
-              selected.data,
-          };
-          // Stay on multiverse map with expanded project nodes.
-          if (state.view !== "universe") {
-            state.view = "universe";
-            document
-              .querySelectorAll("[data-view]")
-              .forEach((button) =>
-                button.classList.toggle(
-                  "selected",
-                  button.getAttribute("data-view") === "universe"
-                )
-              );
-          }
-          buildGraph();
-          renderDetails();
-          showInspectorTab("details");
-        })
+        .then(afterSelect)
         .catch((error) => toast(error.message, true));
       return;
     }
-    buildGraph();
-    renderDetails();
-    showInspectorTab("details");
+    afterSelect();
     return;
   }
   if (["system", "related", "focus"].includes(selected.kind)) {
-    state.focusedNodeId =
-      state.focusedNodeId === selected.data.node_id ? null : selected.data.node_id;
+    // Depth 2 focus on multiverse: never dig into interior-only graph.
+    state.focusedNodeId = null;
     state.selectedNode = selected;
-    buildGraph();
-    renderDetails();
-    showInspectorTab("details");
+    const projectId =
+      selected.projectId ||
+      selected.data?.project_id ||
+      state.selectedProject?.project_id;
+    const stay = () => {
+      state.view = "universe";
+      state.focusedNodeId = null;
+      const keepId = selected.id;
+      buildMultiverseGraph();
+      state.selectedNode =
+        state.graph.nodes.find((item) => item.id === keepId) || selected;
+      drawGraph();
+      renderDetails();
+      showInspectorTab("details");
+    };
+    if (projectId && state.selectedProject?.project_id !== projectId) {
+      selectProject(projectId, { revealInspector: true, syncAssets: false })
+        .then(stay)
+        .catch((error) => toast(error.message, true));
+      return;
+    }
+    if (state.view === "universe") {
+      drawGraph();
+      renderDetails();
+      showInspectorTab("details");
+      return;
+    }
+    stay();
     return;
   }
   state.selectedNode = selected;
@@ -4471,7 +4903,9 @@ function renderActivity() {
       );
       copy.append(action);
     }
-    row.append(node("span"), copy);
+    // Marker is CSS ::before — do not prepend an extra empty span
+    // (it steals the content column and collapses copy into a 10px vertical strip).
+    row.append(copy);
     timeline.append(row);
   }
   for (const message of state.roomMessages) {
@@ -4482,7 +4916,7 @@ function renderActivity() {
       node("small", "", message.body),
       node("small", "", `${message.delivery_state} / ${message.created_at}`)
     );
-    row.append(node("span"), copy);
+    row.append(copy);
     timeline.append(row);
   }
   for (const item of state.dispatches) {
@@ -4524,7 +4958,7 @@ function renderActivity() {
       action.addEventListener("click", () => deliverDispatch(dispatch.dispatch_id));
       copy.append(action);
     }
-    row.append(node("span"), copy);
+    row.append(copy);
     timeline.append(row);
   }
   elements.activity.append(timeline);
@@ -4708,35 +5142,44 @@ function todosForSelectedContext() {
     return state.todos.filter(
       (todo) =>
         todo.scope_kind === "NODE" &&
-        todo.project_id === state.selectedProject.project_id &&
+        todoBelongsToProject(todo, state.selectedProject.project_id) &&
         todo.node_ref === nodeRef
     );
   }
   if (state.selectedProject) {
-    return state.todos.filter(
-      (todo) =>
-        todo.project_id === state.selectedProject.project_id &&
-        todo.scope_kind !== "UNIVERSE"
+    return state.todos.filter((todo) =>
+      todoBelongsToProject(todo, state.selectedProject.project_id)
     );
   }
-  return state.todos.filter((todo) => todo.scope_kind === "UNIVERSE");
+  return state.todos.filter(
+    (todo) =>
+      todo.scope_kind === "UNIVERSE" || !normalizeTodoProjectId(todo.project_id)
+  );
 }
 
 function openTodosForGraphNode(graphNode) {
-  if (!state.selectedProject) return [];
-  if (graphNode.kind === "project") {
+  if (graphNode?.kind === "project") {
+    // Count against the graph project's id, not the currently selected one.
+    const projectId =
+      graphNode.data?.project_id ||
+      String(graphNode.id || "").replace(/^project:/, "");
+    if (!projectId) return [];
     return state.todos.filter(
       (todo) =>
-        todo.project_id === state.selectedProject.project_id &&
-        todo.state !== "DONE"
+        todoBelongsToProject(todo, projectId) && todo.state !== "DONE"
     );
   }
-  const nodeRef = graphNode.data?.node_id;
+  const nodeRef = graphNode?.data?.node_id;
   if (!nodeRef) return [];
+  const projectId =
+    graphNode.projectId ||
+    graphNode.data?.project_id ||
+    state.selectedProject?.project_id;
+  if (!projectId) return [];
   return state.todos.filter(
     (todo) =>
       todo.scope_kind === "NODE" &&
-      todo.project_id === state.selectedProject.project_id &&
+      todoBelongsToProject(todo, projectId) &&
       todo.node_ref === nodeRef &&
       todo.state !== "DONE"
   );
@@ -4828,9 +5271,13 @@ function openTodoDialog(prefill = false) {
   elements.todoFormError.textContent = "";
   if (prefill) prefillTodoScope();
   else renderTodoScopeControls();
+  if (elements.todoScopeFilter && state.selectedProject) {
+    elements.todoScopeFilter.value = "PROJECT";
+  }
   renderTodos();
+  setTodoTab(prefill ? "create" : "board");
   elements.todoDialog.showModal();
-  elements.todoTitle.focus();
+  if (prefill) elements.todoTitle.focus();
 }
 
 
@@ -4856,6 +5303,7 @@ function openConductorTodoDraft(action) {
   elements.todoForm.elements.priority.value = todo.priority;
   elements.todoForm.elements.state.value = todo.state;
   renderTodos();
+  setTodoTab("create");
   elements.todoDialog.showModal();
   elements.todoTitle.focus();
 }
@@ -4886,33 +5334,70 @@ function todoScopeLabel(todo) {
   return `${todo.project_id} / ${todo.node_ref}`;
 }
 
+function normalizeTodoProjectId(value) {
+  if (value == null || value === "" || value === "UNKNOWN" || value === "NONE") {
+    return null;
+  }
+  return String(value);
+}
+
+function todoBelongsToProject(todo, projectId) {
+  const want = normalizeTodoProjectId(projectId);
+  const have = normalizeTodoProjectId(todo?.project_id);
+  if (!want) return false;
+  if (!have) return false;
+  return have === want;
+}
+
+/**
+ * Board visibility rules:
+ * - With a selected project: never show another project's PROJECT/NODE todos.
+ * - UNIVERSE-scoped todos only when filter is ALL or UNIVERSE.
+ * - Without selection: UNIVERSE board only (no project dump).
+ */
 function visibleTodos() {
-  const scope = elements.todoScopeFilter.value;
-  const stateFilter = elements.todoStateFilter.value;
+  const scope = elements.todoScopeFilter?.value || "PROJECT";
+  const stateFilter = elements.todoStateFilter?.value || "OPEN";
   const priorityFilter = elements.todoPriorityFilter?.value || "ALL";
+  const selectedProjectId = normalizeTodoProjectId(
+    state.selectedProject?.project_id
+  );
   return state.todos.filter((todo) => {
     if (stateFilter === "OPEN" && todo.state === "DONE") return false;
     if (stateFilter === "DONE" && todo.state !== "DONE") return false;
-    if (priorityFilter !== "ALL" && todo.priority !== priorityFilter) return false;
-    if (scope === "UNIVERSE" && todo.scope_kind !== "UNIVERSE") return false;
-    if (
-      scope === "PROJECT" &&
-      (!state.selectedProject ||
-        todo.project_id !== state.selectedProject.project_id)
-    ) {
+    if (priorityFilter !== "ALL" && todo.priority !== priorityFilter) {
       return false;
     }
-    if (
-      scope === "NODE" &&
-      (!state.selectedProject ||
-        !selectedNodeRef() ||
-        todo.scope_kind !== "NODE" ||
-        todo.project_id !== state.selectedProject.project_id ||
-        todo.node_ref !== selectedNodeRef())
-    ) {
-      return false;
+
+    const kind = String(todo.scope_kind || "").toUpperCase();
+    const isUniverse = kind === "UNIVERSE" || !normalizeTodoProjectId(todo.project_id);
+
+    if (selectedProjectId) {
+      // Hard isolation: foreign project-bound todos never appear.
+      if (!isUniverse && !todoBelongsToProject(todo, selectedProjectId)) {
+        return false;
+      }
+      if (scope === "UNIVERSE") return isUniverse;
+      if (scope === "NODE") {
+        return (
+          kind === "NODE" &&
+          todoBelongsToProject(todo, selectedProjectId) &&
+          Boolean(selectedNodeRef()) &&
+          todo.node_ref === selectedNodeRef()
+        );
+      }
+      if (scope === "PROJECT") {
+        // Selected-project board: PROJECT + NODE for this project only.
+        return !isUniverse && todoBelongsToProject(todo, selectedProjectId);
+      }
+      // ALL (this context): this project's items + UNIVERSE items.
+      if (isUniverse) return true;
+      return todoBelongsToProject(todo, selectedProjectId);
     }
-    return true;
+
+    // No project selected.
+    if (scope === "PROJECT" || scope === "NODE") return false;
+    return isUniverse;
   });
 }
 
@@ -5023,11 +5508,19 @@ function renderTodos() {
 async function submitTodo(event) {
   event.preventDefault();
   elements.todoFormError.textContent = "";
+  // Create fields live on the Create tab; open it if user submitted elsewhere.
+  if (state.todoTab !== "create") setTodoTab("create");
   const form = new FormData(elements.todoForm);
   const scopeKind = String(form.get("scope_kind"));
+  const title = String(form.get("title") || "").trim();
+  if (!title) {
+    elements.todoFormError.textContent = "Title is required";
+    elements.todoTitle.focus();
+    return;
+  }
   const body = {
     scope_kind: scopeKind,
-    title: String(form.get("title") || "").trim(),
+    title,
     detail: String(form.get("detail") || ""),
     priority: String(form.get("priority")),
     state: String(form.get("state")),
@@ -5050,6 +5543,7 @@ async function submitTodo(event) {
     renderTodos();
     renderDetails();
     drawGraph();
+    setTodoTab("board");
     toast("Todo recorded");
   } catch (error) {
     elements.todoFormError.textContent = error.message;
@@ -6695,14 +7189,39 @@ function bindEvents() {
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
+  if (elements.settingsDialog) {
+    elements.settingsDialog.addEventListener("click", (event) => {
+      const tab = event.target.closest("[data-settings-tab]");
+      if (!tab || !elements.settingsDialog.contains(tab)) return;
+      event.preventDefault();
+      setSettingsTab(tab.getAttribute("data-settings-tab"));
+    });
+  }
   const openSessionObservatory = async () => {
     try {
       await refreshSupervisorSessions();
+      setObservatoryTab(state.observatoryTab || "sessions");
       elements.sessionObservatoryDialog.showModal();
     } catch (error) {
       toast(error.message, true);
     }
   };
+  if (elements.sessionObservatoryDialog) {
+    elements.sessionObservatoryDialog.addEventListener("click", (event) => {
+      const tab = event.target.closest("[data-observatory-tab]");
+      if (!tab || !elements.sessionObservatoryDialog.contains(tab)) return;
+      event.preventDefault();
+      setObservatoryTab(tab.getAttribute("data-observatory-tab"));
+    });
+  }
+  if (elements.todoDialog) {
+    elements.todoDialog.addEventListener("click", (event) => {
+      const tab = event.target.closest("[data-todo-tab]");
+      if (!tab || !elements.todoDialog.contains(tab)) return;
+      event.preventDefault();
+      setTodoTab(tab.getAttribute("data-todo-tab"));
+    });
+  }
   elements.sessionObservatoryButton.addEventListener(
     "click",
     openSessionObservatory
@@ -6994,10 +7513,23 @@ function syncConductorSummaryToggle(collapsed) {
 
 refreshConductorPanel = function () {
   const projectCount = (state.projects || []).length;
-  const todoCount = (state.todos || []).length;
   const dispatchCount = (state.dispatches || []).length;
+  // Metric: open todos for selected project only (not global GCS dump).
+  const scopedTodoCount = state.selectedProject
+    ? state.todos.filter(
+        (todo) =>
+          todoBelongsToProject(todo, state.selectedProject.project_id) &&
+          todo.state !== "DONE"
+      ).length
+    : state.todos.filter(
+        (todo) =>
+          (todo.scope_kind === "UNIVERSE" || !todo.project_id) &&
+          todo.state !== "DONE"
+      ).length;
   if (elements.metricProjects) elements.metricProjects.textContent = String(projectCount);
-  if (elements.metricTodos) elements.metricTodos.textContent = String(todoCount);
+  if (elements.metricTodos) {
+    elements.metricTodos.textContent = String(scopedTodoCount);
+  }
   if (elements.metricDispatches) elements.metricDispatches.textContent = String(dispatchCount);
   if (elements.metricService) {
     const ready = elements.serviceStatus?.dataset?.state === "ready";
@@ -7006,7 +7538,7 @@ refreshConductorPanel = function () {
   if (elements.conductorSummaryLine) {
     const service = elements.metricService?.textContent || "—";
     elements.conductorSummaryLine.textContent =
-      `P ${projectCount} · T ${todoCount} · D ${dispatchCount} · ${service}`;
+      `P ${projectCount} · T ${scopedTodoCount} · D ${dispatchCount} · ${service}`;
   }
   if (elements.workspaceTitle && elements.workspaceTitle.classList.contains("conductor-greeting")) {
     const hour = new Date().getHours();
@@ -7151,16 +7683,30 @@ refreshLawStrip = function () {
   });
   elements.canvas.addEventListener("pointermove", (event) => {
     const pan = state.graphPan;
-    if (!pan || pan.pointerId !== event.pointerId) return;
-    const dx = event.clientX - pan.startX;
-    const dy = event.clientY - pan.startY;
-    if (Math.hypot(dx, dy) > 3) {
-      pan.moved = true;
-      elements.canvas.classList.add("is-panning");
+    if (pan && pan.pointerId === event.pointerId) {
+      const dx = event.clientX - pan.startX;
+      const dy = event.clientY - pan.startY;
+      if (Math.hypot(dx, dy) > 3) {
+        pan.moved = true;
+        elements.canvas.classList.add("is-panning");
+        updateGraphHoverTooltip(null, null);
+      }
+      if (pan.moved) {
+        state.graph.x = pan.originX + dx;
+        state.graph.y = pan.originY + dy;
+        drawGraph();
+        return;
+      }
     }
-    if (!pan.moved) return;
-    state.graph.x = pan.originX + dx;
-    state.graph.y = pan.originY + dy;
+    handleGraphPointerHover(event);
+  });
+  elements.canvas.addEventListener("pointerleave", () => {
+    if (!state.hoveredNodeId) {
+      updateGraphHoverTooltip(null, null);
+      return;
+    }
+    state.hoveredNodeId = null;
+    updateGraphHoverTooltip(null, null);
     drawGraph();
   });
   const endPan = (event) => {
