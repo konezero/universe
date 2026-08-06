@@ -272,10 +272,10 @@ class SessionSupervisorStore:
         return dict(observation)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
     @contextmanager
@@ -440,7 +440,43 @@ class SessionSupervisorStore:
                         "session_id is already bound to a different identity",
                         status=409,
                     )
-                return material, False
+                # Idempotent re-inject: refresh observation time so Observatory
+                # does not treat the card as frozen at first registration.
+                summary = session.get("bounded_summary")
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET updated_at = ?,
+                        bounded_summary = CASE
+                            WHEN ? IS NOT NULL AND TRIM(?) != '' THEN ?
+                            ELSE bounded_summary
+                        END,
+                        row_version = row_version + 1
+                    WHERE session_id = ?
+                    """,
+                    (
+                        now,
+                        summary,
+                        summary,
+                        summary,
+                        session["session_id"],
+                    ),
+                )
+                self._event(
+                    connection,
+                    session_id=session["session_id"],
+                    event_type="SESSION_REOBSERVED",
+                    prior_state=material.get("state"),
+                    state=material.get("state"),
+                    details={"source": "register_session_idempotent"},
+                )
+                row = connection.execute(
+                    "SELECT * FROM session_record WHERE session_id = ?",
+                    (session["session_id"],),
+                ).fetchone()
+                if row is None:
+                    return material, False
+                return self._session_material(connection, row), False
             alias = session["alias"] or self._default_alias(session)
             connection.execute(
                 """

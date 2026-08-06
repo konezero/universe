@@ -522,9 +522,9 @@
     </div>
     <div class="session-observatory-toolbar">
       <span id="session-observatory-summary">Loading sessions…</span>
-      <label class="session-observatory-filter">
+      <label class="session-observatory-filter" title="Default shows one active 1:1 session per node/mode. Expand a card for older threads, or check this for the full Supervisor list including STOPPED.">
         <input id="observatory-show-all" type="checkbox" />
-        Show all (incl. STOPPED)
+        Show all (every session id, incl. STOPPED)
       </label>
       <button id="cleanup-sessions-button" class="secondary-button" type="button" title="Remove DISCONNECTED/STOPPED sessions; LIVE kept. Re-register on boot/mode-change/inject.">
         Clean sessions

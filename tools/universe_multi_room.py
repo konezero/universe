@@ -141,13 +141,17 @@ class MultiRoomStore:
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        # Shares universe.sqlite3 with the main service, remote gateway, and
+        # session supervisor. DELETE journal fights WAL writers on Windows and
+        # surfaces as "database is locked" when remote UI switches rooms.
         connection = sqlite3.connect(
             self.database_path, timeout=30, check_same_thread=False
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        # Avoid lingering locks on Windows test cleanup.
-        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     def _ensure_schema(self) -> None:

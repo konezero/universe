@@ -46,6 +46,8 @@ const state = {
   roomSessionBindings: [],
   selectedSupervisorSessionId: null,
   observatoryShowAll: false,
+  /** Expanded (node|mode) groups so operators can pick an alternate 1:1 session. */
+  observatoryExpandedCoords: {},
   supervisorEvents: [],
   legacyExecutors: [],
   conversationTarget: {
@@ -427,11 +429,31 @@ function sessionProjectPathLabel(session) {
     : `📁 unbound · node=${session.node || "—"}`;
 }
 
-function observatoryVisibleSessions(sessions) {
+function sessionCoordinateKey(session) {
+  return `${String(session?.node || "?").toUpperCase()}|${String(
+    session?.mode || "?"
+  ).toUpperCase()}`;
+}
+
+function sessionActivityMs(session) {
+  const date = parseSessionDate(
+    session?.last_activity_at || session?.updated_at || session?.created_at
+  );
+  return date ? date.getTime() : 0;
+}
+
+function sessionObservatoryRank(session) {
+  const stateName = String(session?.state || "").toUpperCase();
+  const live = stateName === "LIVE" ? 3 : stateName === "STARTING" ? 2 : 1;
+  const isDefault = session?.is_default ? 1 : 0;
+  return live * 1e15 + isDefault * 1e14 + sessionActivityMs(session);
+}
+
+function observatoryEligibleSessions(sessions) {
   const list = Array.isArray(sessions) ? sessions.slice() : [];
   if (state.observatoryShowAll) return list;
-  // Default: hide STOPPED noise; keep LIVE / default / recent DISCONNECTED.
-  const kept = list.filter((session) => {
+  // Hide STOPPED noise; keep LIVE / default / recent DISCONNECTED.
+  return list.filter((session) => {
     const stateName = String(session.state || "").toUpperCase();
     if (stateName === "STOPPED") return false;
     if (stateName === "LIVE" || session.is_default) return true;
@@ -439,12 +461,63 @@ function observatoryVisibleSessions(sessions) {
       session.last_activity_at || session.updated_at
     );
     if (!activity) return stateName !== "DISCONNECTED";
-    // Keep disconnected only if touched in last 7 days.
     return Date.now() - activity.getTime() < 7 * 86_400_000;
   });
-  // One card per (node,mode,provider,provider_session_ref) — already unique by session_id,
-  // but collapse identical alias groups: keep LIVE/default/newest only when refs differ.
-  return kept;
+}
+
+/**
+ * Collapse to last-active (prefer LIVE/default) per (node, mode).
+ * Expanded coords show the full alternate 1:1 list for that slot.
+ */
+function observatorySessionGroups(sessions) {
+  const eligible = observatoryEligibleSessions(sessions);
+  const byCoord = new Map();
+  for (const session of eligible) {
+    const key = sessionCoordinateKey(session);
+    if (!byCoord.has(key)) byCoord.set(key, []);
+    byCoord.get(key).push(session);
+  }
+  const groups = [];
+  for (const [key, members] of byCoord.entries()) {
+    const ranked = members
+      .slice()
+      .sort((a, b) => sessionObservatoryRank(b) - sessionObservatoryRank(a));
+    const expanded = Boolean(state.observatoryExpandedCoords[key]);
+    groups.push({
+      key,
+      primary: ranked[0],
+      alternatives: ranked.slice(1),
+      members: ranked,
+      expanded,
+    });
+  }
+  groups.sort(
+    (a, b) => sessionObservatoryRank(b.primary) - sessionObservatoryRank(a.primary)
+  );
+  return groups;
+}
+
+function observatoryVisibleSessions(sessions) {
+  if (state.observatoryShowAll) {
+    return observatoryEligibleSessions(sessions);
+  }
+  const cards = [];
+  for (const group of observatorySessionGroups(sessions)) {
+    if (group.expanded) {
+      cards.push(...group.members);
+    } else {
+      cards.push(group.primary);
+    }
+  }
+  return cards;
+}
+
+function toggleObservatoryCoordExpand(coordKey) {
+  state.observatoryExpandedCoords = {
+    ...state.observatoryExpandedCoords,
+    [coordKey]: !state.observatoryExpandedCoords[coordKey],
+  };
+  renderSessionObservatory();
 }
 
 function sessionPreviewSnippet(session) {
@@ -699,19 +772,40 @@ async function injectSessionFromObservatory() {
   }
   elements.observatoryInjectRef.value = "";
   await refreshSupervisorSessions();
+  // Product path: open Project Master room, not only Session Observatory.
+  const masterTarget =
+    result.project_master?.conversation_target ||
+    (mode === "MASTER" && projectId && projectId.toUpperCase() !== "CONDUCTOR"
+      ? { kind: "PROJECT_MASTER", projectId }
+      : null);
+  if (masterTarget?.kind === "PROJECT_MASTER" && masterTarget.projectId) {
+    try {
+      await callProjectMaster(masterTarget.projectId);
+      toast(`Session attached → ${masterTarget.projectId} Project Master room`);
+      return;
+    } catch (error) {
+      console.warn("Open Project Master room after inject failed", error);
+    }
+  }
   toast("Session injected into Universe");
 }
 
 function renderSessionObservatory() {
   if (!elements.sessionObservatoryList) return;
   const allSessions = state.supervisorSessions || [];
+  const groups = observatorySessionGroups(allSessions);
   const sessions = observatoryVisibleSessions(allSessions);
   const live = allSessions.filter((item) => item.state === "LIVE").length;
   const unknown = allSessions.filter((item) => item.state === "UNKNOWN").length;
-  const hidden = Math.max(0, allSessions.length - sessions.length);
+  const altCount = groups.reduce((n, g) => n + g.alternatives.length, 0);
+  const collapsedHint = state.observatoryShowAll
+    ? ""
+    : altCount
+      ? ` · ${groups.length} slots · ${altCount} older hidden`
+      : ` · ${groups.length} slots`;
   elements.sessionObservatorySummary.textContent =
     `${sessions.length} shown / ${allSessions.length} total · ${live} live · ${unknown} unknown` +
-    (hidden ? ` · ${hidden} hidden` : "") +
+    collapsedHint +
     ` · ${state.runtimeAudit?.platform_approvals?.pending_count || 0} approvals`;
   if (elements.observatoryShowAllToggle) {
     elements.observatoryShowAllToggle.checked = Boolean(state.observatoryShowAll);
@@ -728,12 +822,24 @@ function renderSessionObservatory() {
       )
     );
   }
+
+  const groupBySessionId = new Map();
+  for (const group of groups) {
+    for (const member of group.members) {
+      groupBySessionId.set(member.session_id, group);
+    }
+  }
+
   for (const session of sessions) {
+    const group = groupBySessionId.get(session.session_id);
+    const isPrimary =
+      group && group.primary && group.primary.session_id === session.session_id;
     const card = node("article", "supervisor-session-card");
     card.dataset.default = String(Boolean(session.is_default));
     card.dataset.selected = String(
       session.session_id === state.selectedSupervisorSessionId
     );
+    card.dataset.primary = String(Boolean(isPrimary));
     card.tabIndex = 0;
     card.setAttribute("role", "button");
     card.title = "Select to show last activity and recent turns";
@@ -755,6 +861,11 @@ function renderSessionObservatory() {
       node("span", "session-state-pill", sessionStateLabel(session))
     );
     heading.lastElementChild.dataset.state = session.state || "UNKNOWN";
+    if (isPrimary && !state.observatoryShowAll) {
+      heading.append(node("span", "session-token-pill active", "ACTIVE"));
+    } else if (!isPrimary && group) {
+      heading.append(node("span", "session-token-pill alt", "OTHER"));
+    }
     const meta = node("div", "session-card-meta");
     meta.append(
       node("span", "", sessionCoordinateLabel(session)),
@@ -832,6 +943,13 @@ function renderSessionObservatory() {
             }
           );
         }
+        // Collapse group after choosing so the list stays one-active-per-slot.
+        if (group) {
+          state.observatoryExpandedCoords = {
+            ...state.observatoryExpandedCoords,
+            [group.key]: false,
+          };
+        }
         const project = state.projects.find(
           (item) => item.project_id === session.node
         );
@@ -847,6 +965,40 @@ function renderSessionObservatory() {
       }
     });
     actions.append(saveAlias, resume);
+    if (
+      group &&
+      isPrimary &&
+      group.alternatives.length > 0 &&
+      !state.observatoryShowAll
+    ) {
+      const more = node(
+        "button",
+        "secondary-button compact-action",
+        group.expanded
+          ? "Hide older sessions"
+          : `Other sessions (${group.alternatives.length})`
+      );
+      more.type = "button";
+      more.title =
+        "Same node/mode can have several 1:1 threads. Show older ones to switch.";
+      more.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleObservatoryCoordExpand(group.key);
+      });
+      actions.append(more);
+    } else if (group && group.expanded && !isPrimary && !state.observatoryShowAll) {
+      const hide = node(
+        "button",
+        "secondary-button compact-action",
+        "Back to active"
+      );
+      hide.type = "button";
+      hide.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleObservatoryCoordExpand(group.key);
+      });
+      actions.append(hide);
+    }
     card.append(heading, meta, path, snippet, ref, alias, actions);
     elements.sessionObservatoryList.append(card);
   }
@@ -2847,10 +2999,23 @@ async function injectSessionRefThin() {
       provider,
       session_ref: sessionRef,
       make_default: true,
+      display_name: "Project Master",
     },
   });
   const roomId = result.room?.room_id || result.binding?.room_id;
   await refreshMultiRooms();
+  // Prefer Project Master conversation dock over multi-room list only.
+  try {
+    await callProjectMaster(projectId);
+    toast(
+      result.supervisor_session_created
+        ? `Injected → ${projectId} Project Master (registered)`
+        : `Injected → ${projectId} Project Master (reused)`
+    );
+    return;
+  } catch (error) {
+    console.warn("callProjectMaster after inject failed", error);
+  }
   if (roomId) {
     await openMultiRoom(roomId);
   }

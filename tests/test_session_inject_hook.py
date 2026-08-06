@@ -115,6 +115,70 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("019fd10b-current-universe", ref)
         self.assertEqual("GROK.active_sessions.json", source)
 
+    def test_resolve_grok_prefers_activity_over_opened_at(self) -> None:
+        """Duplicate active_sessions rows: short new agent must not beat real chat."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grok_home = root / "grok-home"
+            repo = root / "universe"
+            repo.mkdir()
+            from urllib.parse import quote
+
+            encoded = quote(str(repo.resolve()), safe="")
+            sess_root = grok_home / "sessions" / encoded
+            real = sess_root / "real-long-session"
+            short = sess_root / "short-dup-session"
+            real.mkdir(parents=True)
+            short.mkdir(parents=True)
+            (real / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "last_active_at": "2026-08-06T04:12:00Z",
+                        "num_chat_messages": 400,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (short / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "last_active_at": "2026-08-06T04:09:00Z",
+                        "num_chat_messages": 10,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            active = [
+                {
+                    "session_id": "real-long-session",
+                    "pid": 1,
+                    "cwd": str(repo),
+                    "opened_at": "2026-08-05T08:00:00Z",
+                },
+                {
+                    "session_id": "short-dup-session",
+                    "pid": 1,
+                    "cwd": str(repo),
+                    "opened_at": "2026-08-06T04:08:00Z",  # newer open, less activity
+                },
+            ]
+            (grok_home / "active_sessions.json").write_text(
+                json.dumps(active), encoding="utf-8"
+            )
+            provider, ref, source = resolve_provider_and_ref(
+                args=_args(),
+                stdin_payload=None,
+                session_fields={},
+                environment={
+                    "GROK_AGENT": "1",
+                    "GROK_HOME": str(grok_home),
+                },
+                repo_root=repo,
+            )
+        self.assertEqual("GROK", provider)
+        self.assertEqual("real-long-session", ref)
+        self.assertEqual("GROK.active_sessions.activity", source)
+
     def test_resolve_grok_from_sessions_mtime_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -141,7 +205,7 @@ class SessionInjectHookTests(unittest.TestCase):
             )
         self.assertEqual("GROK", provider)
         self.assertEqual("new-session-id", ref)
-        self.assertEqual("GROK.sessions_mtime", source)
+        self.assertEqual("GROK.sessions_activity", source)
 
     def test_grok_env_still_wins_over_local(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

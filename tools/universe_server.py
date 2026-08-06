@@ -3681,10 +3681,10 @@ class UniverseStore:
         self.remote_access = RemoteAccessStore(self.database_path)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
     @contextmanager
@@ -16064,6 +16064,14 @@ def perform_session_ref_inject(
             else session.get("default_pointer_version")
         )
 
+    # Project Master room (PROJECT + MASTER) is the product attach surface for
+    # user ↔ Master chat. Label the slot that way so UI / bridge_line match.
+    display_name = str(body.get("display_name") or "").strip()
+    if not display_name:
+        if room_type == "PROJECT" and slot_role == "MASTER":
+            display_name = "Project Master"
+        else:
+            display_name = normalized_alias
     room_result = multi_rooms.inject_session_ref(
         {
             "room_id": room_id,
@@ -16073,9 +16081,61 @@ def perform_session_ref_inject(
             "provider": normalized_provider,
             "provider_session_ref": normalized_ref,
             "supervisor_session_id": session_id,
-            "display_name": body.get("display_name") or normalized_alias,
+            "display_name": display_name,
         }
     )
+    project_master: dict[str, Any] | None = None
+    if (
+        room_type == "PROJECT"
+        and slot_role == "MASTER"
+        and project_id
+        and str(project_id).strip().upper() not in {"", "CONDUCTOR", "UNKNOWN"}
+    ):
+        # Persist coordinate for Project Master Host settings / prepare, not only
+        # multi-room bind + Supervisor. This is what the Project Master room UI reads.
+        try:
+            from project_master_host import (  # noqa: WPS433
+                ProjectMasterSessionStore,
+                _default_state_db,
+                provider_session_connection,
+            )
+
+            master_store = ProjectMasterSessionStore(
+                _default_state_db(str(project_id)),
+                str(project_id),
+                session_supervisor=session_supervisor,
+                requested_mode=normalized_mode or "MASTER",
+            )
+            observation = master_store.observe_provider_session(
+                normalized_provider, normalized_ref
+            )
+            project_master = {
+                "project_id": str(project_id),
+                "slot_role": "MASTER",
+                "room_role": "PROJECT_MASTER",
+                "observation": observation,
+                "display_name": "Project Master",
+                "session_connection": provider_session_connection(
+                    target_kind="PROJECT_MASTER",
+                    target_id=str(project_id),
+                    requested_mode=normalized_mode or "MASTER",
+                    store=master_store,
+                    resident=False,
+                    connection_state=observation,
+                ),
+                "conversation_target": {
+                    "kind": "PROJECT_MASTER",
+                    "projectId": str(project_id),
+                },
+            }
+        except Exception as error:  # noqa: BLE001 — inject must stay best-effort
+            project_master = {
+                "project_id": str(project_id),
+                "slot_role": "MASTER",
+                "room_role": "PROJECT_MASTER",
+                "observation": "FAILED",
+                "detail": f"{type(error).__name__}:{error}",
+            }
     return {
         **room_result,
         "schema": API_SCHEMA,
@@ -16090,6 +16150,7 @@ def perform_session_ref_inject(
         "resident_runtime_reload": (
             "REQUIRED" if make_default and default_selection is not None else "NOT_REQUIRED"
         ),
+        "project_master": project_master,
         "authority": "UNASSIGNED",
         "execution_assignment": "UNASSIGNED",
     }
@@ -16766,7 +16827,18 @@ def main() -> int:
                     start_service=bool(args.start_service),
                 )
                 # Detach tray so this CLI can return after launch.
-                creationflags = _windows_tray_creationflags()
+                # Do NOT use CREATE_NO_WINDOW / DETACHED_PROCESS: WinForms NotifyIcon
+                # needs the interactive desktop message loop or the icon never appears
+                # (and the host often exits immediately).
+                startupinfo = None
+                if hasattr(subprocess, "STARTUPINFO"):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= getattr(
+                        subprocess, "STARTF_USESHOWWINDOW", 0x00000001
+                    )
+                    # SW_HIDE — hide console window, keep interactive session.
+                    startupinfo.wShowWindow = 0
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 # PowerShell is resolved to an absolute path; all arguments are fixed.
                 process = subprocess.Popen(  # nosec B603
                     tray_args,
@@ -16775,6 +16847,8 @@ def main() -> int:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=creationflags,
+                    startupinfo=startupinfo,
+                    close_fds=True,
                 )
                 result = {
                     "schema": "universe.local-service-control.v1",

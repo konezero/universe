@@ -170,6 +170,53 @@ def _encode_grok_workspace_dir(repo_root: Path) -> str:
     return quote(str(repo_root.resolve()), safe="")
 
 
+def _grok_session_activity_key(
+    sessions_root: Path, session_id: str
+) -> tuple[str, float, int]:
+    """Sort key for Grok sessions (higher / later is better).
+
+    Uses summary.json last_active_at, chat_history mtime, and message count so
+    stale or short-lived active_sessions rows lose to the real conversation.
+    """
+    session_dir = sessions_root / session_id
+    last_active = ""
+    mtime = 0.0
+    num_messages = 0
+    if not session_dir.is_dir():
+        return ("", 0.0, 0)
+    try:
+        mtime = float(session_dir.stat().st_mtime)
+    except OSError:
+        mtime = 0.0
+    summary_path = session_dir / "summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            summary = None
+        if isinstance(summary, Mapping):
+            last_active = str(
+                summary.get("last_active_at") or summary.get("updated_at") or ""
+            ).strip()
+            for key in ("num_chat_messages", "num_messages"):
+                raw = summary.get(key)
+                if isinstance(raw, int) and raw >= 0:
+                    num_messages = raw
+                    break
+                if isinstance(raw, str) and raw.isdigit():
+                    num_messages = int(raw)
+                    break
+    for name in ("chat_history.jsonl", "updates.jsonl", "summary.json"):
+        path = session_dir / name
+        if not path.is_file():
+            continue
+        try:
+            mtime = max(mtime, float(path.stat().st_mtime))
+        except OSError:
+            continue
+    return (last_active, mtime, num_messages)
+
+
 def resolve_grok_local_session_ref(
     repo_root: Path | None,
     environment: Mapping[str, str],
@@ -177,8 +224,11 @@ def resolve_grok_local_session_ref(
     """Resolve Grok session_ref from local TUI state (no network).
 
     Priority:
-    1. ``$GROK_HOME/active_sessions.json`` entry whose ``cwd`` matches repo_root
-    2. Newest session directory under ``$GROK_HOME/sessions/<encoded-cwd>/``
+    1. Among ``$GROK_HOME/active_sessions.json`` rows for this repo cwd, pick the
+       session with the highest local activity (summary last_active / mtime),
+       not merely the newest ``opened_at`` (can be a short duplicate agent).
+    2. Else newest active session folder under
+       ``$GROK_HOME/sessions/<encoded-cwd>/`` by the same activity key.
     """
     home = _grok_home(environment)
     if repo_root is not None:
@@ -186,6 +236,10 @@ def resolve_grok_local_session_ref(
             repo_resolved = str(repo_root.expanduser().resolve())
         except OSError:
             repo_resolved = str(repo_root)
+
+        sessions_root = home / "sessions" / _encode_grok_workspace_dir(
+            Path(repo_resolved)
+        )
 
         active_path = home / "active_sessions.json"
         if active_path.is_file():
@@ -206,16 +260,21 @@ def resolve_grok_local_session_ref(
                         matches.append(dict(item))
                 if matches:
                     matches.sort(
-                        key=lambda row: str(row.get("opened_at") or ""),
+                        key=lambda row: (
+                            *_grok_session_activity_key(
+                                sessions_root, str(row.get("session_id") or "")
+                            ),
+                            str(row.get("opened_at") or ""),
+                        ),
                         reverse=True,
                     )
                     chosen = str(matches[0].get("session_id") or "").strip()
                     if chosen:
-                        return chosen, "GROK.active_sessions.json"
+                        source = "GROK.active_sessions.json"
+                        if len(matches) > 1:
+                            source = "GROK.active_sessions.activity"
+                        return chosen, source
 
-        sessions_root = home / "sessions" / _encode_grok_workspace_dir(
-            Path(repo_resolved)
-        )
         if sessions_root.is_dir():
             candidates = [
                 path
@@ -223,10 +282,15 @@ def resolve_grok_local_session_ref(
                 if path.is_dir() and not path.name.startswith(".")
             ]
             if candidates:
-                latest = max(candidates, key=lambda path: path.stat().st_mtime)
+                latest = max(
+                    candidates,
+                    key=lambda path: _grok_session_activity_key(
+                        sessions_root, path.name
+                    ),
+                )
                 name = latest.name.strip()
                 if name:
-                    return name, "GROK.sessions_mtime"
+                    return name, "GROK.sessions_activity"
 
     return None, "GROK.local_unresolved"
 
@@ -713,6 +777,12 @@ def run_hook(
         "provider_session_ref": session_ref,
         "make_default": make_default,
         "bounded_summary": f"Hook inject ({args.trigger})",
+        # Product label for PROJECT room MASTER slot (UI Project Master room).
+        "display_name": (
+            "Project Master"
+            if room_type == "PROJECT" and slot_role == "MASTER"
+            else ""
+        ),
     }
 
     if args.dry_run:

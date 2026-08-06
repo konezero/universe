@@ -18,6 +18,20 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$trayLogDir = Join-Path $env:LOCALAPPDATA "Universe"
+if (-not (Test-Path -LiteralPath $trayLogDir)) {
+  New-Item -ItemType Directory -Path $trayLogDir -Force | Out-Null
+}
+$trayLogPath = Join-Path $trayLogDir "tray.log"
+function Write-TrayLog {
+  param([string]$Message)
+  try {
+    $line = "{0} {1}" -f (Get-Date -Format "o"), $Message
+    Add-Content -LiteralPath $trayLogPath -Value $line -Encoding UTF8
+  } catch { }
+}
+Write-TrayLog "tray host starting pid=$PID"
+
 $createdNew = $false
 $trayMutex = [System.Threading.Mutex]::new(
   $true,
@@ -25,9 +39,23 @@ $trayMutex = [System.Threading.Mutex]::new(
   [ref]$createdNew
 )
 if (-not $createdNew) {
+  # Another tray is already running (icon may be in the overflow ^ area).
+  Write-TrayLog "mutex already owned; exit (icon may already be in tray overflow)"
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    [System.Windows.Forms.MessageBox]::Show(
+      "Universe tray is already running.`nCheck the notification area (taskbar ^ overflow).",
+      "Universe Tray",
+      [System.Windows.Forms.MessageBoxButtons]::OK,
+      [System.Windows.Forms.MessageBoxIcon]::Information
+    ) | Out-Null
+  } catch {
+    # Non-interactive hosts: exit quietly.
+  }
   $trayMutex.Dispose()
   exit 0
 }
+Write-TrayLog "mutex acquired"
 
 if (-not $PythonExecutable) {
   if ($env:UNIVERSE_PYTHON) {
@@ -263,26 +291,59 @@ $notify.Add_DoubleClick({
     Open-UniverseUi -Status $status
   })
 
+# Status poll timer (after the UI message loop is running).
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 8000
 $timer.Add_Tick({ Update-TrayStatus | Out-Null })
 $timer.Start()
 
-if ($StartService) {
-  Invoke-UniverseCli -Args @("start", "--no-open-ui") | Out-Null
-}
+# Do NOT block before Application.Run. NotifyIcon needs the message loop to
+# paint; a long "start service" call left the tray invisible.
+$bootTimer = New-Object System.Windows.Forms.Timer
+$bootTimer.Interval = 400
+$bootTimer.Add_Tick({
+    $bootTimer.Stop()
+    $bootTimer.Dispose()
+    try {
+      if ($StartService) {
+        Write-TrayLog "StartService requested (deferred)"
+        Invoke-UniverseCli -Args @("start", "--no-open-ui") | Out-Null
+        Write-TrayLog "StartService finished"
+      }
+    } catch {
+      Write-TrayLog ("StartService failed: {0}" -f $_.Exception.Message)
+    }
+    try {
+      $status = Update-TrayStatus
+      $notify.BalloonTipTitle = "Universe"
+      $notify.BalloonTipText = if ($status.status -eq "READY") {
+        "Local service is ready."
+      } else {
+        "Tray controls are ready; service status is $($status.status)."
+      }
+      $notify.ShowBalloonTip(4000)
+      Write-TrayLog ("deferred boot status={0}" -f $status.status)
+    } catch {
+      Write-TrayLog ("deferred status failed: {0}" -f $_.Exception.Message)
+    }
+  })
+$bootTimer.Start()
 
-$initialStatus = Update-TrayStatus
+$notify.Visible = $true
+$notify.Text = "Universe: starting..."
 $notify.BalloonTipTitle = "Universe"
-$notify.BalloonTipText = if ($initialStatus.status -eq "READY") {
-  "Local service is ready."
-} else {
-  "Tray controls are ready; service status is $($initialStatus.status)."
+$notify.BalloonTipText = "Tray is starting..."
+try {
+  $notify.ShowBalloonTip(2000)
+} catch {
+  Write-TrayLog ("initial ShowBalloonTip failed: {0}" -f $_.Exception.Message)
 }
-$notify.ShowBalloonTip(2500)
+Write-TrayLog "entering message loop"
 try {
   [System.Windows.Forms.Application]::Run()
+  Write-TrayLog "Application.Run returned"
 } finally {
+  Write-TrayLog "tray host shutting down"
   $timer.Stop()
   $timer.Dispose()
   $notify.Visible = $false
