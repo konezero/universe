@@ -45,12 +45,28 @@ Codex with env:
 python tools/universe_session_inject_hook.py --repo-root . --provider CODEX --trigger mode_change
 ```
 
+Grok Build / Grok TUI (auto local resolve):
+
+```powershell
+# Prefer explicit env when available:
+#   GROK_SESSION_ID / XAI_SESSION_ID / GROK_CONVERSATION_ID
+# Otherwise the hook reads local TUI state (no network):
+#   1) $GROK_HOME/active_sessions.json matching --repo-root cwd
+#   2) newest $GROK_HOME/sessions/<url-encoded-cwd>/<session-id>/
+# GROK_AGENT=1 (set by Grok agent processes) enables auto provider=GROK.
+python tools/universe_session_inject_hook.py --repo-root . --trigger mode_change
+```
+
 Hook outcomes (JSON on stdout): `INJECTED` | `SKIPPED` | `OFFLINE` | `DRY_RUN` |
 `INJECT_FAILED`. Default exit code is **0** so Mode/boot is never blocked.
 Use `--strict` only in CI. Optional `--update-session-md` patches observation
 lines (`Last Provider*`) without granting authority.
 
-Project wiring: `.claude/settings.json` → `SessionStart` command hook.
+Project wiring:
+
+- Claude: `.claude/settings.json` → `SessionStart` → inject hook (`--from-stdin`)
+- Codex: env `CODEX_THREAD_ID` after Mode context is active
+- Grok: env ref **or** local `active_sessions.json` / sessions dir under `GROK_HOME`
 
 ## Manual route
 

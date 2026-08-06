@@ -123,3 +123,41 @@ MODE_CHANGE / prepare-session succeeds
 ```
 
 Manual or Host hook path: `.ai/skills/common/host-state-projection/SKILL.md`.
+
+## Post-MODE_CHANGE: Universe session-ref inject (product)
+
+After Registry resolution succeeds and the Host knows (or can observe) a
+provider session coordinate, run a **best-effort** Universe inject. This is a
+product continuity step, not governance permission.
+
+```text
+MODE_CHANGE succeeds
+  -> optional Host observation: provider + session_ref
+  -> python tools/universe_session_inject_hook.py
+       --repo-root <project-root>
+       --trigger mode_change
+       [--provider ...] [--session-ref ...]
+       [--update-session-md]
+  -> Universe OFFLINE / SKIPPED must not fail MODE_CHANGE
+```
+
+Provider ref resolution (hook):
+
+```text
+Claude  -> SessionStart stdin session_id / CLAUDE_* env
+Codex   -> CODEX_THREAD_ID / CODEX_SESSION_ID
+Grok    -> GROK_SESSION_ID | XAI_SESSION_ID | GROK_CONVERSATION_ID
+           else $GROK_HOME/active_sessions.json (cwd match)
+           else newest $GROK_HOME/sessions/<encoded-cwd>/
+```
+
+Rules:
+
+1. Inject only when `provider` + `session_ref` + `project_id` resolve.
+2. Default exit is non-blocking (`SKIPPED` / `OFFLINE` / `INJECTED` all exit 0).
+3. Does **not** create Authority, Execution Assignment, or write scope.
+4. Prefer hook observation under `.ai/runtime/tmp/last_provider_session_observation.json`.
+5. `--update-session-md` may patch `Last Provider*` observation lines only.
+
+See `tools/universe_session_inject_hook.py` and
+`.ai/skills/common/session-ref-inject/SKILL.md`.

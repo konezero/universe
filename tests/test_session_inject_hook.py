@@ -77,6 +77,104 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("claude-sess-9", ref)
         self.assertEqual("STDIN.session_id", source)
 
+    def test_resolve_grok_from_active_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grok_home = root / "grok-home"
+            (grok_home).mkdir()
+            active = [
+                {
+                    "session_id": "019fd10b-other-workspace",
+                    "pid": 1,
+                    "cwd": str(root / "other"),
+                    "opened_at": "2026-08-01T00:00:00Z",
+                },
+                {
+                    "session_id": "019fd10b-current-universe",
+                    "pid": 2,
+                    "cwd": str(root / "universe"),
+                    "opened_at": "2026-08-06T00:00:00Z",
+                },
+            ]
+            (grok_home / "active_sessions.json").write_text(
+                json.dumps(active), encoding="utf-8"
+            )
+            repo = root / "universe"
+            repo.mkdir()
+            provider, ref, source = resolve_provider_and_ref(
+                args=_args(),
+                stdin_payload=None,
+                session_fields={},
+                environment={
+                    "GROK_AGENT": "1",
+                    "GROK_HOME": str(grok_home),
+                },
+                repo_root=repo,
+            )
+        self.assertEqual("GROK", provider)
+        self.assertEqual("019fd10b-current-universe", ref)
+        self.assertEqual("GROK.active_sessions.json", source)
+
+    def test_resolve_grok_from_sessions_mtime_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grok_home = root / "grok-home"
+            repo = root / "proj"
+            repo.mkdir()
+            from urllib.parse import quote
+
+            encoded = quote(str(repo.resolve()), safe="")
+            sess_root = grok_home / "sessions" / encoded
+            older = sess_root / "old-session-id"
+            newer = sess_root / "new-session-id"
+            older.mkdir(parents=True)
+            newer.mkdir(parents=True)
+            # Ensure mtime order: touch newer last.
+            older.joinpath("marker").write_text("o", encoding="utf-8")
+            newer.joinpath("marker").write_text("n", encoding="utf-8")
+            provider, ref, source = resolve_provider_and_ref(
+                args=_args(provider="GROK"),
+                stdin_payload=None,
+                session_fields={},
+                environment={"GROK_HOME": str(grok_home)},
+                repo_root=repo,
+            )
+        self.assertEqual("GROK", provider)
+        self.assertEqual("new-session-id", ref)
+        self.assertEqual("GROK.sessions_mtime", source)
+
+    def test_grok_env_still_wins_over_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grok_home = root / "g"
+            grok_home.mkdir()
+            (grok_home / "active_sessions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "session_id": "from-active",
+                            "cwd": str(root),
+                            "opened_at": "2026-08-06T00:00:00Z",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            provider, ref, source = resolve_provider_and_ref(
+                args=_args(),
+                stdin_payload=None,
+                session_fields={},
+                environment={
+                    "GROK_AGENT": "1",
+                    "GROK_HOME": str(grok_home),
+                    "GROK_SESSION_ID": "from-env",
+                },
+                repo_root=root,
+            )
+        self.assertEqual("GROK", provider)
+        self.assertEqual("from-env", ref)
+        self.assertEqual("GROK_SESSION_ID", source)
+
     def test_project_and_mode_from_session_md_fields(self) -> None:
         fields = {"Project": "universe", "Mode": "MASTER", "Node": "universe"}
         project = resolve_project_id(

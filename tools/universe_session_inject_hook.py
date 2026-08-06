@@ -23,7 +23,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 HOOK_SCHEMA = "universe.session-inject-hook.v1"
 PROVIDERS = frozenset({"CLAUDE", "CODEX", "GROK"})
@@ -45,6 +45,9 @@ PROVIDER_HINT_ENV = (
     "AI_PROVIDER",
     "PROVIDER",
 )
+
+# Truthy values that mark this process as a Grok Build / Grok TUI agent.
+_GROK_AGENT_TRUTHY = frozenset({"1", "true", "yes", "on", "GROK", "GROK_AGENT"})
 
 
 def utc_now() -> str:
@@ -130,12 +133,111 @@ def _parse_session_md_provider(fields: Mapping[str, str]) -> tuple[str | None, s
     return provider, ref
 
 
+def _paths_equal(left: str, right: str) -> bool:
+    try:
+        a = Path(left).expanduser().resolve()
+        b = Path(right).expanduser().resolve()
+    except OSError:
+        return os.path.normcase(os.path.normpath(left)) == os.path.normcase(
+            os.path.normpath(right)
+        )
+    if os.name == "nt":
+        return os.path.normcase(str(a)) == os.path.normcase(str(b))
+    return a == b
+
+
+def _grok_home(environment: Mapping[str, str]) -> Path:
+    raw = str(environment.get("GROK_HOME") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".grok"
+
+
+def _grok_agent_active(environment: Mapping[str, str]) -> bool:
+    value = str(environment.get("GROK_AGENT") or "").strip()
+    if value.upper() in _GROK_AGENT_TRUTHY or value in _GROK_AGENT_TRUTHY:
+        return True
+    # Some hosts only set GROK_HOME while the agent process is live.
+    if str(environment.get("GROK_HOME") or "").strip() and str(
+        environment.get("GROK_SESSION_ID") or ""
+    ).strip():
+        return True
+    return False
+
+
+def _encode_grok_workspace_dir(repo_root: Path) -> str:
+    """Match Grok TUI session folder naming: URL-quote of absolute path."""
+    return quote(str(repo_root.resolve()), safe="")
+
+
+def resolve_grok_local_session_ref(
+    repo_root: Path | None,
+    environment: Mapping[str, str],
+) -> tuple[str | None, str]:
+    """Resolve Grok session_ref from local TUI state (no network).
+
+    Priority:
+    1. ``$GROK_HOME/active_sessions.json`` entry whose ``cwd`` matches repo_root
+    2. Newest session directory under ``$GROK_HOME/sessions/<encoded-cwd>/``
+    """
+    home = _grok_home(environment)
+    if repo_root is not None:
+        try:
+            repo_resolved = str(repo_root.expanduser().resolve())
+        except OSError:
+            repo_resolved = str(repo_root)
+
+        active_path = home / "active_sessions.json"
+        if active_path.is_file():
+            try:
+                payload = json.loads(active_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, list):
+                matches: list[dict[str, Any]] = []
+                for item in payload:
+                    if not isinstance(item, Mapping):
+                        continue
+                    session_id = str(item.get("session_id") or "").strip()
+                    cwd = str(item.get("cwd") or "").strip()
+                    if not session_id or not cwd:
+                        continue
+                    if _paths_equal(cwd, repo_resolved):
+                        matches.append(dict(item))
+                if matches:
+                    matches.sort(
+                        key=lambda row: str(row.get("opened_at") or ""),
+                        reverse=True,
+                    )
+                    chosen = str(matches[0].get("session_id") or "").strip()
+                    if chosen:
+                        return chosen, "GROK.active_sessions.json"
+
+        sessions_root = home / "sessions" / _encode_grok_workspace_dir(
+            Path(repo_resolved)
+        )
+        if sessions_root.is_dir():
+            candidates = [
+                path
+                for path in sessions_root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            ]
+            if candidates:
+                latest = max(candidates, key=lambda path: path.stat().st_mtime)
+                name = latest.name.strip()
+                if name:
+                    return name, "GROK.sessions_mtime"
+
+    return None, "GROK.local_unresolved"
+
+
 def resolve_provider_and_ref(
     *,
     args: argparse.Namespace,
     stdin_payload: Mapping[str, Any] | None,
     session_fields: Mapping[str, str],
     environment: Mapping[str, str],
+    repo_root: Path | None = None,
 ) -> tuple[str | None, str | None, str]:
     """Return (provider, session_ref, source_label)."""
     if args.provider and (args.session_ref or args.provider_session_ref):
@@ -145,26 +247,7 @@ def resolve_provider_and_ref(
             return provider, ref, "CLI"
 
     if stdin_payload:
-        for key in (
-            "session_id",
-            "sessionId",
-            "conversation_id",
-            "conversationId",
-            "thread_id",
-            "threadId",
-        ):
-            raw = stdin_payload.get(key)
-            if isinstance(raw, str) and raw.strip():
-                # Claude Code SessionStart typically supplies session_id.
-                return "CLAUDE", raw.strip(), f"STDIN.{key}"
-
-        nested = stdin_payload.get("session")
-        if isinstance(nested, Mapping):
-            for key in ("id", "session_id", "sessionId"):
-                raw = nested.get(key)
-                if isinstance(raw, str) and raw.strip():
-                    return "CLAUDE", raw.strip(), f"STDIN.session.{key}"
-
+        # Explicit provider in stdin wins over Claude-shaped keys.
         provider_hint = stdin_payload.get("provider")
         ref_hint = (
             stdin_payload.get("session_ref")
@@ -183,6 +266,27 @@ def resolve_provider_and_ref(
                 "STDIN.explicit",
             )
 
+        for key in (
+            "session_id",
+            "sessionId",
+            "conversation_id",
+            "conversationId",
+            "thread_id",
+            "threadId",
+        ):
+            raw = stdin_payload.get(key)
+            if isinstance(raw, str) and raw.strip():
+                # Claude Code SessionStart typically supplies session_id.
+                # Grok TUI may also pass session_id with provider=GROK (handled above).
+                return "CLAUDE", raw.strip(), f"STDIN.{key}"
+
+        nested = stdin_payload.get("session")
+        if isinstance(nested, Mapping):
+            for key in ("id", "session_id", "sessionId"):
+                raw = nested.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    return "CLAUDE", raw.strip(), f"STDIN.session.{key}"
+
     # Explicit provider env + matching ref env.
     for key in PROVIDER_HINT_ENV:
         hint = str(environment.get(key) or "").strip().upper()
@@ -191,6 +295,12 @@ def resolve_provider_and_ref(
                 ref = str(environment.get(env_key) or "").strip()
                 if ref:
                     return hint, ref, env_key
+            if hint == "GROK":
+                grok_ref, grok_source = resolve_grok_local_session_ref(
+                    repo_root, environment
+                )
+                if grok_ref:
+                    return "GROK", grok_ref, grok_source
 
     # Scan all known provider env refs.
     for provider, keys in PROVIDER_ENV_REFS.items():
@@ -207,6 +317,24 @@ def resolve_provider_and_ref(
                 ref = str(environment.get(env_key) or "").strip()
                 if ref:
                     return provider, ref, env_key
+            if provider == "GROK":
+                grok_ref, grok_source = resolve_grok_local_session_ref(
+                    repo_root, environment
+                )
+                if grok_ref:
+                    return "GROK", grok_ref, grok_source
+
+    # Grok TUI local state (active_sessions / sessions dir) when this process
+    # is a Grok agent or the user asked for GROK without a ref env.
+    want_grok_local = False
+    if args.provider and str(args.provider).strip().upper() == "GROK":
+        want_grok_local = True
+    elif _grok_agent_active(environment):
+        want_grok_local = True
+    if want_grok_local:
+        grok_ref, grok_source = resolve_grok_local_session_ref(repo_root, environment)
+        if grok_ref:
+            return "GROK", grok_ref, grok_source
 
     md_provider, md_ref = _parse_session_md_provider(session_fields)
     if md_provider and md_ref:
@@ -389,6 +517,7 @@ def patch_session_md_observation(
     if not lines:
         return "SESSION_MD_EMPTY"
     changed = 0
+    seen: set[str] = set()
     out: list[str] = []
     for line in lines:
         matched = False
@@ -402,10 +531,20 @@ def patch_session_md_observation(
                 if new_line != line:
                     changed += 1
                 out.append(new_line)
+                seen.add(key)
                 matched = True
                 break
         if not matched:
             out.append(line)
+    # Append missing observation keys (session.md from Host projection may omit them).
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    missing = [key for key in replacements if key not in seen]
+    if missing:
+        if out and not out[-1].endswith(("\n", "\r\n")):
+            out[-1] = out[-1] + newline
+        for key in missing:
+            out.append(f"{key}: {replacements[key]}{newline}")
+            changed += 1
     if changed == 0:
         return "SESSION_MD_UNCHANGED"
     try:
@@ -488,6 +627,7 @@ def run_hook(
         stdin_payload=stdin_payload,
         session_fields=session_fields,
         environment=env,
+        repo_root=repo_root,
     )
     project_id = resolve_project_id(
         args=args,
