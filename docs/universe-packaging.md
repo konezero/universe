@@ -4,6 +4,10 @@ Status: first productization slice
 Scope: local service lifecycle + user-scope Start Menu / optional autostart  
 Not: Tauri tray binary, MSI/Code-signed installer, admin services, remote hosts
 
+**Install mode (Universe attach vs project standalone)** is fixed in
+[`docs/universe-install-mode.md`](universe-install-mode.md). Default product
+path: host boots, project is PWD attach. Install packs must offer that choice.
+
 ## Goals
 
 1. Start / stop / restart / status the local Universe service without hunting PIDs.

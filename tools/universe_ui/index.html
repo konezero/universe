@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=activity-timeline-layout-6">
+  <link rel="stylesheet" href="/styles.css?v=nav-dedupe-7">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -14,12 +14,13 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Universe</strong>
       </div>
-      <nav id="primary-nav" class="primary-nav" aria-label="Primary views">
-        <button type="button" class="selected" data-primary-view="network">Network</button>
-        <button type="button" data-primary-view="ecosystem">Ecosystem</button>
-        <button type="button" data-primary-view="timeline">Timeline</button>
-        <button type="button" data-primary-view="memory">Memory</button>
-        <button type="button" data-primary-view="future">Future</button>
+      <nav id="primary-nav" class="primary-nav" aria-label="Workspace surfaces">
+        <button type="button" class="selected" data-primary-view="map" title="Multiverse map">Map</button>
+        <button type="button" data-primary-view="timeline" title="Project timeline graph">Timeline</button>
+        <button type="button" data-primary-view="documents" title="Document graph">Documents</button>
+        <button type="button" data-primary-view="memory" title="Project memory (inspector)">Memory</button>
+        <button type="button" data-primary-view="future" title="Future paths (inspector)">Future</button>
+        <button type="button" data-primary-view="bench" title="Skill bench (inspector)">Bench</button>
       </nav>
       <label class="top-search">
         <span class="sr-only">Search</span>
@@ -49,18 +50,6 @@
       </div>
       <div id="project-list" class="project-list" role="listbox" aria-label="Projects"></div>
 
-      <div class="rail-block">
-        <div class="section-heading rail-subhead"><span>Views</span></div>
-        <nav class="rail-views" aria-label="Workspace views">
-          <button type="button" class="rail-view selected" data-view="universe">Multiverse Map</button>
-          <button type="button" class="rail-view" data-view="timeline">Timeline Flow</button>
-          <button type="button" class="rail-view" data-view="documents">Documents</button>
-          <button type="button" class="rail-view" data-primary-view="memory">Memory</button>
-          <button type="button" class="rail-view" data-primary-view="bench">Performance Bench</button>
-          <button type="button" class="rail-view" data-primary-view="future">Future Paths</button>
-        </nav>
-      </div>
-
       <div class="rail-block session-block">
         <div class="section-heading rail-subhead"><span>Session</span></div>
         <button id="session-observatory-button" class="session-card" type="button" title="Open session observatory">
@@ -68,25 +57,13 @@
           <small id="session-provider-line">Provider · AUTO</small>
           <span class="session-dot" data-state="ready"></span>
         </button>
-        <small class="network-latency" id="network-latency">Network · local loopback</small>
+        <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
     </aside>
 
     <main class="graph-workspace">
       <div class="graph-toolbar glass-bar">
         <div class="toolbar-filters">
-          <label>View
-            <select id="view-mode-select" aria-label="View mode">
-              <option value="universe">Multiverse Map</option>
-              <option value="timeline">Timeline</option>
-              <option value="documents">Documents</option>
-            </select>
-          </label>
-          <div class="segmented-control" aria-label="Graph view">
-            <button type="button" data-view="timeline">Timeline</button>
-            <button type="button" class="selected" data-view="universe">Universe map</button>
-            <button type="button" data-view="documents">Documents</button>
-          </div>
           <div class="graph-map-controls" aria-label="Map controls">
             <button id="graph-zoom-out" class="icon-button compact" type="button" title="Zoom out">&#8722;</button>
             <button id="graph-fit" class="icon-button compact" type="button" title="Fit graph">&#9638;</button>
@@ -95,10 +72,10 @@
           <button id="prepare-project-button" class="secondary-button" type="button" title="Queue project-map discovery">Request Project Map</button>
         </div>
         <div class="toolbar-legend graph-legend" aria-hidden="true">
-          <span><i class="node-key project"></i>Adopted path</span>
-          <span><i class="node-key system"></i>Parallel work</span>
-          <span><i class="node-key predicted"></i>Future branch</span>
-          <span><i class="node-key document"></i>Documents</span>
+          <span><i class="node-key project"></i>Project</span>
+          <span><i class="node-key system"></i>System</span>
+          <span><i class="node-key predicted"></i>Predicted</span>
+          <span><i class="node-key document"></i>Document</span>
         </div>
       </div>
       <div class="canvas-wrap starfield">
@@ -141,7 +118,7 @@
             <div class="conductor-actions">
               <button type="button" class="ghost-action" id="action-fit-map">Open Multiverse Map</button>
               <button type="button" class="ghost-action" id="action-refresh">Sync Peers</button>
-              <button type="button" class="ghost-action" data-primary-view="future">Review Future Paths</button>
+              <button type="button" class="ghost-action" data-primary-view="future">Open Future tab</button>
               <button type="button" class="ghost-action" id="action-todo">Dispatch Board</button>
             </div>
           </div>
@@ -945,6 +922,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=activity-timeline-layout-6" defer></script>
+  <script src="/app.js?v=nav-dedupe-7" defer></script>
 </body>
 </html>

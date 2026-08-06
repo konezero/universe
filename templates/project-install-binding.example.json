@@ -1,0 +1,28 @@
+{
+  "schema": "universe.install-binding.v1",
+  "install_mode": "UNIVERSE_ATTACHED",
+  "prefer_boot": "HOST",
+  "project_id": "example-project",
+  "project_root": ".",
+  "runtime_pin": {
+    "kind": "CAREER_RELEASE_OR_HOST",
+    "release_id": null,
+    "manifest_digest": null,
+    "note": "Attached mode may leave pin null and follow host-current runtime."
+  },
+  "career_source": {
+    "project_id": "ai-career",
+    "role": "CAREER_SOURCE"
+  },
+  "universe_host": {
+    "discovery": "LOCAL_SERVER_JSON",
+    "state_file_hint": "%LOCALAPPDATA%\\Universe\\server.json"
+  },
+  "standalone": {
+    "enabled": false,
+    "embed_runtime": false,
+    "boot_entry": null
+  },
+  "updated_at": "2026-08-06T00:00:00Z",
+  "_comment": "Copy to <project>/.ai/universe/install_binding.json. See docs/universe-install-mode.md"
+}

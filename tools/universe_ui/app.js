@@ -1300,6 +1300,44 @@ function setGraphScale(nextScale) {
   drawGraph();
 }
 
+/** Graph canvas modes only (not inspector tabs). */
+function showGraphView(view) {
+  const allowed = new Set(["universe", "timeline", "documents", "implementation"]);
+  if (!allowed.has(view)) view = "universe";
+  state.view = view;
+  state.selectedNode = null;
+  state.focusedNodeId = null;
+  elements.nodeBreadcrumb?.classList.add("hidden");
+  syncPrimaryNavSelection(
+    view === "universe" ? "map" : view
+  );
+  buildGraph();
+  renderDetails();
+}
+
+/** Highlight top nav without toast placeholders. */
+function syncPrimaryNavSelection(primaryView) {
+  if (!elements.primaryNav) return;
+  for (const item of elements.primaryNav.querySelectorAll("[data-primary-view]")) {
+    item.classList.toggle(
+      "selected",
+      item.getAttribute("data-primary-view") === primaryView
+    );
+  }
+}
+
+/** Open inspector tab (Memory / Future / Bench / Activity / Details). */
+function openInspectorSurface(tab) {
+  const allowed = new Set(["details", "activity", "bench", "memory", "future"]);
+  if (!allowed.has(tab)) tab = "details";
+  state.inspectorDismissed = false;
+  document.body.classList.add("inspector-open");
+  showInspectorTab(tab);
+  if (["memory", "future", "bench"].includes(tab)) {
+    syncPrimaryNavSelection(tab);
+  }
+}
+
 function fitGraphView() {
   const nodes = state.graph.nodes;
   if (!nodes.length) {
@@ -4567,15 +4605,7 @@ function selectGraphNode(event) {
     const projectId = selected.data?.project_id || selected.projectId;
     const afterSelect = () => {
       state.view = "universe";
-      if (elements.viewModeSelect) {
-        elements.viewModeSelect.value = "universe";
-      }
-      document.querySelectorAll("[data-view]").forEach((button) =>
-        button.classList.toggle(
-          "selected",
-          button.getAttribute("data-view") === "universe"
-        )
-      );
+      syncPrimaryNavSelection("map");
       state.focusedNodeId = null;
       state.selectedNode = {
         ...selected,
@@ -7427,32 +7457,25 @@ function bindEvents() {
   elements.workerBindingScope.addEventListener("change", renderWorkerBindingSettings);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
 
-  if (elements.viewModeSelect) {
-    elements.viewModeSelect.addEventListener("change", () => {
-      const value = elements.viewModeSelect.value;
-      const btn = document.querySelector(`.segmented-control [data-view="${value}"]`);
-      if (btn) btn.click();
-    });
-  }
-  document.querySelectorAll(".rail-view[data-view]").forEach((button) => {
-    button.addEventListener("click", () => {
-      document.querySelectorAll(".rail-view[data-view]").forEach((b) => b.classList.remove("selected"));
-      button.classList.add("selected");
-      const value = button.getAttribute("data-view");
-      const seg = document.querySelector(`.segmented-control [data-view="${value}"]`);
-      if (seg) seg.click();
-      if (elements.viewModeSelect) elements.viewModeSelect.value = value;
-    });
-  });
-  document.querySelectorAll(".rail-view[data-primary-view], .ghost-action[data-primary-view]").forEach((button) => {
+  document.querySelectorAll(".ghost-action[data-primary-view]").forEach((button) => {
     button.addEventListener("click", () => {
       const view = button.getAttribute("data-primary-view");
       const nav = elements.primaryNav?.querySelector(`[data-primary-view="${view}"]`);
       if (nav) nav.click();
+      else if (["memory", "future", "bench", "activity", "details"].includes(view)) {
+        openInspectorSurface(view);
+      } else if (view === "map" || view === "universe") {
+        showGraphView("universe");
+      }
     });
   });
   const fitBtn = document.querySelector("#action-fit-map");
-  if (fitBtn) fitBtn.addEventListener("click", () => document.querySelector("#graph-fit")?.click());
+  if (fitBtn) {
+    fitBtn.addEventListener("click", () => {
+      showGraphView("universe");
+      fitGraphView();
+    });
+  }
   const refreshAct = document.querySelector("#action-refresh");
   if (refreshAct) refreshAct.addEventListener("click", () => document.querySelector("#refresh-button")?.click());
   const todoAct = document.querySelector("#action-todo");
@@ -7469,35 +7492,23 @@ function bindEvents() {
       const button = event.target.closest("[data-primary-view]");
       if (!button) return;
       const view = button.getAttribute("data-primary-view");
-      for (const item of elements.primaryNav.querySelectorAll("[data-primary-view]")) {
-        item.classList.toggle("selected", item === button);
-      }
-      if (view === "ecosystem") {
-        toast("Ecosystem · project list");
-        return;
-      }
-      if (view === "project") {
-        if (typeof showGraphView === "function") showGraphView("universe");
-        else if (document.querySelector('[data-view="universe"]')) {
-          document.querySelector('[data-view="universe"]').click();
+      // Graph surfaces (single place — not also on left rail / toolbar).
+      if (view === "map" || view === "network" || view === "project" || view === "ecosystem") {
+        showGraphView("universe");
+        if (view === "ecosystem") {
+          // Project list lives in the left rail — just focus map + list context.
+          elements.projectList?.focus?.();
         }
-        toast("Project topology");
         return;
       }
-      if (view === "network") {
-        toast("Network peer map is a later surface (placeholder)");
+      if (view === "timeline" || view === "documents") {
+        showGraphView(view);
         return;
       }
-      const tabMap = {
-        experience: "bench",
-        memory: "memory",
-        future: "future",
-        bench: "bench",
-      };
-      const tab = tabMap[view];
-      if (tab && typeof showInspectorTab === "function") {
-        document.body.classList.add("inspector-open");
-        showInspectorTab(tab);
+      // Project-context panels live only in the inspector.
+      if (["memory", "future", "bench", "activity", "details"].includes(view)) {
+        openInspectorSurface(view);
+        return;
       }
     });
   }
@@ -7632,37 +7643,29 @@ refreshLawStrip = function () {
     button.addEventListener("click", () => button.closest("dialog").close());
   }
 
-  for (const button of document.querySelectorAll("[data-view]")) {
+  // Graph mode lives on top primary nav (showGraphView). Legacy [data-view]
+  // controls were removed to stop Map/Timeline/Memory duplicates.
+  document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.view = button.dataset.view;
-      for (const candidate of document.querySelectorAll("[data-view]")) {
-        candidate.classList.toggle(
-          "selected",
-          candidate.dataset.view === button.dataset.view
-        );
-      }
-      if (elements.viewModeSelect) {
-        elements.viewModeSelect.value = button.dataset.view;
-      }
-      state.selectedNode = null;
-      state.focusedNodeId = null;
-      elements.nodeBreadcrumb.classList.add("hidden");
-      buildGraph();
-      renderDetails();
+      showGraphView(button.dataset.view);
     });
-  }
-  // Boot on Multiverse Map so Universe hub is visible without an extra click.
-  if (elements.viewModeSelect) {
-    elements.viewModeSelect.value = state.view;
-  }
-  document.querySelectorAll("[data-view]").forEach((candidate) => {
-    candidate.classList.toggle(
-      "selected",
-      candidate.dataset.view === state.view
-    );
   });
+  syncPrimaryNavSelection(
+    state.view === "universe" ? "map" : state.view
+  );
   for (const button of document.querySelectorAll("[data-tab]")) {
-    button.addEventListener("click", () => showInspectorTab(button.dataset.tab));
+    button.addEventListener("click", () => {
+      const tab = button.dataset.tab;
+      showInspectorTab(tab);
+      // Keep top nav in sync when switching inspector tabs from the panel itself.
+      if (["memory", "future", "bench"].includes(tab)) {
+        syncPrimaryNavSelection(tab);
+      } else if (state.view === "universe") {
+        syncPrimaryNavSelection("map");
+      } else if (state.view === "timeline" || state.view === "documents") {
+        syncPrimaryNavSelection(state.view);
+      }
+    });
   }
   elements.canvas.addEventListener("click", selectGraphNode);
   elements.canvas.addEventListener("pointerdown", (event) => {
