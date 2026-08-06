@@ -6,17 +6,14 @@
 
 | 구분 | 역할 |
 |------|------|
-| **Todo 보드 (`project_todo`)** | **정본 작업 큐.** 프로젝트 스코프 + `detail`에 문서 경로 연결 |
+| **Universe Todo (`project_todo`)** | **호스트 실행·운영 큐** (Universe가 돌리거나 관찰할 일). 제품 백로그 대체 아님 |
+| **프로젝트 자체 보드** | 제품 엔지니어링 일 — 유지 가능 (Issues, next_actions 등) |
 | **이 마크다운 워크리스트** | **이력·구현 수준 스냅샷 / 인덱스.** 일상 진행 추적용 아님 |
-| **Seed worklist 버튼** | **제거됨** (GCS 고정 템플릿이 전 프로젝트에 복제되던 경로). 항목은 Todo로 직접 추가 |
+| **Seed worklist 버튼** | **제거됨**. 호스트 큐 항목은 Todo로 직접 추가 |
 
-열린 일은 UI Todo(또는 `GET /v1/todos`)에 넣고, 관련 문서는 `detail`에 경로로 적는다.  
-예: `docs/universe-install-mode.md`, `docs/universe-packaging.md`.  
-(정식 `document_ref` 필드는 후속; 현재는 detail 링크.)
-
-**전 프로젝트 심기:** `.ai/universe/TODO_TRACKING_POLICY.md`  
-정본: `docs/universe-todo-tracking-policy.md`  
-(마크다운 backlog 상태 추적 금지 → DB Todo + 문서 참조만.)
+호스트 쪽 열린 일은 UI Todo(또는 `GET /v1/todos`) + `detail`에 문서 경로.  
+제품 일은 프로젝트 보드. 정책 plant: `.ai/universe/TODO_TRACKING_POLICY.md`  
+(Career 배포; 정본 설명 `docs/universe-todo-tracking-policy.md`).
 
 universe 프로젝트 시드 예: install_mode 구현 Todo, packaging/E2E/Memory/Bench 등.
 
