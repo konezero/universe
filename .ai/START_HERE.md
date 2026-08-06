@@ -42,9 +42,13 @@ gate, authority, or assignment state.
 
 ## Mutation Entry
 
-Before every durable mutation, execute
+Before every **project-owned** durable mutation, execute
 `.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
 Current Anchor do not replace the required Guard result and receipt.
+Runtime-owned state, `HOST_STATE_PROJECTION`, handoff evidence, and
+automatic continuity do **not** use Guard; see
+`.ai/skills/common/host-state-projection/SKILL.md` and the
+Runtime-Owned State Exception in execution-guard.
 For one exact, single-occurrence repository text replacement on an
 existing file, prefer
 `.ai/skills/common/receipt-aware-text-edit/SKILL.md`; that Skill
@@ -55,10 +59,10 @@ validated work remain outside the Runtime. Their immutable commit SHA
 may be appended to the approved Task Proposal's Result Receipt and
 never creates Runtime authority, Binding, or an execution receipt.
 
-For a new mutation request, first follow
+For a new **project-owned** mutation request, first follow
 `.ai/skills/common/task-assignment/SKILL.md`, then bind exact approval
 through `.ai/skills/common/execution-binding/SKILL.md`. Neither step
-replaces the final Guard.
+replaces the final Guard for that class of work.
 
 ## Task Worker Entry
 

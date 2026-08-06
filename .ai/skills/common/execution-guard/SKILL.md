@@ -53,7 +53,9 @@ not create Runtime authority or execution evidence.
 
 ## Runtime-Owned State Exception
 
-Do not invoke this Skill for a Runtime's declared operational-state route:
+Do not invoke this Skill for a Runtime's declared operational-state route.
+These are **continuity and bookkeeping**, not project mutation. They must not
+require Task Assignment, approval, or a Mutation Receipt.
 
 ```text
 SNAPSHOT_SAVE / CHECKPOINT
@@ -61,13 +63,39 @@ MEMORY_SYNC
 runtime-owned Inbox or Queue transition
 RESUME_SAVE
 selected RESUME restore / Current Anchor realignment
+MODE_CHANGE / prepare-session Mode Anchor store update
+HOST_STATE_PROJECTION
+  (Mode Anchor SQLite -> .ai/runtime/state/session.md
+   and current_anchor_frame.md companion projection)
+session / provider observation under .ai/runtime/state/ or .ai/runtime/tmp/
+SESSION_HANDOFF evidence
+  (previous_session_id -> current_session_id, handoff inbox metadata,
+   Runtime-owned HANDOFF_APPEND on declared handoff paths)
+automatic continuity flush (checkpoint + resume-save lifecycle)
 ```
 
-These operations are governed by their persistence, provenance, selection, and
-currentness contracts instead. The exception is shared by ai-career and
-installed project Runtimes and applies only to declared Runtime state paths. It
-never covers Core, source, templates, configuration, external systems, or a
-project-owned artifact merely because it is mentioned by a Runtime command.
+These operations are governed by their persistence, provenance, selection,
+projection, and currentness contracts instead. The exception is shared by
+ai-career and installed project Runtimes and applies only to declared Runtime
+state paths and Host-owned projection of Mode Anchor / session coordinates.
+
+Rules for this exception:
+
+```text
+Host or declared Runtime route only
+fixed paths and fixed fields (no free-form agent patch of arbitrary files)
+projection and handoff evidence never create Authority, Write Scope,
+  Execution Assignment, or final execution permission
+SQLite Mode Anchor / continuity store remains the operational truth where
+  both SQLite and markdown companions exist
+markdown companions may be stale without failing Mode transition
+```
+
+It never covers Core, source, templates, configuration, external systems, or a
+project-owned product artifact merely because it is mentioned by a Runtime
+command. An agent free-form edit of `session.md` that invents mode, authority,
+or assignment claims is not this exception; that is unclassified durable
+mutation and still requires this Guard.
 
 ## Check
 
@@ -136,6 +164,14 @@ approved the Sub's concrete target. The Guard permits the concrete target only
 when it is inside the Parent Write Scope and exactly present in the Boss
 allocation. The resulting receipt seals the verified lineage and its digest.
 
+When `task_frame_lineage.status` is `VERIFIED`, the `approval.operation`,
+`approval.target`, `approval.boundary`, and `approval.evidence_ref` fields
+describe the Parent Frame-level Assignment. They are not a second approval for
+the concrete file named by the Sub request. The concrete operation and target
+are checked separately against the verified Parent Write Scope and the
+Runtime-recorded Boss allocation. A template or envelope `target` must not be
+read as permission to mutate that file when it conflicts with the Assignment.
+
 `payload_sha256` binds create/modify permission to the exact bytes. The target
 preimage binds modify/delete permission to the exact file observed before the
 check. Re-read the target immediately before submission; do not infer either
@@ -190,6 +226,13 @@ The consume envelope adds:
   "content_base64": "<exact-bytes-or-empty-for-delete>"
 }
 ```
+
+Read the receipt only from the exact raw result path
+`result["permit_receipt"]["receipt_id"]`. Do not fall back to keys such as
+`receipt`, `result`, or a guessed provider-specific field. The Host issues a
+30-second receipt by default; it is one-time and process-local, so check and
+consume it immediately without serializing it through a later proposal or
+batch step.
 
 `execution-guard consume` remains the thin receipt-consumption surface for a
 Host that already provides its own attested pre-write hook. It does not perform

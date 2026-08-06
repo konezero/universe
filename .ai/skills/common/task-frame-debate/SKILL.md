@@ -139,6 +139,20 @@ Boss envelope produces a Result Packet candidate; it is not Parent adoption. A
 caller may reduce the reviewer count before approval when Host capability or
 scope requires it, but must not add undeclared turns after execution begins.
 
+### Sequential Activation Invariant
+
+`declare_turns` records every approved turn but makes only the single root
+turn `READY`. After the Boss records the complete allocation set,
+`submit_boss_allocations` makes only the first declared Sub `READY`. Later
+Sub turns remain `DECLARED` until the dependency route releases them after the
+preceding Sub result is recorded. This is the supported activation model for
+the default profile.
+
+Do not declare sibling-only parallel reviewers and expect the Host to choose an
+order. Parallel activation requires an explicit Runtime-supported dependency
+route; otherwise the frame is blocked as ambiguous. If a reviewer must be
+removed, change the execution plan before approval and create a new proposal.
+
 ## Parent Instruction Ledger
 
 Before declaring turns, the Parent must append the user's instruction unchanged
@@ -237,7 +251,7 @@ fabricate a Worker Result Envelope and do not create a replacement Frame. Once
 the Runtime returns the turn to `READY`, obtain a fresh invocation plan and
 claim it with a new actor/run pair. The retired run must not be resumed.
 
-Create the approved frame once through the file-backed Task Frame CLI, then
+Create the approved frame once through the Host-owned Task Frame registry, then
 submit each transition through `task-frame continue` against the same database:
 
 ```text
@@ -256,6 +270,15 @@ receipts, and returned envelopes across CLI calls. It must never refresh or
 mutate the Mode Current Anchor. The Parent may query `task-frame status`
 without taking a Worker role.
 
+The SQLite file is a durable journal, not proof that the active Host owns the
+Frame. A mutation-capable frame must first be created or registered through the
+selected Host's `/v1/task-frame/create` surface and then reopened with the same
+Frame identity and database. Direct `--database` creation is suitable for
+read-only inspection or local coordination only when Host ownership is not
+required. If the Guard cannot find the Frame in its Host registry, the result
+is `TASK_FRAME_MUTATION_FRAME_NOT_FOUND`; do not create a replacement SQLite
+file to bypass that result.
+
 The Parent must not call `complete_turn`, request or claim a Sub turn,
 reconstruct a Worker envelope, shorten returned text, or replace Worker result
 fields. It may record user constraints, invoke the root Boss, poll status,
@@ -268,6 +291,21 @@ If the Host lacks Worker invocation, keep `worker_invocation: UNKNOWN` and stop
 before inventing results. After completion, return the Result Packet to the
 current Parent as `CANDIDATE`. External mutation still requires assignment,
 binding, execution guard, and a receipt-aware mutation path.
+
+### Interrupted Batch Recovery
+
+Workers and their parent process may be interrupted by provider quota,
+platform shutdown, or a Host restart. A bounded batch must therefore persist
+its result envelope, evidence reference, and any completed Git commit evidence
+before waiting for the next batch. Return incremental envelopes; do not hold
+all batch output in volatile process memory.
+
+On resume, reopen the existing Host-owned Frame and reuse its proposal,
+approval, Assignment, Binding, and current coordinates. A failed run is
+retired and must receive a new Worker actor and run reference, but a restart
+must not recreate the Frame or invent a new proposal from a new wall-clock
+timestamp. Push remains a separate final publication step unless explicitly
+requested; intermediate commits are evidence, not a new Runtime authority.
 
 For a write-capable Frame, obtain and bind the Parent's Frame-level Assignment
 and Write Scope before invoking the Boss. Immediately before each Sub mutation,

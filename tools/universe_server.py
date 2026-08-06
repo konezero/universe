@@ -270,6 +270,11 @@ DEFAULT_REFS = {
     "anchor_store": ".ai/runtime/anchor_store",
     "master_inbox": ".ai/inbox/MASTER",
 }
+NETWORK_ANCHOR_ROLES = frozenset(
+    {"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR"}
+)
+# Prefer first existing sibling folder name for Career source.
+CAREER_ROOT_CANDIDATES = ("ai-career", "career")
 DOCUMENT_ROLES = frozenset(
     {
         "ARCHITECTURE",
@@ -971,11 +976,121 @@ def _project_file_ref(project_root: Path, value: Any, field: str) -> dict[str, s
     return normalized
 
 
+def _registration_network_role(metadata: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    role = str(metadata.get("network_role") or "").strip().upper()
+    if role in NETWORK_ANCHOR_ROLES:
+        return role
+    return None
+
+
+def _resolve_registration_manifest_rel(
+    project_root: Path,
+    *,
+    preferred: str,
+    network_role: str | None,
+) -> str:
+    preferred_path = project_root / preferred
+    if preferred_path.is_file():
+        return preferred
+    if network_role is None:
+        raise UniverseError(
+            "PROJECT_MANIFEST_UNAVAILABLE",
+            f"manifest does not exist: {preferred}",
+        )
+    # Network anchors (Universe home / Career source) may use alternate
+    # identity files when REPOSITORY_MANIFEST.md is not published yet.
+    for candidate in (
+        "REPOSITORY_MANIFEST.md",
+        "VERSION_MANIFEST.md",
+        "AGENTS.md",
+        "README.md",
+    ):
+        if (project_root / candidate).is_file():
+            return candidate
+    raise UniverseError(
+        "PROJECT_MANIFEST_UNAVAILABLE",
+        "network anchor root has no identity manifest/README",
+    )
+
+
+def discover_network_anchor_candidates(
+    *,
+    universe_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Built-in multiverse nodes: this Universe repo + sibling Career source."""
+    home = (universe_root or Path(__file__).resolve().parents[1]).expanduser()
+    home = home.resolve()
+    candidates: list[dict[str, Any]] = [
+        {
+            "project_id": "universe",
+            "project_root": home,
+            "metadata": {
+                "network_role": "UNIVERSE_HOME",
+                "display_name": "Universe",
+                "label": "Universe home",
+            },
+        }
+    ]
+    parent = home.parent
+    for folder in CAREER_ROOT_CANDIDATES:
+        career_root = (parent / folder).resolve()
+        if not career_root.is_dir():
+            continue
+        # Registry owner is usually "ai-career"; prefer that id when folder matches.
+        project_id = "ai-career" if folder == "ai-career" else "career"
+        candidates.append(
+            {
+                "project_id": project_id,
+                "project_root": career_root,
+                "metadata": {
+                    "network_role": "CAREER_SOURCE",
+                    "display_name": "Career",
+                    "label": "ai-career source",
+                },
+            }
+        )
+        break
+    return candidates
+
+
+def ensure_network_anchor_projects(
+    store: "UniverseStore",
+    *,
+    universe_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Idempotently attach Universe + Career as project nodes when roots exist."""
+    ensured: list[dict[str, Any]] = []
+    for candidate in discover_network_anchor_candidates(universe_root=universe_root):
+        root = Path(candidate["project_root"])
+        if not root.is_dir():
+            continue
+        try:
+            project, _created = store.register_project(
+                {
+                    "project_id": candidate["project_id"],
+                    "project_root": str(root),
+                    "metadata": dict(candidate.get("metadata") or {}),
+                }
+            )
+            ensured.append(project)
+        except UniverseError:
+            # Skip unreadable / mismatched roots; do not block the service.
+            continue
+    return ensured
+
+
 def normalize_registration(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UniverseError("REQUEST_INVALID", "registration body must be an object")
     project_id = _project_id(value.get("project_id"))
     project_root = _canonical_project_root(value.get("project_root"))
+
+    metadata = value.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise UniverseError("PROJECT_METADATA_INVALID", "metadata must be an object")
+    network_role = _registration_network_role(metadata)
 
     refs_value = value.get("refs", DEFAULT_REFS)
     if not isinstance(refs_value, dict):
@@ -986,10 +1101,26 @@ def normalize_registration(value: Any) -> dict[str, Any]:
             "PROJECT_REFS_INVALID",
             f"unsupported refs: {', '.join(sorted(unknown_refs))}",
         )
+    # Resolve manifest first so network anchors can substitute identity files.
+    preferred_manifest = str(
+        refs_value.get("manifest", DEFAULT_REFS["manifest"]) or DEFAULT_REFS["manifest"]
+    )
+    manifest_rel = _resolve_registration_manifest_rel(
+        project_root,
+        preferred=preferred_manifest,
+        network_role=network_role,
+    )
+    refs_merged = dict(DEFAULT_REFS)
+    refs_merged.update(
+        {key: refs_value[key] for key in refs_value if key in ALLOWED_REF_KEYS}
+    )
+    refs_merged["manifest"] = manifest_rel
     refs = {
-        key: _relative_ref(project_root, refs_value.get(key, default), key)
+        key: _relative_ref(project_root, refs_merged.get(key, default), key)
         for key, default in DEFAULT_REFS.items()
     }
+    # Re-bind manifest after relative normalization for substituted names.
+    refs["manifest"] = _relative_ref(project_root, manifest_rel, "manifest")
     manifest_path = project_root / refs["manifest"]
     if not manifest_path.is_file():
         raise UniverseError(
@@ -1010,10 +1141,11 @@ def normalize_registration(value: Any) -> dict[str, Any]:
                 "project_id does not match Mode Registry owner",
                 HTTPStatus.CONFLICT,
             )
+    elif network_role is None:
+        # Ordinary projects keep existing strictness via manifest only;
+        # missing registry is allowed today if file absent.
+        pass
 
-    metadata = value.get("metadata", {})
-    if not isinstance(metadata, dict):
-        raise UniverseError("PROJECT_METADATA_INVALID", "metadata must be an object")
     return {
         "schema": PROJECT_SCHEMA,
         "project_id": project_id,
@@ -11046,6 +11178,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.project_room_events = ProjectRoomEventHub()
         self.multi_rooms = MultiRoomStore(str(store.database_path))
         self.conductor_permissions = ConductorPermissionBridge()
+        # Multiverse rail: Universe home + Career source as project nodes.
+        try:
+            ensure_network_anchor_projects(
+                self.store,
+                universe_root=Path(__file__).resolve().parents[1],
+            )
+        except UniverseError:
+            # Never block service boot on optional network anchors.
+            pass
         super().__init__(address, UniverseRequestHandler)
         self.conductor_session_host = (
             ResidentModeSessionHost(
@@ -11144,9 +11285,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._supervisor_maintenance_worker.start()
         self.rendezvous_service: UniverseRendezvousService | None = None
         self._rendezvous_start_error: dict[str, str] | None = None
+        self._remote_access_resume: dict[str, Any] | None = None
         self._maybe_start_rendezvous()
+        # Resume saved remote gateway/tunnel after reboot without blocking serve.
+        threading.Thread(
+            target=self._resume_remote_access_background,
+            name="universe-remote-access-resume",
+            daemon=True,
+        ).start()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
+
+    def _resume_remote_access_background(self) -> None:
+        try:
+            # Let server.json settle (upstream for gateway).
+            time.sleep(1.2)
+            self._remote_access_resume = self.maybe_resume_remote_access()
+        except Exception as error:  # noqa: BLE001 - never kill service for tunnel
+            self._remote_access_resume = {
+                "status": "REMOTE_ACCESS_RESUME_FAILED",
+                "error_code": "REMOTE_ACCESS_RESUME_EXCEPTION",
+                "detail": f"{type(error).__name__}: {error}",
+            }
 
     def _loopback_endpoint_url(self) -> str:
         host, port = self.server_address[:2]
@@ -11300,11 +11460,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             config_path=self.remote_connector_config_path,
         )
         snapshot = self.store.remote_access.snapshot()
+        # Surface last resume outcome + saved public URL when offline so UI is not empty.
+        resume = self._remote_access_resume
+        if (
+            gateway.get("status") == "OFFLINE"
+            and isinstance(connector.get("configuration"), Mapping)
+        ):
+            public = str(
+                connector["configuration"].get("public_base_url") or ""
+            ).strip()
+            if public and not gateway.get("public_base_url"):
+                gateway = {
+                    **gateway,
+                    "public_base_url": public,
+                    "saved_configuration": True,
+                }
         return {
             **snapshot,
             "status": "REMOTE_ACCESS_STATUS_COLLECTED",
             "gateway": gateway,
             "connector": connector,
+            "resume": resume,
         }
 
     def start_remote_access(self, value: Any) -> dict[str, Any]:
@@ -11373,39 +11549,70 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 public_base_url=public_base_url,
                 python_executable=python_tool.executable,
             )
-            connector = {"status": "OFFLINE"}
+            connector: dict[str, Any] = {"status": "OFFLINE"}
             if transport_kind == "SSH_REVERSE_TUNNEL":
                 ssh_tool = self.host_profile.resolve("ssh")
                 if ssh_tool is None:
-                    raise RemoteConnectorError(
-                        "REMOTE_CONNECTOR_SSH_UNAVAILABLE",
-                        "verified native ssh.exe is required for Internet access",
-                        HTTPStatus.CONFLICT,
+                    # Keep gateway so Settings still shows a live local proxy.
+                    gateway.pop("control_token", None)
+                    return {
+                        "schema": API_SCHEMA,
+                        "status": "REMOTE_ACCESS_PARTIAL",
+                        "gateway": gateway,
+                        "connector": {
+                            "status": "FAILED",
+                            "error_code": "REMOTE_CONNECTOR_SSH_UNAVAILABLE",
+                            "detail": "verified native ssh.exe is required for Internet access",
+                        },
+                    }
+                try:
+                    connector = start_connector(
+                        config=value,
+                        gateway_endpoint=str(gateway["control_endpoint"]),
+                        ssh_executable=ssh_tool.executable,
+                        python_executable=python_tool.executable,
+                        state_path=self.remote_connector_state_path,
+                        config_path=self.remote_connector_config_path,
                     )
-                connector = start_connector(
-                    config=value,
-                    gateway_endpoint=str(gateway["control_endpoint"]),
-                    ssh_executable=ssh_tool.executable,
-                    python_executable=python_tool.executable,
-                    state_path=self.remote_connector_state_path,
-                    config_path=self.remote_connector_config_path,
-                )
+                except RemoteConnectorError as error:
+                    gateway.pop("control_token", None)
+                    return {
+                        "schema": API_SCHEMA,
+                        "status": "REMOTE_ACCESS_PARTIAL",
+                        "gateway": gateway,
+                        "connector": {
+                            "status": "FAILED",
+                            "error_code": error.code,
+                            "detail": error.detail,
+                            "configuration": value,
+                        },
+                    }
                 if connector.get("status") != "READY":
-                    stop_gateway(self.remote_gateway_state_path)
-                    raise RemoteConnectorError(
-                        "REMOTE_CONNECTOR_START_FAILED",
-                        "SSH connector did not become ready",
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                    )
+                    gateway.pop("control_token", None)
+                    return {
+                        "schema": API_SCHEMA,
+                        "status": "REMOTE_ACCESS_PARTIAL",
+                        "gateway": gateway,
+                        "connector": {
+                            **dict(connector),
+                            "status": str(connector.get("status") or "FAILED"),
+                            "error_code": "REMOTE_CONNECTOR_START_FAILED",
+                            "detail": (
+                                "SSH connector did not become ready "
+                                "(often remote port already in use; check remote-ssh.log)"
+                            ),
+                            "configuration": value,
+                        },
+                    }
         except (
             OSError,
             GatewayError,
             RemoteAccessError,
             RemoteConnectorError,
         ) as error:
-            if transport_kind == "SSH_REVERSE_TUNNEL":
-                stop_connector(self.remote_connector_state_path)
-                stop_gateway(self.remote_gateway_state_path)
+            # Gateway itself failed — full stop.
+            stop_connector(self.remote_connector_state_path)
+            stop_gateway(self.remote_gateway_state_path)
             raise UniverseError(
                 getattr(error, "code", "REMOTE_GATEWAY_START_FAILED"),
                 getattr(error, "detail", str(error)),
@@ -11418,6 +11625,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "gateway": gateway,
             "connector": connector,
         }
+
+    def maybe_resume_remote_access(self) -> dict[str, Any] | None:
+        """Best-effort restore saved Internet/LAN remote access after service boot."""
+        if not self.remote_connector_config_path.is_file():
+            return None
+        existing = gateway_status(self.remote_gateway_state_path)
+        if existing.get("status") in {"READY", "HOST_OFFLINE"}:
+            return {
+                "status": "REMOTE_ACCESS_ALREADY_RUNNING",
+                "gateway": existing,
+            }
+        try:
+            return self.start_remote_access({"transport_kind": "SAVED"})
+        except UniverseError as error:
+            return {
+                "status": "REMOTE_ACCESS_RESUME_FAILED",
+                "error_code": error.code,
+                "detail": error.detail,
+            }
 
     def stop_remote_access(self) -> dict[str, Any]:
         connector = stop_connector(self.remote_connector_state_path)
@@ -12085,12 +12311,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         continuity_by_project = {
             str(item.get("project_id") or ""): item for item in continuity
         }
+        projects_by_id = {
+            str(item.get("project_id") or ""): item
+            for item in self.store.list_projects()
+        }
         enriched: list[dict[str, Any]] = []
         for session in sessions:
             enriched.append(
                 self._session_observatory_card(
                     session,
                     continuity_by_project=continuity_by_project,
+                    projects_by_id=projects_by_id,
                 )
             )
         return {
@@ -12120,6 +12351,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         session: Mapping[str, Any],
         *,
         continuity_by_project: Mapping[str, Mapping[str, Any]],
+        projects_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Add last-activity + short chat preview for Observatory disambiguation."""
         card = dict(session)
@@ -12128,6 +12360,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         lease_at = str((lease or {}).get("updated_at") or "") or None
         updated_at = str(session.get("updated_at") or "") or None
         created_at = str(session.get("created_at") or "") or None
+        projects = projects_by_id or {}
+        bound_project = projects.get(node) if node else None
+        if isinstance(bound_project, Mapping):
+            card["project_bound"] = True
+            card["project_root"] = bound_project.get("project_root")
+            card["project_display_name"] = (
+                (bound_project.get("metadata") or {}).get("display_name")
+                if isinstance(bound_project.get("metadata"), Mapping)
+                else None
+            ) or bound_project.get("project_id")
+            card["project_network_role"] = (
+                (bound_project.get("metadata") or {}).get("network_role")
+                if isinstance(bound_project.get("metadata"), Mapping)
+                else None
+            )
+        else:
+            card["project_bound"] = False
+            card["project_root"] = None
+            card["project_display_name"] = None
+            card["project_network_role"] = None
+            # CONDUCTOR node is the app Mode session, not a registered project root.
+            if node.upper() == "CONDUCTOR":
+                card["project_bind_note"] = "CONDUCTOR mode session (not a project root)"
+            elif node:
+                card["project_bind_note"] = f"no registered project for node={node}"
+            else:
+                card["project_bind_note"] = "node empty"
 
         # Strict session match only — never share one project transcript across
         # sibling sessions that only share node/mode.
@@ -13221,6 +13480,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send_error(error)
             return
         if path == "/v1/projects":
+            try:
+                ensure_network_anchor_projects(
+                    self.server.store,
+                    universe_root=Path(__file__).resolve().parents[1],
+                )
+            except UniverseError:
+                pass
             self._send(
                 HTTPStatus.OK,
                 {
@@ -13683,6 +13949,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         )
         if (
             path == "/v1/supervisor/sessions"
+            or path == "/v1/supervisor/sessions/cleanup"
             or privileged_supervisor_match is not None
         ) and not self._authorize_supervisor_control():
             return
@@ -13714,6 +13981,45 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "SUPERVISOR_SESSION_ALREADY_REGISTERED"
                         ),
                         "session": session,
+                    },
+                )
+                return
+            if path == "/v1/supervisor/sessions/cleanup":
+                # Optional body: { "keep_live_only": true } (default)
+                payload = body if isinstance(body, Mapping) else {}
+                keep_live_only = payload.get("keep_live_only", True)
+                if keep_live_only is False:
+                    keep_states = frozenset(
+                        {
+                            str(item).upper()
+                            for item in (payload.get("keep_states") or [])
+                            if str(item).strip()
+                        }
+                    )
+                    if not keep_states:
+                        keep_states = frozenset({"LIVE", "STARTING"})
+                else:
+                    keep_states = frozenset({"LIVE", "STARTING"})
+                # Always sweep zombie LIVE first so dead PIDs can be purged.
+                try:
+                    sweep = self.server.session_supervisor.sweep_stale_live_sessions()
+                except SessionSupervisorError as error:
+                    sweep = {
+                        "status": "LIVE_SESSION_SWEEP_FAILED",
+                        "error_code": error.code,
+                        "detail": str(error),
+                    }
+                result = self.server.session_supervisor.purge_inactive_sessions(
+                    keep_states=keep_states,
+                    include_unknown=bool(payload.get("include_unknown", True)),
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SUPERVISOR_SESSIONS_CLEANED",
+                        "live_session_sweep": sweep,
+                        "cleanup": result,
                     },
                 )
                 return
@@ -15713,9 +16019,14 @@ def perform_session_ref_inject(
         provider=normalized_provider,
         provider_session_ref=normalized_ref,
     )
-    normalized_alias = str(body.get("alias") or "").strip() or (
-        f"{normalized_node} {normalized_mode} | {normalized_provider}"
-    )
+    if str(body.get("alias") or "").strip():
+        normalized_alias = str(body.get("alias")).strip()
+    elif normalized_node == normalized_mode:
+        normalized_alias = f"{normalized_node} | {normalized_provider}"
+    else:
+        normalized_alias = (
+            f"{normalized_node} {normalized_mode} | {normalized_provider}"
+        )
     make_default_raw = body.get("make_default")
     if make_default_raw is None:
         make_default = slot_role == "MASTER" and room_type == "PROJECT"
@@ -15823,9 +16134,14 @@ def attach_supervisor_session(
         provider=normalized_provider,
         provider_session_ref=normalized_ref,
     )
-    normalized_alias = str(alias or "").strip() or (
-        f"{normalized_node} {normalized_mode} | {normalized_provider}"
-    )
+    if str(alias or "").strip():
+        normalized_alias = str(alias).strip()
+    elif normalized_node == normalized_mode:
+        normalized_alias = f"{normalized_node} | {normalized_provider}"
+    else:
+        normalized_alias = (
+            f"{normalized_node} {normalized_mode} | {normalized_provider}"
+        )
     profile = local_connection_profile(endpoint)
     supervisor_transport = HttpUniverseTransport(
         profile,

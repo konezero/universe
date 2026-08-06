@@ -93,44 +93,33 @@ an executable-runtime start proposal instead of silently ending at governance
 preparation. The Host still waits for approval, then re-evaluates with the
 required executable Task and Evidence profiles before starting the executor.
 
-A process-local transition proposal may remain read-only. If the transition is
-persisted to session files, an Anchor surface, a database, or another durable
-target, execute `.ai/skills/common/execution-guard/SKILL.md` first. A selected
-Mode or Role never supplies the missing Authority, Write Scope, Assignment, or
-approval.
+A process-local transition proposal may remain read-only. When the Host
+persists Mode transition results to the **Runtime-owned** Mode Anchor store,
+session companions under `.ai/runtime/state/`, provider observation, or
+session handoff evidence, that write is `HOST_STATE_PROJECTION` /
+`SESSION_HANDOFF` under the Runtime-owned operational-state exception. Do
+**not** route those writes through Execution Guard, Task Assignment, or a
+Mutation Receipt. See `.ai/skills/common/host-state-projection/SKILL.md` and
+`.ai/skills/common/execution-guard/SKILL.md` (Runtime-Owned State Exception).
 
-## Post-MODE_CHANGE: Universe session-ref inject (product)
+A selected Mode or Role never supplies Authority, Write Scope, Assignment, or
+approval for **project-owned** source, Core, templates, configuration, or
+external systems. Those still require Execution Guard.
 
-After Registry resolution succeeds and the Host knows (or can observe) a
-provider session coordinate, run a **best-effort** Universe inject. This is a
-product continuity step, not governance permission.
+## Post-MODE_CHANGE: Host state projection (continuity)
+
+After Registry resolution and Mode Anchor store update succeed, the Host
+should project Current Mode / Anchor coordinates into companion markdown when
+those files are installed:
 
 ```text
-MODE_CHANGE succeeds
-  -> optional Host observation: provider + session_ref
-  -> python tools/universe_session_inject_hook.py
-       --repo-root <project-root>
-       --trigger mode_change
-       [--provider ...] [--session-ref ...]
-       [--update-session-md]
-  -> Universe OFFLINE / SKIPPED must not fail MODE_CHANGE
+MODE_CHANGE / prepare-session succeeds
+  -> Mode Anchor store is operational truth
+  -> HOST_STATE_PROJECTION (no Guard)
+       .ai/runtime/state/session.md
+       .ai/runtime/state/current_anchor_frame.md
+  -> projection failure must not fail MODE_CHANGE
+  -> companions never create authority
 ```
 
-Rules:
-
-1. Inject only when `provider` + `session_ref` + `project_id` resolve.
-2. Default exit is non-blocking (`SKIPPED` / `OFFLINE` / `INJECTED` all exit 0).
-3. Does **not** create Authority, Execution Assignment, or write scope.
-4. Prefer hook observation under `.ai/runtime/tmp/last_provider_session_observation.json`.
-5. `--update-session-md` may patch `Last Provider*` observation lines only; that
-   is still not authority. Durable governance writes remain Guard-gated.
-
-Harness transport:
-
-- Claude Code: project `.claude/settings.json` `SessionStart` → same hook with
-  `--from-stdin` (reads `session_id`).
-- Codex: env `CODEX_THREAD_ID` + same hook after Mode context is active.
-- Manual / skill: `.ai/skills/common/session-ref-inject/SKILL.md`.
-
-See `tools/universe_session_inject_hook.py` and
-`.ai/skills/common/session-ref-inject/SKILL.md`.
+Manual or Host hook path: `.ai/skills/common/host-state-projection/SKILL.md`.

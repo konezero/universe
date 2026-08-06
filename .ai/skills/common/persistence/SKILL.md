@@ -53,12 +53,16 @@ approved Runtime-owned archive path through `HANDOFF_APPEND`; provider-native
 evidence is required before reporting that export as durable.
 
 Checkpoint, snapshot, memory sync, runtime-owned Inbox/Queue updates,
-`RESUME_SAVE`, and selected `RESUME` restore use the declared Runtime-owned
-operational-state route rather than Execution Guard. They remain bounded by
-their persistence, selection, provenance, and Current Anchor contracts.
+`RESUME_SAVE`, selected `RESUME` restore, automatic continuity flush,
+`SESSION_HANDOFF` evidence, Runtime-owned `HANDOFF_APPEND`, and
+`HOST_STATE_PROJECTION` (Mode Anchor companions under
+`.ai/runtime/state/`) use the declared Runtime-owned operational-state route
+rather than Execution Guard. They remain bounded by their persistence,
+selection, provenance, projection, and Current Anchor contracts. They do not
+create Authority or Execution Assignment.
 
-Any persistence action that writes source, a project-owned artifact, Core,
-configuration, templates, or an external system must instead execute
+Any persistence action that writes source, a project-owned product artifact,
+Core, configuration, templates, or an external system must instead execute
 `.ai/skills/common/execution-guard/SKILL.md` for that exact target. Read-only
 resume discovery does not require a mutation receipt. A prepared payload or
 user request is not evidence of durable completion.

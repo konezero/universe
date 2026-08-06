@@ -64,10 +64,7 @@ Hosts leave executable Runtime fields, endpoint, and Runtime Currentness
 Session image has been loaded. `SESSION_PREPARED` additionally requires
 Registry-backed Mode/Role/Scope/Profile resolution and loading that context.
 A Host session reference is optional observation provenance, not a preparation
-precondition. When Mode context is active and a provider session coordinate is
-known, Hosts should best-effort run
-`tools/universe_session_inject_hook.py` (see mode-change and session-ref-inject
-Skills). Universe offline must not block BOOT.
+precondition.
 
 PREPARING_SESSION and REBOOT rehydrate governance context from readable Anchor
 Snapshot evidence. In every source-only Mode, the snapshot is an

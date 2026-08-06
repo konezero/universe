@@ -14,6 +14,21 @@ This is the discoverable `RESUME_SAVE` entrypoint over
 material and saves the exact immutable candidate in the project-local
 continuity store. Saving does not make a Resume record current or authoritative.
 
+## Automatic lifecycle route
+
+Persistent Conductor, Master, and project Mode Sessions are automatically
+flushed through the shared automatic continuity coordinator at stable lifecycle
+events: `TASK_COMPLETED`, `NORMAL_STOP`, `PROVIDER_SWITCH`, `MODE_SWITCH`, and
+debounced `IDLE`. This Host lifecycle route is common to all persistent modes;
+it is not a per-provider or per-mode opt-in.
+
+Task Frame Boss and Worker sessions are ephemeral and do not create persistent
+Mode Resume records. Their Parent persists bounded task state when appropriate.
+
+Automatic flushing is separate from the explicit `RESUME_SAVE` command below.
+It uses the same validators and local SQLite store, but does not imply user
+intent, restore, authority, or Git/archive publication.
+
 ## Command intent (mandatory)
 
 ```text

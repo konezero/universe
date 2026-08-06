@@ -774,9 +774,16 @@ def _prepare_skill_observation(request: Mapping[str, Any]) -> dict[str, Any]:
         "evidence_refs",
         "metrics",
     }
+    optional_fields = {"execution_context"}
     for index, raw_observation in enumerate(raw_observations):
         observation = _required_mapping(raw_observation, f"observations[{index}]")
-        _exact_fields(observation, required_fields, f"observations[{index}]")
+        if not required_fields.issubset(observation) or not set(observation).issubset(
+            required_fields | optional_fields
+        ):
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID",
+                f"observations[{index}] contains invalid fields",
+            )
         observation_digest = _required_text(
             observation.get("observation_digest"),
             f"observations[{index}].observation_digest",
@@ -829,6 +836,59 @@ def _prepare_skill_observation(request: Mapping[str, Any]) -> dict[str, Any]:
             raise ContinuityCommandError(
                 "CONTINUITY_REQUEST_INVALID", "observation metrics are invalid"
             )
+        raw_execution_context = observation.get("execution_context")
+        if raw_execution_context is None:
+            raw_execution_context = {}
+        execution_context = _required_mapping(
+            raw_execution_context, f"observations[{index}].execution_context"
+        )
+        allowed_execution_fields = {
+            "provider_ref",
+            "worker_role",
+            "task_kind",
+            "node_ref",
+            "failure_kind",
+            "quota_state",
+        }
+        if not set(execution_context).issubset(allowed_execution_fields) or not all(
+            isinstance(execution_context.get(field, ""), str)
+            for field in execution_context
+        ):
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID", "observation execution_context is invalid"
+            )
+        failure_kind = str(
+            execution_context.get(
+                "failure_kind", "NONE" if outcome == "SUCCEEDED" else "UNKNOWN"
+            )
+        ).strip().upper()
+        quota_state = str(execution_context.get("quota_state", "UNKNOWN")).strip().upper()
+        if failure_kind not in {
+            "NONE",
+            "PROVIDER_QUOTA",
+            "PROVIDER_ERROR",
+            "VALIDATION",
+            "TIMEOUT",
+            "CANCELLED",
+            "UNKNOWN",
+        } or quota_state not in {"AVAILABLE", "WARNING", "EXHAUSTED", "UNKNOWN"}:
+            raise ContinuityCommandError(
+                "CONTINUITY_REQUEST_INVALID", "observation execution_context is invalid"
+            )
+        normalized_execution_context = {
+            "provider_ref": str(execution_context.get("provider_ref", "")).strip()
+            or "UNKNOWN",
+            "worker_role": str(execution_context.get("worker_role", "")).strip()
+            or "UNKNOWN",
+            "task_kind": str(
+                execution_context.get("task_kind", skill_binding["operation_class"])
+            ).strip()
+            or skill_binding["operation_class"],
+            "node_ref": str(execution_context.get("node_ref", "")).strip()
+            or "UNKNOWN",
+            "failure_kind": failure_kind,
+            "quota_state": quota_state,
+        }
         observations.append(
             {
                 "observation_digest": observation_digest,
@@ -844,6 +904,7 @@ def _prepare_skill_observation(request: Mapping[str, Any]) -> dict[str, Any]:
                 "validation_state": validation_state,
                 "evidence_refs": _source_refs(observation.get("evidence_refs")),
                 "metrics": dict(sorted(metrics.items())),
+                "execution_context": normalized_execution_context,
             }
         )
         seen_digests.add(observation_digest)

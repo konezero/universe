@@ -18,7 +18,9 @@ Time Passage Alone: does not create STALE
 Frame Store: cache, not authority
 Source Authority: immutable Git commit
 
-Mutation Guard: `.ai/skills/common/execution-guard/SKILL.md`
+Project Mutation Guard: `.ai/skills/common/execution-guard/SKILL.md`
+Runtime State / Projection: `.ai/skills/common/host-state-projection/SKILL.md`
+  (no Guard; Mode Anchor store is operational truth for Mode Current)
 Receipt Binding: session_id + frame_id + anchor_id + target + operation
 Receipt Reuse: forbidden
 

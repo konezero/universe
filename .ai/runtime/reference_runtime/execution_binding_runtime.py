@@ -18,6 +18,7 @@ from typing import Any
 
 PROPOSAL_SCHEMA = "ai-career.execution-assignment-proposal.v1"
 BINDING_SCHEMA = "ai-career.execution-binding-result.v1"
+PLATFORM_APPROVAL_EVIDENCE_SCHEMA = "ai-career.platform-approval-evidence.v1"
 INSTRUCTION_RECEIPT_SCHEMA = "ai-career.instruction-receipt.v1"
 WORK_RECEIPT_SCHEMA = "ai-career.project-source-work-receipt.v1"
 MUTATION_OPERATIONS = frozenset({"CREATE", "MODIFY", "DELETE", "MOVE"})
@@ -85,7 +86,6 @@ def build_assignment_proposal(
         "write_operations": operations,
         "task_summary": task_summary,
         "request_ref": request_ref,
-        "proposed_at": proposed_at,
     }
     proposal_id = "assignment_" + _digest(material)[:24]
     return {
@@ -94,6 +94,7 @@ def build_assignment_proposal(
         "assignment_state": "CANDIDATE",
         "proposal_id": proposal_id,
         **material,
+        "proposed_at": proposed_at,
         "approval_required": True,
         "authority_created": False,
         "repository_write": False,
@@ -277,6 +278,11 @@ def apply_execution_binding(
     authority_source_ref = _evidence_ref(
         approval.get("authority_source_ref"), "approval.authority_source_ref"
     )
+    platform_evidence = _platform_approval_evidence(
+        approval.get("platform_approval_evidence"),
+        proposal=normalized_proposal,
+        approval_ref=approval_ref,
+    )
     bound_at = _timestamp(observed_at)
     binding_material = {
         "proposal_id": normalized_proposal["proposal_id"],
@@ -321,6 +327,7 @@ def apply_execution_binding(
         "binding_id": binding_id,
         "proposal_id": normalized_proposal["proposal_id"],
         "approval_ref": approval_ref,
+        **({"platform_approval_evidence": platform_evidence} if platform_evidence else {}),
         **coordinates,
         "bound_at": bound_at,
         "scope": "process-local",
@@ -331,6 +338,7 @@ def apply_execution_binding(
         "binding_id": binding_id,
         "proposal_id": normalized_proposal["proposal_id"],
         "snapshot": bound_snapshot,
+        **({"platform_approval_evidence": platform_evidence} if platform_evidence else {}),
         "authority_created": False,
         "canonical_authority_changed": False,
         "process_local_state_updated": True,
@@ -606,16 +614,87 @@ def _validated_proposal(value: Mapping[str, Any]) -> dict[str, Any]:
             proposal.get("task_summary"), "proposal.task_summary"
         ),
         "request_ref": _required_text(proposal.get("request_ref"), "proposal.request_ref"),
+    }
+    expected_id = "assignment_" + _digest(material)[:24]
+    legacy_id = "assignment_" + _digest(
+        {**material, "proposed_at": proposal["proposed_at"]}
+    )[:24]
+    supplied_id = proposal.get("proposal_id")
+    if supplied_id not in {expected_id, legacy_id}:
+        raise ExecutionBindingError(
+            "EXECUTION_BINDING_PROPOSAL_INVALID", "proposal hash does not match content"
+        )
+    return {
+        "proposal_id": _required_text(supplied_id, "proposal.proposal_id"),
+        **material,
         "proposed_at": _timestamp(
             _required_text(proposal.get("proposed_at"), "proposal.proposed_at")
         ),
     }
-    expected_id = "assignment_" + _digest(material)[:24]
-    if proposal.get("proposal_id") != expected_id:
+
+
+def _platform_approval_evidence(
+    value: Any,
+    *,
+    proposal: Mapping[str, Any],
+    approval_ref: str,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    evidence = dict(_mapping(value, "approval.platform_approval_evidence"))
+    if evidence.get("schema") != PLATFORM_APPROVAL_EVIDENCE_SCHEMA:
         raise ExecutionBindingError(
-            "EXECUTION_BINDING_PROPOSAL_INVALID", "proposal hash does not match content"
+            "EXECUTION_BINDING_APPROVAL_MISMATCH",
+            "platform approval evidence schema is invalid",
         )
-    return {"proposal_id": expected_id, **material}
+    normalized = {
+        "schema": PLATFORM_APPROVAL_EVIDENCE_SCHEMA,
+        "evidence_ref": _evidence_ref(
+            evidence.get("evidence_ref"),
+            "approval.platform_approval_evidence.evidence_ref",
+        ),
+        "provider": _required_text(
+            evidence.get("provider"),
+            "approval.platform_approval_evidence.provider",
+        ).upper(),
+        "request_id": _required_text(
+            evidence.get("request_id"),
+            "approval.platform_approval_evidence.request_id",
+        ),
+        "session_id": _required_text(
+            evidence.get("session_id"),
+            "approval.platform_approval_evidence.session_id",
+        ),
+        "proposal_id": _required_text(
+            evidence.get("proposal_id") or proposal["proposal_id"],
+            "approval.platform_approval_evidence.proposal_id",
+        ),
+        "decision": _required_text(
+            evidence.get("decision"),
+            "approval.platform_approval_evidence.decision",
+        ).upper(),
+    }
+    if normalized["evidence_ref"] != approval_ref:
+        raise ExecutionBindingError(
+            "EXECUTION_BINDING_APPROVAL_MISMATCH",
+            "platform approval evidence does not match approval.evidence_ref",
+        )
+    if normalized["proposal_id"] != proposal["proposal_id"]:
+        raise ExecutionBindingError(
+            "EXECUTION_BINDING_APPROVAL_MISMATCH",
+            "platform approval evidence does not reference the current proposal",
+        )
+    if normalized["session_id"] != proposal["session_id"]:
+        raise ExecutionBindingError(
+            "EXECUTION_BINDING_APPROVAL_MISMATCH",
+            "platform approval evidence session does not match the proposal",
+        )
+    if normalized["decision"] not in {"ALLOW_ONCE", "ALLOW_ALWAYS"}:
+        raise ExecutionBindingError(
+            "EXECUTION_BINDING_APPROVAL_REQUIRED",
+            "platform approval evidence must record an allow decision",
+        )
+    return normalized
 
 
 def _current_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:

@@ -62,6 +62,33 @@ The database, WAL, and shared-memory files are Runtime state and remain outside
 source commits. The installed directory-local `.gitignore` excludes every
 Runtime-created file while keeping the ignore boundary itself managed.
 
+## Automatic Mode Continuity
+
+Automatic continuity is a common rule for every persistent Mode Session:
+
+```text
+Conductor / Master / project Mode
+  -> automatic Checkpoint + Resume flush
+
+Task Frame Boss / Worker
+  -> ephemeral; Parent persists bounded result state
+```
+
+The Host must route these stable lifecycle events through the shared automatic
+coordinator for every persistent mode:
+
+```text
+TASK_COMPLETED | NORMAL_STOP | PROVIDER_SWITCH | MODE_SWITCH | IDLE (debounced)
+```
+
+The Host supplies bounded redacted context and valid runtime coordinates. An
+unknown coordinate produces `AUTO_CONTINUITY_SKIPPED`; it must never be guessed
+or reported as `SAVED`. Duplicate flushes are idempotent by payload digest.
+
+This lifecycle route is separate from the explicit `RESUME_SAVE` command. It
+writes only local Runtime SQLite state and never publishes Git or a Resume
+Archive.
+
 Mobile and web Connectors do not access this store merely by attaching source.
 Without a bound Execution Host, their durable boundary is an approved Provider
 `HANDOFF_APPEND` to a declared Runtime-owned append path.

@@ -377,7 +377,12 @@ class SessionSupervisorStore:
 
     @staticmethod
     def _default_alias(session: Mapping[str, Any]) -> str:
-        return f"{session['node']} {session['mode']} | {session['provider']}"
+        node = str(session["node"])
+        mode = str(session["mode"])
+        provider = str(session["provider"])
+        # Avoid "CONDUCTOR CONDUCTOR | CODEX" when node == mode.
+        head = node if node == mode else f"{node} {mode}"
+        return f"{head} | {provider}"
 
     @staticmethod
     def _event(
@@ -1174,6 +1179,98 @@ class SessionSupervisorStore:
                     """
                 ).fetchall()
             return [self._session_material(connection, row) for row in rows]
+
+    def purge_inactive_sessions(
+        self,
+        *,
+        keep_states: frozenset[str] | None = None,
+        include_unknown: bool = True,
+    ) -> dict[str, Any]:
+        """Delete Supervisor rows that are not actively LIVE/STARTING.
+
+        Keeps only sessions whose state is in keep_states (default LIVE+STARTING).
+        Clears default pointers and leases for removed sessions. Does not kill
+        processes. Mode-change / inject / boot may re-register coordinates.
+        """
+        keep = keep_states or frozenset({"LIVE", "STARTING"})
+        invalid = keep - SESSION_STATES
+        if invalid:
+            raise SessionSupervisorError(
+                "SESSION_STATE_INVALID",
+                f"unsupported keep_states: {', '.join(sorted(invalid))}",
+            )
+        removed: list[dict[str, Any]] = []
+        kept = 0
+        with self._connection(immediate=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT session_id, node, mode, provider, provider_session_ref,
+                       state, alias, updated_at
+                FROM session_record
+                ORDER BY updated_at DESC, session_id
+                """
+            ).fetchall()
+            for row in rows:
+                state = str(row["state"] or "")
+                if state in keep:
+                    kept += 1
+                    continue
+                if not include_unknown and state == "UNKNOWN":
+                    kept += 1
+                    continue
+                session_id = str(row["session_id"])
+                connection.execute(
+                    "DELETE FROM target_default_session WHERE session_id = ?",
+                    (session_id,),
+                )
+                connection.execute(
+                    "DELETE FROM process_lease WHERE session_id = ?",
+                    (session_id,),
+                )
+                connection.execute(
+                    "DELETE FROM session_binding_history WHERE session_id = ?",
+                    (session_id,),
+                )
+                connection.execute(
+                    "DELETE FROM supervisor_event WHERE session_id = ?",
+                    (session_id,),
+                )
+                connection.execute(
+                    "DELETE FROM session_record WHERE session_id = ?",
+                    (session_id,),
+                )
+                removed.append(
+                    {
+                        "session_id": session_id,
+                        "node": row["node"],
+                        "mode": row["mode"],
+                        "provider": row["provider"],
+                        "provider_session_ref": row["provider_session_ref"],
+                        "state": state,
+                        "alias": row["alias"],
+                        "updated_at": row["updated_at"],
+                    }
+                )
+            self._event(
+                connection,
+                session_id=None,
+                event_type="SESSIONS_PURGED_INACTIVE",
+                details={
+                    "removed_count": len(removed),
+                    "kept_count": kept,
+                    "keep_states": sorted(keep),
+                    "include_unknown": include_unknown,
+                },
+            )
+        return {
+            "status": "SESSIONS_PURGED",
+            "removed_count": len(removed),
+            "kept_count": kept,
+            "keep_states": sorted(keep),
+            "removed": removed[:200],
+            "authority": "UNASSIGNED",
+            "execution_assignment": "UNASSIGNED",
+        }
 
     def sweep_stale_live_sessions(self) -> dict[str, Any]:
         """Demote LIVE/STARTING sessions that have no living process.

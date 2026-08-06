@@ -61,6 +61,23 @@ Worker for routing purposes. This includes platform-native sub-agents,
 provider CLIs, model APIs, MCP-backed agents, and local agent processes. The
 transport does not create an exception.
 
+### Activation and Frame Ownership
+
+The default Frame route is sequential. `declare_turns` may declare the full
+approved graph, but only its single root becomes `READY`. After the root Boss
+records all validated allocations, the Host may activate only the first
+dependency-ready Sub. The next Sub becomes `READY` only after the preceding
+route records its terminal result. Sibling reviewers are not an implicit
+parallel queue; an unsupported parallel shape must be rejected as ambiguous
+before invocation.
+
+The active Host owns the mutation-capable Frame registry. A SQLite database
+passed through the CLI is a journal and reopen handle, not independent proof
+of registry ownership. The Host must create or register the Frame through its
+Task Frame API before a mutation-capable transition. A direct file-backed
+Frame that is absent from the Host registry must fail closed with
+`TASK_FRAME_MUTATION_FRAME_NOT_FOUND` rather than being silently adopted.
+
 The Host must not invoke such an agent before a Task Frame has accepted the
 declared turn and returned `WORKER_INVOCATION_READY`. A raw collaboration
 spawn, direct provider CLI call, or equivalent model invocation is not a

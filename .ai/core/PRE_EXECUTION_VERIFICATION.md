@@ -33,7 +33,9 @@ ALWAYS VERIFY IMMEDIATELY BEFORE EXECUTION.
 
 The Execution Guard protects project-owned source, policy, configuration,
 external systems, and unclassified durable targets. It does not gate a
-declared Runtime's own operational-state maintenance:
+declared Runtime's own operational-state maintenance, session continuity, or
+Host state projection. Those are bookkeeping and handoff, not execution
+mutation, and must not require Task Assignment or a Mutation Receipt.
 
 ```text
 SNAPSHOT_SAVE / CHECKPOINT
@@ -41,15 +43,28 @@ MEMORY_SYNC
 runtime-owned Inbox or Queue state transition
 RESUME_SAVE
 selected RESUME restore / Current Anchor realignment
+MODE_CHANGE / prepare-session Mode Anchor store update
+HOST_STATE_PROJECTION
+  (Mode Anchor store -> session.md / current_anchor_frame.md companions)
+session / provider observation under Runtime state or tmp paths
+SESSION_HANDOFF evidence and Runtime-owned HANDOFF_APPEND
+automatic continuity flush (checkpoint + resume-save lifecycle)
 ```
 
 This exception is common to ai-career and installed project Runtimes. It is
-limited to the Runtime's declared state paths and persistence contracts. Such
-operations must preserve their own evidence, provenance, append-only, and
-selection rules; they do not create authority, write scope, or execution
-permission. A write that changes project source, Core policy, templates,
-configuration, or an external system leaves this exception and requires the
-normal Assignment, approval, and Execution Guard route.
+limited to the Runtime's declared state paths, Host-owned projection of Mode
+Anchor and session coordinates, and declared handoff surfaces. Such operations
+must preserve their own evidence, provenance, append-only, and selection rules;
+they do not create authority, write scope, or execution permission.
+
+When both a Mode Anchor store and markdown companions exist, the store is the
+operational truth for Mode Current Anchor. Companions are projections and may
+lag without failing Mode transition. Free-form agent invention of authority or
+mode claims in those files is not this exception.
+
+A write that changes project source, Core policy, templates, configuration, or
+an external system leaves this exception and requires the normal Assignment,
+approval, and Execution Guard route.
 
 ## Placement
 

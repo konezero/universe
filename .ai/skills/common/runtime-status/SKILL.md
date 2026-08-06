@@ -23,6 +23,12 @@ It does not infer one plane from the other. Repository `VERIFIED` does not make
 the Session Runtime `READY`; process-local `CURRENT` does not make repository
 validation pass.
 
+When both a Mode Anchor store and markdown companions under
+`.ai/runtime/state/` exist, prefer the Mode Anchor store for Mode Current
+Anchor fields. Companions are `HOST_STATE_PROJECTION` targets and may lag
+without making Mode transition fail. Refreshing companions is not Guard work;
+see `.ai/skills/common/host-state-projection/SKILL.md`.
+
 ## Invoke
 
 ```text

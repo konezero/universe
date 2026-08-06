@@ -82,9 +82,11 @@ Runtime Image documents remain observed references.
 `.ai/skills/common/anchor-currentness/SKILL.md`.
 `MODE LIST`, `MODE SHOW`, `MODE ADD`, `MODE MODIFY`, and `MODE DELETE`
 follow `.ai/skills/common/master-mode-registry/SKILL.md`.
-Any mutation outside the `OS_INSTALL` / `OS_UPDATE` Host Runtime
-Lifecycle route follows `.ai/skills/common/execution-guard/SKILL.md`
-before a file, shell, API, database, Git, or external write tool runs.
+Any **project-owned** mutation outside the `OS_INSTALL` / `OS_UPDATE`
+Host Runtime Lifecycle route and outside Runtime-owned state /
+`HOST_STATE_PROJECTION` / handoff / continuity follows
+`.ai/skills/common/execution-guard/SKILL.md` before a file, shell,
+API, database, Git, or external write tool runs.
 Exact single-occurrence text replacement on an existing file follows
 `.ai/skills/common/receipt-aware-text-edit/SKILL.md`.
 `STATUS` reads `.ai/runtime/project_instance/status.md`.

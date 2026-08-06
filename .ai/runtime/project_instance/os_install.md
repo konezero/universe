@@ -10,7 +10,7 @@ remain source-bound. Edit project policy outside this block.
 
 Schema: ai-career.project-runtime-install-record.v1
 Source Repository: https://github.com/konezero/ai-career.git
-Source Commit: 8fe4d05d71c270a6dc550f9676c1fc2a33eed5b8
+Source Commit: 9179f4fba1cfad938d1b3464c51c1a2a6819d1ba
 Source Policy: git show from one immutable commit
 Distribution Manifest: `.ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json`
 Installer: `.ai/runtime/tools/project_runtime_installer.py`
@@ -18,9 +18,9 @@ Validation: `.ai/runtime/project_instance/validation/latest.md`
 
 Git Initialization: not performed
 Git Commit: not performed
-Install Host: local-pc
-Install Commander Surface: codex-desktop
-Install Execution Surface: local-codex
+Install Host: local-grok
+Install Commander Surface: grok-cli
+Install Execution Surface: local-grok
 
 Session Runtime: UNKNOWN
 Session Preparation State: UNKNOWN

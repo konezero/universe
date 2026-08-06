@@ -34,6 +34,20 @@ assignment, Mode Current Anchor activation, or executable Runtime currentness.
 changes project source or any non-Runtime-owned target leaves this route and
 requires Execution Guard.
 
+## Common automatic mode route
+
+Every persistent Conductor, Master, and project Mode Session must route stable
+events through the shared automatic continuity coordinator:
+
+```text
+TASK_COMPLETED | NORMAL_STOP | PROVIDER_SWITCH | MODE_SWITCH | IDLE (debounced)
+```
+
+Task Frame Boss/Worker sessions remain ephemeral; their Parent owns any
+automatic persistence of bounded result state. Unknown coordinates fail closed
+as `AUTO_CONTINUITY_SKIPPED`. This automatic route is distinct from an
+explicit `CHECKPOINT` command and never publishes Git or a Resume Archive.
+
 A mobile or web Connector without a bound Execution Host cannot save, list, or
 load this local SQLite store. It may only route a selected handoff artifact to
 `HANDOFF_APPEND` when an approved Provider writer is available.

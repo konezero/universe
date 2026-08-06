@@ -100,6 +100,22 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(SessionSupervisorError, "persistent Mode"):
             self.store.register_session(candidate)
 
+    def test_purge_inactive_keeps_live_only(self) -> None:
+        dead, _ = self.store.register_session(self.session("session-dead"))
+        live_candidate = self.session("session-live")
+        live_candidate["provider_session_ref"] = "provider-session-live"
+        live_candidate["state"] = "LIVE"
+        live, _ = self.store.register_session(live_candidate)
+        self.store.set_default(dead["session_id"], expected_pointer_version=0)
+        result = self.store.purge_inactive_sessions()
+        self.assertEqual("SESSIONS_PURGED", result["status"])
+        self.assertEqual(1, result["removed_count"])
+        self.assertEqual(1, result["kept_count"])
+        remaining = self.store.list_sessions()
+        self.assertEqual(1, len(remaining))
+        self.assertEqual(live["session_id"], remaining[0]["session_id"])
+        self.assertEqual("LIVE", remaining[0]["state"])
+
     def test_registration_is_idempotent_and_identity_conflict_fails(self) -> None:
         first, created = self.store.register_session(self.session())
         second, created_again = self.store.register_session(self.session())

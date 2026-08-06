@@ -2586,6 +2586,7 @@ class TaskFrameRuntime:
             raw_skill_run_observations,
             allocation=self.allocation_snapshot(turn_id),
             result_status=result_status,
+            worker_role=turn["role"],
         )
         if isinstance(skill_observations, str):
             return {"status": skill_observations}
@@ -3821,6 +3822,7 @@ class TaskFrameRuntime:
         *,
         allocation: Mapping[str, Any] | None,
         result_status: str,
+        worker_role: str,
     ) -> list[dict[str, Any]] | str:
         """Accept observed Skill outcomes only for a declared project binding."""
 
@@ -3844,8 +3846,13 @@ class TaskFrameRuntime:
             "evidence_refs",
             "metrics",
         }
+        optional_fields = {"execution_context"}
         for observation in value:
-            if not isinstance(observation, Mapping) or set(observation) != required_fields:
+            if (
+                not isinstance(observation, Mapping)
+                or not required_fields.issubset(observation)
+                or not set(observation).issubset(required_fields | optional_fields)
+            ):
                 return "SKILL_RUN_OBSERVATIONS_INVALID"
             binding_digest = str(observation.get("skill_binding_digest", "")).strip()
             model_ref = str(observation.get("model_ref", "")).strip()
@@ -3875,6 +3882,51 @@ class TaskFrameRuntime:
                 for metric in metrics.values()
             ):
                 return "SKILL_RUN_OBSERVATION_METRICS_INVALID"
+            raw_execution_context = observation.get("execution_context")
+            if raw_execution_context is None:
+                raw_execution_context = {}
+            if not isinstance(raw_execution_context, Mapping) or not set(
+                raw_execution_context
+            ).issubset({"provider_ref", "node_ref", "failure_kind", "quota_state"}):
+                return "SKILL_RUN_OBSERVATION_EXECUTION_CONTEXT_INVALID"
+            if not all(
+                isinstance(raw_execution_context.get(field, ""), str)
+                for field in raw_execution_context
+            ):
+                return "SKILL_RUN_OBSERVATION_EXECUTION_CONTEXT_INVALID"
+            provider_ref = str(raw_execution_context.get("provider_ref", "")).strip()
+            node_ref = str(raw_execution_context.get("node_ref", "")).strip()
+            failure_kind = str(
+                raw_execution_context.get(
+                    "failure_kind", "NONE" if outcome == "SUCCEEDED" else "UNKNOWN"
+                )
+            ).strip().upper()
+            quota_state = str(
+                raw_execution_context.get("quota_state", "UNKNOWN")
+            ).strip().upper()
+            if failure_kind not in {
+                "NONE",
+                "PROVIDER_QUOTA",
+                "PROVIDER_ERROR",
+                "VALIDATION",
+                "TIMEOUT",
+                "CANCELLED",
+                "UNKNOWN",
+            } or quota_state not in {"AVAILABLE", "WARNING", "EXHAUSTED", "UNKNOWN"}:
+                return "SKILL_RUN_OBSERVATION_EXECUTION_CONTEXT_INVALID"
+            if (
+                quota_state == "EXHAUSTED" and failure_kind != "PROVIDER_QUOTA"
+            ) or (outcome == "SUCCEEDED" and failure_kind not in {"NONE", "UNKNOWN"}):
+                return "SKILL_RUN_OBSERVATION_EXECUTION_CONTEXT_INVALID"
+            binding = bindings[binding_digest]
+            execution_context = {
+                "provider_ref": provider_ref or "UNKNOWN",
+                "worker_role": worker_role,
+                "task_kind": str(binding["operation_class"]),
+                "node_ref": node_ref or "UNKNOWN",
+                "failure_kind": failure_kind,
+                "quota_state": quota_state,
+            }
             canonical = {
                 "skill_binding_digest": binding_digest,
                 "model_ref": model_ref,
@@ -3882,6 +3934,7 @@ class TaskFrameRuntime:
                 "validation_state": validation_state,
                 "evidence_refs": list(normalized_evidence),
                 "metrics": dict(sorted(metrics.items())),
+                "execution_context": execution_context,
             }
             normalized.append({
                 **canonical,

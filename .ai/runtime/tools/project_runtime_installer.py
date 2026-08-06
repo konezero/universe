@@ -1720,7 +1720,8 @@ def _render_generated_surface(
             Validation: `.ai/runtime/project_instance/validation/latest.md`
 
             Mutation Entry: `.ai/skills/common/execution-guard/SKILL.md`
-            Mutation Rule: Guard check before every raw write tool
+            Mutation Rule: Guard before project-owned / source / external mutation; Runtime-owned state, HOST_STATE_PROJECTION, handoff, and continuity flush use the Guard exception list
+            Host State Projection: `.ai/skills/common/host-state-projection/SKILL.md`
             Exact Text Edit Entry: `.ai/skills/common/receipt-aware-text-edit/SKILL.md`
 
             Task Assignment Entry: `.ai/skills/common/task-assignment/SKILL.md`
@@ -1815,18 +1816,31 @@ def _render_generated_surface(
             ## Execution Guard
 
             Mode and Role do not create authority. A current, scoped assignment and
-            immediate pre-execution verification are required before mutation.
+            immediate pre-execution verification are required before **project-owned**
+            mutation (source, product trees, Core, templates, configuration, external
+            systems).
 
-            Before every file create/edit/delete/move, write-capable API or database
-            mutation, or durable side effect other than ordinary source-control
-            operations, execute
+            Before every project-owned file create/edit/delete/move, write-capable API
+            or database mutation, or other project-owned / external / unclassified
+            durable side effect other than ordinary source-control operations, execute
             `.ai/skills/common/execution-guard/SKILL.md`. Reading or summarizing that
             Skill is not sufficient. Do not call a raw mutation tool first.
 
-            A mutation may proceed only when the active Session Boot process returns
-            `EXECUTION_GUARD_PERMITTED`, supplies a one-time receipt, and the Host has
-            a receipt-aware pre-write hook. Missing endpoint, token, Authority, Write
-            Scope, Execution Assignment, approval, or Host hook blocks mutation.
+            A project-owned mutation may proceed only when the active Session Boot
+            process returns `EXECUTION_GUARD_PERMITTED`, supplies a one-time receipt,
+            and the Host has a receipt-aware pre-write hook. Missing endpoint, token,
+            Authority, Write Scope, Execution Assignment, approval, or Host hook
+            blocks that class of mutation.
+
+            **Runtime-owned state is not Guard work.** MODE_CHANGE / Mode Anchor
+            store updates, `HOST_STATE_PROJECTION` into
+            `.ai/runtime/state/session.md` and `current_anchor_frame.md`, session /
+            provider observation under Runtime state or tmp, session handoff evidence,
+            Runtime-owned handoff append, checkpoint / resume / memory sync / inbox
+            queue transitions, and automatic continuity flush use the Runtime-owned
+            state exception in execution-guard. Follow
+            `.ai/skills/common/host-state-projection/SKILL.md`. Those writes never
+            create Authority or Execution Assignment.
 
             After completed, validated work, ordinary local Git staging, commit, and
             push remain outside the Runtime. The immutable Git commit SHA may be
@@ -1891,9 +1905,13 @@ def _render_generated_surface(
 
             ## Mutation Entry
 
-            Before every durable mutation, execute
+            Before every **project-owned** durable mutation, execute
             `.ai/skills/common/execution-guard/SKILL.md`. BOOT readiness and a
             Current Anchor do not replace the required Guard result and receipt.
+            Runtime-owned state, `HOST_STATE_PROJECTION`, handoff evidence, and
+            automatic continuity do **not** use Guard; see
+            `.ai/skills/common/host-state-projection/SKILL.md` and the
+            Runtime-Owned State Exception in execution-guard.
             For one exact, single-occurrence repository text replacement on an
             existing file, prefer
             `.ai/skills/common/receipt-aware-text-edit/SKILL.md`; that Skill
@@ -1904,10 +1922,10 @@ def _render_generated_surface(
             may be appended to the approved Task Proposal's Result Receipt and
             never creates Runtime authority, Binding, or an execution receipt.
 
-            For a new mutation request, first follow
+            For a new **project-owned** mutation request, first follow
             `.ai/skills/common/task-assignment/SKILL.md`, then bind exact approval
             through `.ai/skills/common/execution-binding/SKILL.md`. Neither step
-            replaces the final Guard.
+            replaces the final Guard for that class of work.
 
             ## Task Worker Entry
 
@@ -1993,9 +2011,11 @@ def _render_generated_surface(
             `.ai/skills/common/anchor-currentness/SKILL.md`.
             `MODE LIST`, `MODE SHOW`, `MODE ADD`, `MODE MODIFY`, and `MODE DELETE`
             follow `.ai/skills/common/master-mode-registry/SKILL.md`.
-            Any mutation outside the `OS_INSTALL` / `OS_UPDATE` Host Runtime
-            Lifecycle route follows `.ai/skills/common/execution-guard/SKILL.md`
-            before a file, shell, API, database, Git, or external write tool runs.
+            Any **project-owned** mutation outside the `OS_INSTALL` / `OS_UPDATE`
+            Host Runtime Lifecycle route and outside Runtime-owned state /
+            `HOST_STATE_PROJECTION` / handoff / continuity follows
+            `.ai/skills/common/execution-guard/SKILL.md` before a file, shell,
+            API, database, Git, or external write tool runs.
             Exact single-occurrence text replacement on an existing file follows
             `.ai/skills/common/receipt-aware-text-edit/SKILL.md`.
             `STATUS` reads `.ai/runtime/project_instance/status.md`.
@@ -2067,7 +2087,9 @@ def _render_generated_surface(
             Frame Store: cache, not authority
             Source Authority: immutable Git commit
 
-            Mutation Guard: `.ai/skills/common/execution-guard/SKILL.md`
+            Project Mutation Guard: `.ai/skills/common/execution-guard/SKILL.md`
+            Runtime State / Projection: `.ai/skills/common/host-state-projection/SKILL.md`
+              (no Guard; Mode Anchor store is operational truth for Mode Current)
             Receipt Binding: session_id + frame_id + anchor_id + target + operation
             Receipt Reuse: forbidden
 

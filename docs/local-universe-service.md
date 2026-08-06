@@ -159,6 +159,22 @@ instances. It does not create authority, network identity proof, or discovery.
 Use `--database`, `--state-file`, `--port`, or `--token` to override these
 values. Non-loopback listen addresses are rejected.
 
+## Network anchor projects (Universe + Career)
+
+On service start and on `GET /v1/projects`, Universe **idempotently attaches**
+built-in multiverse nodes when their roots exist next to this repository:
+
+| project_id | default root | role |
+|------------|--------------|------|
+| `universe` | this repo (`tools/..`) | `UNIVERSE_HOME` |
+| `ai-career` | sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
+
+These appear in the left project rail as **Universe** / **Career**. Ordinary
+product projects (GCS, etc.) still register explicitly.
+
+Career may use `VERSION_MANIFEST.md` / `AGENTS.md` / `README.md` as identity
+when `REPOSITORY_MANIFEST.md` is absent (`network_role=CAREER_SOURCE`).
+
 ## Register a project
 
 With the service running:

@@ -40,7 +40,8 @@ python .ai/runtime/reference_runtime/cli.py skill-observation prepare \
 The request contains the project, Task Frame, and immutable source references,
 plus each observation's Runtime-computed observation and binding digests, the
 complete declared binding, model reference, outcome, validation state, bounded
-evidence references, and allow-listed numeric metrics. The Runtime verifies the
+evidence references, allow-listed numeric metrics, and bounded provider, role,
+task, node, failure, and quota labels. The Runtime verifies the
 binding digest, then removes the project-local `skill_ref` from the prepared
 candidate while preserving Skill ID, version, operation class, and Context Pack
 digest for downstream Bench use. The candidate carries

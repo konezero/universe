@@ -26,6 +26,7 @@
         <input id="global-search" type="search" placeholder="Search universes, projects, nodes, events…">
       </label>
       <div class="topbar-actions">
+        <a id="universe-list-link" class="text-button" href="/join" title="Public universe list (rendezvous)">목록</a>
         <span id="service-status" class="status-dot local-node-chip" data-state="loading">Local Node</span>
         <span id="mode-status" class="mode-label" data-state="loading">—</span>
         <button id="todo-button" class="icon-button" type="button" title="Todo work map" aria-label="Todo work map">&#9745;</button>
@@ -102,8 +103,8 @@
       </div>
       <div class="canvas-wrap starfield">
         <canvas id="universe-graph" aria-label="Project system graph"></canvas>
-        <div id="graph-empty" class="graph-empty">Select a project</div>
-        <p id="graph-hint" class="graph-hint">Drag to pan · Wheel to zoom · Click a node for details</p>
+        <div id="graph-empty" class="graph-empty">Universe multiverse map</div>
+        <p id="graph-hint" class="graph-hint">Universe hub · projects around · click a project to expand nodes · pan/zoom</p>
         <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
           <button id="exit-node-universe" class="icon-button compact" type="button" title="Return" aria-label="Return">&#8592;</button>
           <span id="node-breadcrumb-project"></span>
@@ -525,6 +526,9 @@
         <input id="observatory-show-all" type="checkbox" />
         Show all (incl. STOPPED)
       </label>
+      <button id="cleanup-sessions-button" class="secondary-button" type="button" title="Remove DISCONNECTED/STOPPED sessions; LIVE kept. Re-register on boot/mode-change/inject.">
+        Clean sessions
+      </button>
       <button id="refresh-sessions-button" class="secondary-button" type="button">Refresh</button>
     </div>
     <section class="session-inject-section">

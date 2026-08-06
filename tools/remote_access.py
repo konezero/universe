@@ -399,16 +399,23 @@ class RemoteAccessStore:
                 raise RemoteAccessError(
                     "REMOTE_DEVICE_SESSION_EXPIRED", "paired device session expired", 401
                 )
-            if str(row["user_agent_digest"]) != _digest(normalized_agent):
-                raise RemoteAccessError(
-                    "REMOTE_DEVICE_SESSION_MISMATCH",
-                    "paired device session belongs to another browser",
-                    401,
+            # Mobile browsers may rotate User-Agent strings; keep the session if
+            # the cookie token is valid, and refresh the stored agent digest.
+            agent_digest = _digest(normalized_agent)
+            if str(row["user_agent_digest"]) != agent_digest:
+                connection.execute(
+                    """
+                    UPDATE remote_device
+                    SET user_agent_digest = ?, last_seen_at = ?
+                    WHERE device_id = ?
+                    """,
+                    (agent_digest, now, row["device_id"]),
                 )
-            connection.execute(
-                "UPDATE remote_device SET last_seen_at = ? WHERE device_id = ?",
-                (now, row["device_id"]),
-            )
+            else:
+                connection.execute(
+                    "UPDATE remote_device SET last_seen_at = ? WHERE device_id = ?",
+                    (now, row["device_id"]),
+                )
             refreshed = connection.execute(
                 "SELECT * FROM remote_device WHERE device_id = ?", (row["device_id"],)
             ).fetchone()

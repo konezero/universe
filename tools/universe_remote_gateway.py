@@ -270,11 +270,14 @@ class RemoteGatewayHandler(BaseHTTPRequestHandler):
             self._pairing_status()
             return
         if path == "/" and SESSION_COOKIE not in self._cookies():
+            # Unpaired browsers land on the public universe list (rendezvous
+            # broker at /join), not device-pair. Device pair is still /pair.
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/pair")
+            self.send_header("Location", "/join")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
-        device = self._authorize_remote_browser()
+        device = self._authorize_remote_browser(path=path)
         if device is None:
             return
         self._proxy(device)
@@ -290,7 +293,7 @@ class RemoteGatewayHandler(BaseHTTPRequestHandler):
         if path == "/pair/request":
             self._request_pairing()
             return
-        device = self._authorize_remote_browser()
+        device = self._authorize_remote_browser(path=path)
         if device is not None:
             self._proxy(device)
 
@@ -325,7 +328,19 @@ class RemoteGatewayHandler(BaseHTTPRequestHandler):
 
     def _pairing_form(self) -> None:
         code = parse_qs(urlsplit(self.path).query).get("code", [""])[0]
+        reason = parse_qs(urlsplit(self.path).query).get("reason", [""])[0]
         safe_code = html.escape(code, quote=True)
+        reason_note = ""
+        if reason in {
+            "REMOTE_DEVICE_SESSION_INVALID",
+            "REMOTE_DEVICE_SESSION_EXPIRED",
+            "REMOTE_DEVICE_SESSION_MISMATCH",
+            "session_invalid",
+        }:
+            reason_note = (
+                "<p class='warn'>Previous remote session expired or was reset "
+                "(common after tunnel restart). Pair again to open the main app.</p>"
+            )
         self._send_html(
             HTTPStatus.OK,
             f"""<!doctype html>
@@ -333,7 +348,16 @@ class RemoteGatewayHandler(BaseHTTPRequestHandler):
 content="width=device-width,initial-scale=1"><title>Pair Universe</title>
 <style>{PAIRING_STYLE}</style></head><body><main>
 <span class="kicker">UNIVERSE REMOTE</span><h1>Pair this browser</h1>
-<p>Enter the single-use code shown on your desktop. The desktop must approve this device.</p>
+<p>This pairs <strong>this browser to this PC's Universe app</strong>. After
+desktop approval you get the main UI. To browse or join <strong>other
+universes</strong>, use the public list.</p>
+{reason_note}
+<p><a class="link" href="/join">← 유니버스 목록 (다른 유니버스 가입)</a></p>
+<ol class="steps">
+<li>On desktop Universe: Settings → Remote access → create pairing code</li>
+<li>Enter the code here and wait for desktop Approve</li>
+<li>This browser opens the main Universe UI automatically</li>
+</ol>
 <form method="post" action="/pair/request"><label>Pairing code
 <input name="code" value="{safe_code}" autocomplete="one-time-code" required></label>
 <label>Device name<input name="device_name" value="Mobile browser" maxlength="120" required></label>
@@ -381,7 +405,7 @@ content="width=device-width,initial-scale=1"><title>Pair Universe</title>
 <body><main><span class="kicker">APPROVAL REQUIRED</span><h1>Check your desktop</h1>
 <p id="state">Waiting for the Universe desktop to approve this browser.</p>
 <small>You may close this page if you did not request access.</small></main>
-<script>const id={json.dumps(safe_id)};async function poll(){{const r=await fetch('/pair/status?id='+encodeURIComponent(id),{{cache:'no-store'}});const p=await r.json();if(p.state==='CONSUMED'){{location.replace('/');return}}if(p.state==='DENIED'||p.state==='EXPIRED'){{document.querySelector('#state').textContent=p.state;return}}setTimeout(poll,1200)}}poll();</script>
+<script>const id={json.dumps(safe_id)};async function poll(){{const r=await fetch('/pair/status?id='+encodeURIComponent(id),{{cache:'no-store',credentials:'same-origin'}});const p=await r.json();if(p.state==='CONSUMED'){{location.replace('/?paired=1');return}}if(p.state==='DENIED'||p.state==='EXPIRED'){{document.querySelector('#state').textContent=p.state;return}}setTimeout(poll,1200)}}poll();</script>
 </body></html>""",
         )
 
@@ -417,9 +441,15 @@ content="width=device-width,initial-scale=1"><title>Pair Universe</title>
             HTTPStatus.OK, {"status": "REMOTE_PAIRING_STATUS", "state": result["state"]}
         )
 
-    def _authorize_remote_browser(self) -> dict[str, Any] | None:
+    def _authorize_remote_browser(
+        self, *, path: str | None = None
+    ) -> dict[str, Any] | None:
         token = self._cookies().get(SESSION_COOKIE, "")
         if not token:
+            # Browser navigations should re-enter pairing, not a raw JSON error.
+            if self._wants_html_navigation():
+                self._redirect_to_pair(clear_session=True)
+                return None
             self._send_error_payload(
                 401, "REMOTE_DEVICE_PAIRING_REQUIRED", "pair this browser first"
             )
@@ -430,8 +460,67 @@ content="width=device-width,initial-scale=1"><title>Pair Universe</title>
                 user_agent=self.headers.get("User-Agent") or "UNKNOWN_BROWSER",
             )
         except RemoteAccessError as error:
+            # Stale cookies after tunnel/gateway restart are common: clear and re-pair.
+            recoverable = error.code in {
+                "REMOTE_DEVICE_SESSION_INVALID",
+                "REMOTE_DEVICE_SESSION_EXPIRED",
+                "REMOTE_DEVICE_SESSION_MISMATCH",
+            }
+            if recoverable and self._wants_html_navigation():
+                self._redirect_to_pair(clear_session=True)
+                return None
+            if recoverable:
+                secure = urlsplit(self.server.public_base_url).scheme == "https"
+                self._send_json(
+                    error.status,
+                    {
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                        "recovery": "CLEAR_COOKIE_AND_REPAIR",
+                        "pair_path": "/pair",
+                    },
+                    cookies=[
+                        self._cookie(SESSION_COOKIE, "", max_age=0, secure=secure),
+                        self._cookie(PAIRING_COOKIE, "", max_age=0, secure=secure),
+                    ],
+                )
+                return None
             self._send_error_payload(error.status, error.code, error.detail)
             return None
+
+    def _wants_html_navigation(self) -> bool:
+        accept = (self.headers.get("Accept") or "").lower()
+        if "text/html" in accept:
+            return True
+        # Top-level navigations often omit Accept or use */*.
+        if self.command == "GET" and (
+            "application/json" not in accept or accept.strip() in {"", "*/*"}
+        ):
+            path = urlsplit(self.path).path
+            if path.startswith("/v1/") or path.startswith("/_universe/"):
+                return False
+            return True
+        return False
+
+    def _redirect_to_pair(self, *, clear_session: bool = False) -> None:
+        secure = urlsplit(self.server.public_base_url).scheme == "https"
+        location = "/pair"
+        if clear_session:
+            location = "/pair?reason=session_invalid"
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        if clear_session:
+            self.send_header(
+                "Set-Cookie",
+                self._cookie(SESSION_COOKIE, "", max_age=0, secure=secure),
+            )
+            self.send_header(
+                "Set-Cookie",
+                self._cookie(PAIRING_COOKIE, "", max_age=0, secure=secure),
+            )
+        self.end_headers()
 
     def _authorize_control(self) -> bool:
         try:
@@ -540,7 +629,9 @@ content="width=device-width,initial-scale=1"><title>Pair Universe</title>
         cookie[name] = value
         cookie[name]["path"] = "/"
         cookie[name]["httponly"] = True
-        cookie[name]["samesite"] = "Strict"
+        # Lax: allow top-level navigation after /pair/wait → / so the session
+        # cookie is actually sent and the Universe main UI can load.
+        cookie[name]["samesite"] = "Lax"
         cookie[name]["max-age"] = str(max_age)
         if secure:
             cookie[name]["secure"] = True
@@ -601,6 +692,10 @@ h1{font-size:28px;margin:10px 0 8px}p{color:#b7c0c8;line-height:1.55}form{displa
 label{display:grid;gap:7px;font-size:13px;color:#cad2d8}input{width:100%;border:1px solid #40505c;
 background:#0d141a;color:#fff;padding:13px 14px;font:inherit}button{border:0;background:#55d6be;color:#05100e;
 padding:13px 16px;font-weight:700;cursor:pointer}small{display:block;color:#77838c;line-height:1.5}
+.steps{color:#b7c0c8;line-height:1.55;padding-left:1.2rem;margin:12px 0 0}
+.steps li{margin:6px 0}.warn{color:#f0b45d;border:1px solid rgba(240,180,74,.35);
+background:rgba(240,180,74,.08);padding:10px 12px;border-radius:8px}
+a.link{color:#55d6be;font-size:.9rem}
 """
 
 

@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: 8fe4d05d71c270a6dc550f9676c1fc2a33eed5b8
+Source Commit: 9179f4fba1cfad938d1b3464c51c1a2a6819d1ba
 
 ## Entry
 
@@ -102,6 +102,7 @@ Source Commit: 8fe4d05d71c270a6dc550f9676c1fc2a33eed5b8
 - `.ai/runtime/reference_runtime/__init__.py`
 - `.ai/runtime/reference_runtime/anchor_session_memory_adapter.py`
 - `.ai/runtime/reference_runtime/anchor_session_memory_runtime.py`
+- `.ai/runtime/reference_runtime/auto_continuity_runtime.py`
 - `.ai/runtime/reference_runtime/capabilities.json`
 - `.ai/runtime/reference_runtime/cli.py`
 - `.ai/runtime/reference_runtime/continuity_runtime.py`
@@ -132,6 +133,7 @@ Source Commit: 8fe4d05d71c270a6dc550f9676c1fc2a33eed5b8
 - `.ai/skills/common/conversation-recall/SKILL.md`
 - `.ai/skills/common/execution-binding/SKILL.md`
 - `.ai/skills/common/execution-guard/SKILL.md`
+- `.ai/skills/common/host-state-projection/SKILL.md`
 - `.ai/skills/common/master-mode-registry/SKILL.md`
 - `.ai/skills/common/memory-sync/SKILL.md`
 - `.ai/skills/common/mode-change/SKILL.md`

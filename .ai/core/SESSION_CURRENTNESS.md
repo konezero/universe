@@ -53,6 +53,10 @@ GIT-BACKED SOURCE REMAINS AUTHORITY.
 RUNTIME ANCHOR FRAME RECORDS CURRENTNESS.
 RUNTIME ANCHOR FRAME DOES NOT CREATE AUTHORITY.
 
+MODE ANCHOR STORE IS OPERATIONAL TRUTH FOR MODE CURRENT ANCHOR.
+session.md / current_anchor_frame.md ARE COMPANION PROJECTIONS.
+HOST_STATE_PROJECTION AND SESSION_HANDOFF ARE NOT EXECUTION MUTATION.
+
 CURRENT ANCHOR PHYSICAL TIME MOVES FORWARD WITH HOST-OBSERVED USER INPUT.
 TIME PASSAGE ALONE DOES NOT CREATE STALE.
 
@@ -296,7 +300,13 @@ It does not grant authority.
 
 It does not prove that the current session may execute.
 
-The runtime must still validate:
+Recording handoff evidence and projecting Mode Anchor companions
+(`HOST_STATE_PROJECTION`) are Runtime-owned operational state. They do not
+require Execution Guard, Task Assignment, or a Mutation Receipt. See
+`.ai/skills/common/host-state-projection/SKILL.md`.
+
+Before **project-owned** mutation or command execution, the runtime must still
+validate:
 
 ```text
 source_ref

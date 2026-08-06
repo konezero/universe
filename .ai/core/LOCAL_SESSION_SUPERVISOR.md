@@ -156,20 +156,29 @@ Session Boot session.
 
 ## Automatic Continuity Boundary
 
+The common mode contract is carried into attached projects by
+`.ai/templates/runtime_continuity/README.md` and
+`.ai/skills/common/resume-save/SKILL.md`. Every persistent Conductor, Master,
+and project Mode Session must attach the shared lifecycle adapter and route
+`TASK_COMPLETED`, `NORMAL_STOP`, `PROVIDER_SWITCH`, `MODE_SWITCH`, and debounced
+`IDLE` through it. A Provider or UI surface may not opt out.
+
+Task Frame Boss and Worker sessions remain ephemeral. They do not replace a
+persistent Provider Session Ref or create a persistent Mode Resume record; the
+Parent flushes bounded task results through its own persistent session.
+
 Automatic continuity writes only to the attached project's local
-`.ai/runtime/continuity/continuity.sqlite`. It may be triggered by stable task
-completion, Provider or Mode switching, explicit stop, or bounded idle
-activity. Signals are debounced and idempotent.
+`.ai/runtime/continuity/continuity.sqlite`. It is a Supervisor lifecycle flush,
+not the user command named `RESUME_SAVE`. The same Runtime validators and
+durable store are used, but an automatic trigger cannot infer a user request,
+publish an archive, or create Git authority.
 
-This is a Supervisor lifecycle flush, not the user command named
-`RESUME_SAVE`. The Supervisor uses the same Runtime validators and durable
-store, but it cannot infer a user request, publish an archive, or create Git
-authority from an automatic trigger.
+Unknown coordinates fail closed as `AUTO_CONTINUITY_SKIPPED`. A crash preserves
+the last good record and dirty-end evidence; it never fabricates a summary.
 
-Git publication and Resume Archive publication are separate, explicit user
+Git publication and Resume Archive publication remain separate, explicit user
 commands with separate approval. Automatic continuity has no code path that
-invokes either publication mechanism. A crash preserves the last good record
-and dirty-end evidence; it never fabricates a summary.
+invokes either publication mechanism.
 
 ## Service And Tray Boundary
 

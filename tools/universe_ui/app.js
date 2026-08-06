@@ -20,7 +20,7 @@ const state = {
   memoryProposals: [],
   selectedNode: null,
   focusedNodeId: null,
-  view: "timeline",
+  view: "universe",
   roomMessages: [],
   conductorMessages: [],
   conductorPermissions: [],
@@ -156,6 +156,7 @@ const elements = {
     "#session-observatory-detail-preview"
   ),
   observatoryShowAllToggle: document.querySelector("#observatory-show-all"),
+  cleanupSessionsButton: document.querySelector("#cleanup-sessions-button"),
   legacyExecutorList: document.querySelector("#legacy-executor-list"),
   sessionEventList: document.querySelector("#session-event-list"),
   runtimeAuditGrid: document.querySelector("#runtime-audit-grid"),
@@ -405,6 +406,27 @@ function sessionFingerprint(session) {
   ].join(" · ");
 }
 
+/** Resolve registered project_root for session.node (project_id). */
+function sessionProjectPathLabel(session) {
+  if (session.project_root) {
+    const name = session.project_display_name || session.node || "project";
+    return `📁 ${name} · ${session.project_root}`;
+  }
+  // Fallback: client-side project list if audit not yet enriched.
+  const project = (state.projects || []).find(
+    (item) => item.project_id === session.node
+  );
+  if (project?.project_root) {
+    return `📁 ${projectDisplayName(project)} · ${project.project_root}`;
+  }
+  if (String(session.node || "").toUpperCase() === "CONDUCTOR") {
+    return "📁 CONDUCTOR mode session · (not a project root)";
+  }
+  return session.project_bind_note
+    ? `📁 ${session.project_bind_note}`
+    : `📁 unbound · node=${session.node || "—"}`;
+}
+
 function observatoryVisibleSessions(sessions) {
   const list = Array.isArray(sessions) ? sessions.slice() : [];
   if (state.observatoryShowAll) return list;
@@ -490,6 +512,14 @@ function renderSelectedSessionDetail() {
       "div",
       "",
       `${session.state || "?"} · ${session.is_default ? "DEFAULT" : "alt"} · ${session.currentness || "UNKNOWN"}`
+    )
+  );
+  const pathLine = sessionProjectPathLabel(session);
+  meta.append(
+    node(
+      "div",
+      session.project_bound ? "session-detail-path bound" : "session-detail-path unbound",
+      pathLine
     )
   );
   for (const row of uniqueTimeRows(session)) {
@@ -602,6 +632,35 @@ function selectedIsConductorProject() {
   return project === "CONDUCTOR" || project === "universe";
 }
 
+async function cleanupSupervisorSessions() {
+  const confirmed = window.confirm(
+    "Clean inactive Supervisor sessions?\n\n" +
+      "Removes DISCONNECTED / STOPPED / REGISTERED / UNKNOWN rows.\n" +
+      "Keeps LIVE (and STARTING). Does not kill processes.\n" +
+      "Mode-change / boot / inject can re-register coords later."
+  );
+  if (!confirmed) return;
+  if (elements.cleanupSessionsButton) {
+    elements.cleanupSessionsButton.disabled = true;
+  }
+  try {
+    // Sweep zombies to DISCONNECTED, then purge non-LIVE.
+    const result = await api("/v1/supervisor/sessions/cleanup", {
+      method: "POST",
+      body: { keep_live_only: true, include_unknown: true },
+    });
+    const removed = result.cleanup?.removed_count ?? 0;
+    const kept = result.cleanup?.kept_count ?? 0;
+    state.selectedSupervisorSessionId = null;
+    await refreshSupervisorSessions();
+    toast(`Sessions cleaned · removed ${removed} · kept ${kept}`);
+  } finally {
+    if (elements.cleanupSessionsButton) {
+      elements.cleanupSessionsButton.disabled = false;
+    }
+  }
+}
+
 async function injectSessionFromObservatory() {
   const provider = elements.observatoryInjectProvider?.value || "CODEX";
   const sessionRef = elements.observatoryInjectRef?.value?.trim() || "";
@@ -710,6 +769,14 @@ function renderSessionObservatory() {
         })
       )
     );
+    const path = node(
+      "p",
+      session.project_bound ||
+        (state.projects || []).some((item) => item.project_id === session.node)
+        ? "session-path-line bound"
+        : "session-path-line unbound",
+      sessionProjectPathLabel(session)
+    );
     const snippetText = sessionPreviewSnippet(session);
     const snippet = node(
       "p",
@@ -780,7 +847,7 @@ function renderSessionObservatory() {
       }
     });
     actions.append(saveAlias, resume);
-    card.append(heading, meta, snippet, ref, alias, actions);
+    card.append(heading, meta, path, snippet, ref, alias, actions);
     elements.sessionObservatoryList.append(card);
   }
   renderSelectedSessionDetail();
@@ -1106,13 +1173,14 @@ function fitGraphView() {
 
 function updateGraphChrome() {
   if (elements.graphHint) {
-    elements.graphHint.classList.toggle(
-      "hidden",
-      !state.selectedProject || !state.graph.nodes.length
-    );
+    // Multiverse map can show Universe hub with zero projects selected.
+    elements.graphHint.classList.toggle("hidden", !state.graph.nodes.length);
   }
   if (elements.graphEmpty) {
-    // empty state already driven elsewhere
+    // Multiverse hub alone is still a valid map — don't cover it forever.
+    if (state.view === "universe" && state.graph.nodes.length) {
+      elements.graphEmpty.classList.add("hidden");
+    }
   }
 }
 
@@ -1132,6 +1200,14 @@ async function refresh({ syncSelectedProject = false } = {}) {
         : health.status;
     state.modeContract = health.mode_contract || null;
     renderModeStatus();
+    const listLink = document.querySelector("#universe-list-link");
+    if (listLink) {
+      // Always offer public list; remote users need a way back to other universes.
+      listLink.href = "/join";
+      listLink.hidden = false;
+      listLink.textContent =
+        state.accessSurface === "REMOTE_BROWSER" ? "목록 · 다른 유니버스" : "목록";
+    }
 
     const [
       projectResult,
@@ -1203,9 +1279,29 @@ async function refresh({ syncSelectedProject = false } = {}) {
   }
 }
 
+function projectDisplayName(project) {
+  const meta = project?.metadata || {};
+  return (
+    meta.display_name ||
+    meta.label ||
+    project?.project_id ||
+    "project"
+  );
+}
+
+function projectSortKey(project) {
+  const role = String(project?.metadata?.network_role || "");
+  if (role === "UNIVERSE_HOME") return "0";
+  if (role === "CAREER_SOURCE") return "1";
+  return `2:${project?.project_id || ""}`;
+}
+
 function renderProjects() {
   elements.projectList.replaceChildren();
-  for (const project of state.projects) {
+  const projects = (state.projects || [])
+    .slice()
+    .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
+  for (const project of projects) {
     const button = node("button", "project-item");
     button.type = "button";
     button.role = "option";
@@ -1216,10 +1312,14 @@ function renderProjects() {
     if (state.selectedProject?.project_id === project.project_id) {
       button.classList.add("selected");
     }
+    if (project.metadata?.network_role) {
+      button.dataset.networkRole = project.metadata.network_role;
+    }
+    const label = projectDisplayName(project);
     const avatar = node(
       "span",
       "project-avatar",
-      project.project_id.slice(0, 2)
+      String(label).slice(0, 2)
     );
     const copy = node("span", "project-copy");
     const openTodoCount = state.todos.filter(
@@ -1231,14 +1331,20 @@ function renderProjects() {
         proposal.project_id === project.project_id &&
         proposal.state === "PROPOSED"
     ).length;
+    const roleTag =
+      project.metadata?.network_role === "UNIVERSE_HOME"
+        ? "home"
+        : project.metadata?.network_role === "CAREER_SOURCE"
+          ? "career"
+          : "";
     copy.append(
-      node("span", "project-name", project.project_id),
+      node("span", "project-name", label),
       node(
         "span",
         "project-meta",
-        `${project.metadata.label || project.refs.mode_registry}${
-          openTodoCount ? ` / ${openTodoCount} open` : ""
-        }${
+        `${roleTag ? `${roleTag} · ` : ""}${
+          project.metadata.label || project.project_id
+        }${openTodoCount ? ` / ${openTodoCount} open` : ""}${
           pendingApprovalCount ? ` / ${pendingApprovalCount} approval` : ""
         }`
       )
@@ -2307,6 +2413,10 @@ function renderRemoteAccessSettings() {
   const connector = remote.connector || { status: "OFFLINE" };
   const online = gateway.status === "READY" || gateway.status === "HOST_OFFLINE";
   const internetReady = connector.status === "READY";
+  const connectorFailed =
+    connector.status === "FAILED" ||
+    connector.status === "TUNNEL_FAILED" ||
+    Boolean(connector.error_code);
   const localOperator = state.accessSurface !== "REMOTE_BROWSER";
   const configuration = connector.configuration || null;
   const transport =
@@ -2328,19 +2438,67 @@ function renderRemoteAccessSettings() {
     elements.remoteKnownHostsFile.value = configuration.known_hosts_file || "";
   }
   const visibleStatus =
-    transport === "SSH_REVERSE_TUNNEL" ? connector.status : gateway.status;
+    transport === "SSH_REVERSE_TUNNEL"
+      ? internetReady
+        ? "READY"
+        : online
+          ? connectorFailed
+            ? "GATEWAY_UP / TUNNEL_FAILED"
+            : gateway.status || "OFFLINE"
+          : connector.status || gateway.status || "OFFLINE"
+      : gateway.status;
   elements.remoteAccessStatus.textContent = visibleStatus || "OFFLINE";
-  elements.remoteAccessStatus.dataset.state = visibleStatus || "OFFLINE";
-  elements.remoteAccessEndpoint.textContent = gateway.public_base_url
-    ? `${internetReady ? "Internet" : "Mobile"} URL: ${gateway.public_base_url}`
-    : "Mobile gateway is stopped.";
-  elements.startRemoteAccess.disabled = online || !localOperator;
+  elements.remoteAccessStatus.dataset.state =
+    internetReady || online ? "READY" : visibleStatus || "OFFLINE";
+  const publicUrl =
+    gateway.public_base_url ||
+    configuration?.public_base_url ||
+    "";
+  const lines = [];
+  if (publicUrl) {
+    lines.push(
+      `${internetReady ? "Internet" : online ? "Gateway (tunnel down)" : "Saved"} URL: ${publicUrl}`
+    );
+  } else {
+    lines.push("Mobile gateway is stopped.");
+  }
+  if (gateway.control_endpoint) {
+    lines.push(`Gateway control: ${gateway.control_endpoint}`);
+  }
+  if (gateway.status) {
+    lines.push(`Gateway: ${gateway.status}`);
+  }
+  if (connector.status) {
+    lines.push(`Tunnel: ${connector.status}`);
+  }
+  if (connector.detail || connector.error_code) {
+    lines.push(
+      `Error: ${connector.error_code || "FAILED"} · ${connector.detail || ""}`
+    );
+  }
+  if (remote.resume?.status && remote.resume.status !== "REMOTE_ACCESS_STARTED") {
+    lines.push(
+      `Resume: ${remote.resume.status}${
+        remote.resume.detail ? ` · ${remote.resume.detail}` : ""
+      }`
+    );
+  }
+  if (connectorFailed && (configuration?.remote_port || 18443)) {
+    lines.push(
+      `Hint: remote port ${configuration?.remote_port || 18443} may still be held on the VPS from a prior tunnel (ssh log: remote port forwarding failed). Free that port or change remote_port, then Start again.`
+    );
+  }
+  elements.remoteAccessEndpoint.textContent = lines.join("\n");
+  // Allow restart when gateway is up but tunnel failed.
+  elements.startRemoteAccess.disabled =
+    (online && internetReady) || !localOperator;
   elements.stopRemoteAccess.disabled = !online || !localOperator;
   elements.createPairing.disabled =
     !online ||
     !localOperator ||
     (transport === "SSH_REVERSE_TUNNEL" && !internetReady);
-  elements.remoteAccessTransport.disabled = online || !localOperator;
+  elements.remoteAccessTransport.disabled =
+    (online && internetReady) || !localOperator;
 
   elements.remotePairingList.replaceChildren();
   const pending = (remote.pairings || []).filter(
@@ -2399,25 +2557,47 @@ async function refreshRemoteAccessSettings() {
 async function setRemoteAccess(operation) {
   elements.settingsError.textContent = "";
   const transport = elements.remoteAccessTransport.value;
-  const body =
-    operation !== "start" || transport === "LAN"
-      ? { transport_kind: transport }
-      : {
-          transport_kind: "SSH_REVERSE_TUNNEL",
-          public_base_url: elements.remotePublicUrl.value.trim(),
-          ssh_host: elements.remoteSshHost.value.trim(),
-          ssh_port: Number(elements.remoteSshPort.value),
-          ssh_user: elements.remoteSshUser.value.trim(),
-          remote_port: Number(elements.remoteForwardPort.value),
-          identity_file: elements.remoteIdentityFile.value.trim(),
-          known_hosts_file: elements.remoteKnownHostsFile.value.trim(),
-        };
-  await api(`/v1/settings/remote-access/${operation}`, {
+  let body;
+  if (operation !== "start") {
+    body = { transport_kind: transport };
+  } else if (transport === "LAN") {
+    body = { transport_kind: "LAN" };
+  } else if (
+    !elements.remotePublicUrl.value.trim() &&
+    state.remoteAccess?.connector?.configuration_available
+  ) {
+    // Prefer saved Gabia/SSH config when form fields are empty after reboot.
+    body = { transport_kind: "SAVED" };
+  } else {
+    body = {
+      transport_kind: "SSH_REVERSE_TUNNEL",
+      public_base_url: elements.remotePublicUrl.value.trim(),
+      ssh_host: elements.remoteSshHost.value.trim(),
+      ssh_port: Number(elements.remoteSshPort.value),
+      ssh_user: elements.remoteSshUser.value.trim(),
+      remote_port: Number(elements.remoteForwardPort.value),
+      identity_file: elements.remoteIdentityFile.value.trim(),
+      known_hosts_file: elements.remoteKnownHostsFile.value.trim(),
+    };
+  }
+  const result = await api(`/v1/settings/remote-access/${operation}`, {
     method: "POST",
     body,
   });
   await refreshRemoteAccessSettings();
-  toast(operation === "start" ? "Mobile access started" : "Mobile access stopped");
+  if (operation !== "start") {
+    toast("Mobile access stopped");
+    return;
+  }
+  if (result.status === "REMOTE_ACCESS_PARTIAL") {
+    toast(
+      result.connector?.detail ||
+        "Gateway up, tunnel failed (often remote port in use)",
+      true
+    );
+    return;
+  }
+  toast("Mobile access started");
 }
 
 async function createRemotePairing() {
@@ -2921,21 +3101,159 @@ function openProjectRoomStream(projectId) {
 }
 
 function buildGraph() {
+  elements.nodeBreadcrumb.classList.add("hidden");
+  // Multiverse map: Universe hub + projects (+ expanded project nodes).
+  if (state.view === "universe" || state.view === "implementation") {
+    if (state.focusedNodeId && state.selectedProject && state.view === "universe") {
+      buildNodeUniverseGraph();
+      return;
+    }
+    if (state.view === "implementation" && state.selectedProject) {
+      buildProjectInteriorGraph({ mode: "implementation" });
+      return;
+    }
+    buildMultiverseGraph();
+    return;
+  }
   if (!state.selectedProject) {
     state.graph.nodes = [];
     state.graph.edges = [];
+    elements.graphEmpty.classList.remove("hidden");
+    if (elements.graphEmpty) {
+      elements.graphEmpty.textContent =
+        "Select Multiverse Map for Universe → projects, or pick a project";
+    }
     drawGraph();
     return;
   }
-  elements.nodeBreadcrumb.classList.add("hidden");
   if (state.view === "timeline") {
     buildTimelineGraph();
+    return;
+  }
+  buildProjectInteriorGraph({ mode: state.view });
+}
+
+/** Universe at center, registered projects around it; selected project's nodes radiate out. */
+function buildMultiverseGraph() {
+  const hub = {
+    id: "universe:hub",
+    label: "Universe",
+    kind: "universe",
+    data: {
+      kind: "UNIVERSE_INSTANCE",
+      label: "Local Universe",
+      note: "Parent observation hub — projects attach around this instance",
+    },
+    x: 0,
+    y: 0,
+  };
+  const graphNodes = [hub];
+  const graphEdges = [];
+  const projects = (state.projects || [])
+    .slice()
+    .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
+
+  if (!projects.length) {
+    state.graph.nodes = graphNodes;
+    state.graph.edges = graphEdges;
+    state.graph.scale = 1;
+    state.graph.x = 0;
+    state.graph.y = 0;
+    // Still show Universe hub; hint instead of full empty overlay.
+    if (elements.graphEmpty) {
+      elements.graphEmpty.classList.add("hidden");
+    }
+    if (elements.graphHint) {
+      elements.graphHint.classList.remove("hidden");
+      elements.graphHint.textContent =
+        "Universe hub · no projects attached yet (register / restart for anchors)";
+    }
+    drawGraph();
+    return;
+  }
+
+  projects.forEach((project, index) => {
+    const angle =
+      (Math.PI * 2 * index) / Math.max(projects.length, 1) - Math.PI / 2;
+    // All attached roots are project nodes around the Universe hub.
+    // Career is a project (laws source), not a second center.
+    const radius = 210;
+    const selected =
+      state.selectedProject?.project_id === project.project_id;
+    const id = `project:${project.project_id}`;
+    graphNodes.push({
+      id,
+      label: projectDisplayName(project),
+      kind: "project",
+      data: project,
+      x: Math.cos(angle) * radius,
+      y: Math.sin(angle) * radius,
+      selectedProject: selected,
+    });
+    graphEdges.push({
+      from: hub.id,
+      to: id,
+      kind: "project-link",
+    });
+  });
+
+  // Expand selected project's functional nodes around that project card.
+  if (state.selectedProject && state.projection) {
+    const parentId = `project:${state.selectedProject.project_id}`;
+    const parent = graphNodes.find((item) => item.id === parentId);
+    const px = parent?.x || 0;
+    const py = parent?.y || 0;
+    const systems = state.projection.nodes || [];
+    systems.forEach((item, index) => {
+      const angle =
+        (Math.PI * 2 * index) / Math.max(systems.length, 1) - Math.PI / 2;
+      const r = 100 + (index % 2) * 18;
+      graphNodes.push({
+        id: `node:${item.node_id}`,
+        label: item.title,
+        kind: "system",
+        data: item,
+        x: px + Math.cos(angle) * r,
+        y: py + Math.sin(angle) * r,
+      });
+      graphEdges.push({
+        from: parentId,
+        to: `node:${item.node_id}`,
+        kind: "contains",
+      });
+    });
+    for (const edge of state.projection.edges || []) {
+      graphEdges.push({
+        from: `node:${edge.from_node}`,
+        to: `node:${edge.to_node}`,
+        kind: edge.kind,
+      });
+    }
+  }
+
+  state.graph.nodes = graphNodes;
+  state.graph.edges = graphEdges;
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  elements.graphEmpty.classList.add("hidden");
+  if (elements.graphHint) {
+    elements.graphHint.textContent =
+      "Universe hub · projects around · select a project to expand its nodes";
+  }
+  drawGraph();
+}
+
+/** Single-project interior graph (timeline/documents/future/legacy). */
+function buildProjectInteriorGraph({ mode }) {
+  if (!state.selectedProject) {
+    buildMultiverseGraph();
     return;
   }
   const graphNodes = [
     {
       id: `project:${state.selectedProject.project_id}`,
-      label: state.selectedProject.project_id,
+      label: projectDisplayName(state.selectedProject),
       kind: "project",
       data: state.selectedProject,
     },
@@ -2943,7 +3261,7 @@ function buildGraph() {
   const graphEdges = [];
   const projection = state.projection;
   if (projection) {
-    if (state.view === "implementation") {
+    if (mode === "implementation") {
       for (const item of projection.nodes || []) {
         graphNodes.push({
           id: `node:${item.node_id}`,
@@ -2972,7 +3290,7 @@ function buildGraph() {
           kind: "implementation-binding",
         });
       }
-      layoutGraph(graphNodes, state.view);
+      layoutGraph(graphNodes, mode);
       state.graph.nodes = graphNodes;
       state.graph.edges = graphEdges;
       state.graph.scale = 1;
@@ -3002,7 +3320,7 @@ function buildGraph() {
         kind: edge.kind,
       });
     }
-    if (state.view === "documents") {
+    if (mode === "documents") {
       for (const item of projection.documents || []) {
         graphNodes.push({
           id: `document:${item.document_id}`,
@@ -3025,7 +3343,7 @@ function buildGraph() {
         }
       }
     }
-    if (state.view === "future") {
+    if (mode === "future") {
       for (const item of projection.predicted_paths || []) {
         graphNodes.push({
           id: `predicted:${item.candidate_id}`,
@@ -3044,7 +3362,7 @@ function buildGraph() {
       }
     }
   }
-  layoutGraph(graphNodes, state.view);
+  layoutGraph(graphNodes, mode);
   state.graph.nodes = graphNodes;
   state.graph.edges = graphEdges;
   state.graph.scale = 1;
@@ -3534,14 +3852,26 @@ function drawGraph() {
     const isPredicted = edge.kind === "predicts";
     const isImplementationLink = edge.kind === "implementation-binding";
     context.lineWidth = isDocumentLink ? 1.4 : 1.2;
+    const isProjectLink = edge.kind === "project-link";
+    context.lineWidth = isDocumentLink ? 1.4 : isProjectLink ? 1.6 : 1.2;
     context.strokeStyle = isPredicted
       ? "rgba(155, 124, 255, 0.75)"
       : isDocumentLink
       ? "rgba(240, 184, 74, 0.7)"
       : isImplementationLink
         ? "rgba(122, 106, 212, 0.7)"
-        : "rgba(120, 180, 230, 0.35)";
-    context.setLineDash(isPredicted ? [7, 6] : isDocumentLink ? [5, 4] : isImplementationLink ? [3, 3] : []);
+        : isProjectLink
+          ? "rgba(90, 200, 255, 0.45)"
+          : "rgba(120, 180, 230, 0.35)";
+    context.setLineDash(
+      isPredicted
+        ? [7, 6]
+        : isDocumentLink
+          ? [5, 4]
+          : isImplementationLink
+            ? [3, 3]
+            : []
+    );
     context.beginPath();
     context.moveTo(from.x, from.y);
     context.lineTo(to.x, to.y);
@@ -3551,6 +3881,7 @@ function drawGraph() {
   for (const item of state.graph.nodes) {
     const selected = state.selectedNode?.id === item.id;
     const color = {
+      universe: "#5ad0ff",
       project: "#3d7ecf",
       system: "#1769aa",
       focus: "#4ec4ff",
@@ -3558,9 +3889,11 @@ function drawGraph() {
       document: "#c48a2a",
       implementation: "#7a6ad4",
       predicted: "#c45b58",
-    }[item.kind];
-    const widthValue = ["project", "focus"].includes(item.kind) ? 126 : 108;
-    const heightValue = ["project", "focus"].includes(item.kind) ? 42 : 36;
+    }[item.kind] || "#3d7ecf";
+    const isHub = item.kind === "universe";
+    const isProjectLike = ["project", "focus", "universe"].includes(item.kind);
+    const widthValue = isHub ? 148 : isProjectLike ? 126 : 108;
+    const heightValue = isHub ? 48 : isProjectLike ? 42 : 36;
     const x0 = item.x - widthValue / 2;
     const y0 = item.y - heightValue / 2;
     if (selected) {
@@ -3582,7 +3915,9 @@ function drawGraph() {
     context.stroke();
     context.shadowBlur = 0;
     context.fillStyle = selected ? "#eaf8ff" : "#d7e7f8";
-    context.font = `${item.kind === "project" ? "600" : "500"} 11px Segoe UI`;
+    context.font = `${
+      item.kind === "universe" || item.kind === "project" ? "600" : "500"
+    } 11px Segoe UI`;
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.fillText(
@@ -3639,16 +3974,56 @@ function selectGraphNode(event) {
   const selected =
     [...state.graph.nodes]
       .reverse()
-      .find(
-        (item) =>
-          Math.abs(point.x - item.x) <= 58 &&
-          Math.abs(point.y - item.y) <= 24
-      ) || null;
+      .find((item) => {
+        const hitX = item.kind === "universe" ? 78 : 58;
+        const hitY = item.kind === "universe" ? 28 : 24;
+        return (
+          Math.abs(point.x - item.x) <= hitX &&
+          Math.abs(point.y - item.y) <= hitY
+        );
+      }) || null;
   if (!selected) return;
   state.inspectorDismissed = false;
+  if (selected.kind === "universe") {
+    state.focusedNodeId = null;
+    state.selectedNode = selected;
+    buildGraph();
+    renderDetails();
+    showInspectorTab("details");
+    return;
+  }
   if (selected.kind === "project") {
     state.focusedNodeId = null;
     state.selectedNode = selected;
+    const projectId = selected.data?.project_id;
+    if (projectId && state.selectedProject?.project_id !== projectId) {
+      selectProject(projectId, { revealInspector: true, syncAssets: false })
+        .then(() => {
+          state.selectedNode = {
+            ...selected,
+            data:
+              state.projects.find((item) => item.project_id === projectId) ||
+              selected.data,
+          };
+          // Stay on multiverse map with expanded project nodes.
+          if (state.view !== "universe") {
+            state.view = "universe";
+            document
+              .querySelectorAll("[data-view]")
+              .forEach((button) =>
+                button.classList.toggle(
+                  "selected",
+                  button.getAttribute("data-view") === "universe"
+                )
+              );
+          }
+          buildGraph();
+          renderDetails();
+          showInspectorTab("details");
+        })
+        .catch((error) => toast(error.message, true));
+      return;
+    }
     buildGraph();
     renderDetails();
     showInspectorTab("details");
@@ -3671,27 +4046,37 @@ function selectGraphNode(event) {
 
 function renderDetails() {
   elements.details.replaceChildren();
-  if (!state.selectedProject) {
+  const selected = state.selectedNode;
+  if (!state.selectedProject && !selected) {
     document.body.classList.remove("inspector-open");
-    elements.details.append(node("p", "empty-copy", "No project selected"));
+    elements.details.append(
+      node(
+        "p",
+        "empty-copy",
+        "Multiverse map — click Universe hub or a project node"
+      )
+    );
     return;
   }
-  const selected = state.selectedNode;
-  // Project selection keeps inspector available unless the user dismissed it.
+  // Project / hub selection keeps inspector available unless dismissed.
   document.body.classList.toggle(
     "inspector-open",
-    Boolean(state.selectedProject) && !state.inspectorDismissed
+    Boolean(state.selectedProject || selected) && !state.inspectorDismissed
   );
   const heading = node("div", "detail-group");
   heading.append(
     node(
       "h2",
       "",
-      selected?.label || state.selectedProject.project_id
+      selected?.label ||
+        projectDisplayName(state.selectedProject) ||
+        state.selectedProject?.project_id ||
+        "Universe"
     )
   );
   const grid = node("dl", "detail-grid");
-  const data = selected?.data || state.projection?.project || state.selectedProject;
+  const data =
+    selected?.data || state.projection?.project || state.selectedProject || {};
   addDetail(grid, "Type", selected?.kind || "project");
   addDetail(
     grid,
@@ -3700,14 +4085,25 @@ function renderDetails() {
   );
   if (data.kind) addDetail(grid, "Kind", data.kind);
   if (data.role) addDetail(grid, "Role", data.role);
+  if (data.network_role) addDetail(grid, "Network role", data.network_role);
+  if (data.display_name) addDetail(grid, "Display", data.display_name);
+  if (data.note) addDetail(grid, "Note", data.note);
   if (data.goal) addDetail(grid, "Goal", data.goal);
   if (data.technologies?.length) addDetail(grid, "Technologies", data.technologies.join(", "));
   if (data.node_ids?.length) addDetail(grid, "Related to", data.node_ids.join(", "));
   if (data.path) addDetail(grid, "Path", data.path);
   if (data.project_root) addDetail(grid, "Root", data.project_root);
+  if (data.project_id) addDetail(grid, "Project id", data.project_id);
   if (data.symbol) addDetail(grid, "Symbol", data.symbol);
-  if (selected?.kind === "project" && state.projection?.source?.commit) {
+  if (
+    selected?.kind === "project" &&
+    state.projection?.source?.commit &&
+    selected?.data?.project_id === state.selectedProject?.project_id
+  ) {
     addDetail(grid, "Source commit", state.projection.source.commit);
+  }
+  if (selected?.kind === "universe") {
+    addDetail(grid, "Projects", String((state.projects || []).length));
   }
   heading.append(grid);
   elements.details.append(heading);
@@ -6272,6 +6668,11 @@ function bindEvents() {
       renderSessionObservatory();
     });
   }
+  if (elements.cleanupSessionsButton) {
+    elements.cleanupSessionsButton.addEventListener("click", () => {
+      cleanupSupervisorSessions().catch((error) => toast(error.message, true));
+    });
+  }
   elements.hostToolSettings.addEventListener("click", (event) => {
     const action = event.target.closest(
       ".host-tool-set, .host-tool-verify, .host-tool-model-set"
@@ -6538,7 +6939,13 @@ refreshLawStrip = function () {
     button.addEventListener("click", () => {
       state.view = button.dataset.view;
       for (const candidate of document.querySelectorAll("[data-view]")) {
-        candidate.classList.toggle("selected", candidate === button);
+        candidate.classList.toggle(
+          "selected",
+          candidate.dataset.view === button.dataset.view
+        );
+      }
+      if (elements.viewModeSelect) {
+        elements.viewModeSelect.value = button.dataset.view;
       }
       state.selectedNode = null;
       state.focusedNodeId = null;
@@ -6547,6 +6954,16 @@ refreshLawStrip = function () {
       renderDetails();
     });
   }
+  // Boot on Multiverse Map so Universe hub is visible without an extra click.
+  if (elements.viewModeSelect) {
+    elements.viewModeSelect.value = state.view;
+  }
+  document.querySelectorAll("[data-view]").forEach((candidate) => {
+    candidate.classList.toggle(
+      "selected",
+      candidate.dataset.view === state.view
+    );
+  });
   for (const button of document.querySelectorAll("[data-tab]")) {
     button.addEventListener("click", () => showInspectorTab(button.dataset.tab));
   }

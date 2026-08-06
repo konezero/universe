@@ -328,3 +328,28 @@ These local continuity operations are `HOST_DEPENDENT`. A source-only mobile or
 web Connector cannot execute them unless a connected Execution Host exposes the
 project filesystem. With only an approved Provider writer, the Connector stops
 at `HANDOFF_APPEND`; it does not open or claim the local SQLite store.
+
+## Automatic Continuity Coordination
+
+`auto_continuity_runtime.py` provides a reusable Host-side coordinator for
+automatic local continuity saves. It is intentionally not a transcript reader:
+the Host must supply a bounded, redacted `compressed_context` and a trigger.
+
+The common lifecycle contract applies to every persistent Conductor, Master,
+and project Mode Session. Hosts should construct `ModeContinuityLifecycle` for
+each such session and route all five stable triggers through it. Task Frame
+Boss/Worker sessions use `EPHEMERAL_TASK_FRAME_SESSION` and are skipped by this
+adapter; their Parent persists bounded result state.
+
+Supported triggers are `TASK_COMPLETED`, `NORMAL_STOP`, `PROVIDER_SWITCH`,
+`MODE_SWITCH`, and `IDLE`. For a valid runtime coordinate, the coordinator
+executes the immutable sequence below through the installed continuity CLI:
+
+```text
+checkpoint prepare -> checkpoint save -> resume-save prepare -> resume-save save
+```
+
+Missing or `UNKNOWN` node, mode, session, frame, anchor, or source coordinates
+produce `AUTO_CONTINUITY_SKIPPED`; no project continuity record is written.
+The coordinator records only local Runtime state and never publishes Git
+history. A project Host must explicitly wire its lifecycle events to use it.

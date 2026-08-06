@@ -78,18 +78,31 @@ sandbox.
 ## Execution Guard
 
 Mode and Role do not create authority. A current, scoped assignment and
-immediate pre-execution verification are required before mutation.
+immediate pre-execution verification are required before **project-owned**
+mutation (source, product trees, Core, templates, configuration, external
+systems).
 
-Before every file create/edit/delete/move, write-capable API or database
-mutation, or durable side effect other than ordinary source-control
-operations, execute
+Before every project-owned file create/edit/delete/move, write-capable API
+or database mutation, or other project-owned / external / unclassified
+durable side effect other than ordinary source-control operations, execute
 `.ai/skills/common/execution-guard/SKILL.md`. Reading or summarizing that
 Skill is not sufficient. Do not call a raw mutation tool first.
 
-A mutation may proceed only when the active Session Boot process returns
-`EXECUTION_GUARD_PERMITTED`, supplies a one-time receipt, and the Host has
-a receipt-aware pre-write hook. Missing endpoint, token, Authority, Write
-Scope, Execution Assignment, approval, or Host hook blocks mutation.
+A project-owned mutation may proceed only when the active Session Boot
+process returns `EXECUTION_GUARD_PERMITTED`, supplies a one-time receipt,
+and the Host has a receipt-aware pre-write hook. Missing endpoint, token,
+Authority, Write Scope, Execution Assignment, approval, or Host hook
+blocks that class of mutation.
+
+**Runtime-owned state is not Guard work.** MODE_CHANGE / Mode Anchor
+store updates, `HOST_STATE_PROJECTION` into
+`.ai/runtime/state/session.md` and `current_anchor_frame.md`, session /
+provider observation under Runtime state or tmp, session handoff evidence,
+Runtime-owned handoff append, checkpoint / resume / memory sync / inbox
+queue transitions, and automatic continuity flush use the Runtime-owned
+state exception in execution-guard. Follow
+`.ai/skills/common/host-state-projection/SKILL.md`. Those writes never
+create Authority or Execution Assignment.
 
 After completed, validated work, ordinary local Git staging, commit, and
 push remain outside the Runtime. The immutable Git commit SHA may be
