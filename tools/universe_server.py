@@ -24,7 +24,7 @@ import uuid
 import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -143,6 +143,8 @@ UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 PROJECT_ATTACHMENT_SCHEMA = "universe.project-attachment.v1"
+RUNTIME_LEASE_SCHEMA = "universe.shared-runtime-lease.v1"
+RUNTIME_LEASE_OPERATION_SCHEMA = "universe.shared-runtime-lease-operation.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 TODO_SCHEMA = "universe.todo.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
@@ -234,6 +236,11 @@ PROJECT_UNIVERSE_MEMBERSHIPS = frozenset(
     {"DETACHED", "DISCOVERED", "LINKED", "MANAGED"}
 )
 PROJECT_RUNTIME_HOSTS = frozenset({"PROJECT_LOCAL", "UNIVERSE_SHARED"})
+RUNTIME_LEASE_STATUSES = frozenset({"ACTIVE", "RELEASED", "EXPIRED", "UNHEALTHY"})
+RUNTIME_LEASE_HEALTH_STATUSES = frozenset({"UNKNOWN", "HEALTHY", "UNHEALTHY"})
+RUNTIME_LEASE_DEFAULT_TTL_SECONDS = 3600
+RUNTIME_LEASE_MAX_TTL_SECONDS = 30 * 24 * 3600
+RUNTIME_HOST_PROFILE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_.-]{0,63}$")
 PROJECT_ATTACHMENT_FIELDS = frozenset(
     {"schema", "install_origin", "universe_membership", "runtime_host"}
 )
@@ -1407,6 +1414,106 @@ def _observed_at(value: Any, field: str) -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def _lease_timestamp(value: Any, field: str) -> datetime:
+    normalized = _observed_at(value, field)
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
+def _normalize_runtime_lease_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="runtime_lease_activate",
+        required=frozenset({"runtime_host_profile"}),
+        optional=frozenset({"schema", "selected_release_id", "ttl_seconds"}),
+    )
+    schema = request.get("schema", RUNTIME_LEASE_SCHEMA)
+    if schema != RUNTIME_LEASE_SCHEMA:
+        raise UniverseError(
+            "RUNTIME_LEASE_SCHEMA_INVALID",
+            f"runtime lease schema must be {RUNTIME_LEASE_SCHEMA}",
+        )
+    runtime_host_profile = _required_text(
+        request["runtime_host_profile"], "runtime_host_profile"
+    ).upper()
+    if not RUNTIME_HOST_PROFILE_PATTERN.fullmatch(runtime_host_profile):
+        raise UniverseError(
+            "RUNTIME_LEASE_HOST_PROFILE_INVALID",
+            "runtime_host_profile must be an uppercase identifier",
+        )
+    selected_release_id = request.get("selected_release_id")
+    if selected_release_id is not None:
+        selected_release_id = _identifier(selected_release_id, "selected_release_id")
+    ttl_seconds = request.get("ttl_seconds", RUNTIME_LEASE_DEFAULT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or not 1 <= ttl_seconds <= RUNTIME_LEASE_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "RUNTIME_LEASE_TTL_INVALID",
+            f"ttl_seconds must be an integer between 1 and {RUNTIME_LEASE_MAX_TTL_SECONDS}",
+        )
+    return {
+        "schema": RUNTIME_LEASE_SCHEMA,
+        "runtime_host_profile": runtime_host_profile,
+        "selected_release_id": selected_release_id,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+def _normalize_runtime_lease_control(
+    value: Any,
+    *,
+    operation: str,
+    optional: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field=f"runtime_lease_{operation}",
+        required=frozenset({"lease_id"}),
+        optional=frozenset({"schema", *optional}),
+    )
+    schema = request.get("schema", RUNTIME_LEASE_SCHEMA)
+    if schema != RUNTIME_LEASE_SCHEMA:
+        raise UniverseError(
+            "RUNTIME_LEASE_SCHEMA_INVALID",
+            f"runtime lease schema must be {RUNTIME_LEASE_SCHEMA}",
+        )
+    request["lease_id"] = _required_text(request["lease_id"], "lease_id")
+    return request
+
+
+def _project_local_fallback(project: Mapping[str, Any]) -> dict[str, Any]:
+    attachment = project["attachment"]
+    origin = attachment["install_origin"]
+    metadata = project.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    declaration = metadata.get("local_fallback")
+    declared = declaration is True or (
+        isinstance(declaration, Mapping) and declaration.get("declared") is True
+    )
+    if origin == "PROJECT_STANDALONE":
+        return {
+            "status": "AVAILABLE",
+            "runtime_host": "PROJECT_LOCAL",
+            "declared": True,
+            "reason": "PROJECT_STANDALONE_ORIGIN",
+        }
+    if origin == "UNIVERSE_CREATED" and declared:
+        return {
+            "status": "AVAILABLE",
+            "runtime_host": "PROJECT_LOCAL",
+            "declared": True,
+            "reason": "DECLARED_LOCAL_FALLBACK",
+        }
+    return {
+        "status": "UNAVAILABLE",
+        "runtime_host": attachment["runtime_host"],
+        "declared": False,
+        "reason": "LOCAL_FALLBACK_NOT_DECLARED",
+    }
 
 
 def _skill_metrics(value: Any, field: str) -> dict[str, int | float]:
@@ -3809,6 +3916,34 @@ class UniverseStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS shared_runtime_lease (
+                    schema TEXT NOT NULL DEFAULT 'universe.shared-runtime-lease.v1',
+                    lease_id TEXT PRIMARY KEY,
+                    universe_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    selected_release_id TEXT
+                        REFERENCES release_artifact(release_id),
+                    runtime_host_profile TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('ACTIVE', 'RELEASED', 'EXPIRED', 'UNHEALTHY')),
+                    health_status TEXT NOT NULL
+                        CHECK(health_status IN ('UNKNOWN', 'HEALTHY', 'UNHEALTHY')),
+                    last_health_checked_at TEXT,
+                    released_at TEXT,
+                    reason TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS shared_runtime_lease_active_project
+                ON shared_runtime_lease(project_id)
+                WHERE status = 'ACTIVE';
+
+                CREATE INDEX IF NOT EXISTS shared_runtime_lease_project_time
+                ON shared_runtime_lease(project_id, issued_at, lease_id);
+
                 CREATE TABLE IF NOT EXISTS project_event (
                     event_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -5082,6 +5217,41 @@ class UniverseStore:
                         "install_origin cannot change after registration",
                         HTTPStatus.CONFLICT,
                     )
+                active_lease = connection.execute(
+                    """
+                    SELECT lease_id FROM shared_runtime_lease
+                    WHERE project_id = ? AND status = 'ACTIVE'
+                    """,
+                    (project["project_id"],),
+                ).fetchone()
+                if active_lease is not None and (
+                    project["attachment"]["universe_membership"]
+                    != stored_attachment["universe_membership"]
+                    or project["attachment"]["runtime_host"]
+                    != stored_attachment["runtime_host"]
+                ):
+                    raise UniverseError(
+                        "RUNTIME_LEASE_ACTIVE_ATTACHMENT_MUTATION",
+                        "active runtime lease must be released before changing attachment",
+                        HTTPStatus.CONFLICT,
+                    )
+            if (
+                project["attachment"]["universe_membership"] == "MANAGED"
+                or project["attachment"]["runtime_host"] == "UNIVERSE_SHARED"
+            ):
+                active_lease = connection.execute(
+                    """
+                    SELECT lease_id FROM shared_runtime_lease
+                    WHERE project_id = ? AND status = 'ACTIVE'
+                    """,
+                    (project["project_id"],),
+                ).fetchone()
+                if active_lease is None:
+                    raise UniverseError(
+                        "RUNTIME_LEASE_REQUIRED",
+                        "MANAGED or UNIVERSE_SHARED attachment requires an active runtime lease",
+                        HTTPStatus.CONFLICT,
+                    )
             root_owner = connection.execute(
                 "SELECT project_id FROM project_connection WHERE project_root = ?",
                 (project["project_root"],),
@@ -5157,9 +5327,571 @@ class UniverseStore:
             )
         return self._project_row(row)
 
+    def _project_for_connection(
+        self, connection: sqlite3.Connection, project_id: str
+    ) -> dict[str, Any]:
+        normalized = _project_id(project_id)
+        row = connection.execute(
+            """
+            SELECT project_id, project_root, refs_json, metadata_json,
+                   attachment_json, registered_at, updated_at
+            FROM project_connection
+            WHERE project_id = ?
+            """,
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "PROJECT_NOT_FOUND",
+                f"project is not attached: {normalized}",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._project_row(row)
+
+    @staticmethod
+    def _runtime_lease_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": str(row["schema"]),
+            "lease_id": str(row["lease_id"]),
+            "universe_id": str(row["universe_id"]),
+            "project_id": str(row["project_id"]),
+            "selected_release_id": row["selected_release_id"],
+            "runtime_host_profile": str(row["runtime_host_profile"]),
+            "issued_at": str(row["issued_at"]),
+            "expires_at": str(row["expires_at"]),
+            "status": str(row["status"]),
+            "health_status": str(row["health_status"]),
+            "last_health_checked_at": row["last_health_checked_at"],
+            "released_at": row["released_at"],
+            "reason": row["reason"],
+        }
+
+    @staticmethod
+    def _runtime_lease_result(
+        *,
+        status: str,
+        lease: dict[str, Any] | None,
+        project: dict[str, Any],
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema": RUNTIME_LEASE_OPERATION_SCHEMA,
+            "status": status,
+            "project_id": project["project_id"],
+            "lease": lease,
+            "project": project,
+            "fallback": fallback,
+        }
+
+    @staticmethod
+    def _runtime_lease_universe_id(connection: sqlite3.Connection) -> str:
+        row = connection.execute(
+            "SELECT universe_id FROM universe_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "UNIVERSE_IDENTITY_UNAVAILABLE",
+                "Universe identity is missing from the local database",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        return str(row["universe_id"])
+
+    @staticmethod
+    def _set_project_runtime_attachment(
+        connection: sqlite3.Connection,
+        project: dict[str, Any],
+        *,
+        membership: str,
+        runtime_host: str,
+        now: str,
+    ) -> dict[str, Any]:
+        attachment = dict(project["attachment"])
+        attachment["universe_membership"] = membership
+        attachment["runtime_host"] = runtime_host
+        connection.execute(
+            """
+            UPDATE project_connection
+            SET attachment_json = ?, updated_at = ?
+            WHERE project_id = ?
+            """,
+            (
+                _canonical_json(attachment),
+                now,
+                project["project_id"],
+            ),
+        )
+        project["attachment"] = attachment
+        project["updated_at"] = now
+        return project
+
+    def _apply_runtime_fallback(
+        self,
+        connection: sqlite3.Connection,
+        project: dict[str, Any],
+        *,
+        now: str,
+    ) -> dict[str, Any]:
+        fallback = _project_local_fallback(project)
+        self._set_project_runtime_attachment(
+            connection,
+            project,
+            membership="LINKED",
+            runtime_host=fallback["runtime_host"],
+            now=now,
+        )
+        return fallback
+
+    def _expire_runtime_lease(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        now: str,
+    ) -> tuple[sqlite3.Row, dict[str, Any], dict[str, Any]]:
+        project = self._project_for_connection(connection, row["project_id"])
+        fallback = self._apply_runtime_fallback(connection, project, now=now)
+        connection.execute(
+            """
+            UPDATE shared_runtime_lease
+            SET status = 'EXPIRED', health_status = 'UNHEALTHY',
+                released_at = ?, reason = ?
+            WHERE lease_id = ? AND status = 'ACTIVE'
+            """,
+            (now, "LEASE_EXPIRED", row["lease_id"]),
+        )
+        refreshed = connection.execute(
+            "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+            (row["lease_id"],),
+        ).fetchone()
+        if refreshed is None:
+            raise UniverseError(
+                "RUNTIME_LEASE_NOT_FOUND",
+                "runtime lease disappeared during expiry reconciliation",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        return refreshed, project, fallback
+
+    def activate_shared_runtime_lease(
+        self,
+        project_id: str,
+        value: Any,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        request = _normalize_runtime_lease_request(value)
+        issued_at = _observed_at(now or utc_now(), "issued_at")
+        issued_datetime = _lease_timestamp(issued_at, "issued_at")
+        expires_at = (
+            issued_datetime + timedelta(seconds=request["ttl_seconds"])
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self._connection() as connection:
+            project = self._project_for_connection(connection, project_id)
+            active = connection.execute(
+                """
+                SELECT * FROM shared_runtime_lease
+                WHERE project_id = ? AND status = 'ACTIVE'
+                """,
+                (project["project_id"],),
+            ).fetchone()
+            if active is not None:
+                if _lease_timestamp(active["expires_at"], "expires_at") <= _lease_timestamp(
+                    issued_at, "issued_at"
+                ):
+                    self._expire_runtime_lease(connection, active, now=issued_at)
+                else:
+                    raise UniverseError(
+                        "RUNTIME_LEASE_ALREADY_ACTIVE",
+                        "project already has an active shared runtime lease",
+                        HTTPStatus.CONFLICT,
+                    )
+                project = self._project_for_connection(connection, project_id)
+            if project["attachment"]["universe_membership"] != "LINKED":
+                raise UniverseError(
+                    "RUNTIME_LEASE_ATTACHMENT_TRANSITION_INVALID",
+                    "only LINKED projects can activate a shared runtime lease",
+                    HTTPStatus.CONFLICT,
+                )
+            selected_release_id = request["selected_release_id"]
+            if selected_release_id is not None:
+                release = connection.execute(
+                    "SELECT 1 FROM release_artifact WHERE release_id = ?",
+                    (selected_release_id,),
+                ).fetchone()
+                if release is None:
+                    raise UniverseError(
+                        "RELEASE_NOT_FOUND",
+                        f"release is not imported: {selected_release_id}",
+                        HTTPStatus.NOT_FOUND,
+                    )
+            lease_id = "lease_" + uuid.uuid4().hex
+            universe_id = self._runtime_lease_universe_id(connection)
+            connection.execute(
+                """
+                INSERT INTO shared_runtime_lease(
+                    schema, lease_id, universe_id, project_id, selected_release_id,
+                    runtime_host_profile, issued_at, expires_at, status,
+                    health_status, last_health_checked_at, released_at, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'UNKNOWN', NULL, NULL, NULL)
+                """,
+                (
+                    RUNTIME_LEASE_SCHEMA,
+                    lease_id,
+                    universe_id,
+                    project["project_id"],
+                    selected_release_id,
+                    request["runtime_host_profile"],
+                    issued_at,
+                    expires_at,
+                ),
+            )
+            self._set_project_runtime_attachment(
+                connection,
+                project,
+                membership="MANAGED",
+                runtime_host="UNIVERSE_SHARED",
+                now=issued_at,
+            )
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_FOUND",
+                    "runtime lease was not persisted",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return self._runtime_lease_result(
+                status="RUNTIME_LEASE_ACTIVATED",
+                lease=self._runtime_lease_row(row),
+                project=project,
+                fallback={
+                    "status": "SHARED_RUNTIME_ACTIVE",
+                    "runtime_host": "UNIVERSE_SHARED",
+                    "declared": True,
+                    "reason": "ACTIVE_SHARED_RUNTIME_LEASE",
+                },
+            )
+
+    def inspect_shared_runtime_lease(
+        self,
+        project_id: str,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        observed_at = _observed_at(now or utc_now(), "observed_at")
+        with self._connection() as connection:
+            project = self._project_for_connection(connection, project_id)
+            row = connection.execute(
+                """
+                SELECT * FROM shared_runtime_lease
+                WHERE project_id = ?
+                ORDER BY issued_at DESC, lease_id DESC
+                LIMIT 1
+                """,
+                (project["project_id"],),
+            ).fetchone()
+            fallback = _project_local_fallback(project)
+            if row is not None and row["status"] == "ACTIVE":
+                if _lease_timestamp(row["expires_at"], "expires_at") <= _lease_timestamp(
+                    observed_at, "observed_at"
+                ):
+                    row, project, fallback = self._expire_runtime_lease(
+                        connection, row, now=observed_at
+                    )
+                else:
+                    fallback = {
+                        "status": "SHARED_RUNTIME_ACTIVE",
+                        "runtime_host": "UNIVERSE_SHARED",
+                        "declared": True,
+                        "reason": "ACTIVE_SHARED_RUNTIME_LEASE",
+                    }
+            return self._runtime_lease_result(
+                status="RUNTIME_LEASE_INSPECTED",
+                lease=self._runtime_lease_row(row) if row is not None else None,
+                project=project,
+                fallback=fallback,
+            )
+
+    def list_shared_runtime_leases(
+        self,
+        project_id: str | None = None,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        observed_at = _observed_at(now or utc_now(), "observed_at")
+        with self._connection() as connection:
+            params: tuple[Any, ...] = ()
+            where = ""
+            if project_id is not None:
+                normalized = _project_id(project_id)
+                self._project_for_connection(connection, normalized)
+                where = "WHERE project_id = ?"
+                params = (normalized,)
+            rows = connection.execute(
+                f"SELECT * FROM shared_runtime_lease {where} "
+                "ORDER BY issued_at DESC, lease_id DESC",
+                params,
+            ).fetchall()
+            for row in rows:
+                if row["status"] == "ACTIVE" and _lease_timestamp(
+                    row["expires_at"], "expires_at"
+                ) <= _lease_timestamp(observed_at, "observed_at"):
+                    self._expire_runtime_lease(connection, row, now=observed_at)
+            rows = connection.execute(
+                f"SELECT * FROM shared_runtime_lease {where} "
+                "ORDER BY issued_at DESC, lease_id DESC",
+                params,
+            ).fetchall()
+        return {
+            "schema": RUNTIME_LEASE_OPERATION_SCHEMA,
+            "status": "RUNTIME_LEASES_COLLECTED",
+            "project_id": project_id,
+            "leases": [self._runtime_lease_row(row) for row in rows],
+        }
+
+    def renew_shared_runtime_lease(
+        self,
+        project_id: str,
+        value: Any,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        request = _normalize_runtime_lease_control(
+            value, operation="renew", optional=frozenset({"ttl_seconds"})
+        )
+        ttl_seconds = request.get("ttl_seconds", RUNTIME_LEASE_DEFAULT_TTL_SECONDS)
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or not 1 <= ttl_seconds <= RUNTIME_LEASE_MAX_TTL_SECONDS
+        ):
+            raise UniverseError(
+                "RUNTIME_LEASE_TTL_INVALID",
+                f"ttl_seconds must be an integer between 1 and {RUNTIME_LEASE_MAX_TTL_SECONDS}",
+            )
+        observed_at = _observed_at(now or utc_now(), "renewed_at")
+        observed_datetime = _lease_timestamp(observed_at, "renewed_at")
+        expires_at = (
+            observed_datetime + timedelta(seconds=ttl_seconds)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self._connection() as connection:
+            project = self._project_for_connection(connection, project_id)
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ? AND project_id = ?",
+                (request["lease_id"], project["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_FOUND",
+                    "runtime lease is not bound to this project",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["status"] == "ACTIVE" and _lease_timestamp(
+                row["expires_at"], "expires_at"
+            ) <= observed_datetime:
+                self._expire_runtime_lease(connection, row, now=observed_at)
+                row = connection.execute(
+                    "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+                    (request["lease_id"],),
+                ).fetchone()
+            if row["status"] != "ACTIVE":
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_ACTIVE",
+                    "only an active shared runtime lease can be renewed",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                "UPDATE shared_runtime_lease SET expires_at = ? WHERE lease_id = ?",
+                (expires_at, request["lease_id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+                (request["lease_id"],),
+            ).fetchone()
+            return self._runtime_lease_result(
+                status="RUNTIME_LEASE_RENEWED",
+                lease=self._runtime_lease_row(row),
+                project=project,
+                fallback={
+                    "status": "SHARED_RUNTIME_ACTIVE",
+                    "runtime_host": "UNIVERSE_SHARED",
+                    "declared": True,
+                    "reason": "ACTIVE_SHARED_RUNTIME_LEASE",
+                },
+            )
+
+    def release_shared_runtime_lease(
+        self,
+        project_id: str,
+        value: Any,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        request = _normalize_runtime_lease_control(
+            value, operation="release", optional=frozenset({"reason"})
+        )
+        observed_at = _observed_at(now or utc_now(), "released_at")
+        observed_datetime = _lease_timestamp(observed_at, "released_at")
+        reason = _required_text(
+            request.get("reason", "OPERATOR_RELEASE"), "reason"
+        )
+        with self._connection() as connection:
+            project = self._project_for_connection(connection, project_id)
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ? AND project_id = ?",
+                (request["lease_id"], project["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_FOUND",
+                    "runtime lease is not bound to this project",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["status"] == "ACTIVE" and _lease_timestamp(
+                row["expires_at"], "expires_at"
+            ) <= observed_datetime:
+                self._expire_runtime_lease(connection, row, now=observed_at)
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_ACTIVE",
+                    "expired runtime lease was reconciled before release",
+                    HTTPStatus.CONFLICT,
+                )
+            if row["status"] != "ACTIVE":
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_ACTIVE",
+                    "only an active shared runtime lease can be released",
+                    HTTPStatus.CONFLICT,
+                )
+            fallback = self._apply_runtime_fallback(
+                connection, project, now=observed_at
+            )
+            connection.execute(
+                """
+                UPDATE shared_runtime_lease
+                SET status = 'RELEASED', released_at = ?, reason = ?
+                WHERE lease_id = ?
+                """,
+                (observed_at, reason, request["lease_id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+                (request["lease_id"],),
+            ).fetchone()
+            return self._runtime_lease_result(
+                status="RUNTIME_LEASE_RELEASED",
+                lease=self._runtime_lease_row(row),
+                project=project,
+                fallback=fallback,
+            )
+
+    def health_check_shared_runtime_lease(
+        self,
+        project_id: str,
+        value: Any,
+        *,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        request = _normalize_runtime_lease_control(
+            value,
+            operation="health",
+            optional=frozenset({"health_status"}),
+        )
+        health_status = _required_text(
+            request.get("health_status"), "health_status"
+        ).upper()
+        if health_status not in RUNTIME_LEASE_HEALTH_STATUSES - {"UNKNOWN"}:
+            raise UniverseError(
+                "RUNTIME_LEASE_HEALTH_INVALID",
+                "health_status must be HEALTHY or UNHEALTHY",
+            )
+        observed_at = _observed_at(now or utc_now(), "health_checked_at")
+        with self._connection() as connection:
+            project = self._project_for_connection(connection, project_id)
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ? AND project_id = ?",
+                (request["lease_id"], project["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_FOUND",
+                    "runtime lease is not bound to this project",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["status"] == "ACTIVE" and _lease_timestamp(
+                row["expires_at"], "expires_at"
+            ) <= _lease_timestamp(observed_at, "health_checked_at"):
+                self._expire_runtime_lease(connection, row, now=observed_at)
+                row = connection.execute(
+                    "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+                    (request["lease_id"],),
+                ).fetchone()
+            if row["status"] != "ACTIVE":
+                raise UniverseError(
+                    "RUNTIME_LEASE_NOT_ACTIVE",
+                    "only an active shared runtime lease can be health-checked",
+                    HTTPStatus.CONFLICT,
+                )
+            if health_status == "HEALTHY":
+                fallback = {
+                    "status": "SHARED_RUNTIME_ACTIVE",
+                    "runtime_host": "UNIVERSE_SHARED",
+                    "declared": True,
+                    "reason": "HEALTH_CHECK_PASSED",
+                }
+                connection.execute(
+                    """
+                    UPDATE shared_runtime_lease
+                    SET health_status = 'HEALTHY', last_health_checked_at = ?
+                    WHERE lease_id = ?
+                    """,
+                    (observed_at, request["lease_id"]),
+                )
+            else:
+                fallback = self._apply_runtime_fallback(
+                    connection, project, now=observed_at
+                )
+                connection.execute(
+                    """
+                    UPDATE shared_runtime_lease
+                    SET status = 'UNHEALTHY', health_status = 'UNHEALTHY',
+                        last_health_checked_at = ?, released_at = ?, reason = ?
+                    WHERE lease_id = ?
+                    """,
+                    (
+                        observed_at,
+                        observed_at,
+                        "HEALTH_CHECK_FAILED",
+                        request["lease_id"],
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
+                (request["lease_id"],),
+            ).fetchone()
+            return self._runtime_lease_result(
+                status="RUNTIME_LEASE_HEALTH_RECORDED",
+                lease=self._runtime_lease_row(row),
+                project=project,
+                fallback=fallback,
+            )
+
     def delete_project(self, project_id: str) -> dict[str, Any]:
         normalized = _project_id(project_id)
         with self._connection() as connection:
+            active_lease = connection.execute(
+                """
+                SELECT lease_id FROM shared_runtime_lease
+                WHERE project_id = ? AND status = 'ACTIVE'
+                """,
+                (normalized,),
+            ).fetchone()
+            if active_lease is not None:
+                raise UniverseError(
+                    "RUNTIME_LEASE_RELEASE_REQUIRED",
+                    "active runtime lease must be released before detaching a project",
+                    HTTPStatus.CONFLICT,
+                )
             cursor = connection.execute(
                 "DELETE FROM project_connection WHERE project_id = ?", (normalized,)
             )
@@ -13566,6 +14298,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        if path == "/v1/runtime-leases":
+            query = parse_qs(urlsplit(self.path).query)
+            project_id = (query.get("project_id") or [None])[0]
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.list_shared_runtime_leases(project_id),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/settings/providers":
             self._send(
                 HTTPStatus.OK,
@@ -13863,6 +14606,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         try:
             if suffix == "":
                 self._send(HTTPStatus.OK, self.server.store.get_project(project_id))
+                return
+            if suffix == "/runtime-lease":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.inspect_shared_runtime_lease(project_id),
+                )
                 return
             if suffix == "/events":
                 self._send(
@@ -14998,6 +15747,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.prepare_project_master_session(parts[0]),
                 )
                 return
+            if parts is not None and parts[1] == "/runtime-lease/activate":
+                result = self.server.store.activate_shared_runtime_lease(
+                    parts[0], body
+                )
+                self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
+                return
+            if parts is not None and parts[1] == "/runtime-lease/renew":
+                result = self.server.store.renew_shared_runtime_lease(parts[0], body)
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
+            if parts is not None and parts[1] == "/runtime-lease/release":
+                result = self.server.store.release_shared_runtime_lease(parts[0], body)
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
+            if parts is not None and parts[1] == "/runtime-lease/health":
+                result = self.server.store.health_check_shared_runtime_lease(
+                    parts[0], body
+                )
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
             if parts is not None and parts[1] == "/provider-setting":
                 self._send(
                     HTTPStatus.OK,
@@ -15695,6 +16464,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-bridge/replies",
             "/master-bridge",
             "/master-session/prepare",
+            "/runtime-lease/activate",
+            "/runtime-lease/renew",
+            "/runtime-lease/release",
+            "/runtime-lease/health",
+            "/runtime-lease",
             "/agent-session/permissions",
             "/governance-proposals",
             "/provider-setting",

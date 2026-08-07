@@ -5273,5 +5273,234 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(listed["invocations"]))
 
 
+class RuntimeLeaseStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.store = UniverseStore(self.root / "universe.sqlite3")
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def register_project(
+        self,
+        project_id: str,
+        *,
+        origin: str = "PROJECT_STANDALONE",
+        metadata: dict[str, Any] | None = None,
+        membership: str = "LINKED",
+    ) -> dict[str, Any]:
+        project_root = self.root / project_id
+        project_root.mkdir(parents=True, exist_ok=True)
+        (project_root / "REPOSITORY_MANIFEST.md").write_text(
+            f"# {project_id}\n",
+            encoding="utf-8",
+        )
+        project, created = self.store.register_project(
+            {
+                "project_id": project_id,
+                "project_root": str(project_root),
+                "metadata": metadata or {},
+                "attachment": {
+                    "install_origin": origin,
+                    "universe_membership": membership,
+                    "runtime_host": "PROJECT_LOCAL",
+                },
+            }
+        )
+        self.assertTrue(created)
+        return project
+
+    @staticmethod
+    def activate_request(**overrides: Any) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "runtime_host_profile": "UNIVERSE_SHARED_DEFAULT",
+            "selected_release_id": None,
+            "ttl_seconds": 300,
+        }
+        request.update(overrides)
+        return request
+
+    def test_activate_inspect_list_and_renew_shared_runtime_lease(self) -> None:
+        project = self.register_project("LEASE-HAPPY")
+        activated = self.store.activate_shared_runtime_lease(
+            project["project_id"],
+            self.activate_request(),
+            now="2026-08-07T00:00:00Z",
+        )
+        lease = activated["lease"]
+        self.assertEqual("RUNTIME_LEASE_ACTIVATED", activated["status"])
+        self.assertEqual("ACTIVE", lease["status"])
+        self.assertEqual(self.store.identity()["universe_id"], lease["universe_id"])
+        self.assertEqual("LEASE-HAPPY", lease["project_id"])
+        self.assertIsNone(lease["selected_release_id"])
+        self.assertNotIn("source_write", lease)
+        self.assertEqual("MANAGED", activated["project"]["attachment"]["universe_membership"])
+        self.assertEqual("UNIVERSE_SHARED", activated["project"]["attachment"]["runtime_host"])
+
+        inspected = self.store.inspect_shared_runtime_lease(
+            "LEASE-HAPPY", now="2026-08-07T00:01:00Z"
+        )
+        self.assertEqual(lease["lease_id"], inspected["lease"]["lease_id"])
+        self.assertEqual("SHARED_RUNTIME_ACTIVE", inspected["fallback"]["status"])
+        listed = self.store.list_shared_runtime_leases(
+            "LEASE-HAPPY", now="2026-08-07T00:01:00Z"
+        )
+        self.assertEqual([lease["lease_id"]], [item["lease_id"] for item in listed["leases"]])
+
+        renewed = self.store.renew_shared_runtime_lease(
+            "LEASE-HAPPY",
+            {"lease_id": lease["lease_id"], "ttl_seconds": 600},
+            now="2026-08-07T00:02:00Z",
+        )
+        self.assertEqual("RUNTIME_LEASE_RENEWED", renewed["status"])
+        self.assertEqual("2026-08-07T00:12:00Z", renewed["lease"]["expires_at"])
+
+    def test_release_and_unhealthy_use_explicit_standalone_fallback(self) -> None:
+        project = self.register_project("LEASE-STANDALONE")
+        activated = self.store.activate_shared_runtime_lease(
+            project["project_id"],
+            self.activate_request(),
+            now="2026-08-07T00:00:00Z",
+        )
+        released = self.store.release_shared_runtime_lease(
+            project["project_id"],
+            {"lease_id": activated["lease"]["lease_id"]},
+            now="2026-08-07T00:01:00Z",
+        )
+        self.assertEqual("RELEASED", released["lease"]["status"])
+        self.assertEqual("AVAILABLE", released["fallback"]["status"])
+        self.assertEqual("PROJECT_LOCAL", released["fallback"]["runtime_host"])
+        self.assertEqual("LINKED", released["project"]["attachment"]["universe_membership"])
+        self.assertEqual("PROJECT_LOCAL", released["project"]["attachment"]["runtime_host"])
+
+        declared = self.register_project(
+            "LEASE-DECLARED",
+            origin="UNIVERSE_CREATED",
+            metadata={"local_fallback": {"declared": True}},
+        )
+        managed = self.store.activate_shared_runtime_lease(
+            declared["project_id"],
+            self.activate_request(),
+            now="2026-08-07T00:00:00Z",
+        )
+        unhealthy = self.store.health_check_shared_runtime_lease(
+            declared["project_id"],
+            {
+                "lease_id": managed["lease"]["lease_id"],
+                "health_status": "UNHEALTHY",
+            },
+            now="2026-08-07T00:01:00Z",
+        )
+        self.assertEqual("UNHEALTHY", unhealthy["lease"]["status"])
+        self.assertEqual("AVAILABLE", unhealthy["fallback"]["status"])
+        self.assertEqual("PROJECT_LOCAL", unhealthy["project"]["attachment"]["runtime_host"])
+
+    def test_expiry_releases_to_linked_and_blocks_renewal(self) -> None:
+        project = self.register_project("LEASE-EXPIRY")
+        activated = self.store.activate_shared_runtime_lease(
+            project["project_id"],
+            self.activate_request(ttl_seconds=60),
+            now="2026-08-07T00:00:00Z",
+        )
+        expired = self.store.inspect_shared_runtime_lease(
+            project["project_id"], now="2026-08-07T00:01:01Z"
+        )
+        self.assertEqual("EXPIRED", expired["lease"]["status"])
+        self.assertEqual("LINKED", expired["project"]["attachment"]["universe_membership"])
+        self.assertEqual("AVAILABLE", expired["fallback"]["status"])
+        with self.assertRaises(UniverseError) as context:
+            self.store.renew_shared_runtime_lease(
+                project["project_id"],
+                {"lease_id": activated["lease"]["lease_id"]},
+                now="2026-08-07T00:02:00Z",
+            )
+        self.assertEqual("RUNTIME_LEASE_NOT_ACTIVE", context.exception.code)
+
+    def test_universe_created_without_fallback_reports_unavailable(self) -> None:
+        project = self.register_project("LEASE-NO-FALLBACK", origin="UNIVERSE_CREATED")
+        activated = self.store.activate_shared_runtime_lease(
+            project["project_id"],
+            self.activate_request(),
+            now="2026-08-07T00:00:00Z",
+        )
+        unhealthy = self.store.health_check_shared_runtime_lease(
+            project["project_id"],
+            {
+                "lease_id": activated["lease"]["lease_id"],
+                "health_status": "UNHEALTHY",
+            },
+            now="2026-08-07T00:01:00Z",
+        )
+        self.assertEqual("UNAVAILABLE", unhealthy["fallback"]["status"])
+        self.assertEqual("LOCAL_FALLBACK_NOT_DECLARED", unhealthy["fallback"]["reason"])
+        self.assertEqual("LINKED", unhealthy["project"]["attachment"]["universe_membership"])
+        self.assertEqual("UNIVERSE_SHARED", unhealthy["project"]["attachment"]["runtime_host"])
+
+    def test_invalid_attachment_transitions_and_lease_inputs_are_rejected(self) -> None:
+        detached = self.register_project(
+            "LEASE-DETACHED",
+            membership="DETACHED",
+        )
+        with self.assertRaises(UniverseError) as context:
+            self.store.activate_shared_runtime_lease(
+                detached["project_id"],
+                self.activate_request(),
+            )
+        self.assertEqual("RUNTIME_LEASE_ATTACHMENT_TRANSITION_INVALID", context.exception.code)
+
+        linked = self.register_project("LEASE-INVALID")
+        with self.assertRaises(UniverseError) as context:
+            self.store.activate_shared_runtime_lease(
+                linked["project_id"],
+                self.activate_request(selected_release_id="missing-release"),
+            )
+        self.assertEqual("RELEASE_NOT_FOUND", context.exception.code)
+
+        activated = self.store.activate_shared_runtime_lease(
+            linked["project_id"], self.activate_request()
+        )
+        with self.assertRaises(UniverseError) as context:
+            self.store.register_project(
+                {
+                    "project_id": linked["project_id"],
+                    "project_root": linked["project_root"],
+                    "metadata": linked["metadata"],
+                    "attachment": {
+                        "install_origin": "PROJECT_STANDALONE",
+                        "universe_membership": "LINKED",
+                        "runtime_host": "PROJECT_LOCAL",
+                    },
+                }
+            )
+        self.assertEqual(
+            "RUNTIME_LEASE_ACTIVE_ATTACHMENT_MUTATION", context.exception.code
+        )
+        with self.assertRaises(UniverseError) as context:
+            self.store.activate_shared_runtime_lease(
+                linked["project_id"], self.activate_request()
+            )
+        self.assertEqual("RUNTIME_LEASE_ALREADY_ACTIVE", context.exception.code)
+        with self.assertRaises(UniverseError) as context:
+            self.store.health_check_shared_runtime_lease(
+                linked["project_id"],
+                {
+                    "lease_id": activated["lease"]["lease_id"],
+                    "health_status": "UNKNOWN",
+                },
+            )
+        self.assertEqual("RUNTIME_LEASE_HEALTH_INVALID", context.exception.code)
+        with self.assertRaises(UniverseError) as context:
+            self.store.delete_project(linked["project_id"])
+        self.assertEqual("RUNTIME_LEASE_RELEASE_REQUIRED", context.exception.code)
+
+        with self.assertRaises(UniverseError) as context:
+            self.register_project(
+                "LEASE-MANAGED-WITHOUT-LEASE",
+                membership="MANAGED",
+            )
+        self.assertEqual("RUNTIME_LEASE_REQUIRED", context.exception.code)
+
+
 if __name__ == "__main__":
     unittest.main()
