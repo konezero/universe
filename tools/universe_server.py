@@ -142,6 +142,7 @@ API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
+PROJECT_ATTACHMENT_SCHEMA = "universe.project-attachment.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 TODO_SCHEMA = "universe.todo.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
@@ -228,6 +229,14 @@ PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+PROJECT_INSTALL_ORIGINS = frozenset({"PROJECT_STANDALONE", "UNIVERSE_CREATED"})
+PROJECT_UNIVERSE_MEMBERSHIPS = frozenset(
+    {"DETACHED", "DISCOVERED", "LINKED", "MANAGED"}
+)
+PROJECT_RUNTIME_HOSTS = frozenset({"PROJECT_LOCAL", "UNIVERSE_SHARED"})
+PROJECT_ATTACHMENT_FIELDS = frozenset(
+    {"schema", "install_origin", "universe_membership", "runtime_host"}
+)
 CONNECTION_KINDS = frozenset({"LOCAL", "REMOTE", "PEER"})
 TRANSPORT_KINDS = frozenset({"HTTP", "GIT", "P2P"})
 INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
@@ -817,6 +826,82 @@ def _project_id(value: Any) -> str:
     return project_id
 
 
+def normalize_project_attachment(
+    value: Any = None,
+    *,
+    default_membership: str = "DETACHED",
+    install_mode: Any = None,
+) -> dict[str, str]:
+    """Return the versioned attachment record without changing project identity."""
+
+    if value is None:
+        raw: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        raw = dict(value)
+    else:
+        raise UniverseError(
+            "PROJECT_ATTACHMENT_INVALID",
+            "attachment must be an object",
+        )
+
+    unknown = set(raw) - PROJECT_ATTACHMENT_FIELDS
+    if unknown:
+        raise UniverseError(
+            "PROJECT_ATTACHMENT_INVALID",
+            f"attachment contains unsupported fields: {', '.join(sorted(unknown))}",
+        )
+
+    schema = raw.get("schema", PROJECT_ATTACHMENT_SCHEMA)
+    if schema != PROJECT_ATTACHMENT_SCHEMA:
+        raise UniverseError(
+            "PROJECT_ATTACHMENT_SCHEMA_INVALID",
+            f"attachment schema must be {PROJECT_ATTACHMENT_SCHEMA}",
+        )
+
+    default_membership = _required_text(
+        default_membership, "default_membership"
+    ).upper()
+    if default_membership not in PROJECT_UNIVERSE_MEMBERSHIPS:
+        raise UniverseError(
+            "PROJECT_ATTACHMENT_VALUE_INVALID",
+            f"unsupported default_membership: {default_membership}",
+        )
+
+    defaults = {
+        "install_origin": "PROJECT_STANDALONE",
+        "universe_membership": default_membership,
+        "runtime_host": "PROJECT_LOCAL",
+    }
+
+    if install_mode is not None:
+        normalized_mode = _required_text(install_mode, "install_mode").upper()
+        if normalized_mode not in {"PROJECT_STANDALONE", "UNIVERSE_ATTACHED"}:
+            raise UniverseError(
+                "PROJECT_INSTALL_MODE_INVALID",
+                "install_mode must be PROJECT_STANDALONE or UNIVERSE_ATTACHED",
+            )
+        # The legacy flag describes the connection posture, not historical
+        # origin. Keep origin conservative and only map the live relationship.
+        if normalized_mode == "UNIVERSE_ATTACHED":
+            defaults["universe_membership"] = "LINKED"
+
+    normalized: dict[str, str] = {"schema": PROJECT_ATTACHMENT_SCHEMA}
+    for field, allowed in (
+        ("install_origin", PROJECT_INSTALL_ORIGINS),
+        ("universe_membership", PROJECT_UNIVERSE_MEMBERSHIPS),
+        ("runtime_host", PROJECT_RUNTIME_HOSTS),
+    ):
+        candidate = raw.get(field, defaults[field])
+        candidate = _required_text(candidate, f"attachment.{field}").upper()
+        if candidate not in allowed:
+            raise UniverseError(
+                "PROJECT_ATTACHMENT_VALUE_INVALID",
+                f"unsupported attachment.{field}: {candidate}",
+            )
+        normalized[field] = candidate
+    return normalized
+
+
 def _event_type(value: Any) -> str:
     event_type = _required_text(value, "event_type").upper()
     if not EVENT_TYPE_PATTERN.fullmatch(event_type):
@@ -1095,6 +1180,14 @@ def normalize_registration(value: Any) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         raise UniverseError("PROJECT_METADATA_INVALID", "metadata must be an object")
     network_role = _registration_network_role(metadata)
+    legacy_install_mode = value.get("install_mode")
+    if legacy_install_mode is None and "install_mode" in metadata:
+        legacy_install_mode = metadata["install_mode"]
+    attachment = normalize_project_attachment(
+        value.get("attachment"),
+        default_membership="LINKED",
+        install_mode=legacy_install_mode,
+    )
 
     refs_value = value.get("refs", DEFAULT_REFS)
     if not isinstance(refs_value, dict):
@@ -1156,6 +1249,7 @@ def normalize_registration(value: Any) -> dict[str, Any]:
         "project_root": str(project_root),
         "refs": refs,
         "metadata": metadata,
+        "attachment": attachment,
     }
 
 
@@ -3710,6 +3804,7 @@ class UniverseStore:
                     project_root TEXT NOT NULL UNIQUE,
                     refs_json TEXT NOT NULL,
                     metadata_json TEXT NOT NULL,
+                    attachment_json TEXT,
                     registered_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -4383,6 +4478,16 @@ class UniverseStore:
                 );
                 """
             )
+            project_connection_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(project_connection)"
+                ).fetchall()
+            }
+            if "attachment_json" not in project_connection_columns:
+                connection.execute(
+                    "ALTER TABLE project_connection ADD COLUMN attachment_json TEXT"
+                )
             provider_table = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'cli_provider_setting'"
@@ -4938,7 +5043,11 @@ class UniverseStore:
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
-                "SELECT project_root FROM project_connection WHERE project_id = ?",
+                """
+                SELECT project_root, attachment_json
+                FROM project_connection
+                WHERE project_id = ?
+                """,
                 (project["project_id"],),
             ).fetchone()
             if (
@@ -4950,6 +5059,29 @@ class UniverseStore:
                     "project_id is already attached to another root",
                     HTTPStatus.CONFLICT,
                 )
+            if existing is not None and existing["attachment_json"]:
+                try:
+                    stored_attachment = normalize_project_attachment(
+                        json.loads(existing["attachment_json"]),
+                        default_membership="LINKED",
+                    )
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise UniverseError(
+                        "PROJECT_ATTACHMENT_INVALID",
+                        "stored project attachment is not valid JSON",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    ) from error
+                if "attachment" not in value:
+                    project["attachment"] = stored_attachment
+                elif (
+                    project["attachment"]["install_origin"]
+                    != stored_attachment["install_origin"]
+                ):
+                    raise UniverseError(
+                        "PROJECT_ATTACHMENT_ORIGIN_IMMUTABLE",
+                        "install_origin cannot change after registration",
+                        HTTPStatus.CONFLICT,
+                    )
             root_owner = connection.execute(
                 "SELECT project_id FROM project_connection WHERE project_root = ?",
                 (project["project_root"],),
@@ -4968,12 +5100,13 @@ class UniverseStore:
                 """
                 INSERT INTO project_connection(
                     project_id, project_root, refs_json, metadata_json,
-                    registered_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    attachment_json, registered_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id) DO UPDATE SET
                     project_root = excluded.project_root,
                     refs_json = excluded.refs_json,
                     metadata_json = excluded.metadata_json,
+                    attachment_json = excluded.attachment_json,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -4982,6 +5115,9 @@ class UniverseStore:
                     json.dumps(project["refs"], sort_keys=True, separators=(",", ":")),
                     json.dumps(
                         project["metadata"], sort_keys=True, separators=(",", ":")
+                    ),
+                    json.dumps(
+                        project["attachment"], sort_keys=True, separators=(",", ":")
                     ),
                     now,
                     now,
@@ -4994,7 +5130,7 @@ class UniverseStore:
             rows = connection.execute(
                 """
                 SELECT project_id, project_root, refs_json, metadata_json,
-                       registered_at, updated_at
+                       attachment_json, registered_at, updated_at
                 FROM project_connection
                 ORDER BY project_id
                 """
@@ -5007,7 +5143,7 @@ class UniverseStore:
             row = connection.execute(
                 """
                 SELECT project_id, project_root, refs_json, metadata_json,
-                       registered_at, updated_at
+                       attachment_json, registered_at, updated_at
                 FROM project_connection
                 WHERE project_id = ?
                 """,
@@ -10869,12 +11005,25 @@ class UniverseStore:
 
     @staticmethod
     def _project_row(row: sqlite3.Row) -> dict[str, Any]:
+        attachment_json = row["attachment_json"]
+        try:
+            attachment = normalize_project_attachment(
+                json.loads(attachment_json) if attachment_json else None,
+                default_membership="LINKED",
+            )
+        except (TypeError, json.JSONDecodeError) as error:
+            raise UniverseError(
+                "PROJECT_ATTACHMENT_INVALID",
+                "stored project attachment is not valid JSON",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            ) from error
         return {
             "schema": PROJECT_SCHEMA,
             "project_id": row["project_id"],
             "project_root": row["project_root"],
             "refs": json.loads(row["refs_json"]),
             "metadata": json.loads(row["metadata_json"]),
+            "attachment": attachment,
             "registered_at": row["registered_at"],
             "updated_at": row["updated_at"],
         }

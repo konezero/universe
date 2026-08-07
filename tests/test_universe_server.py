@@ -46,6 +46,7 @@ from universe_server import (  # noqa: E402
     local_connection_profile,
     normalize_conductor_ui_action,
     normalize_planning_runtime_binding,
+    normalize_project_attachment,
     normalize_skill_observation_candidate,
     provider_ref_from_model_ref,
     publish_skill_observation,
@@ -2143,6 +2144,133 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(1, len(result["projects"]))
         self.assertEqual("Trading", result["projects"][0]["metadata"]["label"])
+
+    def test_project_attachment_contract_defaults_and_legacy_mapping(self) -> None:
+        self.assertEqual(
+            {
+                "schema": "universe.project-attachment.v1",
+                "install_origin": "PROJECT_STANDALONE",
+                "universe_membership": "DETACHED",
+                "runtime_host": "PROJECT_LOCAL",
+            },
+            normalize_project_attachment(),
+        )
+        self.assertEqual(
+            "LINKED",
+            normalize_project_attachment(
+                install_mode="UNIVERSE_ATTACHED",
+            )["universe_membership"],
+        )
+        with self.assertRaises(UniverseError) as context:
+            normalize_project_attachment({"runtime_host": "REMOTE"})
+        self.assertEqual("PROJECT_ATTACHMENT_VALUE_INVALID", context.exception.code)
+        with self.assertRaises(UniverseError) as context:
+            normalize_project_attachment({"unsupported": True})
+        self.assertEqual("PROJECT_ATTACHMENT_INVALID", context.exception.code)
+
+    def test_registration_exposes_attachment_and_preserves_origin_on_refresh(self) -> None:
+        explicit = {
+            "schema": "universe.project-attachment.v1",
+            "install_origin": "UNIVERSE_CREATED",
+            "universe_membership": "LINKED",
+            "runtime_host": "PROJECT_LOCAL",
+        }
+        status, result = self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(
+                attachment=explicit,
+                metadata={"label": "Trading", "current_anchor": "anchor-1"},
+            ),
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(explicit, result["project"]["attachment"])
+        original_refs = result["project"]["refs"]
+        original_metadata = result["project"]["metadata"]
+
+        status, refreshed = self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(metadata={"label": "Trading Updated"}),
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("UNIVERSE_CREATED", refreshed["project"]["attachment"]["install_origin"])
+        self.assertEqual("GCS", refreshed["project"]["project_id"])
+        self.assertEqual(original_refs, refreshed["project"]["refs"])
+        self.assertEqual({"label": "Trading Updated"}, refreshed["project"]["metadata"])
+        self.assertNotEqual(original_metadata, refreshed["project"]["metadata"])
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(
+                attachment={
+                    **explicit,
+                    "install_origin": "PROJECT_STANDALONE",
+                }
+            ),
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("PROJECT_ATTACHMENT_ORIGIN_IMMUTABLE", result["error_code"])
+
+    def test_registration_defaults_attachment_to_linked_project_local(self) -> None:
+        status, result = self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(),
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(
+            {
+                "schema": "universe.project-attachment.v1",
+                "install_origin": "PROJECT_STANDALONE",
+                "universe_membership": "LINKED",
+                "runtime_host": "PROJECT_LOCAL",
+            },
+            result["project"]["attachment"],
+        )
+
+    def test_legacy_project_record_without_attachment_normalizes_on_read(self) -> None:
+        metadata = {"label": "Legacy", "current_anchor": "anchor-legacy"}
+        status, registered = self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(metadata=metadata),
+            self.token,
+        )
+        self.assertEqual(201, status)
+        original = registered["project"]
+        connection = sqlite3.connect(self.server.store.database_path)
+        try:
+            connection.execute(
+                "UPDATE project_connection SET attachment_json = NULL WHERE project_id = ?",
+                ("GCS",),
+            )
+        finally:
+            connection.close()
+
+        project = self.server.store.get_project("GCS")
+        self.assertEqual(original["project_id"], project["project_id"])
+        self.assertEqual(original["refs"], project["refs"])
+        self.assertEqual(metadata, project["metadata"])
+        self.assertEqual("LINKED", project["attachment"]["universe_membership"])
+        self.assertEqual("PROJECT_LOCAL", project["attachment"]["runtime_host"])
+
+    def test_registration_rejects_invalid_attachment_value(self) -> None:
+        status, result = self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(
+                attachment={"universe_membership": "UNKNOWN"},
+            ),
+            self.token,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("PROJECT_ATTACHMENT_VALUE_INVALID", result["error_code"])
 
     def test_room_message_stays_in_room_without_a_master_bridge(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
