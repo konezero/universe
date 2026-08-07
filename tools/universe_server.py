@@ -5573,6 +5573,33 @@ class UniverseStore:
                 },
             )
 
+    def active_shared_runtime_release_id(
+        self,
+        project_id: str,
+        *,
+        now: str | None = None,
+    ) -> str | None:
+        """Return the selected release for a currently active project lease."""
+
+        normalized = _project_id(project_id)
+        observed_at = _observed_at(now or utc_now(), "observed_at")
+        with self._connection() as connection:
+            self._project_for_connection(connection, normalized)
+            row = connection.execute(
+                """
+                SELECT selected_release_id FROM shared_runtime_lease
+                WHERE project_id = ?
+                  AND status = 'ACTIVE'
+                  AND expires_at > ?
+                ORDER BY issued_at DESC, lease_id DESC
+                LIMIT 1
+                """,
+                (normalized, observed_at),
+            ).fetchone()
+        if row is None or row["selected_release_id"] is None:
+            return None
+        return str(row["selected_release_id"])
+
     def inspect_shared_runtime_lease(
         self,
         project_id: str,
@@ -12150,6 +12177,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continuity_coordinator=self.continuity_coordinator,
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
+                governance_context_resolver=self._project_master_governance_context,
             )
             if auto_start_project_masters
             else None
@@ -12732,6 +12760,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "bridge": bridge,
                 }
         return self.project_master_hosts.ensure(project)
+
+    def _project_master_governance_context(self, project_id: str) -> dict[str, Any]:
+        """Resolve the minimal immutable v2 context for one project Master."""
+
+        release_id = self.store.active_shared_runtime_release_id(project_id)
+        if release_id is None:
+            return {"status": "ABSENT", "reason": "NO_SHARED_RELEASE"}
+        artifact = self.store.get_release_artifact_binding(release_id)
+        try:
+            with ReleaseRuntime(
+                database_path=Path(artifact["database_path"]),
+                manifest_path=Path(artifact["manifest_path"]),
+            ) as runtime:
+                return runtime.select_governance_context({
+                    "role": "PROJECT_MASTER",
+                    "mode": "MASTER",
+                    "operation": "DELEGATE_TO_BOSS",
+                    "scope": "FEATURE",
+                    "risk": "GUARDED",
+                    "capability": "TASK_FRAME",
+                })
+        except (ReleaseRuntimeError, OSError, sqlite3.Error) as error:
+            raise ProjectMasterHostError(
+                f"PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE: {error}"
+            ) from error
 
     def apply_project_seed_assets(
         self,

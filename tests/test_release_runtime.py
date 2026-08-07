@@ -149,6 +149,24 @@ class ReleaseRuntimeTests(unittest.TestCase):
         self.assertEqual(["BOOT_CORE"], mode["load_profiles"])
         self.assertEqual("APPEND_ONLY", mode["overlay_policy"])
 
+    def test_legacy_release_keeps_governance_context_absent(self) -> None:
+        selector = {
+            "role": "PROJECT_MASTER",
+            "mode": "MASTER",
+            "operation": "DELEGATE_TO_BOSS",
+            "scope": "FEATURE",
+            "risk": "GUARDED",
+            "capability": "TASK_FRAME",
+        }
+        with ReleaseRuntime(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        ) as runtime:
+            context = runtime.select_governance_context(selector)
+
+        self.assertEqual("ABSENT", context["status"])
+        self.assertEqual("GOVERNANCE_CATALOG_ABSENT", context["reason"])
+
     def test_applies_fresh_release_without_executing_packaged_installer(self) -> None:
         marker = self.root / "installer-executed"
         self.assertFalse(marker.exists())

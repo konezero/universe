@@ -1091,6 +1091,36 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertEqual("Project Master answer", self.replies[0]["body"])
 
+    def test_selected_governance_context_is_injected_for_provider(self) -> None:
+        selected = {
+            "schema": "universe.release-governance-context.v1",
+            "status": "SELECTED",
+            "release_id": "core-test",
+            "selector_digest": "a" * 64,
+            "units": [{"governance_id": "CORE", "content": "Use the contract."}],
+        }
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            governance_context_resolver=lambda project_id: (
+                selected if project_id == "GCS" else {"status": "ABSENT"}
+            ),
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(selected, self.provider.messages[0]["governance_context"])
+
     def test_permission_request_blocks_until_ui_decision_is_delivered(self) -> None:
         provider = PermissionFakeProvider()
         permission_posted = threading.Event()

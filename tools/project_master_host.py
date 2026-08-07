@@ -103,6 +103,7 @@ PermissionPoster = Callable[..., dict[str, Any]]
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceCommitResolver = Callable[[Path], str]
+GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
 
 
 class CommanderSurfaceObserver(Protocol):
@@ -2248,6 +2249,7 @@ class ProjectMasterConversationWorker:
         stream_poster: StreamPoster = post_master_stream_event,
         permission_poster: PermissionPoster = post_agent_permission_request,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
+        governance_context_resolver: GovernanceContextResolver | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -2259,6 +2261,7 @@ class ProjectMasterConversationWorker:
         self.stream_poster = stream_poster
         self.permission_poster = permission_poster
         self.completion_observer = completion_observer
+        self.governance_context_resolver = governance_context_resolver
         self._last_completion: dict[str, Any] | None = None
         self._last_completion_at = 0.0
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -2375,6 +2378,12 @@ class ProjectMasterConversationWorker:
             provider_message["skill_binding_proposals"] = (
                 self.store.skill_binding_proposals()
             )
+            if self.governance_context_resolver is not None:
+                governance_context = self.governance_context_resolver(self.project_id)
+                if governance_context.get("status") == "SELECTED":
+                    provider_message["governance_context"] = dict(governance_context)
+                elif governance_context.get("status") != "ABSENT":
+                    raise ProjectMasterHostError("PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE")
             stream_reply = getattr(self.provider, "reply_stream", None)
             if callable(stream_reply):
                 body = stream_reply(
@@ -2608,6 +2617,7 @@ class ResidentProjectMasterHostManager:
         provider_resolver: Callable[[str], str] | None = None,
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
+        governance_context_resolver: GovernanceContextResolver | None = None,
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
         self.bridge_registrar = bridge_registrar
@@ -2616,6 +2626,7 @@ class ResidentProjectMasterHostManager:
         self.provider_factory = provider_factory
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.coordinator_factory = coordinator_factory or self._default_coordinator
+        self.governance_context_resolver = governance_context_resolver
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
         self._lock = threading.RLock()
 
@@ -2700,6 +2711,7 @@ class ResidentProjectMasterHostManager:
                         )
                     )
                 ),
+                governance_context_resolver=self.governance_context_resolver,
             )
             host = LiveProjectMasterBridgeHost(
                 project_root,

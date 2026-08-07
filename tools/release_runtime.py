@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from core_release import CoreReleaseError, canonical_bytes, verify_release
 
@@ -20,6 +20,16 @@ INSTALL_STATE_PATH = (
 )
 PLAN_SCHEMA = "universe.project-release-plan.v1"
 PROFILE_CATALOG_REQUIRED = "PROFILE_CATALOG_REQUIRED"
+GOVERNANCE_CONTEXT_SCHEMA = "universe.release-governance-context.v1"
+GOVERNANCE_SELECTOR_FIELDS = (
+    "role",
+    "mode",
+    "operation",
+    "scope",
+    "risk",
+    "capability",
+)
+MAX_GOVERNANCE_CONTEXT_BYTES = 128 * 1024
 
 
 class ReleaseRuntimeError(ValueError):
@@ -73,6 +83,124 @@ class ReleaseRuntime:
     @property
     def profile_catalog_status(self) -> str:
         return self.metadata.get("profile_catalog_status", "LEGACY")
+
+    @property
+    def governance_catalog_status(self) -> str:
+        return self.metadata.get("governance_catalog_status", "ABSENT")
+
+    def select_governance_context(self, selector: Mapping[str, Any]) -> dict[str, Any]:
+        """Return only the immutable governance units selected for one role."""
+
+        if self.governance_catalog_status != "PRESENT":
+            return {
+                "schema": GOVERNANCE_CONTEXT_SCHEMA,
+                "status": "ABSENT",
+                "release_id": self.release_id,
+                "reason": "GOVERNANCE_CATALOG_ABSENT",
+            }
+        normalized = _governance_selector(selector)
+        rows = self._connection.execute(
+            """
+            SELECT governance_id, required, priority
+            FROM governance_index
+            WHERE role = ? AND mode = ? AND operation = ? AND scope = ?
+              AND risk = ? AND capability = ?
+            ORDER BY priority, governance_id
+            """,
+            tuple(normalized[field] for field in GOVERNANCE_SELECTOR_FIELDS),
+        ).fetchall()
+        selected_ids = [str(row["governance_id"]) for row in rows]
+        selected = set(selected_ids)
+        selector_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        for row in self._connection.execute(
+            """
+            SELECT base_governance_id, overriding_governance_id
+            FROM governance_override
+            WHERE applies_when_json = ?
+            ORDER BY base_governance_id, overriding_governance_id
+            """,
+            (selector_json,),
+        ):
+            base = str(row["base_governance_id"])
+            override = str(row["overriding_governance_id"])
+            if base in selected:
+                selected.remove(base)
+                selected.add(override)
+                if override not in selected_ids:
+                    selected_ids.append(override)
+
+        dependencies = {
+            str(row["governance_id"]): [
+                str(item["requires_governance_id"])
+                for item in self._connection.execute(
+                    """SELECT requires_governance_id FROM governance_dependency
+                       WHERE governance_id = ? ORDER BY requires_governance_id""",
+                    (row["governance_id"],),
+                )
+            ]
+            for row in self._connection.execute(
+                "SELECT DISTINCT governance_id FROM governance_dependency"
+            )
+        }
+        closure: list[str] = []
+        visited: set[str] = set()
+
+        def visit(governance_id: str) -> None:
+            if governance_id in visited:
+                return
+            for dependency in dependencies.get(governance_id, []):
+                visit(dependency)
+            visited.add(governance_id)
+            closure.append(governance_id)
+
+        for governance_id in selected_ids:
+            if governance_id in selected:
+                visit(governance_id)
+
+        units: list[dict[str, Any]] = []
+        content_size = 0
+        for governance_id in closure:
+            row = self._connection.execute(
+                """
+                SELECT u.governance_id, u.kind, u.source_ref, u.source_digest,
+                       u.compact_instruction, f.content
+                FROM governance_unit AS u
+                JOIN release_file AS f ON f.path = u.source_ref
+                WHERE u.governance_id = ?
+                """,
+                (governance_id,),
+            ).fetchone()
+            if row is None:
+                raise ReleaseRuntimeError("governance unit is missing from release")
+            content = row["content"]
+            if not isinstance(content, bytes) or hashlib.sha256(content).hexdigest() != row["source_digest"]:
+                raise ReleaseRuntimeError("governance unit digest does not match release")
+            content_size += len(content)
+            if content_size > MAX_GOVERNANCE_CONTEXT_BYTES:
+                raise ReleaseRuntimeError("selected governance context exceeds size limit")
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ReleaseRuntimeError("governance unit is not UTF-8 text") from error
+            units.append({
+                "governance_id": str(row["governance_id"]),
+                "kind": str(row["kind"]),
+                "source_ref": str(row["source_ref"]),
+                "source_digest": str(row["source_digest"]),
+                "compact_instruction": str(row["compact_instruction"]),
+                "content": text,
+            })
+        material = {
+            "schema": GOVERNANCE_CONTEXT_SCHEMA,
+            "status": "SELECTED",
+            "release_id": self.release_id,
+            "source_commit": self.metadata["source_commit"],
+            "selector": normalized,
+            "dependency_closure": closure,
+            "units": units,
+        }
+        material["selector_digest"] = _digest(material)
+        return material
 
     def list_profiles(self) -> dict[str, Any]:
         self._require_profiles()
@@ -509,6 +637,13 @@ def _required_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ReleaseRuntimeError(f"{field} must be non-empty text")
     return value.strip()
+
+
+def _governance_selector(value: Mapping[str, Any]) -> dict[str, str]:
+    if set(value) != set(GOVERNANCE_SELECTOR_FIELDS):
+        raise ReleaseRuntimeError("governance selector fields are invalid")
+    return {field: _required_text(value.get(field), f"selector.{field}").upper()
+            for field in GOVERNANCE_SELECTOR_FIELDS}
 
 
 def _release_path(value: str) -> str:
