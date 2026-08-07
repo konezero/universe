@@ -14,9 +14,11 @@ from typing import Any
 
 from host_profile import resolve_host_tool
 from release_profile_catalog import (
+    GovernanceCatalog,
     ReleaseProfileCatalog,
     ReleaseProfileError,
-    parse_release_profile_catalog,
+    parse_release_catalog,
+    parse_release_governance_catalog,
 )
 
 LEGACY_RELEASE_SCHEMA = "universe.core-release-db.v1"
@@ -90,11 +92,63 @@ CREATE TABLE mode_profile_load (
     PRIMARY KEY(mode_profile_id, ordinal),
     UNIQUE(mode_profile_id, profile_id)
 );
+
+CREATE TABLE governance_unit (
+    governance_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_ref TEXT NOT NULL
+        REFERENCES release_file(path),
+    source_digest TEXT NOT NULL,
+    compact_instruction TEXT NOT NULL,
+    release_id TEXT NOT NULL
+);
+
+CREATE TABLE governance_index (
+    role TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    governance_id TEXT NOT NULL
+        REFERENCES governance_unit(governance_id),
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    priority INTEGER NOT NULL CHECK (priority >= 0),
+    PRIMARY KEY(
+        role, mode, operation, scope, risk, capability, governance_id
+    )
+);
+
+CREATE TABLE governance_dependency (
+    governance_id TEXT NOT NULL
+        REFERENCES governance_unit(governance_id)
+        ON DELETE CASCADE,
+    requires_governance_id TEXT NOT NULL
+        REFERENCES governance_unit(governance_id)
+        ON DELETE CASCADE,
+    PRIMARY KEY(governance_id, requires_governance_id)
+);
+
+CREATE TABLE governance_override (
+    base_governance_id TEXT NOT NULL
+        REFERENCES governance_unit(governance_id)
+        ON DELETE CASCADE,
+    overriding_governance_id TEXT NOT NULL
+        REFERENCES governance_unit(governance_id)
+        ON DELETE CASCADE,
+    applies_when_json TEXT NOT NULL,
+    PRIMARY KEY(
+        base_governance_id, overriding_governance_id, applies_when_json
+    )
+);
 """
 
 
 class CoreReleaseError(ValueError):
     pass
+
+
+ReleaseCatalog = ReleaseProfileCatalog | GovernanceCatalog
 
 
 @dataclass(frozen=True)
@@ -232,7 +286,7 @@ def _source_inventory(
     dict[str, Any],
     dict[str, Any],
     list[GitBlob],
-    ReleaseProfileCatalog | None,
+    ReleaseCatalog | None,
     str,
 ]:
     source_index_blob = reader.read_blob(commit, source_index_path)
@@ -280,7 +334,7 @@ def _source_inventory(
     if package.get("source_index_path") != source_index_path:
         raise CoreReleaseError("distribution manifest source index does not match")
     catalog_path = "NONE"
-    catalog: ReleaseProfileCatalog | None = None
+    catalog: ReleaseCatalog | None = None
     raw_catalog_path = source_index.get("release_profile_catalog_path")
     if raw_catalog_path is not None:
         catalog_path = validate_release_path(str(raw_catalog_path))
@@ -290,7 +344,7 @@ def _source_inventory(
                 "release_profile_catalog_path"
             )
         try:
-            catalog = parse_release_profile_catalog(
+            catalog = parse_release_catalog(
                 _json_object(
                     blob_by_path[catalog_path].content,
                     "release profile catalog",
@@ -304,11 +358,11 @@ def _source_inventory(
 
 def _profile_material(
     *,
-    catalog: ReleaseProfileCatalog | None,
+    catalog: ReleaseCatalog | None,
     catalog_path: str,
     blob_by_path: dict[str, GitBlob],
 ) -> dict[str, Any]:
-    if catalog is None:
+    if not isinstance(catalog, ReleaseProfileCatalog):
         return {
             "status": "ABSENT",
             "path": "NONE",
@@ -329,6 +383,41 @@ def _profile_material(
     }
 
 
+def _governance_material(
+    *,
+    catalog: ReleaseCatalog | None,
+    catalog_path: str,
+    blob_by_path: dict[str, GitBlob],
+) -> dict[str, Any]:
+    if not isinstance(catalog, GovernanceCatalog):
+        return {
+            "status": "ABSENT",
+            "path": "NONE",
+            "sha256": "NONE",
+            "catalog_digest": "NONE",
+            "governance_unit_count": 0,
+            "governance_index_count": 0,
+            "governance_dependency_count": 0,
+            "governance_override_count": 0,
+        }
+    for unit in catalog.governance_units:
+        if blob_by_path[unit.source_ref].sha256 != unit.source_digest:
+            raise CoreReleaseError(
+                "governance source digest does not match packaged file: "
+                + unit.source_ref
+            )
+    return {
+        "status": "PRESENT",
+        "path": catalog_path,
+        "sha256": blob_by_path[catalog_path].sha256,
+        "catalog_digest": catalog.digest,
+        "governance_unit_count": len(catalog.governance_units),
+        "governance_index_count": len(catalog.governance_index),
+        "governance_dependency_count": len(catalog.governance_dependencies),
+        "governance_override_count": len(catalog.governance_overrides),
+    }
+
+
 def _payload_material(
     *,
     source_repository: str,
@@ -340,6 +429,7 @@ def _payload_material(
     files: list[dict[str, Any]],
     schema: str = RELEASE_SCHEMA,
     profile_catalog: dict[str, Any] | None = None,
+    governance_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema": schema,
@@ -353,6 +443,8 @@ def _payload_material(
     }
     if profile_catalog is not None:
         result["profile_catalog"] = profile_catalog
+    if governance_catalog is not None:
+        result["governance_catalog"] = governance_catalog
     return result
 
 
@@ -398,6 +490,11 @@ def build_release(
         catalog_path=profile_catalog_path,
         blob_by_path=blob_by_path,
     )
+    governance_material = _governance_material(
+        catalog=profile_catalog,
+        catalog_path=profile_catalog_path,
+        blob_by_path=blob_by_path,
+    )
     payload = _payload_material(
         source_repository=normalized_repository,
         source_commit=source_commit,
@@ -407,6 +504,11 @@ def build_release(
         distribution_manifest_sha256=blob_by_path[distribution_path].sha256,
         files=file_material,
         profile_catalog=profile_material,
+        governance_catalog=(
+            governance_material
+            if isinstance(profile_catalog, GovernanceCatalog)
+            else None
+        ),
     )
     payload_sha256 = sha256_bytes(canonical_bytes(payload))
     release_id = f"core-{source_commit[:12]}-{payload_sha256[:12]}"
@@ -432,13 +534,38 @@ def build_release(
         "profile_catalog_sha256": str(profile_material["sha256"]),
         "profile_catalog_digest": str(profile_material["catalog_digest"]),
         "profile_catalog_owner": (
-            profile_catalog.owner if profile_catalog is not None else "NONE"
+            profile_catalog.owner
+            if isinstance(profile_catalog, ReleaseProfileCatalog)
+            else "NONE"
         ),
         "load_profile_count": str(profile_material["load_profile_count"]),
         "skill_binding_count": str(profile_material["skill_binding_count"]),
         "mode_profile_count": str(profile_material["mode_profile_count"]),
+        "governance_catalog_status": str(governance_material["status"]),
+        "governance_catalog_path": str(governance_material["path"]),
+        "governance_catalog_sha256": str(governance_material["sha256"]),
+        "governance_catalog_digest": str(
+            governance_material["catalog_digest"]
+        ),
+        "governance_catalog_owner": (
+            profile_catalog.owner
+            if isinstance(profile_catalog, GovernanceCatalog)
+            else "NONE"
+        ),
+        "governance_unit_count": str(
+            governance_material["governance_unit_count"]
+        ),
+        "governance_index_count": str(
+            governance_material["governance_index_count"]
+        ),
+        "governance_dependency_count": str(
+            governance_material["governance_dependency_count"]
+        ),
+        "governance_override_count": str(
+            governance_material["governance_override_count"]
+        ),
     }
-    _write_database(database_path, metadata, blobs, profile_profile=profile_catalog)
+    _write_database(database_path, metadata, blobs, catalog=profile_catalog)
     database_sha256 = sha256_bytes(database_path.read_bytes())
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -457,6 +584,8 @@ def build_release(
         "candidate_execution": "FORBIDDEN",
         "profile_catalog": profile_material,
     }
+    if isinstance(profile_catalog, GovernanceCatalog):
+        manifest["governance_catalog"] = governance_material
     _write_json_atomic(manifest_path, manifest)
     verify_release(database_path=database_path, manifest_path=manifest_path)
     return manifest
@@ -467,7 +596,7 @@ def _write_database(
     metadata: dict[str, str],
     blobs: list[GitBlob],
     *,
-    profile_profile: ReleaseProfileCatalog | None,
+    catalog: ReleaseCatalog | None,
 ) -> None:
     database_path = database_path.expanduser().resolve()
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -507,7 +636,7 @@ def _write_database(
                         for blob in blobs
                     ],
                 )
-                if profile_profile is not None:
+                if isinstance(catalog, ReleaseProfileCatalog):
                     connection.executemany(
                         """
                         INSERT INTO load_profile(profile_id, description)
@@ -515,7 +644,7 @@ def _write_database(
                         """,
                         [
                             (profile.profile_id, profile.description)
-                            for profile in profile_profile.load_profiles
+                            for profile in catalog.load_profiles
                         ],
                     )
                     connection.executemany(
@@ -531,7 +660,7 @@ def _write_database(
                                 surface.path,
                                 int(surface.required),
                             )
-                            for profile in profile_profile.load_profiles
+                            for profile in catalog.load_profiles
                             for ordinal, surface in enumerate(profile.surfaces)
                         ],
                     )
@@ -542,7 +671,7 @@ def _write_database(
                         """,
                         [
                             (binding.skill_id, binding.profile_id)
-                            for binding in profile_profile.skill_bindings
+                            for binding in catalog.skill_bindings
                         ],
                     )
                     connection.executemany(
@@ -552,7 +681,7 @@ def _write_database(
                         """,
                         [
                             (profile.mode_profile_id, profile.overlay_policy)
-                            for profile in profile_profile.mode_profiles
+                            for profile in catalog.mode_profiles
                         ],
                     )
                     connection.executemany(
@@ -567,10 +696,84 @@ def _write_database(
                                 ordinal,
                                 load_profile_id,
                             )
-                            for profile in profile_profile.mode_profiles
+                            for profile in catalog.mode_profiles
                             for ordinal, load_profile_id in enumerate(
                                 profile.load_profiles
                             )
+                        ],
+                    )
+                if isinstance(catalog, GovernanceCatalog):
+                    connection.executemany(
+                        """
+                        INSERT INTO governance_unit(
+                            governance_id, kind, source_ref, source_digest,
+                            compact_instruction, release_id
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                unit.governance_id,
+                                unit.kind,
+                                unit.source_ref,
+                                unit.source_digest,
+                                unit.compact_instruction,
+                                metadata["release_id"],
+                            )
+                            for unit in catalog.governance_units
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO governance_index(
+                            role, mode, operation, scope, risk, capability,
+                            governance_id, required, priority
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                entry.selector.role,
+                                entry.selector.mode,
+                                entry.selector.operation,
+                                entry.selector.scope,
+                                entry.selector.risk,
+                                entry.selector.capability,
+                                entry.governance_id,
+                                int(entry.required),
+                                entry.priority,
+                            )
+                            for entry in catalog.governance_index
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO governance_dependency(
+                            governance_id, requires_governance_id
+                        ) VALUES (?, ?)
+                        """,
+                        [
+                            (
+                                dependency.governance_id,
+                                dependency.requires_governance_id,
+                            )
+                            for dependency in catalog.governance_dependencies
+                        ],
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO governance_override(
+                            base_governance_id, overriding_governance_id,
+                            applies_when_json
+                        ) VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                override.base_governance_id,
+                                override.overriding_governance_id,
+                                canonical_bytes(
+                                    override.applies_when.as_dict()
+                                ).decode("ascii"),
+                            )
+                            for override in catalog.governance_overrides
                         ],
                     )
             connection.execute("VACUUM")
@@ -628,21 +831,31 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             raise CoreReleaseError("release database integrity check failed")
         metadata = dict(connection.execute("SELECT key, value FROM release_metadata"))
         schema = metadata.get("schema")
+        legacy_v2_objects = [
+            ("table", "load_profile"),
+            ("table", "load_profile_surface"),
+            ("table", "mode_profile"),
+            ("table", "mode_profile_load"),
+            ("table", "release_file"),
+            ("table", "release_metadata"),
+            ("table", "skill_profile_binding"),
+        ]
+        current_v2_objects = [
+            ("table", "governance_dependency"),
+            ("table", "governance_index"),
+            ("table", "governance_override"),
+            ("table", "governance_unit"),
+            *legacy_v2_objects,
+        ]
         expected_objects = (
-            [
-                ("table", "load_profile"),
-                ("table", "load_profile_surface"),
-                ("table", "mode_profile"),
-                ("table", "mode_profile_load"),
-                ("table", "release_file"),
-                ("table", "release_metadata"),
-                ("table", "skill_profile_binding"),
-            ]
+            {tuple(legacy_v2_objects), tuple(current_v2_objects)}
             if schema == RELEASE_SCHEMA
-            else [
-                ("table", "release_file"),
-                ("table", "release_metadata"),
-            ]
+            else {
+                (
+                    ("table", "release_file"),
+                    ("table", "release_metadata"),
+                )
+            }
         )
         objects = connection.execute(
             """
@@ -652,7 +865,7 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             ORDER BY type, name
             """
         ).fetchall()
-        if objects != expected_objects:
+        if tuple(objects) not in expected_objects:
             raise CoreReleaseError("release database contains unexpected objects")
         if schema == RELEASE_SCHEMA:
             foreign_key_issues = connection.execute(
@@ -672,6 +885,12 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         profile_rows = (
             _read_profile_rows(connection)
             if schema == RELEASE_SCHEMA
+            else None
+        )
+        governance_rows = (
+            _read_governance_rows(connection)
+            if schema == RELEASE_SCHEMA
+            and tuple(objects) == tuple(current_v2_objects)
             else None
         )
     finally:
@@ -702,10 +921,18 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         raise CoreReleaseError("release payload size is inconsistent")
 
     profile_material = None
+    governance_material = None
     if metadata["schema"] == RELEASE_SCHEMA:
         profile_material = _verified_profile_material(
             metadata=metadata,
             rows=profile_rows,
+            governance_rows=governance_rows,
+            files={item["path"]: item["sha256"] for item in files},
+        )
+        governance_material = _verified_governance_material(
+            metadata=metadata,
+            profile_rows=profile_rows,
+            rows=governance_rows,
             files={item["path"]: item["sha256"] for item in files},
         )
     payload = _payload_material(
@@ -721,6 +948,12 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         files=files,
         schema=metadata["schema"],
         profile_catalog=profile_material,
+        governance_catalog=(
+            governance_material
+            if governance_material is not None
+            and governance_material["status"] == "PRESENT"
+            else None
+        ),
     )
     payload_sha256 = sha256_bytes(canonical_bytes(payload))
     if payload_sha256 != metadata.get("payload_sha256"):
@@ -738,12 +971,14 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
     }
     if profile_material is not None:
         expected_manifest["profile_catalog"] = profile_material
+    if governance_material is not None and governance_material["status"] == "PRESENT":
+        expected_manifest["governance_catalog"] = governance_material
     for field, value in expected_manifest.items():
         if manifest.get(field) != value:
             raise CoreReleaseError(f"release manifest field mismatch: {field}")
     if manifest.get("database") != database_path.name:
         raise CoreReleaseError("release manifest database name does not match")
-    return {
+    result = {
         "status": "CORE_RELEASE_VERIFIED",
         "release_id": metadata["release_id"],
         "source_commit": metadata["source_commit"],
@@ -766,6 +1001,9 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             }
         ),
     }
+    if governance_material is not None and governance_material["status"] == "PRESENT":
+        result["governance_catalog"] = governance_material
+    return result
 
 
 def _read_profile_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
@@ -805,30 +1043,52 @@ def _read_profile_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3
     }
 
 
-def _verified_profile_material(
+def _read_governance_rows(
+    connection: sqlite3.Connection,
+) -> dict[str, list[sqlite3.Row]]:
+    connection.row_factory = sqlite3.Row
+    return {
+        "units": connection.execute(
+            """
+            SELECT governance_id, kind, source_ref, source_digest,
+                   compact_instruction
+            FROM governance_unit
+            ORDER BY governance_id
+            """
+        ).fetchall(),
+        "index": connection.execute(
+            """
+            SELECT role, mode, operation, scope, risk, capability,
+                   governance_id, required, priority
+            FROM governance_index
+            ORDER BY role, mode, operation, scope, risk, capability,
+                     priority, governance_id
+            """
+        ).fetchall(),
+        "dependencies": connection.execute(
+            """
+            SELECT governance_id, requires_governance_id
+            FROM governance_dependency
+            ORDER BY governance_id, requires_governance_id
+            """
+        ).fetchall(),
+        "overrides": connection.execute(
+            """
+            SELECT base_governance_id, overriding_governance_id,
+                   applies_when_json
+            FROM governance_override
+            ORDER BY base_governance_id, overriding_governance_id,
+                     applies_when_json
+            """
+        ).fetchall(),
+    }
+
+
+def _profile_catalog_raw(
     *,
     metadata: dict[str, str],
-    rows: dict[str, list[sqlite3.Row]] | None,
-    files: dict[str, str],
+    rows: dict[str, list[sqlite3.Row]],
 ) -> dict[str, Any]:
-    if rows is None:
-        raise CoreReleaseError("release profile catalog tables are unavailable")
-    catalog_status = metadata.get("profile_catalog_status")
-    if catalog_status == "ABSENT":
-        if any(rows.values()):
-            raise CoreReleaseError("absent release profile catalog has stored rows")
-        return {
-            "status": "ABSENT",
-            "path": "NONE",
-            "sha256": "NONE",
-            "catalog_digest": "NONE",
-            "load_profile_count": 0,
-            "skill_binding_count": 0,
-            "mode_profile_count": 0,
-        }
-    if catalog_status != "PRESENT":
-        raise CoreReleaseError("release profile catalog status is invalid")
-
     surfaces_by_profile: dict[str, list[dict[str, Any]]] = {}
     for row in rows["surfaces"]:
         surfaces_by_profile.setdefault(row["profile_id"], []).append(
@@ -836,8 +1096,10 @@ def _verified_profile_material(
         )
     loads_by_mode: dict[str, list[str]] = {}
     for row in rows["mode_loads"]:
-        loads_by_mode.setdefault(row["mode_profile_id"], []).append(row["profile_id"])
-    raw = {
+        loads_by_mode.setdefault(row["mode_profile_id"], []).append(
+            row["profile_id"]
+        )
+    return {
         "schema": "ai-career.release-profile-catalog.v1",
         "owner": metadata.get("profile_catalog_owner", ""),
         "load_profiles": [
@@ -861,8 +1123,188 @@ def _verified_profile_material(
             for row in rows["modes"]
         ],
     }
+
+
+def _governance_catalog_raw(
+    *,
+    metadata: dict[str, str],
+    profile_rows: dict[str, list[sqlite3.Row]] | None,
+    governance_rows: dict[str, list[sqlite3.Row]] | None,
+) -> dict[str, Any]:
+    if profile_rows is None or governance_rows is None:
+        raise CoreReleaseError(
+            "v2 governance catalog requires profile and governance tables"
+        )
+    raw = _profile_catalog_raw(metadata=metadata, rows=profile_rows)
+    overrides: list[dict[str, Any]] = []
+    for row in governance_rows["overrides"]:
+        try:
+            applies_when = json.loads(row["applies_when_json"])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise CoreReleaseError(
+                "governance override selector is invalid"
+            ) from error
+        overrides.append(
+            {
+                "base_governance_id": row["base_governance_id"],
+                "overriding_governance_id": row["overriding_governance_id"],
+                "applies_when": applies_when,
+            }
+        )
+    raw.update(
+        {
+            "schema": "ai-career.release-profile-catalog.v2",
+            "governance_units": [
+                {
+                    "governance_id": row["governance_id"],
+                    "kind": row["kind"],
+                    "source_ref": row["source_ref"],
+                    "source_digest": row["source_digest"],
+                    "compact_instruction": row["compact_instruction"],
+                }
+                for row in governance_rows["units"]
+            ],
+            "governance_index": [
+                {
+                    "role": row["role"],
+                    "mode": row["mode"],
+                    "operation": row["operation"],
+                    "scope": row["scope"],
+                    "risk": row["risk"],
+                    "capability": row["capability"],
+                    "governance_id": row["governance_id"],
+                    "required": bool(row["required"]),
+                    "priority": row["priority"],
+                }
+                for row in governance_rows["index"]
+            ],
+            "governance_dependencies": [
+                {
+                    "governance_id": row["governance_id"],
+                    "requires_governance_id": row["requires_governance_id"],
+                }
+                for row in governance_rows["dependencies"]
+            ],
+            "governance_overrides": overrides,
+        }
+    )
+    return raw
+
+
+def _verified_governance_material(
+    *,
+    metadata: dict[str, str],
+    profile_rows: dict[str, list[sqlite3.Row]] | None,
+    rows: dict[str, list[sqlite3.Row]] | None,
+    files: dict[str, str],
+) -> dict[str, Any]:
+    status = metadata.get("governance_catalog_status", "ABSENT")
+    absent = {
+        "status": "ABSENT",
+        "path": "NONE",
+        "sha256": "NONE",
+        "catalog_digest": "NONE",
+        "governance_unit_count": 0,
+        "governance_index_count": 0,
+        "governance_dependency_count": 0,
+        "governance_override_count": 0,
+    }
+    if rows is None:
+        if status != "ABSENT":
+            raise CoreReleaseError(
+                "governance catalog is present without governance tables"
+            )
+        return absent
+    if status == "ABSENT":
+        if any(rows.values()):
+            raise CoreReleaseError(
+                "absent governance catalog has stored rows"
+            )
+        return absent
+    if status != "PRESENT":
+        raise CoreReleaseError("governance catalog status is invalid")
+
+    raw = _governance_catalog_raw(
+        metadata=metadata,
+        profile_rows=profile_rows,
+        governance_rows=rows,
+    )
     try:
-        catalog = parse_release_profile_catalog(raw, packaged_paths=files)
+        catalog = parse_release_governance_catalog(
+            raw,
+            packaged_paths=files,
+        )
+    except ReleaseProfileError as error:
+        raise CoreReleaseError(str(error)) from error
+    for unit in catalog.governance_units:
+        if files.get(unit.source_ref) != unit.source_digest:
+            raise CoreReleaseError(
+                "governance source digest is inconsistent: "
+                + unit.source_ref
+            )
+    expected_counts = {
+        "governance_unit_count": len(catalog.governance_units),
+        "governance_index_count": len(catalog.governance_index),
+        "governance_dependency_count": len(catalog.governance_dependencies),
+        "governance_override_count": len(catalog.governance_overrides),
+    }
+    for key, value in expected_counts.items():
+        if metadata.get(key) != str(value):
+            raise CoreReleaseError(f"governance count mismatch: {key}")
+    if metadata.get("governance_catalog_digest") != catalog.digest:
+        raise CoreReleaseError("governance catalog digest is inconsistent")
+    catalog_path = metadata.get("governance_catalog_path", "")
+    if catalog_path not in files:
+        raise CoreReleaseError("governance catalog path is not packaged")
+    if metadata.get("governance_catalog_sha256") != files[catalog_path]:
+        raise CoreReleaseError(
+            "governance catalog file digest is inconsistent"
+        )
+    return {
+        "status": "PRESENT",
+        "path": catalog_path,
+        "sha256": metadata.get("governance_catalog_sha256"),
+        "catalog_digest": catalog.digest,
+        **expected_counts,
+    }
+
+
+def _verified_profile_material(
+    *,
+    metadata: dict[str, str],
+    rows: dict[str, list[sqlite3.Row]] | None,
+    governance_rows: dict[str, list[sqlite3.Row]] | None,
+    files: dict[str, str],
+) -> dict[str, Any]:
+    if rows is None:
+        raise CoreReleaseError("release profile catalog tables are unavailable")
+    catalog_status = metadata.get("profile_catalog_status")
+    if catalog_status == "ABSENT":
+        if any(rows.values()):
+            raise CoreReleaseError("absent release profile catalog has stored rows")
+        return {
+            "status": "ABSENT",
+            "path": "NONE",
+            "sha256": "NONE",
+            "catalog_digest": "NONE",
+            "load_profile_count": 0,
+            "skill_binding_count": 0,
+            "mode_profile_count": 0,
+        }
+    if catalog_status != "PRESENT":
+        raise CoreReleaseError("release profile catalog status is invalid")
+
+    raw = (
+        _governance_catalog_raw(
+            metadata=metadata,
+            profile_rows=rows,
+            governance_rows=governance_rows,
+        )
+        if metadata.get("governance_catalog_status") == "PRESENT"
+        else _profile_catalog_raw(metadata=metadata, rows=rows)
+    )
+    try:
+        catalog = parse_release_catalog(raw, packaged_paths=files)
     except ReleaseProfileError as error:
         raise CoreReleaseError(str(error)) from error
     expected_counts = {
