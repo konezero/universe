@@ -109,7 +109,16 @@ class ReleaseRuntime:
             """,
             tuple(normalized[field] for field in GOVERNANCE_SELECTOR_FIELDS),
         ).fetchall()
-        selected_ids = [str(row["governance_id"]) for row in rows]
+        matched_entries = [
+            {
+                **normalized,
+                "governance_id": str(row["governance_id"]),
+                "required": bool(row["required"]),
+                "priority": int(row["priority"]),
+            }
+            for row in rows
+        ]
+        selected_ids = [entry["governance_id"] for entry in matched_entries]
         selected = set(selected_ids)
         selector_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
         for row in self._connection.execute(
@@ -128,6 +137,8 @@ class ReleaseRuntime:
                 selected.add(override)
                 if override not in selected_ids:
                     selected_ids.append(override)
+        if not selected:
+            raise ReleaseRuntimeError("governance selector has no matching units")
 
         dependencies = {
             str(row["governance_id"]): [
@@ -190,16 +201,30 @@ class ReleaseRuntime:
                 "compact_instruction": str(row["compact_instruction"]),
                 "content": text,
             })
+        catalog_digest = _required_text(
+            self.metadata.get("governance_catalog_digest"),
+            "governance_catalog_digest",
+        )
+        selector_digest = _digest(
+            {
+                "catalog_digest": catalog_digest,
+                "selector": normalized,
+                "matched_entries": matched_entries,
+                "dependency_closure": closure,
+                "source_digests": [unit["source_digest"] for unit in units],
+            }
+        )
         material = {
             "schema": GOVERNANCE_CONTEXT_SCHEMA,
             "status": "SELECTED",
             "release_id": self.release_id,
             "source_commit": self.metadata["source_commit"],
+            "catalog_digest": catalog_digest,
             "selector": normalized,
             "dependency_closure": closure,
             "units": units,
+            "selector_digest": selector_digest,
         }
-        material["selector_digest"] = _digest(material)
         return material
 
     def list_profiles(self) -> dict[str, Any]:

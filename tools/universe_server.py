@@ -12108,6 +12108,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except UniverseError:
             # Never block service boot on optional network anchors.
             pass
+        self._request_worker_lock = threading.Lock()
+        self._active_request_workers = 0
+        self._request_workers_idle = threading.Event()
+        self._request_workers_idle.set()
         super().__init__(address, UniverseRequestHandler)
         self.conductor_session_host = (
             ResidentModeSessionHost(
@@ -12208,20 +12212,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.rendezvous_service: UniverseRendezvousService | None = None
         self._rendezvous_start_error: dict[str, str] | None = None
         self._remote_access_resume: dict[str, Any] | None = None
+        self._remote_access_resume_stop = threading.Event()
         self._maybe_start_rendezvous()
         # Resume saved remote gateway/tunnel after reboot without blocking serve.
-        threading.Thread(
+        self._remote_access_resume_worker = threading.Thread(
             target=self._resume_remote_access_background,
             name="universe-remote-access-resume",
             daemon=True,
-        ).start()
+        )
+        self._remote_access_resume_worker.start()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
 
     def _resume_remote_access_background(self) -> None:
         try:
-            # Let server.json settle (upstream for gateway).
-            time.sleep(1.2)
+            # Let server.json settle (upstream for gateway), unless shutdown wins.
+            if self._remote_access_resume_stop.wait(1.2):
+                return
+            if self._remote_access_resume_stop.is_set():
+                return
             self._remote_access_resume = self.maybe_resume_remote_access()
         except Exception as error:  # noqa: BLE001 - never kill service for tunnel
             self._remote_access_resume = {
@@ -12229,6 +12238,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "error_code": "REMOTE_ACCESS_RESUME_EXCEPTION",
                 "detail": f"{type(error).__name__}: {error}",
             }
+
+    def process_request_thread(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        """Track request completion so shutdown cannot race SQLite cleanup."""
+
+        with self._request_worker_lock:
+            self._active_request_workers += 1
+            self._request_workers_idle.clear()
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._request_worker_lock:
+                self._active_request_workers -= 1
+                if self._active_request_workers == 0:
+                    self._request_workers_idle.set()
+
+    def wait_for_request_workers(self, timeout: float = 5.0) -> bool:
+        """Wait until all request handlers have released their local resources."""
+
+        return self._request_workers_idle.wait(timeout)
 
     def _loopback_endpoint_url(self) -> str:
         host, port = self.server_address[:2]
@@ -14154,6 +14186,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     }
                 )
 
+        self._remote_access_resume_stop.set()
+        if self._remote_access_resume_worker.is_alive():
+            close_step(
+                "remote_access_resume_worker",
+                lambda: self._remote_access_resume_worker.join(timeout=5),
+            )
         self._supervisor_maintenance_stop.set()
         if self._supervisor_maintenance_worker.is_alive():
             close_step(
@@ -14187,6 +14225,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if self.rendezvous_service is not None:
             close_step("rendezvous_service", self.rendezvous_service.stop)
             self.rendezvous_service = None
+        if not self.wait_for_request_workers():
+            self._shutdown_errors.append(
+                {
+                    "component": "request_workers",
+                    "error": "TimeoutError: request handlers did not finish before shutdown",
+                }
+            )
         close_step("http_server", super().server_close)
         print(
             json.dumps(

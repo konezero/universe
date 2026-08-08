@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -166,6 +167,111 @@ class ReleaseRuntimeTests(unittest.TestCase):
 
         self.assertEqual("ABSENT", context["status"])
         self.assertEqual("GOVERNANCE_CATALOG_ABSENT", context["reason"])
+
+    @staticmethod
+    def _governance_runtime() -> ReleaseRuntime:
+        runtime = object.__new__(ReleaseRuntime)
+        runtime.metadata = {
+            "release_id": "core-test",
+            "source_commit": "a" * 40,
+            "governance_catalog_status": "PRESENT",
+            "governance_catalog_digest": "b" * 64,
+        }
+        runtime._connection = sqlite3.connect(":memory:")
+        runtime._connection.row_factory = sqlite3.Row
+        runtime._connection.executescript(
+            """
+            CREATE TABLE governance_index (
+                role TEXT, mode TEXT, operation TEXT, scope TEXT, risk TEXT,
+                capability TEXT, governance_id TEXT, required INTEGER, priority INTEGER
+            );
+            CREATE TABLE governance_override (
+                base_governance_id TEXT, overriding_governance_id TEXT,
+                applies_when_json TEXT
+            );
+            CREATE TABLE governance_dependency (
+                governance_id TEXT, requires_governance_id TEXT
+            );
+            CREATE TABLE governance_unit (
+                governance_id TEXT, kind TEXT, source_ref TEXT,
+                source_digest TEXT, compact_instruction TEXT
+            );
+            CREATE TABLE release_file (path TEXT, content BLOB);
+            """
+        )
+        return runtime
+
+    def test_governance_context_rejects_unmatched_selector(self) -> None:
+        runtime = self._governance_runtime()
+        self.addCleanup(runtime.close)
+        selector = {
+            "role": "PROJECT_MASTER",
+            "mode": "MASTER",
+            "operation": "DELEGATE_TO_BOSS",
+            "scope": "FEATURE",
+            "risk": "GUARDED",
+            "capability": "TASK_FRAME",
+        }
+
+        with self.assertRaisesRegex(ReleaseRuntimeError, "no matching units"):
+            runtime.select_governance_context(selector)
+
+    def test_governance_context_uses_canonical_selector_digest(self) -> None:
+        runtime = self._governance_runtime()
+        self.addCleanup(runtime.close)
+        selector = {
+            "role": "PROJECT_MASTER",
+            "mode": "MASTER",
+            "operation": "DELEGATE_TO_BOSS",
+            "scope": "FEATURE",
+            "risk": "GUARDED",
+            "capability": "TASK_FRAME",
+        }
+        runtime._connection.execute(
+            "INSERT INTO governance_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*selector.values(), "CORE_INVARIANTS", 1, 0),
+        )
+        content = b"Core contract.\n"
+        source_digest = hashlib.sha256(content).hexdigest()
+        runtime._connection.execute(
+            "INSERT INTO governance_unit VALUES (?, ?, ?, ?, ?)",
+            (
+                "CORE_INVARIANTS",
+                "CORE_INVARIANT",
+                ".ai/core.md",
+                source_digest,
+                "Load core.",
+            ),
+        )
+        runtime._connection.execute(
+            "INSERT INTO release_file VALUES (?, ?)",
+            (".ai/core.md", content),
+        )
+        context = runtime.select_governance_context(selector)
+        expected = hashlib.sha256(
+            json.dumps(
+                {
+                    "catalog_digest": "b" * 64,
+                    "selector": selector,
+                    "matched_entries": [
+                        {
+                            **selector,
+                            "governance_id": "CORE_INVARIANTS",
+                            "required": True,
+                            "priority": 0,
+                        }
+                    ],
+                    "dependency_closure": ["CORE_INVARIANTS"],
+                    "source_digests": [source_digest],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        self.assertEqual(expected, context["selector_digest"])
+        self.assertEqual("b" * 64, context["catalog_digest"])
 
     def test_applies_fresh_release_without_executing_packaged_installer(self) -> None:
         marker = self.root / "installer-executed"

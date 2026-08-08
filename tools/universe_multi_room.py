@@ -13,9 +13,9 @@ import secrets
 import sqlite3
 import threading
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Mapping
-from uuid import uuid4
+from typing import Any, Iterator, Mapping
 
 ROOM_SCHEMA = "universe.chat-room.v1"
 ROOM_MESSAGE_SCHEMA = "universe.chat-room-message.v1"
@@ -140,7 +140,8 @@ class MultiRoomStore:
         self.hub = MultiRoomEventHub()
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         # Shares universe.sqlite3 with the main service, remote gateway, and
         # session supervisor. DELETE journal fights WAL writers on Windows and
         # surfaces as "database is locked" when remote UI switches rooms.
@@ -152,7 +153,11 @@ class MultiRoomStore:
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _ensure_schema(self) -> None:
         with self._connect() as connection:

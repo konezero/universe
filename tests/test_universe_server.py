@@ -2729,6 +2729,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH", response["error_code"]
         )
+        self.assertTrue(self.server.wait_for_request_workers(timeout=1))
 
     def test_governance_approval_does_not_resolve_platform_permission(self) -> None:
         proposal = self.create_task_proposal_fixture()
