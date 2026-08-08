@@ -547,6 +547,7 @@
     <div class="dialog-tabs settings-tabs" role="tablist" aria-label="Observatory categories">
       <button type="button" class="dialog-tab settings-tab is-active" role="tab" aria-selected="true" data-observatory-tab="sessions">Sessions</button>
       <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="register">Register</button>
+      <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="activity">Activity</button>
       <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="attachments">Attachments</button>
       <button type="button" class="dialog-tab settings-tab" role="tab" aria-selected="false" data-observatory-tab="audit">Audit</button>
     </div>
@@ -608,6 +609,21 @@
             </button>
           </div>
           <p id="observatory-inject-status" class="section-note"></p>
+        </section>
+      </div>
+
+      <div class="dialog-tab-panel settings-tab-panel" data-observatory-panel="activity" role="tabpanel" hidden>
+        <section class="provider-activity-section">
+          <div class="section-heading"><span>Provider activity</span></div>
+          <p class="section-note">
+            Sources stay local. Universe retains only reduced activity, cursor state, and reviewable references.
+          </p>
+          <div class="session-observatory-toolbar">
+            <span id="provider-activity-summary">No registered activity sources.</span>
+            <button id="discover-provider-activity-button" class="secondary-button" type="button">Discover local sources</button>
+          </div>
+          <div id="provider-activity-list" class="session-observatory-list"></div>
+          <div id="provider-activity-discovery" class="provider-activity-discovery"></div>
         </section>
       </div>
 

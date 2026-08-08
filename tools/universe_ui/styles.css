@@ -3258,10 +3258,38 @@ body {
 }
 
 .session-inject-section,
-.room-session-section {
+.room-session-section,
+.provider-activity-section {
   display: grid;
   gap: 8px;
   margin: 0 0 14px;
+}
+
+.provider-activity-discovery {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.provider-activity-discovery-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.6fr) minmax(0, 1.4fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-quiet);
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.provider-activity-discovery-row code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
 }
 
 .session-inject-form {

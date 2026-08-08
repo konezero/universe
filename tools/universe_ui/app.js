@@ -57,6 +57,8 @@ const state = {
   todoTab: "board",
   supervisorEvents: [],
   legacyExecutors: [],
+  providerActivitySources: [],
+  providerActivityDiscoveries: [],
   conversationTarget: {
     kind: "UNIVERSE_CONDUCTOR",
     projectId: null,
@@ -210,6 +212,10 @@ const elements = {
   observatoryInjectMode: document.querySelector("#observatory-inject-mode"),
   observatoryInjectButton: document.querySelector("#observatory-inject-button"),
   observatoryInjectStatus: document.querySelector("#observatory-inject-status"),
+  providerActivitySummary: document.querySelector("#provider-activity-summary"),
+  providerActivityList: document.querySelector("#provider-activity-list"),
+  providerActivityDiscovery: document.querySelector("#provider-activity-discovery"),
+  discoverProviderActivity: document.querySelector("#discover-provider-activity-button"),
   roomSessionBindingList: document.querySelector("#room-session-binding-list"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
@@ -645,9 +651,10 @@ async function api(path, options = {}) {
 }
 
 async function refreshSupervisorSessions() {
-  const [audit, legacy] = await Promise.all([
+  const [audit, legacy, activity] = await Promise.all([
     api("/v1/runtime/audit"),
     api("/v1/supervisor/legacy-executors"),
+    api("/v1/session-observer/sources"),
   ]);
   state.runtimeAudit = audit;
   state.runtimePreflight = audit.preflight || null;
@@ -655,9 +662,141 @@ async function refreshSupervisorSessions() {
   state.roomSessionBindings = audit.room_session_bindings || [];
   state.supervisorEvents = audit.recent_events || [];
   state.legacyExecutors = legacy.executors || [];
+  state.providerActivitySources = activity.sources || [];
   prefillsObservatoryInjectForm();
   renderRuntimePreflight();
   renderSessionObservatory();
+  renderProviderActivitySources();
+}
+
+async function discoverProviderActivitySources() {
+  if (elements.discoverProviderActivity) {
+    elements.discoverProviderActivity.disabled = true;
+  }
+  try {
+    const results = await Promise.all(
+      ["CODEX", "CLAUDE", "GROK"].map((provider) =>
+        api(`/v1/session-observer/discover?provider=${provider}`)
+      )
+    );
+    state.providerActivityDiscoveries = results.flatMap(
+      (result) => result.sources || []
+    );
+    renderProviderActivitySources();
+  } finally {
+    if (elements.discoverProviderActivity) {
+      elements.discoverProviderActivity.disabled = false;
+    }
+  }
+}
+
+async function registerProviderActivitySource(source) {
+  await api("/v1/session-observer/sources", {
+    method: "POST",
+    body: {
+      provider: source.provider,
+      provider_session_id: source.provider_session_id,
+      source_path: source.source_path,
+      source_kind: source.source_kind,
+      source_version: source.source_version,
+    },
+  });
+  await refreshSupervisorSessions();
+  toast("Activity source registered locally");
+}
+
+async function scanProviderActivitySource(sourceId) {
+  const result = await api(
+    `/v1/session-observer/sources/${encodeURIComponent(sourceId)}/scan`,
+    { method: "POST", body: {} }
+  );
+  await refreshSupervisorSessions();
+  toast(`Activity scan: ${result.added || 0} new events`);
+}
+
+async function showProviderActivityBatch(sourceId) {
+  const result = await api(
+    `/v1/session-observer/sources/${encodeURIComponent(sourceId)}/batch-candidate`
+  );
+  const candidate = result.candidate || {};
+  toast(
+    candidate.status === "REVIEW_REQUIRED"
+      ? `${candidate.activity_refs?.length || 0} activity references are ready for review`
+      : "No reviewable activity boundary yet"
+  );
+}
+
+function renderProviderActivitySources() {
+  if (!elements.providerActivityList || !elements.providerActivityDiscovery) return;
+  const sources = state.providerActivitySources || [];
+  if (elements.providerActivitySummary) {
+    const active = sources.filter((source) => source.status === "ACTIVE").length;
+    const unknown = sources.filter((source) => source.status === "UNKNOWN").length;
+    elements.providerActivitySummary.textContent =
+      `${sources.length} registered - ${active} active - ${unknown} needs attention`;
+  }
+  elements.providerActivityList.replaceChildren();
+  if (!sources.length) {
+    elements.providerActivityList.append(
+      node("p", "empty-copy", "No provider source is registered yet.")
+    );
+  }
+  for (const source of sources) {
+    const card = node("article", "supervisor-session-card");
+    const heading = node("div", "session-card-heading");
+    heading.append(
+      node("strong", "", `${source.provider} activity`),
+      node("span", "session-state-pill", source.status || "UNKNOWN")
+    );
+    heading.lastElementChild.dataset.state = source.status || "UNKNOWN";
+    const meta = node("div", "session-card-meta");
+    meta.append(
+      node("span", "", source.provider_session_id || "unknown session"),
+      node("span", "", `cursor ${source.cursor?.ordinal || 0}`),
+      node("span", "", source.last_seen_at ? formatSessionTime(source.last_seen_at) : "not scanned")
+    );
+    const reason = source.reason
+      ? node("p", "session-path-line unbound", source.reason)
+      : node("p", "session-path-line bound", source.source_path || "local source");
+    const actions = node("div", "session-card-actions");
+    const scan = node("button", "secondary-button compact-action", "Scan now");
+    scan.type = "button";
+    scan.addEventListener("click", () => {
+      scanProviderActivitySource(source.source_id).catch((error) => toast(error.message, true));
+    });
+    const batch = node("button", "secondary-button compact-action", "Review batch");
+    batch.type = "button";
+    batch.addEventListener("click", () => {
+      showProviderActivityBatch(source.source_id).catch((error) => toast(error.message, true));
+    });
+    actions.append(scan, batch);
+    card.append(heading, meta, reason, actions);
+    elements.providerActivityList.append(card);
+  }
+
+  elements.providerActivityDiscovery.replaceChildren();
+  const registeredPaths = new Set(sources.map((source) => source.source_path));
+  const discovered = (state.providerActivityDiscoveries || []).filter(
+    (source) => !registeredPaths.has(source.source_path)
+  );
+  if (!discovered.length) return;
+  elements.providerActivityDiscovery.append(
+    node("p", "section-note", `${discovered.length} local source candidates`)
+  );
+  for (const source of discovered) {
+    const row = node("div", "provider-activity-discovery-row");
+    row.append(
+      node("span", "", `${source.provider} - ${source.provider_session_id}`),
+      node("code", "", source.source_path)
+    );
+    const add = node("button", "secondary-button compact-action", "Register");
+    add.type = "button";
+    add.addEventListener("click", () => {
+      registerProviderActivitySource(source).catch((error) => toast(error.message, true));
+    });
+    row.append(add);
+    elements.providerActivityDiscovery.append(row);
+  }
 }
 
 function prefillsObservatoryInjectForm() {
@@ -3286,7 +3425,7 @@ function setSettingsTab(tabId) {
 }
 
 function setObservatoryTab(tabId) {
-  const allowed = new Set(["sessions", "register", "attachments", "audit"]);
+  const allowed = new Set(["sessions", "register", "activity", "attachments", "audit"]);
   if (allowed.has(tabId)) state.observatoryTab = tabId;
   setDialogCategoryTab(elements.sessionObservatoryDialog, {
     tabAttr: "data-observatory-tab",
@@ -3552,13 +3691,14 @@ async function loadAllProjectProjections() {
     return;
   }
   const results = await Promise.all(
-    projects.map((project) =>
-      api(
+    projects.map((project) => {
+      if (!project.projection_available) return Promise.resolve(null);
+      return api(
         `/v1/projects/${encodeURIComponent(project.project_id)}/projection`
-      ).catch(() => null)
-    )
+      ).catch(() => null);
+    })
   );
-  const next = { ...state.projectionsByProject };
+  const next = {};
   projects.forEach((project, index) => {
     const projection = results[index]?.projection;
     if (projection) next[project.project_id] = projection;
@@ -7329,6 +7469,11 @@ function bindEvents() {
   elements.refreshSessionsButton.addEventListener("click", () => {
     refreshSupervisorSessions().catch((error) => toast(error.message, true));
   });
+  if (elements.discoverProviderActivity) {
+    elements.discoverProviderActivity.addEventListener("click", () => {
+      discoverProviderActivitySources().catch((error) => toast(error.message, true));
+    });
+  }
   elements.discoverHostTools.addEventListener("click", () => {
     discoverHostTools().catch((error) => toast(error.message, true));
   });

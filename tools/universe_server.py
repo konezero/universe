@@ -5310,7 +5310,12 @@ class UniverseStore:
             rows = connection.execute(
                 """
                 SELECT project_id, project_root, refs_json, metadata_json,
-                       attachment_json, registered_at, updated_at
+                       attachment_json, registered_at, updated_at,
+                       EXISTS(
+                           SELECT 1 FROM project_projection
+                           WHERE project_projection.project_id = project_connection.project_id
+                             AND project_projection.is_current = 1
+                       ) AS projection_available
                 FROM project_connection
                 ORDER BY project_id
                 """
@@ -5323,7 +5328,12 @@ class UniverseStore:
             row = connection.execute(
                 """
                 SELECT project_id, project_root, refs_json, metadata_json,
-                       attachment_json, registered_at, updated_at
+                       attachment_json, registered_at, updated_at,
+                       EXISTS(
+                           SELECT 1 FROM project_projection
+                           WHERE project_projection.project_id = project_connection.project_id
+                             AND project_projection.is_current = 1
+                       ) AS projection_available
                 FROM project_connection
                 WHERE project_id = ?
                 """,
@@ -5344,7 +5354,12 @@ class UniverseStore:
         row = connection.execute(
             """
             SELECT project_id, project_root, refs_json, metadata_json,
-                   attachment_json, registered_at, updated_at
+                   attachment_json, registered_at, updated_at,
+                   EXISTS(
+                       SELECT 1 FROM project_projection
+                       WHERE project_projection.project_id = project_connection.project_id
+                         AND project_projection.is_current = 1
+                   ) AS projection_available
             FROM project_connection
             WHERE project_id = ?
             """,
@@ -5999,6 +6014,12 @@ class UniverseStore:
     def list_provider_session_sources(self) -> list[dict[str, Any]]:
         return self.provider_session_observer.list_sources()
 
+    def discover_provider_session_sources(self, provider: str) -> list[dict[str, Any]]:
+        try:
+            return self.provider_session_observer.discover_sources(provider)
+        except ProviderSessionObserverError as error:
+            raise UniverseError(error.code, error.detail) from error
+
     def list_provider_session_activities(self, source_id: str) -> list[dict[str, Any]]:
         try:
             return self.provider_session_observer.list_activities(source_id)
@@ -6010,6 +6031,9 @@ class UniverseStore:
             return self.provider_session_observer.build_batch_candidate(source_id)
         except ProviderSessionObserverError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+
+    def scan_registered_provider_sources(self) -> list[dict[str, Any]]:
+        return self.provider_session_observer.scan_registered_sources()
 
     def list_events(self, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
         normalized = _project_id(project_id)
@@ -11946,6 +11970,7 @@ class UniverseStore:
             "refs": json.loads(row["refs_json"]),
             "metadata": json.loads(row["metadata_json"]),
             "attachment": attachment,
+            "projection_available": bool(row["projection_available"]),
             "registered_at": row["registered_at"],
             "updated_at": row["updated_at"],
         }
@@ -12825,6 +12850,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.project_master_hosts.save_idle_sessions(idle_seconds)
             )
             results["dirty_ends"] = self.project_master_hosts.reconcile_residents()
+        results["provider_activity"] = self.store.scan_registered_provider_sources()
         reconcile_runtime = getattr(self.conductor_runtime, "reconcile", None)
         if callable(reconcile_runtime):
             runtime_state = reconcile_runtime()
@@ -14759,6 +14785,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "sources": sources,
                 },
             )
+            return
+        if path == "/v1/session-observer/discover":
+            if not self._authorize_local_operator():
+                return
+            provider = (parse_qs(urlsplit(self.path).query).get("provider") or [""])[0]
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROVIDER_SESSION_SOURCES_DISCOVERED",
+                        "sources": self.server.store.discover_provider_session_sources(
+                            provider
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
             return
         if path == "/v1/session-observer/activities":
             query_map = parse_qs(urlsplit(self.path).query)

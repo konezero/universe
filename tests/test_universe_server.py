@@ -566,6 +566,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("PROJECTS_COLLECTED", result["status"])
 
+        project, _ = self.server.store.register_project(self.registration())
+        self.assertFalse(project["projection_available"])
+
     def test_universe_identity_is_durable_and_unique_per_database(self) -> None:
         identity = self.server.store.identity()
         self.assertEqual("universe.identity.v1", identity["schema"])
@@ -760,6 +763,40 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(403, status)
         self.assertEqual("LOCAL_OPERATOR_REQUIRED", denied["error_code"])
+
+        discovered_source = {
+            "schema": "universe.provider-session-source.v1",
+            "status": "DISCOVERED",
+            "provider": "CODEX",
+            "provider_session_id": "rollout-20260808",
+            "source_path": str(rollout),
+            "source_kind": "CODEX_ROLLOUT_JSONL",
+            "source_version": "v1",
+            "last_modified_at": "2026-08-08T00:00:00Z",
+        }
+        with patch.object(
+            self.server.store,
+            "discover_provider_session_sources",
+            return_value=[discovered_source],
+        ) as discover:
+            status, discovered = self.request(
+                "GET", "/v1/session-observer/discover?provider=CODEX"
+            )
+            self.assertEqual(200, status)
+            self.assertEqual("PROVIDER_SESSION_SOURCES_DISCOVERED", discovered["status"])
+            self.assertEqual([discovered_source], discovered["sources"])
+            discover.assert_called_once_with("CODEX")
+        status, remote_discovery = self.request(
+            "GET",
+            "/v1/session-observer/discover?provider=CODEX",
+            extra_headers={"X-Universe-Access-Surface": "REMOTE_BROWSER"},
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("LOCAL_OPERATOR_REQUIRED", remote_discovery["error_code"])
+
+        maintenance = self.server.run_supervisor_maintenance_once(idle_seconds=0)
+        self.assertIn("provider_activity", maintenance)
+        self.assertEqual(1, len(maintenance["provider_activity"]))
 
     def test_linked_project_master_result_advances_only_its_todo(self) -> None:
         self.server.store.register_project(self.registration())

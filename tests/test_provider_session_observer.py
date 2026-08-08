@@ -138,6 +138,16 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual("NOT_PROJECTED", candidate["future"]["state"])
         self.assertNotIn("private", json.dumps(candidate))
 
+    def test_discovery_reads_only_known_provider_paths(self) -> None:
+        codex_home = self.root / "codex"
+        rollout = codex_home / "archived_sessions" / "rollout-20260808.jsonl"
+        rollout.parent.mkdir(parents=True)
+        self.write(rollout, {"type": "turn_started", "message": "private"})
+        discovered = self.store.discover_sources("CODEX", home=codex_home)
+        self.assertEqual(1, len(discovered))
+        self.assertEqual("rollout-20260808", discovered[0]["provider_session_id"])
+        self.assertNotIn("private", json.dumps(discovered))
+
 
 if __name__ == "__main__":
     unittest.main()

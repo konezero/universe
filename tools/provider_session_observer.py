@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -255,12 +256,73 @@ class ProviderSessionObserverStore:
             ).fetchone()
         return self._source_row(row)
 
+    def discover_sources(
+        self, provider: str, *, home: Path | None = None
+    ) -> list[dict[str, Any]]:
+        """Return local source metadata without opening any transcript file."""
+        normalized_provider = _text(provider, "provider").upper()
+        if normalized_provider not in PROVIDERS:
+            raise ProviderSessionObserverError(
+                "SOURCE_PROVIDER_UNSUPPORTED", normalized_provider
+            )
+        root = home or self._default_provider_home(normalized_provider)
+        if not root.is_dir():
+            return []
+        if normalized_provider == "CODEX":
+            paths = list((root / "archived_sessions").glob("rollout-*.jsonl"))
+            paths.extend((root / "sessions").glob("**/rollout-*.jsonl"))
+        elif normalized_provider == "CLAUDE":
+            paths = list((root / "projects").glob("**/*.jsonl"))
+        else:
+            paths = list((root / "sessions").glob("**/updates.jsonl"))
+        file_paths: list[tuple[Path, float]] = []
+        for path in paths:
+            try:
+                if path.is_file():
+                    file_paths.append((path, path.stat().st_mtime))
+            except OSError:
+                # Discovery is advisory. A rotating provider directory must not
+                # turn a local UI refresh into a transcript read or a failure.
+                continue
+        candidates: list[dict[str, Any]] = []
+        for path, modified_at in sorted(
+            file_paths, key=lambda item: item[1], reverse=True
+        )[:200]:
+            provider_session_id = (
+                path.parent.name if normalized_provider == "GROK" else path.stem
+            )
+            candidates.append(
+                {
+                    "schema": SOURCE_SCHEMA,
+                    "status": "DISCOVERED",
+                    "provider": normalized_provider,
+                    "provider_session_id": provider_session_id,
+                    "source_path": str(path.resolve()),
+                    "source_kind": SOURCE_KINDS[normalized_provider],
+                    "source_version": "v1",
+                    "last_modified_at": datetime.fromtimestamp(modified_at, tz=timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                }
+            )
+        return candidates
+
     def list_sources(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM provider_session_source ORDER BY updated_at DESC, source_id"
             ).fetchall()
         return [self._source_row(row) for row in rows]
+
+    def scan_registered_sources(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            source_ids = [
+                str(row["source_id"])
+                for row in connection.execute(
+                    "SELECT source_id FROM provider_session_source WHERE enabled = 1"
+                ).fetchall()
+            ]
+        return [self.scan(source_id) for source_id in source_ids]
 
     def list_activities(self, source_id: str, *, active_only: bool = True) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -489,6 +551,14 @@ class ProviderSessionObserverStore:
             "last_seen_at": row["last_seen_at"],
             "updated_at": row["updated_at"],
         }
+
+    @staticmethod
+    def _default_provider_home(provider: str) -> Path:
+        if provider == "CODEX":
+            return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        if provider == "CLAUDE":
+            return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        return Path(os.environ.get("GROK_HOME") or Path.home() / ".grok")
 
     @staticmethod
     def _activity_row(row: sqlite3.Row) -> dict[str, Any]:
