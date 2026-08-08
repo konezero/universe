@@ -2,8 +2,10 @@
 
 Status: TEST_PROTOTYPE
 
-Universe distributes an immutable ai-career Core Release without requiring a
-project to access the private ai-career Git repository.
+Career produces an immutable Runtime Release DB. Universe distributes the
+selected release without requiring an attached Project to access the private
+ai-career Git repository. Project attachment and project-facing templates are
+Universe-owned; the Release DB remains Career-owned.
 
 ## Boundary
 

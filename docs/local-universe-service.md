@@ -292,6 +292,9 @@ POST   /v1/projects/{project_id}/release-proposals
 POST   /v1/projects/{project_id}/release-proposals/apply
 GET    /v1/projects/{project_id}/seed-asset-proposal
 POST   /v1/projects/{project_id}/seed-asset-proposal/apply
+GET    /v1/project-templates
+GET    /v1/projects/{project_id}/integration-template-proposal
+POST   /v1/projects/{project_id}/integration-template-proposal/apply
 GET    /v1/projects/{project_id}/runtime-worker-invocations
 POST   /v1/projects/{project_id}/runtime-worker-invocations
 GET    /v1/projects/{project_id}/dispatches
@@ -802,6 +805,27 @@ then validates every published digest. A repeated apply with identical bytes
 is read-only. The installed Project must already expose a real
 `.ai/universe/` Runtime-state root; the Host does not create that directory
 through raw filesystem access.
+
+## Project integration catalog
+
+Universe owns the versioned project-integration catalog. `GET
+/v1/project-templates` exposes its template digests without addressing a
+Project. `GET /v1/projects/{project_id}/integration-template-proposal` creates
+the exact `universe.project-integration-proposal.v1` for one registered
+Project, without storing or writing it.
+
+The proposal contains one tracked Project-source asset,
+`.universe/project.json`, and three local Runtime assets under `.ai/`. The
+apply route accepts only `APPROVED` with the current proposal ID and digest.
+Universe creates one exact approval evidence reference, then passes the
+unchanged proposal and scope-specific approval fields to the resident Project
+Master. The Master uses the existing receipt-aware mutation gateway for every
+changed file, verifies all output digests, and returns an idempotent receipt.
+
+An integration apply requires an installed Career Project Runtime and a
+reachable resident Project Master. For a Fresh Project, the approved Release
+proposal and Project Lifecycle Host complete `OS_INSTALL` first; this route
+never creates a substitute `.ai/` Runtime or bypasses the Career lifecycle.
 
 Building a Projection returns the current node/edge/document map, structural
 gaps, and user-selectable predicted paths. The UI places component documents

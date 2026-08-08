@@ -219,6 +219,65 @@ class UniverseDispatchTests(unittest.TestCase):
         self.assertEqual("bridge_123", payload["bridge_id"])
         self.assertEqual("host-session-opaque", payload["master_session_ref"])
 
+    def test_master_bridge_delivers_integration_assets_to_exact_route(self) -> None:
+        captured: dict[str, object] = {}
+
+        class BridgeHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                captured["path"] = self.path
+                captured["authorization"] = self.headers.get("Authorization")
+                length = int(self.headers["Content-Length"])
+                captured["payload"] = json.loads(self.rfile.read(length))
+                body = b'{"status":"PROJECT_INTEGRATION_APPLIED"}'
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BridgeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address[:2]
+        host_text = host.decode("ascii") if isinstance(host, bytes) else host
+        previous = os.environ.get("UNIVERSE_TEST_MASTER_TOKEN")
+        os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = "bridge-test-token"
+        proposal = {
+            "proposal_id": "project_integration_123",
+            "proposal_digest": "a" * 64,
+        }
+        approval = {"status": "APPROVED", "proposal_id": proposal["proposal_id"]}
+        try:
+            receipt = HttpProjectMasterBridge(
+                endpoint=f"http://{host_text}:{port}",
+                credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+            ).apply_integration_assets(
+                bridge={"project_id": "GCS"},
+                proposal=proposal,
+                approval=approval,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            if previous is None:
+                os.environ.pop("UNIVERSE_TEST_MASTER_TOKEN", None)
+            else:
+                os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
+
+        self.assertEqual("DELIVERED", receipt["status"])
+        self.assertEqual(
+            "/v1/project-master/integration-assets/apply",
+            captured["path"],
+        )
+        self.assertEqual("Bearer bridge-test-token", captured["authorization"])
+        payload = cast(dict[str, Any], captured["payload"])
+        self.assertEqual("GCS", payload["project_id"])
+        self.assertEqual(proposal, payload["proposal"])
+
 
 if __name__ == "__main__":
     unittest.main()

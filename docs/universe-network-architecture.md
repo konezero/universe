@@ -431,6 +431,15 @@ Future Universe peer exchange may use a different `PEER` connection profile.
 It must not reuse a paired browser session as peer identity and is excluded
 from the first remote release.
 
+## Product ownership
+
+Rendezvous is a separate product in the Universe product suite. It owns
+Universe UUID registration, discovery visibility, owner-approved connection
+requests, and route resolution. Universe owns the local application, pairing,
+and Project lifecycle; Career owns Runtime Release DB production. A
+Rendezvous route does not grant Provider permission or Project execution
+authority. See `docs/universe-product-suite.md`.
+
 ## Implementation Sequence
 
 ### Slice 1: Local proxy boundary

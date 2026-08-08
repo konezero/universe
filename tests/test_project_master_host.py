@@ -23,6 +23,8 @@ from project_master_bridge import (  # noqa: E402
 )
 from project_seed_apply import build_project_seed_asset_approval  # noqa: E402
 from project_seed_assets import build_project_seed_asset_proposal  # noqa: E402
+from project_integration_apply import build_project_integration_approval  # noqa: E402
+from project_integration_catalog import build_project_integration_proposal  # noqa: E402
 from project_skill_plan_apply import build_project_skill_plan_approval  # noqa: E402
 from project_master_host import (  # noqa: E402
     ClaudeProjectMasterRuntime,
@@ -256,6 +258,8 @@ class FakeSurfaceObserver:
         boundary: str,
         approval_evidence_ref: str,
         request_ref: str,
+        write_roots: tuple[Path, ...] | None = None,
+        task_summary: str = "Apply one approved Universe Project Seed asset",
     ) -> Mapping[str, Any]:
         self.mutations.append(
             {
@@ -264,8 +268,11 @@ class FakeSurfaceObserver:
                 "boundary": boundary,
                 "approval_evidence_ref": approval_evidence_ref,
                 "request_ref": request_ref,
+                "write_roots": write_roots,
+                "task_summary": task_summary,
             }
         )
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         return {
             "status": "FILE_MUTATION_APPLIED",
@@ -863,6 +870,37 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         self.assertEqual("PROJECT_SEED_ASSETS_APPLIED", receipt["status"])
         self.assertEqual(5, len(self.surface_observer.mutations))
+
+    def test_live_bridge_applies_integration_assets_through_coordinator_gateway(
+        self,
+    ) -> None:
+        worker = self._worker()
+        host = LiveProjectMasterBridgeHost(
+            self.root,
+            "bridge-token",
+            ".ai/master/inbox",
+            worker,
+            self.surface_observer,
+        )
+        proposal = build_project_integration_proposal("GCS", root=ROOT)
+        approval = build_project_integration_approval(
+            project_id="GCS",
+            proposal=proposal,
+            project_source_evidence_ref="universe://approval/integration/source-host",
+            local_runtime_evidence_ref="universe://approval/integration/runtime-host",
+        )
+
+        receipt = host.apply_integration_assets(
+            {
+                "project_id": "GCS",
+                "proposal": proposal,
+                "approval": approval,
+            }
+        )
+
+        self.assertEqual("PROJECT_INTEGRATION_APPLIED", receipt["status"])
+        self.assertEqual(4, len(self.surface_observer.mutations))
+        self.assertTrue((self.root / ".universe" / "project.json").is_file())
 
     def test_live_bridge_binds_skill_plan_context_idempotently(self) -> None:
         skill = self.root / ".ai" / "skills" / "common" / "source-review" / "SKILL.md"

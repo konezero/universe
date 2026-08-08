@@ -705,6 +705,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("TODO_SCOPE_COORDINATE_INVALID", invalid["error_code"])
 
+    def test_project_integration_catalog_is_read_only_and_digest_bound(self) -> None:
+        status, result = self.request("GET", "/v1/project-templates")
+
+        self.assertEqual(200, status)
+        self.assertEqual("universe.project-integration-catalog.v1", result["schema"])
+        self.assertEqual("PROJECT_INTEGRATION_CATALOG_READY", result["status"])
+        self.assertEqual("LOCAL_ONLY", result["project_binding"]["workspace_tracking"])
+        self.assertEqual("NONE", result["effects"]["project_source_write"])
+        self.assertEqual(4, len(result["templates"]))
+
+    def test_project_integration_proposal_is_project_bound_and_non_executing(self) -> None:
+        self.server.store.register_project(self.registration())
+
+        status, result = self.request(
+            "GET", "/v1/projects/GCS/integration-template-proposal"
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("GCS", result["project_id"])
+        self.assertEqual("PROPOSED", result["effects"]["project_source_write"])
+        self.assertEqual("NOT_STARTED", result["apply_contract"]["execution"])
+        self.assertEqual(4, len(result["assets"]))
+
     def test_provider_session_observer_api_projects_redacted_activity(self) -> None:
         rollout = self.temp_root / "rollout-observer.jsonl"
         rollout.write_text(
@@ -5139,6 +5162,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         self.assertEqual(409, status)
         self.assertEqual("PROJECT_SEED_ASSET_APPROVAL_STALE", result["error_code"])
+        ensure.assert_not_called()
+
+    def test_integration_apply_routes_exact_approval_to_project_master(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        _, proposal = self.request(
+            "GET",
+            "/v1/projects/GCS/integration-template-proposal",
+            token=self.token,
+        )
+        bridge = {
+            "project_id": "GCS",
+            "endpoint": "http://127.0.0.1:19091",
+            "credential_env": "UNIVERSE_TEST_MASTER_TOKEN",
+        }
+        host_receipt = {
+            "schema": "universe.project-master-integration-apply-delivery-receipt.v1",
+            "status": "DELIVERED",
+            "project_id": "GCS",
+            "proposal_id": proposal["proposal_id"],
+            "host_response": {"status": "PROJECT_INTEGRATION_APPLIED"},
+        }
+
+        with (
+            patch.object(
+                self.server,
+                "ensure_project_master",
+                return_value={"status": "EXISTING_BRIDGE"},
+            ),
+            patch.object(
+                self.server.store,
+                "get_master_bridge",
+                return_value=bridge,
+            ),
+            patch(
+                "universe_server.HttpProjectMasterBridge.apply_integration_assets",
+                return_value=host_receipt,
+            ) as apply_integration_assets,
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/integration-template-proposal/apply",
+                {
+                    "approval": "APPROVED",
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                },
+                self.token,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_INTEGRATION_APPLICATION_DELIVERED", result["status"])
+        self.assertEqual("APPROVED", result["approval"]["status"])
+        self.assertEqual(
+            result["approval"]["project_source_evidence_ref"],
+            result["approval"]["local_runtime_evidence_ref"],
+        )
+        self.assertTrue(
+            result["approval"]["project_source_evidence_ref"].startswith(
+                "universe://projects/GCS/integration-template-proposals/"
+            )
+        )
+        apply_integration_assets.assert_called_once()
+
+    def test_integration_apply_rejects_stale_proposal_before_host_call(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+
+        with patch.object(self.server, "ensure_project_master") as ensure:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/integration-template-proposal/apply",
+                {
+                    "approval": "APPROVED",
+                    "proposal_id": "project_integration_stale",
+                    "proposal_digest": "f" * 64,
+                },
+                self.token,
+            )
+
+        self.assertEqual(409, status)
+        self.assertEqual("PROJECT_INTEGRATION_APPROVAL_STALE", result["error_code"])
         ensure.assert_not_called()
 
     def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(

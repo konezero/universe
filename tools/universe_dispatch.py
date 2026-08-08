@@ -26,6 +26,9 @@ MASTER_BRIDGE_RECEIPT_SCHEMA = "universe.project-master-bridge-receipt.v1"
 MASTER_SEED_APPLY_RECEIPT_SCHEMA = (
     "universe.project-master-seed-apply-delivery-receipt.v1"
 )
+MASTER_INTEGRATION_APPLY_RECEIPT_SCHEMA = (
+    "universe.project-master-integration-apply-delivery-receipt.v1"
+)
 MASTER_SKILL_PLAN_APPLY_RECEIPT_SCHEMA = (
     "universe.project-master-skill-plan-apply-delivery-receipt.v1"
 )
@@ -295,6 +298,62 @@ class HttpProjectMasterBridge:
             raise DispatchError("MASTER_SEED_APPLY_REJECTED")
         return {
             "schema": MASTER_SEED_APPLY_RECEIPT_SCHEMA,
+            "status": "DELIVERED",
+            "project_id": project_id,
+            "proposal_id": proposal.get("proposal_id", "UNKNOWN"),
+            "endpoint": endpoint,
+            "host_response": payload,
+            "delivered_at": utc_now(),
+        }
+
+    def apply_integration_assets(
+        self,
+        *,
+        bridge: dict[str, Any],
+        proposal: dict[str, Any],
+        approval: dict[str, Any],
+    ) -> dict[str, Any]:
+        endpoint = self.validate()
+        credential_env = _environment_name(self.credential_env)
+        token = os.environ.get(credential_env)
+        if not token:
+            raise DispatchError("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE")
+        project_id = _project_id(bridge.get("project_id"))
+        body = json.dumps(
+            {
+                "project_id": project_id,
+                "proposal": proposal,
+                "approval": approval,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        request = Request(
+            endpoint + "/v1/project-master/integration-assets/apply",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=max(self.timeout_seconds, 60.0)) as response:  # nosec B310
+                payload = json.loads(response.read().decode("utf-8"))
+                status_code = response.status
+        except HTTPError as error:
+            try:
+                detail = json.loads(error.read().decode("utf-8"))
+                code = str(detail.get("error_code") or f"HTTP_{error.code}")
+            except (UnicodeError, json.JSONDecodeError):
+                code = f"HTTP_{error.code}"
+            raise DispatchError("MASTER_INTEGRATION_APPLY_" + code) from error
+        except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise DispatchError("MASTER_INTEGRATION_APPLY_UNAVAILABLE") from error
+        if not 200 <= status_code < 300 or not isinstance(payload, dict):
+            raise DispatchError("MASTER_INTEGRATION_APPLY_REJECTED")
+        return {
+            "schema": MASTER_INTEGRATION_APPLY_RECEIPT_SCHEMA,
             "status": "DELIVERED",
             "project_id": project_id,
             "proposal_id": proposal.get("proposal_id", "UNKNOWN"),

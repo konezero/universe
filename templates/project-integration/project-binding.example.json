@@ -1,0 +1,8 @@
+{
+  "schema": "universe.project-binding.v1",
+  "project_id": "<PROJECT_ID>",
+  "workspace_path": ".ai",
+  "workspace_tracking": "LOCAL_ONLY",
+  "runtime_owner": "universe",
+  "standalone_install": "SUPPORTED"
+}

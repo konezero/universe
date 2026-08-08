@@ -91,6 +91,11 @@ class ProjectMasterBridgeHost:
             "PROJECT_SEED_ASSET_MUTATION_GATEWAY_UNAVAILABLE"
         )
 
+    def apply_integration_assets(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError(
+            "PROJECT_INTEGRATION_MUTATION_GATEWAY_UNAVAILABLE"
+        )
+
     def apply_skill_plan(self, _request: Any) -> dict[str, Any]:
         raise ProjectMasterBridgeError("PROJECT_SKILL_PLAN_CONTEXT_GATEWAY_UNAVAILABLE")
 
@@ -140,6 +145,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             (
                 "/v1/project-master/seed-assets/apply"
             ): self.server.bridge_host.apply_seed_assets,
+            (
+                "/v1/project-master/integration-assets/apply"
+            ): self.server.bridge_host.apply_integration_assets,
             (
                 "/v1/project-master/skill-plans/apply"
             ): self.server.bridge_host.apply_skill_plan,

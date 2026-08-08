@@ -15,6 +15,10 @@
 제품 일은 프로젝트 보드. 정책 plant: `.ai/universe/TODO_TRACKING_POLICY.md`  
 (Career 배포; 정본 설명 `docs/universe-todo-tracking-policy.md`).
 
+제품군 경계는 `docs/universe-product-suite.md`가 정한다. Universe는
+프로젝트 편입 템플릿을 소유하고, Career는 Runtime Release DB를 생산하며,
+Rendezvous는 원격 발견과 연결 승인을 소유한다.
+
 universe 프로젝트 시드 예: install_mode 구현 Todo, packaging/E2E/Memory/Bench 등.
 
 **구현 수준 갱신:** 2026-08-06 (Todo = 정본 큐; install_mode 문서 고정) · 이전 2026-07-31  

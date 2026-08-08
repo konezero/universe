@@ -74,6 +74,12 @@ from project_seed_assets import (
     project_seed_template,
 )
 from project_seed_apply import build_project_seed_asset_approval
+from project_integration_catalog import (
+    ProjectIntegrationCatalogError,
+    build_project_integration_proposal,
+    load_project_integration_catalog,
+)
+from project_integration_apply import build_project_integration_approval
 from project_skill_plan_apply import (
     ProjectSkillPlanApplyError,
     build_project_skill_plan_approval,
@@ -2288,6 +2294,25 @@ def normalize_project_seed_asset_apply_request(value: Any) -> dict[str, str]:
     if request["approval"] != "APPROVED":
         raise UniverseError(
             "PROJECT_SEED_ASSET_APPROVAL_REQUIRED",
+            "approval must be APPROVED before Project Host application",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        "approval": "APPROVED",
+        "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
+        "proposal_digest": _sha256(request["proposal_digest"], "proposal_digest"),
+    }
+
+
+def normalize_project_integration_apply_request(value: Any) -> dict[str, str]:
+    request = _exact_object_fields(
+        value,
+        field="project_integration_apply_request",
+        required=frozenset({"approval", "proposal_id", "proposal_digest"}),
+    )
+    if request["approval"] != "APPROVED":
+        raise UniverseError(
+            "PROJECT_INTEGRATION_APPROVAL_REQUIRED",
             "approval must be APPROVED before Project Host application",
             HTTPStatus.CONFLICT,
         )
@@ -13122,6 +13147,70 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "delivery": delivery,
         }
 
+    def apply_project_integration_assets(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = normalize_project_integration_apply_request(value)
+        self.store.get_project(project_id)
+        proposal = build_project_integration_proposal(project_id)
+        if (
+            request["proposal_id"] != proposal["proposal_id"]
+            or request["proposal_digest"] != proposal["proposal_digest"]
+        ):
+            raise UniverseError(
+                "PROJECT_INTEGRATION_APPROVAL_STALE",
+                "approval does not match the current Project integration proposal",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            self.ensure_project_master(project_id)
+            bridge = self.store.get_master_bridge(project_id)
+            approval_evidence_ref = (
+                "universe://projects/"
+                + quote(project_id, safe="")
+                + "/integration-template-proposals/"
+                + quote(proposal["proposal_id"], safe="")
+                + "/approvals/"
+                + _json_sha256(request)[:24]
+            )
+            approval = build_project_integration_approval(
+                project_id=project_id,
+                proposal=proposal,
+                project_source_evidence_ref=approval_evidence_ref,
+                local_runtime_evidence_ref=approval_evidence_ref,
+            )
+            delivery = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+                timeout_seconds=60,
+            ).apply_integration_assets(
+                bridge=bridge,
+                proposal=proposal,
+                approval=approval,
+            )
+        except (
+            DispatchError,
+            OSError,
+            ProjectIntegrationCatalogError,
+            ProjectMasterHostError,
+        ) as error:
+            raise UniverseError(
+                "PROJECT_INTEGRATION_APPLICATION_BLOCKED",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_INTEGRATION_APPLICATION_DELIVERED",
+            "project_id": project_id,
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "approval": approval,
+            "delivery": delivery,
+        }
+
     def deliver_master_handoff(
         self,
         project_id: str,
@@ -14792,6 +14881,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/project-templates":
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    load_project_integration_catalog(),
+                )
+            except ProjectIntegrationCatalogError as error:
+                self._send_error(
+                    UniverseError(
+                        str(error),
+                        "Universe project-integration catalog is unavailable",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                )
+            return
         release_id = self._release_path(path)
         if release_id is not None:
             try:
@@ -15050,6 +15154,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         try:
             if suffix == "":
                 self._send(HTTPStatus.OK, self.server.store.get_project(project_id))
+                return
+            if suffix == "/integration-template-proposal":
+                self.server.store.get_project(project_id)
+                self._send(
+                    HTTPStatus.OK,
+                    build_project_integration_proposal(project_id),
+                )
                 return
             if suffix == "/runtime-lease":
                 self._send(
@@ -16280,6 +16391,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.apply_project_seed_assets(parts[0], body),
                 )
                 return
+            if parts is not None and parts[1] == "/integration-template-proposal/apply":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.apply_project_integration_assets(parts[0], body),
+                )
+                return
             if parts is not None and parts[1] == "/release-proposals/apply":
                 self._send(
                     HTTPStatus.OK,
@@ -16974,6 +17091,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/runtime-lease/release",
             "/runtime-lease/health",
             "/runtime-lease",
+            "/integration-template-proposal/apply",
+            "/integration-template-proposal",
             "/agent-session/permissions",
             "/governance-proposals",
             "/provider-setting",

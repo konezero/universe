@@ -44,6 +44,10 @@ from project_master_bridge import (
 )
 from project_seed_apply import apply_project_seed_asset_proposal
 from project_seed_assets import ProjectSeedAssetError
+from project_integration_apply import (
+    ProjectIntegrationApplyError,
+    apply_project_integration_proposal,
+)
 from project_skill_binding import (
     ProjectSkillBindingError,
     build_project_skill_binding_proposal,
@@ -208,10 +212,31 @@ class ProjectModeCoordinator:
         boundary: str,
         approval_evidence_ref: str,
         request_ref: str,
+        write_roots: tuple[Path, ...] | None = None,
+        task_summary: str = "Apply one approved Universe Project Seed asset",
     ) -> Mapping[str, Any]:
         binding = self._ensure_runtime()
         normalized_operation = _text(operation, "operation").upper()
         normalized_target = target.expanduser().resolve(strict=target.exists())
+        requested_roots = write_roots or (
+            self.project_root / ".ai" / "universe",
+        )
+        normalized_roots: list[Path] = []
+        for root in requested_roots:
+            normalized_root = root.expanduser().resolve(strict=root.exists())
+            try:
+                normalized_root.relative_to(self.project_root)
+            except ValueError as error:
+                raise ProjectMasterHostError(
+                    "PROJECT_MUTATION_ROOT_OUT_OF_SCOPE"
+                ) from error
+            normalized_roots.append(normalized_root)
+        if not any(
+            _path_is_within(normalized_target, normalized_root)
+            for normalized_root in normalized_roots
+        ):
+            raise ProjectMasterHostError("PROJECT_MUTATION_TARGET_OUT_OF_SCOPE")
+        normalized_summary = _text(task_summary, "task_summary")
         target_preimage = (
             {
                 "status": "PRESENT",
@@ -235,9 +260,9 @@ class ProjectModeCoordinator:
                     "operation": normalized_operation,
                     "target": str(normalized_target),
                     "boundary": boundary,
-                    "write_roots": [str(self.project_root / ".ai" / "universe")],
+                    "write_roots": [str(root) for root in normalized_roots],
                     "write_operations": ["CREATE", "MODIFY"],
-                    "task_summary": "Apply one approved Universe Project Seed asset",
+                    "task_summary": normalized_summary,
                     "request_ref": request_ref,
                 },
             },
@@ -2544,6 +2569,31 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
         except (ProjectSeedAssetError, ProjectMasterHostError) as error:
             raise ProjectMasterBridgeError(str(error)) from error
 
+    def apply_integration_assets(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "project_id",
+            "proposal",
+            "approval",
+        }:
+            raise ProjectMasterBridgeError(
+                "PROJECT_INTEGRATION_APPLY_REQUEST_INVALID"
+            )
+        gateway = self._coordinator
+        if not callable(getattr(gateway, "apply_file", None)):
+            raise ProjectMasterBridgeError(
+                "PROJECT_INTEGRATION_MUTATION_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return apply_project_integration_proposal(
+                project_root=self.project_root,
+                project_id=_text(request.get("project_id"), "project_id"),
+                proposal=request.get("proposal"),
+                approval=request.get("approval"),
+                mutation_gateway=gateway,
+            )
+        except (ProjectIntegrationApplyError, ProjectMasterHostError) as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
     def apply_skill_plan(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping) or set(request) != {
             "project_id",
@@ -3117,6 +3167,14 @@ def _runtime_context(observation: Mapping[str, Any]) -> dict[str, str]:
             else "UNKNOWN"
         ),
     }
+
+
+def _path_is_within(target: Path, root: Path) -> bool:
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _text(value: Any, field: str) -> str:

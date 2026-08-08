@@ -30,8 +30,9 @@ Link across queues is optional (`todo.detail` ↔ issue id). Ownership stays spl
 
 | Layer | Role |
 |-------|------|
-| **ai-career** | Template SSOT: `.ai/templates/universe_project_seed/TODO_TRACKING_POLICY.md` |
-| **Promotion / install** | OS_INSTALL / distribution pack plants `.ai/universe/TODO_TRACKING_POLICY.md` |
+| **Universe** | Project-integration template SSOT: Todo policy, Project binding, and attach guidance |
+| **Career** | Runtime Release DB payload and lifecycle contract producer; not the project-integration template owner |
+| **Promotion / install** | Universe install flow plants local `.ai/universe/TODO_TRACKING_POLICY.md` from the selected release and project template |
 | **Universe host** | Todo API/UI; execution wiring (TODO → dispatch/TF) may grow later |
 | **Project** | Installed plant + **keeps its own product board** |
 
@@ -62,16 +63,20 @@ until attach (`prefer_boot: HOST` when host returns).
 .ai/universe/TODO_TRACKING_POLICY.md
 ```
 
-Career source:
+Canonical Universe source:
 
 ```text
-.ai/templates/universe_project_seed/TODO_TRACKING_POLICY.md
+templates/project-integration/TODO_TRACKING_POLICY.md
 ```
 
-Registered in Career `CORE_SURFACE_REGISTRY` and
-`project_runtime_source_index` for distribution packs.
+`GET /v1/project-templates` exposes the digest-bound catalog. For a registered
+Project, `GET /v1/projects/<project_id>/integration-template-proposal` exposes
+the exact local plant before an install starts.
 
-Universe repo `templates/project-todo-tracking-policy.md` is a **mirror** only.
+Career may retain `.ai/templates/universe_project_seed/TODO_TRACKING_POLICY.md`
+as a compatibility installation mirror until the Universe Project Lifecycle
+Host materializes this catalog directly. Career does not independently own or
+author the policy.
 
 ## Agent load hint
 
@@ -86,7 +91,8 @@ use the **project’s own** board; do not invent a second full backlog in Todo.
 
 ## Acceptance
 
-- [ ] Policy plant present via Career install/update
+- [ ] Policy plant proposed by the Universe integration catalog before install
+- [ ] Policy plant materialized by the Universe Project Lifecycle Host
 - [ ] Wording: Todo = Universe host queue, not product board replacement
 - [ ] Host-facing open work can live in `project_todo`
 - [ ] Project-local boards remain allowed for product work

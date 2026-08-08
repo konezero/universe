@@ -25,6 +25,14 @@ class BuildPortableTests(unittest.TestCase):
             self.assertTrue(
                 (
                     package
+                    / "templates"
+                    / "project-integration"
+                    / "project-binding.example.json"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    package
                     / ".ai"
                     / "runtime"
                     / "project_instance"
