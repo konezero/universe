@@ -39,7 +39,7 @@ DEFAULT_STATE = Path(
 @dataclass
 class StepResult:
     name: str
-    status: str  # PASS | FAIL | SKIP
+    status: str  # PASS | FAIL | SKIP | PENDING_APPROVAL
     detail: str = ""
 
 
@@ -56,6 +56,8 @@ class SmokeReport:
     def finalize(self) -> None:
         if any(step.status == "FAIL" for step in self.steps):
             self.overall = "FAIL"
+        elif any(step.status == "PENDING_APPROVAL" for step in self.steps):
+            self.overall = "BLOCKED"
         elif not self.steps:
             self.overall = "FAIL"
         else:
@@ -192,11 +194,34 @@ def check_live(state_path: Path, project_id: str) -> SmokeReport:
         ]
         universe_root = root / ".ai" / "universe"
         missing = [name for name in assets if not (universe_root / name).is_file()]
-        report.add(
-            "seed_assets",
-            "PASS" if not missing and universe_root.is_dir() else "FAIL",
-            "ok" if not missing else f"missing={missing}",
-        )
+        if not missing and universe_root.is_dir():
+            report.add("seed_assets", "PASS", "ok")
+        else:
+            proposal_status, proposal = _http(
+                endpoint,
+                "GET",
+                f"/v1/projects/{project_id}/seed-asset-proposal",
+                token=token,
+            )
+            proposal_value = proposal.get("proposal") or {}
+            proposed_assets = proposal_value.get("assets") or []
+            approval = (proposal_value.get("apply_contract") or {}).get("approval")
+            if (
+                proposal_status == 200
+                and len(proposed_assets) == len(assets)
+                and approval == "EXACT_USER_APPROVAL_REQUIRED"
+            ):
+                report.add(
+                    "seed_assets",
+                    "PENDING_APPROVAL",
+                    "exact seed asset approval required; missing=" + ",".join(missing),
+                )
+            else:
+                report.add(
+                    "seed_assets",
+                    "FAIL",
+                    f"missing={missing} proposal_http={proposal_status}",
+                )
 
     status, seed = _http(
         endpoint, "GET", f"/v1/projects/{project_id}/seed", token=token
@@ -308,6 +333,10 @@ def check_live(state_path: Path, project_id: str) -> SmokeReport:
         report.overall = "FAIL"
     if required_ok and not any(step.status == "FAIL" for step in report.steps):
         report.overall = "PASS"
+    elif not any(step.status == "FAIL" for step in report.steps) and any(
+        step.status == "PENDING_APPROVAL" for step in report.steps
+    ):
+        report.overall = "BLOCKED"
     return report
 
 
@@ -531,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mode:     {payload['mode']}")
         print(f"overall:  {payload['overall']}")
         for step in payload["steps"]:
-            detail = f" — {step['detail']}" if step["detail"] else ""
+            detail = f" - {step['detail']}" if step["detail"] else ""
             print(f"  [{step['status']}] {step['name']}{detail}")
     return 0 if report.overall == "PASS" else 1
 

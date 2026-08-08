@@ -702,6 +702,114 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("TODO_SCOPE_COORDINATE_INVALID", invalid["error_code"])
 
+    def test_provider_session_observer_api_projects_redacted_activity(self) -> None:
+        rollout = self.temp_root / "rollout-observer.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "tool_call", "command": "private command"})
+            + "\n",
+            encoding="utf-8",
+        )
+        status, registered = self.request(
+            "POST",
+            "/v1/session-observer/sources",
+            {
+                "provider": "CODEX",
+                "provider_session_id": "codex-observer-1",
+                "source_path": str(rollout),
+                "source_kind": "CODEX_ROLLOUT_JSONL",
+                "source_version": "v1",
+            },
+        )
+        self.assertEqual(201, status)
+        source_id = registered["source"]["source_id"]
+        status, scanned = self.request(
+            "POST", f"/v1/session-observer/sources/{source_id}/scan", {}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(1, scanned["added"])
+
+        status, activities = self.request(
+            "GET", f"/v1/session-observer/activities?source_id={source_id}"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("TOOL_PHASE", activities["activities"][0]["event_kind"])
+        self.assertNotIn("private command", json.dumps(activities))
+        status, batch = self.request(
+            "GET", f"/v1/session-observer/sources/{source_id}/batch-candidate"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("ACTIVITY_BATCH_EMPTY", batch["candidate"]["status"])
+        status, remote_sources = self.request(
+            "GET",
+            "/v1/session-observer/sources",
+            extra_headers={"X-Universe-Access-Surface": "REMOTE_BROWSER"},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("REDACTED", remote_sources["sources"][0]["source_path"])
+        status, denied = self.request(
+            "POST",
+            "/v1/session-observer/sources",
+            {
+                "provider": "CODEX",
+                "provider_session_id": "codex-remote-denied",
+                "source_path": str(rollout),
+                "source_kind": "CODEX_ROLLOUT_JSONL",
+                "source_version": "v1",
+            },
+            extra_headers={"X-Universe-Access-Surface": "REMOTE_BROWSER"},
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("LOCAL_OPERATOR_REQUIRED", denied["error_code"])
+
+    def test_linked_project_master_result_advances_only_its_todo(self) -> None:
+        self.server.store.register_project(self.registration())
+        todo = self.server.store.create_todo(
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Exercise Master result transition",
+                "detail": "",
+                "priority": "P1",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            }
+        )
+        message, created = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "TASK_DRAFT",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "Run the linked task.",
+                "todo_id": todo["todo_id"],
+                "idempotency_key": "linked-master-todo-1",
+            },
+        )
+        self.assertTrue(created)
+        delivered = self.server.store.apply_master_message_todo_transition(
+            "GCS", message["message_id"], outcome="DELIVERED"
+        )
+        self.assertEqual("IN_PROGRESS", delivered["state"])
+        completed = self.server.store.apply_master_message_todo_transition(
+            "GCS", message["message_id"], outcome="COMPLETED"
+        )
+        self.assertEqual("DONE", completed["state"])
+        self.assertEqual("DONE", self.server.store.get_todo(todo["todo_id"])["state"])
+
+        unlinked, _ = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "STATUS",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "No Todo relation.",
+                "idempotency_key": "unlinked-master-todo-1",
+            },
+        )
+        result = self.server.store.apply_master_message_todo_transition(
+            "GCS", unlinked["message_id"], outcome="COMPLETED"
+        )
+        self.assertEqual("TODO_NOT_LINKED", result["status"])
+
     def test_server_state_carries_the_database_universe_identity(self) -> None:
         identity = self.server.store.identity()
         state_path = self.temp_root / "server.json"

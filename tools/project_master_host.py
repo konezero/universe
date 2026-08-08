@@ -2618,6 +2618,7 @@ class ResidentProjectMasterHostManager:
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
+        completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
         self.bridge_registrar = bridge_registrar
@@ -2627,6 +2628,7 @@ class ResidentProjectMasterHostManager:
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
+        self.completion_observer = completion_observer
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
         self._lock = threading.RLock()
 
@@ -2703,12 +2705,10 @@ class ResidentProjectMasterHostManager:
                 bridge_token=os.environ[credential_env],
                 surface_observer=coordinator,
                 completion_observer=(
-                    lambda event, root=project_root, owner=coordinator: (
-                        self._save_project_completion(
-                            root,
-                            event,
-                            runtime_coordinate=self._continuity_coordinate(owner),
-                        )
+                    lambda event, root=project_root, owner=coordinator: self._observe_completion(
+                        root,
+                        event,
+                        runtime_coordinate=self._continuity_coordinate(owner),
                     )
                 ),
                 governance_context_resolver=self.governance_context_resolver,
@@ -2871,6 +2871,21 @@ class ResidentProjectMasterHostManager:
             summary=f"Project Master state {event.get('message_id', 'UNKNOWN')}",
             runtime_coordinate=runtime_coordinate,
         )
+
+    def _observe_completion(
+        self,
+        project_root: Path,
+        event: Mapping[str, Any],
+        *,
+        runtime_coordinate: Mapping[str, Any] | None,
+    ) -> None:
+        self._save_project_completion(
+            project_root,
+            event,
+            runtime_coordinate=runtime_coordinate,
+        )
+        if self.completion_observer is not None:
+            self.completion_observer(event)
 
     def save_idle_sessions(self, idle_seconds: float) -> list[dict[str, Any]]:
         with self._lock:

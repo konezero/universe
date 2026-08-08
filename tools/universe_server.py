@@ -137,6 +137,10 @@ from universe_rendezvous_client import (
     load_rendezvous_config,
 )
 from universe_multi_room import MultiRoomError, MultiRoomStore
+from provider_session_observer import (
+    ProviderSessionObserverError,
+    ProviderSessionObserverStore,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -2845,6 +2849,9 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
         "sender": sender,
         "body": body,
     }
+    todo_id = value.get("todo_id")
+    if todo_id is not None:
+        material["todo_id"] = _identifier(todo_id, "todo_id")
     if in_reply_to is not None:
         material["in_reply_to"] = in_reply_to
     digest = hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
@@ -2862,6 +2869,8 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
     }
     if in_reply_to is not None:
         message["in_reply_to"] = in_reply_to
+    if todo_id is not None:
+        message["todo_id"] = material["todo_id"]
     return message
 
 
@@ -3884,6 +3893,7 @@ class UniverseStore:
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.remote_access = RemoteAccessStore(self.database_path)
+        self.provider_session_observer = ProviderSessionObserverStore(self.database_path)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -5973,6 +5983,33 @@ class UniverseStore:
                 ),
             )
         return event, True
+
+    def register_provider_session_source(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            return self.provider_session_observer.register_source(value)
+        except ProviderSessionObserverError as error:
+            raise UniverseError(error.code, error.detail) from error
+
+    def scan_provider_session_source(self, source_id: str) -> dict[str, Any]:
+        try:
+            return self.provider_session_observer.scan(source_id)
+        except ProviderSessionObserverError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+
+    def list_provider_session_sources(self) -> list[dict[str, Any]]:
+        return self.provider_session_observer.list_sources()
+
+    def list_provider_session_activities(self, source_id: str) -> list[dict[str, Any]]:
+        try:
+            return self.provider_session_observer.list_activities(source_id)
+        except ProviderSessionObserverError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+
+    def prepare_provider_activity_batch(self, source_id: str) -> dict[str, Any]:
+        try:
+            return self.provider_session_observer.build_batch_candidate(source_id)
+        except ProviderSessionObserverError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
 
     def list_events(self, project_id: str, limit: int = 100) -> list[dict[str, Any]]:
         normalized = _project_id(project_id)
@@ -9329,6 +9366,14 @@ class UniverseStore:
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
         message = normalize_room_message(project["project_id"], value)
+        todo_id = message.get("todo_id")
+        if todo_id is not None:
+            todo = self.get_todo(todo_id)
+            if todo["project_id"] != project["project_id"]:
+                raise UniverseError(
+                    "TODO_PROJECT_MISMATCH",
+                    "room message todo must belong to the target project",
+                )
         delivery_json = _canonical_json(delivery or {})
         with self._connection() as connection:
             existing = connection.execute(
@@ -9694,11 +9739,129 @@ class UniverseStore:
             status="AVAILABLE",
             last_delivery_at=receipt["delivered_at"],
         )
-        return self._update_room_delivery(
+        delivered = self._update_room_delivery(
             message,
             delivery_state="DELIVERED_TO_MASTER",
             delivery=receipt,
-        ), True
+        )
+        self.apply_master_message_todo_transition(
+            project_id,
+            delivered["message_id"],
+            outcome="DELIVERED",
+        )
+        return delivered, True
+
+    def apply_master_message_todo_transition(
+        self,
+        project_id: str,
+        message_id: str,
+        *,
+        outcome: str,
+    ) -> dict[str, Any]:
+        normalized_project = _project_id(project_id)
+        normalized_message = _required_text(message_id, "message_id")
+        normalized_outcome = _required_text(outcome, "outcome").upper()
+        desired_state = {
+            "DELIVERED": "IN_PROGRESS",
+            "COMPLETED": "DONE",
+            "FAILED": "BLOCKED",
+        }.get(normalized_outcome)
+        if desired_state is None:
+            raise UniverseError(
+                "TODO_TRANSITION_OUTCOME_INVALID",
+                "outcome must be DELIVERED, COMPLETED, or FAILED",
+            )
+        with self._connection() as connection:
+            message_row = connection.execute(
+                """
+                SELECT message_json FROM project_room_message
+                WHERE project_id = ? AND message_id = ?
+                """,
+                (normalized_project, normalized_message),
+            ).fetchone()
+            if message_row is None:
+                raise UniverseError(
+                    "ROOM_MESSAGE_NOT_FOUND",
+                    "room message does not exist for the project",
+                    HTTPStatus.NOT_FOUND,
+                )
+            message = json.loads(message_row["message_json"])
+            todo_id = message.get("todo_id")
+            if not isinstance(todo_id, str) or not todo_id:
+                return {
+                    "status": "TODO_NOT_LINKED",
+                    "project_id": normalized_project,
+                    "message_id": normalized_message,
+                    "outcome": normalized_outcome,
+                }
+            todo_row = connection.execute(
+                """
+                SELECT todo_id, project_id, state, revision FROM project_todo
+                WHERE todo_id = ?
+                """,
+                (todo_id,),
+            ).fetchone()
+            if todo_row is None or todo_row["project_id"] != normalized_project:
+                return {
+                    "status": "TODO_LINK_UNAVAILABLE",
+                    "project_id": normalized_project,
+                    "message_id": normalized_message,
+                    "todo_id": todo_id,
+                    "outcome": normalized_outcome,
+                }
+            current_state = str(todo_row["state"])
+            if (
+                current_state == desired_state
+                or (current_state == "DONE" and desired_state == "BLOCKED")
+                or (current_state == "BLOCKED" and desired_state == "IN_PROGRESS")
+            ):
+                return {
+                    "status": "TODO_TRANSITION_NOT_REQUIRED",
+                    "project_id": normalized_project,
+                    "message_id": normalized_message,
+                    "todo_id": todo_id,
+                    "state": current_state,
+                    "outcome": normalized_outcome,
+                }
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE project_todo
+                SET state = ?, revision = revision + 1, updated_at = ?
+                WHERE todo_id = ? AND revision = ?
+                """,
+                (desired_state, now, todo_id, todo_row["revision"]),
+            )
+        event, _ = self.append_event(
+            normalized_project,
+            {
+                "event_id": "todo-master-"
+                + _json_sha256(
+                    {
+                        "project_id": normalized_project,
+                        "message_id": normalized_message,
+                        "todo_id": todo_id,
+                        "outcome": normalized_outcome,
+                    }
+                )[:24],
+                "event_type": "TODO_MASTER_TRANSITION",
+                "payload": {
+                    "todo_id": todo_id,
+                    "message_id": normalized_message,
+                    "outcome": normalized_outcome,
+                    "state": desired_state,
+                },
+            },
+        )
+        return {
+            "status": "TODO_TRANSITION_APPLIED",
+            "project_id": normalized_project,
+            "message_id": normalized_message,
+            "todo_id": todo_id,
+            "state": desired_state,
+            "outcome": normalized_outcome,
+            "event_id": event["event_id"],
+        }
 
     def append_master_bridge_reply(
         self,
@@ -12182,6 +12345,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
                 governance_context_resolver=self._project_master_governance_context,
+                completion_observer=self._observe_project_master_completion,
             )
             if auto_start_project_masters
             else None
@@ -13665,6 +13829,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.publish_project_room_changed(project_id)
         return message, created
 
+    def _observe_project_master_completion(self, event: Mapping[str, Any]) -> None:
+        project_id = event.get("project_id")
+        message_id = event.get("message_id")
+        status = event.get("status")
+        if not isinstance(project_id, str) or not isinstance(message_id, str):
+            return
+        if status not in {"COMPLETED", "FAILED"}:
+            return
+        try:
+            self.store.apply_master_message_todo_transition(
+                project_id,
+                message_id,
+                outcome=status,
+            )
+        except UniverseError:
+            # A missing/old room message must not turn a completed provider turn
+            # into an error or invent a Todo linkage.
+            return
+        self.publish_project_room_changed(project_id)
+
     def publish_project_room_changed(self, project_id: str) -> None:
         self.project_room_events.publish(
             project_id,
@@ -14561,6 +14745,64 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/session-observer/sources":
+            sources = self.server.store.list_provider_session_sources()
+            if self.headers.get("X-Universe-Access-Surface") == "REMOTE_BROWSER":
+                for source in sources:
+                    source["source_path"] = "REDACTED"
+                    source["file_identity"] = None
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "PROVIDER_SESSION_SOURCES_COLLECTED",
+                    "sources": sources,
+                },
+            )
+            return
+        if path == "/v1/session-observer/activities":
+            query_map = parse_qs(urlsplit(self.path).query)
+            source_id = (query_map.get("source_id") or [""])[0]
+            if not source_id:
+                self._send_error(
+                    UniverseError(
+                        "SOURCE_ID_REQUIRED",
+                        "source_id query parameter is required",
+                    )
+                )
+                return
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROVIDER_SESSION_ACTIVITIES_COLLECTED",
+                        "activities": self.server.store.list_provider_session_activities(
+                            source_id
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        activity_batch = re.fullmatch(
+            r"/v1/session-observer/sources/([^/]+)/batch-candidate$", path
+        )
+        if activity_batch is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROVIDER_ACTIVITY_BATCH_PREPARED",
+                        "candidate": self.server.store.prepare_provider_activity_batch(
+                            unquote(activity_batch.group(1))
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/conductor-room/messages":
             self._send(
                 HTTPStatus.OK,
@@ -14999,6 +15241,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             self._authorize_local_operator()
         ):
             return
+        if path == "/v1/session-observer/sources" or re.fullmatch(
+            r"/v1/session-observer/sources/[^/]+/scan", path
+        ):
+            if not self._authorize_local_operator():
+                return
         if path == "/v1/service/shutdown" and not self._authorize_service_control():
             return
         privileged_supervisor_match = re.fullmatch(
@@ -15457,6 +15704,31 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "todo": todo,
                         "task_frame_created": False,
                         "execution_assignment_created": False,
+                    },
+                )
+                return
+            if path == "/v1/session-observer/sources":
+                source = self.server.store.register_provider_session_source(body)
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROVIDER_SESSION_SOURCE_REGISTERED",
+                        "source": source,
+                    },
+                )
+                return
+            source_scan = re.fullmatch(r"/v1/session-observer/sources/([^/]+)/scan", path)
+            if source_scan is not None:
+                result = self.server.store.scan_provider_session_source(
+                    unquote(source_scan.group(1))
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROVIDER_SESSION_SOURCE_SCANNED",
+                        **result,
                     },
                 )
                 return

@@ -268,6 +268,20 @@ Raw prompts, source text, provider messages, credentials, tool command text,
 and full transcripts are excluded from Universe activity, Bench, and Memory
 records unless a separate explicit, redacted artifact contract permits them.
 
+### Local Observer Delivery Boundary
+
+The local observer surface registers an explicitly selected Provider source,
+tails it with a durable file identity and cursor, and stores only reduced
+activity. Codex rollout JSONL, Claude session JSONL branch leaves, and Grok
+`updates.jsonl` share the same `UNKNOWN` fail-closed behavior for rotation,
+truncation, missing files, and unsupported schema.
+
+At a turn boundary, Universe can prepare a redacted activity batch candidate.
+The candidate contains only activity references, reducer metadata, and the
+source cursor. It is `REVIEW_REQUIRED`: it does not publish Memory, create a
+Skill Bench observation, or alter Future paths. Those three routes retain
+their own evidence and adoption contracts.
+
 ## Security and Privacy
 
 1. Observation requires local user enablement and visible source registration.
