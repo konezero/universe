@@ -1209,18 +1209,23 @@ def normalize_registration(value: Any) -> dict[str, Any]:
             "PROJECT_REFS_INVALID",
             f"unsupported refs: {', '.join(sorted(unknown_refs))}",
         )
-    # Resolve manifest first so network anchors can substitute identity files.
-    preferred_manifest = str(
-        refs_value.get("manifest", DEFAULT_REFS["manifest"]) or DEFAULT_REFS["manifest"]
+    refs_merged = dict(DEFAULT_REFS)
+    refs_merged.update(
+        {key: refs_value[key] for key in refs_value if key in ALLOWED_REF_KEYS}
     )
+    # Validate every caller-provided reference before inspecting the project.
+    # Otherwise an escaped manifest can be reported as merely unavailable when
+    # its root has no preferred manifest file.
+    for key in refs_value:
+        _relative_ref(project_root, refs_value[key], key)
+
+    # Resolve manifest only after the supplied reference boundary is known to
+    # be safe, so network anchors can still substitute an identity file.
+    preferred_manifest = str(refs_merged["manifest"] or DEFAULT_REFS["manifest"])
     manifest_rel = _resolve_registration_manifest_rel(
         project_root,
         preferred=preferred_manifest,
         network_role=network_role,
-    )
-    refs_merged = dict(DEFAULT_REFS)
-    refs_merged.update(
-        {key: refs_value[key] for key in refs_value if key in ALLOWED_REF_KEYS}
     )
     refs_merged["manifest"] = manifest_rel
     refs = {

@@ -2321,8 +2321,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         status, result = self.request("GET", "/v1/projects", token=self.token)
         self.assertEqual(200, status)
-        self.assertEqual(1, len(result["projects"]))
-        self.assertEqual("Trading", result["projects"][0]["metadata"]["label"])
+        gcs_projects = [
+            item for item in result["projects"] if item["project_id"] == "GCS"
+        ]
+        self.assertEqual(1, len(gcs_projects))
+        self.assertEqual("Trading", gcs_projects[0]["metadata"]["label"])
 
     def test_project_attachment_contract_defaults_and_legacy_mapping(self) -> None:
         self.assertEqual(
@@ -3392,6 +3395,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_fresh_project_intent_returns_seed_routes_without_project_state(
         self,
     ) -> None:
+        baseline_projects = self.server.store.list_projects()
         status, result = self.request(
             "POST",
             "/v1/future-paths",
@@ -3406,7 +3410,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("FRESH_PROJECT_ROUTE_CANDIDATES", result["status"])
-        self.assertEqual([], self.server.store.list_projects())
+        self.assertEqual(baseline_projects, self.server.store.list_projects())
         proposal = result["proposal"]
         self.assertEqual("FUTURE_PATH_CANDIDATES", proposal["status"])
         self.assertEqual("NOT_AVAILABLE", proposal["probabilities"])
@@ -3430,6 +3434,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("REQUEST_INVALID", rejected["error_code"])
 
     def test_fresh_project_composition_requires_explicit_adoption(self) -> None:
+        baseline_projects = self.server.store.list_projects()
         request = {
             "intent": {
                 "project": "Local trading workstation",
@@ -3459,7 +3464,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(
             all(value == "NONE" for value in composition["effects"].values())
         )
-        self.assertEqual([], self.server.store.list_projects())
+        self.assertEqual(baseline_projects, self.server.store.list_projects())
 
         status, repeated = self.request(
             "POST", "/v1/fresh-project-compositions", request, self.token
@@ -3487,7 +3492,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         adoption = adopted["adoption"]
         self.assertEqual("PROJECT_MASTER_HANDOFF_CANDIDATE", adoption["next_operation"])
         self.assertTrue(all(value == "NONE" for value in adoption["effects"].values()))
-        self.assertEqual([], self.server.store.list_projects())
+        self.assertEqual(baseline_projects, self.server.store.list_projects())
 
         status, compositions = self.request(
             "GET", "/v1/fresh-project-compositions", token=self.token
@@ -3517,6 +3522,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_fresh_project_refinement_requires_bound_candidate_and_user_adoption(
         self,
     ) -> None:
+        baseline_projects = self.server.store.list_projects()
         status, created = self.request(
             "POST",
             "/v1/fresh-project-compositions",
@@ -3641,7 +3647,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {item["document_id"] for item in refined["document_plan"]},
         )
         self.assertTrue(all(value == "NONE" for value in refined["effects"].values()))
-        self.assertEqual([], self.server.store.list_projects())
+        self.assertEqual(baseline_projects, self.server.store.list_projects())
 
         status, requests = self.request(
             "GET", "/v1/fresh-project-refinement-requests", token=self.token
