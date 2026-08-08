@@ -6032,6 +6032,59 @@ class UniverseStore:
         except ProviderSessionObserverError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
 
+    def record_provider_activity_memory(
+        self, project_id: str, source_id: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Record an operator-selected redacted activity batch as project memory."""
+        project = self.get_project(project_id)
+        candidate = self.prepare_provider_activity_batch(source_id)
+        if candidate["status"] != "REVIEW_REQUIRED":
+            raise UniverseError(
+                "PROVIDER_ACTIVITY_BATCH_EMPTY",
+                "no reviewable activity boundary is available for this source",
+                HTTPStatus.CONFLICT,
+            )
+        source = candidate["source"]
+        origin_ref = (
+            "universe://provider-session-source/"
+            f"{source['source_id']}/activity-batch/{candidate['candidate_id']}"
+        )
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT memory_json, created_at, updated_at
+                FROM project_memory
+                WHERE project_id = ? AND origin_ref = ?
+                """,
+                (project["project_id"], origin_ref),
+            ).fetchone()
+        if existing is not None:
+            memory = json.loads(existing["memory_json"])
+            memory["created_at"] = existing["created_at"]
+            memory["updated_at"] = existing["updated_at"]
+            return memory, False
+        activity_count = len(candidate["activity_refs"])
+        body = "\n".join(
+            (
+                "Provider activity review batch.",
+                f"Provider: {source['provider']}",
+                f"Session: {source['provider_session_id']}",
+                f"Reduced activity references: {activity_count}",
+                "Raw transcript, prompts, responses, and tool commands are excluded.",
+                "Review and link this memory to a project node before using it as context.",
+            )
+        )
+        memory = self.create_project_memory(
+            project["project_id"],
+            {
+                "title": f"{source['provider']} activity batch ({activity_count})",
+                "body": body,
+                "state": "OBSERVED",
+                "origin_ref": origin_ref,
+            },
+        )
+        return memory, True
+
     def scan_registered_provider_sources(self) -> list[dict[str, Any]]:
         return self.provider_session_observer.scan_registered_sources()
 
@@ -15286,7 +15339,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         ):
             return
         if path == "/v1/session-observer/sources" or re.fullmatch(
-            r"/v1/session-observer/sources/[^/]+/scan", path
+            r"/v1/session-observer/sources/[^/]+/(scan|record-memory)", path
         ):
             if not self._authorize_local_operator():
                 return
@@ -15773,6 +15826,33 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "PROVIDER_SESSION_SOURCE_SCANNED",
                         **result,
+                    },
+                )
+                return
+            source_memory = re.fullmatch(
+                r"/v1/session-observer/sources/([^/]+)/record-memory", path
+            )
+            if source_memory is not None:
+                request = _exact_object_fields(
+                    body,
+                    field="provider_activity_memory_request",
+                    required=frozenset({"project_id"}),
+                    optional=frozenset(),
+                )
+                memory, created = self.server.store.record_provider_activity_memory(
+                    _project_id(request["project_id"]),
+                    unquote(source_memory.group(1)),
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "PROVIDER_ACTIVITY_MEMORY_RECORDED"
+                            if created
+                            else "PROVIDER_ACTIVITY_MEMORY_ALREADY_RECORDED"
+                        ),
+                        "memory": memory,
                     },
                 )
                 return

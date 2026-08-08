@@ -1,8 +1,10 @@
 # Universe Memory RAG (product slice)
 
 Status: implemented (deterministic 1st slice)  
-Scope: project-local memory notes, node link/unlink, search, propose-links  
-Not: Candidate creation, Seed mutation, nightly LLM batch, Career promotion
+Scope: project-local memory notes, operator-selected provider activity batches,
+node link/unlink, search, propose-links
+Not: Candidate creation, Seed mutation, automatic Bench/Future promotion,
+nightly LLM batch, Career promotion
 
 ## Invariant
 
@@ -11,6 +13,7 @@ Node Memory = reference context
 MEMORY_SYNC != Candidate
 MEMORY_SYNC != Seed write
 MEMORY_SYNC != Task Frame / authority
+Provider activity batch -> operator-selected project Memory -> node review/link
 ```
 
 ## API
@@ -21,6 +24,7 @@ GET  /v1/projects/{project_id}/memories?link_state=&node_ref=&q=
 POST /v1/projects/{project_id}/memories/link
 GET  /v1/projects/{project_id}/memories/propose-links
 POST /v1/projects/{project_id}/memories/maintain
+POST /v1/session-observer/sources/{source_id}/record-memory
 ```
 
 Create body:
@@ -36,6 +40,18 @@ Create body:
 ```
 
 If `node_ref` is omitted, `link_state` is `UNLINKED`.
+
+## Provider activity memory
+
+The Activity panel can record one reviewed Provider batch into the currently
+selected Project as an `OBSERVED`, `UNLINKED` memory. The server stores only
+the provider/session identity, count of reduced activity references, and a
+batch origin reference. It excludes transcript, prompts, responses, and tool
+commands. The operator then uses the normal node-link flow.
+
+`record-memory` is local-operator only. It is idempotent per
+project/source/batch and never creates a Skill observation, Bench row,
+Experience Case, Future projection, Candidate, or Career promotion.
 
 ## Propose-links
 
@@ -105,4 +121,3 @@ POST /v1/settings/service
 - `interval_hours = 0` (default): worker idle (rechecks ~30s)
 - `interval_hours > 0`: runs HEURISTIC maintain for each connected project on that period, applying PROPOSED only
 - UI: Settings → Memory maintain interval (hours)
-

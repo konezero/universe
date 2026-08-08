@@ -709,9 +709,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         rollout = self.temp_root / "rollout-observer.jsonl"
         rollout.write_text(
             json.dumps({"type": "tool_call", "command": "private command"})
+            + "\n"
+            + json.dumps({"type": "turn_completed", "text": "private completion"})
             + "\n",
             encoding="utf-8",
         )
+        self.server.store.register_project(self.registration())
         status, registered = self.request(
             "POST",
             "/v1/session-observer/sources",
@@ -729,19 +732,42 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "POST", f"/v1/session-observer/sources/{source_id}/scan", {}
         )
         self.assertEqual(200, status)
-        self.assertEqual(1, scanned["added"])
+        self.assertEqual(2, scanned["added"])
 
         status, activities = self.request(
             "GET", f"/v1/session-observer/activities?source_id={source_id}"
         )
         self.assertEqual(200, status)
-        self.assertEqual("TOOL_PHASE", activities["activities"][0]["event_kind"])
+        self.assertEqual(
+            {"TOOL_PHASE", "TURN_COMPLETED"},
+            {item["event_kind"] for item in activities["activities"]},
+        )
         self.assertNotIn("private command", json.dumps(activities))
+        self.assertNotIn("private completion", json.dumps(activities))
         status, batch = self.request(
             "GET", f"/v1/session-observer/sources/{source_id}/batch-candidate"
         )
         self.assertEqual(200, status)
-        self.assertEqual("ACTIVITY_BATCH_EMPTY", batch["candidate"]["status"])
+        self.assertEqual("REVIEW_REQUIRED", batch["candidate"]["status"])
+        status, recorded = self.request(
+            "POST",
+            f"/v1/session-observer/sources/{source_id}/record-memory",
+            {"project_id": "GCS"},
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("PROVIDER_ACTIVITY_MEMORY_RECORDED", recorded["status"])
+        memory = recorded["memory"]
+        self.assertEqual("OBSERVED", memory["state"])
+        self.assertEqual("UNLINKED", memory["link_state"])
+        self.assertNotIn("private", json.dumps(memory))
+        status, duplicate = self.request(
+            "POST",
+            f"/v1/session-observer/sources/{source_id}/record-memory",
+            {"project_id": "GCS"},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("PROVIDER_ACTIVITY_MEMORY_ALREADY_RECORDED", duplicate["status"])
+        self.assertEqual(memory["memory_id"], duplicate["memory"]["memory_id"])
         status, remote_sources = self.request(
             "GET",
             "/v1/session-observer/sources",
@@ -763,6 +789,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(403, status)
         self.assertEqual("LOCAL_OPERATOR_REQUIRED", denied["error_code"])
+        status, remote_record = self.request(
+            "POST",
+            f"/v1/session-observer/sources/{source_id}/record-memory",
+            {"project_id": "GCS"},
+            extra_headers={"X-Universe-Access-Surface": "REMOTE_BROWSER"},
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("LOCAL_OPERATOR_REQUIRED", remote_record["error_code"])
 
         discovered_source = {
             "schema": "universe.provider-session-source.v1",

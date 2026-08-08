@@ -726,6 +726,24 @@ async function showProviderActivityBatch(sourceId) {
   );
 }
 
+async function recordProviderActivityMemory(sourceId) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) {
+    throw new Error("Select a project before recording activity memory");
+  }
+  const result = await api(
+    `/v1/session-observer/sources/${encodeURIComponent(sourceId)}/record-memory`,
+    { method: "POST", body: { project_id: projectId } }
+  );
+  await selectProject(projectId, { revealInspector: true });
+  showInspectorTab("memory");
+  toast(
+    result.status === "PROVIDER_ACTIVITY_MEMORY_RECORDED"
+      ? "Activity batch recorded as unlinked project memory"
+      : "Activity batch memory already exists"
+  );
+}
+
 function renderProviderActivitySources() {
   if (!elements.providerActivityList || !elements.providerActivityDiscovery) return;
   const sources = state.providerActivitySources || [];
@@ -769,7 +787,12 @@ function renderProviderActivitySources() {
     batch.addEventListener("click", () => {
       showProviderActivityBatch(source.source_id).catch((error) => toast(error.message, true));
     });
-    actions.append(scan, batch);
+    const record = node("button", "secondary-button compact-action", "Record memory");
+    record.type = "button";
+    record.addEventListener("click", () => {
+      recordProviderActivityMemory(source.source_id).catch((error) => toast(error.message, true));
+    });
+    actions.append(scan, batch, record);
     card.append(heading, meta, reason, actions);
     elements.providerActivityList.append(card);
   }
