@@ -16,6 +16,8 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from project_integration_catalog import load_project_integration_catalog
+
 ROOT = Path(__file__).resolve().parents[1]
 
 INCLUDE_DIRS = (
@@ -73,6 +75,24 @@ def copy_tree(src: Path, dest: Path) -> None:
 
 def write_launcher(path: Path, body: str) -> None:
     path.write_text(body.replace("\n", "\r\n"), encoding="utf-8", newline="")
+
+
+
+def write_project_integration_catalog(package_root: Path) -> dict:
+    """Record the catalog resolved from the packaged template files."""
+
+    catalog = load_project_integration_catalog(package_root)
+    manifest_path = package_root / "project-integration-catalog.json"
+    manifest_path.write_text(
+        json.dumps(catalog, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "path": manifest_path.relative_to(package_root).as_posix(),
+        "schema": catalog["schema"],
+        "status": catalog["status"],
+        "catalog_digest": catalog["catalog_digest"],
+    }
 
 
 def env_snippet(*, python_cmd: str) -> str:
@@ -224,6 +244,7 @@ def build_portable(
         python_meta = embed_python(package_root, python_zip)
 
     write_launchers(package_root, includes_python=with_python)
+    project_integration_catalog = write_project_integration_catalog(package_root)
 
     req_line = (
         "Bundled: runtime\\python\\python.exe (Windows embeddable CPython)"
@@ -258,6 +279,11 @@ Docs
 docs\\universe-packaging.md
 docs\\local-universe-service.md
 docs\\universe-memory-rag.md
+
+Project integration catalog
+---------------------------
+project-integration-catalog.json is resolved from this package's
+copied templates. VERSION.txt records the same catalog digest.
 """
     (package_root / "README-PORTABLE.txt").write_text(readme, encoding="utf-8")
     version = {
@@ -269,6 +295,7 @@ docs\\universe-memory-rag.md
         "includes_python": with_python,
         "data_dir": "data",
         "python": python_meta,
+        "project_integration_catalog": project_integration_catalog,
     }
     (package_root / "VERSION.txt").write_text(
         json.dumps(version, indent=2) + "\n", encoding="utf-8"

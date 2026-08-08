@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from build_portable import build_portable, embed_python, write_launchers  # noqa: E402
+from project_integration_catalog import load_project_integration_catalog  # noqa: E402
 
 
 class BuildPortableTests(unittest.TestCase):
@@ -47,6 +48,19 @@ class BuildPortableTests(unittest.TestCase):
             self.assertTrue((package / "VERSION.txt").is_file())
             version = json.loads((package / "VERSION.txt").read_text(encoding="utf-8"))
             self.assertFalse(version["includes_python"])
+            catalog_manifest_path = package / "project-integration-catalog.json"
+            self.assertTrue(catalog_manifest_path.is_file())
+            catalog_manifest = json.loads(catalog_manifest_path.read_text(encoding="utf-8"))
+            package_catalog = load_project_integration_catalog(package)
+            self.assertEqual(package_catalog, catalog_manifest)
+            self.assertEqual(
+                package_catalog["catalog_digest"],
+                version["project_integration_catalog"]["catalog_digest"],
+            )
+            self.assertEqual(
+                "project-integration-catalog.json",
+                version["project_integration_catalog"]["path"],
+            )
             launcher = (package / "Start-Universe.cmd").read_text(encoding="utf-8")
             self.assertIn("UNIVERSE_PYTHON", launcher)
             zip_path = Path(result["zip_path"])
