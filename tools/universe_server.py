@@ -9894,8 +9894,7 @@ class UniverseStore:
             current_state = str(todo_row["state"])
             if (
                 current_state == desired_state
-                or (current_state == "DONE" and desired_state == "BLOCKED")
-                or (current_state == "BLOCKED" and desired_state == "IN_PROGRESS")
+                or current_state in {"DONE", "BLOCKED"}
             ):
                 return {
                     "status": "TODO_TRANSITION_NOT_REQUIRED",
@@ -16928,6 +16927,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             or scheme.lower() != "bearer"
             or not hmac.compare_digest(candidate, self.server.token)
         ):
+            # POST callers may already have sent a bounded JSON body. Consume it
+            # before responding so a rejected keep-alive request cannot abort the
+            # connection while the client is still writing.
+            self._drain_bounded_request_body()
             self._send(
                 HTTPStatus.UNAUTHORIZED,
                 {

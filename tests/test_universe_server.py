@@ -866,6 +866,56 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("DONE", completed["state"])
         self.assertEqual("DONE", self.server.store.get_todo(todo["todo_id"])["state"])
+        repeated = self.server.store.apply_master_message_todo_transition(
+            "GCS", message["message_id"], outcome="COMPLETED"
+        )
+        self.assertEqual("TODO_TRANSITION_NOT_REQUIRED", repeated["status"])
+        stale_delivery = self.server.store.apply_master_message_todo_transition(
+            "GCS", message["message_id"], outcome="DELIVERED"
+        )
+        self.assertEqual("TODO_TRANSITION_NOT_REQUIRED", stale_delivery["status"])
+        stale_failure = self.server.store.apply_master_message_todo_transition(
+            "GCS", message["message_id"], outcome="FAILED"
+        )
+        self.assertEqual("TODO_TRANSITION_NOT_REQUIRED", stale_failure["status"])
+
+        failure_todo = self.server.store.create_todo(
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Exercise Master failure transition",
+                "detail": "",
+                "priority": "P1",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 1,
+            }
+        )
+        failure_message, _ = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "TASK_DRAFT",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "Run the linked failure task.",
+                "todo_id": failure_todo["todo_id"],
+                "idempotency_key": "linked-master-todo-failure-1",
+            },
+        )
+        self.server.store.apply_master_message_todo_transition(
+            "GCS", failure_message["message_id"], outcome="DELIVERED"
+        )
+        failed = self.server.store.apply_master_message_todo_transition(
+            "GCS", failure_message["message_id"], outcome="FAILED"
+        )
+        self.assertEqual("BLOCKED", failed["state"])
+        repeated_failure = self.server.store.apply_master_message_todo_transition(
+            "GCS", failure_message["message_id"], outcome="FAILED"
+        )
+        self.assertEqual("TODO_TRANSITION_NOT_REQUIRED", repeated_failure["status"])
+        stale_after_failure = self.server.store.apply_master_message_todo_transition(
+            "GCS", failure_message["message_id"], outcome="DELIVERED"
+        )
+        self.assertEqual("TODO_TRANSITION_NOT_REQUIRED", stale_after_failure["status"])
 
         unlinked, _ = self.server.store.create_room_message(
             "GCS",

@@ -126,6 +126,30 @@ class ProviderSessionObserverTests(unittest.TestCase):
         activity = self.store.list_activities(str(source["source_id"]))[0]
         self.assertEqual("QUOTA_STOP", activity["event_kind"])
 
+    def test_all_provider_scans_redact_payloads_and_are_idempotent(self) -> None:
+        fixtures = {
+            "CODEX": ("rollout-redaction.jsonl", {"type": "turn_completed", "text": "private-codex"}),
+            "CLAUDE": ("claude-redaction.jsonl", {"type": "message", "uuid": "claude-redaction", "text": "private-claude"}),
+            "GROK": ("updates.jsonl", {"type": "rate_limit_event", "message": "private-grok"}),
+        }
+        for provider, (filename, event) in fixtures.items():
+            with self.subTest(provider=provider):
+                source_path = self.root / provider.lower() / filename
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                self.write(source_path, event)
+                source = self.register(provider, source_path)
+                first = self.store.scan(str(source["source_id"]))
+                second = self.store.scan(str(source["source_id"]))
+                rendered = json.dumps(
+                    {
+                        "source": first,
+                        "activities": self.store.list_activities(str(source["source_id"])),
+                    }
+                )
+                self.assertEqual(1, first["added"])
+                self.assertEqual(0, second["added"])
+                self.assertNotIn("private-", rendered)
+
     def test_batch_candidate_is_redacted_and_does_not_publish_memory_or_bench(self) -> None:
         source_path = self.root / "rollout-batch.jsonl"
         self.write(source_path, {"type": "turn_completed", "text": "private"})
