@@ -236,7 +236,13 @@ class RemoteGatewayTests(unittest.TestCase):
         device = self.store.snapshot()["devices"][0]
         self.store.revoke_device(device["device_id"])
         with self.assertRaises(HTTPError) as raised:
-            self._open(Request(self.endpoint + "/", method="GET"))
+            self._open(
+                Request(
+                    self.endpoint + "/app.js",
+                    method="GET",
+                    headers={"Accept": "application/json"},
+                )
+            )
         try:
             self.assertEqual(HTTPStatus.UNAUTHORIZED, raised.exception.code)
         finally:
@@ -244,7 +250,13 @@ class RemoteGatewayTests(unittest.TestCase):
 
     def test_unpaired_browser_cannot_read_upstream(self) -> None:
         with self.assertRaises(HTTPError) as raised:
-            urlopen(self.endpoint + "/app.js", timeout=5)
+            urlopen(
+                Request(
+                    self.endpoint + "/app.js",
+                    headers={"Accept": "application/json"},
+                ),
+                timeout=5,
+            )
         try:
             self.assertEqual(HTTPStatus.UNAUTHORIZED, raised.exception.code)
         finally:

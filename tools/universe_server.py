@@ -13732,9 +13732,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
         try:
-            catalog = self.provider_model_catalog.discover(persist=True)
-        except ProviderModelCatalogError:
+            # Host executable discovery already probes each tool. Model catalog
+            # discovery can additionally run provider-specific list commands
+            # (notably `grok models`), so keep it on its explicit endpoint.
             catalog = self.provider_model_catalog.snapshot()
+        except ProviderModelCatalogError:
+            catalog = {}
         return {
             **profile,
             "provider_models": catalog,
