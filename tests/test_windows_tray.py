@@ -52,6 +52,13 @@ class WindowsTrayContractTests(unittest.TestCase):
             self.assertIn("Universe.ico", script)
             self.assertIn("IconLocation", script)
 
+    def test_custom_icon_is_a_valid_ico_asset(self) -> None:
+        icon = ROOT / "packaging" / "windows" / "Universe.ico"
+        header = icon.read_bytes()
+        self.assertGreaterEqual(len(header), 6)
+        self.assertEqual(b"\x00\x00\x01\x00", header[:4])
+        self.assertGreater(len(header), 32)
+
     def test_tray_stays_attached_to_the_user_desktop(self) -> None:
         flags = _windows_tray_creationflags()
         detached = getattr(__import__("subprocess"), "DETACHED_PROCESS", 0)

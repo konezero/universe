@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from core_release import build_release  # noqa: E402
+from core_release import CoreReleaseError, build_release  # noqa: E402
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError  # noqa: E402
 
 
@@ -355,6 +355,11 @@ class ReleaseRuntimeTests(unittest.TestCase):
             "project-owned edit\n",
             encoding="utf-8",
         )
+        before_apply = {
+            path.relative_to(self.target).as_posix(): path.read_bytes()
+            for path in self.target.rglob("*")
+            if path.is_file()
+        }
 
         with ReleaseRuntime(
             database_path=self.database,
@@ -370,6 +375,12 @@ class ReleaseRuntimeTests(unittest.TestCase):
                     target_root=self.target,
                     approved_plan_digest=plan["plan_digest"],
                 )
+        after_apply = {
+            path.relative_to(self.target).as_posix(): path.read_bytes()
+            for path in self.target.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before_apply, after_apply)
 
     def test_stale_plan_digest_is_rejected_before_writes(self) -> None:
         with ReleaseRuntime(
@@ -381,6 +392,21 @@ class ReleaseRuntimeTests(unittest.TestCase):
                     target_root=self.target,
                     approved_plan_digest="0" * 64,
                 )
+        self.assertEqual([], list(self.target.iterdir()))
+
+    def test_tampered_release_is_rejected_before_project_mutation(self) -> None:
+        tampered_database = self.root / "tampered-release.sqlite3"
+        tampered_manifest = self.root / "tampered-release.manifest.json"
+        tampered_database.write_bytes(self.database.read_bytes())
+        tampered_manifest.write_bytes(self.manifest.read_bytes())
+        with tampered_database.open("ab") as stream:
+            stream.write(b"tampered")
+
+        with self.assertRaisesRegex(CoreReleaseError, "database digest"):
+            ReleaseRuntime(
+                database_path=tampered_database,
+                manifest_path=tampered_manifest,
+            )
         self.assertEqual([], list(self.target.iterdir()))
 
     def test_materializes_provider_attested_source_bundle(self) -> None:

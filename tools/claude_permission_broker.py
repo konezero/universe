@@ -113,6 +113,8 @@ class ClaudePermissionBroker:
         self._server = HTTPServer((host, port), self._handler_type())
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
+        self._mcp_config_path: Path | None = None
+        self._mcp_config_lock = threading.Lock()
 
     @property
     def endpoint(self) -> str:
@@ -134,10 +136,7 @@ class ClaudePermissionBroker:
         if self._stopped.is_set():
             return
         self._stopped.set()
-        with self._bootstrap_lock:
-            # Burn the bootstrap credential too, so a late child cannot use it.
-            self._bootstrap_consumed = True
-            self._bootstrap_token = ""
+        self._invalidate_bootstrap()
         self.token.revoke()
         # Closing the bridge cancels every pending request, including one whose
         # operator decision is still in flight.
@@ -150,6 +149,11 @@ class ClaudePermissionBroker:
             self._thread = None
         self._server.server_close()
 
+    def abort_registration(self) -> None:
+        """Invalidate an MCP registration that did not complete in time."""
+
+        self._invalidate_bootstrap()
+
     @property
     def registered(self) -> bool:
         """True once the MCP server has exchanged its bootstrap token."""
@@ -159,7 +163,12 @@ class ClaudePermissionBroker:
     def wait_for_registration(self, timeout_seconds: float = 30.0) -> bool:
         """Block until the MCP server registers. A turn must not start first."""
 
-        return self._registered.wait(timeout_seconds)
+        registered = self._registered.wait(timeout_seconds)
+        if not registered:
+            # A child that missed the registration window must not be able to
+            # register later, and its one-time config must not remain on disk.
+            self.abort_registration()
+        return registered
 
     def exchange_bootstrap(self, presented: str | None) -> dict[str, Any]:
         """Trade the one-time bootstrap token for the session token.
@@ -181,6 +190,7 @@ class ClaudePermissionBroker:
             self._bootstrap_consumed = True
             self._bootstrap_token = ""
             self._registered.set()
+            self._cleanup_mcp_config()
             return {"status": "REGISTERED", "session_token": self.token.value}
 
     def provider_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
@@ -226,7 +236,37 @@ class ClaudePermissionBroker:
             json.dumps(self.mcp_config(), indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        with self._mcp_config_lock:
+            self._mcp_config_path = path
         return path
+
+    def _invalidate_bootstrap(self) -> None:
+        with self._bootstrap_lock:
+            # Burn the bootstrap credential so a late child cannot use it.
+            self._bootstrap_consumed = True
+            self._bootstrap_token = ""
+        self._cleanup_mcp_config()
+
+    def _cleanup_mcp_config(self) -> None:
+        with self._mcp_config_lock:
+            path = self._mcp_config_path
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Windows can keep the file locked briefly while the provider is
+            # starting. Retain the path so close() can retry the cleanup.
+            return
+        with self._mcp_config_lock:
+            if self._mcp_config_path == path:
+                self._mcp_config_path = None
+        # The host creates a private temporary directory for this one file.
+        # Remove it only when empty; never remove a caller-owned non-empty dir.
+        try:
+            path.parent.rmdir()
+        except OSError:
+            return
 
     # -- request handling -----------------------------------------------
 

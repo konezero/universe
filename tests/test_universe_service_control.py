@@ -22,6 +22,9 @@ from universe_service_control import (  # noqa: E402
 
 
 class UniverseServiceControlTests(unittest.TestCase):
+    def test_stop_grace_window_covers_resident_provider_cleanup(self) -> None:
+        self.assertEqual(20.0, stop_service.__kwdefaults__["timeout_seconds"])
+
     def test_missing_state_is_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "server.json"

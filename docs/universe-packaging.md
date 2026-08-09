@@ -84,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\uninstall-user.ps1
 - No administrator elevation required for this slice.
 - Does not ship Python; Host Python must already be on `PATH`.
 - Does not create Windows Services (`services.msc`).
-- Ships a PowerShell WinForms tray host; a compiled native tray binary and custom icon remain follow-up work.
+- Ships a PowerShell WinForms tray host with the packaged `packaging/windows/Universe.ico` asset. A compiled native tray binary remains follow-up work.
 - Does not grant project authority or Execution Assignment.
 
 ## Portable package (zip / folder)
@@ -177,7 +177,7 @@ shortcuts. This is the interim installer path until signed MSIX/MSI.
 4. ~~Per-user portable installer~~ → `Install-Portable-User.ps1`
 5. Signed MSIX/MSI (WiX) for enterprise distribution.
 6. In-app settings panel actions that shell out only via Host-approved control.
-7. Custom tray icon asset (currently uses application system icon).
+7. ~~Custom tray icon asset~~ -> `packaging/windows/Universe.ico` is included in the portable package and used by the tray and Start Menu shortcuts.
 
 ## Signed MSI (still later)
 

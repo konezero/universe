@@ -14,8 +14,15 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from universe_memory import propose_node_links  # noqa: E402
-from universe_server import create_server, universe_mode_contract  # noqa: E402
+from universe_memory import (  # noqa: E402
+    propose_node_links,
+    run_nightly_memory_rag_batch,
+)
+from universe_server import (  # noqa: E402
+    create_server,
+    normalize_skill_observation_candidate,
+    universe_mode_contract,
+)
 
 
 class UniverseMemoryTests(unittest.TestCase):
@@ -329,6 +336,70 @@ class UniverseMemoryTests(unittest.TestCase):
             "UNAVAILABLE_FALLBACK_DETERMINISTIC",
             "APPLIED_EXTERNAL_PROPOSALS",
         })
+
+    def test_nightly_memory_rag_batch_redacts_provenance_and_calls_sink(self) -> None:
+        sink_records: list[dict[str, Any]] = []
+        result = run_nightly_memory_rag_batch(
+            project_id="GCS",
+            memory_loader=lambda: [
+                {
+                    "memory_id": "memory-secret",
+                    "link_state": "UNLINKED",
+                    "title": "order risk note",
+                    "body": "private prompt and source command must never escape",
+                }
+            ],
+            node_loader=lambda: [
+                {"node_id": "order-risk", "label": "Order Risk", "kind": "system"}
+            ],
+            proposal_sink=lambda record: sink_records.append(dict(record)) or {
+                "queued": True,
+                "internal_path": "C:/private/queue.db",
+            },
+            source_ref="C:/private/source/repository",
+            observed_at="2026-08-10T00:00:00Z",
+        )
+        self.assertEqual("MEMORY_RAG_PROPOSAL_BATCH_READY", result["status"])
+        self.assertEqual(1, result["proposal_count"])
+        self.assertEqual(1, len(sink_records))
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("private prompt", serialized)
+        self.assertNotIn("private/queue.db", serialized)
+        self.assertNotIn("private/source/repository", serialized)
+        self.assertEqual("NOT_RETAINED", result["provenance"]["raw_prompts"])
+        self.assertEqual("NOT_RETAINED", result["provenance"]["raw_source"])
+        self.assertEqual("NOT_RETAINED", result["provenance"]["raw_commands"])
+        self.assertEqual(
+            result["provenance"]["proposal_digest"],
+            sink_records[0]["provenance"]["proposal_digest"],
+        )
+
+    def test_local_dogfood_skill_observation_fixture_enters_project_queue(self) -> None:
+        fixture_path = ROOT / "tests" / "fixtures" / "skill_observation_dogfood.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        normalized = normalize_skill_observation_candidate("GCS", fixture)
+        approval = {
+            "schema": "universe.skill-observation-publication-approval.v1",
+            "status": "APPROVED",
+            "operation_class": "UNIVERSE_OBSERVATION_QUEUE",
+            "project_ref": "project://GCS",
+            "candidate_id": fixture["candidate_id"],
+            "candidate_digest": normalized["candidate_digest"],
+            "selection_ref": "local://dogfood/selection-001",
+            "approver": "PROJECT_MASTER",
+            "evidence_ref": "local://dogfood/approval-001",
+        }
+        status, queued = self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observation-queue",
+            {**fixture, "publication_approval": approval},
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("SKILL_OBSERVATION_QUEUED", queued["status"])
+        self.assertEqual("QUEUED", queued["item"]["status"])
+        self.assertEqual(
+            normalized["candidate_digest"], queued["item"]["candidate_digest"]
+        )
 
 
 if __name__ == "__main__":

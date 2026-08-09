@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Function-first foundation landed |
-| **Date** | 2026-08-05 |
+| **Status** | Function-first foundation plus bounded meeting coordinator landed |
+| **Date** | 2026-08-10 |
 | **Product architecture** | `docs/multi-room-chat-architecture.md` |
 | **S1 design detail** | `docs/room-session-attach-streaming.md` |
 | **Purpose of this doc** | Inventory of **what is implemented now** for a later major UI redesign |
@@ -24,7 +24,7 @@
 | `.ai/skills/common/meeting-room-create/SKILL.md` | Skill entry for meeting create |
 | `.ai/skills/common/session-ref-inject/SKILL.md` | Inject + hook contract |
 | `.ai/skills/common/mode-change/SKILL.md` | Post-MODE_CHANGE inject step |
-| `tests/test_multi_room.py` | Unit tests for store rules |
+| `tests/test_multi_room.py` | Unit tests for store rules and meeting coordination |
 | `tests/test_session_inject_hook.py` | Hook resolve / dry-run / offline / inject |
 
 Database: **same Universe SQLite** (`universe.sqlite3` / service DB). Tables:
@@ -73,8 +73,11 @@ Database: **same Universe SQLite** (`universe.sqlite3` / service DB). Tables:
 | Conductor host + MODEL slots | **Done** |
 | User write allowed | **Done** (write matrix) |
 | Skill `meeting-room-create` | **Done** |
-| Multi-model live debate orchestration (round-robin prompts) | **Not done** — rooms/slots only; models not auto-prompted in loop |
-| Meeting summary file drop | **Not done** (API shape ready for later) |
+| Bounded round-robin coordination core | **Done** (`MultiRoomMeetingCoordinator`) |
+| Delta-only provider input | **Done**; full transcript forwarding is forbidden |
+| Turn-boundary cancellation and per-room single flight | **Done** |
+| Durable meeting summary | **Done** (`MEETING_SUMMARY` control event) |
+| Live native-provider completion adapter / HTTP run endpoint | **Not wired**; current native control returns queue acceptance, not a synchronous final result |
 
 ### S4 — Boss room
 
@@ -209,7 +212,9 @@ When redesigning SPA:
 3. Session Observatory is optional entry; **inject + attach APIs** are required for harness boot.
 4. Per-room SSE already exists at `/v1/rooms/{id}/stream` — multi-dock should open multiple EventSources.
 5. Classic Project Master dock (`/v1/projects/.../room/*`) remains until fully migrated; multi-room is parallel foundation.
-6. Feature gaps for redesign backlog: Host session_ref hard-switch, live multi-model meeting loop, TF auto boss-room, dashboard (S6).
+6. Feature gaps for redesign backlog: Host session_ref hard-switch, live native
+   completion adapter for the bounded meeting coordinator, TF auto boss-room,
+   and dashboard (S6).
 
 ---
 

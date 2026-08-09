@@ -40,10 +40,37 @@ class BuildPortableTests(unittest.TestCase):
                     / "mode_registry.json"
                 ).is_file()
             )
+            packaged_ai_files = [
+                path.relative_to(package).as_posix()
+                for path in (package / ".ai").rglob("*")
+                if path.is_file()
+            ]
+            self.assertEqual(
+                [".ai/runtime/project_instance/mode_registry.json"],
+                packaged_ai_files,
+            )
+            self.assertEqual(
+                json.loads(
+                    (
+                        ROOT / "templates/universe-runtime/mode_registry.json"
+                    ).read_text(encoding="utf-8")
+                ),
+                json.loads(
+                    (
+                        package
+                        / ".ai/runtime/project_instance/mode_registry.json"
+                    ).read_text(encoding="utf-8")
+                ),
+            )
             self.assertTrue((package / "Start-Universe.cmd").is_file())
+            self.assertTrue((package / "Start-Universe-Tray.cmd").is_file())
             self.assertTrue(
                 (package / "packaging" / "windows" / "Universe.ico").is_file()
             )
+            source_icon = ROOT / "packaging" / "windows" / "Universe.ico"
+            packaged_icon = package / "packaging" / "windows" / "Universe.ico"
+            self.assertEqual(source_icon.read_bytes(), packaged_icon.read_bytes())
+            self.assertGreater(len(packaged_icon.read_bytes()), 32)
             self.assertTrue((package / "data" / ".gitkeep").is_file())
             self.assertTrue((package / "VERSION.txt").is_file())
             version = json.loads((package / "VERSION.txt").read_text(encoding="utf-8"))
@@ -67,7 +94,22 @@ class BuildPortableTests(unittest.TestCase):
             self.assertTrue(zip_path.is_file())
             with zipfile.ZipFile(zip_path) as archive:
                 names = archive.namelist()
+                self.assertIn(
+                    f"{package.name}/packaging/windows/Universe.ico",
+                    names,
+                )
             self.assertTrue(any(name.endswith("tools/universe_server.py") for name in names))
+            zipped_ai_files = sorted(
+                name
+                for name in names
+                if "/.ai/" in name and not name.endswith("/")
+            )
+            self.assertEqual(1, len(zipped_ai_files))
+            self.assertTrue(
+                zipped_ai_files[0].endswith(
+                    ".ai/runtime/project_instance/mode_registry.json"
+                )
+            )
 
     def test_embed_python_from_local_zip(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

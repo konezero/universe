@@ -14839,7 +14839,34 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
 
     def prepare_project_master_session(self, project_id: str) -> dict[str, Any]:
-        host = self.ensure_project_master(project_id)
+        try:
+            host = self.ensure_project_master(project_id)
+        except ProjectMasterHostError as error:
+            error_code = str(error).strip() or "PROJECT_MASTER_SESSION_PREPARATION_FAILED"
+            if error_code == "PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE":
+                raise UniverseError(
+                    "PROJECT_RUNTIME_UPDATE_REQUIRED",
+                    (
+                        f"Project {project_id} does not expose the installed Runtime "
+                        "mode boot binding; install or update its local AI Workspace "
+                        "before preparing a Project Master session"
+                    ),
+                    HTTPStatus.CONFLICT,
+                ) from error
+            if error_code == "PROJECT_RUNTIME_CLI_UNAVAILABLE":
+                raise UniverseError(
+                    "PROJECT_RUNTIME_INSTALL_REQUIRED",
+                    (
+                        f"Project {project_id} has no usable local AI Workspace; "
+                        "attach or install it before preparing a Project Master session"
+                    ),
+                    HTTPStatus.CONFLICT,
+                ) from error
+            raise UniverseError(
+                "PROJECT_MASTER_SESSION_PREPARATION_FAILED",
+                error_code,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from error
         multi_room = None
         bridge_line = None
         try:

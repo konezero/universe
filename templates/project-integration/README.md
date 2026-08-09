@@ -32,6 +32,23 @@ local:   .ai/
 An attached Project must not track its installed `.ai/` workspace. A migration
 removes `.ai/` from the Git index without deleting local files.
 
+For an existing clone, create a verified backup before changing the index:
+
+```powershell
+python tools/migrate_local_workspace.py migrate `
+  --project-root C:\workspace\project `
+  --backup-dir C:\workspace-backups\project-ai `
+  --quiescence-evidence-ref operator:project-hosts-stopped
+```
+
+Stop the project's live hosts before migration and record that observation in
+`--quiescence-evidence-ref`. The command requires an active `.ai/` ignore rule,
+copies and hashes every local Workspace file, removes only Git index entries,
+and verifies that the working-tree bytes did not change. Restore refuses to
+overwrite a different local file or restore into a different project root.
+Intentional relocation requires `restore --allow-relocated`. The tool never
+pulls, installs, updates, or boots a Runtime.
+
 ## Compatibility transition
 
 Until the Universe installer consumes this catalog directly, the equivalent

@@ -2007,25 +2007,35 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             session_ref=self.session_ref,
             permission_requester=self._permission_requester,
         )
-        broker = ClaudePermissionBroker(
-            bridge=bridge,
-            target=f"{self.project_id}/{self.requested_mode}",
-        ).start()
-        config_root = Path(tempfile.mkdtemp(prefix="universe-claude-mcp-"))
-        mcp_config = broker.write_mcp_config(config_root / "mcp.json")
-        session = ClaudeResidentSession(
-            executable=executable,
-            cwd=self.project_root,
-            # The capability token must never reach Claude's own environment.
-            environment=broker.provider_environment(environment),
-            model=model,
-            system_prompt=self._system_prompt(),
-            session_id=self.session_id,
-            session_observer=observe_session,
-            permission_mcp_config=mcp_config,
-            permission_bridge=bridge,
-            permission_ready=broker.wait_for_registration,
-        )
+        broker: ClaudePermissionBroker | None = None
+        config_root: Path | None = None
+        try:
+            broker = ClaudePermissionBroker(
+                bridge=bridge,
+                target=f"{self.project_id}/{self.requested_mode}",
+            ).start()
+            config_root = Path(tempfile.mkdtemp(prefix="universe-claude-mcp-"))
+            mcp_config = broker.write_mcp_config(config_root / "mcp.json")
+            session = ClaudeResidentSession(
+                executable=executable,
+                cwd=self.project_root,
+                # The capability token must never reach Claude's own environment.
+                environment=broker.provider_environment(environment),
+                model=model,
+                system_prompt=self._system_prompt(),
+                session_id=self.session_id,
+                session_observer=observe_session,
+                permission_mcp_config=mcp_config,
+                permission_bridge=bridge,
+                permission_ready=broker.wait_for_registration,
+                permission_failure=broker.close,
+            )
+        except Exception:
+            if broker is not None:
+                broker.close()
+            if config_root is not None:
+                shutil.rmtree(config_root, ignore_errors=True)
+            raise
         self._permission_broker = broker
         self._mcp_config_root = config_root
         self.session_id = session.session_id

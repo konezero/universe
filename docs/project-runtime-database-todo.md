@@ -1,6 +1,6 @@
 # Project Runtime Database Migration Todo
 
-Status: first vertical slice implemented in source worktrees
+Status: P0 and P1 implemented, released, installed, and verified
 
 ## P0 - Mode Boot authority
 
@@ -21,16 +21,33 @@ Status: first vertical slice implemented in source worktrees
 
 ## P1 - Runtime state consolidation
 
-- [ ] Move Mode Current Anchor writes from per-Mode compatibility stores into
+- [x] Move Mode Current Anchor writes from per-Mode compatibility stores into
   the Project Runtime database as the only write path.
-- [ ] Render Markdown state companions from the database as non-authoritative
+- [x] Render Markdown state companions from the database as non-authoritative
   projections.
-- [ ] Move Assignment and Task Frame indexes without changing approval or
+- [x] Move Assignment and Task Frame indexes without changing approval or
   Execution Guard boundaries.
-- [ ] Move continuity/checkpoint indexes while keeping transcript and raw
+- [x] Move continuity/checkpoint indexes while keeping transcript and raw
   provider content outside the database.
-- [ ] Add schema migrations, backup/restore, corruption recovery, and vacuum
+- [x] Add schema migrations, backup/restore, corruption recovery, and vacuum
   policy.
+
+P1 source acceptance includes schema v1-to-v2 migration, DB-only Current
+Anchor writes, forward-only commander observations, reference-only Assignment /
+Task Frame / Continuity indexes, integrity checks, rollback-safe restore, and
+non-authoritative Markdown projections. Runtime installation tests include
+`project_runtime_store.py` in the fresh-install package fixture.
+
+P1 release and consumer evidence:
+
+- ai-career PR #269 source commit:
+  `94460a5228603a2ce2f80f6b0ee1a0092bf53f7d`
+- Universe Host Runtime Lifecycle receipt:
+  `host-runtime-lifecycle-374ee07f881d9b5f587e4eb0`
+- Post-update repository validation: `PASS / VERIFIED`
+- Validation ID:
+  `1c39336eb8bdb786b628314e2874f1d5d838eb18d7210aa65249860fc18710c4`
+- Service dogfood endpoint after restart: `http://127.0.0.1:60589/`
 
 ## Acceptance
 

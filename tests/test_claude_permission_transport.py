@@ -213,6 +213,73 @@ class BrokerTests(unittest.TestCase):
 
         self.assertIn("universe_permission", loaded["mcpServers"])
 
+    def test_bootstrap_registration_removes_config_file_and_private_directory(
+        self,
+    ) -> None:
+        broker = self._broker("allow-once")
+        config_root = self.root / "registration-cleanup"
+        path = broker.write_mcp_config(config_root / "mcp.json")
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+
+        self.assertTrue(path.is_file())
+        self.assertEqual("REGISTERED", broker.exchange_bootstrap(bootstrap)["status"])
+        self.assertFalse(path.exists())
+        self.assertFalse(config_root.exists())
+
+    def test_registration_timeout_invalidates_bootstrap_and_cleans_config(self) -> None:
+        broker = self._broker("allow-once")
+        config_root = self.root / "timeout-cleanup"
+        path = broker.write_mcp_config(config_root / "mcp.json")
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+
+        self.assertFalse(broker.wait_for_registration(0.01))
+        self.assertFalse(path.exists())
+        self.assertFalse(config_root.exists())
+        self.assertEqual(
+            "BOOTSTRAP_ALREADY_USED",
+            broker.exchange_bootstrap(bootstrap)["reason"],
+        )
+
+    def test_close_cleans_config_file_and_private_directory(self) -> None:
+        broker = self._broker("allow-once")
+        config_root = self.root / "close-cleanup"
+        path = broker.write_mcp_config(config_root / "mcp.json")
+
+        broker.close()
+
+        self.assertFalse(path.exists())
+        self.assertFalse(config_root.exists())
+
+    def test_close_retries_cleanup_after_windows_file_lock(self) -> None:
+        broker = self._broker("allow-once")
+        config_root = self.root / "locked-cleanup"
+        path = broker.write_mcp_config(config_root / "mcp.json")
+        bootstrap = broker.mcp_config()["mcpServers"]["universe_permission"]["env"][
+            "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
+        ]
+        real_unlink = Path.unlink
+        attempts = 0
+
+        def locked_once(target: Path, *args, **kwargs) -> None:
+            nonlocal attempts
+            if target == path and attempts == 0:
+                attempts += 1
+                raise PermissionError("simulated Windows file lock")
+            real_unlink(target, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=locked_once):
+            self.assertEqual("REGISTERED", broker.exchange_bootstrap(bootstrap)["status"])
+            self.assertTrue(path.exists())
+            broker.close()
+
+        self.assertEqual(1, attempts)
+        self.assertFalse(path.exists())
+        self.assertFalse(config_root.exists())
+
     def test_http_round_trip_allows_and_denies(self) -> None:
         broker = self._broker("allow-once").start()
         url = f"{broker.endpoint}{BROKER_PATH}"
@@ -358,6 +425,34 @@ class BootstrapExchangeTests(unittest.TestCase):
         self.assertIn("MCP_NOT_REGISTERED", str(caught.exception))
         # The prompt must never have been written.
         self.assertEqual([], built[0].sent)
+
+    def test_provider_launch_failure_cleans_permission_config_and_broker(self) -> None:
+        from claude_resident_session import ClaudeResidentSession
+
+        broker = self._broker("allow-once")
+        config_root = self.root / "launch-failure"
+        path = broker.write_mcp_config(config_root / "mcp.json")
+
+        def failing_factory(**_kwargs):
+            raise RuntimeError("provider launch failed")
+
+        session = ClaudeResidentSession(
+            executable=Path("claude.exe"),
+            cwd=self.root,
+            environment={},
+            system_prompt="probe",
+            session_id=None,
+            session_observer=lambda _s: None,
+            permission_failure=broker.close,
+            process_factory=failing_factory,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "provider launch failed"):
+            session.send_message("go", lambda _d: None)
+
+        self.assertFalse(path.exists())
+        self.assertFalse(config_root.exists())
+        self.assertTrue(broker.token.revoked)
 
     def test_mcp_client_registers_then_uses_memory_token(self) -> None:
         broker = self._broker().start()

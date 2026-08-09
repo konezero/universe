@@ -60,8 +60,10 @@ against the current Project Projection nodes. It never writes Seed or links
 automatically. UI may apply a proposal as `PROPOSED` or `LINKED` after user
 action.
 
-Nightly LLM maintenance remains a later batch; this slice ships the
-non-LLM proposal helper and a deterministic maintain batch.
+Nightly LLM scoring remains a later provider adapter. This slice ships the
+non-LLM proposal helper, deterministic maintain batch, and a service-callable
+redacted nightly batch contract whose sink receives only proposal records and
+digests.
 
 ## Maintain batch (deterministic nightly stub)
 
@@ -88,6 +90,12 @@ effects.auto_linked: false
 
 It never auto-`LINKED`, never writes Seed, and never creates Candidates. A later
 nightly LLM batch may replace scoring while keeping the same apply boundary.
+
+`run_nightly_memory_rag_batch()` adds a credential-free service boundary for
+scheduled runs. It hashes the Memory/Node sets and source reference, omits raw
+prompts, source, commands, and sink details from returned evidence, and emits
+proposal-only records. The current scorer is deterministic or heuristic; no
+provider call is implied.
 
 ## Bench compare
 

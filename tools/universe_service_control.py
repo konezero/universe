@@ -232,7 +232,7 @@ def service_status(state_path: Path | None = None) -> dict[str, Any]:
 def stop_service(
     state_path: Path | None = None,
     *,
-    timeout_seconds: float = 8.0,
+    timeout_seconds: float = 20.0,
 ) -> dict[str, Any]:
     path = (state_path or default_state_path()).expanduser()
     before = service_status(path)

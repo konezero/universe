@@ -29,11 +29,14 @@ Acceptance evidence must come from the actual Grok CLI process. Structural and c
 
 ## P2 - Claude MCP bootstrap file cleanup
 
-- [ ] Remove the temporary `mcp.json` after the one-time bootstrap exchange when the provider no longer needs the file.
-- [ ] Cover normal close, startup failure, timeout, and interrupted bootstrap cleanup paths.
-- [ ] Verify an exchanged or stale bootstrap cannot authorize a later request and is absent from durable logs and receipts.
+- [x] Remove the temporary `mcp.json` after the one-time bootstrap exchange when the provider no longer needs the file.
+- [x] Cover normal close, startup failure, timeout, interrupted bootstrap, and
+  transient Windows file-lock retry cleanup paths.
+- [x] Verify an exchanged or stale bootstrap cannot authorize a later request and is absent from durable logs and receipts.
 
-The current one-time exchange already invalidates the bootstrap token. This item reduces residual file exposure and operational clutter.
+The one-time exchange invalidates the bootstrap token. The provider receives no
+session capability token, and a transient unlink failure retains the private
+config path for one final cleanup attempt during close.
 
 ## P2 - long-running Provider recovery probes
 

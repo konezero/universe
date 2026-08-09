@@ -158,6 +158,19 @@ trusted HTTPS reverse proxy on the user's server
 
 Deployment and verification are defined in `docs/external-access-dogfood.md`.
 
+### Local acceptance boundary
+
+The local test suite verifies the connector and gateway without contacting a
+remote server. It covers the fixed loopback upstream, `HOST_OFFLINE` when the
+local service cannot be reached, pairing and revocation, SSE forwarding, and
+removal of browser credentials and caller-supplied proxy headers. It also
+verifies the connector's key-only SSH argv contract and that public status does
+not expose private paths or control tokens.
+
+An actual Gabia/VPS tunnel, DNS or HTTPS reverse proxy, SSH server policy, and
+mobile-browser pairing over the Internet remain deployment checks. They require
+host credentials and are intentionally outside local acceptance tests.
+
 ## Components
 
 ### Local Universe HTTP service

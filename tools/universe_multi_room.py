@@ -26,6 +26,8 @@ ROOM_STREAM_SCHEMA = "universe.chat-room-stream.v1"
 INJECT_SCHEMA = "universe.session-ref-inject.v1"
 ROOM_DURABLE_EVENT_SCHEMA = "universe.chat-room-durable-event.v1"
 ROOM_CURSOR_SCHEMA = "universe.chat-room-cursor.v1"
+MEETING_COORDINATOR_SCHEMA = "universe.meeting-coordinator.v1"
+MEETING_SUMMARY_SCHEMA = "universe.meeting-summary.v1"
 
 ROOM_TYPES = frozenset({"PROJECT", "BOSS", "MEETING"})
 ROOM_STATES = frozenset({"OPEN", "CLOSED"})
@@ -1609,6 +1611,76 @@ class MultiRoomStore:
             "event": payload,
         }
 
+    def record_control_event(
+        self,
+        room_id: str,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a room control observation and publish its live projection."""
+
+        room = self.get_room(room_id)
+        normalized_type = _text(event_type, "event_type", limit=96).upper()
+        event_id = "evt_" + secrets.token_hex(12)
+        now = utc_now()
+        event = {
+            "schema": ROOM_EVENT_SCHEMA,
+            "event_id": event_id,
+            "event_type": normalized_type,
+            "room_id": room["room_id"],
+            "project_id": room.get("project_id"),
+            "task_frame_id": room.get("task_frame_id"),
+            "payload": dict(payload or {}),
+            "created_at": now,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_room_control_event(
+                    event_id, room_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    room["room_id"],
+                    normalized_type,
+                    json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                ),
+            )
+            connection.commit()
+        self.hub.publish(
+            room["room_id"],
+            {"type": normalized_type, "event": event},
+        )
+        return event
+
+    def list_control_events(
+        self,
+        room_id: str,
+        *,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rid = _text(room_id, "room_id", limit=80)
+        cap = max(1, min(500, int(limit)))
+        clauses = ["room_id = ?"]
+        params: list[Any] = [rid]
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(_text(event_type, "event_type", limit=96).upper())
+        params.append(cap)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM chat_room_control_event
+                WHERE """
+                + " AND ".join(clauses)
+                + " ORDER BY created_at ASC, event_id ASC LIMIT ?",
+                params,
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
     def room_snapshot(self, room_id: str) -> dict[str, Any]:
         room = self.get_room(room_id)
         bindings = self.list_bindings(room_id)
@@ -1907,3 +1979,375 @@ class MultiRoomNativeControlRegistry:
                 self.store.set_participant_state(binding_id, "DISCONNECTED")
             except MultiRoomError:
                 pass
+
+
+class MultiRoomMeetingCoordinator:
+    """Run a bounded, deterministic round-robin meeting over model bindings.
+
+    Provider adapters receive only the immediately preceding room delta. The
+    durable room remains the source of the observable transcript; the
+    coordinator never constructs or forwards a full transcript to a provider.
+    """
+
+    def __init__(
+        self,
+        store: MultiRoomStore,
+        invoke_provider: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]],
+        *,
+        max_turns: int = 24,
+    ) -> None:
+        if not callable(invoke_provider):
+            raise MultiRoomError(
+                "MEETING_PROVIDER_INVOKER_INVALID",
+                "meeting provider invoker must be callable",
+            )
+        self.store = store
+        self.invoke_provider = invoke_provider
+        self.max_turns = max(1, min(48, int(max_turns)))
+        self._cancel_lock = threading.RLock()
+        self._cancel_requests: dict[str, str] = {}
+        self._run_lock = threading.Lock()
+        self._active_rooms: set[str] = set()
+
+    def cancel(self, run_id: str, *, reason: str = "operator") -> dict[str, Any]:
+        rid = _text(run_id, "run_id", limit=120)
+        cancel_reason = _text(reason, "reason", limit=240)
+        with self._cancel_lock:
+            self._cancel_requests[rid] = cancel_reason
+        return {
+            "schema": MEETING_COORDINATOR_SCHEMA,
+            "status": "MEETING_CANCEL_REQUESTED",
+            "run_id": rid,
+            "reason": cancel_reason,
+        }
+
+    def _cancel_reason(self, run_id: str) -> str | None:
+        with self._cancel_lock:
+            return self._cancel_requests.get(run_id)
+
+    def _clear_cancel(self, run_id: str) -> None:
+        with self._cancel_lock:
+            self._cancel_requests.pop(run_id, None)
+
+    def run(
+        self,
+        room_id: str,
+        *,
+        prompt: str,
+        max_turns: int = 6,
+        run_id: str | None = None,
+        cancel_check: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        with self._run_lock:
+            if rid in self._active_rooms:
+                raise MultiRoomError(
+                    "MEETING_ROOM_BUSY",
+                    "meeting room already has an active run",
+                    409,
+                )
+            self._active_rooms.add(rid)
+        try:
+            return self._run_single(
+                rid,
+                prompt=prompt,
+                max_turns=max_turns,
+                run_id=run_id,
+                cancel_check=cancel_check,
+            )
+        finally:
+            with self._run_lock:
+                self._active_rooms.discard(rid)
+
+    def _run_single(
+        self,
+        room_id: str,
+        *,
+        prompt: str,
+        max_turns: int,
+        run_id: str | None,
+        cancel_check: Callable[[Mapping[str, Any]], bool] | None,
+    ) -> dict[str, Any]:
+        room = self.store.get_room(room_id)
+        if room["room_type"] != "MEETING":
+            raise MultiRoomError(
+                "MEETING_ROOM_TYPE_INVALID",
+                "round-robin coordination requires a MEETING room",
+                409,
+            )
+        if room["state"] != "OPEN":
+            raise MultiRoomError("ROOM_CLOSED", "cannot run a closed meeting", 409)
+        try:
+            if isinstance(max_turns, bool):
+                raise ValueError
+            bounded_turns = int(max_turns)
+        except (TypeError, ValueError) as error:
+            raise MultiRoomError(
+                "MEETING_TURN_LIMIT_INVALID",
+                "max_turns must be an integer",
+            ) from error
+        if bounded_turns < 1 or bounded_turns > self.max_turns:
+            raise MultiRoomError(
+                "MEETING_TURN_LIMIT_INVALID",
+                f"max_turns must be between 1 and {self.max_turns}",
+            )
+        if cancel_check is not None and not callable(cancel_check):
+            raise MultiRoomError(
+                "MEETING_CANCEL_CHECK_INVALID",
+                "cancel_check must be callable",
+            )
+        models = sorted(
+            (
+                binding
+                for binding in self.store.list_bindings(room["room_id"])
+                if binding["slot_role"] == "MODEL"
+            ),
+            key=lambda item: (item.get("created_at") or "", item["binding_id"]),
+        )
+        if not models:
+            raise MultiRoomError(
+                "MEETING_MODELS_UNAVAILABLE",
+                "meeting requires at least one active MODEL binding",
+                409,
+            )
+        meeting_run_id = _text(
+            run_id or "meeting_" + secrets.token_hex(12),
+            "run_id",
+            limit=120,
+        )
+        existing = [
+            event
+            for event in self.store.list_control_events(
+                room["room_id"], event_type="MEETING_SUMMARY", limit=500
+            )
+            if event.get("payload", {}).get("run_id") == meeting_run_id
+        ]
+        if existing:
+            raise MultiRoomError(
+                "MEETING_RUN_CONFLICT",
+                "run_id already has an observable meeting summary",
+                409,
+            )
+
+        started_at = utc_now()
+        turns: list[dict[str, Any]] = []
+        current_delta: dict[str, Any] | None = None
+        status = "COMPLETED"
+        reason = "BOUNDED_TURNS_REACHED"
+        prompt_message = self.store.post_message(
+            room["room_id"],
+            {
+                "author_role": "USER",
+                "body_text": prompt,
+                "idempotency_key": f"meeting:{meeting_run_id}:prompt",
+                "correlation_id": meeting_run_id,
+            },
+        )
+        current_delta = prompt_message
+        self.store.record_control_event(
+            room["room_id"],
+            "MEETING_STARTED",
+            {
+                "schema": MEETING_COORDINATOR_SCHEMA,
+                "run_id": meeting_run_id,
+                "max_turns": bounded_turns,
+                "participant_order": [item["binding_id"] for item in models],
+                "delivery_mode": "INCREMENTAL_DELTA_ONLY",
+                "transcript_forwarded": False,
+                "cancel_policy": "TURN_BOUNDARY_FAIL_CLOSED",
+            },
+        )
+        try:
+            for turn_number in range(bounded_turns):
+                cancel_reason = self._cancel_reason(meeting_run_id)
+                if cancel_reason:
+                    status = "INTERRUPTED"
+                    reason = cancel_reason
+                    break
+                checkpoint = {
+                    "run_id": meeting_run_id,
+                    "turn_number": turn_number,
+                    "turn_count": len(turns),
+                    "max_turns": bounded_turns,
+                }
+                if cancel_check is not None:
+                    try:
+                        should_cancel = bool(cancel_check(checkpoint))
+                    except Exception as error:  # fail closed at turn boundary
+                        should_cancel = True
+                        reason = f"CANCEL_CHECK_ERROR:{type(error).__name__}"
+                    if should_cancel:
+                        status = "INTERRUPTED"
+                        if reason == "BOUNDED_TURNS_REACHED":
+                            reason = "CANCEL_CHECK_REQUESTED"
+                        break
+                binding = models[turn_number % len(models)]
+                if current_delta is None:
+                    status = "FAILED"
+                    reason = "INCREMENTAL_DELTA_MISSING"
+                    break
+                turn = {
+                    "schema": MEETING_COORDINATOR_SCHEMA,
+                    "run_id": meeting_run_id,
+                    "turn_number": turn_number,
+                    "round_number": turn_number // len(models) + 1,
+                    "binding_id": binding["binding_id"],
+                    "provider": binding.get("provider"),
+                    "provider_session_ref": binding.get("provider_session_ref"),
+                    "input_mode": "INCREMENTAL_DELTA_ONLY",
+                    "transcript_forwarded": False,
+                    "delta": dict(current_delta),
+                }
+                self.store.record_control_event(
+                    room["room_id"], "MEETING_TURN_STARTED", turn
+                )
+                try:
+                    provider_result = self.invoke_provider(dict(binding), turn)
+                    if not isinstance(provider_result, Mapping):
+                        raise MultiRoomError(
+                            "MEETING_PROVIDER_RESULT_INVALID",
+                            "provider result must be an object",
+                        )
+                except Exception as error:  # provider failure is observable and terminal
+                    status = "FAILED"
+                    reason = f"PROVIDER_ERROR:{type(error).__name__}"
+                    turns.append(
+                        {
+                            "turn_number": turn_number,
+                            "binding_id": binding["binding_id"],
+                            "status": "FAILED",
+                            "reason": reason,
+                            "input_event_id": current_delta.get("room_event_id"),
+                            "output_event_id": None,
+                        }
+                    )
+                    break
+                provider_status = str(provider_result.get("status") or "COMPLETED").upper()
+                if provider_status in {"CANCELLED", "INTERRUPTED", "ABORTED"}:
+                    status = "INTERRUPTED"
+                    reason = str(provider_result.get("reason") or provider_status)
+                    turns.append(
+                        {
+                            "turn_number": turn_number,
+                            "binding_id": binding["binding_id"],
+                            "status": "INTERRUPTED",
+                            "reason": reason,
+                            "input_event_id": current_delta.get("room_event_id"),
+                            "output_event_id": None,
+                        }
+                    )
+                    break
+                if provider_status in {"FAILED", "ERROR", "REJECTED"}:
+                    status = "FAILED"
+                    reason = str(provider_result.get("reason") or provider_status)
+                    turns.append(
+                        {
+                            "turn_number": turn_number,
+                            "binding_id": binding["binding_id"],
+                            "status": "FAILED",
+                            "reason": reason,
+                            "input_event_id": current_delta.get("room_event_id"),
+                            "output_event_id": None,
+                        }
+                    )
+                    break
+                body = provider_result.get("body_text") or provider_result.get("text")
+                if not isinstance(body, str) or not body.strip():
+                    status = "FAILED"
+                    reason = "PROVIDER_OUTPUT_MISSING"
+                    turns.append(
+                        {
+                            "turn_number": turn_number,
+                            "binding_id": binding["binding_id"],
+                            "status": "FAILED",
+                            "reason": reason,
+                            "input_event_id": current_delta.get("room_event_id"),
+                            "output_event_id": None,
+                        }
+                    )
+                    break
+                try:
+                    output_message = self.store.post_message(
+                        room["room_id"],
+                        {
+                            "author_role": "MODEL",
+                            "author_binding_id": binding["binding_id"],
+                            "body_text": body,
+                            "idempotency_key": f"meeting:{meeting_run_id}:turn:{turn_number}",
+                            "provider_event_id": provider_result.get("provider_event_id"),
+                            "correlation_id": meeting_run_id,
+                        },
+                    )
+                except Exception as error:
+                    status = "FAILED"
+                    reason = f"ROOM_OUTPUT_ERROR:{type(error).__name__}"
+                    turns.append(
+                        {
+                            "turn_number": turn_number,
+                            "binding_id": binding["binding_id"],
+                            "status": "FAILED",
+                            "reason": reason,
+                            "input_event_id": current_delta.get("room_event_id"),
+                            "output_event_id": None,
+                        }
+                    )
+                    break
+                current_delta = output_message
+                turns.append(
+                    {
+                        "turn_number": turn_number,
+                        "binding_id": binding["binding_id"],
+                        "status": "COMPLETED",
+                        "reason": "NONE",
+                        "input_event_id": turn["delta"].get("room_event_id"),
+                        "output_event_id": output_message["room_event_id"],
+                    }
+                )
+        finally:
+            self._clear_cancel(meeting_run_id)
+        finished_at = utc_now()
+        summary = {
+            "schema": MEETING_SUMMARY_SCHEMA,
+            "run_id": meeting_run_id,
+            "room_id": room["room_id"],
+            "status": status,
+            "reason": reason,
+            "started_at": started_at,
+            "completed_at": finished_at,
+            "max_turns": bounded_turns,
+            "turn_count": len(turns),
+            "round_count": (len(turns) + len(models) - 1) // len(models),
+            "participant_order": [item["binding_id"] for item in models],
+            "turns": turns,
+            "delivery_mode": "INCREMENTAL_DELTA_ONLY",
+            "transcript_forwarded": False,
+            "cancel_policy": "TURN_BOUNDARY_FAIL_CLOSED",
+            "bounded": True,
+            "last_event_id": current_delta.get("room_event_id") if current_delta else None,
+        }
+        recorded = self.store.record_control_event(
+            room["room_id"], "MEETING_SUMMARY", {**summary}
+        )
+        return {
+            **summary,
+            "summary_event_id": recorded["event_id"],
+        }
+
+    def summary(self, room_id: str, run_id: str) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        target = _text(run_id, "run_id", limit=120)
+        events = self.store.list_control_events(
+            rid, event_type="MEETING_SUMMARY", limit=500
+        )
+        for event in reversed(events):
+            payload = event.get("payload")
+            if isinstance(payload, dict) and payload.get("run_id") == target:
+                return {
+                    **payload,
+                    "summary_event_id": event.get("event_id"),
+                }
+        raise MultiRoomError(
+            "MEETING_SUMMARY_NOT_FOUND",
+            "meeting summary does not exist",
+            404,
+        )

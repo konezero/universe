@@ -6,10 +6,14 @@ Seed revisions, Bench observations, or Career promotions.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping
 
 MEMORY_SCHEMA = "universe.project-memory.v1"
+MEMORY_RAG_BATCH_SCHEMA = "universe.project-memory-rag-batch.v1"
 MEMORY_STATES = frozenset({"BRAINSTORM", "OBSERVED", "QUESTION", "DECISION_NOTE"})
 MEMORY_LINK_STATES = frozenset({"UNLINKED", "LINKED", "PROPOSED"})
 MEMORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -21,6 +25,207 @@ class MemoryError(ValueError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _utc_now() -> str:
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
+
+
+def _redacted_memory_index(memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only stable identifiers/state for provenance hashing."""
+
+    return sorted(
+        [
+            {
+                "memory_id": str(item.get("memory_id") or ""),
+                "link_state": str(item.get("link_state") or "UNKNOWN").upper(),
+            }
+            for item in memories
+            if item.get("memory_id")
+        ],
+        key=lambda item: item["memory_id"],
+    )
+
+
+def _redacted_node_index(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only stable node coordinates; labels and source text are omitted."""
+
+    return sorted(
+        [
+            {
+                "node_id": str(item.get("node_id") or item.get("id") or ""),
+                "kind": str(item.get("kind") or "functional"),
+            }
+            for item in nodes
+            if item.get("node_id") or item.get("id")
+        ],
+        key=lambda item: item["node_id"],
+    )
+
+
+def run_nightly_memory_rag_batch(
+    *,
+    project_id: str,
+    memory_loader: Callable[[], list[dict[str, Any]]],
+    node_loader: Callable[[], list[dict[str, Any]]],
+    proposal_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+    scorer: str = "AUTO",
+    limit: int = 20,
+    per_memory: int = 1,
+    min_score: int = 1,
+    source_ref: str = "service://universe/memory-rag/nightly",
+    observed_at: str | None = None,
+) -> dict[str, Any]:
+    """Run a redacted, service-callable nightly Memory RAG proposal batch.
+
+    The loaders are deliberately callback-based so a service can supply its
+    current project projections without this module acquiring a database or a
+    provider client. Only deterministic/heuristic local scoring is performed;
+    no prompt, source body, command, or raw loader payload is returned or sent
+    to ``proposal_sink``.
+    """
+
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise MemoryError("MEMORY_RAG_PROJECT_INVALID", "project_id is required")
+    if not callable(memory_loader) or not callable(node_loader):
+        raise MemoryError(
+            "MEMORY_RAG_LOADER_INVALID",
+            "memory_loader and node_loader must be callable",
+        )
+    if proposal_sink is not None and not callable(proposal_sink):
+        raise MemoryError("MEMORY_RAG_SINK_INVALID", "proposal_sink must be callable")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise MemoryError("MEMORY_RAG_LIMIT_INVALID", "limit must be between 1 and 100")
+    if (
+        isinstance(per_memory, bool)
+        or not isinstance(per_memory, int)
+        or not 1 <= per_memory <= 5
+    ):
+        raise MemoryError(
+            "MEMORY_RAG_PER_MEMORY_INVALID",
+            "per_memory must be between 1 and 5",
+        )
+    if (
+        isinstance(min_score, bool)
+        or not isinstance(min_score, int)
+        or not 1 <= min_score <= 50
+    ):
+        raise MemoryError(
+            "MEMORY_RAG_MIN_SCORE_INVALID",
+            "min_score must be between 1 and 50",
+        )
+    normalized_scorer = str(scorer or "AUTO").strip().upper()
+    if normalized_scorer not in {"AUTO", "DETERMINISTIC", "HEURISTIC"}:
+        raise MemoryError(
+            "MEMORY_RAG_SCORER_INVALID",
+            "nightly scorer must be AUTO, DETERMINISTIC, or HEURISTIC",
+        )
+    memories = memory_loader()
+    nodes = node_loader()
+    if not isinstance(memories, list) or not all(isinstance(item, dict) for item in memories):
+        raise MemoryError("MEMORY_RAG_MEMORY_PAYLOAD_INVALID", "memory_loader must return objects")
+    if not isinstance(nodes, list) or not all(isinstance(item, dict) for item in nodes):
+        raise MemoryError("MEMORY_RAG_NODE_PAYLOAD_INVALID", "node_loader must return objects")
+    memory_index = _redacted_memory_index(memories)
+    node_index = _redacted_node_index(nodes)
+    memory_set_digest = _digest(memory_index)
+    node_set_digest = _digest(node_index)
+    effective_scorer = (
+        "HEURISTIC_WEIGHTED"
+        if normalized_scorer in {"AUTO", "HEURISTIC"}
+        else "DETERMINISTIC_TOKEN_OVERLAP"
+    )
+    if effective_scorer == "HEURISTIC_WEIGHTED":
+        proposals = propose_node_links_heuristic(
+            memories=memories,
+            nodes=nodes,
+            limit=limit,
+        )
+    else:
+        proposals = propose_node_links(
+            memories=memories,
+            nodes=nodes,
+            limit=limit,
+        )
+    selected = select_best_proposals(
+        proposals,
+        per_memory=per_memory,
+        min_score=min_score,
+    )
+    selected = selected[:limit]
+    safe_observed_at = observed_at or _utc_now()
+    if not isinstance(safe_observed_at, str) or not safe_observed_at.strip():
+        raise MemoryError("MEMORY_RAG_OBSERVED_AT_INVALID", "observed_at must be text")
+    source_digest = _digest(str(source_ref))
+    proposal_digest = _digest(selected)
+    batch_key = {
+        "project_id": project_id.strip(),
+        "memory_set_digest": memory_set_digest,
+        "node_set_digest": node_set_digest,
+        "proposal_digest": proposal_digest,
+        "scorer": effective_scorer,
+        "observed_at": safe_observed_at,
+    }
+    batch_id = "memory_rag_batch_" + _digest(batch_key)[:24]
+    record: dict[str, Any] = {
+        "schema": MEMORY_RAG_BATCH_SCHEMA,
+        "status": "MEMORY_RAG_PROPOSAL_BATCH_READY",
+        "batch_id": batch_id,
+        "project_ref": f"project://{project_id.strip()}",
+        "observed_at": safe_observed_at,
+        "scorer": effective_scorer,
+        "proposal_count": len(selected),
+        "proposals": selected,
+        "provenance": {
+            "source_digest": source_digest,
+            "memory_set_digest": memory_set_digest,
+            "node_set_digest": node_set_digest,
+            "proposal_digest": proposal_digest,
+            "raw_inputs": "NOT_RETAINED",
+            "raw_prompts": "NOT_RETAINED",
+            "raw_source": "NOT_RETAINED",
+            "raw_commands": "NOT_RETAINED",
+        },
+        "effects": {
+            "memory_write": "NONE",
+            "seed_write": "NONE",
+            "candidate_write": "NONE",
+            "authority": "NONE",
+        },
+    }
+    if proposal_sink is not None:
+        try:
+            sink_result = proposal_sink(record)
+        except Exception as error:  # preserve service boundary and redaction
+            raise MemoryError(
+                "MEMORY_RAG_SINK_FAILED",
+                f"proposal sink failed: {type(error).__name__}",
+            ) from error
+        record["sink"] = {
+            "status": "ACCEPTED",
+            "result_digest": _digest(sink_result),
+        }
+    else:
+        record["sink"] = {"status": "NOT_CONFIGURED"}
+    record["record_digest"] = _digest(
+        {key: value for key, value in record.items() if key != "record_digest"}
+    )
+    return record
 
 
 def _text(value: Any, field: str, *, max_len: int = 4000) -> str:

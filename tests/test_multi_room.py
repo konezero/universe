@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -15,6 +16,7 @@ from session_supervisor import SessionSupervisorStore  # noqa: E402
 from universe_multi_room import (  # noqa: E402
     MultiRoomDeliveryCoordinator,
     MultiRoomError,
+    MultiRoomMeetingCoordinator,
     MultiRoomNativeControlRegistry,
     MultiRoomStore,
 )
@@ -107,6 +109,152 @@ class MultiRoomStoreTests(unittest.TestCase):
         messages = self.store.list_messages(room_id)
         self.assertEqual(1, len(messages))
         self.assertEqual("USER", messages[0]["author_role"])
+
+    def test_round_robin_meeting_is_bounded_and_incremental(self) -> None:
+        created = self.store.create_meeting_room(
+            {
+                "title": "Bounded round robin",
+                "topic": "delta delivery",
+                "models": [
+                    {"provider": "CODEX", "display_name": "Codex"},
+                    {"provider": "CLAUDE", "display_name": "Claude"},
+                ],
+            }
+        )
+        room_id = created["room"]["room_id"]
+        model_bindings = sorted(
+            [
+                binding
+                for binding in self.store.list_bindings(room_id)
+                if binding["slot_role"] == "MODEL"
+            ],
+            key=lambda item: (item["created_at"], item["binding_id"]),
+        )
+        received: list[dict[str, object]] = []
+
+        def invoke(binding, turn):
+            received.append(
+                {
+                    "binding_id": binding["binding_id"],
+                    "turn_number": turn["turn_number"],
+                    "delta": turn["delta"]["body_text"],
+                    "has_messages": "messages" in turn,
+                    "transcript_forwarded": turn["transcript_forwarded"],
+                }
+            )
+            return {
+                "status": "COMPLETED",
+                "body_text": f"delta-{turn['turn_number']}",
+                "provider_event_id": f"provider-event-{turn['turn_number']}",
+            }
+
+        coordinator = MultiRoomMeetingCoordinator(self.store, invoke)
+        summary = coordinator.run(
+            room_id,
+            prompt="seed question",
+            max_turns=5,
+            run_id="meeting-delta-1",
+        )
+
+        self.assertEqual("COMPLETED", summary["status"])
+        self.assertEqual(5, summary["turn_count"])
+        self.assertEqual("TURN_BOUNDARY_FAIL_CLOSED", summary["cancel_policy"])
+        self.assertEqual(
+            [
+                model_bindings[index % len(model_bindings)]["binding_id"]
+                for index in range(5)
+            ],
+            [item["binding_id"] for item in received],
+        )
+        self.assertEqual(
+            [
+                "seed question",
+                "delta-0",
+                "delta-1",
+                "delta-2",
+                "delta-3",
+            ],
+            [item["delta"] for item in received],
+        )
+        self.assertTrue(all(not item["has_messages"] for item in received))
+        self.assertTrue(all(item["transcript_forwarded"] is False for item in received))
+        self.assertEqual(
+            summary,
+            coordinator.summary(room_id, "meeting-delta-1"),
+        )
+        control_events = self.store.list_control_events(room_id)
+        self.assertEqual(
+            1,
+            len(
+                [
+                    event
+                    for event in control_events
+                    if event["event_type"] == "MEETING_SUMMARY"
+                ]
+            ),
+        )
+
+    def test_round_robin_meeting_cancels_at_turn_boundary(self) -> None:
+        room_id = self.store.create_meeting_room(
+            {
+                "title": "Cancelable meeting",
+                "models": [{"provider": "GROK", "display_name": "Grok"}],
+            }
+        )["room"]["room_id"]
+        calls: list[int] = []
+
+        def invoke(_binding, turn):
+            calls.append(int(turn["turn_number"]))
+            return {"status": "COMPLETED", "body_text": "next delta"}
+
+        coordinator = MultiRoomMeetingCoordinator(self.store, invoke)
+        cancellation = coordinator.cancel("meeting-cancel-1", reason="user stop")
+        self.assertEqual("MEETING_CANCEL_REQUESTED", cancellation["status"])
+        summary = coordinator.run(
+            room_id,
+            prompt="cancel before provider call",
+            max_turns=4,
+            run_id="meeting-cancel-1",
+        )
+        self.assertEqual("INTERRUPTED", summary["status"])
+        self.assertEqual("user stop", summary["reason"])
+        self.assertEqual("TURN_BOUNDARY_FAIL_CLOSED", summary["cancel_policy"])
+        self.assertEqual(0, summary["turn_count"])
+        self.assertEqual([], calls)
+
+    def test_round_robin_meeting_allows_only_one_active_run_per_room(self) -> None:
+        room_id = self.store.create_meeting_room(
+            {
+                "title": "Single flight",
+                "models": [{"provider": "CODEX", "display_name": "Codex"}],
+            }
+        )["room"]["room_id"]
+        entered = threading.Event()
+        release = threading.Event()
+
+        def invoke(_binding, _turn):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return {"status": "COMPLETED", "body_text": "done"}
+
+        coordinator = MultiRoomMeetingCoordinator(self.store, invoke)
+        result: list[dict[str, object]] = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                coordinator.run(room_id, prompt="first", max_turns=1)
+            )
+        )
+        worker.start()
+        self.assertTrue(entered.wait(2))
+        try:
+            with self.assertRaises(MultiRoomError) as context:
+                coordinator.run(room_id, prompt="second", max_turns=1)
+            self.assertEqual("MEETING_ROOM_BUSY", context.exception.code)
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual("COMPLETED", result[0]["status"])
 
     def test_room_events_are_monotonic_and_provider_events_are_idempotent(self) -> None:
         room = self.store.create_meeting_room(

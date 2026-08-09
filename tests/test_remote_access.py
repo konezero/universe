@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from remote_access import RemoteAccessError, RemoteAccessStore  # noqa: E402
 from universe_remote_gateway import (  # noqa: E402
     GatewayError,
+    SESSION_COOKIE,
     _validate_listen_host,
     create_gateway,
 )
@@ -158,7 +159,8 @@ class RemoteGatewayTests(unittest.TestCase):
         self.gateway_thread.start()
         gateway_host, gateway_port = self.gateway.server_address[:2]
         self.endpoint = f"http://{gateway_host}:{gateway_port}"
-        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.cookie_jar = CookieJar()
+        self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
         self.user_agent = "UniverseMobileTest/1"
 
     def tearDown(self) -> None:
@@ -261,6 +263,95 @@ class RemoteGatewayTests(unittest.TestCase):
             self.assertEqual(HTTPStatus.UNAUTHORIZED, raised.exception.code)
         finally:
             raised.exception.close()
+
+    def test_gateway_reports_host_offline_when_fixed_upstream_is_unreachable(self) -> None:
+        self.upstream_state.write_text(
+            json.dumps(
+                {
+                    "endpoint": "http://127.0.0.1:9",
+                    "database": str(self.database),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self._open(
+            Request(self.endpoint + "/_universe/health", method="GET")
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(HTTPStatus.OK, response.status)
+        self.assertEqual("HOST_OFFLINE", payload["status"])
+        self.assertEqual("LOOPBACK_FIXED", payload["upstream"])
+
+    def test_gateway_fails_closed_for_non_loopback_upstream_state(self) -> None:
+        self.upstream_state.write_text(
+            json.dumps(
+                {
+                    "endpoint": "http://203.0.113.10:18443",
+                    "database": str(self.database),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self._open(
+            Request(self.endpoint + "/_universe/health", method="GET")
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual("HOST_OFFLINE", payload["status"])
+
+    def test_proxy_does_not_forward_browser_credentials_or_proxy_headers(self) -> None:
+        invitation = self.store.create_pairing(
+            public_base_url=self.endpoint, ttl_seconds=600
+        )
+        form = urlencode(
+            {"code": invitation["code"], "device_name": "Header test"}
+        ).encode("utf-8")
+        with self._open(
+            Request(
+                self.endpoint + "/pair/request",
+                data=form,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        ):
+            pass
+        pending = self.store.snapshot()["pairings"][0]
+        self.store.decide_pairing(pending["pairing_id"], approve=True)
+        with self._open(
+            Request(
+                self.endpoint + f"/pair/status?id={pending['pairing_id']}",
+                method="GET",
+            )
+        ):
+            pass
+
+        session_token = next(
+            cookie.value
+            for cookie in self.cookie_jar
+            if cookie.name == SESSION_COOKIE
+        )
+
+        with self._open(
+            Request(
+                self.endpoint + "/",
+                method="GET",
+                headers={
+                    "Authorization": "Bearer local-secret",
+                    "Cookie": f"{SESSION_COOKIE}={session_token}; local-token=secret",
+                    "X-Forwarded-Host": "attacker.invalid",
+                    "X-Forwarded-For": "203.0.113.10",
+                },
+            )
+        ) as response:
+            self.assertIn(b"Universe upstream", response.read())
+
+        observed = _UpstreamHandler.observed_headers
+        self.assertNotIn("Authorization", observed)
+        self.assertNotIn("Cookie", observed)
+        self.assertNotIn("X-Forwarded-Host", observed)
+        self.assertNotIn("X-Forwarded-For", observed)
+        self.assertNotEqual("attacker.invalid", observed.get("Host"))
 
     def test_listen_host_rejects_public_and_wildcard_addresses(self) -> None:
         self.assertEqual("127.0.0.1", _validate_listen_host("127.0.0.1"))

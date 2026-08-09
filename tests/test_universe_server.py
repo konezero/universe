@@ -28,7 +28,10 @@ JsonObject = dict[str, Any]
 
 from core_release import build_release  # noqa: E402
 from host_profile import HostProfileStore  # noqa: E402
-from project_master_host import ProjectTaskProposalAdapter  # noqa: E402
+from project_master_host import (  # noqa: E402
+    ProjectMasterHostError,
+    ProjectTaskProposalAdapter,
+)
 from project_seed_assets import materialize_project_seed_assets  # noqa: E402
 from universe_server import (  # noqa: E402
     ConductorPermissionBridge,
@@ -3115,6 +3118,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertNotIn("authority", prepared["session_connection"])
         self.assertNotIn("currentness", prepared["session_connection"])
+
+    def test_project_master_prepare_reports_runtime_update_requirement(self) -> None:
+        class MissingRuntimeBindingManager:
+            @staticmethod
+            def is_resident(_project_id: str) -> bool:
+                return False
+
+            @staticmethod
+            def ensure(_project: dict[str, object]) -> dict[str, object]:
+                raise ProjectMasterHostError(
+                    "PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE"
+                )
+
+            @staticmethod
+            def close() -> None:
+                return
+
+        self.request("POST", "/v1/projects/register", self.registration())
+        self.server.project_master_hosts = MissingRuntimeBindingManager()
+
+        status, response = self.request(
+            "POST",
+            "/v1/projects/GCS/master-session/prepare",
+            {},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("ERROR", response["status"])
+        self.assertEqual("PROJECT_RUNTIME_UPDATE_REQUIRED", response["error_code"])
+        self.assertIn("install or update", response["detail"])
 
     def test_conductor_room_persists_fresh_project_draft_action(self) -> None:
         message, created = self.server.store.create_conductor_room_message(

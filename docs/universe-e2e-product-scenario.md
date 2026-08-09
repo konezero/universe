@@ -327,6 +327,35 @@ python -m pytest tests/test_universe_e2e_product_scenario.py -q
 apply (that Host path remains a live `check` criterion). `check` requires a
 READY local service and reports PASS/FAIL per step for the GCS line.
 
+## Fresh-clone verification companion
+
+Before a project Master or Task Frame is prepared for a fresh clone, callers
+may run the read-only install preflight:
+
+```powershell
+python tools/project_install_flow.py preflight `
+  --project-root C:\workspace\GCS `
+  --project-id GCS `
+  --source-commit <full-ai-career-commit>
+```
+
+The result must be `PROJECT_INSTALL_PLAN_READY`, with `state: PLAN_READY` and
+`candidate_execution: FORBIDDEN`. The command does not create `.ai`, start a
+Runtime, or invoke a provider. `PROJECT_STANDALONE` is an explicit opt-in;
+the default is `UNIVERSE_ATTACHED` with `prefer_boot: HOST`.
+
+The caller then passes the exact `plan_digest` to a lifecycle adapter. The
+adapter, not Universe, performs `OS_INSTALL`/`OS_UPDATE`. The adapter must
+return the exact target, operation, install mode, immutable `ai-career`
+source commit, managed paths, and `READY_FOR_BOOT`. Universe verifies the
+installed `.ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json`, the
+required companion artifacts, the live source commit, and preservation of
+pre-existing project files before reporting `PROJECT_INSTALL_READY_FOR_BOOT`.
+
+Any missing artifact, stale plan, partial `.ai`, source mismatch, unmanaged
+local-file change, or adapter response that merely claims READY is a blocked
+result. No provider credentials or network access are part of this scenario.
+
 ## Related documents
 
 - `docs/local-universe-service.md` — service, register, inbox, dispatch APIs

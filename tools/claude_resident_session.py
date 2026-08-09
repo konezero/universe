@@ -254,6 +254,7 @@ class ClaudeResidentSession:
         permission_mcp_config: Path | None = None,
         permission_bridge: Any | None = None,
         permission_ready: Callable[[], bool] | None = None,
+        permission_failure: Callable[[], None] | None = None,
         process_factory: Callable[..., ClaudeStreamProcess] | None = None,
     ) -> None:
         self.permission_mcp_config = permission_mcp_config
@@ -261,6 +262,7 @@ class ClaudeResidentSession:
         # Blocks until the MCP permission server has registered. A turn must
         # not start before the approval path exists.
         self.permission_ready = permission_ready
+        self.permission_failure = permission_failure
         self.executable = executable
         self.cwd = cwd
         self.environment = dict(environment)
@@ -378,13 +380,18 @@ class ClaudeResidentSession:
             # Never spin a retry loop against a spent quota.
             raise ClaudeResidentError("CLAUDE_QUOTA_EXHAUSTED")
         self._set_state(SESSION_CONNECTING)
-        self._process = self._process_factory(
-            executable=self.executable,
-            arguments=self._arguments(),
-            cwd=self.cwd,
-            environment=self.environment,
-            event_handler=self._handle_event,
-        )
+        try:
+            self._process = self._process_factory(
+                executable=self.executable,
+                arguments=self._arguments(),
+                cwd=self.cwd,
+                environment=self.environment,
+                event_handler=self._handle_event,
+            )
+        except Exception:
+            self._abort_permission_path()
+            self._set_state(SESSION_FAILED)
+            raise
         self._launch_count += 1
         self._set_state(SESSION_READY)
         return self.session_status()
@@ -408,6 +415,7 @@ class ClaudeResidentSession:
             self._turn_text = []
             if self.permission_ready is not None and not self.permission_ready():
                 # No approval path yet: refuse rather than run unguarded.
+                self._abort_permission_path()
                 self._set_state(SESSION_FAILED)
                 raise ClaudeResidentError("CLAUDE_PERMISSION_MCP_NOT_REGISTERED")
             self._turn_error = None
@@ -494,6 +502,16 @@ class ClaudeResidentSession:
             raise ClaudeResidentError(f"CLAUDE_SESSION_STATE_INVALID:{state}")
         with self._state_lock:
             self._state = state
+
+    def _abort_permission_path(self) -> None:
+        if self.permission_failure is not None:
+            try:
+                self.permission_failure()
+            except Exception:
+                pass
+        process, self._process = self._process, None
+        if process is not None:
+            process.close()
 
     def _observe_session(self, value: Any) -> None:
         if not isinstance(value, str) or not value.strip():

@@ -265,6 +265,40 @@ or `.ai/`, starts a Runtime, or consumes an approval. Its result is one of:
 The full product alias may later add explicit `ensure-host` and approved apply
 steps, but it must retain this preflight boundary.
 
+### 5.1 Fresh-clone attach/install verification slice
+
+The fresh-clone path is an explicit state machine implemented by
+`tools/project_install_flow.py`:
+
+```text
+PREFLIGHT -> PLAN_READY -> APPLYING -> ARTIFACTS_VERIFIED -> READY_FOR_BOOT
+                                      \-> BLOCKED
+```
+
+`plan` and `preflight` are read-only. They require a full 40-character
+immutable `ai-career` source commit and inspect whether the project has no
+`.ai`, a managed installation, or a partial/invalid installation. A partial
+`.ai` surface produces `BLOCKED`; it is never silently overwritten.
+
+The apply function receives a caller-supplied lifecycle adapter. Universe does
+not create Runtime files. The adapter request carries the exact project root,
+install mode, operation (`OS_INSTALL` or `OS_UPDATE`), and immutable source
+commit. The adapter must return all of the following before the flow can claim
+`READY_FOR_BOOT`:
+
+- `result: PASS`, `repository_runtime: VERIFIED`, and the exact target root;
+- the exact install mode and operation;
+- the exact live `ai-career` source commit;
+- `boot_handoff.status: READY_FOR_BOOT`;
+- the managed path list used to protect pre-existing project files.
+
+The verifier then checks the installed Runtime manifest, project identity,
+source commit, required installation artifacts, and every pre-existing file
+outside the adapter-declared managed paths. A positive or false READY response
+from an adapter is rejected when any check fails. The adapter is responsible
+for the actual OS lifecycle mutation and remains the only component allowed to
+materialize `.ai`.
+
 ---
 
 ## 6. What lives where (fixed inventory)

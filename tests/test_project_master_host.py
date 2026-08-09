@@ -1243,6 +1243,27 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("Universe Project Room message", gateway.prompts[0])
         self.assertTrue(runtime.session_ref.startswith("claude-code:"))
 
+    def test_claude_runtime_cleans_mcp_config_when_resident_launch_fails(self) -> None:
+        runtime = ClaudeProjectMasterRuntime(self.root, "GCS", self.state)
+        runtime.set_permission_requester(lambda _request: "allow-once")
+        config_root = self.root / "claude-launch-failure"
+
+        with patch(
+            "project_master_host._resolve_claude",
+            return_value=(Path("claude.exe"), {}, "default"),
+        ), patch(
+            "project_master_host.tempfile.mkdtemp",
+            return_value=str(config_root),
+        ), patch(
+            "project_master_host.ClaudeResidentSession",
+            side_effect=RuntimeError("launch failed"),
+        ), self.assertRaises(RuntimeError):
+            runtime.prepare_session()
+
+        self.assertFalse(config_root.exists())
+        self.assertIsNone(runtime._permission_broker)
+        self.assertIsNone(runtime._mcp_config_root)
+
     def test_resident_provider_permission_requester_is_rebound_after_prepare(
         self,
     ) -> None:

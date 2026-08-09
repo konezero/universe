@@ -175,5 +175,35 @@ Still open:
   probes for every Provider.
 - Multi-Project publication dogfood with enough samples to evaluate local
   binding quality against external benchmark priors.
-- Desktop/mobile visual QA and accessibility pass for the Runtime Audit and
-  Worker Bench surfaces.
+- Accessibility semantics beyond the current desktop/mobile smoke pass.
+
+### 8) 2026-08-10 Conductor integration pass
+
+Completed locally:
+
+- Project Runtime DB P1 source implementation and fresh-install package
+  regression coverage.
+- Verified backup plus index-only `.ai` migration with explicit host
+  quiescence evidence and project-root-safe restore.
+- Fresh-clone `UNIVERSE_ATTACHED` / `PROJECT_STANDALONE` installation planning
+  with immutable ai-career source binding and false-READY rejection.
+- Claude one-time MCP configuration cleanup, including timeout, startup
+  failure, close, and transient Windows lock retry paths.
+- Bounded, delta-only meeting coordinator with turn-boundary cancellation,
+  durable summaries, and per-room single-flight enforcement.
+- Redacted service-callable Memory RAG batch foundation and local dogfood Skill
+  observation fixture.
+- Portable icon, release non-mutation, fixed-loopback upstream, HOST_OFFLINE,
+  and browser credential/header isolation tests.
+- Desktop live visual smoke: Session Observatory, Provider worker bindings,
+  Worker Bench, and chat/map layout rendered with no fresh-page console warning
+  or error. A 390 x 844 mobile viewport also rendered without page-level
+  horizontal overflow; responsive contract tests retain the regression guard.
+
+External or deliberately deferred:
+
+- Real Grok bounded-session probe while the provider quota is exhausted.
+- Long-running quota/restart recovery probes for every real Provider.
+- Live native-provider completion adapter for automatic meeting runs.
+- Gabia/VPS tunnel, public DNS/HTTPS, mobile Internet pairing, and signed
+  MSI/MSIX deployment.

@@ -1,0 +1,42 @@
+{
+  "candidate_id": "skill-observation-universe-dogfood-001",
+  "candidate": {
+    "schema": "ai-career.skill-observation-candidate.v1",
+    "project_ref": "project://GCS",
+    "task_frame_ref": "task-frame://universe/room-memory-bench-dogfood",
+    "source_ref": "local://universe/dogfood/skill-run-observation",
+    "observations": [
+      {
+        "observation_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "skill_binding_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "skill": {
+          "skill_id": "local.room-memory-review",
+          "skill_version": "0.1.0",
+          "operation_class": "READ",
+          "context_pack_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "model_ref": "provider://LOCAL/model/dogfood-fixture",
+        "outcome": "SUCCEEDED",
+        "validation_state": "PASS",
+        "evidence_refs": ["local://dogfood/evidence-001"],
+        "metrics": {
+          "duration_ms": 1,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cost_units": 0
+        },
+        "execution_context": {
+          "provider_ref": "LOCAL",
+          "worker_role": "QA",
+          "task_kind": "READ",
+          "node_ref": "room-memory-bench",
+          "failure_kind": "NONE",
+          "quota_state": "AVAILABLE"
+        }
+      }
+    ],
+    "observed_at": "2026-08-10T00:00:00Z",
+    "target_ref": "universe://local/project-queue",
+    "redaction_state": "REDACTED"
+  }
+}
