@@ -3937,23 +3937,14 @@ def _required_markers(manifest: Mapping[str, Any]) -> dict[str, list[str]]:
             "Schema: ai-career.project-runtime-version.v1",
             f"Package Schema: {DISTRIBUTION_SCHEMA}",
         ],
+        # Runtime-owned state is preserved across a managed update. Its values
+        # may be initial UNKNOWN markers or a Host-projected active session.
+        # Shape and coordinate validation below cover both valid states.
         ".ai/runtime/state/session.md": [
             "Schema: ai-career.project-runtime-session.v1",
-            "Entered At: UNKNOWN",
-            "Observed At: UNKNOWN",
-            "State Updated At: UNKNOWN",
-            "Validated At: UNKNOWN",
-            "Mode Current Anchor: UNKNOWN",
-            "Mode Registry Revision: UNKNOWN",
-            "Mode Registry Digest: UNKNOWN",
-            "Mode Definition Digest: UNKNOWN",
         ],
         ".ai/runtime/state/current_anchor_frame.md": [
             "Schema: ai-career.project-runtime-current-frame.v1",
-            "Entered At: UNKNOWN",
-            "Observed At: UNKNOWN",
-            "State Updated At: UNKNOWN",
-            "Validated At: UNKNOWN",
         ],
     }
     for path in MANAGED_OVERLAY_PATHS:
@@ -4403,7 +4394,10 @@ def _validate_target(target_root: Path, *, write_evidence: bool) -> dict[str, An
             coordinate_failures.append("initialized session marker")
         if frame_id != "current":
             coordinate_failures.append("active frame id")
-        if currentness_key != f"{session_id} + current":
+        if currentness_key not in {
+            f"{session_id}+current",
+            f"{session_id} + current",
+        }:
             coordinate_failures.append("active currentness key")
         if state_origin not in {
             "current_session",

@@ -24,11 +24,18 @@ write authority.
   implementation-graph.json
   bindings.json
   documents.json
+  TODO_TRACKING_POLICY.md   # from this template; work queue = Todo DB
 ```
 
-`manifest.json` binds the four payload digests. The five files are one
-project-owned revision and must be prepared together. A partial set is not a
-published Project Seed.
+`manifest.json` binds the four payload digests. The five graph/catalog files
+are one project-owned Seed revision and must be prepared together. A partial
+set is not a published Project Seed.
+
+`TODO_TRACKING_POLICY.md` is **policy plant** (not part of the five-file Seed
+digest). Delivered from **this Career template** on attach/install. Rule:
+Universe Todo = **host** ops/execution queue for the attach; project-local
+work boards stay valid for product work; docs = reference only. See the file
+in this folder for the full rule.
 
 ## Graph Separation
 

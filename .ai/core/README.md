@@ -2,7 +2,7 @@
 
 Schema: ai-career.project-runtime-core-index.v1
 Node: universe
-Source Commit: 9179f4fba1cfad938d1b3464c51c1a2a6819d1ba
+Source Commit: 89ec0e0e3b2460d2e8f6560b3dae030be648f52b
 
 ## Entry
 
@@ -39,8 +39,10 @@ Source Commit: 9179f4fba1cfad938d1b3464c51c1a2a6819d1ba
 - `.ai/templates/universe_connection/README.md`
 - `.ai/templates/universe_node_memory/README.md`
 - `.ai/templates/universe_project_seed/README.md`
+- `.ai/templates/universe_project_seed/TODO_TRACKING_POLICY.md`
 - `.ai/templates/worker_resume_archive/README.md`
 - `.ai/universe/README.md`
+- `.ai/universe/TODO_TRACKING_POLICY.md`
 
 ### core_runtime
 - `.ai/core/AI_CORE.md`
@@ -133,6 +135,7 @@ Source Commit: 9179f4fba1cfad938d1b3464c51c1a2a6819d1ba
 - `.ai/skills/common/conversation-recall/SKILL.md`
 - `.ai/skills/common/execution-binding/SKILL.md`
 - `.ai/skills/common/execution-guard/SKILL.md`
+- `.ai/skills/common/governance-bootstrap/SKILL.md`
 - `.ai/skills/common/host-state-projection/SKILL.md`
 - `.ai/skills/common/master-mode-registry/SKILL.md`
 - `.ai/skills/common/memory-sync/SKILL.md`

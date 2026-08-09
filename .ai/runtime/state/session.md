@@ -20,6 +20,13 @@ Mode Registry Revision: 4
 Mode Registry Digest: 2f4cb7e4c57a78a71593308f89a86e5afbe0f4398c803cf7a2cbe9b2d9c5c8ac
 Mode Definition Digest: d0b1c16a204b26ba66d8b599f92ba05aeceac148553dc8622254e4899c46d730
 Executable Runtime Currentness: CURRENT
+Provider Session Greeting Required: UNKNOWN
+Provider Session Persistence: UNKNOWN
+Provider Session Authority: UNKNOWN
+Execution Host Binding: UNKNOWN
+Write Target Ref: UNKNOWN
+Write Target Capability: UNKNOWN
+Write Target Binding: UNKNOWN
 Last Provider: GROK
 Requested Mode: MASTER
 Interaction Carrier: grok-cli

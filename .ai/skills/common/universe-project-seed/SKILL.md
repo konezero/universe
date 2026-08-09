@@ -16,7 +16,20 @@ The canonical asset contract is installed at:
 
 ```text
 .ai/templates/universe_project_seed/README.md
+.ai/templates/universe_project_seed/TODO_TRACKING_POLICY.md
 ```
+
+`TODO_TRACKING_POLICY.md` is a **policy plant** (not one of the five Seed digest
+payloads). On OS_INSTALL / project-runtime distribution it ships with the
+`universe_project_seed` template and should land at:
+
+```text
+.ai/universe/TODO_TRACKING_POLICY.md
+```
+
+Rule: Universe `project_todo` is the **host** operational/execution queue for
+this attach — not a replacement for the project’s own product work board.
+Docs are references only; see `TODO_TRACKING_POLICY.md`.
 
 ## Inputs
 
