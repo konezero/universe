@@ -365,6 +365,17 @@ def restart_service(
 ) -> dict[str, Any]:
     path = state_path or default_state_path()
     stop_result = stop_service(path)
+    stop_status = str(stop_result.get("status") or "")
+    if stop_status not in {"STOPPED", "ALREADY_STOPPED"}:
+        return {
+            "schema": "universe.local-service-control.v1",
+            "status": stop_status or "STOP_FAILED",
+            "stop": stop_result,
+            "start": {
+                "status": "NOT_ATTEMPTED",
+                "reason": "PREVIOUS_SERVICE_TERMINATION_UNCONFIRMED",
+            },
+        }
     start_result = start_service(
         state_path=path,
         database_path=database_path,

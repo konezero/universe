@@ -15,6 +15,7 @@ from universe_service_control import (  # noqa: E402
     load_state,
     pid_is_running,
     probe_health,
+    restart_service,
     service_status,
     start_service,
     stop_service,
@@ -200,6 +201,26 @@ class UniverseServiceControlTests(unittest.TestCase):
                     report = stop_service(path)
             self.assertEqual("STOP_FAILED", report["status"])
             self.assertFalse(report["destructive_fallback_performed"])
+
+    def test_restart_does_not_start_until_previous_process_is_stopped(self) -> None:
+        stop_result = {
+            "status": "STOP_TIMEOUT",
+            "current": {"pid": 42, "pid_running": True},
+        }
+        with mock.patch(
+            "universe_service_control.stop_service",
+            return_value=stop_result,
+        ):
+            with mock.patch("universe_service_control.start_service") as start:
+                result = restart_service()
+
+        self.assertEqual("STOP_TIMEOUT", result["status"])
+        self.assertEqual("NOT_ATTEMPTED", result["start"]["status"])
+        self.assertEqual(
+            "PREVIOUS_SERVICE_TERMINATION_UNCONFIRMED",
+            result["start"]["reason"],
+        )
+        start.assert_not_called()
 
 
 if __name__ == "__main__":
