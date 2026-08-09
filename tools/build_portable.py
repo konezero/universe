@@ -33,8 +33,11 @@ INCLUDE_FILES = (
     "REPOSITORY_MANIFEST.md",
     "AGENTS.md",
 )
-INCLUDE_AI_FILES = (
-    Path(".ai") / "runtime" / "project_instance" / "mode_registry.json",
+PORTABLE_GENERATED_FILES = (
+    (
+        Path("templates") / "universe-runtime" / "mode_registry.json",
+        Path(".ai") / "runtime" / "project_instance" / "mode_registry.json",
+    ),
 )
 SKIP_DIR_NAMES = {
     "__pycache__",
@@ -221,12 +224,13 @@ def build_portable(
         if src.is_file():
             shutil.copy2(src, package_root / name)
 
-    for rel in INCLUDE_AI_FILES:
-        src = ROOT / rel
-        if src.is_file():
-            dest = package_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
+    for source_rel, target_rel in PORTABLE_GENERATED_FILES:
+        src = ROOT / source_rel
+        if not src.is_file():
+            raise FileNotFoundError(f"portable source is missing: {source_rel}")
+        dest = package_root / target_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
 
     data_dir = package_root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)

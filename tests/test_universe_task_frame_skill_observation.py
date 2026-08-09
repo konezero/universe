@@ -11,6 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_ROOT = ROOT / ".ai" / "runtime"
+if not (RUNTIME_ROOT / "reference_runtime").is_dir():
+    raise unittest.SkipTest(
+        "installed Universe AI Workspace is required for Runtime integration tests"
+    )
 sys.path.insert(0, str(RUNTIME_ROOT))
 
 from reference_runtime.anchor_session_memory_adapter import (  # noqa: E402

@@ -97,9 +97,10 @@ class UniverseRuntimeHostLayoutTests(unittest.TestCase):
         self.assertNotIn('"powershell.exe"', host)
 
     def test_installed_codex_adapter_does_not_declare_universe_worker(self) -> None:
-        adapter = json.loads(
-            (ROOT / ".ai/adapters/codex/adapter.json").read_text(encoding="utf-8")
-        )
+        adapter_path = ROOT / ".ai/adapters/codex/adapter.json"
+        if not adapter_path.is_file():
+            self.skipTest("installed Universe AI Workspace is not present")
+        adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
         self.assertNotIn("task_frame_worker", adapter)
 
         removed = (

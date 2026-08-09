@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
 
+# Universe-managed local AI Workspace
+.ai/
+
 dist/portable/
 
