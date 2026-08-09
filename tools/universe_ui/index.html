@@ -52,17 +52,21 @@
 
       <div class="rail-block session-block">
         <div class="section-heading rail-subhead">
-          <span>Provider Chats</span>
+          <span>Sessions</span>
           <button id="session-observatory-button" class="icon-button compact" type="button" title="Manage sessions" aria-label="Manage sessions">&#8943;</button>
         </div>
         <div class="session-rail-filters">
-          <input id="session-rail-search" type="search" placeholder="Search chats" aria-label="Search provider chats">
+          <input id="session-rail-search" type="search" placeholder="Search sessions" aria-label="Search sessions">
           <label class="session-rail-worker-toggle" title="Show Task Frame workers">
             <input id="session-rail-show-workers" type="checkbox">
             <span>Workers</span>
           </label>
+          <label class="session-rail-worker-toggle" title="Show sessions hidden from the main rail">
+            <input id="session-rail-show-hidden" type="checkbox">
+            <span>Hidden</span>
+          </label>
         </div>
-        <div id="session-rail-list" class="session-rail-list" aria-label="Provider chats"></div>
+        <div id="session-rail-list" class="session-rail-list" aria-label="Universe sessions"></div>
         <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
     </aside>
@@ -545,7 +549,7 @@
       <div>
         <span class="inspector-kicker">Local Supervisor</span>
         <h2>Session Observatory</h2>
-        <p>One active 1:1 per node/mode by default — register, attach, and audit elsewhere.</p>
+        <p>Sessions keep one identity while their provider and Universe location change.</p>
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
     </div>
@@ -564,7 +568,7 @@
           <span id="session-observatory-summary">Loading sessions…</span>
           <label class="session-observatory-filter" title="Default shows one active 1:1 session per node/mode. Expand a card for older threads, or check this for the full Supervisor list including STOPPED.">
             <input id="observatory-show-all" type="checkbox" />
-            Show all (every session id, incl. STOPPED)
+            Show all sessions (including stopped)
           </label>
           <button id="cleanup-sessions-button" class="secondary-button" type="button" title="Remove DISCONNECTED/STOPPED sessions; LIVE kept. Re-register on boot/mode-change/inject.">
             Clean sessions

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -30,6 +31,9 @@ SOURCE_KINDS = {
 }
 METADATA_READ_LIMIT = 256 * 1024
 METADATA_LINE_LIMIT = 192
+DEFAULT_SCAN_BYTE_LIMIT = 256 * 1024
+DEFAULT_SCAN_EVENT_LIMIT = 512
+DEFAULT_SCAN_TIME_LIMIT_SECONDS = 0.25
 
 
 class ProviderSessionObserverError(ValueError):
@@ -140,15 +144,16 @@ def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
     """Read only provider identity metadata from a bounded JSONL prefix.
 
     Prompt, response, tool input, command, and message bodies are deliberately
-    ignored. Discovery remains advisory: malformed or rotating files fall back
-    to path-derived identity instead of breaking the chat catalog.
+    ignored. Discovery remains advisory, but identity never falls back to a
+    path or filename. Ambiguous sources stay unbound.
     """
     metadata: dict[str, Any] = {
-        "provider_session_id": path.parent.name if provider == "GROK" else path.stem,
+        "provider_session_id": None,
         "workspace": _workspace_fallback(provider, path),
         "display_name": None,
         "session_kind": "CHAT",
         "parent_provider_session_id": None,
+        "identity_state": "UNKNOWN",
     }
     consumed = 0
     try:
@@ -170,8 +175,9 @@ def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
                     metadata["provider_session_id"] = (
                         _safe_metadata_text(payload.get("id"), limit=256)
                         or _safe_metadata_text(payload.get("session_id"), limit=256)
-                        or metadata["provider_session_id"]
                     )
+                    if metadata["provider_session_id"]:
+                        metadata["identity_state"] = "VERIFIED"
                     metadata["workspace"] = (
                         _safe_metadata_text(payload.get("cwd")) or metadata["workspace"]
                     )
@@ -193,8 +199,9 @@ def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
                 if provider == "CLAUDE":
                     metadata["provider_session_id"] = (
                         _safe_metadata_text(event.get("sessionId"), limit=256)
-                        or metadata["provider_session_id"]
                     )
+                    if metadata["provider_session_id"]:
+                        metadata["identity_state"] = "VERIFIED"
                     metadata["workspace"] = (
                         _safe_metadata_text(event.get("cwd")) or metadata["workspace"]
                     )
@@ -209,7 +216,7 @@ def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
                     if (
                         metadata["workspace"]
                         and metadata["display_name"]
-                        and metadata["provider_session_id"] != path.stem
+                        and metadata["provider_session_id"]
                     ):
                         break
                 if provider == "GROK":
@@ -217,9 +224,9 @@ def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
                     if isinstance(params, Mapping):
                         metadata["provider_session_id"] = (
                             _safe_metadata_text(params.get("sessionId"), limit=256)
-                            or metadata["provider_session_id"]
                         )
-                        if metadata["provider_session_id"] != path.parent.name:
+                        if metadata["provider_session_id"]:
+                            metadata["identity_state"] = "VERIFIED"
                             break
     except OSError:
         pass
@@ -228,7 +235,7 @@ def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
     metadata["workspace_name"] = Path(workspace).name if workspace else "Unknown workspace"
     metadata["display_name"] = (
         _safe_metadata_text(metadata.get("display_name"), limit=160)
-        or metadata["workspace_name"]
+        or f"{provider.title()} session"
     )
     return metadata
 
@@ -337,6 +344,14 @@ class ProviderSessionObserverStore:
         source_id = str(value.get("source_id") or "source_" + uuid.uuid4().hex)
         provider_session_id = _identifier(value.get("provider_session_id"), "provider_session_id")
         source_version = _text(value.get("source_version", "v1"), "source_version")
+        start_at_end = value.get("start_at_end") is True
+        initial_offset = 0
+        initial_identity = None
+        initial_status = "REGISTERED"
+        if start_at_end and source_path.is_file():
+            initial_offset = source_path.stat().st_size
+            initial_identity = _file_identity(source_path)
+            initial_status = "ACTIVE"
         now = _now()
         with self._connection() as connection:
             existing = connection.execute(
@@ -357,8 +372,9 @@ class ProviderSessionObserverStore:
                 """
                 INSERT INTO provider_session_source(
                     source_id, provider, provider_session_id, source_path, source_kind,
-                    source_version, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'REGISTERED', ?, ?)
+                    source_version, file_identity, cursor_offset, status,
+                    last_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_id,
@@ -367,6 +383,10 @@ class ProviderSessionObserverStore:
                     str(source_path),
                     source_kind,
                     source_version,
+                    initial_identity,
+                    initial_offset,
+                    initial_status,
+                    now if start_at_end else None,
                     now,
                     now,
                 ),
@@ -428,6 +448,7 @@ class ProviderSessionObserverStore:
                     "parent_provider_session_id": metadata[
                         "parent_provider_session_id"
                     ],
+                    "identity_state": metadata["identity_state"],
                     "transcript_content": "EXCLUDED",
                 }
             )
@@ -510,7 +531,22 @@ class ProviderSessionObserverStore:
             "raw_transcript": "EXCLUDED",
         }
 
-    def scan(self, source_id: str) -> dict[str, Any]:
+    def scan(
+        self,
+        source_id: str,
+        *,
+        max_bytes: int = DEFAULT_SCAN_BYTE_LIMIT,
+        max_events: int = DEFAULT_SCAN_EVENT_LIMIT,
+        max_seconds: float = DEFAULT_SCAN_TIME_LIMIT_SECONDS,
+    ) -> dict[str, Any]:
+        if max_bytes <= 0 or max_events <= 0 or max_seconds <= 0:
+            raise ProviderSessionObserverError(
+                "SOURCE_REQUEST_INVALID", "scan limits must be positive"
+            )
+        max_bytes = min(max_bytes, 4 * 1024 * 1024)
+        max_events = min(max_events, 4096)
+        max_seconds = min(max_seconds, 2.0)
+        started = time.monotonic()
         with self._connection() as connection:
             source = connection.execute(
                 "SELECT * FROM provider_session_source WHERE source_id = ?", (source_id,)
@@ -534,6 +570,8 @@ class ProviderSessionObserverStore:
                     (identity, source_id),
                 )
             added = 0
+            scanned_bytes = 0
+            scanned_events = 0
             next_offset = offset
             try:
                 with path.open("rb") as handle:
@@ -543,7 +581,18 @@ class ProviderSessionObserverStore:
                         raw_line = handle.readline()
                         if not raw_line or not raw_line.endswith(b"\n"):
                             break
+                        if scanned_bytes + len(raw_line) > max_bytes:
+                            handle.seek(start)
+                            break
+                        if (
+                            scanned_events >= max_events
+                            or time.monotonic() - started >= max_seconds
+                        ):
+                            handle.seek(start)
+                            break
                         next_offset = handle.tell()
+                        scanned_bytes += len(raw_line)
+                        scanned_events += 1
                         try:
                             event = json.loads(raw_line.decode("utf-8"))
                         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -572,7 +621,63 @@ class ProviderSessionObserverStore:
             current = connection.execute(
                 "SELECT * FROM provider_session_source WHERE source_id = ?", (source_id,)
             ).fetchone()
-        return {"schema": OBSERVER_SCHEMA, "source": self._source_row(current), "added": added}
+        return {
+            "schema": OBSERVER_SCHEMA,
+            "source": self._source_row(current),
+            "added": added,
+            "bounded_read": {
+                "bytes": scanned_bytes,
+                "events": scanned_events,
+                "byte_limit": max_bytes,
+                "event_limit": max_events,
+            },
+        }
+
+    def discover_sessions(
+        self, provider: str, *, home: Path | None = None
+    ) -> list[dict[str, Any]]:
+        return [
+            self._public_discovery(item)
+            for item in self.discover_sources(provider, home=home)
+        ]
+
+    def identify_session(self, source_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM provider_session_source WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        if row is None:
+            raise ProviderSessionObserverError("SOURCE_NOT_FOUND", source_id)
+        return self._public_source_row(row)
+
+    def open_cursor(self, source_id: str) -> dict[str, Any]:
+        source = self.identify_session(source_id)
+        return {
+            "source_id": source_id,
+            "cursor": source["cursor"],
+            "status": source["status"],
+        }
+
+    def read_bounded(self, source_id: str, **limits: Any) -> dict[str, Any]:
+        result = self.scan(source_id, **limits)
+        return {
+            **result,
+            "source": self._public_source_row_from_mapping(result["source"]),
+        }
+
+    def project_activity(self, source_id: str) -> dict[str, Any]:
+        activities = self.list_activities(source_id)
+        latest = activities[0] if activities else None
+        return {
+            "source_id": source_id,
+            "activity_state": (latest or {}).get("activity_state") or "UNKNOWN",
+            "last_activity_at": (latest or {}).get("observed_at"),
+            "evidence_state": "OBSERVED" if latest else "UNKNOWN",
+        }
+
+    def reduce(self, source_id: str) -> dict[str, Any]:
+        return self.project_activity(source_id)
 
     def _reduce_event(
         self,
@@ -676,6 +781,65 @@ class ProviderSessionObserverStore:
             "reason": row["reason"],
             "last_seen_at": row["last_seen_at"],
             "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _public_source_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": SOURCE_SCHEMA,
+            "source_id": row["source_id"],
+            "provider": row["provider"],
+            "source_kind": row["source_kind"],
+            "enabled": bool(row["enabled"]),
+            "cursor": {
+                "offset": row["cursor_offset"],
+                "ordinal": row["cursor_ordinal"],
+            },
+            "status": row["status"],
+            "reason": row["reason"],
+            "last_seen_at": row["last_seen_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _public_source_row_from_mapping(row: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = (
+            "schema",
+            "source_id",
+            "provider",
+            "source_kind",
+            "enabled",
+            "cursor",
+            "status",
+            "reason",
+            "last_seen_at",
+            "updated_at",
+        )
+        return {key: row.get(key) for key in allowed}
+
+    @staticmethod
+    def _public_discovery(value: Mapping[str, Any]) -> dict[str, Any]:
+        identity_state = str(value.get("identity_state") or "UNKNOWN")
+        key_material = "\0".join(
+            (
+                str(value.get("provider") or "UNKNOWN"),
+                str(value.get("source_path") or ""),
+            )
+        )
+        return {
+            "schema": SOURCE_SCHEMA,
+            "discovery_key": "discovery_" + _sha256(key_material)[:24],
+            "provider": value.get("provider"),
+            "source_kind": value.get("source_kind"),
+            "last_modified_at": value.get("last_modified_at"),
+            "display_name": value.get("display_name"),
+            "workspace_name": value.get("workspace_name"),
+            "session_kind": value.get("session_kind"),
+            "identity_state": identity_state,
+            "binding_state": (
+                "ELIGIBLE" if identity_state == "VERIFIED" else "UNBOUND"
+            ),
+            "transcript_content": "EXCLUDED",
         }
 
     @staticmethod

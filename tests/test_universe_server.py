@@ -988,7 +988,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertEqual(
                 "PROVIDER_SESSION_SOURCES_DISCOVERED", discovered["status"]
             )
-            self.assertEqual([discovered_source], discovered["sources"])
+            self.assertEqual("REDACTED", discovered["sources"][0]["source_path"])
+            self.assertEqual(
+                "REDACTED", discovered["sources"][0]["provider_session_id"]
+            )
+            self.assertNotIn(str(rollout), json.dumps(discovered))
             discover.assert_called_once_with("CODEX")
         status, remote_discovery = self.request(
             "GET",
@@ -1001,6 +1005,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         maintenance = self.server.run_supervisor_maintenance_once(idle_seconds=0)
         self.assertIn("provider_activity", maintenance)
         self.assertEqual(1, len(maintenance["provider_activity"]))
+        with patch.object(
+            self.server,
+            "provider_chat_catalog",
+            return_value={"rooms": [], "transcript_content": "EXCLUDED"},
+        ):
+            status, tail = self.request(
+                "POST", "/v1/session-observer/tail", {}
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("PROVIDER_ACTIVITY_TAIL_UPDATED", tail["status"])
+        self.assertNotIn("source_path", json.dumps(tail))
+        self.assertNotIn("provider_session_id", json.dumps(tail))
 
     def test_provider_chat_catalog_lists_all_vendors_and_joins_optional_binding(
         self,
@@ -1041,6 +1057,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "display_name": f"{provider.title()} chat",
                     "session_kind": "CHAT",
                     "parent_provider_session_id": None,
+                    "identity_state": "VERIFIED",
                     "transcript_content": "EXCLUDED",
                 }
             ]
@@ -1062,6 +1079,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         codex = next(room for room in catalog["rooms"] if room["provider"] == "CODEX")
         self.assertEqual("BOUND", codex["binding"]["state"])
+        self.assertEqual("GCS", codex["binding"]["current_project_id"])
         self.assertEqual("GCS", codex["binding"]["node"])
         self.assertEqual(
             "MASTER-CURRENT-GCS-001", codex["binding"]["current_anchor_ref"]
@@ -1071,12 +1089,113 @@ class UniverseLocalServiceTests(unittest.TestCase):
         rendered = json.dumps(catalog)
         self.assertNotIn("provider_session_id", rendered)
         self.assertNotIn("source_path", rendered)
+        self.assertNotIn('"workspace":', rendered)
         self.assertNotIn("legacy_refs", rendered)
+        self.assertNotIn("provider_session_ref", rendered)
+        self.assertNotIn("transport_state", rendered)
         self.assertEqual("EXCLUDED", catalog["transcript_content"])
         self.assertEqual(
             [room["chat_key"] for room in catalog["rooms"]],
             [room["chat_key"] for room in repeated_catalog["rooms"]],
         )
+
+    def test_tail_auto_registers_only_bound_verified_provider_sessions(self) -> None:
+        bound_path = self.temp_root / "rollout-bound-tail.jsonl"
+        bound_path.write_text(
+            json.dumps({"type": "turn_started", "message": "historical private"})
+            + "\n",
+            encoding="utf-8",
+        )
+        unbound_path = self.temp_root / "rollout-unbound-tail.jsonl"
+        unbound_path.write_text(
+            json.dumps({"type": "turn_started", "message": "unbound private"})
+            + "\n",
+            encoding="utf-8",
+        )
+        status, _ = self.request(
+            "POST",
+            "/v1/supervisor/sessions",
+            {
+                "session_id": "session-bound-tail",
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-bound-tail",
+                "anchor_ref": "MASTER-CURRENT-TAIL-001",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+
+        def discovered(provider: str) -> list[dict[str, Any]]:
+            if provider != "CODEX":
+                return []
+            return [
+                {
+                    "schema": "universe.provider-session-source.v1",
+                    "status": "DISCOVERED",
+                    "provider": "CODEX",
+                    "provider_session_id": "codex-bound-tail",
+                    "source_path": str(bound_path),
+                    "source_kind": "CODEX_ROLLOUT_JSONL",
+                    "source_version": "v1",
+                    "last_modified_at": "2026-08-09T00:00:00Z",
+                    "workspace": r"C:\workspace\universe",
+                    "workspace_name": "universe",
+                    "display_name": "Bound live tail",
+                    "session_kind": "CHAT",
+                    "parent_provider_session_id": None,
+                    "identity_state": "VERIFIED",
+                    "transcript_content": "EXCLUDED",
+                },
+                {
+                    "schema": "universe.provider-session-source.v1",
+                    "status": "DISCOVERED",
+                    "provider": "CODEX",
+                    "provider_session_id": "codex-unbound-tail",
+                    "source_path": str(unbound_path),
+                    "source_kind": "CODEX_ROLLOUT_JSONL",
+                    "source_version": "v1",
+                    "last_modified_at": "2026-08-09T00:00:00Z",
+                    "workspace": r"C:\workspace\universe",
+                    "workspace_name": "universe",
+                    "display_name": "Unbound live tail",
+                    "session_kind": "CHAT",
+                    "parent_provider_session_id": None,
+                    "identity_state": "VERIFIED",
+                    "transcript_content": "EXCLUDED",
+                },
+            ]
+
+        with patch.object(
+            self.server.store,
+            "discover_provider_session_sources",
+            side_effect=discovered,
+        ):
+            status, first = self.request("POST", "/v1/session-observer/tail", {})
+            self.assertEqual(HTTPStatus.OK, status)
+            self.assertEqual(1, len(first["scans"]))
+            self.assertEqual(0, first["scans"][0]["added"])
+
+            with bound_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps({"type": "turn_completed", "text": "new private"})
+                    + "\n"
+                )
+            status, second = self.request("POST", "/v1/session-observer/tail", {})
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(second["scans"]))
+        self.assertEqual(1, second["scans"][0]["added"])
+        registered = self.server.store.list_provider_session_sources()
+        self.assertEqual(1, len(registered))
+        self.assertEqual("codex-bound-tail", registered[0]["provider_session_id"])
+        rendered = json.dumps(second)
+        self.assertNotIn(str(bound_path), rendered)
+        self.assertNotIn(str(unbound_path), rendered)
+        self.assertNotIn("codex-bound-tail", rendered)
+        self.assertNotIn("codex-unbound-tail", rendered)
+        self.assertNotIn("private", rendered)
 
     def test_linked_project_master_result_advances_only_its_todo(self) -> None:
         self.server.store.register_project(self.registration())
@@ -1228,7 +1347,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="session-rail-list"', body)
             self.assertIn('id="session-rail-search"', body)
             self.assertIn('id="session-rail-show-workers"', body)
-            self.assertIn("Provider Chats", body)
+            self.assertIn(">Sessions<", body)
+            self.assertIn('id="session-rail-show-hidden"', body)
             self.assertIn("provider-chat-1", body)
             self.assertIn('id="runtime-audit-grid"', body)
             self.assertIn('id="legacy-executor-list"', body)
@@ -1718,7 +1838,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         selected = next(item for item in sessions["sessions"] if item["is_default"])
-        self.assertEqual("thread-current-codex", selected["provider_session_ref"])
+        self.assertEqual(attached["session"]["session_id"], selected["universe_session_id"])
+        self.assertNotIn("provider_session_ref", selected)
         self.assertEqual("Universe Main Conductor", selected["alias"])
 
         status, repeated = attach_supervisor_session(
@@ -1732,6 +1853,81 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("NOT_REQUIRED", repeated["resident_runtime_reload"])
+
+        status, moved = attach_supervisor_session(
+            endpoint=self.endpoint,
+            token=self.token,
+            node="universe",
+            mode="MASTER",
+            provider="CODEX",
+            provider_session_ref="thread-current-codex",
+            alias="Universe Main Master",
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            attached["session"]["session_id"], moved["session"]["session_id"]
+        )
+        self.assertEqual("universe", moved["session"]["current_project_id"])
+        self.assertEqual("MASTER", moved["session"]["mode"])
+        self.assertEqual("Universe Main Master", moved["session"]["alias"])
+        status, all_sessions = self.request(
+            "GET", "/v1/sessions?include_hidden=true", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(all_sessions["sessions"]))
+
+    def test_canonical_session_api_moves_location_without_exposing_raw_refs(self) -> None:
+        status, registered = self.request(
+            "POST",
+            "/v1/sessions",
+            {
+                "session_id": "session-canonical-1",
+                "project_id": "universe",
+                "node": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "private-provider-ref",
+                "anchor_ref": "CONDUCTOR-CURRENT-1",
+                "workspace_key": "origin-workspace",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        session = registered["session"]
+        self.assertNotIn("private-provider-ref", json.dumps(session))
+        self.assertNotIn("provider_session_ref", json.dumps(session))
+        status, moved = self.request(
+            "POST",
+            "/v1/sessions/session-canonical-1/location",
+            {
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "anchor_ref": "MASTER-CURRENT-GCS-2",
+                "evidence_ref": "test://location-move",
+                "expected_version": session["row_version"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GCS", moved["session"]["current_location"]["project_id"])
+        self.assertEqual(
+            session["universe_session_id"], moved["session"]["universe_session_id"]
+        )
+        status, hidden = self.request(
+            "POST",
+            "/v1/sessions/session-canonical-1/visibility",
+            {
+                "visibility": "HIDDEN",
+                "expected_version": moved["session"]["row_version"],
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("HIDDEN", hidden["session"]["visibility"])
+        status, visible = self.request("GET", "/v1/sessions")
+        self.assertEqual([], visible["sessions"])
+        status, all_sessions = self.request("GET", "/v1/sessions?include_hidden=true")
+        self.assertEqual(1, len(all_sessions["sessions"]))
 
     def test_attach_session_requires_explicit_ref_outside_codex_desktop(self) -> None:
         with self.assertRaises(UniverseError) as raised:
@@ -3177,7 +3373,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertFalse(listed["proposals"][0]["platform_permission"])
         status, inbox = self.request(
             "GET",
-            "/v1/governance-proposals",
+            "/v1/governance/proposals/pending",
             token=self.token,
         )
         self.assertEqual(200, status)
@@ -3187,13 +3383,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         status, approved = self.request(
             "POST",
-            "/v1/projects/GCS/governance-proposals/task_proposal_test_001/decision",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
             {
                 "decision": "APPROVE",
                 "proposal_digest": proposal["proposal_digest"],
-                "source": "NATURAL_LANGUAGE",
-                "commander_surface": "UNIVERSE_UI",
-                "idempotency_key": "approve-task-proposal-test-001",
             },
             self.token,
         )
@@ -3205,7 +3398,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "governance-proposals/task_proposal_test_001/decisions/",
             approved["decision"]["evidence_ref"],
         )
-        self.assertEqual("NATURAL_LANGUAGE", approved["decision"]["source"])
+        self.assertEqual("BUTTON", approved["decision"]["source"])
+        self.assertEqual("LOCAL_BROWSER", approved["decision"]["commander_surface"])
         self.assertIn(
             "universe.project-master-governance-approval.v1",
             approved["message"]["body"],
@@ -3221,18 +3415,28 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         status, repeated = self.request(
             "POST",
-            "/v1/projects/GCS/governance-proposals/task_proposal_test_001/decision",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
             {
                 "decision": "APPROVE",
                 "proposal_digest": proposal["proposal_digest"],
-                "source": "NATURAL_LANGUAGE",
-                "commander_surface": "UNIVERSE_UI",
-                "idempotency_key": "approve-task-proposal-test-001",
             },
             self.token,
         )
         self.assertEqual(200, status)
         self.assertEqual("GOVERNANCE_PROPOSAL_ALREADY_APPROVED", repeated["status"])
+
+        status, rejected_bridge = self.request(
+            "POST",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
+            {
+                "decision": "APPROVE",
+                "proposal_digest": proposal["proposal_digest"],
+            },
+            self.token,
+            extra_headers={"X-Universe-Bridge-Token": "provider-bridge"},
+        )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("DIRECT_COMMANDER_REQUIRED", rejected_bridge["error_code"])
 
     def test_commander_text_approves_the_only_pending_task_proposal(self) -> None:
         proposal = self.create_task_proposal_fixture()
@@ -3304,7 +3508,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         decision = result["governance_decision"]["decision"]
         self.assertEqual("NATURAL_LANGUAGE", decision["source"])
-        self.assertEqual("UNIVERSE_UI", decision["commander_surface"])
+        self.assertEqual("LOCAL_BROWSER", decision["commander_surface"])
         self.assertEqual(proposal["proposal_id"], decision["proposal_id"])
         messages = self.server.store.list_room_messages("GCS")
         self.assertTrue(any(message["body"] == "\uc2b9\uc778" for message in messages))

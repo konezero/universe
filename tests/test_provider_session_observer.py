@@ -25,7 +25,9 @@ class ProviderSessionObserverTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def register(self, provider: str, path: Path) -> dict[str, object]:
+    def register(
+        self, provider: str, path: Path, *, start_at_end: bool = False
+    ) -> dict[str, object]:
         return self.store.register_source(
             {
                 "provider": provider,
@@ -37,6 +39,7 @@ class ProviderSessionObserverTests(unittest.TestCase):
                     "GROK": "GROK_UPDATES_JSONL",
                 }[provider],
                 "source_version": "v1",
+                "start_at_end": start_at_end,
             }
         )
 
@@ -80,6 +83,29 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual("ACTIVE", second["source"]["status"])
         self.assertGreater(second["source"]["cursor"]["offset"], first_cursor)
         self.assertEqual(1, second["added"])
+
+    def test_start_at_end_skips_history_and_tails_only_new_events(self) -> None:
+        source_path = self.root / "rollout-live-tail.jsonl"
+        self.write(
+            source_path,
+            {"type": "turn_started", "message": "historical private prompt"},
+        )
+        source = self.register("CODEX", source_path, start_at_end=True)
+
+        first = self.store.scan(str(source["source_id"]))
+        self.assertEqual(0, first["added"])
+        self.assertEqual([], self.store.list_activities(str(source["source_id"])))
+
+        with source_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "turn_completed", "text": "new private result"})
+                + "\n"
+            )
+        second = self.store.scan(str(source["source_id"]))
+        activities = self.store.list_activities(str(source["source_id"]))
+        self.assertEqual(1, second["added"])
+        self.assertEqual("TURN_COMPLETED", activities[0]["event_kind"])
+        self.assertNotIn("private", json.dumps(activities))
 
     def test_rotation_and_schema_errors_fail_closed(self) -> None:
         source_path = self.root / "rollout-rotate.jsonl"
@@ -169,7 +195,8 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.write(rollout, {"type": "turn_started", "message": "private"})
         discovered = self.store.discover_sources("CODEX", home=codex_home)
         self.assertEqual(1, len(discovered))
-        self.assertEqual("rollout-20260808", discovered[0]["provider_session_id"])
+        self.assertIsNone(discovered[0]["provider_session_id"])
+        self.assertEqual("UNKNOWN", discovered[0]["identity_state"])
         self.assertNotIn("private", json.dumps(discovered))
 
     def test_discovery_extracts_only_safe_provider_chat_metadata(self) -> None:
@@ -243,6 +270,35 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual("grok-chat-001", grok["provider_session_id"])
         self.assertEqual(r"C:\workspace\universe-rendezvous", grok["workspace"])
         self.assertNotIn("must stay provider-owned", json.dumps(grok))
+
+    def test_public_adapter_contract_is_bounded_and_redacted(self) -> None:
+        path = self.root / "rollout-public.jsonl"
+        self.write(
+            path,
+            *(
+                {"type": "turn_started", "id": f"event-{index}"}
+                for index in range(5)
+            ),
+        )
+        source = self.store.register_source(
+            {
+                "provider": "CODEX",
+                "provider_session_id": "codex-public",
+                "source_path": str(path),
+                "source_kind": "CODEX_ROLLOUT_JSONL",
+                "source_version": "v1",
+            }
+        )
+        result = self.store.read_bounded(str(source["source_id"]), max_events=2)
+        self.assertEqual(2, result["bounded_read"]["events"])
+        rendered = json.dumps(result)
+        self.assertNotIn(str(path), rendered)
+        self.assertNotIn("codex-public", rendered)
+        self.assertNotIn("source_path", rendered)
+        self.assertEqual(
+            2,
+            self.store.open_cursor(str(source["source_id"]))["cursor"]["ordinal"],
+        )
 
 
 if __name__ == "__main__":

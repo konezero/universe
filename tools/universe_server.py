@@ -6085,6 +6085,40 @@ class UniverseStore:
         self, value: Mapping[str, Any]
     ) -> dict[str, Any]:
         try:
+            if not value.get("source_path") and value.get("source_key"):
+                provider = _required_text(value.get("provider"), "provider").upper()
+                candidates = self.provider_session_observer.discover_sources(provider)
+                source_key = _required_text(value.get("source_key"), "source_key")
+                match = next(
+                    (
+                        item
+                        for item in candidates
+                        if _provider_source_key(item) == source_key
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise UniverseError(
+                        "PROVIDER_SESSION_DISCOVERY_STALE",
+                        "the selected provider session source is no longer observable",
+                        HTTPStatus.CONFLICT,
+                    )
+                if (
+                    match.get("identity_state") != "VERIFIED"
+                    or not match.get("provider_session_id")
+                ):
+                    raise UniverseError(
+                        "PROVIDER_SESSION_IDENTITY_UNKNOWN",
+                        "provider metadata does not establish a session identity",
+                        HTTPStatus.CONFLICT,
+                    )
+                value = {
+                    "provider": match["provider"],
+                    "provider_session_id": match["provider_session_id"],
+                    "source_path": match["source_path"],
+                    "source_kind": match["source_kind"],
+                    "source_version": match["source_version"],
+                }
             return self.provider_session_observer.register_source(value)
         except ProviderSessionObserverError as error:
             raise UniverseError(error.code, error.detail) from error
@@ -13947,13 +13981,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ): source
             for source in registered_sources
         }
-        supervisor_sessions = self.session_supervisor.list_sessions()
+        supervisor_sessions = self.session_supervisor.list_sessions(include_hidden=True)
         rows_by_key: dict[str, dict[str, Any]] = {}
         for source in discovered:
             provider = str(source.get("provider") or "UNKNOWN").upper()
             provider_session_id = str(source.get("provider_session_id") or "")
             source_path = _canonical_provider_source_path(source.get("source_path"))
-            if not provider_session_id or not source_path:
+            if not source_path:
                 continue
             chat_key = "provider_chat_" + _provider_source_key(
                 {
@@ -13962,11 +13996,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "source_path": source_path,
                 }
             ).removeprefix("provider_source_")
-            legacy_refs = {
-                provider_session_id,
-                Path(source_path).stem,
-                Path(source_path).parent.name,
-            }
+            identity_verified = source.get("identity_state") == "VERIFIED"
+            legacy_refs = {provider_session_id} if identity_verified else set()
             matches = [
                 item
                 for item in supervisor_sessions
@@ -13988,21 +14019,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 mode = str(bound.get("mode") or "UNKNOWN")
                 anchor_ref = str(bound.get("anchor_ref") or "UNKNOWN")
                 anchor_identity = {
-                    "project_id": node if node != "UNKNOWN" else None,
+                    "project_id": bound.get("current_project_id")
+                    or (node if node != "UNKNOWN" else None),
                     "node": node,
                     "mode": mode,
                     "current_anchor_ref": anchor_ref,
                 }
                 binding = {
                     "state": "BOUND",
+                    "current_project_id": anchor_identity["project_id"],
                     "node": node,
                     "mode": mode,
                     "alias": bound.get("alias"),
                     "current_anchor_ref": anchor_ref,
                     "anchor_key": "anchor_session_"
                     + _json_sha256(anchor_identity)[:24],
-                    "supervisor_session_id": bound.get("session_id"),
-                    "transport_state": bound.get("state") or "UNKNOWN",
+                    "universe_session_id": bound.get("universe_session_id")
+                    or bound.get("session_id"),
+                    "visibility": bound.get("visibility") or "VISIBLE",
+                    "row_version": bound.get("row_version"),
                     "is_default": bool(bound.get("is_default")),
                 }
 
@@ -14016,11 +14051,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             latest_activity = activities[0] if activities else None
             workspace = str(source.get("workspace") or "").strip() or None
+            evidence_activity = (latest_activity or {}).get("activity_state")
+            if evidence_activity is None and bound is not None:
+                lease = bound.get("process_lease")
+                if (
+                    isinstance(lease, Mapping)
+                    and lease.get("lease_state") == "OWNED"
+                    and bound.get("state") in {"LIVE", "STARTING"}
+                ):
+                    evidence_activity = bound.get("state")
             row = {
                 "schema": "universe.provider-chat-room.v1",
                 "chat_key": chat_key,
                 "provider": provider,
-                "workspace": workspace,
                 "workspace_name": source.get("workspace_name")
                 or (Path(workspace).name if workspace else "Unknown workspace"),
                 "display_name": source.get("display_name") or "Untitled chat",
@@ -14030,10 +14073,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     or source.get("last_modified_at")
                 ),
                 "activity_state": (
-                    (latest_activity or {}).get("activity_state")
-                    or (binding.get("transport_state") if bound is not None else None)
-                    or "DISCOVERED"
+                    evidence_activity or "UNKNOWN"
                 ),
+                "identity_state": source.get("identity_state") or "UNKNOWN",
                 "registered": registered is not None,
                 "binding": binding,
                 "transcript_content": "EXCLUDED",
@@ -14060,6 +14102,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "providers": ["CODEX", "CLAUDE", "GROK"],
             "transcript_content": "EXCLUDED",
         }
+
+    def tail_bound_provider_sessions(self) -> list[dict[str, Any]]:
+        sessions = self.session_supervisor.list_sessions(include_hidden=False)
+        bound_identities = {
+            (
+                str(session.get("provider") or "").upper(),
+                str(session.get("provider_session_ref") or ""),
+            )
+            for session in sessions
+            if session.get("provider_session_ref")
+        }
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            for source in self.store.discover_provider_session_sources(provider):
+                identity = (
+                    provider,
+                    str(source.get("provider_session_id") or ""),
+                )
+                if (
+                    source.get("identity_state") != "VERIFIED"
+                    or identity not in bound_identities
+                ):
+                    continue
+                self.store.register_provider_session_source(
+                    {**source, "start_at_end": True}
+                )
+        return self.store.scan_registered_provider_sources()
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
@@ -14255,14 +14323,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self,
         project_id: str,
         value: Any,
+        *,
+        commander_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         request = value if isinstance(value, Mapping) else {}
         body = str(request.get("body") or "").strip()
-        sender = str(request.get("sender") or "UNIVERSE_CONDUCTOR").upper()
-        kind = str(request.get("kind") or "QUESTION").upper()
+        trusted_commander = bool(
+            commander_context and commander_context.get("authenticated") is True
+        )
         is_commander_approval = (
-            sender == "UNIVERSE_CONDUCTOR"
-            and kind == "QUESTION"
+            trusted_commander
             and body.casefold() in GOVERNANCE_APPROVAL_COMMANDS
         )
         if not is_commander_approval:
@@ -14278,9 +14348,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }
 
         project = self.store.get_project(project_id)
+        commander_message = dict(request)
+        commander_message["sender"] = "UNIVERSE_CONDUCTOR"
+        commander_message["kind"] = "QUESTION"
         message, created = self.store.create_room_message(
             project["project_id"],
-            value,
+            commander_message,
             delivery_state="RECORDED",
         )
         pending = [
@@ -14304,15 +14377,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }
 
         proposal = pending[0]
-        result = self.decide_project_governance_proposal(
-            project["project_id"],
+        result = self.decide_pending_proposal(
             proposal["proposal_id"],
             {
                 "decision": "APPROVE",
                 "proposal_digest": proposal["proposal_digest"],
+            },
+            commander_context={
+                **dict(commander_context or {}),
                 "source": "NATURAL_LANGUAGE",
-                "commander_surface": "UNIVERSE_UI",
-                "idempotency_key": "commander-text:" + message["message_id"],
+                "input_ref": (
+                    f"universe://projects/{quote(project['project_id'], safe='')}/"
+                    f"room/messages/{message['message_id']}"
+                ),
             },
         )
         self.publish_project_room_changed(project["project_id"])
@@ -14322,6 +14399,87 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "governance_decision": result,
             "pending_proposals": [],
         }
+
+    def decide_pending_proposal(
+        self,
+        proposal_id: str,
+        value: Any,
+        *,
+        commander_context: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        context = dict(commander_context or {})
+        if context.get("authenticated") is not True:
+            raise UniverseError(
+                "DIRECT_COMMANDER_REQUIRED",
+                "governance approval requires an authenticated direct Commander action",
+                HTTPStatus.FORBIDDEN,
+            )
+        source = str(context.get("source") or "BUTTON").upper()
+        if source not in {"BUTTON", "NATURAL_LANGUAGE"}:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DECISION_SOURCE_INVALID",
+                "approval source must be a direct button or Commander text action",
+                HTTPStatus.FORBIDDEN,
+            )
+        surface = _identifier(
+            context.get("surface") or "LOCAL_BROWSER", "commander_surface"
+        ).upper()
+        if surface not in {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}:
+            raise UniverseError(
+                "DIRECT_COMMANDER_SURFACE_INVALID",
+                "provider, relay, Project Master, Boss, Worker, and observer surfaces cannot approve",
+                HTTPStatus.FORBIDDEN,
+            )
+        request = _exact_object_fields(
+            value,
+            field="governance_proposal_decision",
+            required=frozenset({"decision", "proposal_digest"}),
+        )
+        matches = [
+            item
+            for item in self.list_governance_proposal_inbox()
+            if item.get("proposal_id") == proposal_id
+        ]
+        if len(matches) != 1:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal is not uniquely observable",
+                HTTPStatus.NOT_FOUND,
+            )
+        proposal = matches[0]
+        input_ref = _required_text(
+            context.get("input_ref")
+            or (
+                "universe://commander-actions/"
+                + _json_sha256(
+                    {
+                        "proposal_id": proposal_id,
+                        "proposal_digest": request["proposal_digest"],
+                        "surface": surface,
+                    }
+                )[:24]
+            ),
+            "commander_input_ref",
+        )
+        idempotency_key = "commander-decision:" + _json_sha256(
+            {
+                "proposal_id": proposal_id,
+                "proposal_digest": request["proposal_digest"],
+                "decision": request["decision"],
+                "input_ref": input_ref,
+            }
+        )
+        return self.decide_project_governance_proposal(
+            str(proposal["project_id"]),
+            proposal_id,
+            {
+                "decision": request["decision"],
+                "proposal_digest": request["proposal_digest"],
+                "source": source,
+                "commander_surface": surface,
+                "idempotency_key": idempotency_key,
+            },
+        )
 
     def _observe_project_master_completion(self, event: Mapping[str, Any]) -> None:
         project_id = event.get("project_id")
@@ -14957,13 +15115,51 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._authorize():
             return
-        if path == "/v1/governance-proposals":
+        if path in {"/v1/governance-proposals", "/v1/governance/proposals/pending"}:
             self._send(
                 HTTPStatus.OK,
                 {
                     "schema": API_SCHEMA,
                     "status": "GOVERNANCE_PROPOSAL_INBOX_COLLECTED",
                     "proposals": self.server.list_governance_proposal_inbox(),
+                },
+            )
+            return
+        if path == "/v1/sessions":
+            query = parse_qs(urlsplit(self.path).query)
+            include_hidden = (query.get("include_hidden") or ["false"])[0].lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SESSIONS_COLLECTED",
+                    "sessions": self.server.session_supervisor.list_public_sessions(
+                        node=query.get("node", [None])[0],
+                        mode=query.get("mode", [None])[0],
+                        include_hidden=include_hidden,
+                    ),
+                },
+            )
+            return
+        canonical_session_match = re.fullmatch(r"/v1/sessions/([^/]+)", path)
+        if canonical_session_match is not None:
+            try:
+                session = self.server.session_supervisor.get_public_session(
+                    unquote(canonical_session_match.group(1))
+                )
+            except SessionSupervisorError as error:
+                self._send_supervisor_error(error)
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SESSION_COLLECTED",
+                    "session": session,
                 },
             )
             return
@@ -14983,9 +15179,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "SUPERVISOR_SESSIONS_COLLECTED",
                     "live_session_sweep": sweep,
-                    "sessions": self.server.session_supervisor.list_sessions(
+                    "sessions": self.server.session_supervisor.list_public_sessions(
                         node=query.get("node", [None])[0],
                         mode=query.get("mode", [None])[0],
+                        include_hidden=(
+                            (query.get("include_hidden") or ["false"])[0].lower()
+                            in {"1", "true", "yes"}
+                        ),
                     ),
                 },
             )
@@ -15044,7 +15244,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         )
         if supervisor_session_match is not None:
             try:
-                session = self.server.session_supervisor.get_session(
+                session = self.server.session_supervisor.get_public_session(
                     unquote(supervisor_session_match.group(1))
                 )
             except SessionSupervisorError as error:
@@ -15287,8 +15487,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             provider = (parse_qs(urlsplit(self.path).query).get("provider") or [""])[0]
             try:
                 sources = self.server.store.discover_provider_session_sources(provider)
-                for source in sources:
-                    source["source_key"] = _provider_source_key(source)
+                sources = [
+                    {
+                        **_public_provider_source(source),
+                        "display_name": source.get("display_name"),
+                        "workspace_name": source.get("workspace_name"),
+                        "session_kind": source.get("session_kind"),
+                        "identity_state": source.get("identity_state") or "UNKNOWN",
+                    }
+                    for source in sources
+                ]
                 self._send(
                     HTTPStatus.OK,
                     {
@@ -15799,7 +16007,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             self._authorize_local_operator()
         ):
             return
-        if path == "/v1/session-observer/sources" or re.fullmatch(
+        if path in {"/v1/session-observer/sources", "/v1/session-observer/tail"} or re.fullmatch(
             r"/v1/session-observer/sources/[^/]+/(scan|record-memory)", path
         ):
             if not self._authorize_local_operator():
@@ -15811,10 +16019,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             r"(bind|lease|reconcile|stop-authorization|recover-absent)",
             path,
         )
+        privileged_session_match = re.fullmatch(
+            r"/v1/sessions/[^/]+/(location|provider)", path
+        )
         if (
             path == "/v1/supervisor/sessions"
             or path == "/v1/supervisor/sessions/cleanup"
             or privileged_supervisor_match is not None
+            or path == "/v1/sessions"
+            or privileged_session_match is not None
         ) and not self._authorize_supervisor_control():
             return
         try:
@@ -15845,6 +16058,83 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "SUPERVISOR_SESSION_ALREADY_REGISTERED"
                         ),
                         "session": session,
+                    },
+                )
+                return
+            if path == "/v1/sessions":
+                session, created = self.server.session_supervisor.register_session(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SESSION_REGISTERED" if created else "SESSION_REOBSERVED",
+                        "session": self.server.session_supervisor.get_public_session(
+                            str(session["session_id"])
+                        ),
+                    },
+                )
+                return
+            if path == "/v1/session-observer/tail":
+                scans = self.server.tail_bound_provider_sessions()
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROVIDER_ACTIVITY_TAIL_UPDATED",
+                        "scans": [
+                            {
+                                "source_id": item.get("source", {}).get("source_id"),
+                                "status": item.get("source", {}).get("status"),
+                                "added": item.get("added", 0),
+                                "bounded_read": item.get("bounded_read"),
+                            }
+                            for item in scans
+                        ],
+                        "catalog": self.server.provider_chat_catalog(),
+                    },
+                )
+                return
+            canonical_session_operation = re.fullmatch(
+                r"/v1/sessions/([^/]+)/(location|provider|visibility)", path
+            )
+            if canonical_session_operation is not None:
+                session_id = unquote(canonical_session_operation.group(1))
+                operation = canonical_session_operation.group(2)
+                if not isinstance(body, Mapping):
+                    raise SessionSupervisorError(
+                        "SESSION_SUPERVISOR_REQUEST_INVALID",
+                        "request body must be an object",
+                    )
+                if operation == "location":
+                    result = self.server.session_supervisor.bind_current_location(
+                        session_id,
+                        project_id=body.get("project_id"),
+                        node=body.get("node"),
+                        mode=body.get("mode"),
+                        anchor_ref=body.get("anchor_ref"),
+                        evidence_ref=body.get("evidence_ref"),
+                        expected_version=body.get("expected_version"),
+                    )
+                elif operation == "provider":
+                    result = self.server.session_supervisor.bind_provider_session(
+                        session_id,
+                        provider=body.get("provider"),
+                        provider_session_ref=body.get("provider_session_ref"),
+                        expected_version=body.get("expected_version"),
+                    )
+                else:
+                    result = self.server.session_supervisor.set_visibility(
+                        session_id,
+                        visibility=body.get("visibility"),
+                        expected_version=body.get("expected_version"),
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SESSION_OPERATION_COMPLETED",
+                        "operation": operation.upper(),
+                        "session": self.server.session_supervisor._public_session(result),
                     },
                 )
                 return
@@ -16685,12 +16975,42 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            canonical_governance_match = re.fullmatch(
+                r"/v1/governance/proposals/([^/]+)/decision", path
+            )
+            if canonical_governance_match is not None:
+                proposal_id = unquote(canonical_governance_match.group(1))
+                result = self.server.decide_pending_proposal(
+                    proposal_id,
+                    {
+                        "decision": (body or {}).get("decision"),
+                        "proposal_digest": (body or {}).get("proposal_digest"),
+                    },
+                    commander_context=self._direct_commander_context(
+                        source="BUTTON",
+                        input_ref=(
+                            "universe://commander-actions/governance/"
+                            + quote(proposal_id, safe="")
+                        ),
+                    ),
+                )
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
             governance_parts = self._governance_proposal_decision_path(path)
             if governance_parts is not None:
-                result = self.server.decide_project_governance_proposal(
-                    governance_parts[0],
+                result = self.server.decide_pending_proposal(
                     governance_parts[1],
-                    body,
+                    {
+                        "decision": (body or {}).get("decision"),
+                        "proposal_digest": (body or {}).get("proposal_digest"),
+                    },
+                    commander_context=self._direct_commander_context(
+                        source="BUTTON",
+                        input_ref=(
+                            "universe://commander-actions/governance/"
+                            + quote(governance_parts[1], safe="")
+                        ),
+                    ),
                 )
                 self._send(
                     HTTPStatus.OK,
@@ -16832,7 +17152,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/room/messages":
-                result = self.server.handle_project_room_input(parts[0], body)
+                result = self.server.handle_project_room_input(
+                    parts[0],
+                    body,
+                    commander_context=self._direct_commander_context(
+                        source="NATURAL_LANGUAGE"
+                    ),
+                )
                 self._send(
                     (
                         HTTPStatus.CREATED
@@ -17354,6 +17680,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def _authorize_service_control(self) -> bool:
         return self._authorize_control_token("SERVICE_CONTROL_TOKEN_REQUIRED")
+
+    def _direct_commander_context(
+        self, *, source: str, input_ref: str | None = None
+    ) -> dict[str, Any]:
+        access_surface = str(
+            self.headers.get("X-Universe-Access-Surface") or "LOCAL_BROWSER"
+        ).upper()
+        forbidden_headers = (
+            "X-Universe-Bridge-Token",
+            "X-Universe-Provider-Session",
+            "X-Universe-Worker-Id",
+        )
+        authenticated = not any(self.headers.get(name) for name in forbidden_headers)
+        if access_surface not in {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}:
+            authenticated = False
+        return {
+            "authenticated": authenticated,
+            "surface": access_surface,
+            "source": source,
+            "input_ref": input_ref,
+        }
 
     def _authorize_local_operator(self) -> bool:
         if self.headers.get("X-Universe-Access-Surface") == "REMOTE_BROWSER":
@@ -18377,11 +18724,16 @@ def attach_supervisor_session(
             "SUPERVISOR_SESSION_RESPONSE_INVALID",
             "session registration response did not contain a session",
         )
+    attached_session_id = _required_text(session.get("session_id"), "session.session_id")
     default_selection: Mapping[str, Any] | None = None
     if make_default and not bool(session.get("is_default")):
         status, default_response = supervisor_transport.request_json(
             method="POST",
-            path=("/v1/supervisor/sessions/" + quote(session_id, safe="") + "/default"),
+            path=(
+                "/v1/supervisor/sessions/"
+                + quote(attached_session_id, safe="")
+                + "/default"
+            ),
             payload={
                 "expected_pointer_version": session.get("default_pointer_version")
             },

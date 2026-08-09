@@ -19,6 +19,7 @@ SESSION_STATES = frozenset(
     {"REGISTERED", "STARTING", "LIVE", "DISCONNECTED", "STOPPED", "UNKNOWN"}
 )
 CURRENTNESS_STATES = frozenset({"UNKNOWN", "CURRENT", "STALE"})
+VISIBILITY_STATES = frozenset({"VISIBLE", "HIDDEN"})
 LEASE_STATES = frozenset({"OWNED", "STALE", "UNKNOWN", "STOP_AUTHORIZED", "RELEASED"})
 PROCESS_IDENTITY_FIELDS = (
     "pid",
@@ -148,6 +149,9 @@ def _normalize_session_descriptor(value: Any) -> dict[str, Any]:
     return {
         "session_id": _required_text(session_id, "session.session_id"),
         "node": _required_text(item.get("node"), "session.node"),
+        "project_id": _optional_text(
+            item.get("project_id") or item.get("node"), "session.project_id"
+        ),
         "mode": _required_text(item.get("mode"), "session.mode").upper(),
         "provider": _required_text(item.get("provider"), "session.provider").upper(),
         "provider_session_ref": _optional_text(
@@ -156,6 +160,18 @@ def _normalize_session_descriptor(value: Any) -> dict[str, Any]:
         "anchor_ref": _optional_text(
             item.get("anchor_ref") or item.get("current_anchor_ref"),
             "session.anchor_ref",
+        ),
+        "workspace_key": _optional_text(
+            item.get("workspace_key"), "session.workspace_key"
+        ),
+        "location_evidence_ref": _optional_text(
+            item.get("location_evidence_ref"), "session.location_evidence_ref"
+        ),
+        "activity_state": _optional_text(
+            item.get("activity_state"), "session.activity_state"
+        ),
+        "last_seen_at": _optional_text(
+            item.get("last_seen_at"), "session.last_seen_at"
         ),
         "alias": _optional_text(item.get("alias"), "session.alias"),
         "session_kind": session_kind,
@@ -318,6 +334,14 @@ class SessionSupervisorStore:
                     state TEXT NOT NULL,
                     currentness TEXT NOT NULL,
                     bounded_summary TEXT,
+                    origin_provider TEXT,
+                    origin_provider_session_ref_hash TEXT,
+                    origin_workspace_key TEXT,
+                    origin_observed_at TEXT,
+                    current_project_id TEXT,
+                    current_activity_state TEXT,
+                    last_seen_at TEXT,
+                    current_provider_binding_id TEXT,
                     row_version INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -335,7 +359,41 @@ class SessionSupervisorStore:
                     provider TEXT NOT NULL,
                     provider_session_ref TEXT,
                     mode TEXT NOT NULL,
-                    bound_at TEXT NOT NULL
+                    bound_at TEXT NOT NULL,
+                    binding_ref TEXT,
+                    provider_session_ref_hash TEXT,
+                    ended_at TEXT,
+                    is_current INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS session_location_history (
+                    location_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    location_ref TEXT NOT NULL UNIQUE,
+                    session_id TEXT NOT NULL REFERENCES session_record(session_id),
+                    project_id TEXT,
+                    node TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    anchor_ref TEXT,
+                    evidence_ref TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    is_current INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS session_visibility (
+                    session_id TEXT PRIMARY KEY REFERENCES session_record(session_id),
+                    visibility TEXT NOT NULL DEFAULT 'VISIBLE',
+                    updated_at TEXT NOT NULL,
+                    CHECK(visibility IN ('VISIBLE','HIDDEN'))
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_source_cursor (
+                    session_id TEXT NOT NULL REFERENCES session_record(session_id),
+                    provider TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    cursor_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id, provider, source_key)
                 );
 
                 CREATE TABLE IF NOT EXISTS process_lease (
@@ -387,6 +445,207 @@ class SessionSupervisorStore:
                 connection.execute(
                     "ALTER TABLE session_record ADD COLUMN anchor_ref TEXT"
                 )
+            session_column_definitions = {
+                "origin_provider": "TEXT",
+                "origin_provider_session_ref_hash": "TEXT",
+                "origin_workspace_key": "TEXT",
+                "origin_observed_at": "TEXT",
+                "current_project_id": "TEXT",
+                "current_activity_state": "TEXT",
+                "last_seen_at": "TEXT",
+                "current_provider_binding_id": "TEXT",
+            }
+            for name, definition in session_column_definitions.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE session_record ADD COLUMN {name} {definition}"
+                    )
+            binding_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(session_binding_history)"
+                )
+            }
+            binding_column_definitions = {
+                "binding_ref": "TEXT",
+                "provider_session_ref_hash": "TEXT",
+                "ended_at": "TEXT",
+                "is_current": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in binding_column_definitions.items():
+                if name not in binding_columns:
+                    connection.execute(
+                        f"ALTER TABLE session_binding_history ADD COLUMN {name} {definition}"
+                    )
+            connection.execute(
+                "UPDATE session_binding_history SET is_current = 0"
+            )
+            connection.execute(
+                """
+                UPDATE session_binding_history SET is_current = 1
+                WHERE binding_id IN (
+                    SELECT MAX(binding_id) FROM session_binding_history
+                    GROUP BY session_id
+                )
+                """
+            )
+            # SQLite does not guarantee a sha256 extension. Backfill hashes in Python.
+            for binding in connection.execute(
+                """
+                SELECT binding_id, provider_session_ref
+                FROM session_binding_history
+                WHERE binding_ref IS NULL OR provider_session_ref_hash IS NULL
+                """
+            ).fetchall():
+                raw_ref = binding["provider_session_ref"]
+                connection.execute(
+                    """
+                    UPDATE session_binding_history
+                    SET binding_ref = COALESCE(binding_ref, ?),
+                        provider_session_ref_hash = COALESCE(provider_session_ref_hash, ?)
+                    WHERE binding_id = ?
+                    """,
+                    (
+                        f"binding_{binding['binding_id']}",
+                        self._hash_provider_ref(raw_ref),
+                        binding["binding_id"],
+                    ),
+                )
+            now = utc_now()
+            duplicate_identities = connection.execute(
+                """
+                SELECT provider, provider_session_ref_hash
+                FROM session_binding_history
+                WHERE is_current = 1
+                  AND provider_session_ref_hash IS NOT NULL
+                GROUP BY provider, provider_session_ref_hash
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+            for identity in duplicate_identities:
+                bindings = connection.execute(
+                    """
+                    SELECT binding_id, session_id, provider, mode
+                    FROM session_binding_history
+                    WHERE is_current = 1
+                      AND provider = ?
+                      AND provider_session_ref_hash = ?
+                    ORDER BY binding_id DESC
+                    """,
+                    (identity["provider"], identity["provider_session_ref_hash"]),
+                ).fetchall()
+                for stale in bindings[1:]:
+                    connection.execute(
+                        """
+                        UPDATE session_binding_history
+                        SET is_current = 0, ended_at = COALESCE(ended_at, ?)
+                        WHERE binding_id = ?
+                        """,
+                        (now, stale["binding_id"]),
+                    )
+                    replacement_ref = self._history_ref(
+                        "binding",
+                        stale["session_id"],
+                        stale["provider"],
+                        "UNBOUND",
+                        stale["binding_id"],
+                        now,
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO session_binding_history(
+                            session_id, provider, provider_session_ref, mode,
+                            bound_at, binding_ref, provider_session_ref_hash,
+                            is_current
+                        ) VALUES (?, ?, NULL, ?, ?, ?, NULL, 1)
+                        """,
+                        (
+                            stale["session_id"],
+                            stale["provider"],
+                            stale["mode"],
+                            now,
+                            replacement_ref,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE session_record
+                        SET provider_session_ref = NULL,
+                            current_provider_binding_id = ?,
+                            updated_at = ?,
+                            row_version = row_version + 1
+                        WHERE session_id = ?
+                        """,
+                        (replacement_ref, now, stale["session_id"]),
+                    )
+            for record in connection.execute("SELECT * FROM session_record").fetchall():
+                session_id = str(record["session_id"])
+                provider_ref_hash = self._hash_provider_ref(
+                    record["provider_session_ref"]
+                )
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET origin_provider = COALESCE(origin_provider, provider),
+                        origin_provider_session_ref_hash = COALESCE(
+                            origin_provider_session_ref_hash, ?
+                        ),
+                        origin_observed_at = COALESCE(origin_observed_at, created_at),
+                        current_project_id = COALESCE(current_project_id, node),
+                        last_seen_at = COALESCE(last_seen_at, updated_at)
+                    WHERE session_id = ?
+                    """,
+                    (provider_ref_hash, session_id),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO session_visibility(
+                        session_id, visibility, updated_at
+                    ) VALUES (?, 'VISIBLE', ?)
+                    """,
+                    (session_id, now),
+                )
+                has_location = connection.execute(
+                    "SELECT 1 FROM session_location_history WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if has_location is None:
+                    location_ref = "location_" + hashlib.sha256(
+                        f"{session_id}\0{record['node']}\0{record['mode']}\0{record['created_at']}".encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()[:24]
+                    connection.execute(
+                        """
+                        INSERT INTO session_location_history(
+                            location_ref, session_id, project_id, node, mode,
+                            anchor_ref, evidence_ref, started_at, is_current
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (
+                            location_ref,
+                            session_id,
+                            record["node"],
+                            record["node"],
+                            record["mode"],
+                            record["anchor_ref"],
+                            "migration://session-supervisor/v1",
+                            record["created_at"],
+                        ),
+                    )
+            connection.executescript(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS one_current_provider_binding
+                ON session_binding_history(session_id) WHERE is_current = 1;
+                CREATE UNIQUE INDEX IF NOT EXISTS one_current_provider_identity
+                ON session_binding_history(provider, provider_session_ref_hash)
+                WHERE is_current = 1 AND provider_session_ref_hash IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS one_current_session_location
+                ON session_location_history(session_id) WHERE is_current = 1;
+                CREATE INDEX IF NOT EXISTS session_location_target
+                ON session_location_history(project_id, node, mode, started_at DESC);
+                """
+            )
             connection.execute(
                 """
                 UPDATE session_record AS record
@@ -414,6 +673,102 @@ class SessionSupervisorStore:
         mode = str(session["mode"])
         # Provider is replaceable transport, not part of the Anchor Session name.
         return node if node == mode else f"{node} {mode}"
+
+    @staticmethod
+    def _hash_provider_ref(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _history_ref(prefix: str, *parts: Any) -> str:
+        material = "\0".join(str(part or "") for part in parts)
+        return f"{prefix}_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _append_provider_binding(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        provider: str,
+        provider_session_ref: str | None,
+        mode: str,
+        now: str,
+    ) -> str:
+        connection.execute(
+            """
+            UPDATE session_binding_history
+            SET is_current = 0, ended_at = COALESCE(ended_at, ?)
+            WHERE session_id = ? AND is_current = 1
+            """,
+            (now, session_id),
+        )
+        binding_ref = cls._history_ref(
+            "binding", session_id, provider, provider_session_ref, now
+        )
+        connection.execute(
+            """
+            INSERT INTO session_binding_history(
+                session_id, provider, provider_session_ref, mode, bound_at,
+                binding_ref, provider_session_ref_hash, is_current
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                session_id,
+                provider,
+                provider_session_ref,
+                mode,
+                now,
+                binding_ref,
+                cls._hash_provider_ref(provider_session_ref),
+            ),
+        )
+        return binding_ref
+
+    @classmethod
+    def _append_location(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        project_id: str | None,
+        node: str,
+        mode: str,
+        anchor_ref: str | None,
+        evidence_ref: str | None,
+        now: str,
+    ) -> str:
+        connection.execute(
+            """
+            UPDATE session_location_history
+            SET is_current = 0, ended_at = COALESCE(ended_at, ?)
+            WHERE session_id = ? AND is_current = 1
+            """,
+            (now, session_id),
+        )
+        location_ref = cls._history_ref(
+            "location", session_id, project_id, node, mode, anchor_ref, now
+        )
+        connection.execute(
+            """
+            INSERT INTO session_location_history(
+                location_ref, session_id, project_id, node, mode, anchor_ref,
+                evidence_ref, started_at, is_current
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                location_ref,
+                session_id,
+                project_id,
+                node,
+                mode,
+                anchor_ref,
+                evidence_ref,
+                now,
+            ),
+        )
+        return location_ref
 
     @staticmethod
     def _event(
@@ -446,27 +801,32 @@ class SessionSupervisorStore:
 
     def register_session(self, value: Any) -> tuple[dict[str, Any], bool]:
         session = _normalize_session_descriptor(value)
+        requested_session_id = session["session_id"]
         now = utc_now()
         with self._connection(immediate=True) as connection:
+            identity_owner = None
+            if session["provider_session_ref"] is not None:
+                identity_owner = connection.execute(
+                    """
+                    SELECT * FROM session_record
+                    WHERE provider = ? AND provider_session_ref = ?
+                    ORDER BY updated_at DESC, session_id
+                    LIMIT 1
+                    """,
+                    (session["provider"], session["provider_session_ref"]),
+                ).fetchone()
+            if identity_owner is not None:
+                session["session_id"] = str(identity_owner["session_id"])
             existing = connection.execute(
                 "SELECT * FROM session_record WHERE session_id = ?",
                 (session["session_id"],),
             ).fetchone()
             if existing is not None:
                 material = self._session_material(connection, existing)
-                comparable = {
-                    key: material[key]
-                    for key in (
-                        "node",
-                        "mode",
-                        "session_kind",
-                    )
-                }
-                requested = {key: session[key] for key in comparable}
-                if comparable != requested:
+                if material["session_kind"] != session["session_kind"]:
                     raise SessionSupervisorError(
                         "SESSION_IDENTITY_CONFLICT",
-                        "session_id is already bound to a different identity",
+                        "session_id is already bound to a different lifetime kind",
                         status=409,
                     )
                 provider_changed = (
@@ -474,12 +834,53 @@ class SessionSupervisorStore:
                     or material["provider_session_ref"]
                     != session["provider_session_ref"]
                 )
+                location_changed = any(
+                    (
+                        material.get("current_project_id") != session["project_id"],
+                        material["node"] != session["node"],
+                        material["mode"] != session["mode"],
+                        session["anchor_ref"] is not None
+                        and material.get("anchor_ref") != session["anchor_ref"],
+                    )
+                )
                 summary = session.get("bounded_summary")
+                alias = material.get("alias")
+                if session.get("alias"):
+                    alias = session["alias"]
+                elif alias == self._default_alias(material):
+                    alias = self._default_alias(session)
+                binding_ref = material.get("current_provider_binding_id")
+                if provider_changed:
+                    binding_ref = self._append_provider_binding(
+                        connection,
+                        session_id=session["session_id"],
+                        provider=session["provider"],
+                        provider_session_ref=session["provider_session_ref"],
+                        mode=session["mode"],
+                        now=now,
+                    )
+                if location_changed:
+                    self._append_location(
+                        connection,
+                        session_id=session["session_id"],
+                        project_id=session["project_id"],
+                        node=session["node"],
+                        mode=session["mode"],
+                        anchor_ref=session["anchor_ref"] or material.get("anchor_ref"),
+                        evidence_ref=session["location_evidence_ref"]
+                        or "observation://session-register",
+                        now=now,
+                    )
                 connection.execute(
                     """
                     UPDATE session_record
-                    SET provider = ?, provider_session_ref = ?,
+                    SET node = ?, mode = ?, current_project_id = ?,
+                        provider = ?, provider_session_ref = ?,
                         anchor_ref = COALESCE(?, anchor_ref),
+                        current_provider_binding_id = COALESCE(?, current_provider_binding_id),
+                        current_activity_state = COALESCE(?, current_activity_state),
+                        last_seen_at = COALESCE(?, last_seen_at, ?),
+                        alias = ?,
                         state = ?,
                         currentness = CASE
                             WHEN ? = 'UNKNOWN' THEN currentness
@@ -494,9 +895,17 @@ class SessionSupervisorStore:
                     WHERE session_id = ?
                     """,
                     (
+                        session["node"],
+                        session["mode"],
+                        session["project_id"],
                         session["provider"],
                         session["provider_session_ref"],
                         session["anchor_ref"],
+                        binding_ref,
+                        session["activity_state"],
+                        session["last_seen_at"],
+                        now,
+                        alias,
                         session["state"],
                         session["currentness"],
                         session["currentness"],
@@ -507,21 +916,6 @@ class SessionSupervisorStore:
                         session["session_id"],
                     ),
                 )
-                if provider_changed:
-                    connection.execute(
-                        """
-                        INSERT INTO session_binding_history(
-                            session_id, provider, provider_session_ref, mode, bound_at
-                        ) VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            session["session_id"],
-                            session["provider"],
-                            session["provider_session_ref"],
-                            session["mode"],
-                            now,
-                        ),
-                    )
                 self._event(
                     connection,
                     session_id=session["session_id"],
@@ -535,6 +929,10 @@ class SessionSupervisorStore:
                     details={
                         "source": "register_session_idempotent",
                         "provider_changed": provider_changed,
+                        "location_changed": location_changed,
+                        "requested_session_id": requested_session_id,
+                        "identity_reused": requested_session_id
+                        != session["session_id"],
                     },
                 )
                 row = connection.execute(
@@ -545,14 +943,25 @@ class SessionSupervisorStore:
                     return material, False
                 return self._session_material(connection, row), False
             alias = session["alias"] or self._default_alias(session)
+            binding_ref = self._history_ref(
+                "binding",
+                session["session_id"],
+                session["provider"],
+                session["provider_session_ref"],
+                now,
+            )
             connection.execute(
                 """
                 INSERT INTO session_record(
                     session_id, node, mode, provider, provider_session_ref,
                     anchor_ref, alias,
                     session_kind, state, currentness, bounded_summary,
+                    origin_provider, origin_provider_session_ref_hash,
+                    origin_workspace_key, origin_observed_at,
+                    current_project_id, current_activity_state, last_seen_at,
+                    current_provider_binding_id,
                     row_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     session["session_id"],
@@ -566,23 +975,43 @@ class SessionSupervisorStore:
                     session["state"],
                     session["currentness"],
                     session["bounded_summary"],
+                    session["provider"],
+                    self._hash_provider_ref(session["provider_session_ref"]),
+                    session["workspace_key"],
+                    now,
+                    session["project_id"],
+                    session["activity_state"],
+                    session["last_seen_at"] or now,
+                    binding_ref,
                     now,
                     now,
                 ),
             )
+            self._append_provider_binding(
+                connection,
+                session_id=session["session_id"],
+                provider=session["provider"],
+                provider_session_ref=session["provider_session_ref"],
+                mode=session["mode"],
+                now=now,
+            )
+            self._append_location(
+                connection,
+                session_id=session["session_id"],
+                project_id=session["project_id"],
+                node=session["node"],
+                mode=session["mode"],
+                anchor_ref=session["anchor_ref"],
+                evidence_ref=session["location_evidence_ref"]
+                or "observation://session-register",
+                now=now,
+            )
             connection.execute(
                 """
-                INSERT INTO session_binding_history(
-                    session_id, provider, provider_session_ref, mode, bound_at
-                ) VALUES (?, ?, ?, ?, ?)
+                INSERT INTO session_visibility(session_id, visibility, updated_at)
+                VALUES (?, 'VISIBLE', ?)
                 """,
-                (
-                    session["session_id"],
-                    session["provider"],
-                    session["provider_session_ref"],
-                    session["mode"],
-                    now,
-                ),
+                (session["session_id"], now),
             )
             self._event(
                 connection,
@@ -629,6 +1058,27 @@ class SessionSupervisorStore:
                 """,
                 (normalized_anchor, version + 1, now, normalized_id, version),
             )
+            current_location = connection.execute(
+                """
+                SELECT * FROM session_location_history
+                WHERE session_id = ? AND is_current = 1
+                """,
+                (normalized_id,),
+            ).fetchone()
+            self._append_location(
+                connection,
+                session_id=normalized_id,
+                project_id=(
+                    current_location["project_id"]
+                    if current_location is not None
+                    else row["current_project_id"]
+                ),
+                node=str(row["node"]),
+                mode=str(row["mode"]),
+                anchor_ref=normalized_anchor,
+                evidence_ref="observation://anchor-bind",
+                now=now,
+            )
             self._event(
                 connection,
                 session_id=normalized_id,
@@ -661,28 +1111,30 @@ class SessionSupervisorStore:
                     "SESSION_VERSION_CONFLICT", "session row version changed", status=409
                 )
             next_version = version + 1
+            binding_ref = self._append_provider_binding(
+                connection,
+                session_id=normalized_id,
+                provider=normalized_provider,
+                provider_session_ref=normalized_ref,
+                mode=str(row["mode"]),
+                now=now,
+            )
             connection.execute(
                 """
                 UPDATE session_record
-                SET provider = ?, provider_session_ref = ?, row_version = ?, updated_at = ?
+                SET provider = ?, provider_session_ref = ?,
+                    current_provider_binding_id = ?, row_version = ?, updated_at = ?
                 WHERE session_id = ? AND row_version = ?
                 """,
                 (
                     normalized_provider,
                     normalized_ref,
+                    binding_ref,
                     next_version,
                     now,
                     normalized_id,
                     version,
                 ),
-            )
-            connection.execute(
-                """
-                INSERT INTO session_binding_history(
-                    session_id, provider, provider_session_ref, mode, bound_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (normalized_id, normalized_provider, normalized_ref, row["mode"], now),
             )
             self._event(
                 connection,
@@ -690,6 +1142,126 @@ class SessionSupervisorStore:
                 event_type="PROVIDER_SESSION_BOUND",
                 state=row["state"],
                 details={"provider": normalized_provider},
+            )
+            return self._session_material(
+                connection, self._require_session(connection, normalized_id)
+            )
+
+    def bind_current_location(
+        self,
+        session_id: str,
+        *,
+        project_id: Any,
+        node: Any,
+        mode: Any,
+        anchor_ref: Any = None,
+        evidence_ref: Any,
+        expected_version: Any,
+    ) -> dict[str, Any]:
+        normalized_id = _required_text(session_id, "session_id")
+        normalized_project = _optional_text(project_id, "project_id")
+        normalized_node = _required_text(node, "node")
+        normalized_mode = _required_text(mode, "mode").upper()
+        normalized_anchor = _optional_text(anchor_ref, "anchor_ref")
+        normalized_evidence = _required_text(evidence_ref, "evidence_ref")
+        version = _non_negative_integer(expected_version, "expected_version")
+        now = utc_now()
+        with self._connection(immediate=True) as connection:
+            row = self._require_session(connection, normalized_id)
+            if int(row["row_version"]) != version:
+                raise SessionSupervisorError(
+                    "SESSION_VERSION_CONFLICT", "session row version changed", status=409
+                )
+            self._append_location(
+                connection,
+                session_id=normalized_id,
+                project_id=normalized_project,
+                node=normalized_node,
+                mode=normalized_mode,
+                anchor_ref=normalized_anchor,
+                evidence_ref=normalized_evidence,
+                now=now,
+            )
+            connection.execute(
+                """
+                UPDATE session_record
+                SET current_project_id = ?, node = ?, mode = ?,
+                    anchor_ref = COALESCE(?, anchor_ref), currentness = 'CURRENT',
+                    row_version = ?, updated_at = ?
+                WHERE session_id = ? AND row_version = ?
+                """,
+                (
+                    normalized_project,
+                    normalized_node,
+                    normalized_mode,
+                    normalized_anchor,
+                    version + 1,
+                    now,
+                    normalized_id,
+                    version,
+                ),
+            )
+            self._event(
+                connection,
+                session_id=normalized_id,
+                event_type="CURRENT_LOCATION_BOUND",
+                state=row["state"],
+                details={
+                    "project_id": normalized_project,
+                    "node": normalized_node,
+                    "mode": normalized_mode,
+                    "evidence_ref": normalized_evidence,
+                },
+            )
+            return self._session_material(
+                connection, self._require_session(connection, normalized_id)
+            )
+
+    def set_visibility(
+        self,
+        session_id: str,
+        *,
+        visibility: Any,
+        expected_version: Any,
+    ) -> dict[str, Any]:
+        normalized_id = _required_text(session_id, "session_id")
+        normalized_visibility = _required_text(visibility, "visibility").upper()
+        if normalized_visibility not in VISIBILITY_STATES:
+            raise SessionSupervisorError(
+                "SESSION_VISIBILITY_INVALID",
+                f"unsupported visibility: {normalized_visibility}",
+            )
+        version = _non_negative_integer(expected_version, "expected_version")
+        now = utc_now()
+        with self._connection(immediate=True) as connection:
+            row = self._require_session(connection, normalized_id)
+            if int(row["row_version"]) != version:
+                raise SessionSupervisorError(
+                    "SESSION_VERSION_CONFLICT", "session row version changed", status=409
+                )
+            connection.execute(
+                """
+                INSERT INTO session_visibility(session_id, visibility, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    visibility = excluded.visibility,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_id, normalized_visibility, now),
+            )
+            connection.execute(
+                """
+                UPDATE session_record SET row_version = ?, updated_at = ?
+                WHERE session_id = ? AND row_version = ?
+                """,
+                (version + 1, now, normalized_id, version),
+            )
+            self._event(
+                connection,
+                session_id=normalized_id,
+                event_type="SESSION_VISIBILITY_CHANGED",
+                state=row["state"],
+                details={"visibility": normalized_visibility},
             )
             return self._session_material(
                 connection, self._require_session(connection, normalized_id)
@@ -1282,7 +1854,11 @@ class SessionSupervisorStore:
             )
 
     def list_sessions(
-        self, *, node: str | None = None, mode: str | None = None
+        self,
+        *,
+        node: str | None = None,
+        mode: str | None = None,
+        include_hidden: bool = False,
     ) -> list[dict[str, Any]]:
         normalized_node = None if node is None else _required_text(node, "node")
         normalized_mode = (
@@ -1321,7 +1897,27 @@ class SessionSupervisorStore:
                     ORDER BY updated_at DESC, session_id
                     """
                 ).fetchall()
-            return [self._session_material(connection, row) for row in rows]
+            materials = [self._session_material(connection, row) for row in rows]
+            if include_hidden:
+                return materials
+            return [item for item in materials if item["visibility"] == "VISIBLE"]
+
+    def get_public_session(self, session_id: str) -> dict[str, Any]:
+        return self._public_session(self.get_session(session_id))
+
+    def list_public_sessions(
+        self,
+        *,
+        node: str | None = None,
+        mode: str | None = None,
+        include_hidden: bool = False,
+    ) -> list[dict[str, Any]]:
+        return [
+            self._public_session(item)
+            for item in self.list_sessions(
+                node=node, mode=mode, include_hidden=include_hidden
+            )
+        ]
 
     def purge_inactive_sessions(
         self,
@@ -1329,12 +1925,7 @@ class SessionSupervisorStore:
         keep_states: frozenset[str] | None = None,
         include_unknown: bool = True,
     ) -> dict[str, Any]:
-        """Delete Supervisor rows that are not actively LIVE/STARTING.
-
-        Keeps only sessions whose state is in keep_states (default LIVE+STARTING).
-        Clears default pointers and leases for removed sessions. Does not kill
-        processes. Mode-change / inject / boot may re-register coordinates.
-        """
+        """Hide inactive sessions while preserving canonical lifetime history."""
         keep = keep_states or frozenset({"LIVE", "STARTING"})
         invalid = keep - SESSION_STATES
         if invalid:
@@ -1363,24 +1954,20 @@ class SessionSupervisorStore:
                     continue
                 session_id = str(row["session_id"])
                 connection.execute(
-                    "DELETE FROM target_default_session WHERE session_id = ?",
-                    (session_id,),
+                    "DELETE FROM target_default_session WHERE session_id = ?", (session_id,)
                 )
                 connection.execute(
                     "DELETE FROM process_lease WHERE session_id = ?",
                     (session_id,),
                 )
                 connection.execute(
-                    "DELETE FROM session_binding_history WHERE session_id = ?",
-                    (session_id,),
-                )
-                connection.execute(
-                    "DELETE FROM supervisor_event WHERE session_id = ?",
-                    (session_id,),
-                )
-                connection.execute(
-                    "DELETE FROM session_record WHERE session_id = ?",
-                    (session_id,),
+                    """
+                    INSERT INTO session_visibility(session_id, visibility, updated_at)
+                    VALUES (?, 'HIDDEN', ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        visibility = 'HIDDEN', updated_at = excluded.updated_at
+                    """,
+                    (session_id, utc_now()),
                 )
                 removed.append(
                     {
@@ -1388,7 +1975,6 @@ class SessionSupervisorStore:
                         "node": row["node"],
                         "mode": row["mode"],
                         "provider": row["provider"],
-                        "provider_session_ref": row["provider_session_ref"],
                         "state": state,
                         "alias": row["alias"],
                         "updated_at": row["updated_at"],
@@ -1407,6 +1993,7 @@ class SessionSupervisorStore:
             )
         return {
             "status": "SESSIONS_PURGED",
+            "retention": "HIDDEN_APPEND_ONLY",
             "removed_count": len(removed),
             "kept_count": kept,
             "keep_states": sorted(keep),
@@ -1611,14 +2198,29 @@ class SessionSupervisorStore:
         ).fetchone()
         bindings = connection.execute(
             """
-            SELECT binding_id, provider, provider_session_ref, mode, bound_at
+            SELECT binding_id, binding_ref, provider, provider_session_ref,
+                   provider_session_ref_hash, mode, bound_at, ended_at, is_current
             FROM session_binding_history
             WHERE session_id = ? ORDER BY binding_id
             """,
             (row["session_id"],),
         ).fetchall()
+        locations = connection.execute(
+            """
+            SELECT location_ref, project_id, node, mode, anchor_ref, evidence_ref,
+                   started_at, ended_at, is_current
+            FROM session_location_history
+            WHERE session_id = ? ORDER BY location_id
+            """,
+            (row["session_id"],),
+        ).fetchall()
+        visibility = connection.execute(
+            "SELECT visibility, updated_at FROM session_visibility WHERE session_id = ?",
+            (row["session_id"],),
+        ).fetchone()
         return {
             "session_id": row["session_id"],
+            "universe_session_id": row["session_id"],
             "node": row["node"],
             "mode": row["mode"],
             "provider": row["provider"],
@@ -1629,6 +2231,19 @@ class SessionSupervisorStore:
             "state": row["state"],
             "currentness": row["currentness"],
             "bounded_summary": row["bounded_summary"],
+            "origin": {
+                "provider": row["origin_provider"],
+                "provider_session_ref_hash": row[
+                    "origin_provider_session_ref_hash"
+                ],
+                "workspace_key": row["origin_workspace_key"],
+                "observed_at": row["origin_observed_at"],
+            },
+            "current_project_id": row["current_project_id"],
+            "current_activity_state": row["current_activity_state"],
+            "last_seen_at": row["last_seen_at"],
+            "current_provider_binding_id": row["current_provider_binding_id"],
+            "visibility": "VISIBLE" if visibility is None else visibility["visibility"],
             "row_version": int(row["row_version"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1638,6 +2253,39 @@ class SessionSupervisorStore:
             ),
             "process_lease": cls._lease_material(lease),
             "binding_history": [dict(item) for item in bindings],
+            "location_history": [dict(item) for item in locations],
+        }
+
+    @staticmethod
+    def _public_session(session: Mapping[str, Any]) -> dict[str, Any]:
+        origin = dict(session.get("origin") or {})
+        current_location = next(
+            (
+                dict(item)
+                for item in reversed(list(session.get("location_history") or []))
+                if item.get("is_current")
+            ),
+            None,
+        )
+        return {
+            "schema": "universe.session.v1",
+            "universe_session_id": session["universe_session_id"],
+            "alias": session.get("alias"),
+            "session_kind": session.get("session_kind"),
+            "origin": {
+                "provider": origin.get("provider"),
+                "workspace_key": origin.get("workspace_key"),
+                "observed_at": origin.get("observed_at"),
+            },
+            "current_location": current_location,
+            "current_provider": session.get("provider"),
+            "current_activity_state": session.get("current_activity_state") or "UNKNOWN",
+            "state": session.get("state"),
+            "currentness": session.get("currentness"),
+            "last_seen_at": session.get("last_seen_at"),
+            "visibility": session.get("visibility") or "VISIBLE",
+            "row_version": session.get("row_version"),
+            "is_default": bool(session.get("is_default")),
         }
 
     @staticmethod
