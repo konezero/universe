@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=nav-dedupe-7">
+  <link rel="stylesheet" href="/styles.css?v=provider-chat-1">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -51,12 +51,18 @@
       <div id="project-list" class="project-list" role="listbox" aria-label="Projects"></div>
 
       <div class="rail-block session-block">
-        <div class="section-heading rail-subhead"><span>Session</span></div>
-        <button id="session-observatory-button" class="session-card" type="button" title="Open session observatory">
-          <strong>Universe Conductor</strong>
-          <small id="session-provider-line">Provider · AUTO</small>
-          <span class="session-dot" data-state="ready"></span>
-        </button>
+        <div class="section-heading rail-subhead">
+          <span>Provider Chats</span>
+          <button id="session-observatory-button" class="icon-button compact" type="button" title="Manage sessions" aria-label="Manage sessions">&#8943;</button>
+        </div>
+        <div class="session-rail-filters">
+          <input id="session-rail-search" type="search" placeholder="Search chats" aria-label="Search provider chats">
+          <label class="session-rail-worker-toggle" title="Show Task Frame workers">
+            <input id="session-rail-show-workers" type="checkbox">
+            <span>Workers</span>
+          </label>
+        </div>
+        <div id="session-rail-list" class="session-rail-list" aria-label="Provider chats"></div>
         <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
     </aside>
@@ -947,6 +953,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=provider-models-9" defer></script>
+  <script src="/app.js?v=provider-chat-1" defer></script>
 </body>
 </html>

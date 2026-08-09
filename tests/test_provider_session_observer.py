@@ -172,6 +172,78 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual("rollout-20260808", discovered[0]["provider_session_id"])
         self.assertNotIn("private", json.dumps(discovered))
 
+    def test_discovery_extracts_only_safe_provider_chat_metadata(self) -> None:
+        codex_home = self.root / "codex"
+        codex_path = codex_home / "sessions" / "2026" / "rollout-safe.jsonl"
+        codex_path.parent.mkdir(parents=True)
+        self.write(
+            codex_path,
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "codex-chat-001",
+                    "cwd": r"C:\workspace\universe",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {"parent_thread_id": "codex-parent-001"}
+                        }
+                    },
+                    "private_prompt": "must not escape",
+                },
+            },
+        )
+        codex = self.store.discover_sources("CODEX", home=codex_home)[0]
+        self.assertEqual("codex-chat-001", codex["provider_session_id"])
+        self.assertEqual(r"C:\workspace\universe", codex["workspace"])
+        self.assertEqual("WORKER", codex["session_kind"])
+        self.assertEqual("codex-parent-001", codex["parent_provider_session_id"])
+        self.assertNotIn("private_prompt", json.dumps(codex))
+        self.assertNotIn("must not escape", json.dumps(codex))
+
+        claude_home = self.root / "claude"
+        claude_path = claude_home / "projects" / "C--workspace-GCS" / "chat.jsonl"
+        claude_path.parent.mkdir(parents=True)
+        self.write(
+            claude_path,
+            {
+                "type": "queue-operation",
+                "sessionId": "claude-chat-001",
+                "cwd": r"C:\workspace\GCS",
+                "slug": "review-current-anchor",
+                "isSidechain": False,
+                "message": "private claude text",
+            },
+        )
+        claude = self.store.discover_sources("CLAUDE", home=claude_home)[0]
+        self.assertEqual("claude-chat-001", claude["provider_session_id"])
+        self.assertEqual("review-current-anchor", claude["display_name"])
+        self.assertEqual("CHAT", claude["session_kind"])
+        self.assertNotIn("private claude text", json.dumps(claude))
+
+        grok_home = self.root / "grok"
+        grok_path = (
+            grok_home
+            / "sessions"
+            / "C%3A%5Cworkspace%5Cuniverse-rendezvous"
+            / "grok-chat-folder"
+            / "updates.jsonl"
+        )
+        grok_path.parent.mkdir(parents=True)
+        self.write(
+            grok_path,
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "grok-chat-001",
+                    "private": "must stay provider-owned",
+                },
+            },
+        )
+        grok = self.store.discover_sources("GROK", home=grok_home)[0]
+        self.assertEqual("grok-chat-001", grok["provider_session_id"])
+        self.assertEqual(r"C:\workspace\universe-rendezvous", grok["workspace"])
+        self.assertNotIn("must stay provider-owned", json.dumps(grok))
+
 
 if __name__ == "__main__":
     unittest.main()

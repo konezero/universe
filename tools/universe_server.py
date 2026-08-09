@@ -195,6 +195,17 @@ PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 PROJECT_MASTER_STREAM_SCHEMA = "universe.project-master-stream-event.v1"
 PROJECT_ROOM_STREAM_SCHEMA = "universe.project-room-stream.v1"
+GOVERNANCE_APPROVAL_COMMANDS = frozenset(
+    {
+        "\uc2b9\uc778",
+        "\uc9c4\ud589",
+        "\uace0\uace0",
+        "\uc2b9\uc778\ud574",
+        "\uc9c4\ud589\ud574",
+        "\uace0\uace0\ud574",
+        "approve",
+    }
+)
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = (
     "universe.governance-proposal-decision.v1"
 )
@@ -13670,6 +13681,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     ) -> dict[str, Any]:
         """Add last-activity + short chat preview for Observatory disambiguation."""
         card = dict(session)
+        card.pop("provider_session_ref", None)
+        history = card.get("binding_history")
+        if isinstance(history, list):
+            card["binding_history"] = [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "provider_session_ref"
+                }
+                for item in history
+                if isinstance(item, Mapping)
+            ]
         node = str(session.get("node") or "")
         lease = session.get("process_lease") if isinstance(session.get("process_lease"), Mapping) else None
         lease_at = str((lease or {}).get("updated_at") or "") or None
@@ -13761,7 +13784,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             continuity.get("state") if isinstance(continuity, Mapping) else None
         )
         anchor_at = None
+        current_anchor_ref = str(session.get("anchor_ref") or "").strip()
         if isinstance(continuity_state, Mapping):
+            if not current_anchor_ref:
+                for key in ("current_anchor_ref", "anchor_ref", "anchor_id"):
+                    value = continuity_state.get(key)
+                    if isinstance(value, str) and value.strip():
+                        current_anchor_ref = value.strip()
+                        break
             for key in (
                 "observed_at",
                 "anchor_observed_at",
@@ -13779,6 +13809,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "anchor"
                 )
                 if isinstance(anchor, Mapping):
+                    if not current_anchor_ref:
+                        for key in ("current_anchor_ref", "anchor_ref", "anchor_id"):
+                            value = anchor.get(key)
+                            if isinstance(value, str) and value.strip():
+                                current_anchor_ref = value.strip()
+                                break
                     for key in ("observed_at", "updated_at", "entered_at"):
                         value = anchor.get(key)
                         if isinstance(value, str) and value.strip():
@@ -13795,13 +13831,42 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         card["last_activity_at"] = last_activity_at
         card["last_message_at"] = last_message_at
         card["last_anchor_at"] = anchor_at
+        current_anchor_ref = current_anchor_ref or "UNKNOWN"
+        anchor_identity = {
+            "project_id": node if node else None,
+            "node": node or "UNKNOWN",
+            "mode": str(session.get("mode") or "UNKNOWN"),
+            "current_anchor_ref": current_anchor_ref,
+        }
+        anchor_identity["anchor_key"] = "anchor_session_" + _json_sha256(
+            anchor_identity
+        )[:24]
+        anchor_alias = str(session.get("alias") or "").strip()
+        anchor_alias = re.sub(
+            r"\s+\|\s+(?:AUTO|CODEX|CLAUDE|GROK)\s*$",
+            "",
+            anchor_alias,
+            flags=re.IGNORECASE,
+        )
+        anchor_identity["alias"] = anchor_alias or " ".join(
+            dict.fromkeys(
+                value
+                for value in (anchor_identity["node"], anchor_identity["mode"])
+                if value and value != "UNKNOWN"
+            )
+        )
+        card["anchor_session"] = anchor_identity
+        card["transport"] = {
+            "provider": session.get("provider") or "UNKNOWN",
+            "state": session.get("state") or "UNKNOWN",
+            "currentness": session.get("currentness") or "UNKNOWN",
+        }
         card["identity"] = {
-            "session_id": session.get("session_id"),
-            "session_id_short": str(session.get("session_id") or "")[-8:] or None,
-            "provider_session_ref": session.get("provider_session_ref"),
-            "provider_ref_short": (
-                str(session.get("provider_session_ref") or "")[-8:] or None
-            ),
+            "anchor_key": anchor_identity["anchor_key"],
+            "project_id": anchor_identity["project_id"],
+            "node": anchor_identity["node"],
+            "mode": anchor_identity["mode"],
+            "current_anchor_ref": current_anchor_ref,
         }
         card["preview"] = {
             "source": preview_source,
@@ -13813,6 +13878,139 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             in {"MULTI_ROOM", "PROJECT_ROOM_DEFAULT"},
         }
         return card
+
+    def provider_chat_catalog(self) -> dict[str, Any]:
+        """Join provider-owned chat metadata to optional Universe bindings.
+
+        The catalog never returns source paths, provider transcript content, or
+        provider session identifiers. Those stay inside the local adapter and
+        are represented to the browser by an opaque chat key.
+        """
+        discovered: list[dict[str, Any]] = []
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            discovered.extend(self.store.discover_provider_session_sources(provider))
+
+        registered_sources = self.store.list_provider_session_sources()
+        registered_by_identity = {
+            (
+                str(source.get("provider") or "").upper(),
+                str(source.get("provider_session_id") or ""),
+                str(source.get("source_path") or ""),
+            ): source
+            for source in registered_sources
+        }
+        supervisor_sessions = self.session_supervisor.list_sessions()
+        rows_by_key: dict[str, dict[str, Any]] = {}
+        for source in discovered:
+            provider = str(source.get("provider") or "UNKNOWN").upper()
+            provider_session_id = str(source.get("provider_session_id") or "")
+            source_path = str(source.get("source_path") or "")
+            if not provider_session_id or not source_path:
+                continue
+            identity = {
+                "provider": provider,
+                "provider_session_id": provider_session_id,
+                "source_path": source_path,
+            }
+            chat_key = "provider_chat_" + _json_sha256(identity)[:24]
+            legacy_refs = {
+                provider_session_id,
+                Path(source_path).stem,
+                Path(source_path).parent.name,
+            }
+            matches = [
+                item
+                for item in supervisor_sessions
+                if str(item.get("provider") or "").upper() == provider
+                and str(item.get("provider_session_ref") or "") in legacy_refs
+            ]
+            matches.sort(
+                key=lambda item: (
+                    bool(item.get("is_default")),
+                    str(item.get("state") or "") in {"LIVE", "STARTING"},
+                    str(item.get("updated_at") or ""),
+                ),
+                reverse=True,
+            )
+            bound = matches[0] if matches else None
+            binding: dict[str, Any] = {"state": "UNBOUND"}
+            if bound is not None:
+                node = str(bound.get("node") or "UNKNOWN")
+                mode = str(bound.get("mode") or "UNKNOWN")
+                anchor_ref = str(bound.get("anchor_ref") or "UNKNOWN")
+                anchor_identity = {
+                    "project_id": node if node != "UNKNOWN" else None,
+                    "node": node,
+                    "mode": mode,
+                    "current_anchor_ref": anchor_ref,
+                }
+                binding = {
+                    "state": "BOUND",
+                    "node": node,
+                    "mode": mode,
+                    "alias": bound.get("alias"),
+                    "current_anchor_ref": anchor_ref,
+                    "anchor_key": "anchor_session_"
+                    + _json_sha256(anchor_identity)[:24],
+                    "supervisor_session_id": bound.get("session_id"),
+                    "transport_state": bound.get("state") or "UNKNOWN",
+                    "is_default": bool(bound.get("is_default")),
+                }
+
+            registered = registered_by_identity.get(
+                (provider, provider_session_id, source_path)
+            )
+            activities: list[dict[str, Any]] = []
+            if registered is not None:
+                activities = self.store.list_provider_session_activities(
+                    str(registered["source_id"])
+                )
+            latest_activity = activities[0] if activities else None
+            workspace = str(source.get("workspace") or "").strip() or None
+            row = {
+                "schema": "universe.provider-chat-room.v1",
+                "chat_key": chat_key,
+                "provider": provider,
+                "workspace": workspace,
+                "workspace_name": source.get("workspace_name")
+                or (Path(workspace).name if workspace else "Unknown workspace"),
+                "display_name": source.get("display_name") or "Untitled chat",
+                "session_kind": source.get("session_kind") or "CHAT",
+                "last_activity_at": (
+                    (latest_activity or {}).get("observed_at")
+                    or source.get("last_modified_at")
+                ),
+                "activity_state": (
+                    (latest_activity or {}).get("activity_state")
+                    or (binding.get("transport_state") if bound is not None else None)
+                    or "DISCOVERED"
+                ),
+                "registered": registered is not None,
+                "binding": binding,
+                "transcript_content": "EXCLUDED",
+            }
+            previous = rows_by_key.get(chat_key)
+            if previous is None or str(row.get("last_activity_at") or "") > str(
+                previous.get("last_activity_at") or ""
+            ):
+                rows_by_key[chat_key] = row
+
+        rooms = sorted(
+            rows_by_key.values(),
+            key=lambda item: (
+                str(item.get("last_activity_at") or ""),
+                str(item.get("chat_key") or ""),
+            ),
+            reverse=True,
+        )
+        return {
+            "schema": "universe.provider-chat-catalog.v1",
+            "status": "PROVIDER_CHAT_CATALOG_COLLECTED",
+            "observed_at": utc_now(),
+            "rooms": rooms,
+            "providers": ["CODEX", "CLAUDE", "GROK"],
+            "transcript_content": "EXCLUDED",
+        }
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
@@ -14004,6 +14202,78 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.publish_project_room_changed(project_id)
         return message, created
 
+    def handle_project_room_input(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        body = str(request.get("body") or "").strip()
+        sender = str(request.get("sender") or "UNIVERSE_CONDUCTOR").upper()
+        kind = str(request.get("kind") or "QUESTION").upper()
+        is_commander_approval = (
+            sender == "UNIVERSE_CONDUCTOR"
+            and kind == "QUESTION"
+            and body.casefold() in GOVERNANCE_APPROVAL_COMMANDS
+        )
+        if not is_commander_approval:
+            message, created = self.send_project_room_message(project_id, value)
+            return {
+                "status": (
+                    "PROJECT_ROOM_MESSAGE_RECORDED"
+                    if created
+                    else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED"
+                ),
+                "message": message,
+                "governance_decision": None,
+            }
+
+        project = self.store.get_project(project_id)
+        message, created = self.store.create_room_message(
+            project["project_id"],
+            value,
+            delivery_state="RECORDED",
+        )
+        pending = [
+            proposal
+            for proposal in self.list_project_governance_proposals(
+                project["project_id"]
+            )
+            if proposal.get("state") == "PROPOSED"
+        ]
+        if len(pending) != 1:
+            self.publish_project_room_changed(project["project_id"])
+            return {
+                "status": (
+                    "GOVERNANCE_APPROVAL_SELECTION_REQUIRED"
+                    if len(pending) > 1
+                    else "GOVERNANCE_APPROVAL_NOT_PENDING"
+                ),
+                "message": message,
+                "governance_decision": None,
+                "pending_proposals": pending,
+            }
+
+        proposal = pending[0]
+        result = self.decide_project_governance_proposal(
+            project["project_id"],
+            proposal["proposal_id"],
+            {
+                "decision": "APPROVE",
+                "proposal_digest": proposal["proposal_digest"],
+                "source": "NATURAL_LANGUAGE",
+                "commander_surface": "UNIVERSE_UI",
+                "idempotency_key": "commander-text:" + message["message_id"],
+            },
+        )
+        self.publish_project_room_changed(project["project_id"])
+        return {
+            "status": "GOVERNANCE_PROPOSAL_APPROVED_FROM_COMMANDER_TEXT",
+            "message": message,
+            "governance_decision": result,
+            "pending_proposals": [],
+        }
+
     def _observe_project_master_completion(self, event: Mapping[str, Any]) -> None:
         project_id = event.get("project_id")
         message_id = event.get("message_id")
@@ -14142,6 +14412,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "commander_surface": decision["commander_surface"],
             "evidence_ref": decision["evidence_ref"],
             "source": decision["source"],
+            "approval_scope": "PRIMARY_TASK_PROPOSAL_AND_UNCHANGED_DESCENDANT_TASK_FRAMES",
+            "descendant_task_frame_policy": {
+                "approval_state": "INHERITED",
+                "commander_reapproval_required": False,
+                "inherit_evidence_ref": decision["evidence_ref"],
+                "parent_proposal_id": proposal["proposal_id"],
+                "parent_proposal_digest": proposal["proposal_digest"],
+                "scope_change_requires_new_primary_proposal": True,
+            },
         }
         message, _created_message = self.send_project_room_message(
             project["project_id"],
@@ -14949,6 +15228,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "sources": sources,
                 },
             )
+            return
+        if path == "/v1/session-observer/chat-rooms":
+            try:
+                self._send(HTTPStatus.OK, self.server.provider_chat_catalog())
+            except UniverseError as error:
+                self._send_error(error)
             return
         if path == "/v1/session-observer/discover":
             if not self._authorize_local_operator():
@@ -16489,15 +16774,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/room/messages":
-                message, created = self.server.send_project_room_message(parts[0], body)
+                result = self.server.handle_project_room_input(parts[0], body)
                 self._send(
-                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    (
+                        HTTPStatus.CREATED
+                        if result["status"] == "PROJECT_ROOM_MESSAGE_RECORDED"
+                        else HTTPStatus.OK
+                    ),
                     {
                         "schema": API_SCHEMA,
-                        "status": "PROJECT_ROOM_MESSAGE_RECORDED"
-                        if created
-                        else "PROJECT_ROOM_MESSAGE_ALREADY_RECORDED",
-                        "message": message,
+                        **result,
                     },
                 )
                 return
@@ -17547,6 +17833,183 @@ def request_json(
     return transport.request_json(method=method, path=path, payload=payload)
 
 
+PROJECT_INSTALL_BINDING_SCHEMA = "universe.install-binding.v1"
+WORK_PREFLIGHT_SCHEMA = "universe.project-work-preflight.v1"
+
+
+def _load_json_object(path: Path, *, code: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise UniverseError(code, str(error)) from error
+    if not isinstance(value, dict):
+        raise UniverseError(code, f"{path} must contain a JSON object")
+    return value
+
+
+def _project_id_from_work_root(project_root: Path, requested_project_id: str) -> str:
+    if requested_project_id.strip():
+        return _project_id(requested_project_id)
+    for relative_path in (
+        Path(".ai") / "universe" / "install_binding.json",
+        Path(".universe") / "project.json",
+    ):
+        path = project_root / relative_path
+        if not path.is_file() or path.is_symlink():
+            continue
+        value = _load_json_object(
+            path,
+            code="PROJECT_WORK_BINDING_INVALID",
+        )
+        candidate = value.get("project_id")
+        if isinstance(candidate, str) and candidate.strip():
+            return _project_id(candidate)
+    raise UniverseError(
+        "PROJECT_ID_REQUIRED",
+        "pass --project-id or add .universe/project.json before universe work",
+    )
+
+
+def resolve_project_work_preflight(
+    *,
+    project_root: Path,
+    project_id: str,
+    endpoint: str,
+    token: str,
+) -> tuple[int, dict[str, Any]]:
+    """Inspect the host and attachment state without mutating a Project.
+
+    This is the first half of the documented ``universe work`` path. It never
+    registers, installs, or applies an integration proposal: callers receive
+    the exact next operation and must obtain the applicable approval separately.
+    """
+
+    root = project_root.expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise UniverseError("PROJECT_ROOT_INVALID", "project_root must be a directory")
+    normalized_project_id = _project_id_from_work_root(root, project_id)
+
+    health_status, health = request_json(
+        endpoint=endpoint,
+        token=token,
+        method="GET",
+        path="/health",
+    )
+    if not 200 <= health_status < 300 or health.get("status") != "READY":
+        return health_status, {
+            "schema": WORK_PREFLIGHT_SCHEMA,
+            "status": "UNIVERSE_HOST_NOT_READY",
+            "project_id": normalized_project_id,
+            "project_root": str(root),
+            "host": {"endpoint": endpoint, "health": health},
+            "next_operation": "ENSURE_UNIVERSE_HOST",
+            "effects": {"project_source_write": "NONE", "runtime_write": "NONE"},
+        }
+
+    install_binding_path = root / ".ai" / "universe" / "install_binding.json"
+    install_binding: dict[str, Any] | None = None
+    if install_binding_path.is_file() and not install_binding_path.is_symlink():
+        install_binding = _load_json_object(
+            install_binding_path,
+            code="PROJECT_WORK_INSTALL_BINDING_INVALID",
+        )
+        if install_binding.get("schema") != PROJECT_INSTALL_BINDING_SCHEMA:
+            raise UniverseError(
+                "PROJECT_WORK_INSTALL_BINDING_INVALID",
+                "install_binding.json has an unsupported schema",
+            )
+        if _project_id(str(install_binding.get("project_id") or "")) != normalized_project_id:
+            raise UniverseError(
+                "PROJECT_WORK_PROJECT_ID_MISMATCH",
+                "install binding project_id does not match the selected Project",
+            )
+
+    proposal_status, proposal = request_json(
+        endpoint=endpoint,
+        token=token,
+        method="GET",
+        path=(
+            "/v1/projects/"
+            + quote(normalized_project_id, safe="")
+            + "/integration-template-proposal"
+        ),
+    )
+    runtime_manifest = (
+        root / ".ai" / "runtime" / "project_instance" / "DISTRIBUTION_MANIFEST.json"
+    )
+    response: dict[str, Any] = {
+        "schema": WORK_PREFLIGHT_SCHEMA,
+        "project_id": normalized_project_id,
+        "project_root": str(root),
+        "host": {
+            "endpoint": endpoint,
+            "status": health.get("status"),
+            "universe": health.get("universe"),
+        },
+        "runtime_installation": (
+            "INSTALLED_CAREER_RUNTIME"
+            if runtime_manifest.is_file() and not runtime_manifest.is_symlink()
+            else "MISSING_CAREER_RUNTIME"
+        ),
+        "install_binding": {
+            "status": "PRESENT" if install_binding is not None else "MISSING",
+            "path": ".ai/universe/install_binding.json",
+            "install_mode": (
+                install_binding.get("install_mode") if install_binding else "UNIVERSE_ATTACHED"
+            ),
+            "prefer_boot": (
+                install_binding.get("prefer_boot") if install_binding else "HOST"
+            ),
+        },
+        "effects": {"project_source_write": "NONE", "runtime_write": "NONE"},
+    }
+    if proposal_status == HTTPStatus.NOT_FOUND:
+        response.update(
+            {
+                "status": "PROJECT_REGISTRATION_REQUIRED",
+                "next_operation": "REGISTER_PROJECT_THROUGH_UNIVERSE",
+                "detail": proposal.get("detail", "Project is not registered in Universe"),
+            }
+        )
+        return HTTPStatus.OK, response
+    if not 200 <= proposal_status < 300:
+        return proposal_status, proposal
+
+    response["integration_proposal"] = {
+        "proposal_id": proposal.get("proposal_id"),
+        "proposal_digest": proposal.get("proposal_digest"),
+        "asset_count": len(proposal.get("assets") or []),
+        "apply_contract": proposal.get("apply_contract"),
+    }
+    if response["runtime_installation"] == "MISSING_CAREER_RUNTIME":
+        response.update(
+            {
+                "status": "CAREER_OS_INSTALL_REQUIRED",
+                "next_operation": "INSTALL_CAREER_RUNTIME_THROUGH_RELEASE_LIFECYCLE",
+            }
+        )
+    elif install_binding is None:
+        response.update(
+            {
+                "status": "PROJECT_INTEGRATION_APPROVAL_REQUIRED",
+                "next_operation": "APPROVE_EXACT_PROJECT_INTEGRATION_PROPOSAL",
+            }
+        )
+    else:
+        response.update(
+            {
+                "status": "UNIVERSE_WORK_READY",
+                "next_operation": "WORK_WITH_UNIVERSE_HOST",
+                "work_context": {
+                    "cwd": str(root),
+                    "project_id": normalized_project_id,
+                    "host_endpoint": endpoint,
+                },
+            }
+        )
+    return HTTPStatus.OK, response
+
+
 def supervisor_session_id_for(
     *,
     node: str,
@@ -17554,13 +18017,12 @@ def supervisor_session_id_for(
     provider: str,
     provider_session_ref: str,
 ) -> str:
-    """Stable Supervisor session_id from (node, mode, provider, provider_session_ref)."""
+    """Stable Anchor Session identity; provider coordinates are replaceable transport."""
+    del provider, provider_session_ref
     material = json.dumps(
         {
             "node": node,
             "mode": mode,
-            "provider": provider,
-            "provider_session_ref": provider_session_ref,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -17650,11 +18112,9 @@ def perform_session_ref_inject(
     if str(body.get("alias") or "").strip():
         normalized_alias = str(body.get("alias")).strip()
     elif normalized_node == normalized_mode:
-        normalized_alias = f"{normalized_node} | {normalized_provider}"
+        normalized_alias = normalized_node
     else:
-        normalized_alias = (
-            f"{normalized_node} {normalized_mode} | {normalized_provider}"
-        )
+        normalized_alias = f"{normalized_node} {normalized_mode}"
     make_default_raw = body.get("make_default")
     if make_default_raw is None:
         make_default = slot_role == "MASTER" and room_type == "PROJECT"
@@ -17826,11 +18286,9 @@ def attach_supervisor_session(
     if str(alias or "").strip():
         normalized_alias = str(alias).strip()
     elif normalized_node == normalized_mode:
-        normalized_alias = f"{normalized_node} | {normalized_provider}"
+        normalized_alias = normalized_node
     else:
-        normalized_alias = (
-            f"{normalized_node} {normalized_mode} | {normalized_provider}"
-        )
+        normalized_alias = f"{normalized_node} {normalized_mode}"
     profile = local_connection_profile(endpoint)
     supervisor_transport = HttpUniverseTransport(
         profile,
@@ -18332,6 +18790,16 @@ def parser() -> argparse.ArgumentParser:
     register.add_argument("--token", default="")
     register.add_argument("--state-file", type=Path, default=default_state_path())
 
+    work = commands.add_parser(
+        "work",
+        help="Inspect the Universe host and Project attachment before work (no writes)",
+    )
+    work.add_argument("project_root", nargs="?", type=Path, default=Path.cwd())
+    work.add_argument("--project-id", default="")
+    work.add_argument("--endpoint", default="")
+    work.add_argument("--token", default="")
+    work.add_argument("--state-file", type=Path, default=default_state_path())
+
     list_command = commands.add_parser("list")
     list_command.add_argument("--endpoint", default="")
     list_command.add_argument("--token", default="")
@@ -18613,6 +19081,13 @@ def main() -> int:
                         "refs": DEFAULT_REFS,
                     },
                 )
+            elif args.command == "work":
+                status, result = resolve_project_work_preflight(
+                    project_root=args.project_root,
+                    project_id=args.project_id,
+                    endpoint=endpoint,
+                    token=token,
+                )
             elif args.command == "publish-skill-observation":
                 status, result = publish_skill_observation(
                     project_id=args.project_id,
@@ -18636,6 +19111,8 @@ def main() -> int:
                     endpoint=endpoint, token=token, method="GET", path="/v1/projects"
                 )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        if args.command == "work":
+            return 0 if result.get("status") == "UNIVERSE_WORK_READY" else 2
         return 0 if 200 <= status < 300 else 1
     except (UniverseError, OSError, sqlite3.Error) as error:
         code = error.code if isinstance(error, UniverseError) else "SERVICE_FAILURE"

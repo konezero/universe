@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
+from urllib.parse import unquote
 
 
 OBSERVER_SCHEMA = "universe.provider-session-observer.v1"
@@ -27,6 +28,8 @@ SOURCE_KINDS = {
     "CLAUDE": "CLAUDE_SESSION_JSONL",
     "GROK": "GROK_UPDATES_JSONL",
 }
+METADATA_READ_LIMIT = 256 * 1024
+METADATA_LINE_LIMIT = 192
 
 
 class ProviderSessionObserverError(ValueError):
@@ -111,6 +114,123 @@ def _event_id(event: Mapping[str, Any], fallback: str) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()[:256]
     return fallback
+
+
+def _safe_metadata_text(value: Any, *, limit: int = 512) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
+
+
+def _workspace_fallback(provider: str, path: Path) -> str | None:
+    if provider == "GROK" and len(path.parents) >= 2:
+        return unquote(path.parents[1].name)
+    if provider == "CLAUDE":
+        encoded = unquote(path.parent.name)
+        if len(encoded) >= 3 and encoded[1:3] == "--":
+            # Claude's project directory is only a fallback. A cwd field read
+            # from bounded metadata wins because '-' is ambiguous here.
+            decoded_path = encoded[3:].replace("-", "\\")
+            return f"{encoded[0]}:\\{decoded_path}"
+    return None
+
+
+def _bounded_session_metadata(provider: str, path: Path) -> dict[str, Any]:
+    """Read only provider identity metadata from a bounded JSONL prefix.
+
+    Prompt, response, tool input, command, and message bodies are deliberately
+    ignored. Discovery remains advisory: malformed or rotating files fall back
+    to path-derived identity instead of breaking the chat catalog.
+    """
+    metadata: dict[str, Any] = {
+        "provider_session_id": path.parent.name if provider == "GROK" else path.stem,
+        "workspace": _workspace_fallback(provider, path),
+        "display_name": None,
+        "session_kind": "CHAT",
+        "parent_provider_session_id": None,
+    }
+    consumed = 0
+    try:
+        with path.open("rb") as handle:
+            for index, raw_line in enumerate(handle):
+                consumed += len(raw_line)
+                if index >= METADATA_LINE_LIMIT or consumed > METADATA_READ_LIMIT:
+                    break
+                try:
+                    event = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, Mapping):
+                    continue
+                if provider == "CODEX" and event.get("type") == "session_meta":
+                    payload = event.get("payload")
+                    if not isinstance(payload, Mapping):
+                        continue
+                    metadata["provider_session_id"] = (
+                        _safe_metadata_text(payload.get("id"), limit=256)
+                        or _safe_metadata_text(payload.get("session_id"), limit=256)
+                        or metadata["provider_session_id"]
+                    )
+                    metadata["workspace"] = (
+                        _safe_metadata_text(payload.get("cwd")) or metadata["workspace"]
+                    )
+                    metadata["display_name"] = _safe_metadata_text(
+                        payload.get("title") or payload.get("slug"), limit=160
+                    )
+                    source = payload.get("source")
+                    if isinstance(source, Mapping) and isinstance(
+                        source.get("subagent"), Mapping
+                    ):
+                        metadata["session_kind"] = "WORKER"
+                        subagent = source["subagent"]
+                        spawn = subagent.get("thread_spawn")
+                        if isinstance(spawn, Mapping):
+                            metadata["parent_provider_session_id"] = _safe_metadata_text(
+                                spawn.get("parent_thread_id"), limit=256
+                            )
+                    break
+                if provider == "CLAUDE":
+                    metadata["provider_session_id"] = (
+                        _safe_metadata_text(event.get("sessionId"), limit=256)
+                        or metadata["provider_session_id"]
+                    )
+                    metadata["workspace"] = (
+                        _safe_metadata_text(event.get("cwd")) or metadata["workspace"]
+                    )
+                    metadata["display_name"] = (
+                        _safe_metadata_text(event.get("slug"), limit=160)
+                        or metadata["display_name"]
+                    )
+                    if event.get("isSidechain") is True or _safe_metadata_text(
+                        event.get("agentId"), limit=256
+                    ):
+                        metadata["session_kind"] = "WORKER"
+                    if (
+                        metadata["workspace"]
+                        and metadata["display_name"]
+                        and metadata["provider_session_id"] != path.stem
+                    ):
+                        break
+                if provider == "GROK":
+                    params = event.get("params")
+                    if isinstance(params, Mapping):
+                        metadata["provider_session_id"] = (
+                            _safe_metadata_text(params.get("sessionId"), limit=256)
+                            or metadata["provider_session_id"]
+                        )
+                        if metadata["provider_session_id"] != path.parent.name:
+                            break
+    except OSError:
+        pass
+    workspace = _safe_metadata_text(metadata.get("workspace"))
+    metadata["workspace"] = workspace
+    metadata["workspace_name"] = Path(workspace).name if workspace else "Unknown workspace"
+    metadata["display_name"] = (
+        _safe_metadata_text(metadata.get("display_name"), limit=160)
+        or metadata["workspace_name"]
+    )
+    return metadata
 
 
 class ProviderSessionObserverStore:
@@ -259,7 +379,7 @@ class ProviderSessionObserverStore:
     def discover_sources(
         self, provider: str, *, home: Path | None = None
     ) -> list[dict[str, Any]]:
-        """Return local source metadata without opening any transcript file."""
+        """Return redacted local chat metadata from known provider paths."""
         normalized_provider = _text(provider, "provider").upper()
         if normalized_provider not in PROVIDERS:
             raise ProviderSessionObserverError(
@@ -288,21 +408,27 @@ class ProviderSessionObserverStore:
         for path, modified_at in sorted(
             file_paths, key=lambda item: item[1], reverse=True
         )[:200]:
-            provider_session_id = (
-                path.parent.name if normalized_provider == "GROK" else path.stem
-            )
+            metadata = _bounded_session_metadata(normalized_provider, path)
             candidates.append(
                 {
                     "schema": SOURCE_SCHEMA,
                     "status": "DISCOVERED",
                     "provider": normalized_provider,
-                    "provider_session_id": provider_session_id,
+                    "provider_session_id": metadata["provider_session_id"],
                     "source_path": str(path.resolve()),
                     "source_kind": SOURCE_KINDS[normalized_provider],
                     "source_version": "v1",
                     "last_modified_at": datetime.fromtimestamp(modified_at, tz=timezone.utc)
                     .isoformat()
                     .replace("+00:00", "Z"),
+                    "workspace": metadata["workspace"],
+                    "workspace_name": metadata["workspace_name"],
+                    "display_name": metadata["display_name"],
+                    "session_kind": metadata["session_kind"],
+                    "parent_provider_session_id": metadata[
+                        "parent_provider_session_id"
+                    ],
+                    "transcript_content": "EXCLUDED",
                 }
             )
         return candidates

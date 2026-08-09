@@ -52,10 +52,108 @@ from universe_server import (  # noqa: E402
     publish_skill_observation,
     prepare_skill_observation_archive,
     require_release_lifecycle_mode,
+    resolve_project_work_preflight,
     resolve_universe_mode_intent,
+    parser,
     universe_mode_contract,
     write_server_state,
 )
+
+
+class UniverseWorkPreflightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "project"
+        self.root.mkdir()
+        (self.root / ".universe").mkdir()
+        (self.root / ".universe" / "project.json").write_text(
+            json.dumps({"project_id": "GCS"}), encoding="utf-8"
+        )
+        self.endpoint = "http://127.0.0.1:41999"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _responses(self) -> list[tuple[int, dict[str, Any]]]:
+        return [
+            (200, {"status": "READY", "universe": {"universe_id": "test"}}),
+            (
+                200,
+                {
+                    "proposal_id": "project_integration_test",
+                    "proposal_digest": "a" * 64,
+                    "assets": [{"target_path": ".universe/project.json"}],
+                    "apply_contract": {"execution": "NOT_STARTED"},
+                },
+            ),
+        ]
+
+    def test_work_preflight_requires_career_runtime_before_apply(self) -> None:
+        with patch("universe_server.request_json", side_effect=self._responses()):
+            status, result = resolve_project_work_preflight(
+                project_root=self.root,
+                project_id="",
+                endpoint=self.endpoint,
+                token="token",
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("CAREER_OS_INSTALL_REQUIRED", result["status"])
+        self.assertEqual("NONE", result["effects"]["project_source_write"])
+
+    def test_work_preflight_requires_exact_integration_approval_when_binding_missing(
+        self,
+    ) -> None:
+        manifest = self.root / ".ai" / "runtime" / "project_instance"
+        manifest.mkdir(parents=True)
+        (manifest / "DISTRIBUTION_MANIFEST.json").write_text("{}\n", encoding="utf-8")
+
+        with patch("universe_server.request_json", side_effect=self._responses()):
+            status, result = resolve_project_work_preflight(
+                project_root=self.root,
+                project_id="GCS",
+                endpoint=self.endpoint,
+                token="token",
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_INTEGRATION_APPROVAL_REQUIRED", result["status"])
+        self.assertEqual(1, result["integration_proposal"]["asset_count"])
+
+    def test_work_preflight_is_ready_for_matching_installed_binding(self) -> None:
+        instance = self.root / ".ai" / "runtime" / "project_instance"
+        instance.mkdir(parents=True)
+        (instance / "DISTRIBUTION_MANIFEST.json").write_text("{}\n", encoding="utf-8")
+        binding = self.root / ".ai" / "universe"
+        binding.mkdir(parents=True)
+        (binding / "install_binding.json").write_text(
+            json.dumps(
+                {
+                    "schema": "universe.install-binding.v1",
+                    "project_id": "GCS",
+                    "install_mode": "UNIVERSE_ATTACHED",
+                    "prefer_boot": "HOST",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("universe_server.request_json", side_effect=self._responses()):
+            status, result = resolve_project_work_preflight(
+                project_root=self.root,
+                project_id="",
+                endpoint=self.endpoint,
+                token="token",
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("UNIVERSE_WORK_READY", result["status"])
+        self.assertEqual(str(self.root.resolve()), result["work_context"]["cwd"])
+
+    def test_work_command_is_registered(self) -> None:
+        args = parser().parse_args(["work", str(self.root), "--project-id", "GCS"])
+        self.assertEqual("work", args.command)
+        self.assertEqual("GCS", args.project_id)
 
 
 class UniverseLocalServiceTests(unittest.TestCase):
@@ -713,7 +811,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PROJECT_INTEGRATION_CATALOG_READY", result["status"])
         self.assertEqual("LOCAL_ONLY", result["project_binding"]["workspace_tracking"])
         self.assertEqual("NONE", result["effects"]["project_source_write"])
-        self.assertEqual(4, len(result["templates"]))
+        self.assertEqual(5, len(result["templates"]))
 
     def test_project_integration_proposal_is_project_bound_and_non_executing(self) -> None:
         self.server.store.register_project(self.registration())
@@ -726,7 +824,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("GCS", result["project_id"])
         self.assertEqual("PROPOSED", result["effects"]["project_source_write"])
         self.assertEqual("NOT_STARTED", result["apply_contract"]["execution"])
-        self.assertEqual(4, len(result["assets"]))
+        self.assertEqual(5, len(result["assets"]))
 
     def test_provider_session_observer_api_projects_redacted_activity(self) -> None:
         rollout = self.temp_root / "rollout-observer.jsonl"
@@ -854,6 +952,75 @@ class UniverseLocalServiceTests(unittest.TestCase):
         maintenance = self.server.run_supervisor_maintenance_once(idle_seconds=0)
         self.assertIn("provider_activity", maintenance)
         self.assertEqual(1, len(maintenance["provider_activity"]))
+
+    def test_provider_chat_catalog_lists_all_vendors_and_joins_optional_binding(
+        self,
+    ) -> None:
+        status, _ = self.request(
+            "POST",
+            "/v1/supervisor/sessions",
+            {
+                "session_id": "session-gcs-master",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-chat-001",
+                "anchor_ref": "MASTER-CURRENT-GCS-001",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+
+        def discovered(provider: str) -> list[dict[str, Any]]:
+            session_id = {
+                "CODEX": "codex-chat-001",
+                "CLAUDE": "claude-chat-001",
+                "GROK": "grok-chat-001",
+            }[provider]
+            return [
+                {
+                    "schema": "universe.provider-session-source.v1",
+                    "status": "DISCOVERED",
+                    "provider": provider,
+                    "provider_session_id": session_id,
+                    "source_path": str(self.temp_root / provider / "chat.jsonl"),
+                    "source_kind": f"{provider}_SESSION_JSONL",
+                    "source_version": "v1",
+                    "last_modified_at": "2026-08-09T00:00:00Z",
+                    "workspace": f"C:\\workspace\\{provider.lower()}",
+                    "workspace_name": provider.lower(),
+                    "display_name": f"{provider.title()} chat",
+                    "session_kind": "CHAT",
+                    "parent_provider_session_id": None,
+                    "transcript_content": "EXCLUDED",
+                }
+            ]
+
+        with patch.object(
+            self.server.store,
+            "discover_provider_session_sources",
+            side_effect=discovered,
+        ):
+            status, catalog = self.request(
+                "GET", "/v1/session-observer/chat-rooms"
+            )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            {"CODEX", "CLAUDE", "GROK"},
+            {room["provider"] for room in catalog["rooms"]},
+        )
+        codex = next(room for room in catalog["rooms"] if room["provider"] == "CODEX")
+        self.assertEqual("BOUND", codex["binding"]["state"])
+        self.assertEqual("GCS", codex["binding"]["node"])
+        self.assertEqual("MASTER-CURRENT-GCS-001", codex["binding"]["current_anchor_ref"])
+        claude = next(
+            room for room in catalog["rooms"] if room["provider"] == "CLAUDE"
+        )
+        self.assertEqual("UNBOUND", claude["binding"]["state"])
+        rendered = json.dumps(catalog)
+        self.assertNotIn("provider_session_id", rendered)
+        self.assertNotIn("source_path", rendered)
+        self.assertEqual("EXCLUDED", catalog["transcript_content"])
 
     def test_linked_project_master_result_advances_only_its_todo(self) -> None:
         self.server.store.register_project(self.registration())
@@ -1002,6 +1169,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="session-observatory-dialog"', body)
             self.assertIn('id="session-observatory-topbar-button"', body)
             self.assertIn('id="session-observatory-list"', body)
+            self.assertIn('id="session-rail-list"', body)
+            self.assertIn('id="session-rail-search"', body)
+            self.assertIn('id="session-rail-show-workers"', body)
+            self.assertIn("Provider Chats", body)
+            self.assertIn("provider-chat-1", body)
             self.assertIn('id="runtime-audit-grid"', body)
             self.assertIn('id="legacy-executor-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
@@ -1030,6 +1202,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("group_by=worker", script)
             self.assertIn("renderRuntimePreflight", script)
             self.assertIn("renderRuntimeAudit", script)
+            self.assertIn("renderSessionRail", script)
+            self.assertIn("/v1/session-observer/chat-rooms", script)
+            self.assertIn("providerChatShowWorkers", script)
+            self.assertIn("currentAnchorLabel", script)
+            self.assertIn("dedupeRoomMessages", script)
+            self.assertIn('(?:AUTO|CODEX|CLAUDE|GROK)', script)
             self.assertIn("/v1/settings/remote-access", script)
             self.assertIn("renderRemoteAccessSettings", script)
             self.assertIn("SSH_REVERSE_TUNNEL", script)
@@ -1048,6 +1226,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("refreshSupervisorSessions", script)
             self.assertIn("/v1/supervisor/legacy-executors", script)
             self.assertNotIn(self.token, script)
+        with urlopen(self.endpoint + "/styles.css", timeout=5) as response:
+            styles = response.read().decode("utf-8")
+            self.assertEqual(200, response.status)
+            self.assertIn(
+                ".app-shell.mockup-shell > .status-bar { grid-column: 1; grid-row: 4; }",
+                styles,
+            )
 
     def test_remote_access_control_is_local_operator_only(self) -> None:
         status, current = self.request("GET", "/v1/settings/remote-access")
@@ -1336,6 +1521,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "mode": "MASTER",
                 "provider": "CODEX",
                 "provider_session_ref": "provider-session-1",
+                "anchor_ref": "MASTER-CURRENT-GCS-001",
             },
             self.token,
         )
@@ -1387,6 +1573,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("UNKNOWN", sessions["sessions"][0]["state"])
         self.assertTrue(sessions["sessions"][0]["is_default"])
+
+        status, audit = self.request("GET", "/v1/runtime/audit", token=self.token)
+        self.assertEqual(HTTPStatus.OK, status)
+        card = next(
+            item for item in audit["sessions"] if item["session_id"] == "session-gcs-master"
+        )
+        self.assertEqual(
+            "MASTER-CURRENT-GCS-001",
+            card["anchor_session"]["current_anchor_ref"],
+        )
+        self.assertEqual("GCS MASTER", card["anchor_session"]["alias"])
+        self.assertNotIn("session_id", card["identity"])
+        self.assertNotIn("provider_session_ref", card["identity"])
+        self.assertNotIn("provider_session_ref", card)
 
         status, aliased = self.request(
             "POST",
@@ -2948,6 +3148,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "universe.project-master-governance-approval.v1",
             approved["message"]["body"],
         )
+        packet = json.loads(approved["message"]["body"].splitlines()[-1])
+        self.assertFalse(
+            packet["descendant_task_frame_policy"][
+                "commander_reapproval_required"
+            ]
+        )
+        self.assertEqual(
+            proposal["proposal_id"],
+            packet["descendant_task_frame_policy"]["parent_proposal_id"],
+        )
 
         status, repeated = self.request(
             "POST",
@@ -2964,6 +3174,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(
             "GOVERNANCE_PROPOSAL_ALREADY_APPROVED", repeated["status"]
+        )
+
+    def test_commander_text_approves_the_only_pending_task_proposal(self) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+
+        def approve(
+            project_root: Path,
+            *,
+            proposal_id: str,
+            proposal_digest: str,
+            evidence_ref: str,
+        ) -> JsonObject:
+            database_path = (
+                project_root
+                / ".ai"
+                / "runtime"
+                / "task_frames"
+                / "task-proposals.sqlite3"
+            )
+            approval = {
+                "schema": "ai-career.task-proposal-approval.v1",
+                "status": "APPROVED",
+                "proposal_id": proposal_id,
+                "proposal_digest": proposal_digest,
+                "evidence_ref": evidence_ref,
+                "approved_at": "2026-08-03T00:02:00Z",
+            }
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE proposal
+                    SET state = 'APPROVED', approved_at = ?, approval_json = ?
+                    WHERE proposal_id = ? AND proposal_digest = ?
+                    """,
+                    (
+                        approval["approved_at"],
+                        json.dumps(approval, sort_keys=True, separators=(",", ":")),
+                        proposal_id,
+                        proposal_digest,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            return {"status": "TASK_PROPOSAL_APPROVED", "approval": approval}
+
+        with patch.object(
+            self.server.project_task_proposals,
+            "approve",
+            side_effect=approve,
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "QUESTION",
+                    "sender": "UNIVERSE_CONDUCTOR",
+                    "body": "\uc2b9\uc778",
+                    "idempotency_key": "commander-text-approve-001",
+                },
+                self.token,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "GOVERNANCE_PROPOSAL_APPROVED_FROM_COMMANDER_TEXT",
+            result["status"],
+        )
+        decision = result["governance_decision"]["decision"]
+        self.assertEqual("NATURAL_LANGUAGE", decision["source"])
+        self.assertEqual("UNIVERSE_UI", decision["commander_surface"])
+        self.assertEqual(proposal["proposal_id"], decision["proposal_id"])
+        messages = self.server.store.list_room_messages("GCS")
+        self.assertTrue(
+            any(message["body"] == "\uc2b9\uc778" for message in messages)
+        )
+        self.assertTrue(
+            any("descendant_task_frame_policy" in message["body"] for message in messages)
         )
 
     def test_governance_proposal_decision_rejects_digest_mismatch(self) -> None:
