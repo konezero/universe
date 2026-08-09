@@ -202,7 +202,7 @@ Order is incremental; each slice ships with **thin UI**.
 | **S1–S5 foundation** | Function-first implementation — see **`docs/multi-room-implementation-status.md`** |
 | **S1** | Project-room Master attach + native incremental input/output mirror (detail: `room-session-attach-streaming.md`) — **Done for resident Codex/Claude/Grok Project Master** |
 | **S2** | Session-ref inject API / seed + MODE_CHANGE·SessionStart hook — **Done** |
-| **S3** | Meeting room Skill create + multi-slot + stream + user interrupt; imported Codex/Claude/Grok sessions are explicitly connected and disconnected through process-local native controls; Room-scoped permission bridge and automated debate loop remain |
+| **S3** | Meeting room Skill create + multi-slot + stream + user interrupt; imported Codex/Claude/Grok sessions use explicit process-local native controls and Room-scoped permission decisions; automated debate loop remains |
 | **S4** | Boss room API + user read-only + Worker report — **API done; TF auto-wire later** |
 | **S5** | Master attach into Boss + call-master — **API done; multi-Host jump later** |
 | **S6** | Dashboard from structured TF/room state + evidence links |

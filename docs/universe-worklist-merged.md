@@ -77,7 +77,7 @@ universe 프로젝트 시드 예: install_mode 구현 Todo, packaging/E2E/Memory
 
 | 항목 | 수준 | 비고 |
 |------|------|------|
-| Live Session Room + 증분 Multi-Room 라우팅 | **EXTERNAL_CONTROL_DONE / ROOM_PERMISSION_NEXT** | 정본 `docs/live-session-room-routing.md`. ordered Room event/cursor, non-replay, Codex/Claude/Grok resident Project Master 및 명시적으로 연결된 외부 Room participant 증분 입력, provider delta/final 관측, 연결 해제와 resume 좌표 불일치 fail-closed 완료. Room-scoped provider permission bridge가 후속 |
+| Live Session Room + 증분 Multi-Room 라우팅 | **ROOM_PERMISSION_DONE / MEETING_AUTOMATION_NEXT** | 정본 `docs/live-session-room-routing.md`. ordered Room event/cursor, non-replay, Codex/Claude/Grok resident Project Master 및 명시적으로 연결된 외부 Room participant 증분 입력, provider delta/final 관측, Room-scoped permission 결정, 연결 해제와 resume 좌표 불일치 fail-closed 완료. 자동 debate loop가 후속 |
 | Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** → 개선 | 뷰 전환 노출, pan/zoom/fit, Inspector 프로젝트 상시(닫기 가능), Conversation 대상 라벨, Esc, 모바일 toolbar/hint polish |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** → 3 | CLI + tray + portable + **embed Python** (`--with-python`) + per-user install script. Signed MSI/MSIX 미착수 |

@@ -115,6 +115,10 @@ BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]
 SourceCommitResolver = Callable[[Path], str]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
 NativeRoomObserver = Callable[[Mapping[str, Any]], None]
+RoomPermissionObserver = Callable[
+    [Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]],
+    None,
+]
 
 
 class CommanderSurfaceObserver(Protocol):
@@ -2089,6 +2093,17 @@ class ResidentModeSessionHost:
                 return session_ref.strip()
             return None
 
+    def set_permission_requester(
+        self,
+        requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> None:
+        with self._lock:
+            self.permission_requester = requester
+            active = self._provider
+            setter = getattr(active, "set_permission_requester", None)
+            if callable(setter):
+                setter(requester)
+
     def reply(
         self,
         provider: str,
@@ -2429,12 +2444,19 @@ class RoomParticipantConversationWorker:
         provider: str,
         session_host: ResidentModeSessionHost,
         room_event_observer: NativeRoomObserver,
+        permission_observer: RoomPermissionObserver,
     ) -> None:
         self.binding_id = _text(binding_id, "binding_id")
         self.provider = _provider(provider)
         self.session_host = session_host
         self.room_event_observer = room_event_observer
+        self.permission_observer = permission_observer
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._permission_lock = threading.RLock()
+        self._permission_waiters: dict[str, dict[str, Any]] = {}
+        self._active_binding: dict[str, Any] | None = None
+        self._active_event: dict[str, Any] | None = None
+        self._closed = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name=f"room-participant-{self.binding_id}",
@@ -2445,6 +2467,7 @@ class RoomParticipantConversationWorker:
     def start(self) -> None:
         if self._started:
             return
+        self.session_host.set_permission_requester(self._request_permission)
         self._started = True
         self._thread.start()
 
@@ -2469,6 +2492,12 @@ class RoomParticipantConversationWorker:
         return self._queue.unfinished_tasks == 0
 
     def close(self) -> None:
+        self._closed.set()
+        with self._permission_lock:
+            waiters = list(self._permission_waiters.values())
+            self._permission_waiters.clear()
+        for waiter in waiters:
+            waiter["event"].set()
         if self._started:
             self._queue.put(None)
             self._thread.join(timeout=10)
@@ -2476,6 +2505,19 @@ class RoomParticipantConversationWorker:
 
     def is_alive(self) -> bool:
         return self._started and self._thread.is_alive()
+
+    def resolve_permission(self, request_id: str, option_id: str) -> bool:
+        normalized_request = _text(request_id, "request_id")
+        normalized_option = _text(option_id, "option_id")
+        with self._permission_lock:
+            if self._closed.is_set():
+                return False
+            waiter = self._permission_waiters.get(normalized_request)
+            if waiter is None or normalized_option not in waiter["options"]:
+                return False
+            waiter["option_id"] = normalized_option
+            waiter["event"].set()
+            return True
 
     def _run(self) -> None:
         while True:
@@ -2496,6 +2538,9 @@ class RoomParticipantConversationWorker:
         room_id = _text(event.get("room_id"), "event.room_id")
         room_event_id = _text(event.get("room_event_id"), "event.room_event_id")
         accepted = False
+        with self._permission_lock:
+            self._active_binding = dict(binding)
+            self._active_event = dict(event)
 
         def observe(event_type: str, **values: Any) -> None:
             self.room_event_observer(
@@ -2558,6 +2603,50 @@ class RoomParticipantConversationWorker:
                 reason=f"{type(error).__name__}: {error}",
                 delivery_status="UNCERTAIN",
             )
+        finally:
+            with self._permission_lock:
+                self._active_binding = None
+                self._active_event = None
+
+    def _request_permission(self, request: Mapping[str, Any]) -> str | None:
+        request_id = _text(request.get("request_id"), "request_id")
+        options = request.get("options")
+        if not isinstance(options, list):
+            raise ProjectMasterHostError("ROOM_PERMISSION_OPTIONS_INVALID")
+        option_ids = {
+            _text(option.get("optionId"), "option.optionId")
+            for option in options
+            if isinstance(option, Mapping)
+        }
+        if not option_ids:
+            raise ProjectMasterHostError("ROOM_PERMISSION_OPTIONS_INVALID")
+        waiter = {
+            "event": threading.Event(),
+            "options": option_ids,
+            "option_id": None,
+        }
+        with self._permission_lock:
+            if self._closed.is_set():
+                return None
+            if self._active_binding is None or self._active_event is None:
+                raise ProjectMasterHostError("ROOM_PERMISSION_CONTEXT_UNAVAILABLE")
+            if request_id in self._permission_waiters:
+                raise ProjectMasterHostError("ROOM_PERMISSION_REQUEST_DUPLICATE")
+            binding = dict(self._active_binding)
+            event = dict(self._active_event)
+            self._permission_waiters[request_id] = waiter
+        try:
+            self.permission_observer(binding, event, request)
+            if not waiter["event"].wait(600):
+                return None
+            with self._permission_lock:
+                if self._closed.is_set():
+                    return None
+                selected = waiter["option_id"]
+            return str(selected) if selected else None
+        finally:
+            with self._permission_lock:
+                self._permission_waiters.pop(request_id, None)
 
 
 @dataclass
@@ -2578,6 +2667,7 @@ class ResidentRoomParticipantHostManager:
         self,
         *,
         room_event_observer: NativeRoomObserver,
+        permission_observer: RoomPermissionObserver | None = None,
         provider_factory: Callable[
             [str, Path, str, ProjectMasterSessionStore, str, str],
             MasterProvider,
@@ -2585,6 +2675,7 @@ class ResidentRoomParticipantHostManager:
         | None = None,
     ) -> None:
         self.room_event_observer = room_event_observer
+        self.permission_observer = permission_observer or self._permission_unavailable
         self.provider_factory = provider_factory
         self._handles: dict[str, ResidentRoomParticipantHandle] = {}
         self._lock = threading.RLock()
@@ -2645,6 +2736,7 @@ class ResidentRoomParticipantHostManager:
                     provider=provider,
                     session_host=host,
                     room_event_observer=self.room_event_observer,
+                    permission_observer=self.permission_observer,
                 )
                 worker.start()
             except Exception:
@@ -2690,6 +2782,19 @@ class ResidentRoomParticipantHostManager:
         handle.close()
         return True
 
+    def resolve_permission(
+        self,
+        binding_id: str,
+        request_id: str,
+        option_id: str,
+    ) -> bool:
+        normalized = _text(binding_id, "binding_id")
+        with self._lock:
+            handle = self._handles.get(normalized)
+        if handle is None or not handle.worker.is_alive():
+            return False
+        return handle.worker.resolve_permission(request_id, option_id)
+
     def close(self) -> None:
         with self._lock:
             handles = list(self._handles.values())
@@ -2698,7 +2803,11 @@ class ResidentRoomParticipantHostManager:
             handle.close()
 
     @staticmethod
-    def _permission_unavailable(_request: Mapping[str, Any]) -> str | None:
+    def _permission_unavailable(
+        _binding: Mapping[str, Any],
+        _event: Mapping[str, Any],
+        _request: Mapping[str, Any],
+    ) -> None:
         raise ProjectMasterHostError("ROOM_PARTICIPANT_PERMISSION_GATEWAY_UNAVAILABLE")
 
 

@@ -197,6 +197,48 @@ class StreamingPreparedFakeProvider(PreparedFakeProvider):
         return "live answer"
 
 
+class RoomPermissionFakeProvider(StreamingPreparedFakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.permission_requester = None
+        self.permission_requested = threading.Event()
+        self.selected_option: str | None = None
+
+    def set_permission_requester(self, requester) -> None:
+        self.permission_requester = requester
+
+    def reply_stream(self, message: Mapping[str, Any], on_delta) -> str:
+        self.messages.append(dict(message))
+        assert self.permission_requester is not None
+        self.selected_option = self.permission_requester(
+            {
+                "schema": "universe.agent-permission-request.v1",
+                "request_id": "permission_room_001",
+                "provider": "CLAUDE",
+                "session_id": self.session_ref,
+                "tool_call": {
+                    "toolCallId": "tool-room-001",
+                    "title": "Inspect repository status",
+                },
+                "options": [
+                    {
+                        "optionId": "allow-once",
+                        "name": "Allow once",
+                        "kind": "allow_once",
+                    },
+                    {
+                        "optionId": "reject-once",
+                        "name": "Reject",
+                        "kind": "reject_once",
+                    },
+                ],
+            }
+        )
+        self.permission_requested.set()
+        on_delta("permission resolved")
+        return "permission resolved"
+
+
 class FakeContinuityCoordinator:
     def __init__(self) -> None:
         self.saves: list[dict[str, Any]] = []
@@ -1849,6 +1891,136 @@ class ProjectMasterHostTests(unittest.TestCase):
                     [event["event"] for event in observed],
                 )
                 self.assertTrue(providers[0].closed)
+
+    def test_room_participant_permission_is_scoped_and_resolved_in_place(
+        self,
+    ) -> None:
+        provider = RoomPermissionFakeProvider()
+        permission_seen = threading.Event()
+        permissions: list[dict[str, Any]] = []
+        observed: list[dict[str, Any]] = []
+
+        def provider_factory(provider_name, _root, _target, store, _mode, _actor):
+            provider.session_ref = store.session_ref_for(provider_name)
+            provider.prepare_session = lambda: None
+            return provider
+
+        def observe_permission(binding, event, permission) -> None:
+            permissions.append(
+                {
+                    "binding": dict(binding),
+                    "event": dict(event),
+                    "permission": dict(permission),
+                }
+            )
+            permission_seen.set()
+
+        binding = {
+            "binding_id": "bind-claude-permission",
+            "slot_role": "MODEL",
+            "provider": "CLAUDE",
+            "provider_session_ref": "claude-session-permission",
+        }
+        event = {
+            "room_id": "room-permission",
+            "room_event_id": "event-permission",
+            "room_sequence": 1,
+            "message": {
+                "room_event_id": "event-permission",
+                "author_role": "USER",
+                "body_text": "Inspect the repository status",
+            },
+        }
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentRoomParticipantHostManager(
+                room_event_observer=lambda value: observed.append(dict(value)),
+                permission_observer=observe_permission,
+                provider_factory=provider_factory,
+            )
+            try:
+                manager.ensure(
+                    binding=binding,
+                    repository_root=self.root,
+                    node="GCS",
+                    mode="MASTER",
+                )
+                self.assertTrue(manager.submit(binding, event))
+                self.assertTrue(permission_seen.wait(2))
+                self.assertTrue(
+                    manager.resolve_permission(
+                        binding["binding_id"],
+                        "permission_room_001",
+                        "allow-once",
+                    )
+                )
+                self.assertTrue(
+                    manager._handles[binding["binding_id"]].worker.wait_idle()
+                )
+            finally:
+                manager.close()
+
+        self.assertEqual("allow-once", provider.selected_option)
+        self.assertEqual(binding, permissions[0]["binding"])
+        self.assertEqual(event, permissions[0]["event"])
+        self.assertEqual(
+            "permission_room_001",
+            permissions[0]["permission"]["request_id"],
+        )
+        self.assertEqual("COMPLETED", observed[-1]["event"])
+
+    def test_room_participant_disconnect_cancels_pending_permission(self) -> None:
+        provider = RoomPermissionFakeProvider()
+        permission_seen = threading.Event()
+
+        def provider_factory(provider_name, _root, _target, store, _mode, _actor):
+            provider.session_ref = store.session_ref_for(provider_name)
+            provider.prepare_session = lambda: None
+            return provider
+
+        binding = {
+            "binding_id": "bind-claude-cancel",
+            "slot_role": "MODEL",
+            "provider": "CLAUDE",
+            "provider_session_ref": "claude-session-cancel",
+        }
+        event = {
+            "room_id": "room-cancel",
+            "room_event_id": "event-cancel",
+            "room_sequence": 1,
+            "message": {
+                "room_event_id": "event-cancel",
+                "author_role": "USER",
+                "body_text": "Wait for permission",
+            },
+        }
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentRoomParticipantHostManager(
+                room_event_observer=lambda _value: None,
+                permission_observer=lambda _binding, _event, _permission: (
+                    permission_seen.set()
+                ),
+                provider_factory=provider_factory,
+            )
+            manager.ensure(
+                binding=binding,
+                repository_root=self.root,
+                node="GCS",
+                mode="MASTER",
+            )
+            self.assertTrue(manager.submit(binding, event))
+            self.assertTrue(permission_seen.wait(2))
+            self.assertTrue(manager.stop(binding["binding_id"]))
+            self.assertFalse(
+                manager.resolve_permission(
+                    binding["binding_id"],
+                    "permission_room_001",
+                    "allow-once",
+                )
+            )
+            manager.close()
+
+        self.assertIsNone(provider.selected_option)
+        self.assertTrue(provider.closed)
 
     def test_room_participant_manager_fails_closed_on_resume_mismatch(self) -> None:
         provider = StreamingPreparedFakeProvider()

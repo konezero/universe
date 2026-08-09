@@ -187,8 +187,14 @@ The Room coordinator records `QUEUED` without advancing the cursor, advances
 it only after provider acceptance, streams deltas as transient observations,
 and stores only the final provider message as a durable Room event. Native
 control callbacks and credentials are never stored in the Room database.
-Generic Room participant permission prompts fail closed until a Room-scoped
-permission bridge is implemented.
+
+Room participant permission prompts use a process-local bridge scoped to the
+exact Room, participant binding, and originating Room event. Pending requests
+are included in the Room snapshot and stream so the operator can select one of
+the provider-offered decisions in place. Disconnecting the participant or
+closing the server cancels pending requests, and stale, cross-Room, or
+cross-binding decisions fail closed. Permission state is not durable authority
+and never changes Career Assignment, Binding, or Execution Guard state.
 
 ## 10. Acceptance criteria
 
@@ -197,6 +203,8 @@ permission bridge is implemented.
   its accepted delivery cursor.
 - A participant never receives its own tailed output as new input.
 - Provider output appears incrementally in the observing Room UI.
+- Provider permission requests appear in the same Room and return only the
+  selected provider option to the exact live participant turn.
 - Viewing the Room does not change provider currentness.
 - Provider replacement attaches under the same Project Current Anchor without
   transcript injection.

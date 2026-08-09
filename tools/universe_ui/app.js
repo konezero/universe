@@ -2711,19 +2711,39 @@ function renderPermissionCard(permission) {
 async function resolveAgentPermission(permission, optionId) {
   try {
     const isConductor = permission.scope_kind === "UNIVERSE_CONDUCTOR";
+    const isRoomParticipant = permission.scope_kind === "ROOM_PARTICIPANT";
     const endpoint = isConductor
       ? `/v1/conductor-room/agent-session/permissions/${encodeURIComponent(
           permission.request_id
         )}/decision`
-      : `/v1/projects/${encodeURIComponent(
-          permission.project_id
-        )}/agent-session/permissions/${encodeURIComponent(
-          permission.request_id
-        )}/decision`;
+      : isRoomParticipant
+        ? `/v1/rooms/${encodeURIComponent(
+            permission.room_id
+          )}/bindings/${encodeURIComponent(
+            permission.binding_id
+          )}/permissions/${encodeURIComponent(
+            permission.request_id
+          )}/decision`
+        : `/v1/projects/${encodeURIComponent(
+            permission.project_id
+          )}/agent-session/permissions/${encodeURIComponent(
+            permission.request_id
+          )}/decision`;
     const result = await api(endpoint, {
       method: "POST",
       body: { option_id: optionId },
     });
+    if (isRoomParticipant) {
+      const snapshot = state.activeMultiRoomSnapshot;
+      if (snapshot?.room?.room_id === permission.room_id) {
+        snapshot.permissions = (snapshot.permissions || []).map((item) =>
+          item.request_id === permission.request_id ? result.permission : item
+        );
+        renderActiveMultiRoom();
+      }
+      toast("Agent permission decision delivered");
+      return;
+    }
     const collection = isConductor
       ? state.conductorPermissions
       : state.projectPermissions;
@@ -3732,12 +3752,24 @@ function renderActiveMultiRoom() {
     }
     participantList.append(row);
   }
+  const pendingPermissions = (snap.permissions || []).filter(
+    (permission) => permission.state === "PENDING"
+  );
+  const permissionList = node("div", "remote-access-list");
+  for (const permission of pendingPermissions) {
+    permissionList.append(renderPermissionCard(permission));
+  }
   const transcript = node("pre", "remote-access-endpoint");
   transcript.textContent = (snap.messages || [])
     .slice(-5)
     .map((message) => `${message.author_role}: ${message.body_text}`)
     .join("\n");
-  elements.multiRoomDetail.replaceChildren(summary, participantList, transcript);
+  elements.multiRoomDetail.replaceChildren(
+    summary,
+    participantList,
+    permissionList,
+    transcript
+  );
 }
 
 async function setRoomParticipantControl(roomId, bindingId, action) {
@@ -3771,6 +3803,8 @@ function openMultiRoomStream(roomId) {
       events: payload.events || [],
       participant_cursors: payload.participant_cursors || [],
       bridge_line: payload.bridge_line || "",
+      permissions:
+        payload.permissions || state.activeMultiRoomSnapshot?.permissions || [],
       write_roles: state.activeMultiRoomSnapshot?.write_roles || [],
       user_may_write: state.activeMultiRoomSnapshot?.user_may_write || false,
     };
@@ -3806,6 +3840,23 @@ function openMultiRoomStream(roomId) {
         -12000
       );
       renderActiveMultiRoom();
+      return;
+    }
+    if (
+      payload.type === "AGENT_PERMISSION" ||
+      payload.type === "AGENT_PERMISSION_RESOLVED"
+    ) {
+      const permission = payload.permission;
+      const snapshot = state.activeMultiRoomSnapshot;
+      if (permission?.request_id && snapshot) {
+        snapshot.permissions = [
+          ...(snapshot.permissions || []).filter(
+            (item) => item.request_id !== permission.request_id
+          ),
+          permission,
+        ];
+        renderActiveMultiRoom();
+      }
       return;
     }
     if (

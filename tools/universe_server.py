@@ -12422,6 +12422,148 @@ class ConductorPermissionBridge:
                 waiter["event"].set()
 
 
+class RoomParticipantPermissionRegistry:
+    """Process-local permission records for live Room participant turns."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._requests: dict[str, dict[str, Any]] = {}
+
+    def record(
+        self,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+        permission: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        try:
+            normalized = normalize_permission_request(permission)
+        except AgentSessionError as error:
+            raise UniverseError(
+                "AGENT_PERMISSION_REQUEST_INVALID",
+                str(error),
+            ) from error
+        request_id = normalized["request_id"]
+        record = {
+            **normalized,
+            "scope_kind": "ROOM_PARTICIPANT",
+            "scope_id": str(binding.get("binding_id") or ""),
+            "room_id": str(event.get("room_id") or ""),
+            "binding_id": str(binding.get("binding_id") or ""),
+            "in_reply_to": str(event.get("room_event_id") or ""),
+            "state": "PENDING",
+            "selected_option_id": None,
+            "requested_at": utc_now(),
+            "resolved_at": None,
+            "persistence": "PROCESS_LOCAL",
+        }
+        for field in ("room_id", "binding_id", "in_reply_to"):
+            _required_text(record[field], field)
+        with self._lock:
+            existing = self._requests.get(request_id)
+            if existing is not None:
+                comparable = {
+                    key: existing.get(key)
+                    for key in (
+                        "provider",
+                        "session_id",
+                        "tool_call",
+                        "options",
+                        "room_id",
+                        "binding_id",
+                        "in_reply_to",
+                    )
+                }
+                expected = {key: record.get(key) for key in comparable}
+                if comparable != expected:
+                    raise UniverseError(
+                        "AGENT_PERMISSION_REQUEST_CONFLICT",
+                        "Room permission request id is already bound elsewhere",
+                        HTTPStatus.CONFLICT,
+                    )
+                return json.loads(_canonical_json(existing)), False
+            self._requests[request_id] = record
+            return json.loads(_canonical_json(record)), True
+
+    def get(self, request_id: str) -> dict[str, Any]:
+        normalized = _required_text(request_id, "request_id")
+        with self._lock:
+            record = self._requests.get(normalized)
+            if record is None:
+                raise UniverseError(
+                    "AGENT_PERMISSION_NOT_FOUND",
+                    "Room participant permission request does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            return json.loads(_canonical_json(record))
+
+    def list_requests(
+        self,
+        room_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        normalized_room = _required_text(room_id, "room_id")
+        bounded = max(1, min(int(limit), 500))
+        with self._lock:
+            records = [
+                record
+                for record in self._requests.values()
+                if record["room_id"] == normalized_room
+            ][-bounded:]
+            return [json.loads(_canonical_json(record)) for record in records]
+
+    def resolve(
+        self,
+        request_id: str,
+        option_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        normalized_request = _required_text(request_id, "request_id")
+        normalized_option = _required_text(option_id, "option_id")
+        with self._lock:
+            record = self._requests.get(normalized_request)
+            if record is None:
+                raise UniverseError(
+                    "AGENT_PERMISSION_NOT_FOUND",
+                    "Room participant permission request does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if normalized_option not in {
+                option["optionId"] for option in record["options"]
+            }:
+                raise UniverseError(
+                    "AGENT_PERMISSION_OPTION_UNKNOWN",
+                    "selected option is not offered by this request",
+                    HTTPStatus.CONFLICT,
+                )
+            if record["state"] != "PENDING":
+                if record["selected_option_id"] == normalized_option:
+                    return json.loads(_canonical_json(record)), False
+                raise UniverseError(
+                    "AGENT_PERMISSION_ALREADY_RESOLVED",
+                    "permission request already has another decision",
+                    HTTPStatus.CONFLICT,
+                )
+            record["state"] = "RESOLVED"
+            record["selected_option_id"] = normalized_option
+            record["resolved_at"] = utc_now()
+            return json.loads(_canonical_json(record)), True
+
+    def cancel_binding(self, binding_id: str) -> None:
+        normalized = _required_text(binding_id, "binding_id")
+        with self._lock:
+            for record in self._requests.values():
+                if record["binding_id"] == normalized and record["state"] == "PENDING":
+                    record["state"] = "CANCELLED"
+                    record["resolved_at"] = utc_now()
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            for record in self._requests.values():
+                if record["state"] == "PENDING":
+                    record["state"] = "CANCELLED"
+                    record["resolved_at"] = utc_now()
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -12505,8 +12647,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.multi_room_native_controls = MultiRoomNativeControlRegistry(
             self.multi_rooms
         )
+        self.room_participant_permissions = RoomParticipantPermissionRegistry()
+        self._room_permission_resolution_lock = threading.RLock()
         self.room_participant_hosts = ResidentRoomParticipantHostManager(
             room_event_observer=self._observe_native_room_event,
+            permission_observer=self._observe_room_participant_permission,
             provider_factory=room_participant_provider_factory,
         )
         self.multi_room_delivery = MultiRoomDeliveryCoordinator(
@@ -14807,6 +14952,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if action == "DISCONNECT":
             self.multi_room_native_controls.unregister(binding_id)
             stopped = self.room_participant_hosts.stop(binding_id)
+            self.room_participant_permissions.cancel_binding(binding_id)
             cursor = self.multi_rooms.set_participant_state(
                 binding_id,
                 "DISCONNECTED",
@@ -14881,6 +15027,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "resident_host": resident,
             "native_control": control,
         }
+
+    def multi_room_snapshot(self, room_id: str) -> dict[str, Any]:
+        snapshot = self.multi_rooms.room_snapshot(room_id)
+        snapshot["permissions"] = self.room_participant_permissions.list_requests(
+            room_id
+        )
+        return snapshot
 
     def send_project_room_message(
         self,
@@ -15076,6 +15229,75 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # into an error or invent a Todo linkage.
             return
         self.publish_project_room_changed(project_id)
+
+    def _observe_room_participant_permission(
+        self,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+        permission: Mapping[str, Any],
+    ) -> None:
+        record, created = self.room_participant_permissions.record(
+            binding,
+            event,
+            permission,
+        )
+        if created:
+            self.multi_rooms.hub.publish(
+                record["room_id"],
+                {
+                    "type": "AGENT_PERMISSION",
+                    "binding_id": record["binding_id"],
+                    "room_event_id": record["in_reply_to"],
+                    "permission": record,
+                },
+            )
+
+    def resolve_room_participant_permission(
+        self,
+        room_id: str,
+        binding_id: str,
+        request_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        decision = normalize_permission_decision(value)
+        option_id = decision["option_id"]
+        with self._room_permission_resolution_lock:
+            current = self.room_participant_permissions.get(request_id)
+            if current["room_id"] != room_id or current["binding_id"] != binding_id:
+                raise UniverseError(
+                    "AGENT_PERMISSION_SCOPE_MISMATCH",
+                    "permission request does not belong to this Room participant",
+                    HTTPStatus.CONFLICT,
+                )
+            if current["state"] != "PENDING":
+                return self.room_participant_permissions.resolve(
+                    request_id,
+                    option_id,
+                )
+            if not self.room_participant_hosts.resolve_permission(
+                binding_id,
+                request_id,
+                option_id,
+            ):
+                raise UniverseError(
+                    "AGENT_PERMISSION_SESSION_UNAVAILABLE",
+                    "Room participant session cannot accept this decision",
+                    HTTPStatus.CONFLICT,
+                )
+            permission, changed = self.room_participant_permissions.resolve(
+                request_id,
+                option_id,
+            )
+        self.multi_rooms.hub.publish(
+            room_id,
+            {
+                "type": "AGENT_PERMISSION_RESOLVED",
+                "binding_id": binding_id,
+                "room_event_id": permission["in_reply_to"],
+                "permission": permission,
+            },
+        )
+        return permission, changed
 
     def _observe_native_room_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("event")
@@ -15774,6 +15996,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "conductor_room_worker",
                 lambda: self._conductor_worker.join(timeout=5),
             )
+        self.room_participant_permissions.cancel_all()
         close_step(
             "multi_room_native_controls",
             self.multi_room_native_controls.close,
@@ -16074,7 +16297,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             try:
                 self._send(
                     HTTPStatus.OK,
-                    self.server.multi_rooms.room_snapshot(unquote(room_get.group(1))),
+                    self.server.multi_room_snapshot(unquote(room_get.group(1))),
                 )
             except MultiRoomError as error:
                 self._send_multi_room_error(error)
@@ -17136,6 +17359,35 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     )
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
+                return
+            room_participant_permission = re.fullmatch(
+                r"/v1/rooms/([^/]+)/bindings/([^/]+)/permissions/([^/]+)/decision$",
+                path,
+            )
+            if room_participant_permission is not None:
+                try:
+                    permission, changed = (
+                        self.server.resolve_room_participant_permission(
+                            unquote(room_participant_permission.group(1)),
+                            unquote(room_participant_permission.group(2)),
+                            unquote(room_participant_permission.group(3)),
+                            body or {},
+                        )
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": (
+                                "AGENT_PERMISSION_RESOLVED"
+                                if changed
+                                else "AGENT_PERMISSION_ALREADY_RESOLVED"
+                            ),
+                            "permission": permission,
+                        },
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
                 return
             room_participant_control = re.fullmatch(
                 r"/v1/rooms/([^/]+)/bindings/([^/]+)/control$", path
@@ -18853,7 +19105,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def _stream_multi_room(self, room_id: str) -> None:
         try:
-            snapshot = self.server.multi_rooms.room_snapshot(room_id)
+            snapshot = self.server.multi_room_snapshot(room_id)
         except MultiRoomError as error:
             self._send_multi_room_error(error)
             return
@@ -18879,6 +19131,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 "events": snapshot["events"],
                 "participant_cursors": snapshot["participant_cursors"],
                 "bridge_line": snapshot["bridge_line"],
+                "permissions": snapshot["permissions"],
             },
         )
         cursor = self.server.multi_rooms.hub.cursor()

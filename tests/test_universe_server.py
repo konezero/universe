@@ -3861,6 +3861,172 @@ class UniverseLocalServiceTests(unittest.TestCase):
             resolved["permission"]["selected_option_id"],
         )
 
+    def test_room_participant_permission_round_trip_is_room_scoped(self) -> None:
+        class PermissionParticipantHosts:
+            def __init__(self) -> None:
+                self.decisions: list[tuple[str, str, str]] = []
+
+            def resolve_permission(
+                self,
+                binding_id: str,
+                request_id: str,
+                option_id: str,
+            ) -> bool:
+                self.decisions.append((binding_id, request_id, option_id))
+                return True
+
+            def close(self) -> None:
+                return
+
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Permission review",
+            host_role="MODEL",
+            project_id="GCS",
+        )
+        binding = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-permission-session",
+            },
+        )["binding"]
+        participant_hosts = PermissionParticipantHosts()
+        self.server.room_participant_hosts.close()
+        self.server.room_participant_hosts = participant_hosts
+        self.server._observe_room_participant_permission(
+            binding,
+            {
+                "room_id": room["room_id"],
+                "room_event_id": "room-event-permission",
+            },
+            {
+                "request_id": "permission_room_server_001",
+                "provider": "CLAUDE",
+                "session_id": "claude-permission-session",
+                "tool_call": {
+                    "toolCallId": "tool-room-server-001",
+                    "title": "Inspect repository status",
+                },
+                "options": [
+                    {
+                        "optionId": "allow-once",
+                        "name": "Allow once",
+                        "kind": "allow_once",
+                    },
+                    {
+                        "optionId": "reject-once",
+                        "name": "Reject",
+                        "kind": "reject_once",
+                    },
+                ],
+            },
+        )
+
+        status, snapshot = self.request(
+            "GET",
+            f"/v1/rooms/{room['room_id']}",
+            token=self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(snapshot["permissions"]))
+        self.assertEqual("ROOM_PARTICIPANT", snapshot["permissions"][0]["scope_kind"])
+        self.assertEqual("PENDING", snapshot["permissions"][0]["state"])
+
+        status, resolved = self.request(
+            "POST",
+            (
+                f"/v1/rooms/{room['room_id']}/bindings/"
+                f"{binding['binding_id']}/permissions/"
+                "permission_room_server_001/decision"
+            ),
+            {"option_id": "allow-once"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AGENT_PERMISSION_RESOLVED", resolved["status"])
+        self.assertEqual("RESOLVED", resolved["permission"]["state"])
+        self.assertEqual(
+            [
+                (
+                    binding["binding_id"],
+                    "permission_room_server_001",
+                    "allow-once",
+                )
+            ],
+            participant_hosts.decisions,
+        )
+
+        status, repeated = self.request(
+            "POST",
+            (
+                f"/v1/rooms/{room['room_id']}/bindings/"
+                f"{binding['binding_id']}/permissions/"
+                "permission_room_server_001/decision"
+            ),
+            {"option_id": "allow-once"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AGENT_PERMISSION_ALREADY_RESOLVED", repeated["status"])
+        self.assertEqual(1, len(participant_hosts.decisions))
+
+    def test_room_participant_permission_rejects_cross_binding_decision(self) -> None:
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Scoped permission",
+            host_role="MODEL",
+            project_id="GCS",
+        )
+        binding = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "GROK",
+                "provider_session_ref": "grok-permission-session",
+            },
+        )["binding"]
+        self.server._observe_room_participant_permission(
+            binding,
+            {
+                "room_id": room["room_id"],
+                "room_event_id": "room-event-scoped",
+            },
+            {
+                "request_id": "permission_room_scoped_001",
+                "provider": "GROK",
+                "session_id": "grok-permission-session",
+                "tool_call": {"toolCallId": "tool-room-scoped-001"},
+                "options": [
+                    {
+                        "optionId": "reject-once",
+                        "name": "Reject",
+                        "kind": "reject_once",
+                    }
+                ],
+            },
+        )
+
+        status, result = self.request(
+            "POST",
+            (
+                f"/v1/rooms/{room['room_id']}/bindings/other-binding/permissions/"
+                "permission_room_scoped_001/decision"
+            ),
+            {"option_id": "reject-once"},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("AGENT_PERMISSION_SCOPE_MISMATCH", result["error_code"])
+        self.assertEqual(
+            "PENDING",
+            self.server.room_participant_permissions.get(
+                "permission_room_scoped_001"
+            )["state"],
+        )
+
     def test_project_room_stream_starts_with_durable_snapshot(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.request(
