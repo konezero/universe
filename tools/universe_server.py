@@ -95,6 +95,7 @@ from project_master_host import (
     ProjectTaskProposalAdapter,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
+    ResidentRoomParticipantHostManager,
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
@@ -12437,6 +12438,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         conductor_session_provider_factory: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
+        room_participant_provider_factory: Any = None,
         host_profile: HostProfileStore | None = None,
         provider_model_catalog: ProviderModelCatalogStore | None = None,
         service_state_path: Path | None = None,
@@ -12502,6 +12504,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.multi_rooms = MultiRoomStore(str(store.database_path))
         self.multi_room_native_controls = MultiRoomNativeControlRegistry(
             self.multi_rooms
+        )
+        self.room_participant_hosts = ResidentRoomParticipantHostManager(
+            room_event_observer=self._observe_native_room_event,
+            provider_factory=room_participant_provider_factory,
         )
         self.multi_room_delivery = MultiRoomDeliveryCoordinator(
             self.multi_rooms,
@@ -14764,6 +14770,118 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "bridge_line": bridge_line,
         }
 
+    def set_room_participant_control(
+        self,
+        room_id: str,
+        binding_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        action = str(request.get("action") or "").strip().upper()
+        room = self.multi_rooms.get_room(room_id)
+        binding = self.multi_rooms.get_binding(binding_id)
+        if binding["room_id"] != room["room_id"]:
+            raise MultiRoomError(
+                "BINDING_ROOM_MISMATCH",
+                "binding does not belong to the requested room",
+                409,
+            )
+        if binding.get("state") != "ACTIVE":
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_BINDING_INACTIVE",
+                "native control requires an active room binding",
+                409,
+            )
+        if binding.get("slot_role") == "USER":
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_CONTROL_FORBIDDEN",
+                "user bindings do not own native provider controls",
+                409,
+            )
+        if room.get("room_type") == "PROJECT" and binding.get("slot_role") == "MASTER":
+            raise MultiRoomError(
+                "PROJECT_MASTER_CONTROL_DEDICATED",
+                "project master native control is managed by the project host",
+                409,
+            )
+        if action == "DISCONNECT":
+            self.multi_room_native_controls.unregister(binding_id)
+            stopped = self.room_participant_hosts.stop(binding_id)
+            cursor = self.multi_rooms.set_participant_state(
+                binding_id,
+                "DISCONNECTED",
+            )
+            return {
+                "schema": API_SCHEMA,
+                "status": "ROOM_PARTICIPANT_CONTROL_DISCONNECTED",
+                "binding_id": binding_id,
+                "resident_host_stopped": stopped,
+                "cursor": cursor,
+            }
+        if action != "CONNECT":
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_CONTROL_ACTION_INVALID",
+                "action must be CONNECT or DISCONNECT",
+            )
+        provider = str(binding.get("provider") or "").strip().upper()
+        provider_session_ref = str(
+            binding.get("provider_session_ref") or ""
+        ).strip()
+        if not provider or not provider_session_ref:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_SESSION_COORDINATE_REQUIRED",
+                "provider and provider_session_ref are required",
+                409,
+            )
+
+        project_id = room.get("project_id")
+        repository_root = Path(__file__).resolve().parents[1]
+        node = str(project_id or "universe")
+        mode = "CONDUCTOR" if binding.get("slot_role") == "CONDUCTOR" else "MASTER"
+        supervisor_session_id = binding.get("supervisor_session_id")
+        if isinstance(project_id, str) and project_id:
+            repository_root = Path(self.store.get_project(project_id)["project_root"])
+        if isinstance(supervisor_session_id, str) and supervisor_session_id:
+            try:
+                supervised = self.session_supervisor.get_session(supervisor_session_id)
+            except SessionSupervisorError as error:
+                raise MultiRoomError(error.code, str(error), error.status) from error
+            node = str(supervised.get("node") or node)
+            mode = str(supervised.get("mode") or mode).upper()
+
+        try:
+            resident = self.room_participant_hosts.ensure(
+                binding=binding,
+                repository_root=repository_root,
+                node=node,
+                mode=mode,
+            )
+            try:
+                control = self.multi_room_native_controls.register(
+                    binding_id,
+                    provider=provider,
+                    provider_session_ref=provider_session_ref,
+                    send_input=self.room_participant_hosts.submit,
+                )
+            except Exception:
+                self.room_participant_hosts.stop(binding_id)
+                raise
+        except MultiRoomError:
+            raise
+        except (OSError, ProjectMasterHostError) as error:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_CONTROL_START_FAILED",
+                str(error),
+                409,
+            ) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "ROOM_PARTICIPANT_CONTROL_CONNECTED",
+            "binding_id": binding_id,
+            "resident_host": resident,
+            "native_control": control,
+        }
+
     def send_project_room_message(
         self,
         project_id: str,
@@ -15656,11 +15774,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "conductor_room_worker",
                 lambda: self._conductor_worker.join(timeout=5),
             )
+        close_step(
+            "multi_room_native_controls",
+            self.multi_room_native_controls.close,
+        )
+        close_step(
+            "room_participant_hosts",
+            self.room_participant_hosts.close,
+        )
         if self.project_master_hosts is not None:
-            close_step(
-                "multi_room_native_controls",
-                self.multi_room_native_controls.close,
-            )
             close_step("project_master_hosts", self.project_master_hosts.close)
             self.project_master_hosts = None
         if self.conductor_session_host is not None:
@@ -17012,6 +17134,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             "delivery": delivery,
                         },
                     )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_participant_control = re.fullmatch(
+                r"/v1/rooms/([^/]+)/bindings/([^/]+)/control$", path
+            )
+            if room_participant_control is not None:
+                try:
+                    result = self.server.set_room_participant_control(
+                        unquote(room_participant_control.group(1)),
+                        unquote(room_participant_control.group(2)),
+                        body or {},
+                    )
+                    self._send(HTTPStatus.OK, result)
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
                 return
@@ -18942,6 +19078,7 @@ def create_server(
     conductor_session_provider_factory: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
+    room_participant_provider_factory: Any = None,
     host_profile: HostProfileStore | None = None,
     service_state_path: Path | None = None,
     remote_gateway_state_path: Path | None = None,
@@ -18970,6 +19107,7 @@ def create_server(
         conductor_session_provider_factory=conductor_session_provider_factory,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
+        room_participant_provider_factory=room_participant_provider_factory,
         host_profile=host_profile,
         service_state_path=service_state_path,
         remote_gateway_state_path=remote_gateway_state_path,

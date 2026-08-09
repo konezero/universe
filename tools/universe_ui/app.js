@@ -3670,23 +3670,83 @@ function renderActiveMultiRoom() {
   const snap = state.activeMultiRoomSnapshot;
   if (!snap || !elements.multiRoomDetail) return;
   const cursors = snap.participant_cursors || [];
-  const lines = [
-    snap.bridge_line || "",
-    `write_roles=${(snap.write_roles || []).join(",")}`,
-    `user_may_write=${snap.user_may_write}`,
-    `events=${(snap.events || []).length}`,
-    ...cursors.map(
-      (cursor) =>
-        `${cursor.participant_state} ${cursor.binding_id}: delivered=${cursor.delivery_sequence}`
-    ),
-    ...Object.entries(state.multiRoomLiveOutput || {}).map(
-      ([bindingId, output]) => `LIVE ${bindingId}: ${output}`
-    ),
-    ...(snap.messages || []).slice(-5).map(
-      (message) => `${message.author_role}: ${message.body_text}`
-    ),
-  ];
-  elements.multiRoomDetail.textContent = lines.join("\n");
+  const cursorByBinding = new Map(
+    cursors.map((cursor) => [cursor.binding_id, cursor])
+  );
+  const room = snap.room || {};
+  const summary = node("div", "remote-access-copy");
+  summary.append(
+    node("strong", "", room.title || room.room_type || "Room"),
+    node(
+      "small",
+      "",
+      `${room.room_type || "ROOM"} | participants=${(snap.bindings || []).length} | events=${(snap.events || []).length}`
+    )
+  );
+  const participantList = node("div", "remote-access-list");
+  for (const binding of snap.bindings || []) {
+    const cursor = cursorByBinding.get(binding.binding_id) || {};
+    const participantState = cursor.participant_state || "OBSERVED";
+    const row = node("div", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    const label =
+      binding.display_name ||
+      [binding.provider, binding.slot_role].filter(Boolean).join(" ") ||
+      binding.slot_role ||
+      "Participant";
+    const liveOutput = state.multiRoomLiveOutput?.[binding.binding_id] || "";
+    copy.append(
+      node("strong", "", label),
+      node(
+        "small",
+        "",
+        `${participantState} | delivered=${cursor.delivery_sequence || 0}`
+      )
+    );
+    if (liveOutput) copy.append(node("small", "", liveOutput));
+    row.append(copy);
+    const dedicatedProjectMaster =
+      room.room_type === "PROJECT" && binding.slot_role === "MASTER";
+    const controllable =
+      binding.slot_role !== "USER" &&
+      !dedicatedProjectMaster &&
+      Boolean(binding.provider && binding.provider_session_ref);
+    if (controllable) {
+      const connected = ["CONTROLLED", "LIVE"].includes(participantState);
+      const control = node(
+        "button",
+        "secondary-button compact-action",
+        connected ? "Disconnect" : "Connect native"
+      );
+      control.type = "button";
+      control.addEventListener("click", () => {
+        setRoomParticipantControl(
+          room.room_id,
+          binding.binding_id,
+          connected ? "DISCONNECT" : "CONNECT"
+        ).catch((error) => {
+          elements.settingsError.textContent = error.message;
+        });
+      });
+      row.append(control);
+    }
+    participantList.append(row);
+  }
+  const transcript = node("pre", "remote-access-endpoint");
+  transcript.textContent = (snap.messages || [])
+    .slice(-5)
+    .map((message) => `${message.author_role}: ${message.body_text}`)
+    .join("\n");
+  elements.multiRoomDetail.replaceChildren(summary, participantList, transcript);
+}
+
+async function setRoomParticipantControl(roomId, bindingId, action) {
+  await api(
+    `/v1/rooms/${encodeURIComponent(roomId)}/bindings/${encodeURIComponent(bindingId)}/control`,
+    { method: "POST", body: { action } }
+  );
+  await openMultiRoom(roomId);
+  toast(action === "CONNECT" ? "Native session connected" : "Native session disconnected");
 }
 
 function closeMultiRoomStream() {

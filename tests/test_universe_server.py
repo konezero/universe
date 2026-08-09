@@ -3641,6 +3641,126 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         )
 
+    def test_meeting_room_native_control_connects_routes_and_disconnects(self) -> None:
+        class FakeParticipantHosts:
+            def __init__(self) -> None:
+                self.ensure_calls: list[dict[str, Any]] = []
+                self.submitted: list[dict[str, Any]] = []
+                self.stopped: list[str] = []
+
+            def ensure(self, **values):
+                self.ensure_calls.append(dict(values))
+                return {
+                    "status": "STARTED",
+                    "provider": values["binding"]["provider"],
+                    "provider_session_ref": values["binding"][
+                        "provider_session_ref"
+                    ],
+                }
+
+            def submit(self, binding, event) -> bool:
+                self.submitted.append(
+                    {"binding": dict(binding), "event": dict(event)}
+                )
+                return True
+
+            def stop(self, binding_id: str) -> bool:
+                self.stopped.append(binding_id)
+                return True
+
+            def close(self) -> None:
+                return
+
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Native review",
+            host_role="MODEL",
+            project_id="GCS",
+        )
+        binding = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-session-existing",
+                "display_name": "Claude reviewer",
+            },
+        )["binding"]
+        fake_hosts = FakeParticipantHosts()
+        self.server.room_participant_hosts.close()
+        self.server.room_participant_hosts = fake_hosts
+
+        status, connected = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/bindings/{binding['binding_id']}/control",
+            {"action": "CONNECT"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("ROOM_PARTICIPANT_CONTROL_CONNECTED", connected["status"])
+        self.assertEqual(self.project_root, fake_hosts.ensure_calls[0]["repository_root"])
+        self.assertEqual("GCS", fake_hosts.ensure_calls[0]["node"])
+        self.assertEqual("MASTER", fake_hosts.ensure_calls[0]["mode"])
+        self.assertEqual(
+            "CONTROLLED",
+            self.server.multi_rooms.participant_cursor(binding["binding_id"])[
+                "participant_state"
+            ],
+        )
+
+        status, posted = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/messages",
+            {"author_role": "USER", "body_text": "Review this increment"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual(1, len(fake_hosts.submitted))
+        self.assertEqual(
+            posted["message"]["room_event_id"],
+            fake_hosts.submitted[0]["event"]["room_event_id"],
+        )
+
+        status, disconnected = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/bindings/{binding['binding_id']}/control",
+            {"action": "DISCONNECT"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "ROOM_PARTICIPANT_CONTROL_DISCONNECTED", disconnected["status"]
+        )
+        self.assertEqual([binding["binding_id"]], fake_hosts.stopped)
+        self.assertEqual(
+            "DISCONNECTED",
+            self.server.multi_rooms.participant_cursor(binding["binding_id"])[
+                "participant_state"
+            ],
+        )
+
+    def test_project_master_native_control_uses_dedicated_host_only(self) -> None:
+        room = self.server.multi_rooms.ensure_project_room("dedicated-master")
+        binding = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "thread-dedicated-master",
+            },
+        )["binding"]
+
+        status, result = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/bindings/{binding['binding_id']}/control",
+            {"action": "CONNECT"},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("PROJECT_MASTER_CONTROL_DEDICATED", result["error_code"])
+
     def test_agent_permission_round_trip_uses_project_room_stream(self) -> None:
         class PermissionHost:
             def resolve_permission(

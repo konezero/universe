@@ -38,6 +38,7 @@ from project_master_host import (  # noqa: E402
     ProjectMasterSessionStore,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
+    ResidentRoomParticipantHostManager,
     _project_master_system_prompt,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
@@ -1771,6 +1772,116 @@ class ProjectMasterHostTests(unittest.TestCase):
 
                 self.assertEqual("one incremental event", provider.messages[0]["body"])
                 self.assertEqual("COMPLETED", observed[-1]["event"])
+
+    def test_room_participant_manager_resumes_and_routes_all_provider_labels(
+        self,
+    ) -> None:
+        for provider_name in ("CODEX", "CLAUDE", "GROK"):
+            with self.subTest(provider=provider_name):
+                providers: list[PreparedFakeProvider] = []
+                observed: list[dict[str, Any]] = []
+
+                def provider_factory(provider, _root, _target, store, _mode, _actor):
+                    instance = StreamingPreparedFakeProvider()
+                    instance.session_ref = store.session_ref_for(provider)
+                    instance.prepare_session = lambda: None
+                    providers.append(instance)
+                    return instance
+
+                binding = {
+                    "binding_id": f"bind-{provider_name.lower()}",
+                    "slot_role": "MODEL",
+                    "provider": provider_name,
+                    "provider_session_ref": f"{provider_name.lower()}-session-001",
+                    "display_name": f"{provider_name} reviewer",
+                }
+                with patch.dict(
+                    os.environ,
+                    {"LOCALAPPDATA": str(self.root)},
+                    clear=False,
+                ):
+                    manager = ResidentRoomParticipantHostManager(
+                        room_event_observer=lambda event: observed.append(dict(event)),
+                        provider_factory=provider_factory,
+                    )
+                    try:
+                        connected = manager.ensure(
+                            binding=binding,
+                            repository_root=self.root,
+                            node="GCS",
+                            mode="MASTER",
+                        )
+                        self.assertTrue(
+                            manager.submit(
+                                binding,
+                                {
+                                    "room_id": "room-meeting",
+                                    "room_event_id": "event-001",
+                                    "room_sequence": 1,
+                                    "correlation_id": "event-001",
+                                    "message": {
+                                        "room_event_id": "event-001",
+                                        "author_role": "USER",
+                                        "body_text": "Review only this increment",
+                                    },
+                                },
+                            )
+                        )
+                        self.assertTrue(
+                            manager._handles[binding["binding_id"]].worker.wait_idle()
+                        )
+                        self.assertTrue(manager.stop(binding["binding_id"]))
+                    finally:
+                        manager.close()
+
+                self.assertEqual("STARTED", connected["status"])
+                self.assertEqual(1, len(providers))
+                self.assertEqual(
+                    binding["provider_session_ref"], providers[0].session_ref
+                )
+                self.assertEqual(1, len(providers[0].messages))
+                self.assertEqual(
+                    "Review only this increment",
+                    providers[0].messages[0]["body"],
+                )
+                self.assertEqual(
+                    ["DELIVERY_ACCEPTED", "DELTA", "DELTA", "COMPLETED"],
+                    [event["event"] for event in observed],
+                )
+                self.assertTrue(providers[0].closed)
+
+    def test_room_participant_manager_fails_closed_on_resume_mismatch(self) -> None:
+        provider = StreamingPreparedFakeProvider()
+
+        def provider_factory(_provider, _root, _target, _store, _mode, _actor):
+            return provider
+
+        binding = {
+            "binding_id": "bind-resume-mismatch",
+            "slot_role": "MODEL",
+            "provider": "CLAUDE",
+            "provider_session_ref": "expected-session",
+        }
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentRoomParticipantHostManager(
+                room_event_observer=lambda _event: None,
+                provider_factory=provider_factory,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    ProjectMasterHostError,
+                    "ROOM_PARTICIPANT_SESSION_RESUME_MISMATCH",
+                ):
+                    manager.ensure(
+                        binding=binding,
+                        repository_root=self.root,
+                        node="GCS",
+                        mode="MASTER",
+                    )
+            finally:
+                manager.close()
+
+        self.assertTrue(provider.closed)
 
     def _worker(self) -> ProjectMasterConversationWorker:
         def post_reply(**values):

@@ -168,19 +168,27 @@ The first implementation slice must:
 8. Expose room/participant activity for observer UI without making viewing an
    activity event.
 
-The current foundation implements the ordered event plane, independent cursors,
-duplicate/echo suppression, non-replaying attach semantics, Conductor native
-streaming, and the observer UI. The resident Project Master path now registers
-a process-local native control for its selected Codex, Claude, or Grok session.
-The Room coordinator records `QUEUED` without advancing the cursor, advances it
-only after provider acceptance, streams deltas as transient observations, and
-stores only the final provider message as a durable Room event. Native control
-callbacks and credentials are never stored in the Room database.
+The current implementation includes the ordered event plane, independent
+cursors, duplicate/echo suppression, non-replaying attach semantics, Conductor
+native streaming, and the observer UI. The resident Project Master path
+registers a process-local native control for its selected Codex, Claude, or
+Grok session.
 
-Provider-specific controls for imported external sessions and arbitrary
-Meeting participants must still register with the delivery coordinator before
-a binding may move from `OBSERVED`/`ATTACHED` to `CONTROLLED`/`LIVE`. Until
-then, discovery is observation-only and no delivery cursor is advanced.
+Imported Codex, Claude, and Grok bindings are observation-only by default. An
+operator must explicitly select `Connect native` for a Room participant. The
+server then resumes the exact bound provider session, rejects a mismatched
+resumed coordinate, and registers a process-local control. `Disconnect`
+removes the control, closes the resident provider, and projects the participant
+as `DISCONNECTED`. A Project Room Master continues to use its dedicated
+Project Master host and cannot be connected through the generic participant
+endpoint.
+
+The Room coordinator records `QUEUED` without advancing the cursor, advances
+it only after provider acceptance, streams deltas as transient observations,
+and stores only the final provider message as a durable Room event. Native
+control callbacks and credentials are never stored in the Room database.
+Generic Room participant permission prompts fail closed until a Room-scoped
+permission bridge is implemented.
 
 ## 10. Acceptance criteria
 

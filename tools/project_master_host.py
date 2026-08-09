@@ -2076,6 +2076,19 @@ class ResidentModeSessionHost:
         with self._lock:
             return self._connection_status(active=self._provider)
 
+    def active_provider_session_ref(self) -> str | None:
+        with self._lock:
+            active = self._provider
+            if active is None:
+                return None
+            session_id = getattr(active, "session_id", None)
+            if isinstance(session_id, str) and session_id.strip():
+                return session_id.strip()
+            session_ref = getattr(active, "session_ref", None)
+            if isinstance(session_ref, str) and session_ref.strip():
+                return session_ref.strip()
+            return None
+
     def reply(
         self,
         provider: str,
@@ -2404,6 +2417,289 @@ class ResidentModeSessionHost:
             self._runtime_observation(active) if active is not None else None
         )
         return status
+
+
+class RoomParticipantConversationWorker:
+    """Serialize incremental Room events through one resident provider session."""
+
+    def __init__(
+        self,
+        *,
+        binding_id: str,
+        provider: str,
+        session_host: ResidentModeSessionHost,
+        room_event_observer: NativeRoomObserver,
+    ) -> None:
+        self.binding_id = _text(binding_id, "binding_id")
+        self.provider = _provider(provider)
+        self.session_host = session_host
+        self.room_event_observer = room_event_observer
+        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"room-participant-{self.binding_id}",
+            daemon=True,
+        )
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._thread.start()
+
+    def submit(
+        self,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> bool:
+        message = event.get("message")
+        if not isinstance(message, Mapping):
+            raise ProjectMasterHostError("NATIVE_ROOM_MESSAGE_INVALID")
+        room_event_id = _text(event.get("room_event_id"), "event.room_event_id")
+        if message.get("room_event_id") != room_event_id:
+            raise ProjectMasterHostError("NATIVE_ROOM_EVENT_ID_MISMATCH")
+        self._queue.put({"binding": dict(binding), "event": dict(event)})
+        return True
+
+    def wait_idle(self, timeout_seconds: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while self._queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self._queue.unfinished_tasks == 0
+
+    def close(self) -> None:
+        if self._started:
+            self._queue.put(None)
+            self._thread.join(timeout=10)
+        self.session_host.close()
+
+    def is_alive(self) -> bool:
+        return self._started and self._thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                if job is None:
+                    return
+                self._process(job["binding"], job["event"])
+            finally:
+                self._queue.task_done()
+
+    def _process(
+        self,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> None:
+        message = event["message"]
+        room_id = _text(event.get("room_id"), "event.room_id")
+        room_event_id = _text(event.get("room_event_id"), "event.room_event_id")
+        accepted = False
+
+        def observe(event_type: str, **values: Any) -> None:
+            self.room_event_observer(
+                {
+                    "event": event_type,
+                    "room_id": room_id,
+                    "room_event_id": room_event_id,
+                    "binding_id": self.binding_id,
+                    "provider_session_ref": binding.get("provider_session_ref"),
+                    **values,
+                }
+            )
+
+        def accept_once() -> None:
+            nonlocal accepted
+            if accepted:
+                return
+            accepted = True
+            observe("DELIVERY_ACCEPTED")
+
+        def observe_delta(delta: str) -> None:
+            accept_once()
+            observe("DELTA", delta=str(delta))
+
+        provider_message = {
+            "schema": "universe.native-room-input.v1",
+            "message_id": room_event_id,
+            "kind": "ROOM_MESSAGE",
+            "sender": message.get("author_role"),
+            "body": message.get("body_text"),
+            "runtime_context": {
+                "requested_mode": self.session_host.requested_mode,
+                "commander_surface": (
+                    "UNIVERSE_UI"
+                    if message.get("author_role") == "USER"
+                    else "ROOM_PARTICIPANT"
+                ),
+            },
+            "room_context": {
+                "room_id": room_id,
+                "room_sequence": event.get("room_sequence"),
+                "correlation_id": event.get("correlation_id"),
+            },
+        }
+        try:
+            result = self.session_host.reply_stream(
+                self.provider,
+                provider_message,
+                observe_delta,
+            )
+            accept_once()
+            observe(
+                "COMPLETED",
+                body=str(result.get("text") or ""),
+                provider_session_ref=result.get("session_ref"),
+            )
+        except Exception as error:
+            observe(
+                "FAILED",
+                reason=f"{type(error).__name__}: {error}",
+                delivery_status="UNCERTAIN",
+            )
+
+
+@dataclass
+class ResidentRoomParticipantHandle:
+    binding_id: str
+    provider: str
+    provider_session_ref: str
+    worker: RoomParticipantConversationWorker
+
+    def close(self) -> None:
+        self.worker.close()
+
+
+class ResidentRoomParticipantHostManager:
+    """Own explicit native controls for imported Room participant sessions."""
+
+    def __init__(
+        self,
+        *,
+        room_event_observer: NativeRoomObserver,
+        provider_factory: Callable[
+            [str, Path, str, ProjectMasterSessionStore, str, str],
+            MasterProvider,
+        ]
+        | None = None,
+    ) -> None:
+        self.room_event_observer = room_event_observer
+        self.provider_factory = provider_factory
+        self._handles: dict[str, ResidentRoomParticipantHandle] = {}
+        self._lock = threading.RLock()
+
+    def ensure(
+        self,
+        *,
+        binding: Mapping[str, Any],
+        repository_root: Path,
+        node: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        binding_id = _text(binding.get("binding_id"), "binding.binding_id")
+        provider = _provider(binding.get("provider"))
+        session_ref = _text(
+            binding.get("provider_session_ref"),
+            "binding.provider_session_ref",
+        )
+        normalized_mode = _text(mode, "mode").upper()
+        normalized_node = _text(node, "node")
+        root = repository_root.expanduser().resolve(strict=True)
+        with self._lock:
+            current = self._handles.get(binding_id)
+            if (
+                current is not None
+                and current.worker.is_alive()
+                and current.provider == provider
+                and current.provider_session_ref == session_ref
+            ):
+                return {
+                    "status": "RESIDENT",
+                    "binding_id": binding_id,
+                    "provider": provider,
+                    "provider_session_ref": session_ref,
+                }
+            if current is not None:
+                current.close()
+                self._handles.pop(binding_id, None)
+            host = ResidentModeSessionHost(
+                root,
+                normalized_node,
+                normalized_mode,
+                _default_room_participant_db(binding_id),
+                actor_label=str(binding.get("display_name") or binding.get("slot_role") or "Room Participant"),
+                permission_requester=self._permission_unavailable,
+                provider_factory=self.provider_factory,
+            )
+            host.store.observe_provider_session(provider, session_ref)
+            try:
+                connection = host.prepare(provider)
+                observed_ref = host.active_provider_session_ref()
+                if observed_ref != session_ref:
+                    raise ProjectMasterHostError(
+                        "ROOM_PARTICIPANT_SESSION_RESUME_MISMATCH"
+                    )
+                worker = RoomParticipantConversationWorker(
+                    binding_id=binding_id,
+                    provider=provider,
+                    session_host=host,
+                    room_event_observer=self.room_event_observer,
+                )
+                worker.start()
+            except Exception:
+                host.close()
+                raise
+            handle = ResidentRoomParticipantHandle(
+                binding_id=binding_id,
+                provider=provider,
+                provider_session_ref=session_ref,
+                worker=worker,
+            )
+            self._handles[binding_id] = handle
+            return {
+                "status": "STARTED",
+                "binding_id": binding_id,
+                "provider": provider,
+                "provider_session_ref": session_ref,
+                "session_connection": connection,
+            }
+
+    def submit(
+        self,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> bool:
+        binding_id = _text(binding.get("binding_id"), "binding.binding_id")
+        with self._lock:
+            handle = self._handles.get(binding_id)
+        if handle is None or not handle.worker.is_alive():
+            raise ProjectMasterHostError("ROOM_PARTICIPANT_NATIVE_CONTROL_UNAVAILABLE")
+        if str(binding.get("provider") or "").upper() != handle.provider:
+            raise ProjectMasterHostError("ROOM_PARTICIPANT_NATIVE_PROVIDER_MISMATCH")
+        if binding.get("provider_session_ref") != handle.provider_session_ref:
+            raise ProjectMasterHostError("ROOM_PARTICIPANT_NATIVE_SESSION_MISMATCH")
+        return handle.worker.submit(binding, event)
+
+    def stop(self, binding_id: str) -> bool:
+        normalized = _text(binding_id, "binding_id")
+        with self._lock:
+            handle = self._handles.pop(normalized, None)
+        if handle is None:
+            return False
+        handle.close()
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            handles = list(self._handles.values())
+            self._handles.clear()
+        for handle in handles:
+            handle.close()
+
+    @staticmethod
+    def _permission_unavailable(_request: Mapping[str, Any]) -> str | None:
+        raise ProjectMasterHostError("ROOM_PARTICIPANT_PERMISSION_GATEWAY_UNAVAILABLE")
 
 
 class ProjectMasterConversationWorker:
@@ -3416,6 +3712,12 @@ def _runtime_tmp() -> Path:
 def _default_state_db(project_id: str) -> Path:
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
     return Path(base) / "Universe" / "project-master-host" / f"{project_id}.sqlite"
+
+
+def _default_room_participant_db(binding_id: str) -> Path:
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    digest = hashlib.sha256(binding_id.encode("utf-8")).hexdigest()[:24]
+    return Path(base) / "Universe" / "room-participant-host" / f"{digest}.sqlite"
 
 
 def _managed_credential_env(project_id: str) -> str:
