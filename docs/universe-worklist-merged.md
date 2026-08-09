@@ -195,6 +195,13 @@ Completed locally:
   observation fixture.
 - Portable icon, release non-mutation, fixed-loopback upstream, HOST_OFFLINE,
   and browser credential/header isolation tests.
+- ai-career PR #269 Project Runtime DB release
+  `94460a5228603a2ce2f80f6b0ee1a0092bf53f7d` installed through the Host Runtime
+  Lifecycle adapter; validation
+  `1c39336eb8bdb786b628314e2874f1d5d838eb18d7210aa65249860fc18710c4`
+  completed `PASS / VERIFIED` and the service returned to `READY`.
+- Service shutdown grace now covers resident-provider cleanup, preventing a
+  completed shutdown from being misreported as `STOP_TIMEOUT`.
 - Desktop live visual smoke: Session Observatory, Provider worker bindings,
   Worker Bench, and chat/map layout rendered with no fresh-page console warning
   or error. A 390 x 844 mobile viewport also rendered without page-level
