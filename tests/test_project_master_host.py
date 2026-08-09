@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from io import StringIO
 import json
 import os
 import sqlite3
@@ -1511,7 +1512,20 @@ class ProjectMasterHostTests(unittest.TestCase):
             payload = (
                 {
                     "status": "SESSION_PREPARED",
-                    "mode_current_anchor": {"status": "MODE_CURRENT_ANCHOR_OBSERVED"},
+                    "mode_current_anchor": {
+                        "status": "MODE_CURRENT_ANCHOR_OBSERVED",
+                        "snapshot": {
+                            "snapshot": {"anchor_id": "MASTER-CURRENT-001"}
+                        },
+                    },
+                    "mode_boot_binding": {
+                        "status": "PREPARED",
+                        "binding_id": "mode-boot-master-001",
+                        "mode": "MASTER",
+                        "role": "MASTER",
+                        "frame_id": "current",
+                        "anchor_id": "MASTER-CURRENT-001",
+                    },
                 }
                 if "prepare-session" in request.arguments
                 else {"status": "COMMANDER_INPUT_OBSERVED"}
@@ -1548,6 +1562,165 @@ class ProjectMasterHostTests(unittest.TestCase):
             f"universe://project-room/messages/{self._message_id()}",
             requests[1]["evidence_ref"],
         )
+
+    def test_project_mode_coordinator_requires_mode_boot_binding(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        registry = self.root / ".ai/runtime/project_instance/mode_registry.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "modes": {
+                        "MASTER": {
+                            "role": "MASTER",
+                            "scope": "architecture/governance",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            native_runner=lambda _request: NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "status": "SESSION_PREPARED",
+                        "mode_current_anchor": {
+                            "status": "MODE_CURRENT_ANCHOR_CREATED",
+                            "snapshot": {
+                                "snapshot": {"anchor_id": "MASTER-CURRENT-001"}
+                            },
+                        },
+                    }
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            ),
+            source_commit_resolver=lambda _root: "a" * 40,
+        )
+
+        with self.assertRaisesRegex(
+            ProjectMasterHostError,
+            "PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE",
+        ):
+            coordinator.prepare()
+
+    def test_project_mode_runtime_uses_prepared_binding_and_anchor_frame(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            source_commit_resolver=lambda _root: "a" * 40,
+        )
+        coordinator._prepared = {
+            "status": "SESSION_PREPARED",
+            "mode_current_anchor": {
+                "status": "MODE_CURRENT_ANCHOR_CREATED",
+                "snapshot": {
+                    "snapshot": {"anchor_id": "MASTER-CURRENT-001"}
+                },
+            },
+            "mode_boot_binding": {
+                "status": "PREPARED",
+                "binding_id": "mode-boot-master-001",
+                "mode": "MASTER",
+                "role": "MASTER",
+                "frame_id": "current",
+                "anchor_id": "MASTER-CURRENT-001",
+            },
+        }
+        process_holder: list[Any] = []
+
+        class FakeRuntimeProcess:
+            def __init__(self, startup: Mapping[str, Any]) -> None:
+                self.pid = 5151
+                self.stdout = StringIO(json.dumps(startup) + "\n")
+                self.stderr = StringIO("")
+                self.return_code = None
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self):
+                self.return_code = 0
+
+            def wait(self, timeout=None):
+                del timeout
+                self.return_code = 0
+                return 0
+
+            def kill(self):
+                self.return_code = -9
+
+        class FakeJob:
+            def close(self):
+                return None
+
+        def start_process(command, **_options):
+            token = command[command.index("--token") + 1]
+            session_id = command[command.index("--session-id") + 1]
+            process = FakeRuntimeProcess(
+                {
+                    "status": "SESSION_BOOT_IMAGE_CREATED",
+                    "host_adapter": {
+                        "endpoint": "http://127.0.0.1:41992",
+                        "token": token,
+                    },
+                    "runtime_state": {
+                        "anchor_id": "MASTER-CURRENT-001",
+                        "mode": "MASTER",
+                        "role": "MASTER",
+                        "session_id": session_id,
+                        "executable_runtime_currentness": "CURRENT",
+                    },
+                    "mode_boot_binding": {
+                        "status": "ACTIVE",
+                        "binding_id": "mode-boot-master-001",
+                    },
+                }
+            )
+            process.command = list(command)
+            process_holder.append(process)
+            return process
+
+        with patch(
+            "project_master_host._required_host_executable",
+            return_value=Path(sys.executable),
+        ), patch(
+            "project_master_host.subprocess.Popen",
+            side_effect=start_process,
+        ), patch(
+            "project_master_host._WindowsKillOnCloseJob",
+            return_value=FakeJob(),
+        ):
+            binding = coordinator._ensure_runtime()
+
+        command = process_holder[0].command
+        self.assertEqual("current", binding["frame_id"])
+        self.assertEqual(
+            "mode-boot-master-001", binding["mode_boot_binding_id"]
+        )
+        self.assertEqual(
+            "mode-boot-master-001",
+            command[command.index("--boot-binding-id") + 1],
+        )
+        self.assertEqual("current", command[command.index("--frame-id") + 1])
+        coordinator.close()
 
     def test_project_mode_coordinator_preserves_runtime_error_code(self) -> None:
         runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"

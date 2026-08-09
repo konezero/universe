@@ -117,8 +117,12 @@ class UniverseConductorRuntime:
             },
         )
         anchor_id = self._prepared_anchor_id(prepared)
+        mode_boot_binding = self._prepared_mode_boot_binding(
+            prepared,
+            anchor_id=anchor_id,
+        )
         session_id = f"universe-conductor-{uuid4().hex}"
-        frame_id = "conductor"
+        frame_id = mode_boot_binding["frame_id"]
         token = secrets.token_urlsafe(32)
         command = [
             str(_required_host_executable("python")),
@@ -133,6 +137,8 @@ class UniverseConductorRuntime:
             frame_id,
             "--anchor-id",
             anchor_id,
+            "--boot-binding-id",
+            mode_boot_binding["binding_id"],
             "--host-action",
             "UNIVERSE_LOCAL_SERVICE",
             "--session-location",
@@ -178,7 +184,13 @@ class UniverseConductorRuntime:
                 or not isinstance(host_adapter, Mapping)
                 or not isinstance(runtime_state, Mapping)
                 or runtime_state.get("anchor_id") != anchor_id
+                or runtime_state.get("mode") != "CONDUCTOR"
+                or runtime_state.get("role") != "CONDUCTOR"
                 or runtime_state.get("executable_runtime_currentness") != "CURRENT"
+                or not isinstance(startup.get("mode_boot_binding"), Mapping)
+                or startup["mode_boot_binding"].get("binding_id")
+                != mode_boot_binding["binding_id"]
+                or startup["mode_boot_binding"].get("status") != "ACTIVE"
             ):
                 raise UniverseConductorRuntimeError(
                     "UNIVERSE_RUNTIME_START_RESULT_INVALID:"
@@ -547,6 +559,31 @@ class UniverseConductorRuntime:
                 "UNIVERSE_SESSION_PREPARATION_FAILED"
             )
         return _text(anchor_id, "mode_current_anchor.anchor_id")
+
+    @staticmethod
+    def _prepared_mode_boot_binding(
+        prepared: Mapping[str, Any],
+        *,
+        anchor_id: str,
+    ) -> dict[str, str]:
+        binding = prepared.get("mode_boot_binding")
+        if not isinstance(binding, Mapping) or binding.get("status") != "PREPARED":
+            raise UniverseConductorRuntimeError(
+                "UNIVERSE_MODE_BOOT_BINDING_UNAVAILABLE"
+            )
+        normalized = {
+            field: _text(binding.get(field), f"mode_boot_binding.{field}")
+            for field in ("binding_id", "mode", "role", "frame_id", "anchor_id")
+        }
+        if (
+            normalized["mode"] != "CONDUCTOR"
+            or normalized["role"] != "CONDUCTOR"
+            or normalized["anchor_id"] != anchor_id
+        ):
+            raise UniverseConductorRuntimeError(
+                "UNIVERSE_MODE_BOOT_BINDING_MISMATCH"
+            )
+        return normalized
 
     def _git_head(self, repository_root: Path) -> str:
         result = self.native_runner(

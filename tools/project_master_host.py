@@ -194,6 +194,7 @@ class ProjectModeCoordinator:
             "MODE_CURRENT_ANCHOR_OBSERVED",
         }:
             raise ProjectMasterHostError("PROJECT_MASTER_SESSION_PREPARATION_FAILED")
+        _mode_boot_binding(result, expected_mode="MASTER", expected_role="MASTER")
         self._prepared = dict(result)
         return result
 
@@ -480,8 +481,15 @@ class ProjectModeCoordinator:
             )
             if not anchor_id:
                 raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
+            mode_boot_binding = _mode_boot_binding(
+                prepared,
+                expected_mode="MASTER",
+                expected_role="MASTER",
+            )
+            if mode_boot_binding["anchor_id"] != anchor_id:
+                raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_MISMATCH")
             session_id = f"project-master-{uuid4().hex}"
-            frame_id = "master"
+            frame_id = mode_boot_binding["frame_id"]
             token = secrets.token_urlsafe(32)
             python = _required_host_executable("python")
             command = [
@@ -497,6 +505,8 @@ class ProjectModeCoordinator:
                 frame_id,
                 "--anchor-id",
                 anchor_id,
+                "--boot-binding-id",
+                mode_boot_binding["binding_id"],
                 "--host-action",
                 "PROJECT_MASTER_SEED_APPLY",
                 "--session-location",
@@ -535,7 +545,13 @@ class ProjectModeCoordinator:
                     or not isinstance(host_adapter, Mapping)
                     or not isinstance(runtime_state, Mapping)
                     or runtime_state.get("anchor_id") != anchor_id
+                    or runtime_state.get("mode") != "MASTER"
+                    or runtime_state.get("role") != "MASTER"
                     or runtime_state.get("executable_runtime_currentness") != "CURRENT"
+                    or not isinstance(startup.get("mode_boot_binding"), Mapping)
+                    or startup["mode_boot_binding"].get("binding_id")
+                    != mode_boot_binding["binding_id"]
+                    or startup["mode_boot_binding"].get("status") != "ACTIVE"
                 ):
                     raise ProjectMasterHostError(
                         "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
@@ -560,6 +576,7 @@ class ProjectModeCoordinator:
                 "session_id": session_id,
                 "frame_id": frame_id,
                 "anchor_id": anchor_id,
+                "mode_boot_binding_id": mode_boot_binding["binding_id"],
                 "runtime_currentness_observation": str(
                     runtime_state["executable_runtime_currentness"]
                 ),
@@ -3882,6 +3899,29 @@ def _mode_current_anchor_ref(preparation: Mapping[str, Any]) -> str:
     if not isinstance(anchor_ref, str) or not anchor_ref.strip():
         raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
     return anchor_ref.strip()
+
+
+def _mode_boot_binding(
+    preparation: Mapping[str, Any],
+    *,
+    expected_mode: str,
+    expected_role: str,
+) -> dict[str, str]:
+    binding = preparation.get("mode_boot_binding")
+    if not isinstance(binding, Mapping) or binding.get("status") != "PREPARED":
+        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE")
+    normalized = {
+        field: _text(binding.get(field), f"mode_boot_binding.{field}")
+        for field in ("binding_id", "mode", "role", "frame_id", "anchor_id")
+    }
+    if (
+        normalized["mode"] != expected_mode
+        or normalized["role"] != expected_role
+    ):
+        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_MISMATCH")
+    if normalized["anchor_id"] != _mode_current_anchor_ref(preparation):
+        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_MISMATCH")
+    return normalized
 
 
 def _path_is_within(target: Path, root: Path) -> bool:

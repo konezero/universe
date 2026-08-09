@@ -38,9 +38,10 @@ local service prepares the `CONDUCTOR / CONDUCTOR` Mode, starts one owned
 internal Skill Router Session Runtime, and binds its loopback endpoint in
 process memory before it accepts Conductor work. Service startup also opens or
 resumes the last Conductor Provider Session coordinate without sending a model
-prompt. The executable Runtime does
-not select or create the active Mode; the prepared `CONDUCTOR` Mode Current
-Anchor remains the governance coordinate. A single service-owned queue then
+prompt. The prepared `CONDUCTOR` Registry snapshot, Current Anchor, and Mode
+Boot Binding are recorded atomically in the Project Runtime database. The
+executable Runtime consumes that one-use binding; it does not reselect Mode from
+the Distribution Manifest default. A single service-owned queue then
 delivers ordinary conversation to one resident Provider Session:
 
 ```text
@@ -670,7 +671,10 @@ and does not claim an unimplemented `session/cancel` surface in this slice.
 
 Before registration, the resident Host invokes the installed project's
 `prepare-session` command for registered `MASTER` Mode from inside the project
-root. Universe does not open or rewrite the project Anchor database itself.
+root. The Project Runtime Host records the Registry snapshot, MASTER Current
+Anchor, and one-use Mode Boot Binding in the Project-owned Runtime database.
+Universe passes only the opaque binding ID to Session Boot and does not open or
+rewrite that database itself.
 For every accepted Project Room user message, the Project Host invokes:
 
 ```text

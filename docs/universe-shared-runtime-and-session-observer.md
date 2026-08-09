@@ -41,7 +41,8 @@ Universe Shared Runtime
 
 Project Workspace
   - repository and worktree
-  - Project ID and Current Anchor
+  - Project ID and one operational Project Runtime database
+  - Mode Registry snapshot, Current Anchors, and Mode Boot Bindings
   - Project release pin and Project profile
   - Project-local Skills, evidence, and artifacts
 ```
@@ -49,6 +50,28 @@ Project Workspace
 `Universe` may host Runtime services. It never acquires the Project's source,
 identity, Current Anchor, release decision, or execution authority merely by
 attaching the Project.
+
+### Project Runtime database boundary
+
+The Project owns one operational SQLite database at
+`.ai/runtime/state/project_runtime.sqlite3` in the standalone layout. A shared
+Universe Runtime may relocate the physical file later, but it must preserve the
+Project identity and the same Host-only write boundary.
+
+```text
+Mode Registry source
+  -> Host preparation transaction
+  -> Registry snapshot + Mode Current Anchor + Mode Boot Binding
+  -> opaque binding ID
+  -> Session Boot
+```
+
+The Distribution Manifest supplies the installed release and first-start
+defaults. It is not the active Mode source after preparation. Provider sessions
+and Workers receive only the opaque binding and cannot write the Project
+Runtime database directly. The existing per-Mode Anchor stores and Markdown
+state files are compatibility inputs/projections during migration; they cannot
+override a prepared DB binding.
 
 ## Project Attachment Model
 
@@ -305,6 +328,17 @@ their own evidence and adoption contracts.
    health checks, explicit detach, and standalone fallback.
 4. Keep Project ID, Current Anchor, Project Runtime, and Execution Guard
    contracts unchanged through every transition.
+
+### P0: Project Runtime database authority
+
+1. Store Project identity, Mode Registry snapshot, Mode Current Anchor, Beyond
+   Anchor history, and Mode Boot Binding in one Host-owned SQLite database.
+2. Make `prepare-session` create a one-use opaque binding and make
+   `session-boot` consume it instead of reusing the installation default Mode.
+3. Route Universe Conductor and Project Master startup through that binding and
+   fail closed on missing, stale, reused, or mismatched bindings.
+4. Migrate Assignment, Task Frame, continuity, and receipt tables only in later
+   slices after their existing authority boundaries are preserved in tests.
 
 ### P0: Governance selector foundation
 

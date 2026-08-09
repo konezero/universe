@@ -45,6 +45,26 @@ class FakeProcess:
 
 
 class UniverseConductorRuntimeTests(unittest.TestCase):
+    def test_prepare_without_mode_boot_binding_fails_before_process_start(self) -> None:
+        prepared = {
+            "status": "SESSION_PREPARED",
+            "mode_current_anchor": {
+                "status": "MODE_CURRENT_ANCHOR_CREATED",
+                "snapshot": {
+                    "snapshot": {"anchor_id": "UNIVERSE-CURRENT-001"}
+                },
+            },
+        }
+
+        anchor_id = UniverseConductorRuntime._prepared_anchor_id(prepared)
+        with self.assertRaisesRegex(
+            RuntimeError, "UNIVERSE_MODE_BOOT_BINDING_UNAVAILABLE"
+        ):
+            UniverseConductorRuntime._prepared_mode_boot_binding(
+                prepared,
+                anchor_id=anchor_id,
+            )
+
     def test_start_prepares_conductor_mode_and_owns_session_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -86,6 +106,14 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                                 }
                             },
                         },
+                        "mode_boot_binding": {
+                            "status": "PREPARED",
+                            "binding_id": "mode-boot-conductor-001",
+                            "mode": "CONDUCTOR",
+                            "role": "CONDUCTOR",
+                            "frame_id": "current",
+                            "anchor_id": "UNIVERSE-CURRENT-001",
+                        },
                     }
                     if len(requests) == 1
                     else {"status": "COMMANDER_INPUT_OBSERVED"}
@@ -120,6 +148,10 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                             "role": "CONDUCTOR",
                             "session_id": session_id,
                             "executable_runtime_currentness": "CURRENT",
+                        },
+                        "mode_boot_binding": {
+                            "status": "ACTIVE",
+                            "binding_id": "mode-boot-conductor-001",
                         },
                     }
                 )
@@ -183,6 +215,14 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             self.assertEqual("CONDUCTOR", requests[0]["role"])
             self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
             self.assertIn("session-boot", process.command)
+            self.assertEqual(
+                "mode-boot-conductor-001",
+                process.command[process.command.index("--boot-binding-id") + 1],
+            )
+            self.assertEqual(
+                "current",
+                process.command[process.command.index("--frame-id") + 1],
+            )
             self.assertEqual(
                 "OWNED",
                 supervisor.get_session("conductor-session")["process_lease"][

@@ -19,6 +19,12 @@ Application startup requests registered `CONDUCTOR` Mode. `UNIVERSE` remains a
 compatibility alias with the same Role, Scope, and Profile. The Role always
 resolves from the Mode Registry.
 
+The installed Distribution Manifest Mode is only a first-start default. A
+prepared Session binds the Registry-resolved Mode, Role, Scope, Current Anchor,
+and Registry digests into the Project Runtime database. Session Boot must
+consume that opaque Mode Boot Binding and must not resolve active Mode from the
+installation default again.
+
 ## Lifecycle boundary
 
 Initial setup runs in `MASTER`. MASTER installs and validates an ai-career
@@ -50,6 +56,8 @@ source-write authority.
 ```text
 CONDUCTOR Mode MUST resolve Role CONDUCTOR.
 Universe and Conductor intent MUST resolve Mode CONDUCTOR.
+Session Boot Mode MUST equal its prepared Mode Boot Binding Mode.
+Missing, stale, reused, or mismatched Mode Boot Bindings MUST fail closed.
 UNIVERSE compatibility Mode MUST NOT become the application startup Mode.
 Release lifecycle mutation MUST require MASTER Mode.
 Mode or Role MUST NOT create authority or execution permission.
