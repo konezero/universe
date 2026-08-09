@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http import HTTPStatus
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+from provider_model_catalog import ProviderModelCatalogStore, empty_catalog  # noqa: E402
+from universe_memory import (  # noqa: E402
+    MemoryError,
+    consolidate_memory_candidates,
+    extract_memory_candidates_from_activity_batch,
+    normalize_memory_batch_config,
+    normalize_memory_candidate,
+    resolve_memory_batch_config,
+    synthesize_memory_candidates,
+)
+from universe_server import create_server  # noqa: E402
+
+
+def available_catalog() -> dict:
+    catalog = empty_catalog()
+    for provider in ("GROK", "CODEX", "CLAUDE"):
+        catalog["providers"][provider].update(
+            {
+                "status": "AVAILABLE",
+                "default": "test-model",
+                "models": ["test-model", "other-model"],
+            }
+        )
+    return catalog
+
+
+class MemoryCandidateContractTests(unittest.TestCase):
+    def test_config_resolution_and_invalid_values_fail_closed(self) -> None:
+        catalog = available_catalog()
+        config = normalize_memory_batch_config(
+            {
+                "stage": "FAST_EXTRACT",
+                "provider": "CODEX",
+                "model_ref": "test-model",
+                "schedule": {"kind": "DAILY"},
+                "quota_or_budget": {"max_runs": 2},
+                "fallback": "DETERMINISTIC",
+            }
+        )
+        resolved = resolve_memory_batch_config(config, catalog)
+        self.assertEqual("AVAILABLE", resolved["resolution"]["status"])
+        self.assertEqual("CODEX", resolved["resolution"]["resolved_provider"])
+        self.assertEqual(2, config["quota_or_budget"]["max_runs"])
+        with self.assertRaisesRegex(MemoryError, "schedule.interval_minutes"):
+            normalize_memory_batch_config(
+                {
+                    "stage": "FAST_EXTRACT",
+                    "schedule": {"kind": "DAILY", "interval_minutes": 0},
+                }
+            )
+        invalid = dict(config)
+        invalid["model_ref"] = "missing-model"
+        with self.assertRaisesRegex(MemoryError, "model"):
+            resolve_memory_batch_config(invalid, catalog)
+
+    def test_candidate_pipeline_is_redacted_typed_and_deterministic(self) -> None:
+        with self.assertRaises(MemoryError) as raw_error:
+            normalize_memory_candidate(
+                {
+                    "project_id": "TEST",
+                    "stage": "FAST_EXTRACT",
+                    "summary": "bounded",
+                    "prompt": "must not persist",
+                }
+            )
+        self.assertEqual("MEMORY_CANDIDATE_RAW_INPUT_FORBIDDEN", raw_error.exception.code)
+        batch = {
+            "source": {
+                "provider": "CODEX",
+                "provider_session_id": "session-1",
+                "source_id": "source-1",
+            },
+            "activity_refs": [
+                {
+                    "event_kind": "TURN_COMPLETED",
+                    "activity_state": "DONE",
+                    "ordinal": 1,
+                    "activity_digest": "a" * 64,
+                },
+                {
+                    "event_kind": "TURN_COMPLETED",
+                    "activity_state": "DONE",
+                    "ordinal": 2,
+                    "activity_digest": "b" * 64,
+                },
+            ],
+        }
+        extracted = extract_memory_candidates_from_activity_batch(
+            batch, project_id="TEST"
+        )
+        self.assertEqual(2, len(extracted))
+        self.assertEqual("MEMORY", extracted[0]["kind"])
+        self.assertNotIn("body", json.dumps(extracted))
+        consolidated = consolidate_memory_candidates(extracted + [extracted[0]])
+        self.assertTrue(any(item["state"] == "SUPERSEDED" for item in consolidated))
+        self.assertTrue(
+            any(
+                relation["relation"] == "DUPLICATE_OF"
+                for item in consolidated
+                for relation in item["relations"]
+            )
+        )
+        synthesized = synthesize_memory_candidates(consolidated)
+        self.assertEqual({"IDEA", "HYPOTHESIS", "PRODUCT"}, {item["kind"] for item in synthesized})
+        self.assertTrue(
+            all(
+                relation["relation"] == "DERIVED_FROM"
+                for item in synthesized
+                for relation in item["relations"]
+            )
+        )
+        self.assertTrue(all(item["effects"]["auto_adoption"] is False for item in synthesized))
+
+
+class MemoryCandidateApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        catalog_path = root / "provider-models.json"
+        catalog_path.write_text(json.dumps(available_catalog()), encoding="utf-8")
+        self.release = threading.Event()
+        self.executor_started = threading.Event()
+
+        def delegation_executor(_record: dict) -> dict:
+            self.executor_started.set()
+            self.release.wait(timeout=10)
+            return {
+                "result_summary": "bounded delegated result",
+                "result_digest": "c" * 64,
+            }
+
+        self.server = create_server(
+            database_path=root / "universe.sqlite3",
+            token="candidate-test-token",
+            auto_start_project_masters=False,
+            auto_start_conductor_runtime=False,
+            provider_model_catalog=ProviderModelCatalogStore(path=catalog_path),
+            conductor_delegation_executor=delegation_executor,
+        )
+        host, port = self.server.server_address[:2]
+        self.endpoint = f"http://{host}:{port}"
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
+        self.thread.start()
+        (root / "TEST").mkdir()
+        (root / "TEST" / "REPOSITORY_MANIFEST.md").write_text(
+            "# TEST\n", encoding="utf-8"
+        )
+        self.server.store.register_project(
+            {
+                "project_id": "TEST",
+                "project_root": str(root / "TEST"),
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.temp.cleanup()
+
+    def request(self, method: str, path: str, body: dict | None = None):
+        data = None
+        headers = {"Authorization": "Bearer candidate-test-token"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(self.endpoint + path, data=data, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=10) as response:
+                return int(response.status), json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            return int(error.code), json.loads(error.read().decode("utf-8"))
+
+    def configure(self, stage: str, **overrides):
+        body = {
+            "stage": stage,
+            "provider": "CODEX",
+            "model_ref": "test-model",
+            "effort": "LOW",
+            "schedule": {"kind": "MANUAL"},
+            "quota_or_budget": None,
+            "fallback": "DETERMINISTIC",
+            "enabled": True,
+            "dry_run": False,
+        }
+        body.update(overrides)
+        return self.request("POST", "/v1/projects/TEST/memory-batch-config", body)
+
+    def test_config_roundtrip_quota_and_candidates_review(self) -> None:
+        status, saved = self.configure(
+            "FAST_EXTRACT",
+            schedule={"kind": "DAILY"},
+            quota_or_budget={"max_runs": 1},
+            dry_run=True,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("AVAILABLE", saved["config"]["resolution"]["status"])
+        status, listed = self.request("GET", "/v1/projects/TEST/memory-batch-config")
+        self.assertEqual(HTTPStatus.OK, status)
+        fast = next(item for item in listed["configs"] if item["stage"] == "FAST_EXTRACT")
+        self.assertTrue(fast["persisted"])
+        self.assertEqual(1, fast["quota_or_budget"]["max_runs"])
+        self.assertTrue(fast["dry_run"])
+        status, invalid = self.configure("CONSOLIDATE", model_ref="missing-model")
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("MEMORY_BATCH_MODEL_NOT_FOUND", invalid["error_code"])
+        self.configure("CONSOLIDATE")
+        self.configure("SYNTHESIZE")
+        self.configure("INDEPENDENT_CHECK")
+
+        activity_batch = {
+            "source": {
+                "provider": "CODEX",
+                "provider_session_id": "session-1",
+                "source_id": "source-1",
+            },
+            "activity_refs": [
+                {
+                    "event_kind": "TURN_COMPLETED",
+                    "activity_state": "DONE",
+                    "ordinal": 1,
+                    "activity_digest": "d" * 64,
+                },
+                {
+                    "event_kind": "TURN_COMPLETED",
+                    "activity_state": "DONE",
+                    "ordinal": 2,
+                    "activity_digest": "e" * 64,
+                },
+            ],
+        }
+        # Dry-run config proves the quota is persisted without writing candidates.
+        status, dry_run = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-batches/run",
+            {"stage": "FAST_EXTRACT", "activity_batches": [activity_batch]},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("DRY_RUN_COMPLETED", dry_run["run"]["status"])
+        status, listed = self.request("GET", "/v1/projects/TEST/memory-candidates")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([], listed["candidates"])
+
+        self.configure("FAST_EXTRACT", quota_or_budget={"max_runs": 2})
+        status, fast_run = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-batches/run",
+            {"stage": "FAST_EXTRACT", "activity_batches": [activity_batch]},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertGreaterEqual(fast_run["run"]["created_count"], 2)
+        self.assertEqual("DETERMINISTIC", fast_run["execution"]["mode"])
+        self.assertEqual("NOT_RUN", fast_run["execution"]["provider_invocation"])
+        status, consolidate = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", {"stage": "CONSOLIDATE"}
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("CONSOLIDATE", consolidate["run"]["stage"])
+        status, synthesize = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", {"stage": "SYNTHESIZE"}
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(3, synthesize["run"]["candidate_count"])
+        self.assertTrue(
+            all(
+                "transcript" not in json.dumps(item).lower()
+                for item in synthesize["run"]["candidates"]
+            )
+        )
+        candidate_id = synthesize["run"]["candidate_ids"][0]
+        status, reviewed = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "KEEP"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("KEEP", reviewed["candidate"]["state"])
+        status, conflict = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "IGNORE"},
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("MEMORY_CANDIDATE_STATE_CONFLICT", conflict["error_code"])
+
+        self.configure(
+            "INDEPENDENT_CHECK",
+            quota_or_budget={"max_tokens": 1000},
+        )
+        status, unsupported_budget = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-batches/run",
+            {"stage": "INDEPENDENT_CHECK"},
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "MEMORY_BATCH_BUDGET_ENFORCEMENT_UNAVAILABLE",
+            unsupported_budget["error_code"],
+        )
+
+    def test_delegation_is_durable_and_does_not_block_chat(self) -> None:
+        status, queued = self.request(
+            "POST",
+            "/v1/conductor/delegations",
+            {
+                "project_id": "TEST",
+                "summary": "Run the approved bounded work",
+                "idempotency_key": "delegation-test-1",
+                "task_frame_ref": "task-frame-1",
+                "worker_role": "PROJECT_MASTER",
+            },
+        )
+        self.assertEqual(HTTPStatus.ACCEPTED, status)
+        delegation_id = queued["delegation"]["delegation_id"]
+        self.assertTrue(self.executor_started.wait(timeout=5))
+        status, message = self.request(
+            "POST",
+            "/v1/conductor-room/messages",
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "What is the current bounded status?",
+                "idempotency_key": "chat-while-delegated-1",
+            },
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("QUEUED", message["message"]["delivery_state"])
+        self.release.set()
+        deadline = time.time() + 5
+        latest = None
+        while time.time() < deadline:
+            _, latest = self.request(
+                "GET", f"/v1/conductor/delegations/{delegation_id}"
+            )
+            if latest.get("state") == "COMPLETED":
+                break
+            time.sleep(0.05)
+        self.assertEqual("COMPLETED", latest["state"])
+        self.assertEqual("bounded delegated result", latest["result"]["summary"])
+
+    def test_running_delegation_recovers_without_transcript(self) -> None:
+        delegation, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "TEST",
+                "summary": "Recover this bounded operation",
+                "idempotency_key": "delegation-recovery-1",
+            }
+        )
+        self.assertTrue(created)
+        started = self.server.store.start_conductor_delegation(
+            delegation["delegation_id"]
+        )
+        self.assertEqual("RUNNING", started["state"])
+        recovered = self.server.store.recover_conductor_delegations()
+        self.assertIn(delegation["delegation_id"], recovered)
+        after = self.server.store.get_conductor_delegation(
+            delegation["delegation_id"]
+        )
+        self.assertEqual("QUEUED", after["state"])
+        self.assertIn("recovered_at", after["progress"])
+        self.assertNotIn("body", json.dumps(after).lower())
+
+    def test_default_project_master_delegation_completes_from_room_reference(self) -> None:
+        self.server._conductor_delegation_executor = (
+            self.server._dispatch_project_master_delegation
+        )
+        delivered = {
+            "schema": "universe.project-room-message.v1",
+            "message_id": "room_delegated001",
+            "project_id": "TEST",
+            "delivery_state": "DELIVERED_TO_MASTER",
+        }
+        self.server.send_project_room_message = lambda _project, _value: (
+            delivered,
+            True,
+        )
+        delegation, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "TEST",
+                "summary": "Run bounded Project work",
+                "idempotency_key": "delegation-project-master-1",
+            }
+        )
+        self.assertTrue(created)
+        self.server._process_conductor_delegation(delegation["delegation_id"])
+        running = self.server.store.get_conductor_delegation(
+            delegation["delegation_id"]
+        )
+        self.assertEqual("RUNNING", running["state"])
+        self.assertEqual(
+            "room_delegated001",
+            running["progress"]["project_room_message_id"],
+        )
+        progressed = self.server.store.update_conductor_delegation_progress(
+            delegation["delegation_id"],
+            {"summary": "Project Master is still running", "step": "IN_PROGRESS"},
+        )
+        self.assertEqual(
+            "room_delegated001",
+            progressed["progress"]["project_room_message_id"],
+        )
+
+        self.server.store.create_room_message(
+            "TEST",
+            {
+                "kind": "RESULT",
+                "sender": "PROJECT_MASTER",
+                "body": "bounded result body remains in the Project Room",
+                "idempotency_key": "delegation-project-master-result-1",
+                "in_reply_to": "room_delegated001",
+            },
+            delivery_state="RECORDED",
+        )
+        self.server._observe_project_master_completion(
+            {
+                "project_id": "TEST",
+                "message_id": "room_delegated001",
+                "status": "COMPLETED",
+            }
+        )
+        completed = self.server.store.get_conductor_delegation(
+            delegation["delegation_id"]
+        )
+        self.assertEqual("COMPLETED", completed["state"])
+        self.assertIn("universe://projects/TEST/room/messages/", completed["result"]["result_ref"])
+        self.assertNotIn("bounded result body", json.dumps(completed))
+
+
+if __name__ == "__main__":
+    unittest.main()

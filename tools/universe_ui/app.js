@@ -20,11 +20,16 @@ const state = {
   contextPacks: [],
   memories: [],
   memoryProposals: [],
+  memoryBatchConfigs: [],
+  memoryBatchRuns: [],
+  memoryCandidates: [],
+  memoryCandidateFilters: { stage: "", kind: "", state: "REVIEW_REQUIRED" },
   selectedNode: null,
   focusedNodeId: null,
   view: "universe",
   roomMessages: [],
   conductorMessages: [],
+  conductorDelegations: [],
   conductorPermissions: [],
   conductorRuntimeBinding: null,
   conductorRefreshInFlight: false,
@@ -1984,6 +1989,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.todos = todoResult.todos;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];
+    state.conductorDelegations = conductorRoomResult.delegations || [];
     state.conductorPermissions = conductorRoomResult.permissions || [];
     state.conductorRuntimeBinding =
       conductorRoomResult.runtime_binding || null;
@@ -2260,10 +2266,15 @@ async function selectProject(
     contextPackResult,
     memoryResult,
     memoryProposalResult,
+    memoryBatchConfigResult,
+    memoryBatchRunResult,
+    memoryCandidateResult,
   ] = await Promise.all([
-    api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
-      () => null
-    ),
+    project.projection_available === false
+      ? Promise.resolve(null)
+      : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
+          () => null
+        ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/dispatches`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
@@ -2302,6 +2313,15 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/memories/propose-links`
     ).catch(() => ({ proposals: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/memory-batch-config`
+    ).catch(() => ({ configs: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/memory-batches/runs`
+    ).catch(() => ({ runs: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`
+    ).catch(() => ({ candidates: [] })),
   ]);
   state.projection = projectionResult?.projection || null;
   if (state.projection) {
@@ -2333,6 +2353,9 @@ async function selectProject(
   state.contextPacks = contextPackResult.context_packs || [];
   state.memories = memoryResult.memories || [];
   state.memoryProposals = memoryProposalResult.proposals || [];
+  state.memoryBatchConfigs = memoryBatchConfigResult.configs || [];
+  state.memoryBatchRuns = memoryBatchRunResult.runs || [];
+  state.memoryCandidates = memoryCandidateResult.candidates || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -2438,16 +2461,43 @@ function renderRoomMessages() {
     const pendingProposals = state.governanceProposalInbox.filter(
       (item) => item.state === "PROPOSED"
     );
+    const delegations = Array.isArray(state.conductorDelegations)
+      ? state.conductorDelegations
+      : [];
     if (
       !state.conductorMessages.length &&
       !pendingPermissions.length &&
-      !pendingProposals.length
+      !pendingProposals.length &&
+      !delegations.length
     ) {
       const item = node("article", "room-message conductor-message");
       item.append(
         node("strong", "", "UNIVERSE / CONDUCTOR"),
         node("p", "", "Universe control room is active."),
         node("small", "", "Send a message here or use + to call a Project Master.")
+      );
+      elements.roomMessageList.append(item);
+    }
+    for (const delegation of delegations.slice(0, 6)) {
+      const item = node("article", "room-message conductor-message delegation-message");
+      const progress = delegation.progress?.summary || "No progress summary";
+      const result = delegation.result?.summary;
+      item.append(
+        node(
+          "strong",
+          "",
+          `DELEGATION / ${delegation.request?.worker_role || "WORKER"}`
+        ),
+        node(
+          "p",
+          "",
+          delegation.request?.summary || "Bounded delegated work"
+        ),
+        node(
+          "small",
+          "",
+          `${delegation.state || "UNKNOWN"} / ${result || progress}`
+        )
       );
       elements.roomMessageList.append(item);
     }
@@ -4173,6 +4223,7 @@ async function refreshConductorRoom() {
   try {
     const result = await api("/v1/conductor-room/messages");
     state.conductorMessages = result.messages || [];
+    state.conductorDelegations = result.delegations || [];
     state.conductorPermissions = result.permissions || [];
     state.conductorRuntimeBinding = result.runtime_binding || null;
     renderComposerState();
@@ -4201,10 +4252,24 @@ function openConductorRoomStream() {
     const payload = envelope.payload || {};
     if (payload.type === "SNAPSHOT") {
       state.conductorMessages = payload.messages || [];
+      state.conductorDelegations = payload.delegations || [];
       state.conductorPermissions = payload.permissions || [];
       state.conductorRuntimeBinding = payload.runtime_binding || null;
       renderComposerState();
       renderRoomMessages();
+      return;
+    }
+    if (payload.type === "CONDUCTOR_DELEGATION") {
+      const delegation = payload.delegation;
+      if (delegation?.delegation_id) {
+        state.conductorDelegations = [
+          delegation,
+          ...state.conductorDelegations.filter(
+            (item) => item.delegation_id !== delegation.delegation_id
+          ),
+        ].slice(0, 100);
+        renderRoomMessages();
+      }
       return;
     }
     if (payload.type !== "CONDUCTOR_STREAM" || !payload.message_id) return;
@@ -7699,6 +7764,264 @@ async function matchExperienceCase(caseId) {
   }
 }
 
+function appendSelectOption(select, value, label) {
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = label;
+  select.append(option);
+}
+
+function memoryBatchField(label, control) {
+  const wrapper = node("label", "memory-batch-field");
+  wrapper.append(node("span", "field-label", label), control);
+  return wrapper;
+}
+
+function renderMemoryBatchStages() {
+  const group = node("div", "detail-group memory-batch-config");
+  group.append(
+    node("h3", "", "Memory batch stages"),
+    node(
+      "p",
+      "context-copy",
+      "Four bounded stages. Provider/model selection is checked against the current catalog before saving or running."
+    )
+  );
+  const configs = Array.isArray(state.memoryBatchConfigs)
+    ? state.memoryBatchConfigs
+    : [];
+  if (!configs.length) {
+    group.append(node("p", "empty-copy", "No stage configuration is available"));
+    return group;
+  }
+  for (const config of configs) {
+    const row = node("div", "memory-batch-row");
+    const heading = node("div", "memory-batch-row-heading");
+    const status = config.resolution?.status || "UNRESOLVED";
+    heading.append(
+      node("strong", "", config.stage),
+      node("span", `memory-batch-status status-${String(status).toLowerCase()}`, status)
+    );
+    row.append(heading);
+
+    const provider = document.createElement("select");
+    for (const option of ["AUTO", "GROK", "CODEX", "CLAUDE"]) {
+      appendSelectOption(provider, option, option);
+    }
+    provider.value = config.provider || "AUTO";
+    const model = document.createElement("input");
+    model.type = "text";
+    model.value = config.model_ref || "";
+    model.placeholder = "Catalog model or blank for default";
+    model.maxLength = 256;
+    const effort = document.createElement("select");
+    for (const option of ["AUTO", "LOW", "MEDIUM", "HIGH", "MAX"]) {
+      appendSelectOption(effort, option, option);
+    }
+    effort.value = config.effort || "AUTO";
+    const schedule = document.createElement("select");
+    for (const option of ["MANUAL", "HOURLY", "DAILY", "WEEKLY"]) {
+      appendSelectOption(schedule, option, option);
+    }
+    schedule.value = config.schedule?.kind || "MANUAL";
+    const fallback = document.createElement("select");
+    for (const option of [
+      "DETERMINISTIC",
+      "DISABLE",
+      "NONE",
+      "AUTO",
+      "GROK",
+      "CODEX",
+      "CLAUDE",
+    ]) {
+      appendSelectOption(fallback, option, option);
+    }
+    fallback.value = config.fallback || "DETERMINISTIC";
+    const quota = document.createElement("input");
+    quota.type = "number";
+    quota.min = "0";
+    quota.max = "1000000";
+    quota.step = "1";
+    quota.placeholder = "Unlimited";
+    quota.value = config.quota_or_budget?.max_runs ?? "";
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox";
+    enabled.checked = config.enabled !== false;
+    const dryRun = document.createElement("input");
+    dryRun.type = "checkbox";
+    dryRun.checked = Boolean(config.dry_run);
+    const toggles = node("div", "memory-batch-toggles");
+    const enabledLabel = node("label", "memory-batch-toggle");
+    enabledLabel.append(enabled, node("span", "", "Enabled"));
+    const dryRunLabel = node("label", "memory-batch-toggle");
+    dryRunLabel.append(dryRun, node("span", "", "Dry run"));
+    toggles.append(enabledLabel, dryRunLabel);
+    const fields = node("div", "memory-batch-fields");
+    fields.append(
+      memoryBatchField("Provider", provider),
+      memoryBatchField("Model", model),
+      memoryBatchField("Effort", effort),
+      memoryBatchField("Schedule", schedule),
+      memoryBatchField("Max runs", quota),
+      memoryBatchField("Fallback", fallback),
+      toggles
+    );
+    row.append(fields);
+    const actions = node("div", "memory-batch-actions");
+    const save = node("button", "secondary-button compact-action", "Save stage");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      try {
+        const maxRuns = quota.value === "" ? null : Number(quota.value);
+        const result = await api(
+          `/v1/projects/${encodeURIComponent(
+            state.selectedProject.project_id
+          )}/memory-batch-config`,
+          {
+            method: "POST",
+            body: {
+              stage: config.stage,
+              provider: provider.value,
+              model_ref: model.value.trim(),
+              effort: effort.value,
+              schedule: { kind: schedule.value },
+              quota_or_budget:
+                maxRuns === null ? null : { max_runs: maxRuns },
+              fallback: fallback.value,
+              enabled: enabled.checked,
+              dry_run: dryRun.checked,
+            },
+          }
+        );
+        state.memoryBatchConfigs = state.memoryBatchConfigs.map((item) =>
+          item.stage === config.stage ? result.config : item
+        );
+        renderMemory();
+        toast(`${config.stage} configuration saved`);
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    const run = node("button", "primary-button compact-action", "Run stage");
+    run.type = "button";
+    run.disabled = config.enabled === false;
+    run.addEventListener("click", async () => {
+      try {
+        const result = await api(
+          `/v1/projects/${encodeURIComponent(
+            state.selectedProject.project_id
+          )}/memory-batches/run`,
+          { method: "POST", body: { stage: config.stage } }
+        );
+        state.memoryBatchRuns = [result.run, ...state.memoryBatchRuns];
+        const candidates = await api(
+          `/v1/projects/${encodeURIComponent(
+            state.selectedProject.project_id
+          )}/memory-candidates?limit=200`
+        );
+        state.memoryCandidates = candidates.candidates || [];
+        renderMemory();
+        toast(`${config.stage} completed`);
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    actions.append(save, run);
+    row.append(actions);
+    group.append(row);
+  }
+  return group;
+}
+
+function renderMemoryCandidateReview() {
+  const group = node("div", "detail-group memory-candidate-review");
+  group.append(
+    node("h3", "", "Candidate review"),
+    node(
+      "p",
+      "context-copy",
+      "Review-only candidates retain summaries, digests, ranges, and relations. Decisions never write Seed, facts, anchors, authority, or source."
+    )
+  );
+  const filters = node("div", "memory-candidate-filters");
+  const filterOptions = [
+    ["stage", "Stage", ["", "FAST_EXTRACT", "CONSOLIDATE", "SYNTHESIZE", "INDEPENDENT_CHECK"]],
+    ["kind", "Kind", ["", "MEMORY", "IDEA", "HYPOTHESIS", "PRODUCT"]],
+    ["state", "State", ["", "REVIEW_REQUIRED", "KEEP", "IGNORE", "EXPLORE", "START_PRODUCT_DESIGN", "SUPERSEDED", "CONFLICTED"]],
+  ];
+  for (const [key, label, options] of filterOptions) {
+    const select = document.createElement("select");
+    for (const option of options) appendSelectOption(select, option, option || `All ${label}`);
+    select.value = state.memoryCandidateFilters[key] || "";
+    select.addEventListener("change", () => {
+      state.memoryCandidateFilters[key] = select.value;
+      renderMemory();
+    });
+    filters.append(memoryBatchField(label, select));
+  }
+  group.append(filters);
+  const filtersState = state.memoryCandidateFilters;
+  const candidates = (state.memoryCandidates || []).filter((candidate) =>
+    (!filtersState.stage || candidate.stage === filtersState.stage) &&
+    (!filtersState.kind || candidate.kind === filtersState.kind) &&
+    (!filtersState.state || candidate.state === filtersState.state)
+  );
+  if (!candidates.length) {
+    group.append(node("p", "empty-copy", "No candidates match the current filters"));
+    return group;
+  }
+  const list = node("div", "memory-candidate-list");
+  for (const candidate of candidates.slice(0, 50)) {
+    const card = node("article", "memory-candidate-row");
+    const provenance = candidate.provenance || {};
+    const range = provenance.source_range || {};
+    const refs = Array.isArray(provenance.ref_digests)
+      ? provenance.ref_digests.length
+      : 0;
+    card.append(
+      node("strong", "", `${candidate.kind} / ${candidate.stage}`),
+      node("span", "memory-candidate-state", candidate.state),
+      node("p", "", candidate.summary || "No summary"),
+      node(
+        "small",
+        "",
+        `session ${String(provenance.source_session || "UNKNOWN").slice(0, 16)} / range ${range.start ?? "-"}-${range.end ?? "-"} / refs ${refs} / repeated ${candidate.relevance?.repetition_count || 1}`
+      )
+    );
+    if (candidate.state === "REVIEW_REQUIRED") {
+      const actions = node("div", "memory-candidate-actions");
+      for (const decision of ["IGNORE", "KEEP", "EXPLORE", "START_PRODUCT_DESIGN"]) {
+        const button = node("button", "secondary-button compact-action", decision);
+        button.type = "button";
+        button.addEventListener("click", async () => {
+          try {
+            const result = await api(
+              `/v1/memory-candidates/${encodeURIComponent(
+                candidate.candidate_id
+              )}/review`,
+              { method: "POST", body: { decision } }
+            );
+            state.memoryCandidates = state.memoryCandidates.map((item) =>
+              item.candidate_id === result.candidate.candidate_id
+                ? result.candidate
+                : item
+            );
+            renderMemory();
+            toast(`Candidate ${decision.toLowerCase()}`);
+          } catch (error) {
+            toast(error.message, true);
+          }
+        });
+        actions.append(button);
+      }
+      card.append(actions);
+    }
+    list.append(card);
+  }
+  group.append(list);
+  return group;
+}
+
 function renderMemory() {
   if (!elements.memoryPanel) return;
   elements.memoryPanel.replaceChildren();
@@ -7792,6 +8115,8 @@ function renderMemory() {
   });
   maintainGroup.append(maintainBtn, applyBtn);
   elements.memoryPanel.append(maintainGroup);
+  elements.memoryPanel.append(renderMemoryBatchStages());
+  elements.memoryPanel.append(renderMemoryCandidateReview());
 
   const create = node("div", "detail-group memory-create");
   create.append(node("h3", "", "Add note"));

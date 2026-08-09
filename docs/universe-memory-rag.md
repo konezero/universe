@@ -1,10 +1,10 @@
 # Universe Memory RAG (product slice)
 
-Status: implemented (deterministic 1st slice)  
-Scope: project-local memory notes, operator-selected provider activity batches,
-node link/unlink, search, propose-links
-Not: Candidate creation, Seed mutation, automatic Bench/Future promotion,
-nightly LLM batch, Career promotion
+Status: implemented foundation (deterministic Memory RAG plus review-only batch candidates)
+Scope: project-local memory notes, configurable redacted batch stages,
+candidate review, node link/unlink, search, and propose-links
+Not: Candidate auto-adoption, Seed mutation, automatic Bench/Future promotion,
+Career promotion, or raw transcript storage
 
 ## Invariant
 
@@ -14,7 +14,94 @@ MEMORY_SYNC != Candidate
 MEMORY_SYNC != Seed write
 MEMORY_SYNC != Task Frame / authority
 Provider activity batch -> operator-selected project Memory -> node review/link
+Provider activity refs -> FAST_EXTRACT -> CONSOLIDATE -> SYNTHESIZE -> Candidate Review
+Conductor chat -> bounded delegation state -> Project Master / Task Frame result
 ```
+
+## Memory batch stages
+
+Each Project can persist one configuration per stage:
+`FAST_EXTRACT`, `CONSOLIDATE`, `SYNTHESIZE`, and optional
+`INDEPENDENT_CHECK`. Configuration includes provider, model, effort, schedule,
+quota or budget, fallback, enabled, and dry-run values. Missing provider,
+model, and effort values inherit the existing `ROUTINE` Worker Binding shape
+for `MEMORY_<STAGE>`.
+
+The service resolves the normalized configuration against the current provider
+model catalog. An invalid provider or model fails closed. An unavailable
+provider is reported as unavailable; only an explicitly configured
+`DETERMINISTIC` fallback can run without an available provider. The catalog
+snapshot and resolution status are returned with the configuration.
+
+The current product slice persists and validates schedule policy, but does not
+yet run these four stages from a wall-clock scheduler. Stage execution is
+manual through the API/UI. The configured Provider, model, and effort gate
+whether a stage may run and are recorded in the run contract; candidate
+generation itself remains deterministic until the Task Frame Provider adapter
+is connected. The service must not claim that a Provider model generated a
+candidate in this state. A run therefore requires `fallback: DETERMINISTIC`
+and reports `provider_invocation: NOT_RUN`. This slice enforces `max_runs`;
+token, cost, and window budgets fail closed until Provider usage telemetry is
+connected.
+
+```text
+GET  /v1/settings/memory-batch/catalog
+GET  /v1/projects/{project_id}/memory-batch-config
+POST /v1/projects/{project_id}/memory-batch-config
+GET  /v1/projects/{project_id}/memory-batches/runs
+POST /v1/projects/{project_id}/memory-batches/run
+```
+
+## Redacted candidates
+
+`FAST_EXTRACT` consumes reduced activity references and creates typed `MEMORY`
+candidates. `CONSOLIDATE` deterministically deduplicates and records
+`DUPLICATE_OF`, `MERGED_FROM`, `CONFLICTS_WITH`, and supersede relations.
+`SYNTHESIZE` creates review-only `IDEA`, `HYPOTHESIS`, and `PRODUCT`
+candidates with `DERIVED_FROM` relations. `INDEPENDENT_CHECK` reports bounded
+integrity failures without changing candidate state.
+
+Candidate records retain only a bounded summary, source-session digest, source
+range, reference digests, relations, and repetition relevance. Raw prompts,
+transcripts, source text, commands, and tool arguments are rejected recursively
+at the API boundary. Repetition changes relevance only; it never creates
+factual authority. Candidate writes do not mutate Current Anchor, Project
+facts, Seed, authority, Assignment, or source.
+
+```text
+GET  /v1/projects/{project_id}/memory-candidates?stage=&kind=&state=
+POST /v1/projects/{project_id}/memory-candidates
+POST /v1/memory-candidates/{candidate_id}/review
+```
+
+Only `REVIEW_REQUIRED` candidates accept `IGNORE`, `KEEP`, `EXPLORE`, or
+`START_PRODUCT_DESIGN`. A second identical decision is idempotent; all other
+transitions fail closed with a conflict.
+
+## Non-blocking Conductor delegation
+
+Delegation stores a bounded summary, project, Worker role, optional Task Frame
+reference, provider/model request, progress summary, and result summary. It
+does not store a chat transcript or replay one on recovery. The delegation
+worker is separate from the ordinary Conductor room worker, so an active
+Project Master or Task Frame delegation does not occupy the Conductor chat
+queue.
+
+```text
+POST /v1/conductor/delegations
+GET  /v1/conductor/delegations?project_id=&state=
+GET  /v1/conductor/delegations/{delegation_id}
+POST /v1/conductor/delegations/{delegation_id}/progress
+POST /v1/conductor/delegations/{delegation_id}/result
+POST /v1/conductor/delegations/{delegation_id}/fail
+```
+
+`RUNNING` delegations are recovered as `QUEUED` on service restart and resume
+from the bounded state record. Conductor remains the coordinator. The default
+`PROJECT_MASTER` route sends only the bounded summary to the resident Project
+Master and completes from the resulting Project Room reference, without
+copying the reply into the delegation record. Boss/Worker roles require an
+approved Task Frame executor and fail closed when one is not installed.
 
 ## API
 
@@ -88,8 +175,9 @@ effects.seed_write: NONE
 effects.auto_linked: false
 ```
 
-It never auto-`LINKED`, never writes Seed, and never creates Candidates. A later
-nightly LLM batch may replace scoring while keeping the same apply boundary.
+It never auto-`LINKED`, never writes Seed, and never creates a Candidate from
+the legacy maintain route. The configurable Memory batch route is the separate
+redacted candidate pipeline described above.
 
 `run_nightly_memory_rag_batch()` adds a credential-free service boundary for
 scheduled runs. It hashes the Memory/Node sets and source reference, omits raw
@@ -112,6 +200,9 @@ Inspector **Memory** tab:
 - unlinked list + Link to selected node
 - refresh / apply deterministic proposals
 - node-scoped linked memory list
+- configure and run the four Memory batch stages
+- filter candidates by stage, kind, and review state
+- review candidate provenance summaries and record bounded decisions
 
 Inspector **Future** tab aggregates Seed structure, Bench/Experience counts,
 Memory, and Master handoffs for a single planning surface.

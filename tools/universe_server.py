@@ -100,15 +100,29 @@ from project_master_host import (
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
 from universe_memory import (
+    MEMORY_BATCH_CONFIG_SCHEMA,
+    MEMORY_BATCH_RUN_SCHEMA,
+    MEMORY_BATCH_STAGES,
+    MEMORY_CANDIDATE_DECISIONS,
+    MEMORY_CANDIDATE_KINDS,
+    MEMORY_CANDIDATE_SCHEMA,
+    MEMORY_CANDIDATE_STATES,
     MEMORY_SCHEMA,
     MemoryError,
+    consolidate_memory_candidates,
+    extract_memory_candidates_from_activity_batch,
     filter_llm_proposals,
+    independent_check_memory_candidates,
+    normalize_memory_batch_config,
+    normalize_memory_candidate,
     normalize_memory_create,
     normalize_memory_link,
     normalize_memory_maintain,
     propose_node_links,
     propose_node_links_heuristic,
+    resolve_memory_batch_config,
     select_best_proposals,
+    synthesize_memory_candidates,
 )
 from universe_runtime_host import (
     RuntimeHostError,
@@ -250,6 +264,13 @@ EXPERIENCE_PATTERN_PROPOSAL_SCHEMA = "universe.experience-pattern-proposal.v1"
 CAREER_PROMOTION_CANDIDATE_SCHEMA = "universe.career-promotion-candidate.v1"
 CAREER_PROMOTION_QUEUE_SCHEMA = "universe.career-promotion-queue-item.v1"
 RUNTIME_WORKER_INVOCATION_SCHEMA = "universe.runtime-worker-invocation.v1"
+CONDUCTOR_DELEGATION_SCHEMA = "universe.conductor-delegation.v1"
+CONDUCTOR_DELEGATION_STATES = frozenset(
+    {"QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}
+)
+CONDUCTOR_DELEGATION_ROLES = frozenset(
+    {"PROJECT_MASTER", "BOSS", "WORKER", "IMPLEMENTER", "REVIEWER", "QA"}
+)
 MAX_BODY_BYTES = 1024 * 1024
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EVENT_TYPE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -3213,6 +3234,108 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
     return message
 
 
+def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
+    """Normalize a bounded handoff request without retaining chat content."""
+
+    if not isinstance(value, Mapping):
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_INVALID",
+            "delegation body must be an object",
+        )
+    allowed = {
+        "project_id",
+        "summary",
+        "idempotency_key",
+        "task_frame_ref",
+        "worker_role",
+        "source_message_id",
+        "provider",
+        "model_ref",
+    }
+    forbidden = {
+        "body",
+        "command",
+        "prompt",
+        "instruction",
+        "transcript",
+        "raw_prompt",
+        "raw_source",
+        "tool_args",
+    }
+    invalid_fields = {
+        str(key).strip().lower()
+        for key in value
+        if str(key).strip().lower() in forbidden
+        or str(key).strip().lower().startswith("raw_")
+    }
+    if invalid_fields:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_RAW_INPUT_FORBIDDEN",
+            "delegation accepts a bounded summary, not prompts, commands, or transcripts",
+        )
+    if set(value) - allowed:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_INVALID",
+            "delegation contains unsupported fields",
+        )
+    project_id = _project_id(value.get("project_id"))
+    summary = _required_text(value.get("summary"), "summary")
+    if len(summary) > 2000:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_SUMMARY_INVALID",
+            "summary must be no longer than 2000 characters",
+        )
+    idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
+    if len(idempotency_key) > 256:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_IDEMPOTENCY_INVALID",
+            "idempotency_key is too long",
+        )
+    task_frame_ref = str(value.get("task_frame_ref") or "").strip()
+    if len(task_frame_ref) > 256:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_TASK_FRAME_INVALID",
+            "task_frame_ref is too long",
+        )
+    worker_role = str(value.get("worker_role") or "PROJECT_MASTER").strip().upper()
+    if worker_role not in CONDUCTOR_DELEGATION_ROLES:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_ROLE_INVALID",
+            "worker_role is not a supported delegation target",
+        )
+    source_message_id = str(value.get("source_message_id") or "").strip()
+    if source_message_id and len(source_message_id) > 160:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_SOURCE_INVALID",
+            "source_message_id is too long",
+        )
+    provider = str(value.get("provider") or "AUTO").strip().upper()
+    if provider not in PROVIDER_SETTING_CHOICES:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_PROVIDER_INVALID",
+            "provider must be AUTO, GROK, CODEX, or CLAUDE",
+        )
+    model_ref = str(value.get("model_ref") or "").strip()
+    if len(model_ref) > 256 or (
+        model_ref and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", model_ref)
+    ):
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_MODEL_INVALID",
+            "model_ref is invalid",
+        )
+    return {
+        "schema": CONDUCTOR_DELEGATION_SCHEMA,
+        "project_id": project_id,
+        "summary": summary,
+        "idempotency_key": idempotency_key,
+        "task_frame_ref": task_frame_ref or None,
+        "worker_role": worker_role,
+        "source_message_id": source_message_id or None,
+        "provider": provider,
+        "model_ref": model_ref,
+    }
+
+
 def normalize_master_bridge(project_id: str, value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -4549,6 +4672,130 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS conductor_room_message_time
                 ON conductor_room_message(created_at, message_id);
 
+                CREATE TABLE IF NOT EXISTS conductor_delegation (
+                    delegation_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    request_json TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
+                    progress_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS conductor_delegation_project_time
+                ON conductor_delegation(project_id, created_at, delegation_id);
+
+                CREATE INDEX IF NOT EXISTS conductor_delegation_state_time
+                ON conductor_delegation(state, updated_at, delegation_id);
+
+                CREATE TABLE IF NOT EXISTS memory_batch_config (
+                    config_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    stage TEXT NOT NULL
+                        CHECK(stage IN ('FAST_EXTRACT', 'CONSOLIDATE', 'SYNTHESIZE', 'INDEPENDENT_CHECK')),
+                    provider TEXT NOT NULL
+                        CHECK(provider IN ('AUTO', 'GROK', 'CODEX', 'CLAUDE')),
+                    model_ref TEXT NOT NULL,
+                    effort TEXT NOT NULL
+                        CHECK(effort IN ('AUTO', 'LOW', 'MEDIUM', 'HIGH', 'MAX')),
+                    schedule_json TEXT NOT NULL,
+                    quota_or_budget_json TEXT,
+                    fallback TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                    dry_run INTEGER NOT NULL CHECK(dry_run IN (0, 1)),
+                    config_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, stage)
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_batch_config_project_stage
+                ON memory_batch_config(project_id, stage, enabled);
+
+                CREATE TABLE IF NOT EXISTS memory_batch_run (
+                    run_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    config_digest TEXT NOT NULL,
+                    input_digest TEXT NOT NULL,
+                    output_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+                    result_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_batch_run_project_time
+                ON memory_batch_run(project_id, started_at, run_id);
+
+                CREATE TABLE IF NOT EXISTS memory_candidate (
+                    candidate_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    stage TEXT NOT NULL
+                        CHECK(stage IN ('FAST_EXTRACT', 'CONSOLIDATE', 'SYNTHESIZE', 'INDEPENDENT_CHECK')),
+                    kind TEXT NOT NULL
+                        CHECK(kind IN ('MEMORY', 'IDEA', 'HYPOTHESIS', 'PRODUCT')),
+                    state TEXT NOT NULL
+                        CHECK(state IN ('REVIEW_REQUIRED', 'KEEP', 'IGNORE', 'EXPLORE', 'START_PRODUCT_DESIGN', 'SUPERSEDED', 'CONFLICTED')),
+                    candidate_digest TEXT NOT NULL UNIQUE,
+                    candidate_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_candidate_filter
+                ON memory_candidate(project_id, stage, kind, state, updated_at, candidate_id);
+
+                CREATE TABLE IF NOT EXISTS memory_candidate_relation (
+                    relation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    candidate_id TEXT NOT NULL
+                        REFERENCES memory_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    target_candidate_id TEXT NOT NULL,
+                    relation TEXT NOT NULL
+                        CHECK(relation IN ('DERIVED_FROM', 'DUPLICATE_OF', 'MERGED_FROM', 'CONFLICTS_WITH', 'SUPERSEDES', 'MERGED_INTO')),
+                    relation_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(candidate_id, target_candidate_id, relation)
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_candidate_relation_target
+                ON memory_candidate_relation(target_candidate_id, relation, candidate_id);
+
+                CREATE TABLE IF NOT EXISTS memory_candidate_review (
+                    review_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL
+                        REFERENCES memory_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    decision TEXT NOT NULL
+                        CHECK(decision IN ('IGNORE', 'KEEP', 'EXPLORE', 'START_PRODUCT_DESIGN')),
+                    decision_json TEXT NOT NULL,
+                    decided_at TEXT NOT NULL,
+                    UNIQUE(candidate_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_candidate_review_project_time
+                ON memory_candidate_review(project_id, decided_at, candidate_id);
+
                 CREATE TABLE IF NOT EXISTS project_master_bridge (
                     project_id TEXT PRIMARY KEY
                         REFERENCES project_connection(project_id)
@@ -5168,6 +5415,202 @@ class UniverseStore:
             "snapshot": snapshot,
             "resolved_at": utc_now(),
         }
+
+    @staticmethod
+    def _memory_batch_config_row(row: sqlite3.Row) -> dict[str, Any]:
+        value = json.loads(row["config_json"])
+        value["schema"] = MEMORY_BATCH_CONFIG_SCHEMA
+        value["config_id"] = str(row["config_id"])
+        value["project_id"] = str(row["project_id"])
+        value["revision"] = int(row["revision"])
+        value["persisted"] = True
+        value["updated_at"] = str(row["updated_at"])
+        return value
+
+    def upsert_memory_batch_config(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "MEMORY_BATCH_CONFIG_INVALID",
+                "memory batch config must be an object",
+            )
+        resolution = value.get("resolution")
+        request = dict(value)
+        request.pop("resolution", None)
+        request.pop("schema", None)
+        try:
+            normalized = normalize_memory_batch_config(request)
+        except MemoryError as error:
+            raise UniverseError(error.code, error.message) from error
+        if isinstance(resolution, Mapping):
+            normalized["resolution"] = dict(resolution)
+        now = utc_now()
+        key = {"project_id": project["project_id"], "stage": normalized["stage"]}
+        config_id = "memory_batch_config_" + _json_sha256(key)[:24]
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT revision FROM memory_batch_config
+                WHERE project_id = ? AND stage = ?
+                """,
+                (project["project_id"], normalized["stage"]),
+            ).fetchone()
+            revision = int(existing["revision"]) + 1 if existing is not None else 1
+            connection.execute(
+                """
+                INSERT INTO memory_batch_config(
+                    config_id, project_id, stage, provider, model_ref, effort,
+                    schedule_json, quota_or_budget_json, fallback, enabled, dry_run,
+                    config_json, revision, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, stage) DO UPDATE SET
+                    config_id = excluded.config_id,
+                    provider = excluded.provider,
+                    model_ref = excluded.model_ref,
+                    effort = excluded.effort,
+                    schedule_json = excluded.schedule_json,
+                    quota_or_budget_json = excluded.quota_or_budget_json,
+                    fallback = excluded.fallback,
+                    enabled = excluded.enabled,
+                    dry_run = excluded.dry_run,
+                    config_json = excluded.config_json,
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    config_id,
+                    project["project_id"],
+                    normalized["stage"],
+                    normalized["provider"],
+                    normalized["model_ref"],
+                    normalized["effort"],
+                    _canonical_json(normalized["schedule"]),
+                    (
+                        _canonical_json(normalized["quota_or_budget"])
+                        if normalized["quota_or_budget"] is not None
+                        else None
+                    ),
+                    normalized["fallback"],
+                    int(normalized["enabled"]),
+                    int(normalized["dry_run"]),
+                    _canonical_json(
+                        {
+                            **normalized,
+                            "project_id": project["project_id"],
+                            "config_id": config_id,
+                            "revision": revision,
+                            "persisted": True,
+                            "updated_at": now,
+                        }
+                    ),
+                    revision,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM memory_batch_config WHERE config_id = ?",
+                (config_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MEMORY_BATCH_CONFIG_UNAVAILABLE",
+                "memory batch config was not persisted",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        return self._memory_batch_config_row(row)
+
+    def get_memory_batch_configs(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_batch_config
+                WHERE project_id = ?
+                ORDER BY stage
+                """,
+                (project["project_id"],),
+            ).fetchall()
+        stored = {str(row["stage"]): self._memory_batch_config_row(row) for row in rows}
+        result: list[dict[str, Any]] = []
+        for stage in ("FAST_EXTRACT", "CONSOLIDATE", "SYNTHESIZE", "INDEPENDENT_CHECK"):
+            if stage in stored:
+                result.append(stored[stage])
+                continue
+            try:
+                binding = self.resolve_worker_binding(
+                    {
+                        "project_id": project["project_id"],
+                        "worker_role": "ROUTINE",
+                        "task_type": f"MEMORY_{stage}",
+                    }
+                )["snapshot"]
+                normalized = normalize_memory_batch_config(
+                    {"stage": stage}, worker_binding=binding
+                )
+            except MemoryError as error:
+                raise UniverseError(error.code, error.message) from error
+            result.append(
+                {
+                    **normalized,
+                    "project_id": project["project_id"],
+                    "config_id": None,
+                    "revision": 0,
+                    "persisted": False,
+                    "updated_at": None,
+                }
+            )
+        return result
+
+    def get_memory_batch_config(self, project_id: str, stage: str) -> dict[str, Any]:
+        normalized_stage = str(stage or "").strip().upper()
+        if normalized_stage not in MEMORY_BATCH_STAGES:
+            raise UniverseError(
+                "MEMORY_BATCH_STAGE_INVALID", "stage is not supported"
+            )
+        return next(
+            item
+            for item in self.get_memory_batch_configs(project_id)
+            if item["stage"] == normalized_stage
+        )
+
+    def list_memory_batch_runs(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_id, project_id, stage, config_digest, input_digest,
+                       output_digest, status, candidate_ids_json, result_json,
+                       started_at, completed_at
+                FROM memory_batch_run
+                WHERE project_id = ?
+                ORDER BY started_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [
+            {
+                "schema": MEMORY_BATCH_RUN_SCHEMA,
+                "run_id": str(row["run_id"]),
+                "project_id": str(row["project_id"]),
+                "stage": str(row["stage"]),
+                "config_digest": str(row["config_digest"]),
+                "input_digest": str(row["input_digest"]),
+                "output_digest": str(row["output_digest"]),
+                "status": str(row["status"]),
+                "candidate_ids": json.loads(row["candidate_ids_json"]),
+                "result": json.loads(row["result_json"]),
+                "started_at": str(row["started_at"]),
+                "completed_at": str(row["completed_at"]),
+            }
+            for row in rows
+        ]
 
     @staticmethod
     def _worker_binding_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -9097,6 +9540,447 @@ class UniverseStore:
             ),
         }
 
+    @staticmethod
+    def _memory_candidate_row(row: sqlite3.Row) -> dict[str, Any]:
+        candidate = json.loads(row["candidate_json"])
+        candidate["schema"] = MEMORY_CANDIDATE_SCHEMA
+        candidate["created_at"] = str(row["created_at"])
+        candidate["updated_at"] = str(row["updated_at"])
+        return candidate
+
+    def _insert_memory_candidates(
+        self,
+        project_id: str,
+        candidates: list[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        project = self.get_project(project_id)
+        normalized: list[dict[str, Any]] = []
+        for item in candidates:
+            try:
+                candidate = normalize_memory_candidate(item, project_id=project["project_id"])
+            except MemoryError as error:
+                raise UniverseError(error.code, error.message) from error
+            if candidate["project_id"] != project["project_id"]:
+                raise UniverseError(
+                    "MEMORY_CANDIDATE_PROJECT_MISMATCH",
+                    "candidate project_id does not match the selected project",
+                )
+            normalized.append(candidate)
+        now = utc_now()
+        stored: list[dict[str, Any]] = []
+        created_count = 0
+        with self._connection() as connection:
+            for candidate in normalized:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM memory_candidate
+                    WHERE candidate_id = ? OR candidate_digest = ?
+                    ORDER BY candidate_id
+                    LIMIT 1
+                    """,
+                    (candidate["candidate_id"], candidate["candidate_digest"]),
+                ).fetchone()
+                if existing is not None:
+                    existing_candidate = self._memory_candidate_row(existing)
+                    if (
+                        existing_candidate["candidate_digest"]
+                        != candidate["candidate_digest"]
+                    ):
+                        raise UniverseError(
+                            "MEMORY_CANDIDATE_IDEMPOTENCY_CONFLICT",
+                            "candidate_id already refers to another candidate",
+                            HTTPStatus.CONFLICT,
+                        )
+                    stored.append(existing_candidate)
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO memory_candidate(
+                        candidate_id, project_id, stage, kind, state,
+                        candidate_digest, candidate_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate["candidate_id"],
+                        project["project_id"],
+                        candidate["stage"],
+                        candidate["kind"],
+                        candidate["state"],
+                        candidate["candidate_digest"],
+                        _canonical_json(candidate),
+                        now,
+                        now,
+                    ),
+                )
+                stored_candidate = {
+                    **candidate,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                stored.append(stored_candidate)
+                created_count += 1
+            for candidate in stored:
+                for relation in candidate.get("relations") or []:
+                    relation_id = "memory_relation_" + _json_sha256(
+                        {
+                            "candidate_id": candidate["candidate_id"],
+                            "target_candidate_id": relation["candidate_id"],
+                            "relation": relation["relation"],
+                        }
+                    )[:24]
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_candidate_relation(
+                            relation_id, project_id, candidate_id,
+                            target_candidate_id, relation, relation_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            relation_id,
+                            project["project_id"],
+                            candidate["candidate_id"],
+                            relation["candidate_id"],
+                            relation["relation"],
+                            _canonical_json(
+                                {
+                                    "schema": "universe.memory-candidate-relation.v1",
+                                    **relation,
+                                    "candidate_id": candidate["candidate_id"],
+                                }
+                            ),
+                            now,
+                        ),
+                    )
+        return stored, created_count
+
+    def create_memory_candidate(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        candidates, created = self._insert_memory_candidates(project_id, [value])
+        return candidates[0], bool(created)
+
+    def list_memory_candidates(
+        self,
+        project_id: str | None = None,
+        *,
+        stage: str | None = None,
+        kind: str | None = None,
+        state: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        normalized_project = _project_id(project_id) if project_id else None
+        if normalized_project:
+            self.get_project(normalized_project)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if normalized_project:
+            clauses.append("project_id = ?")
+            params.append(normalized_project)
+        if stage:
+            normalized_stage = str(stage).strip().upper()
+            if normalized_stage not in MEMORY_BATCH_STAGES:
+                raise UniverseError("MEMORY_BATCH_STAGE_INVALID", "stage is invalid")
+            clauses.append("stage = ?")
+            params.append(normalized_stage)
+        if kind:
+            normalized_kind = str(kind).strip().upper()
+            if normalized_kind not in MEMORY_CANDIDATE_KINDS:
+                raise UniverseError("MEMORY_CANDIDATE_KIND_INVALID", "kind is invalid")
+            clauses.append("kind = ?")
+            params.append(normalized_kind)
+        if state:
+            normalized_state = str(state).strip().upper()
+            if normalized_state == "PROPOSED":
+                normalized_state = "REVIEW_REQUIRED"
+            if normalized_state not in MEMORY_CANDIDATE_STATES:
+                raise UniverseError("MEMORY_CANDIDATE_STATE_INVALID", "state is invalid")
+            clauses.append("state = ?")
+            params.append(normalized_state)
+        params.append(max(1, min(int(limit), 500)))
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM memory_candidate
+                WHERE {where}
+                ORDER BY updated_at DESC, candidate_id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [self._memory_candidate_row(row) for row in rows]
+
+    def get_memory_candidate(self, candidate_id: str) -> dict[str, Any]:
+        normalized = _identifier(candidate_id, "candidate_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_candidate WHERE candidate_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_NOT_FOUND",
+                "memory candidate does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._memory_candidate_row(row)
+
+    def review_memory_candidate(
+        self,
+        candidate_id: str,
+        value: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REVIEW_INVALID",
+                "review body must be an object",
+            )
+        if set(value) - {"decision", "note", "project_id"}:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REVIEW_INVALID",
+                "review contains unsupported fields",
+            )
+        decision = str(value.get("decision") or "").strip().upper()
+        if decision not in MEMORY_CANDIDATE_DECISIONS:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_DECISION_INVALID",
+                "decision must be IGNORE, KEEP, EXPLORE, or START_PRODUCT_DESIGN",
+            )
+        note = str(value.get("note") or "").strip()
+        if len(note) > 500:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REVIEW_INVALID", "note is too long"
+            )
+        candidate = self.get_memory_candidate(candidate_id)
+        if value.get("project_id") is not None and _project_id(value["project_id"]) != candidate["project_id"]:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_PROJECT_MISMATCH",
+                "review project_id does not match candidate",
+                HTTPStatus.CONFLICT,
+            )
+        current_state = candidate["state"]
+        if current_state == decision:
+            return candidate, False
+        if current_state != "REVIEW_REQUIRED":
+            raise UniverseError(
+                "MEMORY_CANDIDATE_STATE_CONFLICT",
+                "candidate is no longer reviewable",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        candidate["state"] = decision
+        candidate["review"] = {
+            "decision": decision,
+            "note": note,
+            "decided_at": now,
+        }
+        candidate["updated_at"] = now
+        review_id = "memory_review_" + _json_sha256(
+            {"candidate_id": candidate["candidate_id"], "decision": decision}
+        )[:24]
+        with self._connection() as connection:
+            update = connection.execute(
+                """
+                UPDATE memory_candidate
+                SET state = ?, candidate_json = ?, updated_at = ?
+                WHERE candidate_id = ? AND state = 'REVIEW_REQUIRED'
+                """,
+                (
+                    decision,
+                    _canonical_json(candidate),
+                    now,
+                    candidate["candidate_id"],
+                ),
+            )
+            if update.rowcount != 1:
+                raise UniverseError(
+                    "MEMORY_CANDIDATE_STATE_CONFLICT",
+                    "candidate changed before review was recorded",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                INSERT INTO memory_candidate_review(
+                    review_id, candidate_id, project_id, decision,
+                    decision_json, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id,
+                    candidate["candidate_id"],
+                    candidate["project_id"],
+                    decision,
+                    _canonical_json(
+                        {
+                            "schema": "universe.memory-candidate-review.v1",
+                            "decision": decision,
+                            "note": note,
+                            "decided_at": now,
+                        }
+                    ),
+                    now,
+                ),
+            )
+        return candidate, True
+
+    def run_memory_batch(
+        self,
+        project_id: str,
+        config: Mapping[str, Any],
+        request: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        request = request if isinstance(request, Mapping) else {}
+        stage = str(config.get("stage") or "").strip().upper()
+        if stage not in MEMORY_BATCH_STAGES:
+            raise UniverseError("MEMORY_BATCH_STAGE_INVALID", "stage is invalid")
+        dry_run = bool(config.get("dry_run", False))
+        budget = config.get("quota_or_budget")
+        if isinstance(budget, Mapping) and budget.get("max_runs") is not None:
+            with self._connection() as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
+                    (project["project_id"], stage),
+                ).fetchone()["count"]
+            if int(count) >= int(budget["max_runs"]):
+                raise UniverseError(
+                    "MEMORY_BATCH_QUOTA_EXCEEDED",
+                    "configured memory batch max_runs quota is exhausted",
+                    HTTPStatus.CONFLICT,
+                )
+
+        candidates: list[dict[str, Any]] = []
+        check: dict[str, Any] | None = None
+        input_material: list[str] = []
+        if stage == "FAST_EXTRACT":
+            batches = request.get("activity_batches")
+            if batches is None:
+                batches = []
+                source_ids = request.get("source_ids")
+                if source_ids is None:
+                    source_ids = [item["source_id"] for item in self.list_provider_session_sources()]
+                if not isinstance(source_ids, list):
+                    raise UniverseError(
+                        "MEMORY_BATCH_SOURCE_IDS_INVALID",
+                        "source_ids must be an array",
+                    )
+                for source_id in source_ids:
+                    batches.append(self.prepare_provider_activity_batch(str(source_id)))
+            if not isinstance(batches, list):
+                raise UniverseError(
+                    "MEMORY_BATCH_ACTIVITY_INVALID",
+                    "activity_batches must be an array",
+                )
+            for batch in batches:
+                extracted = extract_memory_candidates_from_activity_batch(
+                    batch, project_id=project["project_id"]
+                )
+                candidates.extend(extracted)
+                input_material.extend(item["candidate_digest"] for item in extracted)
+        elif stage == "CONSOLIDATE":
+            existing = self.list_memory_candidates(
+                project["project_id"], stage="FAST_EXTRACT", limit=500
+            )
+            input_material = [item["candidate_digest"] for item in existing]
+            candidates = consolidate_memory_candidates(existing)
+        elif stage == "SYNTHESIZE":
+            existing = self.list_memory_candidates(
+                project["project_id"], stage="CONSOLIDATE", limit=500
+            )
+            if not existing:
+                existing = self.list_memory_candidates(
+                    project["project_id"], stage="FAST_EXTRACT", limit=500
+                )
+            input_material = [item["candidate_digest"] for item in existing]
+            raw_kinds = request.get("kinds", ["IDEA", "HYPOTHESIS", "PRODUCT"])
+            if not isinstance(raw_kinds, list):
+                raise UniverseError(
+                    "MEMORY_BATCH_KINDS_INVALID", "kinds must be an array"
+                )
+            try:
+                candidates = synthesize_memory_candidates(existing, kinds=raw_kinds)
+            except MemoryError as error:
+                raise UniverseError(error.code, error.message) from error
+        else:
+            existing = self.list_memory_candidates(project["project_id"], limit=500)
+            input_material = [item["candidate_digest"] for item in existing]
+            try:
+                check = independent_check_memory_candidates(existing)
+            except MemoryError as error:
+                raise UniverseError(error.code, error.message) from error
+
+        input_digest = _json_sha256(sorted(input_material))
+        output_digest = _json_sha256(
+            check if check is not None else [item["candidate_digest"] for item in candidates]
+        )
+        stored_candidates: list[dict[str, Any]] = []
+        created_count = 0
+        if candidates and not dry_run:
+            stored_candidates, created_count = self._insert_memory_candidates(
+                project["project_id"], candidates
+            )
+        elif candidates:
+            stored_candidates = candidates
+        run_id = "memory_batch_run_" + _json_sha256(
+            {
+                "project_id": project["project_id"],
+                "stage": stage,
+                "input_digest": input_digest,
+                "output_digest": output_digest,
+                "config_digest": _json_sha256(config),
+            }
+        )[:24]
+        now = utc_now()
+        result: dict[str, Any] = {
+            "schema": MEMORY_BATCH_RUN_SCHEMA,
+            "status": "DRY_RUN_COMPLETED" if dry_run else "COMPLETED",
+            "run_id": run_id,
+            "project_id": project["project_id"],
+            "stage": stage,
+            "config_digest": _json_sha256(config),
+            "input_digest": input_digest,
+            "output_digest": output_digest,
+            "candidate_count": len(stored_candidates),
+            "created_count": created_count,
+            "candidate_ids": [item["candidate_id"] for item in stored_candidates],
+            "candidates": stored_candidates,
+            "independent_check": check,
+            "effects": {
+                "candidate_write": "NONE" if dry_run else ("CREATED" if created_count else "IDEMPOTENT"),
+                "memory_write": "NONE",
+                "current_anchor": "NONE",
+                "project_facts": "NONE",
+                "seed": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "auto_adoption": False,
+            },
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_batch_run(
+                    run_id, project_id, stage, config_digest, input_digest,
+                    output_digest, status, candidate_ids_json, result_json,
+                    started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    project["project_id"],
+                    stage,
+                    result["config_digest"],
+                    input_digest,
+                    output_digest,
+                    result["status"],
+                    _canonical_json(result["candidate_ids"]),
+                    _canonical_json(result),
+                    now,
+                    now,
+                ),
+            )
+        return {**result, "started_at": now, "completed_at": now}
+
     def compare_skill_bench(
         self, *, group_by: str = "skill", limit: int = 50
     ) -> dict[str, Any]:
@@ -9721,6 +10605,450 @@ class UniverseStore:
                 if state in {"QUEUED", "WAITING_FOR_RUNTIME_BINDING"}:
                     pending.append(row["message_id"])
         return pending
+
+    @staticmethod
+    def _conductor_delegation_row(row: sqlite3.Row) -> dict[str, Any]:
+        request = json.loads(row["request_json"])
+        progress = json.loads(row["progress_json"])
+        result = json.loads(row["result_json"])
+        return {
+            "schema": CONDUCTOR_DELEGATION_SCHEMA,
+            "delegation_id": str(row["delegation_id"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "project_id": str(row["project_id"]),
+            "request": request,
+            "request_digest": _json_sha256(request),
+            "state": str(row["state"]),
+            "progress": progress,
+            "result": result,
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "completed_at": row["completed_at"],
+        }
+
+    def create_conductor_delegation(self, value: Any) -> tuple[dict[str, Any], bool]:
+        request = normalize_conductor_delegation(value)
+        project = self.get_project(request["project_id"])
+        request["project_id"] = project["project_id"]
+        delegation_id = "delegation_" + _json_sha256(
+            {
+                "project_id": request["project_id"],
+                "idempotency_key": request["idempotency_key"],
+            }
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM conductor_delegation
+                WHERE idempotency_key = ?
+                """,
+                (request["idempotency_key"],),
+            ).fetchone()
+            if existing is not None:
+                stored_request = json.loads(existing["request_json"])
+                if _json_sha256(stored_request) != _json_sha256(request):
+                    raise UniverseError(
+                        "CONDUCTOR_DELEGATION_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to another delegation",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self._conductor_delegation_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO conductor_delegation(
+                    delegation_id, idempotency_key, project_id, request_json,
+                    state, progress_json, result_json, created_at, updated_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, 'QUEUED', '{}', '{}', ?, ?, NULL)
+                """,
+                (
+                    delegation_id,
+                    request["idempotency_key"],
+                    request["project_id"],
+                    _canonical_json(request),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (delegation_id,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_UNAVAILABLE",
+                "delegation was not persisted",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        return self._conductor_delegation_row(row), True
+
+    def get_conductor_delegation(self, delegation_id: str) -> dict[str, Any]:
+        normalized = _required_text(delegation_id, "delegation_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_NOT_FOUND",
+                "conductor delegation does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._conductor_delegation_row(row)
+
+    def list_conductor_delegations(
+        self,
+        *,
+        project_id: str | None = None,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            normalized_project = _project_id(project_id)
+            self.get_project(normalized_project)
+            clauses.append("project_id = ?")
+            params.append(normalized_project)
+        if state:
+            normalized_state = str(state).strip().upper()
+            if normalized_state not in CONDUCTOR_DELEGATION_STATES:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_INVALID",
+                    "state is not supported",
+                )
+            clauses.append("state = ?")
+            params.append(normalized_state)
+        params.append(max(1, min(int(limit), 500)))
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM conductor_delegation
+                WHERE {where}
+                ORDER BY created_at DESC, delegation_id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [self._conductor_delegation_row(row) for row in rows]
+
+    def recover_conductor_delegations(self) -> list[str]:
+        recovered_at = utc_now()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT delegation_id, progress_json
+                FROM conductor_delegation
+                WHERE state = 'RUNNING'
+                ORDER BY created_at, delegation_id
+                """
+            ).fetchall()
+            for row in rows:
+                progress = json.loads(row["progress_json"])
+                progress["recovered_at"] = recovered_at
+                progress["summary"] = str(
+                    progress.get("summary") or "Delegation recovered after service restart"
+                )[:1000]
+                connection.execute(
+                    """
+                    UPDATE conductor_delegation
+                    SET state = 'QUEUED', progress_json = ?, updated_at = ?
+                    WHERE delegation_id = ? AND state = 'RUNNING'
+                    """,
+                    (_canonical_json(progress), recovered_at, row["delegation_id"]),
+                )
+            rows = connection.execute(
+                """
+                SELECT delegation_id FROM conductor_delegation
+                WHERE state = 'QUEUED'
+                ORDER BY created_at, delegation_id
+                """
+            ).fetchall()
+        return [str(row["delegation_id"]) for row in rows]
+
+    def start_conductor_delegation(
+        self, delegation_id: str, *, required: bool = True
+    ) -> dict[str, Any] | None:
+        normalized = _required_text(delegation_id, "delegation_id")
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                if not required:
+                    return None
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_NOT_FOUND",
+                    "conductor delegation does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["state"] == "RUNNING":
+                return self._conductor_delegation_row(row)
+            if row["state"] != "QUEUED":
+                if not required:
+                    return None
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "delegation is not queued",
+                    HTTPStatus.CONFLICT,
+                )
+            progress = json.loads(row["progress_json"])
+            progress.setdefault("summary", "Delegation accepted by coordinator")
+            progress["accepted_at"] = now
+            progress["sequence"] = int(progress.get("sequence") or 0) + 1
+            update = connection.execute(
+                """
+                UPDATE conductor_delegation
+                SET state = 'RUNNING', progress_json = ?, updated_at = ?
+                WHERE delegation_id = ? AND state = 'QUEUED'
+                """,
+                (_canonical_json(progress), now, normalized),
+            )
+            if update.rowcount != 1:
+                if not required:
+                    return None
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "delegation changed before it could start",
+                    HTTPStatus.CONFLICT,
+                )
+            updated = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        return self._conductor_delegation_row(updated) if updated is not None else None
+
+    def update_conductor_delegation_progress(
+        self, delegation_id: str, value: Any
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) - {
+            "summary",
+            "step",
+            "sequence",
+            "project_room_message_id",
+        }:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                "progress accepts summary, step, sequence, and a bounded room reference only",
+            )
+        summary = _required_text(value.get("summary"), "progress.summary")
+        if len(summary) > 1000:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                "progress.summary is too long",
+            )
+        step = str(value.get("step") or "").strip()
+        if len(step) > 160:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                "progress.step is too long",
+            )
+        project_room_message_id = str(
+            value.get("project_room_message_id") or ""
+        ).strip()
+        if project_room_message_id and (
+            len(project_room_message_id) > 160
+            or re.fullmatch(r"room_[A-Za-z0-9]+", project_room_message_id) is None
+        ):
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                "progress.project_room_message_id is invalid",
+            )
+        now = utc_now()
+        normalized = _required_text(delegation_id, "delegation_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_NOT_FOUND",
+                    "conductor delegation does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["state"] != "RUNNING":
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "only running delegations accept progress",
+                    HTTPStatus.CONFLICT,
+                )
+            previous = json.loads(row["progress_json"])
+            sequence = value.get("sequence")
+            if sequence is None:
+                sequence = int(previous.get("sequence") or 0) + 1
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                    "progress.sequence must be a positive integer",
+                )
+            progress = {
+                key: previous[key]
+                for key in (
+                    "accepted_at",
+                    "recovered_at",
+                    "project_room_message_id",
+                )
+                if previous.get(key) is not None
+            }
+            progress.update({
+                "summary": summary,
+                "step": step or None,
+                "sequence": min(sequence, 1_000_000),
+                "updated_at": now,
+            })
+            if project_room_message_id:
+                progress["project_room_message_id"] = project_room_message_id
+            update = connection.execute(
+                """
+                UPDATE conductor_delegation
+                SET progress_json = ?, updated_at = ?
+                WHERE delegation_id = ? AND state = 'RUNNING'
+                """,
+                (_canonical_json(progress), now, normalized),
+            )
+            if update.rowcount != 1:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "delegation changed before progress was recorded",
+                    HTTPStatus.CONFLICT,
+                )
+            updated = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        if updated is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_NOT_FOUND",
+                "conductor delegation does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._conductor_delegation_row(updated)
+
+    def complete_conductor_delegation(
+        self, delegation_id: str, value: Any
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) - {
+            "result_summary",
+            "result_digest",
+            "result_ref",
+        }:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_RESULT_INVALID",
+                "result accepts result_summary, result_digest, and result_ref only",
+            )
+        summary = _required_text(value.get("result_summary"), "result_summary")
+        if len(summary) > 2000:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_RESULT_INVALID",
+                "result_summary is too long",
+            )
+        digest = str(value.get("result_digest") or "").strip().lower()
+        if digest and re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_RESULT_INVALID",
+                "result_digest must be a SHA-256 digest",
+            )
+        result_ref = str(value.get("result_ref") or "").strip()
+        if len(result_ref) > 256:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_RESULT_INVALID",
+                "result_ref is too long",
+            )
+        now = utc_now()
+        normalized = _required_text(delegation_id, "delegation_id")
+        result = {
+            "summary": summary,
+            "result_digest": digest or None,
+            "result_ref": result_ref or None,
+            "completed_at": now,
+        }
+        with self._connection() as connection:
+            update = connection.execute(
+                """
+                UPDATE conductor_delegation
+                SET state = 'COMPLETED', result_json = ?, updated_at = ?, completed_at = ?
+                WHERE delegation_id = ? AND state = 'RUNNING'
+                """,
+                (_canonical_json(result), now, now, normalized),
+            )
+            if update.rowcount != 1:
+                row = connection.execute(
+                    "SELECT state FROM conductor_delegation WHERE delegation_id = ?",
+                    (normalized,),
+                ).fetchone()
+                if row is None:
+                    raise UniverseError(
+                        "CONDUCTOR_DELEGATION_NOT_FOUND",
+                        "conductor delegation does not exist",
+                        HTTPStatus.NOT_FOUND,
+                    )
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "only running delegations can be completed",
+                    HTTPStatus.CONFLICT,
+                )
+            updated = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        if updated is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_NOT_FOUND",
+                "conductor delegation does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._conductor_delegation_row(updated)
+
+    def fail_conductor_delegation(
+        self, delegation_id: str, *, code: str, reason: str
+    ) -> dict[str, Any]:
+        normalized_code = _identifier(code, "failure.code").upper()[:160]
+        normalized_reason = _required_text(reason, "failure.reason")[:1000]
+        now = utc_now()
+        normalized = _required_text(delegation_id, "delegation_id")
+        result = {
+            "error_code": normalized_code,
+            "reason": normalized_reason,
+            "failed_at": now,
+        }
+        with self._connection() as connection:
+            update = connection.execute(
+                """
+                UPDATE conductor_delegation
+                SET state = 'FAILED', result_json = ?, updated_at = ?, completed_at = ?
+                WHERE delegation_id = ? AND state IN ('QUEUED', 'RUNNING')
+                """,
+                (_canonical_json(result), now, now, normalized),
+            )
+            if update.rowcount != 1:
+                row = connection.execute(
+                    "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                    (normalized,),
+                ).fetchone()
+                if row is None:
+                    raise UniverseError(
+                        "CONDUCTOR_DELEGATION_NOT_FOUND",
+                        "conductor delegation does not exist",
+                        HTTPStatus.NOT_FOUND,
+                    )
+                return self._conductor_delegation_row(row)
+            updated = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        if updated is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_NOT_FOUND",
+                "conductor delegation does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._conductor_delegation_row(updated)
 
     def wait_conductor_room_message(self, message_id: str) -> None:
         self._transition_conductor_room_message(
@@ -12578,6 +13906,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         auto_start_conductor_runtime: bool = False,
         conductor_runtime_factory: Any = None,
         conductor_session_provider_factory: Any = None,
+        conductor_delegation_executor: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
         room_participant_provider_factory: Any = None,
@@ -12640,6 +13969,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_queued_ids: set[str] = set()
         self._conductor_queue_lock = threading.RLock()
         self._conductor_stop = threading.Event()
+        self._conductor_delegation_executor = (
+            conductor_delegation_executor or self._dispatch_project_master_delegation
+        )
+        self._conductor_delegation_queue: queue.Queue[str | None] = queue.Queue()
+        self._conductor_delegation_queued_ids: set[str] = set()
+        self._conductor_delegation_queue_lock = threading.RLock()
+        self._conductor_delegation_stop = threading.Event()
         self._conductor_session_error: dict[str, str] | None = None
         self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
@@ -12754,6 +14090,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._conductor_worker.start()
+        self._conductor_delegation_worker = threading.Thread(
+            target=self._conductor_delegation_worker_loop,
+            name="universe-conductor-delegation-worker",
+            daemon=True,
+        )
+        self._conductor_delegation_worker.start()
         self._maintain_stop = threading.Event()
         self._maintain_wake = threading.Event()
         self._maintain_last_run: dict[str, Any] | None = None
@@ -12785,6 +14127,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._remote_access_resume_worker.start()
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
+        for delegation_id in self.store.recover_conductor_delegations():
+            self.enqueue_conductor_delegation(delegation_id)
 
     def _resume_remote_access_background(self) -> None:
         try:
@@ -13345,6 +14689,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 return
             self._conductor_queued_ids.add(normalized_id)
         self._conductor_queue.put(normalized_id)
+
+    def enqueue_conductor_delegation(self, delegation_id: str) -> None:
+        normalized_id = _required_text(delegation_id, "delegation_id")
+        with self._conductor_delegation_queue_lock:
+            if normalized_id in self._conductor_delegation_queued_ids:
+                return
+            self._conductor_delegation_queued_ids.add(normalized_id)
+        self._conductor_delegation_queue.put(normalized_id)
 
     def ensure_project_master(self, project_id: str) -> dict[str, Any]:
         if self.project_master_hosts is None:
@@ -14759,6 +16111,221 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "catalog": catalog,
         }
 
+    def memory_batch_catalog_settings(self) -> dict[str, Any]:
+        try:
+            catalog = self.provider_model_catalog.snapshot()
+        except ProviderModelCatalogError as error:
+            raise UniverseError(error.code, str(error)) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEMORY_BATCH_CATALOG_COLLECTED",
+            "catalog": catalog,
+            "stages": sorted(MEMORY_BATCH_STAGES),
+            "resolution_policy": {
+                "provider_model_catalog": "CURRENT_SNAPSHOT_REQUIRED",
+                "invalid_model": "FAIL_CLOSED",
+                "unavailable_provider": "FALLBACK_ONLY",
+            },
+        }
+
+    @staticmethod
+    def _memory_batch_config_request(value: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "stage",
+            "provider",
+            "model",
+            "model_ref",
+            "effort",
+            "schedule",
+            "quota",
+            "budget",
+            "quota_or_budget",
+            "fallback",
+            "enabled",
+            "dry_run",
+        }
+        return {key: value[key] for key in allowed if key in value}
+
+    def _resolve_memory_batch_config(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        project = self.store.get_project(project_id)
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "MEMORY_BATCH_CONFIG_INVALID",
+                "memory batch config must be an object",
+            )
+        request = self._memory_batch_config_request(value)
+        stage = str(request.get("stage") or "").strip().upper()
+        if stage not in MEMORY_BATCH_STAGES:
+            raise UniverseError(
+                "MEMORY_BATCH_STAGE_INVALID", "stage is not supported"
+            )
+        try:
+            binding_resolution = self.store.resolve_worker_binding(
+                {
+                    "project_id": project["project_id"],
+                    "worker_role": "ROUTINE",
+                    "task_type": f"MEMORY_{stage}",
+                }
+            )
+            normalized = normalize_memory_batch_config(
+                request,
+                worker_binding=binding_resolution.get("snapshot"),
+            )
+        except MemoryError as error:
+            raise UniverseError(error.code, error.message) from error
+        try:
+            catalog = self.provider_model_catalog.snapshot()
+        except ProviderModelCatalogError as error:
+            raise UniverseError(error.code, str(error)) from error
+        try:
+            resolved = resolve_memory_batch_config(normalized, catalog)
+        except MemoryError as error:
+            if (
+                error.code == "MEMORY_BATCH_PROVIDER_UNAVAILABLE"
+                and normalized["fallback"] == "DETERMINISTIC"
+            ):
+                resolved = {
+                    **normalized,
+                    "resolution": {
+                        "status": "FALLBACK_DETERMINISTIC",
+                        "error_code": error.code,
+                        "requested_provider": normalized["provider"],
+                        "requested_model_ref": normalized["model_ref"],
+                    },
+                }
+            else:
+                raise UniverseError(error.code, error.message, HTTPStatus.CONFLICT) from error
+        if (
+            resolved.get("resolution", {}).get("status") == "UNAVAILABLE"
+            and normalized["fallback"] == "DETERMINISTIC"
+        ):
+            resolved["resolution"] = {
+                **resolved["resolution"],
+                "status": "FALLBACK_DETERMINISTIC",
+                "error_code": "MEMORY_BATCH_PROVIDER_UNAVAILABLE",
+            }
+        resolved["project_id"] = project["project_id"]
+        resolved["worker_binding"] = {
+            "profile_id": (binding_resolution.get("snapshot") or {}).get("profile_id"),
+            "provider": (binding_resolution.get("snapshot") or {}).get("provider"),
+            "model_ref": (binding_resolution.get("snapshot") or {}).get("model_ref"),
+            "effort": (binding_resolution.get("snapshot") or {}).get("effort"),
+            "binding_digest": (binding_resolution.get("snapshot") or {}).get(
+                "binding_digest"
+            ),
+        }
+        return resolved, catalog
+
+    def memory_batch_configs(self, project_id: str) -> dict[str, Any]:
+        configs: list[dict[str, Any]] = []
+        for stored in self.store.get_memory_batch_configs(project_id):
+            try:
+                resolved, _catalog = self._resolve_memory_batch_config(
+                    project_id, stored
+                )
+                configs.append({**stored, **resolved})
+            except UniverseError as error:
+                configs.append(
+                    {
+                        **stored,
+                        "resolution": {
+                            "status": "BLOCKED",
+                            "error_code": error.code,
+                            "detail": error.detail,
+                        },
+                    }
+                )
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEMORY_BATCH_CONFIGS_COLLECTED",
+            "project_id": project_id,
+            "configs": configs,
+        }
+
+    def set_memory_batch_config(
+        self, project_id: str, value: Any
+    ) -> dict[str, Any]:
+        resolved, _catalog = self._resolve_memory_batch_config(project_id, value)
+        persisted = self.store.upsert_memory_batch_config(
+            project_id,
+            {
+                **self._memory_batch_config_request(resolved),
+                "resolution": resolved.get("resolution"),
+            },
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEMORY_BATCH_CONFIG_SAVED",
+            "config": {
+                **persisted,
+                "resolution": resolved.get("resolution"),
+                "worker_binding": resolved.get("worker_binding"),
+            },
+        }
+
+    def run_memory_batch(self, project_id: str, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "MEMORY_BATCH_REQUEST_INVALID",
+                "memory batch run body must be an object",
+            )
+        stage = str(value.get("stage") or "").strip().upper()
+        if stage not in MEMORY_BATCH_STAGES:
+            raise UniverseError("MEMORY_BATCH_STAGE_INVALID", "stage is not supported")
+        config = self.store.get_memory_batch_config(project_id, stage)
+        resolved, _catalog = self._resolve_memory_batch_config(project_id, config)
+        if not resolved.get("enabled", True):
+            raise UniverseError(
+                "MEMORY_BATCH_DISABLED",
+                "memory batch stage is disabled",
+                HTTPStatus.CONFLICT,
+            )
+        resolution = resolved.get("resolution") or {}
+        if resolution.get("status") not in {"AVAILABLE", "FALLBACK_DETERMINISTIC"}:
+            raise UniverseError(
+                "MEMORY_BATCH_PROVIDER_UNAVAILABLE",
+                "configured provider is unavailable and no deterministic fallback is enabled",
+                HTTPStatus.CONFLICT,
+            )
+        budget = resolved.get("quota_or_budget")
+        if isinstance(budget, Mapping) and set(budget) - {"max_runs"}:
+            raise UniverseError(
+                "MEMORY_BATCH_BUDGET_ENFORCEMENT_UNAVAILABLE",
+                "this slice enforces max_runs only; token, cost, and window budgets require Provider usage telemetry",
+                HTTPStatus.CONFLICT,
+            )
+        if resolved.get("fallback") != "DETERMINISTIC":
+            raise UniverseError(
+                "MEMORY_BATCH_PROVIDER_EXECUTOR_UNAVAILABLE",
+                "configured Provider execution requires the governed Task Frame adapter",
+                HTTPStatus.CONFLICT,
+            )
+        request = {
+            key: value[key]
+            for key in ("activity_batches", "source_ids", "kinds")
+            if key in value
+        }
+        result = self.store.run_memory_batch(project_id, resolved, request)
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEMORY_BATCH_RUN_COMPLETED",
+            "config": {
+                "stage": resolved["stage"],
+                "provider": resolved["provider"],
+                "model_ref": resolved["model_ref"],
+                "fallback": resolved["fallback"],
+                "resolution": resolution,
+            },
+            "execution": {
+                "mode": "DETERMINISTIC",
+                "provider_invocation": "NOT_RUN",
+                "provider_attribution": "NONE",
+            },
+            "run": result,
+        }
+
     def set_host_tool(self, tool: str, value: Any) -> dict[str, Any]:
         request = _exact_object_fields(
             value,
@@ -15254,8 +16821,57 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except UniverseError:
             # A missing/old room message must not turn a completed provider turn
             # into an error or invent a Todo linkage.
-            return
+            pass
+        self._resolve_project_master_delegation(event)
         self.publish_project_room_changed(project_id)
+
+    def _resolve_project_master_delegation(
+        self, event: Mapping[str, Any]
+    ) -> None:
+        project_id = str(event.get("project_id") or "").strip()
+        message_id = str(event.get("message_id") or "").strip()
+        status = str(event.get("status") or "").strip().upper()
+        if not project_id or not message_id or status not in {"COMPLETED", "FAILED"}:
+            return
+        matching = [
+            item
+            for item in self.store.list_conductor_delegations(
+                project_id=project_id, state="RUNNING", limit=500
+            )
+            if item.get("progress", {}).get("project_room_message_id") == message_id
+        ]
+        for delegation in matching:
+            if status == "FAILED":
+                resolved = self.store.fail_conductor_delegation(
+                    delegation["delegation_id"],
+                    code="PROJECT_MASTER_DELEGATION_FAILED",
+                    reason=str(event.get("reason") or "Project Master turn failed"),
+                )
+                self._publish_conductor_delegation(resolved)
+                continue
+            reply = next(
+                (
+                    item
+                    for item in reversed(self.store.list_room_messages(project_id))
+                    if item.get("in_reply_to") == message_id
+                    and item.get("kind") == "RESULT"
+                ),
+                None,
+            )
+            if reply is None:
+                continue
+            resolved = self.store.complete_conductor_delegation(
+                delegation["delegation_id"],
+                {
+                    "result_summary": "Project Master completed delegated work.",
+                    "result_digest": reply.get("content_digest"),
+                    "result_ref": (
+                        f"universe://projects/{quote(project_id, safe='')}/"
+                        f"room/messages/{reply['message_id']}"
+                    ),
+                },
+            )
+            self._publish_conductor_delegation(resolved)
 
     def _observe_room_participant_permission(
         self,
@@ -15632,6 +17248,169 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         value: Any,
     ) -> tuple[dict[str, Any], bool]:
         return self.conductor_permissions.resolve(request_id, value)
+
+    def _publish_conductor_delegation(self, delegation: Mapping[str, Any]) -> None:
+        self.conductor_room_events.publish(
+            {
+                "type": "CONDUCTOR_DELEGATION",
+                "delegation": dict(delegation),
+            }
+        )
+
+    def _conductor_delegation_worker_loop(self) -> None:
+        while not self._conductor_delegation_stop.is_set():
+            delegation_id = self._conductor_delegation_queue.get()
+            try:
+                if delegation_id is None:
+                    return
+                try:
+                    self._process_conductor_delegation(delegation_id)
+                except Exception as error:
+                    try:
+                        delegation = self.store.fail_conductor_delegation(
+                            delegation_id,
+                            code=getattr(error, "code", "CONDUCTOR_DELEGATION_FAILED"),
+                            reason=f"{type(error).__name__}: {error}",
+                        )
+                        self._publish_conductor_delegation(delegation)
+                    except UniverseError:
+                        pass
+            finally:
+                if delegation_id is not None:
+                    with self._conductor_delegation_queue_lock:
+                        self._conductor_delegation_queued_ids.discard(delegation_id)
+                self._conductor_delegation_queue.task_done()
+
+    def _process_conductor_delegation(self, delegation_id: str) -> None:
+        delegation = self.store.start_conductor_delegation(
+            delegation_id,
+            required=False,
+        )
+        if delegation is None:
+            return
+        self._publish_conductor_delegation(delegation)
+        executor = self._conductor_delegation_executor
+        if not callable(executor):
+            progress = self.store.update_conductor_delegation_progress(
+                delegation_id,
+                {
+                    "summary": (
+                        "Delegation is running; awaiting a bounded result from the "
+                        "delegated Worker"
+                    ),
+                    "step": "WAITING_FOR_DELEGATE_RESULT",
+                },
+            )
+            self._publish_conductor_delegation(progress)
+            return
+        outcome = executor(
+            {
+                "schema": CONDUCTOR_DELEGATION_SCHEMA,
+                "delegation_id": delegation["delegation_id"],
+                "project_id": delegation["project_id"],
+                "request": delegation["request"],
+                "progress": delegation["progress"],
+            }
+        )
+        if outcome is None:
+            return
+        if not isinstance(outcome, Mapping):
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_RESULT_INVALID",
+                "delegation executor must return a bounded result object",
+            )
+        if outcome.get("result_summary") is not None:
+            completed = self.store.complete_conductor_delegation(
+                delegation_id,
+                outcome,
+            )
+            self._publish_conductor_delegation(completed)
+            return
+        progress_value = outcome.get("progress")
+        if progress_value is None and outcome.get("progress_summary") is not None:
+            progress_value = {
+                "summary": outcome.get("progress_summary"),
+                "step": outcome.get("step"),
+                "sequence": outcome.get("sequence"),
+            }
+            progress_value = {
+                key: value
+                for key, value in progress_value.items()
+                if value is not None
+            }
+        if progress_value is not None:
+            progress = self.store.update_conductor_delegation_progress(
+                delegation_id,
+                progress_value,
+            )
+            self._publish_conductor_delegation(progress)
+            room_message_id = progress.get("progress", {}).get(
+                "project_room_message_id"
+            )
+            if room_message_id:
+                self._resolve_project_master_delegation(
+                    {
+                        "project_id": progress["project_id"],
+                        "message_id": room_message_id,
+                        "status": "COMPLETED",
+                    }
+                )
+
+    def _dispatch_project_master_delegation(
+        self, record: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        request = record.get("request")
+        if not isinstance(request, Mapping):
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_INVALID",
+                "delegation request is unavailable",
+            )
+        if request.get("worker_role") != "PROJECT_MASTER":
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_TASK_FRAME_EXECUTOR_REQUIRED",
+                "Boss and Worker delegations require an approved Task Frame executor",
+                HTTPStatus.CONFLICT,
+            )
+        if str(request.get("model_ref") or "").strip():
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_MODEL_OVERRIDE_UNSUPPORTED",
+                "Project Master delegation uses the Project's resident model setting",
+                HTTPStatus.CONFLICT,
+            )
+        project_id = _project_id(record.get("project_id"))
+        requested_provider = str(request.get("provider") or "AUTO").upper()
+        if requested_provider != "AUTO":
+            selected_provider = self._resolve_project_master_provider(project_id)
+            if selected_provider != requested_provider:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_PROVIDER_MISMATCH",
+                    "delegation provider does not match the resident Project Master",
+                    HTTPStatus.CONFLICT,
+                )
+        message, _created = self.send_project_room_message(
+            project_id,
+            {
+                "kind": "TASK_DRAFT",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": _required_text(request.get("summary"), "summary"),
+                "idempotency_key": (
+                    f"conductor-delegation:{record['delegation_id']}"
+                ),
+            },
+        )
+        if message.get("delivery_state") != "DELIVERED_TO_MASTER":
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_MASTER_UNAVAILABLE",
+                "Project Master did not accept the delegated message",
+                HTTPStatus.CONFLICT,
+            )
+        return {
+            "progress": {
+                "summary": "Delegated work is running in the Project Master.",
+                "step": "PROJECT_MASTER_RUNNING",
+                "project_room_message_id": message["message_id"],
+            }
+        }
 
     def _conductor_worker_loop(self) -> None:
         while not self._conductor_stop.is_set():
@@ -16023,6 +17802,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "conductor_room_worker",
                 lambda: self._conductor_worker.join(timeout=5),
             )
+        self._conductor_delegation_stop.set()
+        self._conductor_delegation_queue.put(None)
+        if self._conductor_delegation_worker.is_alive():
+            close_step(
+                "conductor_delegation_worker",
+                lambda: self._conductor_delegation_worker.join(timeout=5),
+            )
         self.room_participant_permissions.cancel_all()
         close_step(
             "multi_room_native_controls",
@@ -16090,6 +17876,72 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorize():
+            return
+        if path == "/v1/settings/memory-batch/catalog":
+            try:
+                self._send(HTTPStatus.OK, self.server.memory_batch_catalog_settings())
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        if path in {"/v1/conductor/delegations", "/v1/conductor-room/delegations"}:
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                limit = int((query.get("limit") or ["100"])[0])
+            except (TypeError, ValueError):
+                limit = 100
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "CONDUCTOR_DELEGATIONS_COLLECTED",
+                        "delegations": self.server.store.list_conductor_delegations(
+                            project_id=(query.get("project_id") or [None])[0],
+                            state=(query.get("state") or [None])[0],
+                            limit=limit,
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        delegation_match = re.fullmatch(
+            r"/v1/(?:conductor|conductor-room)/delegations/([^/]+)", path
+        )
+        if delegation_match is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.get_conductor_delegation(
+                        unquote(delegation_match.group(1))
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        if path == "/v1/memory-candidates":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                limit = int((query.get("limit") or ["200"])[0])
+            except (TypeError, ValueError):
+                limit = 200
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MEMORY_CANDIDATES_COLLECTED",
+                        "candidates": self.server.store.list_memory_candidates(
+                            (query.get("project_id") or [None])[0],
+                            stage=(query.get("stage") or [None])[0],
+                            kind=(query.get("kind") or [None])[0],
+                            state=(query.get("state") or [None])[0],
+                            limit=limit,
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
             return
         if path in {"/v1/governance-proposals", "/v1/governance/proposals/pending"}:
             self._send(
@@ -16601,6 +18453,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "schema": API_SCHEMA,
                     "status": "CONDUCTOR_ROOM_MESSAGES_COLLECTED",
                     "messages": self.server.store.list_conductor_room_messages(),
+                    "delegations": self.server.store.list_conductor_delegations(),
                     "permissions": self.server.conductor_permissions.list_requests(),
                     "runtime_binding": self.server.planning_binding_status(),
                 },
@@ -16841,6 +18694,42 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/memory-batch-config":
+                self._send(HTTPStatus.OK, self.server.memory_batch_configs(project_id))
+                return
+            if suffix == "/memory-batches/runs":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MEMORY_BATCH_RUNS_COLLECTED",
+                        "project_id": project_id,
+                        "runs": self.server.store.list_memory_batch_runs(project_id),
+                    },
+                )
+                return
+            if suffix == "/memory-candidates":
+                query_map = parse_qs(urlsplit(self.path).query)
+                try:
+                    limit = int((query_map.get("limit") or ["200"])[0])
+                except (TypeError, ValueError):
+                    limit = 200
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MEMORY_CANDIDATES_COLLECTED",
+                        "project_id": project_id,
+                        "candidates": self.server.store.list_memory_candidates(
+                            project_id,
+                            stage=(query_map.get("stage") or [None])[0],
+                            kind=(query_map.get("kind") or [None])[0],
+                            state=(query_map.get("state") or [None])[0],
+                            limit=limit,
+                        ),
+                    },
+                )
+                return
             if suffix == "/skill-plan-proposals":
                 self._send(
                     HTTPStatus.OK,
@@ -17064,6 +18953,105 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self._read_json()
+            if path == "/v1/settings/memory-batch-config":
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "MEMORY_BATCH_CONFIG_INVALID",
+                        "memory batch config body must be an object",
+                    )
+                project_id = body.get("project_id")
+                if not project_id:
+                    raise UniverseError(
+                        "PROJECT_ID_REQUIRED",
+                        "project_id is required for memory batch config",
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.set_memory_batch_config(str(project_id), body),
+                )
+                return
+            if path in {
+                "/v1/conductor/delegations",
+                "/v1/conductor-room/delegations",
+            }:
+                delegation, created = self.server.store.create_conductor_delegation(body)
+                if created:
+                    self.server.enqueue_conductor_delegation(
+                        delegation["delegation_id"]
+                    )
+                self._send(
+                    HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "CONDUCTOR_DELEGATION_QUEUED"
+                            if created
+                            else "CONDUCTOR_DELEGATION_ALREADY_QUEUED"
+                        ),
+                        "delegation": delegation,
+                    },
+                )
+                return
+            delegation_operation = re.fullmatch(
+                r"/v1/(?:conductor|conductor-room)/delegations/([^/]+)/(start|progress|result|fail)$",
+                path,
+            )
+            if delegation_operation is not None:
+                delegation_id = unquote(delegation_operation.group(1))
+                operation = delegation_operation.group(2)
+                if operation == "start":
+                    delegation = self.server.store.start_conductor_delegation(
+                        delegation_id
+                    )
+                elif operation == "progress":
+                    delegation = self.server.store.update_conductor_delegation_progress(
+                        delegation_id, body
+                    )
+                elif operation == "result":
+                    delegation = self.server.store.complete_conductor_delegation(
+                        delegation_id, body
+                    )
+                else:
+                    if not isinstance(body, Mapping):
+                        raise UniverseError(
+                            "CONDUCTOR_DELEGATION_FAILURE_INVALID",
+                            "failure body must be an object",
+                        )
+                    delegation = self.server.store.fail_conductor_delegation(
+                        delegation_id,
+                        code=str(body.get("error_code") or "DELEGATE_FAILED"),
+                        reason=str(body.get("reason") or "delegated Worker failed"),
+                    )
+                self.server._publish_conductor_delegation(delegation)
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "CONDUCTOR_DELEGATION_UPDATED",
+                        "delegation": delegation,
+                    },
+                )
+                return
+            candidate_review = re.fullmatch(
+                r"/v1/memory-candidates/([^/]+)/review$", path
+            )
+            if candidate_review is not None:
+                candidate, changed = self.server.store.review_memory_candidate(
+                    unquote(candidate_review.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "MEMORY_CANDIDATE_REVIEW_RECORDED"
+                            if changed
+                            else "MEMORY_CANDIDATE_REVIEW_ALREADY_RECORDED"
+                        ),
+                        "candidate": candidate,
+                    },
+                )
+                return
             if path == "/v1/service/shutdown":
                 self._send(
                     HTTPStatus.ACCEPTED,
@@ -18520,6 +20508,67 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/memory-batch-config":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.set_memory_batch_config(parts[0], body),
+                )
+                return
+            if parts is not None and parts[1] == "/memory-batches/run":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.run_memory_batch(parts[0], body),
+                )
+                return
+            if parts is not None and parts[1] == "/memory-candidates":
+                candidate, created = self.server.store.create_memory_candidate(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "MEMORY_CANDIDATE_RECORDED"
+                            if created
+                            else "MEMORY_CANDIDATE_ALREADY_RECORDED"
+                        ),
+                        "candidate": candidate,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/memory-candidates/review":
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "MEMORY_CANDIDATE_REVIEW_INVALID",
+                        "review body must be an object",
+                    )
+                candidate_id = body.get("candidate_id")
+                if not candidate_id:
+                    raise UniverseError(
+                        "MEMORY_CANDIDATE_ID_REQUIRED",
+                        "candidate_id is required",
+                    )
+                review = {
+                    key: body[key] for key in ("decision", "note") if key in body
+                }
+                review["project_id"] = parts[0]
+                candidate, changed = self.server.store.review_memory_candidate(
+                    str(candidate_id), review
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "MEMORY_CANDIDATE_REVIEW_RECORDED"
+                            if changed
+                            else "MEMORY_CANDIDATE_REVIEW_ALREADY_RECORDED"
+                        ),
+                        "candidate": candidate,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/memories/link":
                 memory_id = _identifier(body.get("memory_id"), "memory_id")
                 memory = self.server.store.link_project_memory(
@@ -18972,6 +21021,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/experience-matches",
             "/experience-patterns/auto",
             "/experience-pattern-proposals",
+            "/memory-batches/run",
+            "/memory-batches/runs",
+            "/memory-batch-config",
+            "/memory-candidates/review",
+            "/memory-candidates",
             "/memories/propose-links",
             "/memories/maintain",
             "/memories/link",
@@ -19196,6 +21250,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "payload": {
                         "type": "SNAPSHOT",
                         "messages": self.server.store.list_conductor_room_messages(),
+                        "delegations": self.server.store.list_conductor_delegations(),
                         "permissions": self.server.conductor_permissions.list_requests(),
                         "runtime_binding": self.server.planning_binding_status(),
                     },
@@ -19356,10 +21411,12 @@ def create_server(
     auto_start_conductor_runtime: bool = False,
     conductor_runtime_factory: Any = None,
     conductor_session_provider_factory: Any = None,
+    conductor_delegation_executor: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
     room_participant_provider_factory: Any = None,
     host_profile: HostProfileStore | None = None,
+    provider_model_catalog: ProviderModelCatalogStore | None = None,
     service_state_path: Path | None = None,
     remote_gateway_state_path: Path | None = None,
     remote_connector_state_path: Path | None = None,
@@ -19385,10 +21442,12 @@ def create_server(
         auto_start_conductor_runtime=auto_start_conductor_runtime,
         conductor_runtime_factory=conductor_runtime_factory,
         conductor_session_provider_factory=conductor_session_provider_factory,
+        conductor_delegation_executor=conductor_delegation_executor,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
         room_participant_provider_factory=room_participant_provider_factory,
         host_profile=host_profile,
+        provider_model_catalog=provider_model_catalog,
         service_state_path=service_state_path,
         remote_gateway_state_path=remote_gateway_state_path,
         remote_connector_state_path=remote_connector_state_path,

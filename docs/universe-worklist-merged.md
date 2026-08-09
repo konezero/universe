@@ -214,3 +214,30 @@ External or deliberately deferred:
 - Live native-provider completion adapter for automatic meeting runs.
 - Gabia/VPS tunnel, public DNS/HTTPS, mobile Internet pairing, and signed
   MSI/MSIX deployment.
+
+### 9) 2026-08-10 Memory synthesis and Conductor delegation foundation
+
+Completed locally:
+
+- Per-Project `FAST_EXTRACT`, `CONSOLIDATE`, `SYNTHESIZE`, and
+  `INDEPENDENT_CHECK` configuration with Provider/model catalog validation,
+  effort, schedule policy, quota, fallback, enabled, and dry-run fields.
+- Redacted candidate pipeline and durable review states: `IGNORE`, `KEEP`,
+  `EXPLORE`, and `START_PRODUCT_DESIGN`.
+- Candidate writes remain separate from Memory publication, Current Anchor,
+  Seed, authority, Assignment, and project source.
+- Bounded Conductor delegation records, a worker queue independent from chat,
+  progress/result APIs, restart recovery, Conductor UI status projection, and
+  a default bounded Project Master delivery/result-reference route.
+
+Required follow-up:
+
+- Connect the configured Provider/model/effort to the governed Task Frame
+  execution adapter. Until then candidate generation is deterministic and must
+  not be attributed to a Provider model.
+- Add a clock-driven scheduler for persisted stage schedules, with due-time,
+  quota-window, retry/backoff, and shutdown/restart tests.
+- Connect Boss/Worker delegation roles to the approved Task Frame executor;
+  these roles currently fail closed instead of bypassing Task Frame policy.
+- Add provider-produced candidate contract tests, scheduler recovery tests,
+  and browser interaction/accessibility QA for configuration and review.

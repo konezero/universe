@@ -4165,8 +4165,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("GOVERNANCE_PROPOSAL_INBOX_COLLECTED", inbox["status"])
-        self.assertEqual("GCS", inbox["proposals"][0]["project_id"])
-        self.assertEqual("PROPOSED", inbox["proposals"][0]["state"])
+        gcs_proposal = next(
+            item
+            for item in inbox["proposals"]
+            if item["project_id"] == "GCS"
+            and item["proposal_id"] == proposal["proposal_id"]
+        )
+        self.assertEqual("PROPOSED", gcs_proposal["state"])
 
         status, approved = self.request(
             "POST",
