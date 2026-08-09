@@ -1051,7 +1051,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "source_path": str(self.temp_root / provider / "chat.jsonl"),
                     "source_kind": f"{provider}_SESSION_JSONL",
                     "source_version": "v1",
-                    "last_modified_at": "2026-08-09T00:00:00Z",
+                    "last_modified_at": (
+                        "2026-08-09T00:01:00Z"
+                        if provider == "CLAUDE"
+                        else "2026-08-09T00:00:00Z"
+                    ),
                     "workspace": f"C:\\workspace\\{provider.lower()}",
                     "workspace_name": provider.lower(),
                     "display_name": f"{provider.title()} chat",
@@ -1062,10 +1066,60 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 }
             ]
 
-        with patch.object(
-            self.server.store,
-            "discover_provider_session_sources",
-            side_effect=discovered,
+        anchor_observations = [
+            {
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "anchor_ref": "MASTER-CURRENT-GCS-001",
+                "temporality": "CURRENT",
+                "observed_at": "2026-08-09T00:00:00Z",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-chat-001",
+                "evidence_ref": "universe://projects/GCS/anchor-store/MASTER-CURRENT-GCS-001",
+            }
+        ]
+        with (
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                side_effect=discovered,
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_observations",
+                return_value=anchor_observations,
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_supervisor_projection",
+                return_value={"status": "PROJECT_ANCHORS_PROJECTED"},
+            ),
+            patch.object(
+                self.server.store,
+                "list_provider_session_sources",
+                return_value=[
+                    {
+                        "source_id": "source-codex-chat-001",
+                        "provider": "CODEX",
+                        "provider_session_id": "codex-chat-001",
+                        "source_path": str(
+                            self.temp_root / "CODEX" / "chat.jsonl"
+                        ),
+                    }
+                ],
+            ),
+            patch.object(
+                self.server.store,
+                "list_provider_session_activities",
+                return_value=[
+                    {
+                        "activity_id": "old-activity",
+                        "activity_state": "WAITING",
+                        "observed_at": "2026-08-08T00:00:00Z",
+                    }
+                ],
+            ),
         ):
             status, catalog = self.request("GET", "/v1/session-observer/chat-rooms")
             repeated_status, repeated_catalog = self.request(
@@ -1079,6 +1133,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         codex = next(room for room in catalog["rooms"] if room["provider"] == "CODEX")
         self.assertEqual("BOUND", codex["binding"]["state"])
+        self.assertEqual("CURRENT", codex["binding"]["observer_currentness"])
+        self.assertEqual("2026-08-09T00:00:00Z", codex["last_activity_at"])
+        self.assertEqual("GCS MASTER", codex["binding"]["alias"])
         self.assertEqual("GCS", codex["binding"]["current_project_id"])
         self.assertEqual("GCS", codex["binding"]["node"])
         self.assertEqual(
@@ -1097,6 +1154,310 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             [room["chat_key"] for room in catalog["rooms"]],
             [room["chat_key"] for room in repeated_catalog["rooms"]],
+        )
+
+    def test_provider_chat_catalog_deduplicates_rotated_chat_files_but_keeps_workers(
+        self,
+    ) -> None:
+        def discovered(provider: str) -> list[dict[str, Any]]:
+            if provider != "CLAUDE":
+                return []
+            base = {
+                "schema": "universe.provider-session-source.v1",
+                "status": "DISCOVERED",
+                "provider": "CLAUDE",
+                "provider_session_id": "claude-chat-rotated",
+                "source_kind": "CLAUDE_SESSION_JSONL",
+                "source_version": "v1",
+                "workspace": r"C:\workspace\universe",
+                "workspace_name": "universe",
+                "identity_state": "VERIFIED",
+                "transcript_content": "EXCLUDED",
+            }
+            return [
+                {
+                    **base,
+                    "source_path": str(self.temp_root / "chat-old.jsonl"),
+                    "last_modified_at": "2026-08-08T00:00:00Z",
+                    "display_name": "Rotated chat",
+                    "session_kind": "CHAT",
+                },
+                {
+                    **base,
+                    "source_path": str(self.temp_root / "chat-current.jsonl"),
+                    "last_modified_at": "2026-08-09T00:00:00Z",
+                    "display_name": "Rotated chat",
+                    "session_kind": "CHAT",
+                },
+                {
+                    **base,
+                    "source_path": str(self.temp_root / "agent-one.jsonl"),
+                    "last_modified_at": "2026-08-09T00:01:00Z",
+                    "display_name": "Review worker",
+                    "session_kind": "WORKER",
+                },
+            ]
+
+        with patch.object(
+            self.server.store,
+            "discover_provider_session_sources",
+            side_effect=discovered,
+        ):
+            catalog = self.server.provider_chat_catalog()
+
+        chats = [
+            room for room in catalog["rooms"] if room["session_kind"] == "CHAT"
+        ]
+        workers = [
+            room for room in catalog["rooms"] if room["session_kind"] == "WORKER"
+        ]
+        self.assertEqual(1, len(chats))
+        self.assertEqual("2026-08-09T00:00:00Z", chats[0]["last_activity_at"])
+        self.assertEqual(1, len(workers))
+        self.assertNotEqual(chats[0]["chat_key"], workers[0]["chat_key"])
+
+    def test_provider_chat_catalog_binds_only_boot_anchors_and_merges_provider_history(
+        self,
+    ) -> None:
+        def discovered(provider: str) -> list[dict[str, Any]]:
+            session_id = {
+                "CODEX": "codex-same-anchor",
+                "CLAUDE": "claude-same-anchor",
+                "GROK": "grok-anchorless",
+            }[provider]
+            return [
+                {
+                    "schema": "universe.provider-session-source.v1",
+                    "status": "DISCOVERED",
+                    "provider": provider,
+                    "provider_session_id": session_id,
+                    "source_path": str(self.temp_root / provider / "chat.jsonl"),
+                    "source_kind": f"{provider}_SESSION_JSONL",
+                    "source_version": "v1",
+                    "last_modified_at": (
+                        "2026-08-09T00:01:00Z"
+                        if provider == "CLAUDE"
+                        else "2026-08-09T00:00:00Z"
+                    ),
+                    "workspace": r"C:\workspace\universe",
+                    "workspace_name": "universe",
+                    "display_name": f"{provider.title()} chat",
+                    "session_kind": "CHAT",
+                    "identity_state": "VERIFIED",
+                    "transcript_content": "EXCLUDED",
+                }
+            ]
+
+        supervisor_sessions = [
+            {
+                "session_id": "canonical-codex",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-same-anchor",
+                "node": "CONDUCTOR",
+                "mode": "CONDUCTOR",
+                "anchor_ref": "MASTER-BEYOND-OLD",
+                "is_default": False,
+                "updated_at": "2026-08-08T00:00:00Z",
+            },
+            {
+                "session_id": "canonical-claude",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-same-anchor",
+                "node": "universe",
+                "mode": "MASTER",
+                "anchor_ref": "MASTER-CURRENT-SAME",
+                "is_default": True,
+                "updated_at": "2026-08-09T00:00:00Z",
+            },
+            {
+                "session_id": "legacy-anchorless",
+                "provider": "GROK",
+                "provider_session_ref": "grok-anchorless",
+                "node": "universe",
+                "mode": "MASTER",
+                "anchor_ref": None,
+                "is_default": False,
+                "updated_at": "2026-08-09T00:00:00Z",
+            },
+        ]
+        anchor_observations = [
+            {
+                "project_id": "universe",
+                "node": "universe",
+                "mode": "MASTER",
+                "anchor_ref": "MASTER-CURRENT-SAME",
+                "temporality": "CURRENT",
+                "observed_at": "2026-08-09T00:00:00Z",
+                "provider": provider,
+                "provider_session_ref": session_ref,
+                "evidence_ref": "universe://projects/universe/anchor-store/MASTER-CURRENT-SAME",
+            }
+            for provider, session_ref in (
+                ("CODEX", "codex-same-anchor"),
+                ("CLAUDE", "claude-same-anchor"),
+            )
+        ]
+        with (
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                side_effect=discovered,
+            ),
+            patch.object(
+                self.server.session_supervisor,
+                "list_sessions",
+                return_value=supervisor_sessions,
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_observations",
+                return_value=anchor_observations,
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_supervisor_projection",
+                return_value={"status": "PROJECT_ANCHORS_PROJECTED"},
+            ),
+        ):
+            catalog = self.server.provider_chat_catalog()
+
+        bound = [
+            room for room in catalog["rooms"] if room["binding"]["state"] == "BOUND"
+        ]
+        self.assertEqual(1, len(bound))
+        self.assertEqual("CLAUDE", bound[0]["provider"])
+        self.assertEqual(2, bound[0]["provider_history_count"])
+        grok = next(room for room in catalog["rooms"] if room["provider"] == "GROK")
+        self.assertEqual("UNBOUND", grok["binding"]["state"])
+
+    def test_project_anchor_store_is_source_for_supervisor_projection(self) -> None:
+        status, _ = self.request(
+            "POST", "/v1/projects/register", self.registration(), self.token
+        )
+        self.assertIn(status, {HTTPStatus.OK, HTTPStatus.CREATED})
+        database = (
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "anchor_store"
+            / "mode-master.sqlite3"
+        )
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE anchor_snapshot(
+                    singleton INTEGER PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    frame_id TEXT NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                );
+                CREATE TABLE beyond_anchor_footprints(
+                    anchor_id TEXT PRIMARY KEY,
+                    frame_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    retired_at TEXT NOT NULL,
+                    retirement_reason TEXT NOT NULL
+                );
+                """
+            )
+            current_snapshot = json.dumps(
+                {
+                    "observer_session_ref": "claude-code:claude-current",
+                    "coordinates": {"mode": "MASTER"},
+                }
+            )
+            beyond_snapshot = json.dumps(
+                {
+                    "observer_session_ref": "codex-beyond",
+                    "coordinates": {"mode": "MASTER"},
+                }
+            )
+            connection.execute(
+                "INSERT INTO anchor_snapshot VALUES (1, 1, 'current', ?, 'READY', ?, 'test', ?)",
+                ("MASTER-CURRENT-GCS", "2026-08-09T01:00:00Z", current_snapshot),
+            )
+            connection.execute(
+                "INSERT INTO beyond_anchor_footprints VALUES (?, 'current', 'RETIRED', ?, 'test', ?, ?, 'REPLACED')",
+                (
+                    "MASTER-CURRENT-GCS-OLD",
+                    "2026-08-08T01:00:00Z",
+                    beyond_snapshot,
+                    "2026-08-09T01:00:00Z",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        discovered = [
+            {
+                "provider": "CLAUDE",
+                "provider_session_id": "claude-current",
+                "session_kind": "CHAT",
+                "identity_state": "VERIFIED",
+            },
+            {
+                "provider": "CODEX",
+                "provider_session_id": "codex-beyond",
+                "session_kind": "CHAT",
+                "identity_state": "VERIFIED",
+            },
+        ]
+        observations = self.server._project_anchor_observations(discovered)
+        self.assertEqual(2, len(observations))
+        by_provider = {item["provider"]: item for item in observations}
+        self.assertEqual("CURRENT", by_provider["CLAUDE"]["temporality"])
+        self.assertEqual("BEYOND", by_provider["CODEX"]["temporality"])
+        self.assertEqual(
+            "MASTER-CURRENT-GCS", by_provider["CLAUDE"]["anchor_ref"]
+        )
+        self.assertEqual(
+            "MASTER-CURRENT-GCS", by_provider["CODEX"]["anchor_ref"]
+        )
+        self.assertEqual(
+            "MASTER-CURRENT-GCS-OLD",
+            by_provider["CODEX"]["observed_anchor_ref"],
+        )
+
+        live_codex, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-live-codex",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-beyond",
+                "anchor_ref": "MASTER-CURRENT-GCS-OLD",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        before_version = live_codex["row_version"]
+
+        projection = self.server._project_anchor_supervisor_projection(observations)
+        self.assertEqual(
+            "PROJECT_ANCHORS_OBSERVED_READ_ONLY", projection["status"]
+        )
+        self.assertEqual(0, projection["projected"])
+        after = self.server.session_supervisor.get_session("session-live-codex")
+        self.assertEqual(before_version, after["row_version"])
+        self.assertEqual("MASTER-CURRENT-GCS-OLD", after["anchor_ref"])
+        self.assertEqual("CURRENT", after["currentness"])
+        self.assertFalse(
+            any(
+                item.get("provider_session_ref") == "claude-current"
+                for item in self.server.session_supervisor.list_sessions(
+                    include_hidden=True
+                )
+            )
         )
 
     def test_tail_auto_registers_only_bound_verified_provider_sessions(self) -> None:
@@ -1187,6 +1548,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(1, len(second["scans"]))
         self.assertEqual(1, second["scans"][0]["added"])
+        observed_session = self.server.session_supervisor.get_session(
+            "session-bound-tail"
+        )
+        self.assertEqual("CURRENT", observed_session["currentness"])
+        self.assertEqual("COMPLETED", observed_session["current_activity_state"])
+        self.assertIn(
+            "PROVIDER_ACTIVITY_OBSERVED",
+            {
+                item["event_type"]
+                for item in self.server.session_supervisor.list_events(limit=20)
+            },
+        )
         registered = self.server.store.list_provider_session_sources()
         self.assertEqual(1, len(registered))
         self.assertEqual("codex-bound-tail", registered[0]["provider_session_id"])

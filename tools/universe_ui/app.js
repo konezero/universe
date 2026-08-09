@@ -64,6 +64,9 @@ const state = {
   providerChatSearch: "",
   providerChatShowWorkers: false,
   providerChatShowHidden: false,
+  providerChatExpandedProjects: {},
+  providerChatExpandedBranches: {},
+  selectedProviderChatKey: null,
   providerTailTimer: null,
   providerTailInFlight: false,
   conversationTarget: {
@@ -133,6 +136,12 @@ const elements = {
   sessionRailSearch: document.querySelector("#session-rail-search"),
   sessionRailShowWorkers: document.querySelector("#session-rail-show-workers"),
   sessionRailShowHidden: document.querySelector("#session-rail-show-hidden"),
+  sessionSummaryDialog: document.querySelector("#session-summary-dialog"),
+  sessionSummaryTitle: document.querySelector("#session-summary-title"),
+  sessionSummarySubtitle: document.querySelector("#session-summary-subtitle"),
+  sessionSummaryFacts: document.querySelector("#session-summary-facts"),
+  sessionSummaryOpen: document.querySelector("#session-summary-open"),
+  sessionSummaryManage: document.querySelector("#session-summary-manage"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
   sessionObservatoryDetailMeta: document.querySelector(
     "#session-observatory-detail-meta"
@@ -992,6 +1001,145 @@ async function activateAnchorSession(session) {
   expandConversationLayer();
 }
 
+function sessionRailActivityLabel(room) {
+  const provider = String(room.provider || "UNKNOWN").toUpperCase();
+  const observedAt = String(room.last_activity_at || "").trim();
+  if (!observedAt) return provider;
+  const parsed = new Date(observedAt);
+  if (Number.isNaN(parsed.getTime())) return provider;
+  const activity = `${provider} · ${new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(parsed)}`;
+  const historyCount = Number(room.provider_history_count || 1);
+  return historyCount > 1 ? `${activity} · ${historyCount} providers` : activity;
+}
+
+function supervisorSessionForRoom(room) {
+  const binding = room?.binding || {};
+  return (state.supervisorSessions || []).find(
+    (session) =>
+      session.session_id === binding.universe_session_id ||
+      session.universe_session_id === binding.universe_session_id ||
+      anchorSessionKey(session) === binding.anchor_key
+  );
+}
+
+function sessionRailProjectIdentity(room) {
+  const binding = room?.binding || {};
+  const anchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
+  const boundProject = String(
+    binding.current_project_id || binding.node || ""
+  ).trim();
+  if (anchored && boundProject) {
+    const project = (state.projects || []).find(
+      (item) => String(item.project_id).toLowerCase() === boundProject.toLowerCase()
+    );
+    return {
+      key: `project:${boundProject.toLowerCase()}`,
+      projectId: boundProject,
+      label: project ? projectDisplayName(project) : boundProject,
+      registered: Boolean(project),
+    };
+  }
+
+  const origin = String(room?.workspace_name || "Unassigned").trim();
+  const originKey = origin.toLowerCase();
+  const project = (state.projects || []).find((item) => {
+    const projectId = String(item.project_id || "").toLowerCase();
+    const label = String(projectDisplayName(item) || "").toLowerCase();
+    const rootName = String(item.project_root || "")
+      .replace(/[\\/]+$/, "")
+      .split(/[\\/]/)
+      .at(-1)
+      ?.toLowerCase();
+    return [projectId, label, rootName].filter(Boolean).includes(originKey);
+  });
+  if (project) {
+    return {
+      key: `project:${String(project.project_id).toLowerCase()}`,
+      projectId: project.project_id,
+      label: projectDisplayName(project),
+      registered: true,
+    };
+  }
+  return {
+    key: "unassigned",
+    projectId: null,
+    label: "Unassigned sessions",
+    registered: false,
+  };
+}
+
+function providerChatAnchorLabel(room) {
+  const binding = room?.binding || {};
+  const anchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
+  if (!anchored) return "Not attached";
+  const anchor = String(binding.current_anchor_ref || "UNKNOWN");
+  if (anchor === "UNKNOWN") return "Anchor pending";
+  return anchor;
+}
+
+function renderProviderChatSummary() {
+  if (!elements.sessionSummaryDialog) return;
+  const room = (state.providerChatRooms || []).find(
+    (item) => item.chat_key === state.selectedProviderChatKey
+  );
+  if (!room) {
+    if (elements.sessionSummaryDialog.open) elements.sessionSummaryDialog.close();
+    return;
+  }
+  const binding = room.binding || { state: "UNBOUND" };
+  const project = sessionRailProjectIdentity(room);
+  const boundSession = supervisorSessionForRoom(room);
+  const temporality = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)
+    ? binding.observer_currentness !== "CURRENT"
+      ? "Past"
+      : "Current"
+    : "Unbound";
+  elements.sessionSummaryTitle.textContent =
+    binding.alias || room.display_name || "Session";
+  elements.sessionSummarySubtitle.textContent = `${project.label} · ${temporality}`;
+  elements.sessionSummaryFacts.replaceChildren();
+  const facts = [
+    ["Project", project.label],
+    ["Position", temporality],
+    ["Mode", binding.mode || "Unassigned"],
+    ["Provider", String(room.provider || "UNKNOWN").toUpperCase()],
+    ["Activity", String(room.activity_state || "UNKNOWN").toUpperCase()],
+    ["Last activity", formatSessionTime(room.last_activity_at, { withSeconds: false, relative: true })],
+    ["Anchor", providerChatAnchorLabel(room)],
+    ["Opened from", room.workspace_name || "Unknown"],
+  ];
+  const historyCount = Number(room.provider_history_count || 1);
+  if (historyCount > 1) facts.push(["Provider history", String(historyCount)]);
+  for (const [label, value] of facts) {
+    const fact = node("div", "session-summary-fact");
+    fact.append(node("span", "", label), node("strong", "", value));
+    elements.sessionSummaryFacts.append(fact);
+  }
+  elements.sessionSummaryOpen.disabled = !boundSession;
+  elements.sessionSummaryOpen.textContent = boundSession
+    ? binding.mode === "MASTER"
+      ? "Open Master"
+      : "Open session"
+    : "Not attached";
+  elements.sessionSummaryManage.textContent = boundSession
+    ? "View in Observatory"
+    : "Register session";
+}
+
+function openProviderChatSummary(room) {
+  state.selectedProviderChatKey = room.chat_key;
+  renderSessionRail();
+  renderProviderChatSummary();
+  if (!elements.sessionSummaryDialog.open) {
+    elements.sessionSummaryDialog.showModal();
+  }
+}
+
 function renderSessionRail() {
   if (!elements.sessionRailList) return;
   const query = String(state.providerChatSearch || "").trim().toLowerCase();
@@ -1021,54 +1169,59 @@ function renderSessionRail() {
     return;
   }
 
-  const boundGroups = new Map();
-  const unboundGroups = new Map();
+  const projectGroups = new Map();
   for (const room of rooms) {
     const binding = room.binding || { state: "UNBOUND" };
-    if (binding.state === "BOUND") {
-      const project = binding.current_project_id || binding.node || "Universe";
-      const key = `${project}\u0000${binding.node || "UNKNOWN"}\u0000${binding.mode || "UNKNOWN"}`;
-      if (!boundGroups.has(key)) boundGroups.set(key, []);
-      boundGroups.get(key).push(room);
+    const project = sessionRailProjectIdentity(room);
+    if (!projectGroups.has(project.key)) {
+      projectGroups.set(project.key, {
+        ...project,
+        current: [],
+        past: [],
+        unbound: [],
+      });
+    }
+    const group = projectGroups.get(project.key);
+    if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) {
+      group.unbound.push(room);
+    } else if (binding.observer_currentness === "CURRENT") {
+      group.current.push(room);
     } else {
-      const key = `${room.provider || "UNKNOWN"}\u0000${room.workspace_name || "Unknown origin"}`;
-      if (!unboundGroups.has(key)) unboundGroups.set(key, []);
-      unboundGroups.get(key).push(room);
+      group.past.push(room);
     }
   }
 
-  const appendRoom = (room) => {
+  const appendRoom = (target, room) => {
     const binding = room.binding || { state: "UNBOUND" };
-    const boundSession = (state.supervisorSessions || []).find(
-      (session) =>
-        session.session_id === binding.universe_session_id ||
-        session.universe_session_id === binding.universe_session_id ||
-        anchorSessionKey(session) === binding.anchor_key
-    );
+    const isAnchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
+    const boundSession = supervisorSessionForRoom(room);
     const row = node("div", "session-rail-row");
     const item = node("button", "session-rail-item provider-chat-item");
     item.type = "button";
-    item.dataset.bound = String(binding.state === "BOUND");
+    item.dataset.bound = String(isAnchored);
     item.dataset.kind = room.session_kind || "CHAT";
     item.classList.toggle(
       "selected",
       Boolean(
-        boundSession &&
-          anchorSessionKey(boundSession) === state.selectedSupervisorAnchorKey
+        room.chat_key === state.selectedProviderChatKey ||
+          (boundSession &&
+            anchorSessionKey(boundSession) === state.selectedSupervisorAnchorKey)
       )
     );
     const activityState = String(room.activity_state || "UNKNOWN").toUpperCase();
     item.dataset.state = activityState;
     const copy = node("span", "session-rail-copy");
     const anchorLabel =
-      binding.state === "BOUND" && binding.current_anchor_ref !== "UNKNOWN"
-        ? binding.current_anchor_ref
-        : binding.state === "BOUND"
+      isAnchored && binding.current_anchor_ref !== "UNKNOWN"
+        ? `${binding.observer_currentness === "CURRENT" ? "" : "Past · "}${binding.current_anchor_ref}`
+        : isAnchored
           ? binding.alias || `${binding.node} ${binding.mode}`
           : `${room.provider} origin`;
+    const roomLabel =
+      binding.alias || room.display_name || "Untitled session";
     copy.append(
-      node("strong", "", binding.alias || room.display_name || "Untitled session"),
-      node("small", "", anchorLabel)
+      node("strong", "", roomLabel),
+      node("small", "", `${sessionRailActivityLabel(room)} · ${anchorLabel}`)
     );
     const status = node(
       "span",
@@ -1078,25 +1231,9 @@ function renderSessionRail() {
     status.dataset.state = activityState;
     item.append(node("i", "session-rail-dot"), copy, status);
     item.title = `${room.provider} | ${anchorLabel}`;
-    item.addEventListener("click", async () => {
-      try {
-        if (boundSession) {
-          await activateAnchorSession(boundSession);
-          return;
-        }
-        state.observatoryTab = "activity";
-        setObservatoryTab("activity");
-        if (!elements.sessionObservatoryDialog.open) {
-          elements.sessionObservatoryDialog.showModal();
-        }
-        await discoverProviderActivitySources();
-        toast("Unbound session selected. Register it from Activity.");
-      } catch (error) {
-        toast(error.message, true);
-      }
-    });
+    item.addEventListener("click", () => openProviderChatSummary(room));
     row.append(item);
-    if (binding.state === "BOUND") {
+    if (binding.state === "BOUND" && binding.universe_session_id) {
       const visibility = binding.visibility || "VISIBLE";
       const toggle = node(
         "button",
@@ -1124,34 +1261,105 @@ function renderSessionRail() {
       });
       row.append(toggle);
     }
-    elements.sessionRailList.append(row);
+    target.append(row);
   };
 
-  for (const roomsAtLocation of boundGroups.values()) {
-    const binding = roomsAtLocation[0].binding;
-    const heading = node("div", "session-rail-location");
-    heading.append(
-      node("strong", "", binding.current_project_id || binding.node || "Universe"),
-      node("span", "", `${binding.node || "UNKNOWN"} / ${binding.mode || "UNKNOWN"}`)
+  const projectOrder = new Map(
+    (state.projects || []).map((project, index) => [
+      String(project.project_id).toLowerCase(),
+      index,
+    ])
+  );
+  const groups = [...projectGroups.values()].sort((left, right) => {
+    const leftOrder = projectOrder.get(String(left.projectId || "").toLowerCase());
+    const rightOrder = projectOrder.get(String(right.projectId || "").toLowerCase());
+    if (leftOrder !== undefined || rightOrder !== undefined) {
+      return (leftOrder ?? Number.MAX_SAFE_INTEGER) - (rightOrder ?? Number.MAX_SAFE_INTEGER);
+    }
+    return left.label.localeCompare(right.label);
+  });
+  for (const group of groups) {
+    const total = group.current.length + group.past.length + group.unbound.length;
+    const hasSelected = [...group.current, ...group.past, ...group.unbound].some(
+      (room) =>
+        room.chat_key === state.selectedProviderChatKey ||
+        supervisorSessionForRoom(room) &&
+          anchorSessionKey(supervisorSessionForRoom(room)) ===
+            state.selectedSupervisorAnchorKey
     );
-    elements.sessionRailList.append(heading);
-    roomsAtLocation.forEach(appendRoom);
-  }
-  if (unboundGroups.size) {
-    elements.sessionRailList.append(
-      node("div", "session-rail-unbound-heading", "Unbound vendor sessions")
+    const hasExplicitState = Object.hasOwn(
+      state.providerChatExpandedProjects,
+      group.key
     );
-  }
-  for (const roomsAtOrigin of unboundGroups.values()) {
-    const first = roomsAtOrigin[0];
-    elements.sessionRailList.append(
+    const expanded = query
+      ? true
+      : hasExplicitState
+        ? Boolean(state.providerChatExpandedProjects[group.key])
+        : hasSelected;
+    const tree = node("section", "session-project-tree");
+    tree.dataset.expanded = String(expanded);
+    const toggle = node("button", "session-project-toggle");
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", String(expanded));
+    const chevron = node("span", "session-tree-chevron");
+    chevron.setAttribute("aria-hidden", "true");
+    const title = node("span", "session-project-copy");
+    title.append(
+      node("strong", "", group.label),
       node(
-        "div",
-        "session-rail-workspace",
-        `${first.provider} / ${first.workspace_name || "Unknown origin"}`
+        "small",
+        "",
+        `${group.current.length} current · ${group.past.length} past · ${group.unbound.length} unbound`
       )
     );
-    roomsAtOrigin.forEach(appendRoom);
+    toggle.append(chevron, title, node("span", "session-project-count", String(total)));
+    toggle.addEventListener("click", () => {
+      state.providerChatExpandedProjects[group.key] = !expanded;
+      renderSessionRail();
+    });
+    tree.append(toggle);
+    const body = node("div", "session-project-body");
+    body.hidden = !expanded;
+    const appendBranch = (label, branchRooms) => {
+      if (!branchRooms.length) return;
+      const branch = node("section", "session-project-branch");
+      const branchKey = `${group.key}:${label.toLowerCase()}`;
+      const branchHasExplicitState = Object.hasOwn(
+        state.providerChatExpandedBranches,
+        branchKey
+      );
+      const branchExpanded = query
+        ? true
+        : branchHasExplicitState
+          ? Boolean(state.providerChatExpandedBranches[branchKey])
+          : label === "Current";
+      branch.dataset.expanded = String(branchExpanded);
+      const branchToggle = node("button", "session-project-branch-toggle");
+      branchToggle.type = "button";
+      branchToggle.setAttribute("aria-expanded", String(branchExpanded));
+      const branchChevron = node("span", "session-tree-chevron");
+      branchChevron.setAttribute("aria-hidden", "true");
+      branchToggle.append(
+        branchChevron,
+        node("span", "", label),
+        node("span", "session-project-count", String(branchRooms.length))
+      );
+      branchToggle.addEventListener("click", () => {
+        state.providerChatExpandedBranches[branchKey] = !branchExpanded;
+        renderSessionRail();
+      });
+      branch.append(branchToggle);
+      const lines = node("div", "session-project-branch-lines");
+      lines.hidden = !branchExpanded;
+      branchRooms.forEach((room) => appendRoom(lines, room));
+      branch.append(lines);
+      body.append(branch);
+    };
+    appendBranch("Current", group.current);
+    appendBranch("Past", group.past);
+    appendBranch("Unbound", group.unbound);
+    tree.append(body);
+    elements.sessionRailList.append(tree);
   }
 }
 
@@ -7717,6 +7925,50 @@ function bindEvents() {
     elements.sessionRailShowHidden.addEventListener("change", () => {
       state.providerChatShowHidden = elements.sessionRailShowHidden.checked;
       renderSessionRail();
+    });
+  }
+  if (elements.sessionSummaryOpen) {
+    elements.sessionSummaryOpen.addEventListener("click", async () => {
+      const room = (state.providerChatRooms || []).find(
+        (item) => item.chat_key === state.selectedProviderChatKey
+      );
+      const session = supervisorSessionForRoom(room);
+      if (!session) return;
+      try {
+        elements.sessionSummaryDialog.close();
+        await activateAnchorSession(session);
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+  }
+  if (elements.sessionSummaryManage) {
+    elements.sessionSummaryManage.addEventListener("click", async () => {
+      const room = (state.providerChatRooms || []).find(
+        (item) => item.chat_key === state.selectedProviderChatKey
+      );
+      if (!room) return;
+      const session = supervisorSessionForRoom(room);
+      elements.sessionSummaryDialog.close();
+      if (session) {
+        state.selectedSupervisorAnchorKey = anchorSessionKey(session);
+        state.observatoryTab = "sessions";
+        setObservatoryTab("sessions");
+        renderSessionObservatory();
+      } else {
+        state.observatoryTab = "activity";
+        setObservatoryTab("activity");
+      }
+      if (!elements.sessionObservatoryDialog.open) {
+        elements.sessionObservatoryDialog.showModal();
+      }
+      if (!session) {
+        try {
+          await discoverProviderActivitySources();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      }
     });
   }
   if (elements.discoverProviderActivity) {

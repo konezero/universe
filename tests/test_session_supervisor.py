@@ -636,6 +636,67 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertEqual(1, outcomes.count("PASS"))
         self.assertEqual(1, outcomes.count("DEFAULT_SESSION_VERSION_CONFLICT"))
 
+    def test_latest_observer_activity_selects_current_session_without_rebinding_anchor(
+        self,
+    ) -> None:
+        first, _ = self.store.register_session(self.session("session-one"))
+        second, _ = self.store.register_session(self.session("session-two"))
+
+        self.store.observe_session_activity(
+            first["session_id"],
+            event_type="PROVIDER_SESSION_ATTACHED",
+            activity_state="ATTACHED",
+            observed_at="2099-08-09T01:00:00Z",
+            evidence_ref="observer://attach/one",
+        )
+        observed = self.store.observe_session_activity(
+            second["session_id"],
+            event_type="COMMANDER_MESSAGE_OBSERVED",
+            activity_state="ACTIVE",
+            observed_at="2099-08-09T01:01:00Z",
+            evidence_ref="observer://message/two",
+        )
+
+        first_after = self.store.get_session(first["session_id"])
+        second_after = self.store.get_session(second["session_id"])
+        self.assertEqual("STALE", first_after["currentness"])
+        self.assertEqual("CURRENT", second_after["currentness"])
+        self.assertEqual("MASTER-CURRENT-GCS", first_after["anchor_ref"])
+        self.assertEqual("MASTER-CURRENT-GCS", second_after["anchor_ref"])
+        self.assertEqual("SESSION_ACTIVITY_OBSERVED", observed["observation"]["status"])
+
+    def test_out_of_order_observer_activity_cannot_steal_currentness(self) -> None:
+        first, _ = self.store.register_session(self.session("session-one"))
+        second, _ = self.store.register_session(self.session("session-two"))
+        self.store.observe_session_activity(
+            first["session_id"],
+            event_type="PROVIDER_ACTIVITY_OBSERVED",
+            activity_state="ACTIVE",
+            observed_at="2099-08-09T02:00:00Z",
+            evidence_ref="observer://activity/one",
+        )
+        ignored = self.store.observe_session_activity(
+            first["session_id"],
+            event_type="PROVIDER_ACTIVITY_OBSERVED",
+            activity_state="WAITING",
+            observed_at="2099-08-09T01:00:00Z",
+            evidence_ref="observer://activity/old",
+        )
+        self.store.observe_session_activity(
+            second["session_id"],
+            event_type="PROVIDER_ACTIVITY_OBSERVED",
+            activity_state="ACTIVE",
+            observed_at="2099-08-09T01:30:00Z",
+            evidence_ref="observer://activity/two",
+        )
+
+        self.assertEqual(
+            "OUT_OF_ORDER_OBSERVATION_IGNORED",
+            ignored["observation"]["status"],
+        )
+        self.assertEqual("CURRENT", self.store.get_session(first["session_id"])["currentness"])
+        self.assertEqual("STALE", self.store.get_session(second["session_id"])["currentness"])
+
 
 if __name__ == "__main__":
     unittest.main()

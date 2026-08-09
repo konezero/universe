@@ -1048,6 +1048,15 @@ class ProjectMasterSessionStore:
                     supervisor_session_id,
                     expected_pointer_version=candidate["default_pointer_version"],
                 )
+            self.session_supervisor.observe_session_activity(
+                supervisor_session_id,
+                event_type="PROVIDER_SESSION_ATTACHED",
+                activity_state="ATTACHED",
+                evidence_ref=(
+                    "universe://session-observer/"
+                    f"{self.project_id}/{self.requested_mode}/provider-attach"
+                ),
+            )
         with self._connection() as connection:
             for key, value in (
                 ("last_provider", normalized_provider),
@@ -1062,6 +1071,36 @@ class ProjectMasterSessionStore:
                     (key, value),
                 )
         return state
+
+    def observe_session_activity(
+        self,
+        provider: str,
+        session_ref: str,
+        *,
+        event_type: str,
+        activity_state: str,
+        evidence_ref: str,
+    ) -> dict[str, Any] | None:
+        if self.session_supervisor is None:
+            return None
+        supervisor_session_id = self._supervisor_session_id(provider, session_ref)
+        try:
+            return self.session_supervisor.observe_session_activity(
+                supervisor_session_id,
+                event_type=event_type,
+                activity_state=activity_state,
+                evidence_ref=evidence_ref,
+            )
+        except SessionSupervisorError as error:
+            if error.code != "SESSION_NOT_FOUND":
+                raise
+            self.observe_provider_session(provider, session_ref)
+            return self.session_supervisor.observe_session_activity(
+                supervisor_session_id,
+                event_type=event_type,
+                activity_state=activity_state,
+                evidence_ref=evidence_ref,
+            )
 
     def observe_current_anchor(self, anchor_ref: str) -> dict[str, Any] | None:
         if self.session_supervisor is None:
@@ -2011,6 +2050,16 @@ class ResidentModeSessionHost:
         normalized_provider = _provider(provider)
         with self._lock:
             active = self._ensure(normalized_provider)
+            self.store.observe_session_activity(
+                normalized_provider,
+                active.session_ref,
+                event_type="COMMANDER_MESSAGE_OBSERVED",
+                activity_state="ACTIVE",
+                evidence_ref=(
+                    "universe://session-observer/"
+                    f"{self.target_id}/{self.requested_mode}/commander-message"
+                ),
+            )
             try:
                 text = active.reply(message)
             except Exception as error:
@@ -2024,6 +2073,16 @@ class ResidentModeSessionHost:
                         f"{normalized_provider}_REPLY_FAILED:{type(error).__name__}"
                     )
                 raise
+            self.store.observe_session_activity(
+                normalized_provider,
+                active.session_ref,
+                event_type="PROVIDER_REPLY_OBSERVED",
+                activity_state="COMPLETED",
+                evidence_ref=(
+                    "universe://session-observer/"
+                    f"{self.target_id}/{self.requested_mode}/provider-reply"
+                ),
+            )
             self._last_interaction = {
                 "target_id": self.target_id,
                 "mode": self.requested_mode,

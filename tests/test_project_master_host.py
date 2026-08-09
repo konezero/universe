@@ -374,6 +374,11 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(2, len(sessions[0]["binding_history"]))
         self.assertEqual("MASTER-CURRENT-GCS", sessions[0]["anchor_ref"])
         self.assertEqual("CURRENT", sessions[0]["currentness"])
+        self.assertEqual("ATTACHED", sessions[0]["current_activity_state"])
+        event_types = {
+            event["event_type"] for event in supervisor.list_events(limit=20)
+        }
+        self.assertIn("PROVIDER_SESSION_ATTACHED", event_types)
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
 
@@ -559,6 +564,35 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(["CONDUCTOR", "CONDUCTOR"], [item[1] for item in created])
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
+
+    def test_resident_mode_session_records_commander_and_provider_observations(
+        self,
+    ) -> None:
+        supervisor = SessionSupervisorStore(self.root / "observer-supervisor.sqlite3")
+        provider = PreparedFakeProvider()
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-observer.sqlite",
+            actor_label="Universe Conductor",
+            session_supervisor=supervisor,
+            provider_factory=lambda *_args: provider,
+        )
+        try:
+            host.reply("CODEX", self._envelope()["message"])
+        finally:
+            host.close()
+
+        sessions = supervisor.list_sessions(node="CONDUCTOR", mode="CONDUCTOR")
+        self.assertEqual(1, len(sessions))
+        self.assertEqual("CURRENT", sessions[0]["currentness"])
+        self.assertEqual("COMPLETED", sessions[0]["current_activity_state"])
+        events = [
+            item["event_type"] for item in supervisor.list_events(limit=20)
+        ]
+        self.assertIn("COMMANDER_MESSAGE_OBSERVED", events)
+        self.assertIn("PROVIDER_REPLY_OBSERVED", events)
 
     def test_resident_mode_session_binds_declared_permission_requester(self) -> None:
         provider = PreparedFakeProvider()

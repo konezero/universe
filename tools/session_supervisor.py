@@ -95,6 +95,37 @@ def _canonical_process_timestamp(value: Any) -> str:
     )
 
 
+def _canonical_observed_at(value: Any) -> str:
+    if value is None:
+        return utc_now()
+    text = _required_text(value, "observed_at")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise SessionSupervisorError(
+            "SESSION_ACTIVITY_OBSERVATION_INVALID",
+            "observed_at must be ISO-8601",
+        ) from error
+    if parsed.tzinfo is None:
+        raise SessionSupervisorError(
+            "SESSION_ACTIVITY_OBSERVATION_INVALID",
+            "observed_at must include a timezone",
+        )
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _timestamp_key(value: Any) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _normalize_loopback_endpoint(value: Any) -> str:
     endpoint = _required_text(value, "process_identity.endpoint")
     try:
@@ -1146,6 +1177,137 @@ class SessionSupervisorStore:
             return self._session_material(
                 connection, self._require_session(connection, normalized_id)
             )
+
+    def observe_session_activity(
+        self,
+        session_id: str,
+        *,
+        event_type: Any,
+        activity_state: Any,
+        evidence_ref: Any,
+        observed_at: Any = None,
+    ) -> dict[str, Any]:
+        """Record observer activity without changing the project Current Anchor.
+
+        Currentness belongs to the most recently observed persistent session for
+        one node/mode. Provider switches and chat activity update this observer
+        clock; they never create or retire a Mode Anchor.
+        """
+        normalized_id = _required_text(session_id, "session_id")
+        normalized_event = _required_text(event_type, "event_type").upper()
+        normalized_activity = _required_text(
+            activity_state, "activity_state"
+        ).upper()
+        normalized_evidence = _required_text(evidence_ref, "evidence_ref")
+        normalized_observed_at = _canonical_observed_at(observed_at)
+        observed_key = _timestamp_key(normalized_observed_at)
+        now = utc_now()
+        with self._connection(immediate=True) as connection:
+            row = self._require_session(connection, normalized_id)
+            if _timestamp_key(row["last_seen_at"]) > observed_key:
+                self._event(
+                    connection,
+                    session_id=normalized_id,
+                    event_type="SESSION_ACTIVITY_OBSERVATION_IGNORED",
+                    state=row["state"],
+                    reason="OUT_OF_ORDER_OBSERVATION",
+                    details={
+                        "activity_event_type": normalized_event,
+                        "activity_state": normalized_activity,
+                        "evidence_ref": normalized_evidence,
+                        "observed_at": normalized_observed_at,
+                    },
+                )
+                material = self._session_material(connection, row)
+                material["observation"] = {
+                    "status": "OUT_OF_ORDER_OBSERVATION_IGNORED",
+                    "observed_at": normalized_observed_at,
+                }
+                return material
+            if all(
+                (
+                    _timestamp_key(row["last_seen_at"]) == observed_key,
+                    row["current_activity_state"] == normalized_activity,
+                    row["currentness"] == "CURRENT",
+                )
+            ):
+                material = self._session_material(connection, row)
+                material["observation"] = {
+                    "status": "SESSION_ACTIVITY_ALREADY_OBSERVED",
+                    "observed_at": normalized_observed_at,
+                }
+                return material
+
+            peers = connection.execute(
+                """
+                SELECT session_id, last_seen_at
+                FROM session_record
+                WHERE node = ? AND mode = ?
+                """,
+                (row["node"], row["mode"]),
+            ).fetchall()
+            timestamps = {
+                str(peer["session_id"]): _timestamp_key(peer["last_seen_at"])
+                for peer in peers
+            }
+            timestamps[normalized_id] = observed_key
+            winner_id = max(
+                timestamps,
+                key=lambda candidate_id: (timestamps[candidate_id], candidate_id),
+            )
+            connection.execute(
+                """
+                UPDATE session_record
+                SET currentness = CASE
+                        WHEN session_id = ? THEN 'CURRENT'
+                        ELSE 'STALE'
+                    END,
+                    row_version = row_version + 1
+                WHERE node = ? AND mode = ?
+                  AND currentness != CASE
+                        WHEN session_id = ? THEN 'CURRENT'
+                        ELSE 'STALE'
+                    END
+                """,
+                (winner_id, row["node"], row["mode"], winner_id),
+            )
+            connection.execute(
+                """
+                UPDATE session_record
+                SET current_activity_state = ?, last_seen_at = ?,
+                    row_version = row_version + 1, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    normalized_activity,
+                    normalized_observed_at,
+                    now,
+                    normalized_id,
+                ),
+            )
+            refreshed = self._require_session(connection, normalized_id)
+            self._event(
+                connection,
+                session_id=normalized_id,
+                event_type=normalized_event,
+                prior_state=row["state"],
+                state=refreshed["state"],
+                details={
+                    "activity_state": normalized_activity,
+                    "evidence_ref": normalized_evidence,
+                    "observed_at": normalized_observed_at,
+                    "currentness": refreshed["currentness"],
+                    "current_session_id": winner_id,
+                },
+            )
+            material = self._session_material(connection, refreshed)
+            material["observation"] = {
+                "status": "SESSION_ACTIVITY_OBSERVED",
+                "event_type": normalized_event,
+                "observed_at": normalized_observed_at,
+                "current_session_id": winner_id,
+            }
+            return material
 
     def bind_current_location(
         self,

@@ -544,6 +544,22 @@
     </form>
   </dialog>
 
+  <dialog id="session-summary-dialog" class="session-summary-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Session status</span>
+        <h2 id="session-summary-title">Session</h2>
+        <p id="session-summary-subtitle">Project and anchor position</p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div id="session-summary-facts" class="session-summary-facts"></div>
+    <div class="dialog-actions session-summary-actions">
+      <button id="session-summary-manage" class="secondary-button" type="button">View in Observatory</button>
+      <button id="session-summary-open" class="primary-button" type="button">Open session</button>
+    </div>
+  </dialog>
+
   <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog">
     <div class="dialog-heading">
       <div>

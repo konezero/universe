@@ -3136,10 +3136,117 @@ body {
 .session-rail-list {
   display: grid;
   align-content: start;
-  gap: 4px;
+  gap: 6px;
   min-height: 0;
   padding: 6px 8px;
   overflow-y: auto;
+}
+.session-project-tree {
+  min-width: 0;
+  border-bottom: 1px solid rgba(90, 150, 220, 0.1);
+}
+.session-project-toggle {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 42px;
+  padding: 6px 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  text-align: left;
+}
+.session-project-toggle:hover {
+  border-color: rgba(90, 150, 220, 0.2);
+  background: rgba(20, 36, 64, 0.48);
+  color: var(--text-1);
+}
+.session-tree-chevron {
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+.session-project-tree[data-expanded="true"]
+  > .session-project-toggle
+  .session-tree-chevron {
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+.session-project-copy {
+  min-width: 0;
+}
+.session-project-copy strong,
+.session-project-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-project-copy strong {
+  color: var(--text-1);
+  font-size: 11px;
+}
+.session-project-copy small {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 8px;
+}
+.session-project-count {
+  min-width: 20px;
+  color: var(--text-3);
+  font-size: 9px;
+  text-align: right;
+}
+.session-project-body {
+  display: grid;
+  gap: 5px;
+  padding: 0 0 7px 11px;
+}
+.session-project-body[hidden] {
+  display: none;
+}
+.session-project-branch {
+  min-width: 0;
+  border-left: 1px solid rgba(90, 150, 220, 0.17);
+}
+.session-project-branch-toggle {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 25px;
+  padding: 3px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 8px;
+  text-align: left;
+  text-transform: uppercase;
+}
+.session-project-branch-toggle:hover {
+  color: var(--text-1);
+}
+.session-project-branch-toggle .session-tree-chevron {
+  width: 5px;
+  height: 5px;
+}
+.session-project-branch[data-expanded="true"]
+  .session-project-branch-toggle
+  .session-tree-chevron {
+  transform: rotate(45deg) translate(-1px, -1px);
+}
+.session-project-branch-lines {
+  display: grid;
+  gap: 2px;
+}
+.session-project-branch-lines[hidden] {
+  display: none;
 }
 .session-rail-filters {
   display: grid;
@@ -3317,12 +3424,61 @@ body {
   color: var(--text-3);
   font-size: 10px;
 }
+.session-summary-dialog {
+  width: min(440px, calc(100vw - 24px));
+  max-height: min(680px, calc(100vh - 24px));
+  padding: 18px;
+  overflow: auto;
+}
+.session-summary-dialog .dialog-heading {
+  margin-bottom: 14px;
+}
+.session-summary-dialog .dialog-heading h2 {
+  font-size: 18px;
+}
+.session-summary-dialog .dialog-heading p {
+  margin: 3px 0 0;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.session-summary-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid rgba(90, 150, 220, 0.14);
+}
+.session-summary-fact {
+  min-width: 0;
+  padding: 10px 8px;
+  border-bottom: 1px solid rgba(90, 150, 220, 0.1);
+}
+.session-summary-fact span,
+.session-summary-fact strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.session-summary-fact span {
+  color: var(--text-3);
+  font-size: 8px;
+  text-transform: uppercase;
+}
+.session-summary-fact strong {
+  margin-top: 4px;
+  color: var(--text-1);
+  font-size: 11px;
+  font-weight: 600;
+}
+.session-summary-actions {
+  margin-top: 14px;
+}
 @media (max-width: 420px) {
   .session-rail-filters {
     grid-template-columns: minmax(0, 1fr) auto;
   }
   .session-rail-filters input[type="search"] {
     grid-column: 1 / -1;
+  }
+  .session-summary-facts {
+    grid-template-columns: 1fr;
   }
 }
 .session-card {

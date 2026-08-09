@@ -13013,7 +13013,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.project_master_hosts.save_idle_sessions(idle_seconds)
             )
             results["dirty_ends"] = self.project_master_hosts.reconcile_residents()
-        results["provider_activity"] = self.store.scan_registered_provider_sources()
+        discovered: list[dict[str, Any]] = []
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            discovered.extend(
+                self.store.discover_provider_session_sources(provider)
+            )
+        results["project_anchor_projection"] = (
+            self._project_anchor_supervisor_projection(
+                self._project_anchor_observations(discovered)
+            )
+        )
+        results["provider_activity"] = self.tail_bound_provider_sessions()
         reconcile_runtime = getattr(self.conductor_runtime, "reconcile", None)
         if callable(reconcile_runtime):
             runtime_state = reconcile_runtime()
@@ -13779,6 +13789,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         lease_at = str((lease or {}).get("updated_at") or "") or None
         updated_at = str(session.get("updated_at") or "") or None
         created_at = str(session.get("created_at") or "") or None
+        last_seen_at = str(session.get("last_seen_at") or "") or None
         projects = projects_by_id or {}
         bound_project = projects.get(node) if node else None
         if isinstance(bound_project, Mapping):
@@ -13906,7 +13917,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         candidates = [
             value
-            for value in (last_message_at, lease_at, updated_at, created_at, anchor_at)
+            for value in (last_message_at, lease_at, last_seen_at, created_at)
             if isinstance(value, str) and value
         ]
         last_activity_at = max(candidates) if candidates else updated_at
@@ -13961,6 +13972,210 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
         return card
 
+    def _project_anchor_observations(
+        self, discovered: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        provider_identities: dict[tuple[str, str], dict[str, Any]] = {}
+        exact_identities: dict[str, list[tuple[str, str]]] = {}
+        for source in discovered:
+            provider = str(source.get("provider") or "").upper()
+            provider_session_id = str(
+                source.get("provider_session_id") or ""
+            ).strip()
+            if (
+                source.get("identity_state") != "VERIFIED"
+                or str(source.get("session_kind") or "CHAT").upper() == "WORKER"
+                or not provider_session_id
+            ):
+                continue
+            identity = (provider, provider_session_id)
+            provider_identities.setdefault(identity, source)
+            exact_identities.setdefault(provider_session_id, []).append(identity)
+
+        def resolve_observer(observer_ref: Any) -> tuple[str, str] | None:
+            raw = str(observer_ref or "").strip()
+            if not raw or raw.upper() in {"UNKNOWN", "UNASSIGNED", "NONE"}:
+                return None
+            prefixed = (
+                ("claude-code:", "CLAUDE"),
+                ("grok-acp:", "GROK"),
+                ("codex-app-server:", "CODEX"),
+                ("codex:", "CODEX"),
+            )
+            lowered = raw.lower()
+            for prefix, provider in prefixed:
+                if lowered.startswith(prefix):
+                    identity = (provider, raw[len(prefix) :])
+                    return identity if identity in provider_identities else None
+            exact = exact_identities.get(raw) or []
+            return exact[0] if len(exact) == 1 else None
+
+        candidates: list[dict[str, Any]] = []
+        current_anchors: dict[tuple[str, str], dict[str, str]] = {}
+        for project in self.store.list_projects()[:100]:
+            project_id = str(project.get("project_id") or "").strip()
+            project_root = Path(str(project.get("project_root") or "")).resolve(
+                strict=False
+            )
+            anchor_root = (
+                project_root / ".ai" / "runtime" / "anchor_store"
+            ).resolve(strict=False)
+            try:
+                anchor_root.relative_to(project_root)
+            except ValueError:
+                continue
+            if not anchor_root.is_dir():
+                continue
+            databases = sorted(
+                (
+                    path
+                    for path in anchor_root.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+                ),
+                key=lambda path: path.name,
+            )[:32]
+            for database in databases:
+                connection: sqlite3.Connection | None = None
+                try:
+                    connection = sqlite3.connect(
+                        database.resolve().as_uri() + "?mode=ro",
+                        uri=True,
+                        timeout=2,
+                    )
+                    connection.row_factory = sqlite3.Row
+                    tables = {
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        ).fetchall()
+                    }
+                    rows: list[tuple[str, sqlite3.Row]] = []
+                    if "anchor_snapshot" in tables:
+                        rows.extend(
+                            ("CURRENT", row)
+                            for row in connection.execute(
+                                """
+                                SELECT anchor_id, observed_at, snapshot_json
+                                FROM anchor_snapshot
+                                """
+                            ).fetchall()
+                        )
+                    if "beyond_anchor_footprints" in tables:
+                        rows.extend(
+                            ("BEYOND", row)
+                            for row in connection.execute(
+                                """
+                                SELECT anchor_id, observed_at, snapshot_json
+                                FROM beyond_anchor_footprints
+                                """
+                            ).fetchall()
+                        )
+                    for temporality, row in rows[:1000]:
+                        try:
+                            snapshot = json.loads(str(row["snapshot_json"]))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if not isinstance(snapshot, Mapping):
+                            continue
+                        coordinates = snapshot.get("coordinates")
+                        if not isinstance(coordinates, Mapping):
+                            coordinates = {}
+                        mode = str(coordinates.get("mode") or "").strip().upper()
+                        if not mode:
+                            anchor_prefix = str(row["anchor_id"]).split("-", 1)[0]
+                            mode = anchor_prefix.upper() or "UNKNOWN"
+                        if temporality == "CURRENT":
+                            coordinate = (project_id, mode)
+                            current = {
+                                "anchor_ref": str(row["anchor_id"]),
+                                "observed_at": str(row["observed_at"]),
+                            }
+                            previous_current = current_anchors.get(coordinate)
+                            if previous_current is None or (
+                                current["observed_at"], current["anchor_ref"]
+                            ) > (
+                                previous_current["observed_at"],
+                                previous_current["anchor_ref"],
+                            ):
+                                current_anchors[coordinate] = current
+                        identity = resolve_observer(
+                            snapshot.get("observer_session_ref")
+                        )
+                        if identity is None:
+                            continue
+                        candidates.append(
+                            {
+                                "project_id": project_id,
+                                "node": project_id,
+                                "mode": mode,
+                                "observed_anchor_ref": str(row["anchor_id"]),
+                                "temporality": temporality,
+                                "observed_at": str(row["observed_at"]),
+                                "provider": identity[0],
+                                "provider_session_ref": identity[1],
+                                "evidence_ref": (
+                                    "universe://projects/"
+                                    + quote(project_id, safe="")
+                                    + "/anchor-store/"
+                                    + quote(str(row["anchor_id"]), safe="")
+                                ),
+                            }
+                        )
+                except (OSError, sqlite3.Error):
+                    continue
+                finally:
+                    if connection is not None:
+                        connection.close()
+
+        by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+        for candidate in candidates:
+            current_anchor = current_anchors.get(
+                (str(candidate["project_id"]), str(candidate["mode"]))
+            )
+            candidate["anchor_ref"] = (
+                current_anchor["anchor_ref"]
+                if current_anchor is not None
+                else candidate["observed_anchor_ref"]
+            )
+            candidate["current_anchor_observed_at"] = (
+                current_anchor["observed_at"]
+                if current_anchor is not None
+                else candidate["observed_at"]
+            )
+            identity = (
+                str(candidate["provider"]),
+                str(candidate["provider_session_ref"]),
+            )
+            previous = by_identity.get(identity)
+            rank = (
+                candidate["temporality"] == "CURRENT",
+                str(candidate["observed_at"]),
+                str(candidate["anchor_ref"]),
+            )
+            previous_rank = (
+                previous is not None and previous["temporality"] == "CURRENT",
+                "" if previous is None else str(previous["observed_at"]),
+                "" if previous is None else str(previous["anchor_ref"]),
+            )
+            if previous is None or rank > previous_rank:
+                by_identity[identity] = candidate
+        return list(by_identity.values())
+
+    def _project_anchor_supervisor_projection(
+        self, observations: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        # Anchor stores are observation inputs. Reading the catalog must never
+        # rewrite Supervisor state or derive session currentness from
+        # CURRENT/BEYOND anchor history.
+        return {
+            "schema": "universe.project-anchor-supervisor-projection.v1",
+            "status": "PROJECT_ANCHORS_OBSERVED_READ_ONLY",
+            "observed": len(observations),
+            "projected": 0,
+            "unchanged": len(observations),
+        }
+
     def provider_chat_catalog(self) -> dict[str, Any]:
         """Join provider-owned chat metadata to optional Universe bindings.
 
@@ -13971,6 +14186,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         discovered: list[dict[str, Any]] = []
         for provider in ("CODEX", "CLAUDE", "GROK"):
             discovered.extend(self.store.discover_provider_session_sources(provider))
+
+        anchor_observations = self._project_anchor_observations(discovered)
+        anchors_by_identity = {
+            (
+                str(item["provider"]),
+                str(item["provider_session_ref"]),
+            ): item
+            for item in anchor_observations
+        }
 
         registered_sources = self.store.list_provider_session_sources()
         registered_by_identity = {
@@ -13989,20 +14213,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             source_path = _canonical_provider_source_path(source.get("source_path"))
             if not source_path:
                 continue
-            chat_key = "provider_chat_" + _provider_source_key(
-                {
-                    "provider": provider,
-                    "provider_session_id": provider_session_id,
-                    "source_path": source_path,
-                }
-            ).removeprefix("provider_source_")
             identity_verified = source.get("identity_state") == "VERIFIED"
+            session_kind = str(source.get("session_kind") or "CHAT").upper()
+            anchor_observation = (
+                anchors_by_identity.get((provider, provider_session_id))
+                if session_kind != "WORKER"
+                else None
+            )
+            # Providers may rotate or archive one top-level chat into multiple
+            # files. Keep one room for that verified chat identity. Worker
+            # sidechains stay separate because some providers reuse the parent
+            # session id for every agent file.
+            chat_identity = {
+                "provider": provider,
+                "provider_session_id": provider_session_id,
+                "source_path": (
+                    ""
+                    if identity_verified and session_kind != "WORKER"
+                    else source_path
+                ),
+            }
+            chat_key = "provider_chat_" + _provider_source_key(
+                chat_identity
+            ).removeprefix("provider_source_")
             legacy_refs = {provider_session_id} if identity_verified else set()
             matches = [
                 item
                 for item in supervisor_sessions
                 if str(item.get("provider") or "").upper() == provider
                 and str(item.get("provider_session_ref") or "") in legacy_refs
+                and anchor_observation is not None
             ]
             matches.sort(
                 key=lambda item: (
@@ -14014,31 +14254,59 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             bound = matches[0] if matches else None
             binding: dict[str, Any] = {"state": "UNBOUND"}
-            if bound is not None:
-                node = str(bound.get("node") or "UNKNOWN")
-                mode = str(bound.get("mode") or "UNKNOWN")
-                anchor_ref = str(bound.get("anchor_ref") or "UNKNOWN")
+            if anchor_observation is not None:
+                node = str(anchor_observation.get("node") or "UNKNOWN")
+                mode = str(anchor_observation.get("mode") or "UNKNOWN")
+                anchor_ref = str(
+                    anchor_observation.get("anchor_ref") or "UNKNOWN"
+                )
                 anchor_identity = {
-                    "project_id": bound.get("current_project_id")
+                    "project_id": anchor_observation.get("project_id")
                     or (node if node != "UNKNOWN" else None),
                     "node": node,
                     "mode": mode,
                     "current_anchor_ref": anchor_ref,
                 }
                 binding = {
-                    "state": "BOUND",
+                    "state": "BOUND" if bound is not None else "ANCHOR_OBSERVED",
                     "current_project_id": anchor_identity["project_id"],
                     "node": node,
                     "mode": mode,
-                    "alias": bound.get("alias"),
+                    "alias": f"{anchor_identity['project_id']} {mode}",
+                    "transport_alias": (
+                        bound.get("alias") if bound is not None else None
+                    ),
                     "current_anchor_ref": anchor_ref,
+                    "origin_anchor_ref": anchor_observation.get(
+                        "observed_anchor_ref"
+                    )
+                    or anchor_ref,
+                    "origin_anchor_temporality": anchor_observation[
+                        "temporality"
+                    ],
+                    "observer_currentness": (
+                        bound.get("currentness")
+                        if bound is not None
+                        else "UNKNOWN"
+                    ),
                     "anchor_key": "anchor_session_"
                     + _json_sha256(anchor_identity)[:24],
-                    "universe_session_id": bound.get("universe_session_id")
-                    or bound.get("session_id"),
-                    "visibility": bound.get("visibility") or "VISIBLE",
-                    "row_version": bound.get("row_version"),
-                    "is_default": bool(bound.get("is_default")),
+                    "universe_session_id": (
+                        bound.get("universe_session_id") or bound.get("session_id")
+                        if bound is not None
+                        else None
+                    ),
+                    "visibility": (
+                        bound.get("visibility") or "VISIBLE"
+                        if bound is not None
+                        else "VISIBLE"
+                    ),
+                    "row_version": (
+                        bound.get("row_version") if bound is not None else None
+                    ),
+                    "is_default": bool(
+                        bound is not None and bound.get("is_default")
+                    ),
                 }
 
             registered = registered_by_identity.get(
@@ -14067,11 +14335,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "workspace_name": source.get("workspace_name")
                 or (Path(workspace).name if workspace else "Unknown workspace"),
                 "display_name": source.get("display_name") or "Untitled chat",
-                "session_kind": source.get("session_kind") or "CHAT",
-                "last_activity_at": (
-                    (latest_activity or {}).get("observed_at")
-                    or source.get("last_modified_at")
-                ),
+                "session_kind": session_kind,
+                "last_activity_at": max(
+                    (
+                        str((latest_activity or {}).get("observed_at") or ""),
+                        str(source.get("last_modified_at") or ""),
+                    )
+                )
+                or None,
                 "activity_state": (
                     evidence_activity or "UNKNOWN"
                 ),
@@ -14086,8 +14357,67 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ):
                 rows_by_key[chat_key] = row
 
-        rooms = sorted(
+        anchor_groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows_by_key.values():
+            binding = row.get("binding") or {}
+            anchor_key = str(binding.get("anchor_key") or "")
+            if anchor_key and binding.get("state") in {
+                "BOUND",
+                "ANCHOR_OBSERVED",
+            }:
+                anchor_groups.setdefault(anchor_key, []).append(row)
+        for grouped_rooms in anchor_groups.values():
+            current_room = max(
+                grouped_rooms,
+                key=lambda item: (
+                    str(item.get("last_activity_at") or ""),
+                    str((item.get("binding") or {}).get("state") == "BOUND"),
+                    str(item.get("chat_key") or ""),
+                ),
+            )
+            for row in grouped_rooms:
+                binding = row.get("binding") or {}
+                binding["observer_currentness"] = (
+                    "CURRENT" if row is current_room else "STALE"
+                )
+
+        rooms_by_anchor: dict[str, dict[str, Any]] = {}
+        unmerged_rooms: list[dict[str, Any]] = []
+        for row in sorted(
             rows_by_key.values(),
+            key=lambda item: (
+                str(
+                    (item.get("binding") or {}).get("observer_currentness")
+                    or "UNKNOWN"
+                )
+                == "CURRENT",
+                (item.get("binding") or {}).get("state") == "BOUND",
+                bool((item.get("binding") or {}).get("is_default")),
+                str(item.get("last_activity_at") or ""),
+                str(item.get("chat_key") or ""),
+            ),
+            reverse=True,
+        ):
+            binding = row.get("binding") or {}
+            anchor_key = (
+                str(binding.get("anchor_key") or "")
+                if binding.get("state") in {"BOUND", "ANCHOR_OBSERVED"}
+                else ""
+            )
+            if not anchor_key:
+                unmerged_rooms.append(row)
+                continue
+            primary = rooms_by_anchor.get(anchor_key)
+            if primary is None:
+                row["provider_history_count"] = 1
+                rooms_by_anchor[anchor_key] = row
+                continue
+            primary["provider_history_count"] = int(
+                primary.get("provider_history_count") or 1
+            ) + 1
+
+        rooms = sorted(
+            [*rooms_by_anchor.values(), *unmerged_rooms],
             key=lambda item: (
                 str(item.get("last_activity_at") or ""),
                 str(item.get("chat_key") or ""),
@@ -14127,7 +14457,42 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.store.register_provider_session_source(
                     {**source, "start_at_end": True}
                 )
-        return self.store.scan_registered_provider_sources()
+        scans = self.store.scan_registered_provider_sources()
+        sessions_by_identity = {
+            (
+                str(session.get("provider") or "").upper(),
+                str(session.get("provider_session_ref") or ""),
+            ): session
+            for session in self.session_supervisor.list_sessions(
+                include_hidden=False
+            )
+            if session.get("provider_session_ref")
+        }
+        for scan in scans:
+            source = scan.get("source") or {}
+            identity = (
+                str(source.get("provider") or "").upper(),
+                str(source.get("provider_session_id") or ""),
+            )
+            session = sessions_by_identity.get(identity)
+            source_id = str(source.get("source_id") or "")
+            if session is None or not source_id:
+                continue
+            activities = self.store.list_provider_session_activities(source_id)
+            if not activities:
+                continue
+            latest = activities[0]
+            self.session_supervisor.observe_session_activity(
+                str(session["session_id"]),
+                event_type="PROVIDER_ACTIVITY_OBSERVED",
+                activity_state=str(latest.get("activity_state") or "OBSERVED"),
+                observed_at=latest.get("observed_at"),
+                evidence_ref=(
+                    "universe://provider-session-source/"
+                    f"{source_id}/activity/{latest.get('activity_id')}"
+                ),
+            )
+        return scans
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
