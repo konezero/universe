@@ -142,7 +142,12 @@ from universe_rendezvous_client import (
     default_rendezvous_config_path,
     load_rendezvous_config,
 )
-from universe_multi_room import MultiRoomError, MultiRoomStore
+from universe_multi_room import (
+    MultiRoomDeliveryCoordinator,
+    MultiRoomError,
+    MultiRoomNativeControlRegistry,
+    MultiRoomStore,
+)
 from provider_session_observer import (
     ProviderSessionObserverError,
     ProviderSessionObserverStore,
@@ -171,6 +176,7 @@ CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
 CONDUCTOR_ROOM_UI_ACTION_SCHEMA = "universe.conductor-room-ui-action.v1"
+CONDUCTOR_ROOM_STREAM_SCHEMA = "universe.conductor-room-stream.v1"
 CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
     {
         "QUEUED",
@@ -12224,6 +12230,55 @@ class ProjectRoomEventHub:
                 self._condition.wait(remaining)
 
 
+class ConductorRoomEventHub:
+    """Transient provider stream events for the single Conductor room."""
+
+    def __init__(self, *, retained_events: int = 512) -> None:
+        self._condition = threading.Condition()
+        self._sequence = 0
+        self._events: deque[dict[str, Any]] = deque(
+            maxlen=max(32, int(retained_events))
+        )
+
+    def cursor(self) -> int:
+        with self._condition:
+            return self._sequence
+
+    def publish(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._condition:
+            self._sequence += 1
+            event = {
+                "schema": CONDUCTOR_ROOM_STREAM_SCHEMA,
+                "event_id": self._sequence,
+                "emitted_at": utc_now(),
+                "payload": dict(payload),
+            }
+            self._events.append(event)
+            self._condition.notify_all()
+            return dict(event)
+
+    def wait(
+        self,
+        *,
+        after_event_id: int,
+        timeout_seconds: float,
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        with self._condition:
+            while True:
+                events = [
+                    dict(event)
+                    for event in self._events
+                    if int(event["event_id"]) > after_event_id
+                ]
+                if events:
+                    return events
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                self._condition.wait(remaining)
+
+
 class ConductorPermissionBridge:
     """Process-local approval bridge for the active Conductor provider turn."""
 
@@ -12442,8 +12497,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_queue_lock = threading.RLock()
         self._conductor_stop = threading.Event()
         self._conductor_session_error: dict[str, str] | None = None
+        self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
         self.multi_rooms = MultiRoomStore(str(store.database_path))
+        self.multi_room_native_controls = MultiRoomNativeControlRegistry(
+            self.multi_rooms
+        )
+        self.multi_room_delivery = MultiRoomDeliveryCoordinator(
+            self.multi_rooms,
+            self.multi_room_native_controls.send_input,
+        )
         self.conductor_permissions = ConductorPermissionBridge()
         # Multiverse rail: Universe home + Career source as project nodes.
         try:
@@ -12529,6 +12592,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 provider_resolver=self._resolve_project_master_provider,
                 governance_context_resolver=self._project_master_governance_context,
                 completion_observer=self._observe_project_master_completion,
+                room_event_observer=self._observe_native_room_event,
             )
             if auto_start_project_masters
             else None
@@ -14635,7 +14699,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 else None
             )
             if isinstance(connection, Mapping):
-                self.multi_rooms.attach_session(
+                for previous in self.multi_rooms.list_bindings(room["room_id"]):
+                    if previous["slot_role"] == "MASTER":
+                        self.multi_room_native_controls.unregister(
+                            previous["binding_id"]
+                        )
+                attached = self.multi_rooms.attach_session(
                     room["room_id"],
                     {
                         "slot_role": "MASTER",
@@ -14647,6 +14716,30 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "display_name": "Project Master",
                     },
                 )
+                binding = attached["binding"]
+                provider = binding.get("provider")
+                session_ref = binding.get("provider_session_ref")
+                if (
+                    self.project_master_hosts is not None
+                    and isinstance(provider, str)
+                    and provider
+                    and isinstance(session_ref, str)
+                    and session_ref
+                ):
+                    self.multi_room_native_controls.register(
+                        binding["binding_id"],
+                        provider=provider,
+                        provider_session_ref=session_ref,
+                        send_input=(
+                            lambda native_binding, event, pid=project_id: (
+                                self.project_master_hosts.submit_room_event(
+                                    pid,
+                                    native_binding,
+                                    event,
+                                )
+                            )
+                        ),
+                    )
             snap = self.multi_rooms.room_snapshot(room["room_id"])
             multi_room = {
                 "room": snap["room"],
@@ -14865,6 +14958,101 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # into an error or invent a Todo linkage.
             return
         self.publish_project_room_changed(project_id)
+
+    def _observe_native_room_event(self, event: Mapping[str, Any]) -> None:
+        event_type = event.get("event")
+        room_id = event.get("room_id")
+        room_event_id = event.get("room_event_id")
+        binding_id = event.get("binding_id")
+        if not all(
+            isinstance(value, str) and value
+            for value in (event_type, room_id, room_event_id, binding_id)
+        ):
+            return
+        try:
+            if event_type == "DELIVERY_ACCEPTED":
+                self.multi_rooms.record_delivery_observation(
+                    binding_id,
+                    room_event_id,
+                    status="ACCEPTED",
+                    provider_result={
+                        "provider_session_ref": event.get("provider_session_ref"),
+                        "observation": "NATIVE_PROVIDER_ACCEPTED",
+                    },
+                )
+                return
+            if event_type == "DELTA":
+                self.multi_rooms.hub.publish(
+                    room_id,
+                    {
+                        "type": "PARTICIPANT_DELTA",
+                        "binding_id": binding_id,
+                        "room_event_id": room_event_id,
+                        "delta": str(event.get("delta") or ""),
+                    },
+                )
+                return
+            if event_type == "FAILED":
+                self.multi_rooms.record_delivery_observation(
+                    binding_id,
+                    room_event_id,
+                    status=str(event.get("delivery_status") or "UNCERTAIN"),
+                    provider_result={
+                        "reason": str(event.get("reason") or "PROVIDER_FAILED"),
+                        "retry": "EXPLICIT_ONLY",
+                    },
+                )
+                self.multi_rooms.hub.publish(
+                    room_id,
+                    {
+                        "type": "PARTICIPANT_FAILED",
+                        "binding_id": binding_id,
+                        "room_event_id": room_event_id,
+                        "reason": str(event.get("reason") or "PROVIDER_FAILED"),
+                    },
+                )
+                return
+            if event_type != "COMPLETED":
+                return
+            provider_event_id = "native-final-" + _json_sha256(
+                {
+                    "binding_id": binding_id,
+                    "room_event_id": room_event_id,
+                    "provider_session_ref": event.get("provider_session_ref"),
+                }
+            )
+            binding = self.multi_rooms.get_binding(binding_id)
+            role = binding.get("slot_role")
+            if role not in {"CONDUCTOR", "MASTER", "BOSS", "WORKER", "MODEL"}:
+                role = "MODEL"
+            message = self.multi_rooms.post_message(
+                room_id,
+                {
+                    "author_role": role,
+                    "author_binding_id": binding_id,
+                    "body_text": str(event.get("body") or "").strip()
+                    or "Provider completed without text output.",
+                    "provider_event_id": provider_event_id,
+                    "correlation_id": room_event_id,
+                    "idempotency_key": provider_event_id,
+                },
+            )
+            self.multi_rooms.record_provider_observation(
+                binding_id,
+                provider_event_id,
+            )
+            self.multi_rooms.hub.publish(
+                room_id,
+                {
+                    "type": "PARTICIPANT_COMPLETED",
+                    "binding_id": binding_id,
+                    "room_event_id": room_event_id,
+                    "message": message,
+                },
+            )
+            self.multi_room_delivery.deliver_room(room_id)
+        except MultiRoomError:
+            return
 
     def publish_project_room_changed(self, project_id: str) -> None:
         self.project_room_events.publish(
@@ -15135,11 +15323,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             binding["parent_evidence_ref"] = (
                 f"universe://conductor-room/messages/{message_id}"
             )
-        history = [
-            item
-            for item in self.store.list_conductor_room_messages(limit=200)
-            if item.get("message_id") != message_id
-        ]
         try:
             worker_message = dict(claimed)
             worker_message["available_projects"] = [
@@ -15160,13 +15343,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "origin_anchor_ref": binding.get("origin_anchor_ref", "UNKNOWN"),
                     "origin_frame_id": binding.get("origin_frame_id", "UNKNOWN"),
                     "commander_surface": "UNIVERSE_UI",
-                    "history": history[-50:],
                 }
-                with self.conductor_permissions.message_context(message_id):
-                    session_result = self.conductor_session_host.reply(
-                        provider,
-                        worker_message,
+                sequence = 0
+
+                def emit(event: str, *, delta: str = "", detail: str = "") -> None:
+                    nonlocal sequence
+                    sequence += 1
+                    self.conductor_room_events.publish(
+                        {
+                            "type": "CONDUCTOR_STREAM",
+                            "message_id": message_id,
+                            "event": event,
+                            "sequence": sequence,
+                            "delta": delta,
+                            "detail": detail,
+                        }
                     )
+
+                with self.conductor_permissions.message_context(message_id):
+                    emit("STARTED")
+                    stream_reply = getattr(
+                        self.conductor_session_host, "reply_stream", None
+                    )
+                    if callable(stream_reply):
+                        session_result = stream_reply(
+                            provider,
+                            worker_message,
+                            lambda delta: emit("DELTA", delta=delta),
+                        )
+                    else:
+                        session_result = self.conductor_session_host.reply(
+                            provider,
+                            worker_message,
+                        )
                 self.store.complete_conductor_room_message(
                     message_id,
                     provider=provider,
@@ -15174,7 +15383,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     result_receipt_ref=str(session_result["session_ref"]),
                     ui_action=normalize_conductor_ui_action({"kind": "NONE"}),
                 )
+                emit("COMPLETED")
                 return
+            history = [
+                item
+                for item in self.store.list_conductor_room_messages(limit=200)
+                if item.get("message_id") != message_id
+            ]
             invocation = self.runtime_host.invoke_conductor_message(
                 runtime_binding=binding,
                 message=worker_message,
@@ -15224,11 +15439,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 code=getattr(error, "code", type(error).__name__),
                 reason=str(error),
             )
+            self.conductor_room_events.publish(
+                {
+                    "type": "CONDUCTOR_STREAM",
+                    "message_id": message_id,
+                    "event": "FAILED",
+                    "sequence": 0,
+                    "delta": "",
+                    "detail": str(error),
+                }
+            )
         except Exception as error:
             self.store.fail_conductor_room_message(
                 message_id,
                 code="CONDUCTOR_WORKER_FAILED",
                 reason=f"{type(error).__name__}: {error}",
+            )
+            self.conductor_room_events.publish(
+                {
+                    "type": "CONDUCTOR_STREAM",
+                    "message_id": message_id,
+                    "event": "FAILED",
+                    "sequence": 0,
+                    "delta": "",
+                    "detail": f"{type(error).__name__}: {error}",
+                }
             )
 
     def _resolve_conductor_provider(self, message: dict[str, Any]) -> str:
@@ -15422,6 +15657,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 lambda: self._conductor_worker.join(timeout=5),
             )
         if self.project_master_hosts is not None:
+            close_step(
+                "multi_room_native_controls",
+                self.multi_room_native_controls.close,
+            )
             close_step("project_master_hosts", self.project_master_hosts.close)
             self.project_master_hosts = None
         if self.conductor_session_host is not None:
@@ -15738,6 +15977,59 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except MultiRoomError as error:
                 self._send_multi_room_error(error)
             return
+        room_events = re.fullmatch(r"/v1/rooms/([^/]+)/events$", path)
+        if room_events is not None:
+            try:
+                query_map = parse_qs(urlsplit(self.path).query)
+                raw_after = (query_map.get("after_sequence") or ["0"])[0]
+                raw_limit = (query_map.get("limit") or ["100"])[0]
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOM_EVENTS_COLLECTED",
+                        "room_id": unquote(room_events.group(1)),
+                        "events": self.server.multi_rooms.list_room_events(
+                            unquote(room_events.group(1)),
+                            after_sequence=int(raw_after),
+                            limit=int(raw_limit),
+                        ),
+                    },
+                )
+            except (MultiRoomError, TypeError, ValueError) as error:
+                if isinstance(error, MultiRoomError):
+                    self._send_multi_room_error(error)
+                else:
+                    self._send(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ERROR",
+                            "error_code": "ROOM_EVENT_CURSOR_INVALID",
+                        },
+                    )
+            return
+        room_binding_cursor = re.fullmatch(
+            r"/v1/rooms/([^/]+)/bindings/([^/]+)/cursor$", path
+        )
+        if room_binding_cursor is not None:
+            try:
+                room_id = unquote(room_binding_cursor.group(1))
+                binding_id = unquote(room_binding_cursor.group(2))
+                binding = self.server.multi_rooms.get_binding(binding_id)
+                if binding["room_id"] != room_id:
+                    raise MultiRoomError(
+                        "BINDING_ROOM_MISMATCH",
+                        "binding does not belong to the requested room",
+                        409,
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.multi_rooms.participant_cursor(binding_id),
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
         if path == "/v1/settings/host-tools":
             try:
                 self._send(
@@ -15926,6 +16218,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
             except UniverseError as error:
                 self._send_error(error)
+            return
+        if path == "/v1/conductor-room/stream":
+            self._stream_conductor_room()
             return
         if path == "/v1/conductor-room/messages":
             self._send(
@@ -16705,16 +17000,115 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     message = self.server.multi_rooms.post_message(
                         unquote(room_message_post.group(1)), body or {}
                     )
+                    delivery = self.server.multi_room_delivery.deliver_room(
+                        message["room_id"]
+                    )
                     self._send(
                         HTTPStatus.CREATED,
                         {
                             "schema": API_SCHEMA,
                             "status": "ROOM_MESSAGE_RECORDED",
                             "message": message,
+                            "delivery": delivery,
                         },
                     )
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
+                return
+            room_participant_state = re.fullmatch(
+                r"/v1/rooms/([^/]+)/bindings/([^/]+)/state$", path
+            )
+            if room_participant_state is not None:
+                try:
+                    room_id = unquote(room_participant_state.group(1))
+                    binding_id = unquote(room_participant_state.group(2))
+                    binding = self.server.multi_rooms.get_binding(binding_id)
+                    if binding["room_id"] != room_id:
+                        raise MultiRoomError(
+                            "BINDING_ROOM_MISMATCH",
+                            "binding does not belong to the requested room",
+                            409,
+                        )
+                    result = self.server.multi_rooms.set_participant_state(
+                        binding_id,
+                        str((body or {}).get("state") or ""),
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_delivery_observation = re.fullmatch(
+                r"/v1/rooms/([^/]+)/bindings/([^/]+)/delivery-observations$",
+                path,
+            )
+            if room_delivery_observation is not None:
+                try:
+                    room_id = unquote(room_delivery_observation.group(1))
+                    binding_id = unquote(room_delivery_observation.group(2))
+                    binding = self.server.multi_rooms.get_binding(binding_id)
+                    if binding["room_id"] != room_id:
+                        raise MultiRoomError(
+                            "BINDING_ROOM_MISMATCH",
+                            "binding does not belong to the requested room",
+                            409,
+                        )
+                    result = self.server.multi_rooms.record_delivery_observation(
+                        binding_id,
+                        str((body or {}).get("room_event_id") or ""),
+                        status=str((body or {}).get("status") or ""),
+                        provider_result=(body or {}).get("provider_result"),
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_provider_observation = re.fullmatch(
+                r"/v1/rooms/([^/]+)/bindings/([^/]+)/provider-observations$",
+                path,
+            )
+            if room_provider_observation is not None:
+                try:
+                    room_id = unquote(room_provider_observation.group(1))
+                    binding_id = unquote(room_provider_observation.group(2))
+                    binding = self.server.multi_rooms.get_binding(binding_id)
+                    if binding["room_id"] != room_id:
+                        raise MultiRoomError(
+                            "BINDING_ROOM_MISMATCH",
+                            "binding does not belong to the requested room",
+                            409,
+                        )
+                    result = self.server.multi_rooms.record_provider_observation(
+                        binding_id,
+                        str((body or {}).get("provider_cursor") or ""),
+                        expected_previous=(body or {}).get("expected_previous"),
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_viewer_cursor = re.fullmatch(
+                r"/v1/rooms/([^/]+)/viewer-cursors/([^/]+)$", path
+            )
+            if room_viewer_cursor is not None:
+                try:
+                    result = self.server.multi_rooms.update_viewer_cursor(
+                        unquote(room_viewer_cursor.group(1)),
+                        unquote(room_viewer_cursor.group(2)),
+                        int((body or {}).get("room_sequence") or 0),
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except (MultiRoomError, TypeError, ValueError) as error:
+                    if isinstance(error, MultiRoomError):
+                        self._send_multi_room_error(error)
+                    else:
+                        self._send(
+                            HTTPStatus.BAD_REQUEST,
+                            {
+                                "schema": API_SCHEMA,
+                                "status": "ERROR",
+                                "error_code": "VIEWER_CURSOR_INVALID",
+                            },
+                        )
                 return
             room_call_master = re.fullmatch(r"/v1/rooms/([^/]+)/call-master$", path)
             if room_call_master is not None:
@@ -18346,6 +18740,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 "room": snapshot["room"],
                 "bindings": snapshot["bindings"],
                 "messages": snapshot["messages"],
+                "events": snapshot["events"],
+                "participant_cursors": snapshot["participant_cursors"],
                 "bridge_line": snapshot["bridge_line"],
             },
         )
@@ -18363,6 +18759,45 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 for event in events:
                     cursor = max(cursor, int(event["event_id"]))
                     write_event("room", event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
+    def _stream_conductor_room(self) -> None:
+        cursor = self.server.conductor_room_events.cursor()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self._write_sse(
+                cursor,
+                {
+                    "schema": CONDUCTOR_ROOM_STREAM_SCHEMA,
+                    "event_id": cursor,
+                    "emitted_at": utc_now(),
+                    "payload": {
+                        "type": "SNAPSHOT",
+                        "messages": self.server.store.list_conductor_room_messages(),
+                        "permissions": self.server.conductor_permissions.list_requests(),
+                        "runtime_binding": self.server.planning_binding_status(),
+                    },
+                },
+                event_name="conductor-room",
+            )
+            while True:
+                events = self.server.conductor_room_events.wait(
+                    after_event_id=cursor,
+                    timeout_seconds=15.0,
+                )
+                if not events:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                for event in events:
+                    cursor = int(event["event_id"])
+                    self._write_sse(cursor, event, event_name="conductor-room")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
 
@@ -18433,14 +18868,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
 
-    def _write_sse(self, event_id: int, payload: Mapping[str, Any]) -> None:
+    def _write_sse(
+        self,
+        event_id: int,
+        payload: Mapping[str, Any],
+        *,
+        event_name: str = "project-room",
+    ) -> None:
         body = json.dumps(
             payload,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         )
-        frame = f"id: {event_id}\nevent: project-room\ndata: {body}\n\n"
+        frame = f"id: {event_id}\nevent: {event_name}\ndata: {body}\n\n"
         self.wfile.write(frame.encode("utf-8"))
         self.wfile.flush()
 

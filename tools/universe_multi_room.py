@@ -9,13 +9,14 @@ module owns room identity, membership, messages, attach, inject, and events.
 from __future__ import annotations
 
 import json
+import hashlib
 import secrets
 import sqlite3
 import threading
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 ROOM_SCHEMA = "universe.chat-room.v1"
 ROOM_MESSAGE_SCHEMA = "universe.chat-room-message.v1"
@@ -23,10 +24,28 @@ ROOM_ATTACH_SCHEMA = "universe.chat-room-session-attach.v1"
 ROOM_EVENT_SCHEMA = "universe.chat-room-event.v1"
 ROOM_STREAM_SCHEMA = "universe.chat-room-stream.v1"
 INJECT_SCHEMA = "universe.session-ref-inject.v1"
+ROOM_DURABLE_EVENT_SCHEMA = "universe.chat-room-durable-event.v1"
+ROOM_CURSOR_SCHEMA = "universe.chat-room-cursor.v1"
 
 ROOM_TYPES = frozenset({"PROJECT", "BOSS", "MEETING"})
 ROOM_STATES = frozenset({"OPEN", "CLOSED"})
 ATTACH_STATES = frozenset({"ACTIVE", "DETACHED", "STALE"})
+PARTICIPANT_STATES = frozenset(
+    {"OBSERVED", "ATTACHED", "CONTROLLED", "LIVE", "DISCONNECTED"}
+)
+DELIVERY_STATES = frozenset(
+    {
+        "QUEUED",
+        "ACCEPTED",
+        "DEFERRED",
+        "INTERRUPTED",
+        "REJECTED",
+        "DISCONNECTED",
+        "UNCERTAIN",
+    }
+)
+ACCEPTED_DELIVERY_STATES = frozenset({"ACCEPTED", "DEFERRED", "INTERRUPTED"})
+SINGLETON_SLOT_ROLES = frozenset({"CONDUCTOR", "MASTER", "BOSS"})
 MEMBER_ROLES = frozenset(
     {
         "USER",
@@ -227,9 +246,186 @@ class MultiRoomStore:
 
                 CREATE INDEX IF NOT EXISTS chat_room_control_event_room_time
                 ON chat_room_control_event(room_id, created_at, event_id);
+
+                CREATE TABLE IF NOT EXISTS chat_room_event (
+                    room_id TEXT NOT NULL
+                        REFERENCES chat_room(room_id) ON DELETE CASCADE,
+                    room_sequence INTEGER NOT NULL,
+                    room_event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    origin_binding_id TEXT,
+                    provider_event_id TEXT,
+                    correlation_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(room_id, room_sequence),
+                    UNIQUE(room_id, room_event_id),
+                    UNIQUE(room_id, provider_event_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS chat_room_event_room_time
+                ON chat_room_event(room_id, room_sequence);
+
+                CREATE TABLE IF NOT EXISTS chat_room_participant_cursor (
+                    binding_id TEXT PRIMARY KEY
+                        REFERENCES chat_room_session(binding_id) ON DELETE CASCADE,
+                    participant_state TEXT NOT NULL DEFAULT 'OBSERVED',
+                    delivery_sequence INTEGER NOT NULL DEFAULT 0,
+                    provider_observation_cursor TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_room_delivery (
+                    binding_id TEXT NOT NULL
+                        REFERENCES chat_room_session(binding_id) ON DELETE CASCADE,
+                    room_event_id TEXT NOT NULL,
+                    room_sequence INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    provider_result_json TEXT NOT NULL DEFAULT '{}',
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY(binding_id, room_event_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_room_viewer_cursor (
+                    room_id TEXT NOT NULL
+                        REFERENCES chat_room(room_id) ON DELETE CASCADE,
+                    viewer_id TEXT NOT NULL,
+                    room_sequence INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(room_id, viewer_id)
+                );
                 """
             )
+            self._backfill_room_events(connection)
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO chat_room_participant_cursor(
+                    binding_id, participant_state, delivery_sequence,
+                    provider_observation_cursor, updated_at
+                )
+                SELECT
+                    binding.binding_id,
+                    'OBSERVED',
+                    COALESCE((
+                        SELECT MAX(event.room_sequence)
+                        FROM chat_room_event event
+                        WHERE event.room_id = binding.room_id
+                    ), 0),
+                    NULL,
+                    ?
+                FROM chat_room_session binding
+                """,
+                (now,),
+            )
             connection.commit()
+
+    def _backfill_room_events(self, connection: sqlite3.Connection) -> None:
+        """Project legacy room messages into the ordered event plane once."""
+        rooms = connection.execute(
+            """
+            SELECT DISTINCT message.room_id
+            FROM chat_room_message message
+            LEFT JOIN chat_room_event event
+              ON event.room_id = message.room_id
+             AND json_extract(event.payload_json, '$.message.message_id') = message.message_id
+            WHERE event.room_event_id IS NULL
+            """
+        ).fetchall()
+        for room in rooms:
+            room_id = str(room["room_id"])
+            sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(room_sequence), 0)
+                    FROM chat_room_event WHERE room_id = ?
+                    """,
+                    (room_id,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT message_id, author_binding_id, message_json, created_at
+                FROM chat_room_message
+                WHERE room_id = ?
+                  AND message_id NOT IN (
+                    SELECT json_extract(payload_json, '$.message.message_id')
+                    FROM chat_room_event
+                    WHERE room_id = ?
+                  )
+                ORDER BY created_at ASC, message_id ASC
+                """,
+                (room_id, room_id),
+            ).fetchall()
+            for row in rows:
+                sequence += 1
+                message = json.loads(row["message_json"])
+                event_id = "room_evt_" + hashlib.sha256(
+                    f"{room_id}\0{row['message_id']}".encode("utf-8")
+                ).hexdigest()[:24]
+                provider_event_id = message.get("provider_event_id")
+                correlation_id = message.get("correlation_id")
+                message.update(
+                    {
+                        "room_event_id": event_id,
+                        "room_sequence": sequence,
+                    }
+                )
+                if provider_event_id is not None:
+                    duplicate_provider_event = connection.execute(
+                        """
+                        SELECT 1 FROM chat_room_event
+                        WHERE room_id = ? AND provider_event_id = ?
+                        """,
+                        (room_id, provider_event_id),
+                    ).fetchone()
+                    if duplicate_provider_event is not None:
+                        provider_event_id = None
+                event_payload = {
+                    "schema": ROOM_DURABLE_EVENT_SCHEMA,
+                    "room_id": room_id,
+                    "room_sequence": sequence,
+                    "room_event_id": event_id,
+                    "event_type": "MESSAGE",
+                    "origin_binding_id": row["author_binding_id"],
+                    "provider_event_id": provider_event_id,
+                    "correlation_id": correlation_id,
+                    "message": message,
+                    "created_at": row["created_at"],
+                }
+                connection.execute(
+                    """
+                    INSERT INTO chat_room_event(
+                        room_id, room_sequence, room_event_id, event_type,
+                        origin_binding_id, provider_event_id, correlation_id,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, 'MESSAGE', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        room_id,
+                        sequence,
+                        event_id,
+                        row["author_binding_id"],
+                        provider_event_id,
+                        correlation_id,
+                        json.dumps(
+                            event_payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        row["created_at"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE chat_room_message SET message_json = ?
+                    WHERE message_id = ?
+                    """,
+                    (
+                        json.dumps(message, ensure_ascii=False, separators=(",", ":")),
+                        row["message_id"],
+                    ),
+                )
 
     def create_room(
         self,
@@ -349,18 +545,33 @@ class MultiRoomStore:
             limit=128,
         )
         display_name = _optional_text(value.get("display_name"), "display_name", limit=120)
+        participant_state = str(value.get("participant_state") or "OBSERVED").upper()
+        if participant_state not in PARTICIPANT_STATES:
+            raise MultiRoomError(
+                "PARTICIPANT_STATE_INVALID",
+                f"unsupported participant_state: {participant_state}",
+            )
         now = utc_now()
         binding_id = "bind_" + secrets.token_hex(12)
-        # Detach previous ACTIVE same role for this room (one primary slot per role in v0)
         with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE chat_room_session
-                SET state = 'DETACHED', updated_at = ?
-                WHERE room_id = ? AND slot_role = ? AND state = 'ACTIVE'
-                """,
-                (now, room["room_id"], slot_role),
+            initial_delivery_sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(room_sequence), 0)
+                    FROM chat_room_event WHERE room_id = ?
+                    """,
+                    (room["room_id"],),
+                ).fetchone()[0]
             )
+            if slot_role in SINGLETON_SLOT_ROLES:
+                connection.execute(
+                    """
+                    UPDATE chat_room_session
+                    SET state = 'DETACHED', updated_at = ?
+                    WHERE room_id = ? AND slot_role = ? AND state = 'ACTIVE'
+                    """,
+                    (now, room["room_id"], slot_role),
+                )
             connection.execute(
                 """
                 INSERT INTO chat_room_session(
@@ -380,6 +591,15 @@ class MultiRoomStore:
                     now,
                     now,
                 ),
+            )
+            connection.execute(
+                """
+                INSERT INTO chat_room_participant_cursor(
+                    binding_id, participant_state, delivery_sequence,
+                    provider_observation_cursor, updated_at
+                ) VALUES (?, ?, ?, NULL, ?)
+                """,
+                (binding_id, participant_state, initial_delivery_sequence, now),
             )
             connection.commit()
         binding = self.get_binding(binding_id)
@@ -533,17 +753,15 @@ class MultiRoomStore:
         author_binding_id = _optional_text(
             value.get("author_binding_id"), "author_binding_id", limit=80
         )
+        provider_event_id = _optional_text(
+            value.get("provider_event_id"), "provider_event_id", limit=256
+        )
+        correlation_id = _optional_text(
+            value.get("correlation_id"), "correlation_id", limit=256
+        )
         message_id = "msg_" + secrets.token_hex(12)
+        room_event_id = "room_evt_" + secrets.token_hex(12)
         now = utc_now()
-        payload = {
-            "schema": ROOM_MESSAGE_SCHEMA,
-            "message_id": message_id,
-            "room_id": room["room_id"],
-            "author_role": author_role,
-            "author_binding_id": author_binding_id,
-            "body_text": body_text,
-            "created_at": now,
-        }
         with self._connect() as connection:
             existing = connection.execute(
                 """
@@ -554,6 +772,55 @@ class MultiRoomStore:
             ).fetchone()
             if existing is not None:
                 return self.get_message(str(existing["message_id"]))
+            if author_binding_id is not None:
+                binding = connection.execute(
+                    """
+                    SELECT binding_id FROM chat_room_session
+                    WHERE binding_id = ? AND room_id = ?
+                    """,
+                    (author_binding_id, room["room_id"]),
+                ).fetchone()
+                if binding is None:
+                    raise MultiRoomError(
+                        "AUTHOR_BINDING_INVALID",
+                        "author binding does not belong to the room",
+                        409,
+                    )
+            if provider_event_id is not None:
+                observed = connection.execute(
+                    """
+                    SELECT payload_json FROM chat_room_event
+                    WHERE room_id = ? AND provider_event_id = ?
+                    """,
+                    (room["room_id"], provider_event_id),
+                ).fetchone()
+                if observed is not None:
+                    event_payload = json.loads(observed["payload_json"])
+                    prior_message = event_payload.get("message")
+                    if isinstance(prior_message, dict):
+                        return prior_message
+            room_sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(room_sequence), 0) + 1
+                    FROM chat_room_event WHERE room_id = ?
+                    """,
+                    (room["room_id"],),
+                ).fetchone()[0]
+            )
+            payload = {
+                "schema": ROOM_MESSAGE_SCHEMA,
+                "message_id": message_id,
+                "room_id": room["room_id"],
+                "room_event_id": room_event_id,
+                "room_sequence": room_sequence,
+                "author_role": author_role,
+                "author_binding_id": author_binding_id,
+                "provider_event_id": provider_event_id,
+                "correlation_id": correlation_id,
+                "body_text": body_text,
+                "created_at": now,
+            }
             connection.execute(
                 """
                 INSERT INTO chat_room_message(
@@ -572,11 +839,50 @@ class MultiRoomStore:
                     now,
                 ),
             )
+            event_payload = {
+                "schema": ROOM_DURABLE_EVENT_SCHEMA,
+                "room_id": room["room_id"],
+                "room_sequence": room_sequence,
+                "room_event_id": room_event_id,
+                "event_type": "MESSAGE",
+                "origin_binding_id": author_binding_id,
+                "provider_event_id": provider_event_id,
+                "correlation_id": correlation_id,
+                "message": payload,
+                "created_at": now,
+            }
+            connection.execute(
+                """
+                INSERT INTO chat_room_event(
+                    room_id, room_sequence, room_event_id, event_type,
+                    origin_binding_id, provider_event_id, correlation_id,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, 'MESSAGE', ?, ?, ?, ?, ?)
+                """,
+                (
+                    room["room_id"],
+                    room_sequence,
+                    room_event_id,
+                    author_binding_id,
+                    provider_event_id,
+                    correlation_id,
+                    json.dumps(
+                        event_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
             connection.commit()
         message = self.get_message(message_id)
         self.hub.publish(
             room["room_id"],
-            {"type": "ROOM_MESSAGE", "message": message},
+            {
+                "type": "ROOM_MESSAGE",
+                "message": message,
+                "room_event": event_payload,
+            },
         )
         return message
 
@@ -596,14 +902,333 @@ class MultiRoomStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT message_json FROM chat_room_message
-                WHERE room_id = ?
-                ORDER BY created_at ASC, message_id ASC
+                SELECT payload_json FROM chat_room_event
+                WHERE room_id = ? AND event_type = 'MESSAGE'
+                ORDER BY room_sequence ASC
                 LIMIT ?
                 """,
                 (rid, lim),
             ).fetchall()
-            return [json.loads(row["message_json"]) for row in rows]
+            messages: list[dict[str, Any]] = []
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                message = payload.get("message")
+                if isinstance(message, dict):
+                    messages.append(message)
+            return messages
+
+    def list_room_events(
+        self,
+        room_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        rid = _text(room_id, "room_id", limit=80)
+        after = max(0, int(after_sequence))
+        cap = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM chat_room_event
+                WHERE room_id = ? AND room_sequence > ?
+                ORDER BY room_sequence ASC
+                LIMIT ?
+                """,
+                (rid, after, cap),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def participant_cursor(self, binding_id: str) -> dict[str, Any]:
+        bid = _text(binding_id, "binding_id", limit=80)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT c.*, b.room_id
+                FROM chat_room_participant_cursor c
+                JOIN chat_room_session b ON b.binding_id = c.binding_id
+                WHERE c.binding_id = ?
+                """,
+                (bid,),
+            ).fetchone()
+        if row is None:
+            raise MultiRoomError("BINDING_NOT_FOUND", "session binding not found", 404)
+        return {
+            "schema": ROOM_CURSOR_SCHEMA,
+            "binding_id": row["binding_id"],
+            "room_id": row["room_id"],
+            "participant_state": row["participant_state"],
+            "delivery_sequence": int(row["delivery_sequence"]),
+            "provider_observation_cursor": row["provider_observation_cursor"],
+            "updated_at": row["updated_at"],
+        }
+
+    def set_participant_state(self, binding_id: str, state: str) -> dict[str, Any]:
+        bid = _text(binding_id, "binding_id", limit=80)
+        normalized = _text(state, "participant_state").upper()
+        if normalized not in PARTICIPANT_STATES:
+            raise MultiRoomError(
+                "PARTICIPANT_STATE_INVALID",
+                f"unsupported participant_state: {normalized}",
+            )
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE chat_room_participant_cursor
+                SET participant_state = ?, updated_at = ?
+                WHERE binding_id = ?
+                """,
+                (normalized, now, bid),
+            )
+            if cursor.rowcount != 1:
+                raise MultiRoomError(
+                    "BINDING_NOT_FOUND", "session binding not found", 404
+                )
+        return self.participant_cursor(bid)
+
+    def participant_delivery_batch(
+        self,
+        binding_id: str,
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        cursor = self.participant_cursor(binding_id)
+        cap = max(1, min(500, int(limit)))
+        events = self.list_room_events(
+            cursor["room_id"],
+            after_sequence=cursor["delivery_sequence"],
+            limit=cap,
+        )
+        deliverable: list[dict[str, Any]] = []
+        blocker: dict[str, Any] | None = None
+        with self._connect() as connection:
+            for event in events:
+                if event.get("origin_binding_id") == cursor["binding_id"]:
+                    continue
+                prior = connection.execute(
+                    """
+                    SELECT status, provider_result_json, observed_at
+                    FROM chat_room_delivery
+                    WHERE binding_id = ? AND room_event_id = ?
+                    """,
+                    (cursor["binding_id"], event["room_event_id"]),
+                ).fetchone()
+                if prior is None:
+                    deliverable.append(event)
+                    continue
+                status = str(prior["status"])
+                if status in ACCEPTED_DELIVERY_STATES:
+                    continue
+                blocker = {
+                    "room_event_id": event["room_event_id"],
+                    "room_sequence": event["room_sequence"],
+                    "status": status,
+                    "provider_result": json.loads(
+                        prior["provider_result_json"] or "{}"
+                    ),
+                    "observed_at": prior["observed_at"],
+                }
+                break
+        return {
+            "schema": ROOM_CURSOR_SCHEMA,
+            "status": "PARTICIPANT_DELIVERY_READY" if not blocker else "PARTICIPANT_DELIVERY_BLOCKED",
+            "cursor": cursor,
+            "events": deliverable,
+            "blocker": blocker,
+        }
+
+    def record_delivery_observation(
+        self,
+        binding_id: str,
+        room_event_id: str,
+        *,
+        status: str,
+        provider_result: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        bid = _text(binding_id, "binding_id", limit=80)
+        event_id = _text(room_event_id, "room_event_id", limit=80)
+        normalized = _text(status, "delivery_status").upper()
+        if normalized not in DELIVERY_STATES:
+            raise MultiRoomError(
+                "DELIVERY_STATE_INVALID",
+                f"unsupported delivery status: {normalized}",
+            )
+        if provider_result is not None and not isinstance(provider_result, Mapping):
+            raise MultiRoomError(
+                "PROVIDER_RESULT_INVALID",
+                "provider_result must be an object",
+            )
+        now = utc_now()
+        with self._connect() as connection:
+            binding = connection.execute(
+                "SELECT room_id FROM chat_room_session WHERE binding_id = ?",
+                (bid,),
+            ).fetchone()
+            if binding is None:
+                raise MultiRoomError(
+                    "BINDING_NOT_FOUND", "session binding not found", 404
+                )
+            event = connection.execute(
+                """
+                SELECT room_sequence FROM chat_room_event
+                WHERE room_id = ? AND room_event_id = ?
+                """,
+                (binding["room_id"], event_id),
+            ).fetchone()
+            if event is None:
+                raise MultiRoomError(
+                    "ROOM_EVENT_NOT_FOUND", "room event does not exist", 404
+                )
+            room_sequence = int(event["room_sequence"])
+            current = connection.execute(
+                """
+                SELECT delivery_sequence FROM chat_room_participant_cursor
+                WHERE binding_id = ?
+                """,
+                (bid,),
+            ).fetchone()
+            if current is None:
+                raise MultiRoomError(
+                    "BINDING_NOT_FOUND", "session binding not found", 404
+                )
+            prior = connection.execute(
+                """
+                SELECT status FROM chat_room_delivery
+                WHERE binding_id = ? AND room_event_id = ?
+                """,
+                (bid, event_id),
+            ).fetchone()
+            if (
+                prior is not None
+                and str(prior["status"]) in ACCEPTED_DELIVERY_STATES
+                and normalized == "QUEUED"
+            ):
+                normalized = str(prior["status"])
+            connection.execute(
+                """
+                INSERT INTO chat_room_delivery(
+                    binding_id, room_event_id, room_sequence, status,
+                    provider_result_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(binding_id, room_event_id) DO UPDATE SET
+                    status = excluded.status,
+                    provider_result_json = excluded.provider_result_json,
+                    observed_at = excluded.observed_at
+                """,
+                (
+                    bid,
+                    event_id,
+                    room_sequence,
+                    normalized,
+                    json.dumps(
+                        dict(provider_result or {}),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
+            if normalized in ACCEPTED_DELIVERY_STATES:
+                connection.execute(
+                    """
+                    UPDATE chat_room_participant_cursor
+                    SET delivery_sequence = ?, updated_at = ?
+                    WHERE binding_id = ? AND delivery_sequence <= ?
+                    """,
+                    (room_sequence, now, bid, room_sequence),
+                )
+        return {
+            "schema": ROOM_CURSOR_SCHEMA,
+            "status": "DELIVERY_OBSERVATION_RECORDED",
+            "delivery_status": normalized,
+            "room_event_id": event_id,
+            "cursor": self.participant_cursor(bid),
+        }
+
+    def record_provider_observation(
+        self,
+        binding_id: str,
+        provider_cursor: str,
+        *,
+        expected_previous: str | None = None,
+    ) -> dict[str, Any]:
+        bid = _text(binding_id, "binding_id", limit=80)
+        observed = _text(provider_cursor, "provider_observation_cursor", limit=512)
+        now = utc_now()
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT provider_observation_cursor
+                FROM chat_room_participant_cursor WHERE binding_id = ?
+                """,
+                (bid,),
+            ).fetchone()
+            if current is None:
+                raise MultiRoomError(
+                    "BINDING_NOT_FOUND", "session binding not found", 404
+                )
+            previous = current["provider_observation_cursor"]
+            if expected_previous is not None and previous != expected_previous:
+                raise MultiRoomError(
+                    "PROVIDER_OBSERVATION_CURSOR_CHANGED",
+                    "provider observation cursor changed before update",
+                    409,
+                )
+            connection.execute(
+                """
+                UPDATE chat_room_participant_cursor
+                SET provider_observation_cursor = ?, updated_at = ?
+                WHERE binding_id = ?
+                """,
+                (observed, now, bid),
+            )
+        return self.participant_cursor(bid)
+
+    def update_viewer_cursor(
+        self,
+        room_id: str,
+        viewer_id: str,
+        room_sequence: int,
+    ) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        viewer = _text(viewer_id, "viewer_id", limit=128)
+        sequence = max(0, int(room_sequence))
+        now = utc_now()
+        self.get_room(rid)
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT room_sequence FROM chat_room_viewer_cursor
+                WHERE room_id = ? AND viewer_id = ?
+                """,
+                (rid, viewer),
+            ).fetchone()
+            if current is not None and sequence < int(current["room_sequence"]):
+                raise MultiRoomError(
+                    "VIEWER_CURSOR_REGRESSION",
+                    "viewer cursor cannot move backwards",
+                    409,
+                )
+            connection.execute(
+                """
+                INSERT INTO chat_room_viewer_cursor(
+                    room_id, viewer_id, room_sequence, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(room_id, viewer_id) DO UPDATE SET
+                    room_sequence = excluded.room_sequence,
+                    updated_at = excluded.updated_at
+                """,
+                (rid, viewer, sequence, now),
+            )
+        return {
+            "schema": ROOM_CURSOR_SCHEMA,
+            "status": "VIEWER_CURSOR_UPDATED",
+            "room_id": rid,
+            "viewer_id": viewer,
+            "room_sequence": sequence,
+            "updated_at": now,
+        }
 
     def list_recent_messages(
         self, room_id: str, *, limit: int = 2
@@ -988,6 +1613,10 @@ class MultiRoomStore:
         room = self.get_room(room_id)
         bindings = self.list_bindings(room_id)
         messages = self.list_messages(room_id, limit=200)
+        events = self.list_room_events(room_id, limit=200)
+        participant_cursors = [
+            self.participant_cursor(binding["binding_id"]) for binding in bindings
+        ]
         master = next((b for b in bindings if b["slot_role"] == "MASTER"), None)
         host = next(
             (b for b in bindings if b["slot_role"] == room["host_role"]), None
@@ -999,6 +1628,8 @@ class MultiRoomStore:
             "room": room,
             "bindings": bindings,
             "messages": messages,
+            "events": events,
+            "participant_cursors": participant_cursors,
             "bridge_line": bridge,
             "write_roles": sorted(WRITE_ROLES.get(room["room_type"], frozenset())),
             "user_may_write": "USER" in WRITE_ROLES.get(room["room_type"], frozenset()),
@@ -1057,3 +1688,222 @@ class MultiRoomStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+
+class MultiRoomDeliveryCoordinator:
+    """Fan out unseen room events through already-attached native controls."""
+
+    def __init__(
+        self,
+        store: MultiRoomStore,
+        send_input: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]],
+    ) -> None:
+        self.store = store
+        self.send_input = send_input
+
+    def deliver_binding(self, binding_id: str, *, limit: int = 100) -> dict[str, Any]:
+        binding = self.store.get_binding(binding_id)
+        cursor = self.store.participant_cursor(binding_id)
+        if cursor["participant_state"] not in {"CONTROLLED", "LIVE"}:
+            return {
+                "status": "PARTICIPANT_CONTROL_UNAVAILABLE",
+                "binding_id": binding_id,
+                "participant_state": cursor["participant_state"],
+                "delivered": [],
+            }
+        batch = self.store.participant_delivery_batch(binding_id, limit=limit)
+        if batch["blocker"] is not None and not batch["events"]:
+            return {
+                "status": "PARTICIPANT_DELIVERY_BLOCKED",
+                "binding_id": binding_id,
+                "blocker": batch["blocker"],
+                "delivered": [],
+            }
+        delivered: list[dict[str, Any]] = []
+        for event in batch["events"]:
+            try:
+                result = dict(self.send_input(binding, event))
+                status = str(result.get("status") or "UNCERTAIN").upper()
+                if status not in DELIVERY_STATES:
+                    status = "UNCERTAIN"
+            except Exception as error:
+                status = "UNCERTAIN"
+                result = {
+                    "error": f"{type(error).__name__}: {error}",
+                    "retry": "EXPLICIT_ONLY",
+                }
+            recorded = self.store.record_delivery_observation(
+                binding_id,
+                str(event["room_event_id"]),
+                status=status,
+                provider_result=result,
+            )
+            status = recorded["delivery_status"]
+            delivered.append(
+                {
+                    "room_event_id": event["room_event_id"],
+                    "room_sequence": event["room_sequence"],
+                    "status": status,
+                }
+            )
+            if status not in ACCEPTED_DELIVERY_STATES:
+                return {
+                    "status": "PARTICIPANT_DELIVERY_BLOCKED",
+                    "binding_id": binding_id,
+                    "blocker": delivered[-1],
+                    "delivered": delivered,
+                    "cursor": recorded["cursor"],
+                }
+        return {
+            "status": "PARTICIPANT_DELIVERY_COMPLETED",
+            "binding_id": binding_id,
+            "delivered": delivered,
+            "cursor": self.store.participant_cursor(binding_id),
+        }
+
+    def deliver_room(self, room_id: str, *, limit: int = 100) -> dict[str, Any]:
+        results = [
+            self.deliver_binding(binding["binding_id"], limit=limit)
+            for binding in self.store.list_bindings(room_id)
+        ]
+        return {
+            "status": "ROOM_DELIVERY_OBSERVED",
+            "room_id": room_id,
+            "participants": results,
+        }
+
+
+class MultiRoomNativeControlRegistry:
+    """Process-local native provider controls bound to durable room slots."""
+
+    def __init__(self, store: MultiRoomStore) -> None:
+        self.store = store
+        self._controls: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+
+    def register(
+        self,
+        binding_id: str,
+        *,
+        provider: str,
+        provider_session_ref: str,
+        send_input: Callable[[Mapping[str, Any], Mapping[str, Any]], Any],
+    ) -> dict[str, Any]:
+        bid = _text(binding_id, "binding_id", limit=80)
+        normalized_provider = _text(provider, "provider", limit=64).upper()
+        normalized_session_ref = _text(
+            provider_session_ref,
+            "provider_session_ref",
+            limit=256,
+        )
+        if not callable(send_input):
+            raise MultiRoomError(
+                "NATIVE_CONTROL_SENDER_INVALID",
+                "native control sender must be callable",
+            )
+        binding = self.store.get_binding(bid)
+        if binding.get("state") != "ACTIVE":
+            raise MultiRoomError(
+                "NATIVE_CONTROL_BINDING_INACTIVE",
+                "native control requires an active room binding",
+                409,
+            )
+        if str(binding.get("provider") or "").upper() != normalized_provider:
+            raise MultiRoomError(
+                "NATIVE_CONTROL_PROVIDER_MISMATCH",
+                "native control provider does not match room binding",
+                409,
+            )
+        if binding.get("provider_session_ref") != normalized_session_ref:
+            raise MultiRoomError(
+                "NATIVE_CONTROL_SESSION_MISMATCH",
+                "native control session does not match room binding",
+                409,
+            )
+        control_ref = "native_control_" + secrets.token_hex(12)
+        with self._lock:
+            self._controls[bid] = {
+                "control_ref": control_ref,
+                "provider": normalized_provider,
+                "provider_session_ref": normalized_session_ref,
+                "send_input": send_input,
+            }
+        cursor = self.store.set_participant_state(bid, "CONTROLLED")
+        return {
+            "status": "NATIVE_CONTROL_REGISTERED",
+            "binding_id": bid,
+            "control_ref": control_ref,
+            "provider": normalized_provider,
+            "provider_session_ref": normalized_session_ref,
+            "participant_state": cursor["participant_state"],
+        }
+
+    def unregister(
+        self,
+        binding_id: str,
+        *,
+        control_ref: str | None = None,
+    ) -> bool:
+        bid = _text(binding_id, "binding_id", limit=80)
+        with self._lock:
+            current = self._controls.get(bid)
+            if current is None:
+                return False
+            if control_ref is not None and current["control_ref"] != control_ref:
+                return False
+            self._controls.pop(bid, None)
+        try:
+            self.store.set_participant_state(bid, "DISCONNECTED")
+        except MultiRoomError:
+            pass
+        return True
+
+    def send_input(
+        self,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        bid = _text(binding.get("binding_id"), "binding.binding_id", limit=80)
+        with self._lock:
+            control = self._controls.get(bid)
+        if control is None:
+            raise MultiRoomError(
+                "NATIVE_CONTROL_UNAVAILABLE",
+                "room binding has no live native provider control",
+                409,
+            )
+        if str(binding.get("provider") or "").upper() != control["provider"]:
+            raise MultiRoomError(
+                "NATIVE_CONTROL_PROVIDER_MISMATCH",
+                "live control provider no longer matches room binding",
+                409,
+            )
+        if binding.get("provider_session_ref") != control["provider_session_ref"]:
+            raise MultiRoomError(
+                "NATIVE_CONTROL_SESSION_MISMATCH",
+                "live control session no longer matches room binding",
+                409,
+            )
+        accepted = control["send_input"](dict(binding), dict(event))
+        if accepted is False:
+            raise MultiRoomError(
+                "NATIVE_CONTROL_QUEUE_REJECTED",
+                "native provider control rejected the incremental event",
+                409,
+            )
+        return {
+            "status": "QUEUED",
+            "binding_id": bid,
+            "room_event_id": event.get("room_event_id"),
+            "control_ref": control["control_ref"],
+        }
+
+    def close(self) -> None:
+        with self._lock:
+            binding_ids = list(self._controls)
+            self._controls.clear()
+        for binding_id in binding_ids:
+            try:
+                self.store.set_participant_state(binding_id, "DISCONNECTED")
+            except MultiRoomError:
+                pass

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -10,7 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from session_supervisor import SessionSupervisorStore  # noqa: E402
-from universe_multi_room import MultiRoomError, MultiRoomStore  # noqa: E402
+from universe_multi_room import (  # noqa: E402
+    MultiRoomDeliveryCoordinator,
+    MultiRoomError,
+    MultiRoomNativeControlRegistry,
+    MultiRoomStore,
+)
 from universe_server import (  # noqa: E402
     perform_session_ref_inject,
     supervisor_session_id_for,
@@ -100,6 +107,423 @@ class MultiRoomStoreTests(unittest.TestCase):
         messages = self.store.list_messages(room_id)
         self.assertEqual(1, len(messages))
         self.assertEqual("USER", messages[0]["author_role"])
+
+    def test_room_events_are_monotonic_and_provider_events_are_idempotent(self) -> None:
+        room = self.store.create_meeting_room(
+            {
+                "title": "Live room",
+                "topic": "incremental routing",
+                "models": [{"provider": "CODEX", "display_name": "Codex"}],
+            }
+        )["room"]
+        first = self.store.post_message(
+            room["room_id"],
+            {
+                "author_role": "MODEL",
+                "body_text": "first delta",
+                "provider_event_id": "codex-event-1",
+            },
+        )
+        duplicate = self.store.post_message(
+            room["room_id"],
+            {
+                "author_role": "MODEL",
+                "body_text": "duplicate delta",
+                "provider_event_id": "codex-event-1",
+            },
+        )
+        second = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "next input"},
+        )
+
+        self.assertEqual(first["message_id"], duplicate["message_id"])
+        self.assertEqual(1, first["room_sequence"])
+        self.assertEqual(2, second["room_sequence"])
+        events = self.store.list_room_events(room["room_id"])
+        self.assertEqual([1, 2], [item["room_sequence"] for item in events])
+
+    def test_incremental_delivery_uses_independent_cursors_and_suppresses_echo(self) -> None:
+        room = self.store.create_meeting_room(
+            {
+                "title": "Models",
+                "topic": "fanout",
+                "models": [
+                    {"provider": "CODEX", "display_name": "Codex"},
+                    {"provider": "CLAUDE", "display_name": "Claude"},
+                ],
+            }
+        )["room"]
+        bindings = [
+            binding
+            for binding in self.store.list_bindings(room["room_id"])
+            if binding["slot_role"] == "MODEL"
+        ]
+        self.assertEqual(2, len(bindings))
+        codex, claude = bindings
+        self.store.set_participant_state(codex["binding_id"], "LIVE")
+        self.store.set_participant_state(claude["binding_id"], "LIVE")
+        own = self.store.post_message(
+            room["room_id"],
+            {
+                "author_role": "MODEL",
+                "author_binding_id": codex["binding_id"],
+                "body_text": "Codex output",
+                "provider_event_id": "codex-output-1",
+            },
+        )
+        user = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "Review this"},
+        )
+        delivered_to: list[tuple[str, str]] = []
+
+        def send(binding, event):
+            delivered_to.append((binding["binding_id"], event["room_event_id"]))
+            return {"status": "ACCEPTED", "provider_cursor": "native-1"}
+
+        coordinator = MultiRoomDeliveryCoordinator(self.store, send)
+        codex_result = coordinator.deliver_binding(codex["binding_id"])
+        claude_result = coordinator.deliver_binding(claude["binding_id"])
+
+        self.assertEqual(
+            [(codex["binding_id"], user["room_event_id"])],
+            [item for item in delivered_to if item[0] == codex["binding_id"]],
+        )
+        self.assertEqual(
+            [own["room_event_id"], user["room_event_id"]],
+            [item[1] for item in delivered_to if item[0] == claude["binding_id"]],
+        )
+        self.assertEqual(2, codex_result["cursor"]["delivery_sequence"])
+        self.assertEqual(2, claude_result["cursor"]["delivery_sequence"])
+
+    def test_uncertain_delivery_blocks_retry_until_explicit_resolution(self) -> None:
+        room = self.store.create_meeting_room(
+            {
+                "title": "Uncertain",
+                "topic": "provider acceptance",
+                "models": [{"provider": "GROK", "display_name": "Grok"}],
+            }
+        )["room"]
+        binding = self.store.list_bindings(room["room_id"])[0]
+        self.store.set_participant_state(binding["binding_id"], "CONTROLLED")
+        event = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "hello"},
+        )
+        calls: list[str] = []
+
+        def uncertain(_binding, room_event):
+            calls.append(room_event["room_event_id"])
+            return {"status": "UNCERTAIN"}
+
+        coordinator = MultiRoomDeliveryCoordinator(self.store, uncertain)
+        first = coordinator.deliver_binding(binding["binding_id"])
+        second = coordinator.deliver_binding(binding["binding_id"])
+
+        self.assertEqual("PARTICIPANT_DELIVERY_BLOCKED", first["status"])
+        self.assertEqual("PARTICIPANT_DELIVERY_BLOCKED", second["status"])
+        self.assertEqual([event["room_event_id"]], calls)
+        self.assertEqual([], second["delivered"])
+
+    def test_native_control_queues_only_the_new_event_and_waits_for_acceptance(
+        self,
+    ) -> None:
+        room = self.store.ensure_project_room("proj_native")
+        binding = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "thread-native-1",
+            },
+        )["binding"]
+        queued: list[dict[str, object]] = []
+        registry = MultiRoomNativeControlRegistry(self.store)
+        registered = registry.register(
+            binding["binding_id"],
+            provider="CODEX",
+            provider_session_ref="thread-native-1",
+            send_input=lambda _binding, event: queued.append(dict(event)) or True,
+        )
+        event = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "only this delta"},
+        )
+
+        result = MultiRoomDeliveryCoordinator(
+            self.store,
+            registry.send_input,
+        ).deliver_binding(binding["binding_id"])
+
+        self.assertEqual("CONTROLLED", registered["participant_state"])
+        self.assertEqual("PARTICIPANT_DELIVERY_BLOCKED", result["status"])
+        self.assertEqual("QUEUED", result["blocker"]["status"])
+        self.assertEqual([event["room_event_id"]], [item["room_event_id"] for item in queued])
+        self.assertEqual(
+            0,
+            self.store.participant_cursor(binding["binding_id"])[
+                "delivery_sequence"
+            ],
+        )
+
+        accepted = self.store.record_delivery_observation(
+            binding["binding_id"],
+            event["room_event_id"],
+            status="ACCEPTED",
+        )
+        self.assertEqual(1, accepted["cursor"]["delivery_sequence"])
+        self.assertTrue(registry.unregister(binding["binding_id"]))
+        self.assertEqual(
+            "DISCONNECTED",
+            self.store.participant_cursor(binding["binding_id"])[
+                "participant_state"
+            ],
+        )
+
+    def test_native_control_identity_mismatch_fails_closed(self) -> None:
+        room = self.store.ensure_project_room("proj_identity")
+        binding = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-session-1",
+            },
+        )["binding"]
+        registry = MultiRoomNativeControlRegistry(self.store)
+
+        with self.assertRaises(MultiRoomError) as provider_error:
+            registry.register(
+                binding["binding_id"],
+                provider="CODEX",
+                provider_session_ref="claude-session-1",
+                send_input=lambda _binding, _event: True,
+            )
+        self.assertEqual(
+            "NATIVE_CONTROL_PROVIDER_MISMATCH",
+            provider_error.exception.code,
+        )
+        with self.assertRaises(MultiRoomError) as session_error:
+            registry.register(
+                binding["binding_id"],
+                provider="CLAUDE",
+                provider_session_ref="other-session",
+                send_input=lambda _binding, _event: True,
+            )
+        self.assertEqual(
+            "NATIVE_CONTROL_SESSION_MISMATCH",
+            session_error.exception.code,
+        )
+
+    def test_fast_native_acceptance_is_not_downgraded_to_queued(self) -> None:
+        room = self.store.ensure_project_room("proj_race")
+        binding = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "GROK",
+                "provider_session_ref": "grok-session-1",
+            },
+        )["binding"]
+        registry = MultiRoomNativeControlRegistry(self.store)
+
+        def accept_inline(native_binding, event):
+            self.store.record_delivery_observation(
+                native_binding["binding_id"],
+                event["room_event_id"],
+                status="ACCEPTED",
+            )
+            return True
+
+        registry.register(
+            binding["binding_id"],
+            provider="GROK",
+            provider_session_ref="grok-session-1",
+            send_input=accept_inline,
+        )
+        self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "race"},
+        )
+        result = MultiRoomDeliveryCoordinator(
+            self.store,
+            registry.send_input,
+        ).deliver_binding(binding["binding_id"])
+
+        self.assertEqual("PARTICIPANT_DELIVERY_COMPLETED", result["status"])
+        self.assertEqual("ACCEPTED", result["delivered"][0]["status"])
+        self.assertEqual(1, result["cursor"]["delivery_sequence"])
+
+    def test_viewer_cursor_never_changes_participant_or_provider_cursor(self) -> None:
+        room = self.store.ensure_project_room("proj_view")
+        binding = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "thread-view",
+            },
+        )["binding"]
+        self.store.record_provider_observation(
+            binding["binding_id"], "provider-position-7"
+        )
+        before = self.store.participant_cursor(binding["binding_id"])
+        viewed = self.store.update_viewer_cursor(room["room_id"], "browser-1", 9)
+        after = self.store.participant_cursor(binding["binding_id"])
+
+        self.assertEqual(9, viewed["room_sequence"])
+        self.assertEqual(before, after)
+        with self.assertRaises(MultiRoomError) as ctx:
+            self.store.update_viewer_cursor(room["room_id"], "browser-1", 8)
+        self.assertEqual("VIEWER_CURSOR_REGRESSION", ctx.exception.code)
+
+    def test_new_participant_starts_after_existing_room_history(self) -> None:
+        room = self.store.create_room(
+            room_type="MEETING",
+            title="Late join",
+            host_role="CONDUCTOR",
+        )
+        old = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "before attach"},
+        )
+        binding = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CODEX",
+                "participant_state": "LIVE",
+            },
+        )["binding"]
+        calls: list[str] = []
+
+        coordinator = MultiRoomDeliveryCoordinator(
+            self.store,
+            lambda _binding, event: (
+                calls.append(event["room_event_id"]) or {"status": "ACCEPTED"}
+            ),
+        )
+        self.assertEqual(
+            old["room_sequence"],
+            self.store.participant_cursor(binding["binding_id"])["delivery_sequence"],
+        )
+        coordinator.deliver_binding(binding["binding_id"])
+        self.assertEqual([], calls)
+
+        current = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "after attach"},
+        )
+        coordinator.deliver_binding(binding["binding_id"])
+        self.assertEqual([current["room_event_id"]], calls)
+
+    def test_legacy_room_rows_gain_events_and_non_replaying_cursors(self) -> None:
+        legacy_db = Path(self.temp.name) / "legacy.sqlite3"
+        now = "2026-08-09T00:00:00Z"
+        message = {
+            "schema": "universe.chat-room-message.v1",
+            "message_id": "msg_legacy",
+            "room_id": "room_legacy",
+            "author_role": "USER",
+            "author_binding_id": None,
+            "body_text": "legacy history",
+            "created_at": now,
+        }
+        with sqlite3.connect(legacy_db) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE chat_room (
+                    room_id TEXT PRIMARY KEY, room_type TEXT NOT NULL,
+                    project_id TEXT, task_frame_id TEXT, title TEXT NOT NULL,
+                    host_role TEXT NOT NULL, state TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE chat_room_session (
+                    binding_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+                    slot_role TEXT NOT NULL, provider TEXT,
+                    provider_session_ref TEXT, supervisor_session_id TEXT,
+                    display_name TEXT, state TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE chat_room_message (
+                    message_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL, author_role TEXT NOT NULL,
+                    author_binding_id TEXT, body_text TEXT NOT NULL,
+                    message_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE(room_id, idempotency_key)
+                );
+                CREATE TABLE chat_room_control_event (
+                    event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO chat_room VALUES (?, 'PROJECT', 'legacy', NULL, ?, 'MASTER', 'OPEN', '{}', ?, ?)",
+                ("room_legacy", "Legacy", now, now),
+            )
+            connection.execute(
+                "INSERT INTO chat_room_session VALUES (?, ?, 'MASTER', 'CODEX', 'thread-1', NULL, 'Master', 'ACTIVE', '{}', ?, ?)",
+                ("bind_legacy", "room_legacy", now, now),
+            )
+            connection.execute(
+                "INSERT INTO chat_room_message VALUES (?, ?, ?, 'USER', NULL, ?, ?, ?)",
+                (
+                    "msg_legacy",
+                    "room_legacy",
+                    "idem_legacy",
+                    "legacy history",
+                    json.dumps(message),
+                    now,
+                ),
+            )
+
+        migrated = MultiRoomStore(str(legacy_db))
+        events = migrated.list_room_events("room_legacy")
+        cursor = migrated.participant_cursor("bind_legacy")
+        snapshot = migrated.room_snapshot("room_legacy")
+
+        self.assertEqual(1, len(events))
+        self.assertEqual("msg_legacy", events[0]["message"]["message_id"])
+        self.assertEqual(1, cursor["delivery_sequence"])
+        self.assertEqual(1, len(snapshot["participant_cursors"]))
+
+    def test_duplicate_accepted_delivery_is_idempotent_after_cursor_advance(self) -> None:
+        room = self.store.create_room(
+            room_type="MEETING",
+            title="Duplicate acceptance",
+            host_role="CONDUCTOR",
+        )
+        binding = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CODEX",
+                "participant_state": "LIVE",
+            },
+        )["binding"]
+        first = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "first"},
+        )
+        second = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "second"},
+        )
+        self.store.record_delivery_observation(
+            binding["binding_id"], first["room_event_id"], status="ACCEPTED"
+        )
+        self.store.record_delivery_observation(
+            binding["binding_id"], second["room_event_id"], status="ACCEPTED"
+        )
+        duplicate = self.store.record_delivery_observation(
+            binding["binding_id"], first["room_event_id"], status="ACCEPTED"
+        )
+        self.assertEqual(2, duplicate["cursor"]["delivery_sequence"])
 
     def test_session_ref_inject(self) -> None:
         injected = self.store.inject_session_ref(

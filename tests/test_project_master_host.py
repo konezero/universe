@@ -126,6 +126,12 @@ class StreamingFakeProvider(FakeProvider):
         return "Project Master answer"
 
 
+class FailingStreamingFakeProvider(FakeProvider):
+    def reply_stream(self, message: Mapping[str, Any], on_delta) -> str:
+        self.messages.append(dict(message))
+        raise RuntimeError("provider disconnected")
+
+
 class PermissionFakeProvider(StreamingFakeProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -182,6 +188,14 @@ class PreparedFakeProvider(FakeProvider):
         self.closed = True
 
 
+class StreamingPreparedFakeProvider(PreparedFakeProvider):
+    def reply_stream(self, message: Mapping[str, Any], on_delta) -> str:
+        self.messages.append(dict(message))
+        on_delta("live ")
+        on_delta("answer")
+        return "live answer"
+
+
 class FakeContinuityCoordinator:
     def __init__(self) -> None:
         self.saves: list[dict[str, Any]] = []
@@ -224,6 +238,7 @@ class FakeSurfaceObserver:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
         self.messages: list[dict[str, Any]] = []
+        self.room_events: list[dict[str, Any]] = []
         self.prepare_count = 0
         self.mutations: list[dict[str, Any]] = []
 
@@ -241,6 +256,25 @@ class FakeSurfaceObserver:
             "snapshot": {
                 "anchor_id": "MASTER-CURRENT-TEST",
                 "observed_at": "2026-07-30T00:00:01Z",
+                "snapshot": {
+                    "coordinates": {
+                        "mode": "MASTER",
+                        "commander_surface": "UNIVERSE_UI",
+                    }
+                },
+            },
+        }
+
+    def observe_room_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]:
+        self.room_events.append(dict(event))
+        if self.fail:
+            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
+        return {
+            "status": "COMMANDER_INPUT_OBSERVED",
+            "anchor_mode": "MASTER",
+            "snapshot": {
+                "anchor_id": "MASTER-CURRENT-ROOM-TEST",
+                "observed_at": "2026-08-09T00:00:01Z",
                 "snapshot": {
                     "coordinates": {
                         "mode": "MASTER",
@@ -593,6 +627,37 @@ class ProjectMasterHostTests(unittest.TestCase):
         ]
         self.assertIn("COMMANDER_MESSAGE_OBSERVED", events)
         self.assertIn("PROVIDER_REPLY_OBSERVED", events)
+
+    def test_resident_mode_session_streams_current_turn_through_native_provider(
+        self,
+    ) -> None:
+        provider = StreamingPreparedFakeProvider()
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-stream.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=lambda *_args: provider,
+        )
+        deltas: list[str] = []
+        try:
+            result = host.reply_stream(
+                "CODEX",
+                {
+                    "message_id": "current-only",
+                    "body": "current input",
+                    "runtime_context": {"requested_mode": "CONDUCTOR"},
+                },
+                deltas.append,
+            )
+        finally:
+            host.close()
+
+        self.assertEqual(["live ", "answer"], deltas)
+        self.assertEqual("live answer", result["text"])
+        self.assertEqual("current input", provider.messages[0]["body"])
+        self.assertNotIn("history", provider.messages[0]["runtime_context"])
 
     def test_resident_mode_session_binds_declared_permission_requester(self) -> None:
         provider = PreparedFakeProvider()
@@ -1175,6 +1240,111 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertEqual("Project Master answer", self.replies[0]["body"])
 
+    def test_native_room_event_sends_only_incremental_input_and_observes_output(
+        self,
+    ) -> None:
+        self.provider = StreamingFakeProvider()
+        observed: list[dict[str, Any]] = []
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            room_event_observer=lambda event: observed.append(dict(event)),
+        )
+        room_event = {
+            "room_id": "room_native",
+            "room_event_id": "room_evt_native_001",
+            "room_sequence": 7,
+            "correlation_id": None,
+            "message": {
+                "room_event_id": "room_evt_native_001",
+                "author_role": "USER",
+                "body_text": "Review only this new line",
+            },
+        }
+        worker.start()
+        try:
+            worker.submit_room_event(
+                binding={
+                    "binding_id": "bind_native_001",
+                    "provider": "CODEX",
+                    "provider_session_ref": self.provider.session_ref,
+                },
+                event=room_event,
+                bridge_id="bridge_native_001",
+            )
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(1, len(self.provider.messages))
+        provider_message = self.provider.messages[0]
+        self.assertEqual("Review only this new line", provider_message["body"])
+        self.assertEqual("room_evt_native_001", provider_message["message_id"])
+        self.assertNotIn("history", provider_message)
+        self.assertNotIn("messages", provider_message)
+        self.assertNotIn("skill_plan_context", provider_message)
+        self.assertEqual([room_event], self.surface_observer.room_events)
+        self.assertEqual(
+            [
+                "DELIVERY_ACCEPTED",
+                "DELTA",
+                "DELTA",
+                "COMPLETED",
+            ],
+            [event["event"] for event in observed],
+        )
+        self.assertEqual("Project Master answer", observed[-1]["body"])
+        self.assertEqual([], self.replies)
+        self.assertEqual([], self.streams)
+
+    def test_native_room_failure_is_uncertain_and_does_not_fake_completion(
+        self,
+    ) -> None:
+        self.provider = FailingStreamingFakeProvider()
+        observed: list[dict[str, Any]] = []
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            room_event_observer=lambda event: observed.append(dict(event)),
+        )
+        worker.start()
+        try:
+            worker.submit_room_event(
+                binding={
+                    "binding_id": "bind_native_failure",
+                    "provider": "CLAUDE",
+                    "provider_session_ref": self.provider.session_ref,
+                },
+                event={
+                    "room_id": "room_native",
+                    "room_event_id": "room_evt_native_failure",
+                    "room_sequence": 1,
+                    "message": {
+                        "room_event_id": "room_evt_native_failure",
+                        "author_role": "USER",
+                        "body_text": "fail closed",
+                    },
+                },
+                bridge_id="bridge_native_failure",
+            )
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(["FAILED"], [event["event"] for event in observed])
+        self.assertEqual("UNCERTAIN", observed[0]["delivery_status"])
+        self.assertIn("provider disconnected", observed[0]["reason"])
+
     def test_selected_governance_context_is_injected_for_provider(self) -> None:
         selected = {
             "schema": "universe.release-governance-context.v1",
@@ -1539,6 +1709,68 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("GROK", first["provider"])
         self.assertEqual("CODEX", second["provider"])
         self.assertEqual(2, len(registrations))
+
+    def test_resident_manager_routes_native_room_events_for_all_provider_labels(
+        self,
+    ) -> None:
+        for provider_name in ("CODEX", "CLAUDE", "GROK"):
+            with self.subTest(provider=provider_name):
+                provider = StreamingPreparedFakeProvider()
+                observed: list[dict[str, Any]] = []
+
+                def register(project_id, value):
+                    return {
+                        "bridge_id": f"bridge-{provider_name.lower()}",
+                        "project_id": project_id,
+                        **dict(value),
+                    }, True
+
+                with patch.dict(
+                    os.environ,
+                    {"LOCALAPPDATA": str(self.root)},
+                    clear=False,
+                ):
+                    manager = ResidentProjectMasterHostManager(
+                        universe_endpoint="http://127.0.0.1:52973",
+                        bridge_registrar=register,
+                        provider_factory=lambda _root, _project_id, _store: provider,
+                        provider_resolver=lambda _project_id: provider_name,
+                        coordinator_factory=lambda _root, _project_id, _session: (
+                            self.surface_observer
+                        ),
+                        room_event_observer=lambda event: observed.append(dict(event)),
+                    )
+                    try:
+                        manager.ensure(
+                            {"project_id": "GCS", "project_root": str(self.root)}
+                        )
+                        accepted = manager.submit_room_event(
+                            "GCS",
+                            {
+                                "binding_id": f"bind-{provider_name.lower()}",
+                                "provider": provider_name,
+                                "provider_session_ref": provider.session_ref,
+                            },
+                            {
+                                "room_id": "room_native",
+                                "room_event_id": f"event-{provider_name.lower()}",
+                                "room_sequence": 1,
+                                "message": {
+                                    "room_event_id": f"event-{provider_name.lower()}",
+                                    "author_role": "USER",
+                                    "body_text": "one incremental event",
+                                },
+                            },
+                        )
+                        self.assertTrue(accepted)
+                        self.assertTrue(
+                            manager._handles["GCS"].worker.wait_idle()
+                        )
+                    finally:
+                        manager.close()
+
+                self.assertEqual("one incremental event", provider.messages[0]["body"])
+                self.assertEqual("COMPLETED", observed[-1]["event"])
 
     def _worker(self) -> ProjectMasterConversationWorker:
         def post_reply(**values):

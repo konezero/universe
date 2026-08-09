@@ -2,11 +2,11 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Draft product architecture |
-| **Date** | 2026-08-05 |
+| **Status** | Draft product architecture; live routing contract fixed |
+| **Date** | 2026-08-09 |
 | **Scope** | Universe Instance chat rooms, session attach, streaming, dashboard |
 | **UI strategy** | Function-first thin chrome first; major visual redesign later |
-| **Related** | `docs/room-session-attach-streaming.md`, `docs/local-universe-service.md`, `docs/local-session-supervisor.md`, `docs/universe-design-and-bench-flow.md` |
+| **Related** | `docs/live-session-room-routing.md`, `docs/room-session-attach-streaming.md`, `docs/local-universe-service.md`, `docs/local-session-supervisor.md`, `docs/universe-design-and-bench-flow.md` |
 
 ---
 
@@ -26,11 +26,12 @@ A separate **Meeting room** type lets the Conductor host multi-model debate,
 created via Skill, with the user able to interrupt mid-meeting. Meeting output is
 summary/candidate material (bench-class), not automatic execution authority.
 
-Session continuity: **provider session ref** + optional **Resume compressed
-context** restore *meaning*. Full transcript replay is not required for work, but
-**timeline continuity** is improved by durable room history, post-resume bridge
-lines, and session-ref inject from other harnesses without relying on Session
-Observatory alone.
+The normative live transport and observation rules are fixed in
+`docs/live-session-room-routing.md`. Provider sessions retain their own context;
+Universe does not replay room transcripts or automatically inject Context Packs.
+Vendor Session Rooms mirror one provider session, while Universe-owned rooms
+fan out only unseen events to participant CLI sessions using independent
+delivery and observation cursors.
 
 ---
 
@@ -199,9 +200,9 @@ Order is incremental; each slice ships with **thin UI**.
 |-------|-------------|
 | **S0** | This architecture + write matrix locked in docs — **done** |
 | **S1–S5 foundation** | Function-first implementation — see **`docs/multi-room-implementation-status.md`** |
-| **S1** | Project-room Master attach + stream mirror (detail: `room-session-attach-streaming.md`) — **partial/done foundation** |
+| **S1** | Project-room Master attach + native incremental input/output mirror (detail: `room-session-attach-streaming.md`) — **Done for resident Codex/Claude/Grok Project Master** |
 | **S2** | Session-ref inject API / seed + MODE_CHANGE·SessionStart hook — **Done** |
-| **S3** | Meeting room Skill create + multi-slot + stream + user interrupt — **room/slots done; live debate loop later** |
+| **S3** | Meeting room Skill create + multi-slot + stream + user interrupt — **room/slots done; imported participant native controls and live debate loop later** |
 | **S4** | Boss room API + user read-only + Worker report — **API done; TF auto-wire later** |
 | **S5** | Master attach into Boss + call-master — **API done; multi-Host jump later** |
 | **S6** | Dashboard from structured TF/room state + evidence links |

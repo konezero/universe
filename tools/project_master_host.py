@@ -83,6 +83,12 @@ class MasterProvider(Protocol):
 
     def reply(self, message: Mapping[str, Any]) -> str: ...
 
+    def reply_stream(
+        self,
+        message: Mapping[str, Any],
+        on_delta: Callable[[str], None],
+    ) -> str: ...
+
 
 class ContinuitySaver(Protocol):
     def save(
@@ -108,12 +114,15 @@ NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceCommitResolver = Callable[[Path], str]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
+NativeRoomObserver = Callable[[Mapping[str, Any]], None]
 
 
 class CommanderSurfaceObserver(Protocol):
     def prepare(self) -> Mapping[str, Any]: ...
 
     def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def observe_room_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 class ProjectModeCoordinator:
@@ -197,6 +206,31 @@ class ProjectModeCoordinator:
                 "mode": "MASTER",
                 "commander_surface": "UNIVERSE_UI",
                 "evidence_ref": (f"universe://project-room/messages/{message_id}"),
+            },
+        )
+        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
+            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
+        return result
+
+    def observe_room_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]:
+        room_id = _text(event.get("room_id"), "event.room_id")
+        room_event_id = _text(event.get("room_event_id"), "event.room_event_id")
+        message = event.get("message")
+        if not isinstance(message, Mapping) or message.get("author_role") != "USER":
+            raise ProjectMasterHostError("PROJECT_COMMANDER_ROOM_EVENT_INVALID")
+        result = self._invoke(
+            (
+                "mode-anchor",
+                "observe-commander-input",
+                "--repo-root",
+                str(self.project_root),
+            ),
+            {
+                "mode": "MASTER",
+                "commander_surface": "UNIVERSE_UI",
+                "evidence_ref": (
+                    f"universe://rooms/{room_id}/events/{room_event_id}"
+                ),
             },
         )
         if result.get("status") != "COMMANDER_INPUT_OBSERVED":
@@ -2047,6 +2081,14 @@ class ResidentModeSessionHost:
         provider: str,
         message: Mapping[str, Any],
     ) -> dict[str, Any]:
+        return self.reply_stream(provider, message, lambda _delta: None)
+
+    def reply_stream(
+        self,
+        provider: str,
+        message: Mapping[str, Any],
+        on_delta: Callable[[str], None],
+    ) -> dict[str, Any]:
         normalized_provider = _provider(provider)
         with self._lock:
             active = self._ensure(normalized_provider)
@@ -2061,7 +2103,11 @@ class ResidentModeSessionHost:
                 ),
             )
             try:
-                text = active.reply(message)
+                stream_reply = getattr(active, "reply_stream", None)
+                if callable(stream_reply):
+                    text = stream_reply(message, on_delta)
+                else:
+                    text = active.reply(message)
             except Exception as error:
                 if self._is_quota_exhaustion(error):
                     if not self._save_quota_continuity(active, normalized_provider):
@@ -2375,6 +2421,7 @@ class ProjectMasterConversationWorker:
         permission_poster: PermissionPoster = post_agent_permission_request,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
+        room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -2387,6 +2434,7 @@ class ProjectMasterConversationWorker:
         self.permission_poster = permission_poster
         self.completion_observer = completion_observer
         self.governance_context_resolver = governance_context_resolver
+        self.room_event_observer = room_event_observer
         self._last_completion: dict[str, Any] | None = None
         self._last_completion_at = 0.0
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -2417,6 +2465,29 @@ class ProjectMasterConversationWorker:
         if not self.store.register(normalized):
             return False
         self._queue.put(normalized)
+        return True
+
+    def submit_room_event(
+        self,
+        *,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+        bridge_id: str,
+    ) -> bool:
+        message = event.get("message")
+        if not isinstance(message, Mapping):
+            raise ProjectMasterHostError("NATIVE_ROOM_MESSAGE_INVALID")
+        room_event_id = _text(event.get("room_event_id"), "event.room_event_id")
+        if message.get("room_event_id") != room_event_id:
+            raise ProjectMasterHostError("NATIVE_ROOM_EVENT_ID_MISMATCH")
+        self._queue.put(
+            {
+                "_job_type": "ROOM_EVENT",
+                "binding": dict(binding),
+                "event": dict(event),
+                "bridge_id": _text(bridge_id, "bridge_id"),
+            }
+        )
         return True
 
     def wait_idle(self, timeout_seconds: float = 10.0) -> bool:
@@ -2459,7 +2530,10 @@ class ProjectMasterConversationWorker:
             try:
                 if envelope is None:
                     return
-                self._process(envelope)
+                if envelope.get("_job_type") == "ROOM_EVENT":
+                    self._process_room_event(envelope)
+                else:
+                    self._process(envelope)
             finally:
                 self._queue.task_done()
 
@@ -2565,6 +2639,88 @@ class ProjectMasterConversationWorker:
                 pass
         self._active_bridge_id = ""
         self._active_message_id = ""
+
+    def _process_room_event(self, job: Mapping[str, Any]) -> None:
+        binding = job["binding"]
+        event = job["event"]
+        message = event["message"]
+        room_id = _text(event.get("room_id"), "event.room_id")
+        room_event_id = _text(event.get("room_event_id"), "event.room_event_id")
+        binding_id = _text(binding.get("binding_id"), "binding.binding_id")
+        bridge_id = _text(job.get("bridge_id"), "bridge_id")
+        self._active_bridge_id = bridge_id
+        self._active_message_id = room_event_id
+        accepted = False
+
+        def observe(event_type: str, **values: Any) -> None:
+            if self.room_event_observer is None:
+                return
+            self.room_event_observer(
+                {
+                    "event": event_type,
+                    "project_id": self.project_id,
+                    "room_id": room_id,
+                    "room_event_id": room_event_id,
+                    "binding_id": binding_id,
+                    "provider_session_ref": self.provider.session_ref,
+                    **values,
+                }
+            )
+
+        def accept_once() -> None:
+            nonlocal accepted
+            if accepted:
+                return
+            accepted = True
+            observe("DELIVERY_ACCEPTED")
+
+        try:
+            runtime_context: Mapping[str, Any] = {}
+            if message.get("author_role") == "USER":
+                observe_room_event = getattr(
+                    self.surface_observer,
+                    "observe_room_event",
+                    None,
+                )
+                if not callable(observe_room_event):
+                    raise ProjectMasterHostError(
+                        "PROJECT_COMMANDER_ROOM_OBSERVER_UNAVAILABLE"
+                    )
+                runtime_context = _runtime_context(observe_room_event(event))
+            provider_message = {
+                "schema": "universe.native-room-input.v1",
+                "message_id": room_event_id,
+                "kind": "ROOM_MESSAGE",
+                "sender": message.get("author_role"),
+                "body": message.get("body_text"),
+                "runtime_context": dict(runtime_context),
+                "room_context": {
+                    "room_id": room_id,
+                    "room_sequence": event.get("room_sequence"),
+                    "correlation_id": event.get("correlation_id"),
+                },
+            }
+            stream_reply = getattr(self.provider, "reply_stream", None)
+
+            def on_delta(delta: str) -> None:
+                accept_once()
+                observe("DELTA", delta=str(delta))
+
+            if callable(stream_reply):
+                body = stream_reply(provider_message, on_delta)
+            else:
+                body = self.provider.reply(provider_message)
+            accept_once()
+            observe("COMPLETED", body=str(body))
+        except Exception as error:
+            observe(
+                "FAILED",
+                reason=f"{type(error).__name__}: {error}",
+                delivery_status="UNCERTAIN",
+            )
+        finally:
+            self._active_bridge_id = ""
+            self._active_message_id = ""
 
     def idle_completion(self, idle_seconds: float) -> Mapping[str, Any] | None:
         if (
@@ -2740,6 +2896,7 @@ class ResidentProjectMasterHandle:
     worker: ProjectMasterConversationWorker
     coordinator: CommanderSurfaceObserver
     thread: threading.Thread
+    bridge_id: str = ""
 
     def close(self) -> None:
         self.bridge_server.shutdown()
@@ -2769,6 +2926,7 @@ class ResidentProjectMasterHostManager:
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
+        room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
         self.universe_endpoint = universe_endpoint.rstrip("/")
         self.bridge_registrar = bridge_registrar
@@ -2779,6 +2937,7 @@ class ResidentProjectMasterHostManager:
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
         self.completion_observer = completion_observer
+        self.room_event_observer = room_event_observer
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
         self._lock = threading.RLock()
 
@@ -2866,6 +3025,7 @@ class ResidentProjectMasterHostManager:
                     )
                 ),
                 governance_context_resolver=self.governance_context_resolver,
+                room_event_observer=self.room_event_observer,
             )
             host = LiveProjectMasterBridgeHost(
                 project_root,
@@ -2908,6 +3068,9 @@ class ResidentProjectMasterHostManager:
                         ),
                     },
                 )
+                registered_bridge_id = bridge.get("bridge_id")
+                if isinstance(registered_bridge_id, str) and registered_bridge_id:
+                    handle.bridge_id = registered_bridge_id
             except Exception:
                 self._handles.pop(project_id, None)
                 handle.close()
@@ -2921,6 +3084,29 @@ class ResidentProjectMasterHostManager:
                 "session_preparation": preparation,
                 "session_connection": self._handle_connection(handle),
             }
+
+    def submit_room_event(
+        self,
+        project_id: str,
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> bool:
+        normalized = _text(project_id, "project_id")
+        with self._lock:
+            handle = self._handles.get(normalized)
+        if handle is None or not handle.thread.is_alive():
+            raise ProjectMasterHostError("PROJECT_MASTER_NATIVE_CONTROL_UNAVAILABLE")
+        if str(binding.get("provider") or "").upper() != handle.provider:
+            raise ProjectMasterHostError("PROJECT_MASTER_NATIVE_PROVIDER_MISMATCH")
+        if binding.get("provider_session_ref") != handle.worker.provider.session_ref:
+            raise ProjectMasterHostError("PROJECT_MASTER_NATIVE_SESSION_MISMATCH")
+        if not handle.bridge_id:
+            raise ProjectMasterHostError("PROJECT_MASTER_BRIDGE_ID_UNAVAILABLE")
+        return handle.worker.submit_room_event(
+            binding=binding,
+            event=event,
+            bridge_id=handle.bridge_id,
+        )
 
     def is_resident(self, project_id: str) -> bool:
         with self._lock:

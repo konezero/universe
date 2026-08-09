@@ -2974,6 +2974,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "text": "Conductor response",
                 }
 
+            def reply_stream(self, provider: str, message, on_delta):
+                self.calls.append((provider, message))
+                on_delta("Conductor ")
+                on_delta("response")
+                return {
+                    "provider": provider,
+                    "session_ref": "grok-acp:conductor-session-1",
+                    "connection_state": "REUSED",
+                    "requested_mode": "CONDUCTOR",
+                    "session_persistence": "LAST_COORDINATE",
+                    "text": "Conductor response",
+                }
+
             def close(self) -> None:
                 return
 
@@ -3033,6 +3046,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "CONDUCTOR",
             session_host.calls[0][1]["runtime_context"]["requested_mode"],
+        )
+        self.assertNotIn("history", session_host.calls[0][1]["runtime_context"])
+        stream_events = self.server.conductor_room_events.wait(
+            after_event_id=0,
+            timeout_seconds=0.01,
+        )
+        self.assertEqual(
+            ["STARTED", "DELTA", "DELTA", "COMPLETED"],
+            [item["payload"]["event"] for item in stream_events],
         )
 
     def test_project_master_call_prepares_master_session(self) -> None:
@@ -3546,6 +3568,78 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
         self.assertEqual("partial answer", events[0]["payload"]["delta"])
+
+    def test_multi_room_http_fans_out_one_event_and_records_native_result(
+        self,
+    ) -> None:
+        room = self.server.multi_rooms.ensure_project_room("native-http")
+        binding = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "thread-native-http",
+            },
+        )["binding"]
+        queued: list[dict[str, object]] = []
+        self.server.multi_room_native_controls.register(
+            binding["binding_id"],
+            provider="CODEX",
+            provider_session_ref="thread-native-http",
+            send_input=lambda _binding, event: queued.append(dict(event)) or True,
+        )
+
+        status, posted = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/messages",
+            {"author_role": "USER", "body_text": "incremental native input"},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("ROOM_MESSAGE_RECORDED", posted["status"])
+        self.assertEqual(1, len(queued))
+        room_event_id = posted["message"]["room_event_id"]
+        self.assertEqual(room_event_id, queued[0]["room_event_id"])
+        self.assertEqual(
+            "QUEUED",
+            posted["delivery"]["participants"][0]["blocker"]["status"],
+        )
+
+        base_observation = {
+            "project_id": "native-http",
+            "room_id": room["room_id"],
+            "room_event_id": room_event_id,
+            "binding_id": binding["binding_id"],
+            "provider_session_ref": "thread-native-http",
+        }
+        self.server._observe_native_room_event(
+            {"event": "DELIVERY_ACCEPTED", **base_observation}
+        )
+        self.server._observe_native_room_event(
+            {"event": "DELTA", "delta": "native ", **base_observation}
+        )
+        self.server._observe_native_room_event(
+            {"event": "COMPLETED", "body": "native answer", **base_observation}
+        )
+        self.server._observe_native_room_event(
+            {"event": "COMPLETED", "body": "duplicate", **base_observation}
+        )
+
+        snapshot = self.server.multi_rooms.room_snapshot(room["room_id"])
+        self.assertEqual(
+            ["incremental native input", "native answer"],
+            [message["body_text"] for message in snapshot["messages"]],
+        )
+        self.assertEqual(
+            1,
+            snapshot["participant_cursors"][0]["delivery_sequence"],
+        )
+        self.assertTrue(
+            snapshot["participant_cursors"][0]["provider_observation_cursor"].startswith(
+                "native-final-"
+            )
+        )
 
     def test_agent_permission_round_trip_uses_project_room_stream(self) -> None:
         class PermissionHost:

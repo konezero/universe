@@ -28,6 +28,9 @@ const state = {
   conductorPermissions: [],
   conductorRuntimeBinding: null,
   conductorRefreshInFlight: false,
+  conductorRoomStream: null,
+  conductorRoomStreamState: "IDLE",
+  conductorStreamReplies: {},
   todoDraftSourceKind: "USER",
   projectRoomStream: null,
   projectRoomStreamProjectId: null,
@@ -67,6 +70,11 @@ const state = {
   providerChatExpandedProjects: {},
   providerChatExpandedBranches: {},
   selectedProviderChatKey: null,
+  multiRooms: [],
+  activeMultiRoomId: null,
+  activeMultiRoomSnapshot: null,
+  multiRoomStream: null,
+  multiRoomLiveOutput: {},
   providerTailTimer: null,
   providerTailInFlight: false,
   conversationTarget: {
@@ -2480,6 +2488,15 @@ function renderRoomMessages() {
       }
       elements.roomMessageList.append(item);
     }
+    for (const stream of Object.values(state.conductorStreamReplies)) {
+      const item = node("article", "room-message conductor-message streaming");
+      item.append(
+        node("strong", "", "CONDUCTOR / LIVE"),
+        node("p", "", stream.body || stream.state || "Thinking"),
+        node("small", "", stream.state || "Responding")
+      );
+      elements.roomMessageList.append(item);
+    }
     for (const proposal of pendingProposals) {
       elements.roomMessageList.append(renderGovernanceProposalCard(proposal));
     }
@@ -3642,19 +3659,112 @@ async function refreshMultiRooms() {
 
 async function openMultiRoom(roomId) {
   state.activeMultiRoomId = roomId;
+  state.multiRoomLiveOutput = {};
   const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
-  if (elements.multiRoomDetail) {
-    const lines = [
-      snap.bridge_line || "",
-      `write_roles=${(snap.write_roles || []).join(",")}`,
-      `user_may_write=${snap.user_may_write}`,
-      `messages=${(snap.messages || []).length}`,
-      ...(snap.messages || []).slice(-5).map(
-        (m) => `${m.author_role}: ${m.body_text}`
-      ),
-    ];
-    elements.multiRoomDetail.textContent = lines.join("\n");
-  }
+  state.activeMultiRoomSnapshot = snap;
+  renderActiveMultiRoom();
+  openMultiRoomStream(roomId);
+}
+
+function renderActiveMultiRoom() {
+  const snap = state.activeMultiRoomSnapshot;
+  if (!snap || !elements.multiRoomDetail) return;
+  const cursors = snap.participant_cursors || [];
+  const lines = [
+    snap.bridge_line || "",
+    `write_roles=${(snap.write_roles || []).join(",")}`,
+    `user_may_write=${snap.user_may_write}`,
+    `events=${(snap.events || []).length}`,
+    ...cursors.map(
+      (cursor) =>
+        `${cursor.participant_state} ${cursor.binding_id}: delivered=${cursor.delivery_sequence}`
+    ),
+    ...Object.entries(state.multiRoomLiveOutput || {}).map(
+      ([bindingId, output]) => `LIVE ${bindingId}: ${output}`
+    ),
+    ...(snap.messages || []).slice(-5).map(
+      (message) => `${message.author_role}: ${message.body_text}`
+    ),
+  ];
+  elements.multiRoomDetail.textContent = lines.join("\n");
+}
+
+function closeMultiRoomStream() {
+  if (state.multiRoomStream) state.multiRoomStream.close();
+  state.multiRoomStream = null;
+}
+
+function openMultiRoomStream(roomId) {
+  closeMultiRoomStream();
+  const source = new EventSource(
+    `/v1/rooms/${encodeURIComponent(roomId)}/stream`
+  );
+  state.multiRoomStream = source;
+  source.addEventListener("snapshot", (event) => {
+    if (state.activeMultiRoomId !== roomId) return;
+    const payload = JSON.parse(event.data);
+    state.activeMultiRoomSnapshot = {
+      status: "ROOM_SNAPSHOT",
+      room: payload.room,
+      bindings: payload.bindings || [],
+      messages: payload.messages || [],
+      events: payload.events || [],
+      participant_cursors: payload.participant_cursors || [],
+      bridge_line: payload.bridge_line || "",
+      write_roles: state.activeMultiRoomSnapshot?.write_roles || [],
+      user_may_write: state.activeMultiRoomSnapshot?.user_may_write || false,
+    };
+    renderActiveMultiRoom();
+  });
+  source.addEventListener("room", (event) => {
+    if (state.activeMultiRoomId !== roomId) return;
+    const envelope = JSON.parse(event.data);
+    const payload = envelope.payload || {};
+    if (payload.type === "ROOM_MESSAGE" && payload.message) {
+      const snapshot = state.activeMultiRoomSnapshot || { messages: [], events: [] };
+      snapshot.messages = dedupeRoomMessages([
+        ...(snapshot.messages || []),
+        payload.message,
+      ]);
+      if (payload.room_event) {
+        const byId = new Map(
+          (snapshot.events || []).map((item) => [item.room_event_id, item])
+        );
+        byId.set(payload.room_event.room_event_id, payload.room_event);
+        snapshot.events = [...byId.values()].sort(
+          (left, right) => left.room_sequence - right.room_sequence
+        );
+      }
+      state.activeMultiRoomSnapshot = snapshot;
+      renderActiveMultiRoom();
+      return;
+    }
+    if (payload.type === "PARTICIPANT_DELTA") {
+      const bindingId = payload.binding_id || "provider";
+      const current = state.multiRoomLiveOutput[bindingId] || "";
+      state.multiRoomLiveOutput[bindingId] = `${current}${payload.delta || ""}`.slice(
+        -12000
+      );
+      renderActiveMultiRoom();
+      return;
+    }
+    if (
+      payload.type === "PARTICIPANT_COMPLETED" ||
+      payload.type === "PARTICIPANT_FAILED"
+    ) {
+      if (payload.binding_id) delete state.multiRoomLiveOutput[payload.binding_id];
+      renderActiveMultiRoom();
+      return;
+    }
+    api(`/v1/rooms/${encodeURIComponent(roomId)}`)
+      .then((snapshot) => {
+        if (state.activeMultiRoomId === roomId) {
+          state.activeMultiRoomSnapshot = snapshot;
+          renderActiveMultiRoom();
+        }
+      })
+      .catch(() => {});
+  });
 }
 
 async function createMeetingRoomThin() {
@@ -3961,6 +4071,61 @@ async function refreshConductorRoom() {
   } finally {
     state.conductorRefreshInFlight = false;
   }
+}
+
+function openConductorRoomStream() {
+  if (state.conductorRoomStream) return;
+  const source = new EventSource("/v1/conductor-room/stream");
+  state.conductorRoomStream = source;
+  state.conductorRoomStreamState = "CONNECTING";
+  source.addEventListener("conductor-room", (event) => {
+    let envelope;
+    try {
+      envelope = JSON.parse(event.data);
+    } catch (error) {
+      console.warn("Conductor Room stream payload is invalid", error);
+      return;
+    }
+    state.conductorRoomStreamState = "LIVE";
+    const payload = envelope.payload || {};
+    if (payload.type === "SNAPSHOT") {
+      state.conductorMessages = payload.messages || [];
+      state.conductorPermissions = payload.permissions || [];
+      state.conductorRuntimeBinding = payload.runtime_binding || null;
+      renderComposerState();
+      renderRoomMessages();
+      return;
+    }
+    if (payload.type !== "CONDUCTOR_STREAM" || !payload.message_id) return;
+    const key = payload.message_id;
+    if (payload.event === "COMPLETED") {
+      delete state.conductorStreamReplies[key];
+      window.setTimeout(refreshConductorRoom, 0);
+    } else if (payload.event === "FAILED") {
+      state.conductorStreamReplies[key] = {
+        body: state.conductorStreamReplies[key]?.body || "",
+        state: payload.detail || "Failed",
+      };
+    } else {
+      const current = state.conductorStreamReplies[key] || {
+        body: "",
+        state: "Thinking",
+      };
+      if (payload.event === "DELTA") {
+        current.body += payload.delta || "";
+        current.state = "Responding";
+      }
+      state.conductorStreamReplies[key] = current;
+    }
+    if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+      renderRoomMessages();
+    }
+  });
+  source.addEventListener("error", () => {
+    if (state.conductorRoomStream === source) {
+      state.conductorRoomStreamState = "RECONNECTING";
+    }
+  });
 }
 
 function closeProjectRoomStream() {
@@ -8493,6 +8658,6 @@ refreshLawStrip = function () {
 }
 
 bindEvents();
-refresh();
+refresh().finally(openConductorRoomStream);
 window.setInterval(refreshConductorRoom, 1200);
 state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);
