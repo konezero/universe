@@ -796,9 +796,13 @@ function renderProviderActivitySources() {
       node("span", "", `cursor ${source.cursor?.ordinal || 0}`),
       node("span", "", source.last_seen_at ? formatSessionTime(source.last_seen_at) : "not scanned")
     );
+    const sourceLabel =
+      source.source_path && source.source_path !== "REDACTED"
+        ? source.source_path
+        : "Local provider source";
     const reason = source.reason
       ? node("p", "session-path-line unbound", source.reason)
-      : node("p", "session-path-line bound", source.source_path || "local source");
+      : node("p", "session-path-line bound", sourceLabel);
     const actions = node("div", "session-card-actions");
     const scan = node("button", "secondary-button compact-action", "Scan now");
     scan.type = "button";
@@ -821,9 +825,11 @@ function renderProviderActivitySources() {
   }
 
   elements.providerActivityDiscovery.replaceChildren();
-  const registeredPaths = new Set(sources.map((source) => source.source_path));
+  const registeredSourceKeys = new Set(
+    sources.map((source) => source.source_key).filter(Boolean)
+  );
   const discovered = (state.providerActivityDiscoveries || []).filter(
-    (source) => !registeredPaths.has(source.source_path)
+    (source) => !registeredSourceKeys.has(source.source_key)
   );
   if (!discovered.length) return;
   elements.providerActivityDiscovery.append(

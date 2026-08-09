@@ -32,7 +32,13 @@ class ProjectIntegrationCatalogTests(unittest.TestCase):
         self.assertEqual(CATALOG_RELATIVE_ROOT.as_posix(), catalog["catalog_root"])
         self.assertEqual("LOCAL_ONLY", catalog["project_binding"]["workspace_tracking"])
         self.assertEqual(
-            ["connection", "node_memory", "project_binding", "todo_policy"],
+            [
+                "connection",
+                "install_binding",
+                "node_memory",
+                "project_binding",
+                "todo_policy",
+            ],
             sorted(template["template_id"] for template in catalog["templates"]),
         )
         self.assertEqual("NONE", catalog["effects"]["project_source_write"])
@@ -58,6 +64,17 @@ class ProjectIntegrationCatalogTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 ProjectIntegrationCatalogError,
                 "PROJECT_INTEGRATION_BINDING_INVALID",
+            ):
+                load_project_integration_catalog(root)
+            (catalog_root / "project-binding.example.json").write_bytes(
+                (ROOT / CATALOG_RELATIVE_ROOT / "project-binding.example.json").read_bytes()
+            )
+            (catalog_root / "install-binding.example.json").write_text(
+                json.dumps({"schema": "wrong"}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ProjectIntegrationCatalogError,
+                "PROJECT_INTEGRATION_INSTALL_BINDING_INVALID",
             ):
                 load_project_integration_catalog(root)
 
@@ -90,6 +107,18 @@ class ProjectIntegrationCatalogTests(unittest.TestCase):
         self.assertEqual(
             "GCS",
             json.loads(binding_content.decode("utf-8"))["project_id"],
+        )
+        install_binding_asset = next(
+            asset
+            for asset in proposal["assets"]
+            if asset["target_path"] == ".ai/universe/install_binding.json"
+        )
+        install_binding_content = base64.b64decode(
+            install_binding_asset["content_base64"]
+        )
+        self.assertEqual(
+            "GCS",
+            json.loads(install_binding_content.decode("utf-8"))["project_id"],
         )
         for asset in proposal["assets"]:
             content = base64.b64decode(asset["content_base64"])

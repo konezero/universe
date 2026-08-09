@@ -83,7 +83,7 @@ class ProjectIntegrationApplyTests(unittest.TestCase):
         self.assertEqual("PROJECT_INTEGRATION_APPLIED", receipt["status"])
         self.assertEqual("APPLIED", receipt["project_source_write"])
         self.assertEqual("APPLIED", receipt["project_runtime_state_write"])
-        self.assertEqual(4, len(gateway.calls))
+        self.assertEqual(5, len(gateway.calls))
         source_call = next(
             call
             for call in gateway.calls
@@ -128,7 +128,7 @@ class ProjectIntegrationApplyTests(unittest.TestCase):
 
         self.assertEqual("PROJECT_INTEGRATION_ALREADY_APPLIED", receipt["status"])
         self.assertEqual([], gateway.calls)
-        self.assertEqual(4, len(receipt["unchanged"]))
+        self.assertEqual(5, len(receipt["unchanged"]))
 
     def test_tampered_proposal_is_rejected_before_write(self) -> None:
         proposal = copy.deepcopy(self.proposal)

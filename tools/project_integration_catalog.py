@@ -17,6 +17,10 @@ CATALOG_RELATIVE_ROOT = Path("templates") / "project-integration"
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TEMPLATE_SPECS: Mapping[str, tuple[str, str]] = {
     "project_binding": ("project-binding.example.json", ".universe/project.json"),
+    "install_binding": (
+        "install-binding.example.json",
+        ".ai/universe/install_binding.json",
+    ),
     "todo_policy": ("TODO_TRACKING_POLICY.md", ".ai/universe/TODO_TRACKING_POLICY.md"),
     "connection": ("universe-connection.md", ".ai/universe/connection.md"),
     "node_memory": ("node-memory.md", ".ai/memory/universe_nodes/README.md"),
@@ -72,12 +76,50 @@ def _validate_project_binding(content: bytes) -> dict[str, Any]:
     return value
 
 
+def _validate_install_binding(content: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProjectIntegrationCatalogError(
+            "PROJECT_INTEGRATION_INSTALL_BINDING_INVALID"
+        ) from error
+    expected = {
+        "schema": "universe.install-binding.v1",
+        "install_mode": "UNIVERSE_ATTACHED",
+        "prefer_boot": "HOST",
+        "project_id": "<PROJECT_ID>",
+        "project_root": ".",
+        "runtime_pin": {
+            "kind": "CAREER_RELEASE_OR_HOST",
+            "release_id": None,
+            "manifest_digest": None,
+            "note": "Attached mode follows the installed Career Runtime and Universe host.",
+        },
+        "career_source": {"project_id": "ai-career", "role": "CAREER_SOURCE"},
+        "universe_host": {
+            "discovery": "LOCAL_SERVER_JSON",
+            "state_file_hint": "%LOCALAPPDATA%\\Universe\\server.json",
+        },
+        "standalone": {
+            "enabled": False,
+            "embed_runtime": False,
+            "boot_entry": None,
+        },
+    }
+    if value != expected:
+        raise ProjectIntegrationCatalogError(
+            "PROJECT_INTEGRATION_INSTALL_BINDING_INVALID"
+        )
+    return value
+
+
 def load_project_integration_catalog(root: Path | None = None) -> dict[str, Any]:
     """Load the Universe-owned catalog without materializing Project files."""
 
     catalog_root = _catalog_root(root)
     templates: list[dict[str, Any]] = []
     binding: dict[str, Any] | None = None
+    install_binding: dict[str, Any] | None = None
     digest_material: list[dict[str, str]] = []
     for template_id, (filename, target_path) in TEMPLATE_SPECS.items():
         content = _read_template(catalog_root, filename)
@@ -94,7 +136,9 @@ def load_project_integration_catalog(root: Path | None = None) -> dict[str, Any]
         digest_material.append({"template_id": template_id, "sha256": digest})
         if template_id == "project_binding":
             binding = _validate_project_binding(content)
-    if binding is None:
+        if template_id == "install_binding":
+            install_binding = _validate_install_binding(content)
+    if binding is None or install_binding is None:
         raise ProjectIntegrationCatalogError("PROJECT_INTEGRATION_BINDING_INVALID")
     catalog_digest = _sha256(
         json.dumps(
@@ -109,6 +153,7 @@ def load_project_integration_catalog(root: Path | None = None) -> dict[str, Any]
         "catalog_root": CATALOG_RELATIVE_ROOT.as_posix(),
         "catalog_digest": catalog_digest,
         "project_binding": binding,
+        "install_binding": install_binding,
         "templates": templates,
         "effects": {
             "project_source_write": "NONE",
@@ -134,8 +179,15 @@ def build_project_integration_proposal(
     binding_content = (
         json.dumps(binding, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
+    install_binding = dict(catalog["install_binding"])
+    install_binding["project_id"] = project_id
+    install_binding_content = (
+        json.dumps(install_binding, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
     payloads = {
         ".universe/project.json": binding_content,
+        ".ai/universe/install_binding.json": install_binding_content,
         ".ai/universe/TODO_TRACKING_POLICY.md": _read_template(
             catalog_root, "TODO_TRACKING_POLICY.md"
         ),

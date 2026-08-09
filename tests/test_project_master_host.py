@@ -38,6 +38,7 @@ from project_master_host import (  # noqa: E402
     ProjectMasterSessionStore,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
+    _project_master_system_prompt,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
@@ -360,16 +361,27 @@ class ProjectMasterHostTests(unittest.TestCase):
             requested_mode="MASTER",
         )
         self.assertEqual("NEW", state.observe_provider_session("GROK", "grok-1"))
+        anchored = state.observe_current_anchor("MASTER-CURRENT-GCS")
+        self.assertIsNotNone(anchored)
         self.assertEqual(
             "REPLACED", state.observe_provider_session("CODEX", "codex-1")
         )
         sessions = supervisor.list_sessions(node="GCS", mode="MASTER")
-        self.assertEqual(2, len(sessions))
+        self.assertEqual(1, len(sessions))
         self.assertEqual(
             ["CODEX"], [item["provider"] for item in sessions if item["is_default"]]
         )
+        self.assertEqual(2, len(sessions[0]["binding_history"]))
+        self.assertEqual("MASTER-CURRENT-GCS", sessions[0]["anchor_ref"])
+        self.assertEqual("CURRENT", sessions[0]["currentness"])
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
+
+    def test_project_master_prompt_inherits_primary_approval_for_task_frame(self) -> None:
+        prompt = _project_master_system_prompt("Project Master")
+        self.assertIn("not a second Commander decision", prompt)
+        self.assertIn("same commander_surface and evidence_ref", prompt)
+        self.assertIn("scope or boundary changes", prompt)
 
     def test_legacy_provider_coordinate_is_migrated_without_deletion(self) -> None:
         database = self.root / "legacy-state.sqlite"
@@ -899,7 +911,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
 
         self.assertEqual("PROJECT_INTEGRATION_APPLIED", receipt["status"])
-        self.assertEqual(4, len(self.surface_observer.mutations))
+        self.assertEqual(5, len(self.surface_observer.mutations))
         self.assertTrue((self.root / ".universe" / "project.json").is_file())
 
     def test_live_bridge_binds_skill_plan_context_idempotently(self) -> None:
@@ -1289,6 +1301,38 @@ class ProjectMasterHostTests(unittest.TestCase):
             f"universe://project-room/messages/{self._message_id()}",
             requests[1]["evidence_ref"],
         )
+
+    def test_project_mode_coordinator_preserves_runtime_error_code(self) -> None:
+        runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+
+        def runner(_request):
+            return NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="FAILED",
+                return_code=1,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {"error_code": "EXECUTION_ASSIGNMENT_CURRENTNESS_UNKNOWN"}
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "provider-session",
+            native_runner=runner,
+        )
+
+        with self.assertRaisesRegex(
+            ProjectMasterHostError,
+            "PROJECT_RUNTIME_COMMAND_FAILED:EXECUTION_ASSIGNMENT_CURRENTNESS_UNKNOWN",
+        ):
+            coordinator._invoke(("execution-binding", "propose"), {})
 
     def test_project_stop_denial_retains_process_and_refreshes_lease_version(
         self,

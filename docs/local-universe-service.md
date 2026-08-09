@@ -307,6 +307,11 @@ POST   /v1/dispatches/{dispatch_id}/start
 POST   /v1/dispatches/{dispatch_id}/result
 ```
 
+The local CLI also provides `python tools/universe_server.py work <project_root>
+--project-id <project_id>` as a read-only companion. It resolves host health,
+the project-local Career Runtime marker, and proposal state without registering
+or changing the Project.
+
 ## Todo work map
 
 Todo is durable planning state owned by Universe. It is not a Dispatch, Task
@@ -815,7 +820,7 @@ the exact `universe.project-integration-proposal.v1` for one registered
 Project, without storing or writing it.
 
 The proposal contains one tracked Project-source asset,
-`.universe/project.json`, and three local Runtime assets under `.ai/`. The
+`.universe/project.json`, and four local Runtime assets under `.ai/`. The
 apply route accepts only `APPROVED` with the current proposal ID and digest.
 Universe creates one exact approval evidence reference, then passes the
 unchanged proposal and scope-specific approval fields to the resident Project

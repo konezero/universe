@@ -10,6 +10,7 @@ Career Runtime package and do not grant Project execution authority.
 | Template | Installed or tracked target | Purpose |
 |---|---|---|
 | `project-binding.example.json` | `.universe/project.json` | Small tracked identity and installation-mode binding |
+| `install-binding.example.json` | `.ai/universe/install_binding.json` | Local attached/standalone boot preference |
 | `TODO_TRACKING_POLICY.md` | `.ai/universe/TODO_TRACKING_POLICY.md` | Universe host queue boundary |
 | `universe-connection.md` | local Universe connection metadata | Redacted Project-to-Universe publication boundary |
 | `node-memory.md` | `.ai/memory/universe_nodes/` | Node-attached local memory contract |
@@ -45,3 +46,8 @@ For a registered Project, `GET /v1/projects/<project_id>/integration-template-pr
 returns exact, digest-bound target assets before any write starts. The response
 separates the tracked `.universe/` asset from local `.ai/` assets and remains
 `NOT_STARTED` until the Project Lifecycle Host receives the applicable approval.
+
+`python tools/universe_server.py work <project_root> --project-id <project_id>`
+is the matching read-only preflight. It reports whether Career Runtime install,
+Project registration, or exact integration approval is the next operation; it
+does not materialize catalog assets.

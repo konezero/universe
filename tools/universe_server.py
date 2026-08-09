@@ -187,9 +187,7 @@ PROVIDER_SETTING_SCOPES = frozenset({"UNIVERSE_CONDUCTOR", "PROJECT_MASTER"})
 WORKER_BINDING_SCHEMA = "universe.worker-binding-profile.v1"
 WORKER_BINDING_RESOLUTION_SCHEMA = "universe.worker-binding-resolution.v1"
 WORKER_BINDING_SCOPES = frozenset({"UNIVERSE", "PROJECT"})
-WORKER_BINDING_ROLES = frozenset(
-    {"IMPLEMENTER", "REVIEWER", "QA", "SCOUT", "ROUTINE"}
-)
+WORKER_BINDING_ROLES = frozenset({"IMPLEMENTER", "REVIEWER", "QA", "SCOUT", "ROUTINE"})
 WORKER_BINDING_EFFORTS = frozenset({"AUTO", "LOW", "MEDIUM", "HIGH", "MAX"})
 PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
@@ -206,9 +204,7 @@ GOVERNANCE_APPROVAL_COMMANDS = frozenset(
         "approve",
     }
 )
-GOVERNANCE_PROPOSAL_DECISION_SCHEMA = (
-    "universe.governance-proposal-decision.v1"
-)
+GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
 SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA = (
     "universe.skill-observation-publication-approval.v1"
@@ -287,9 +283,7 @@ SKILL_FAILURE_KINDS = frozenset(
 SKILL_QUOTA_STATES = frozenset({"AVAILABLE", "WARNING", "EXHAUSTED", "UNKNOWN"})
 TODO_SCOPE_KINDS = frozenset({"UNIVERSE", "PROJECT", "NODE"})
 TODO_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
-TODO_STATES = frozenset(
-    {"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"}
-)
+TODO_STATES = frozenset({"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
 TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
@@ -311,9 +305,7 @@ DEFAULT_REFS = {
     "anchor_store": ".ai/runtime/anchor_store",
     "master_inbox": ".ai/inbox/MASTER",
 }
-NETWORK_ANCHOR_ROLES = frozenset(
-    {"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR"}
-)
+NETWORK_ANCHOR_ROLES = frozenset({"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR"})
 # Prefer first existing sibling folder name for Career source.
 CAREER_ROOT_CANDIDATES = ("ai-career", "career")
 DOCUMENT_ROLES = frozenset(
@@ -351,6 +343,8 @@ UNIVERSE_MODE_INTENTS = {
     "\ucee8\ub355\ud130": UNIVERSE_MODE,
     "\ucee8\ub355\ud130\ubaa8\ub4dc": UNIVERSE_MODE,
 }
+
+
 def default_mode_registry_path() -> Path:
     override = os.environ.get("UNIVERSE_MODE_REGISTRY")
     if override:
@@ -985,6 +979,47 @@ def _canonical_json(value: Any) -> str:
 
 def _json_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _canonical_provider_source_path(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.normpath(str(Path(text).resolve())))
+
+
+def _provider_source_key(value: Mapping[str, Any]) -> str:
+    identity = {
+        "provider": str(value.get("provider") or "UNKNOWN").upper(),
+        "provider_session_id": str(value.get("provider_session_id") or ""),
+        "source_path": _canonical_provider_source_path(value.get("source_path")),
+    }
+    return "provider_source_" + _json_sha256(identity)[:24]
+
+
+def _public_provider_source(value: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(value)
+    source["source_key"] = _provider_source_key(source)
+    source["provider_session_id"] = "REDACTED"
+    source["source_path"] = "REDACTED"
+    source["file_identity"] = None
+    return source
+
+
+def _public_provider_activity(value: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = (
+        "schema",
+        "activity_id",
+        "source_id",
+        "ordinal",
+        "event_kind",
+        "activity_state",
+        "observed_at",
+        "activity_digest",
+        "active",
+        "recorded_at",
+    )
+    return {key: value.get(key) for key in allowed}
 
 
 def _write_bytes_atomic(path: Path, content: bytes) -> None:
@@ -2980,9 +3015,8 @@ def normalize_conductor_ui_action(value: Any) -> dict[str, Any]:
         return {"schema": CONDUCTOR_ROOM_UI_ACTION_SCHEMA, "kind": "NONE"}
 
     if kind == "TODO_DRAFT":
-        if (
-            request.get("intent") is not None
-            or fresh_project_fields.intersection(request)
+        if request.get("intent") is not None or fresh_project_fields.intersection(
+            request
         ):
             raise UniverseError(
                 "CONDUCTOR_UI_ACTION_INVALID",
@@ -2997,9 +3031,7 @@ def normalize_conductor_ui_action(value: Any) -> dict[str, Any]:
         draft_request = _exact_object_fields(
             todo_value,
             field="conductor_todo_draft",
-            required=frozenset(
-                {"scope_kind", "title", "detail", "priority", "state"}
-            ),
+            required=frozenset({"scope_kind", "title", "detail", "priority", "state"}),
             optional=frozenset({"project_id", "node_ref"}),
         )
         scope_kind = _required_text(
@@ -3934,7 +3966,9 @@ class UniverseStore:
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.remote_access = RemoteAccessStore(self.database_path)
-        self.provider_session_observer = ProviderSessionObserverStore(self.database_path)
+        self.provider_session_observer = ProviderSessionObserverStore(
+            self.database_path
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -4678,9 +4712,10 @@ class UniverseStore:
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'cli_provider_setting'"
             ).fetchone()
-            if provider_table is not None and "CLAUDE" not in str(
-                provider_table["sql"]
-            ).upper():
+            if (
+                provider_table is not None
+                and "CLAUDE" not in str(provider_table["sql"]).upper()
+            ):
                 connection.execute(
                     "ALTER TABLE cli_provider_setting "
                     "RENAME TO cli_provider_setting_legacy"
@@ -4931,7 +4966,8 @@ class UniverseStore:
         model_ref = str(request.get("model_ref", "")).strip()
         if len(model_ref) > 256:
             raise UniverseError(
-                "WORKER_BINDING_MODEL_INVALID", "model_ref must be at most 256 characters"
+                "WORKER_BINDING_MODEL_INVALID",
+                "model_ref must be at most 256 characters",
             )
         effort = str(request.get("effort", "AUTO")).strip().upper()
         if effort not in WORKER_BINDING_EFFORTS:
@@ -5222,7 +5258,6 @@ class UniverseStore:
                 (str(raw), now),
             )
         return self.get_service_settings()
-
 
     def register_project(self, value: Any) -> tuple[dict[str, Any], bool]:
         project = normalize_registration(value)
@@ -5548,8 +5583,10 @@ class UniverseStore:
         issued_at = _observed_at(now or utc_now(), "issued_at")
         issued_datetime = _lease_timestamp(issued_at, "issued_at")
         expires_at = (
-            issued_datetime + timedelta(seconds=request["ttl_seconds"])
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            (issued_datetime + timedelta(seconds=request["ttl_seconds"]))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         with self._connection() as connection:
             project = self._project_for_connection(connection, project_id)
             active = connection.execute(
@@ -5560,9 +5597,9 @@ class UniverseStore:
                 (project["project_id"],),
             ).fetchone()
             if active is not None:
-                if _lease_timestamp(active["expires_at"], "expires_at") <= _lease_timestamp(
-                    issued_at, "issued_at"
-                ):
+                if _lease_timestamp(
+                    active["expires_at"], "expires_at"
+                ) <= _lease_timestamp(issued_at, "issued_at"):
                     self._expire_runtime_lease(connection, active, now=issued_at)
                 else:
                     raise UniverseError(
@@ -5686,9 +5723,9 @@ class UniverseStore:
             ).fetchone()
             fallback = _project_local_fallback(project)
             if row is not None and row["status"] == "ACTIVE":
-                if _lease_timestamp(row["expires_at"], "expires_at") <= _lease_timestamp(
-                    observed_at, "observed_at"
-                ):
+                if _lease_timestamp(
+                    row["expires_at"], "expires_at"
+                ) <= _lease_timestamp(observed_at, "observed_at"):
                     row, project, fallback = self._expire_runtime_lease(
                         connection, row, now=observed_at
                     )
@@ -5766,8 +5803,10 @@ class UniverseStore:
         observed_at = _observed_at(now or utc_now(), "renewed_at")
         observed_datetime = _lease_timestamp(observed_at, "renewed_at")
         expires_at = (
-            observed_datetime + timedelta(seconds=ttl_seconds)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            (observed_datetime + timedelta(seconds=ttl_seconds))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         with self._connection() as connection:
             project = self._project_for_connection(connection, project_id)
             row = connection.execute(
@@ -5780,9 +5819,11 @@ class UniverseStore:
                     "runtime lease is not bound to this project",
                     HTTPStatus.NOT_FOUND,
                 )
-            if row["status"] == "ACTIVE" and _lease_timestamp(
-                row["expires_at"], "expires_at"
-            ) <= observed_datetime:
+            if (
+                row["status"] == "ACTIVE"
+                and _lease_timestamp(row["expires_at"], "expires_at")
+                <= observed_datetime
+            ):
                 self._expire_runtime_lease(connection, row, now=observed_at)
                 row = connection.execute(
                     "SELECT * FROM shared_runtime_lease WHERE lease_id = ?",
@@ -5826,9 +5867,7 @@ class UniverseStore:
         )
         observed_at = _observed_at(now or utc_now(), "released_at")
         observed_datetime = _lease_timestamp(observed_at, "released_at")
-        reason = _required_text(
-            request.get("reason", "OPERATOR_RELEASE"), "reason"
-        )
+        reason = _required_text(request.get("reason", "OPERATOR_RELEASE"), "reason")
         with self._connection() as connection:
             project = self._project_for_connection(connection, project_id)
             row = connection.execute(
@@ -5841,9 +5880,11 @@ class UniverseStore:
                     "runtime lease is not bound to this project",
                     HTTPStatus.NOT_FOUND,
                 )
-            if row["status"] == "ACTIVE" and _lease_timestamp(
-                row["expires_at"], "expires_at"
-            ) <= observed_datetime:
+            if (
+                row["status"] == "ACTIVE"
+                and _lease_timestamp(row["expires_at"], "expires_at")
+                <= observed_datetime
+            ):
                 self._expire_runtime_lease(connection, row, now=observed_at)
                 raise UniverseError(
                     "RUNTIME_LEASE_NOT_ACTIVE",
@@ -6040,7 +6081,9 @@ class UniverseStore:
             )
         return event, True
 
-    def register_provider_session_source(self, value: Mapping[str, Any]) -> dict[str, Any]:
+    def register_provider_session_source(
+        self, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
         try:
             return self.provider_session_observer.register_source(value)
         except ProviderSessionObserverError as error:
@@ -6050,7 +6093,9 @@ class UniverseStore:
         try:
             return self.provider_session_observer.scan(source_id)
         except ProviderSessionObserverError as error:
-            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+            raise UniverseError(
+                error.code, error.detail, HTTPStatus.NOT_FOUND
+            ) from error
 
     def list_provider_session_sources(self) -> list[dict[str, Any]]:
         return self.provider_session_observer.list_sources()
@@ -6065,13 +6110,17 @@ class UniverseStore:
         try:
             return self.provider_session_observer.list_activities(source_id)
         except ProviderSessionObserverError as error:
-            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+            raise UniverseError(
+                error.code, error.detail, HTTPStatus.NOT_FOUND
+            ) from error
 
     def prepare_provider_activity_batch(self, source_id: str) -> dict[str, Any]:
         try:
             return self.provider_session_observer.build_batch_candidate(source_id)
         except ProviderSessionObserverError as error:
-            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+            raise UniverseError(
+                error.code, error.detail, HTTPStatus.NOT_FOUND
+            ) from error
 
     def record_provider_activity_memory(
         self, project_id: str, source_id: str
@@ -6674,9 +6723,7 @@ class UniverseStore:
                     "failure_kinds": {
                         state: 0 for state in sorted(SKILL_FAILURE_KINDS)
                     },
-                    "quota_states": {
-                        state: 0 for state in sorted(SKILL_QUOTA_STATES)
-                    },
+                    "quota_states": {state: 0 for state in sorted(SKILL_QUOTA_STATES)},
                     "metric_totals": {},
                     "first_observed_at": item["observed_at"],
                     "last_observed_at": item["observed_at"],
@@ -8272,7 +8319,11 @@ class UniverseStore:
         project = self.get_project(project_id)
         body = value if isinstance(value, dict) else {}
         limit = body.get("limit", 50)
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 200
+        ):
             raise UniverseError(
                 "EXPERIENCE_CASE_REQUEST_INVALID",
                 "limit must be an integer from 1 through 200",
@@ -8300,9 +8351,7 @@ class UniverseStore:
             if len(created_cases) + len(reused_cases) >= limit:
                 break
             skill = observation.get("skill") or {}
-            title = (
-                f"Case for {skill.get('skill_id') or observation_id}"
-            )
+            title = f"Case for {skill.get('skill_id') or observation_id}"
             case, created = self.create_experience_case(
                 project["project_id"],
                 {
@@ -8696,9 +8745,7 @@ class UniverseStore:
             proposals.append(proposal)
         return proposals
 
-    def create_project_memory(
-        self, project_id: str, value: Any
-    ) -> dict[str, Any]:
+    def create_project_memory(self, project_id: str, value: Any) -> dict[str, Any]:
         project = self.get_project(project_id)
         try:
             request = normalize_memory_create(value)
@@ -9094,9 +9141,7 @@ class UniverseStore:
                     "failure_kinds": {
                         state: 0 for state in sorted(SKILL_FAILURE_KINDS)
                     },
-                    "quota_states": {
-                        state: 0 for state in sorted(SKILL_QUOTA_STATES)
-                    },
+                    "quota_states": {state: 0 for state in sorted(SKILL_QUOTA_STATES)},
                     "skills": set(),
                     "models": set(),
                     "providers": set(),
@@ -9113,9 +9158,7 @@ class UniverseStore:
             group["validation_states"][item["validation_state"]] += 1
             group["failure_kinds"][execution_context["failure_kind"]] += 1
             group["quota_states"][execution_context["quota_state"]] += 1
-            group["skills"].add(
-                f"{skill['skill_id']}@{skill['skill_version']}"
-            )
+            group["skills"].add(f"{skill['skill_id']}@{skill['skill_version']}")
             group["models"].add(str(item["model_ref"] or "UNKNOWN"))
             group["providers"].add(provider_ref)
             group["projects"].add(str(item.get("project_id") or "UNKNOWN"))
@@ -9136,13 +9179,9 @@ class UniverseStore:
             succeeded = int(group["outcomes"].get("SUCCEEDED") or 0)
             failed = int(group["outcomes"].get("FAILED") or 0)
             decided = succeeded + failed
-            success_rate = (
-                round(succeeded / decided, 4) if decided else None
-            )
+            success_rate = round(succeeded / decided, 4) if decided else None
             samples = group.pop("duration_samples")
-            avg_duration = (
-                round(sum(samples) / len(samples), 2) if samples else None
-            )
+            avg_duration = round(sum(samples) / len(samples), 2) if samples else None
             comparisons.append(
                 {
                     "group_key": group["group_key"],
@@ -9928,10 +9967,7 @@ class UniverseStore:
                     "outcome": normalized_outcome,
                 }
             current_state = str(todo_row["state"])
-            if (
-                current_state == desired_state
-                or current_state in {"DONE", "BLOCKED"}
-            ):
+            if current_state == desired_state or current_state in {"DONE", "BLOCKED"}:
                 return {
                     "status": "TODO_TRANSITION_NOT_REQUIRED",
                     "project_id": normalized_project,
@@ -10308,9 +10344,7 @@ class UniverseStore:
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
         proposal_id = _identifier(proposal.get("proposal_id"), "proposal_id")
-        proposal_digest = _sha256(
-            proposal.get("proposal_digest"), "proposal_digest"
-        )
+        proposal_digest = _sha256(proposal.get("proposal_digest"), "proposal_digest")
         if proposal_digest != request["proposal_digest"]:
             raise UniverseError(
                 "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH",
@@ -10391,9 +10425,7 @@ class UniverseStore:
             )
         return self.get_governance_proposal_decision(decision_id), True
 
-    def get_governance_proposal_decision(
-        self, decision_id: str
-    ) -> dict[str, Any]:
+    def get_governance_proposal_decision(self, decision_id: str) -> dict[str, Any]:
         normalized = _identifier(decision_id, "decision_id")
         with self._connection() as connection:
             row = connection.execute(
@@ -12259,9 +12291,7 @@ class ConductorPermissionBridge:
                     "Conductor permission request does not exist",
                     HTTPStatus.NOT_FOUND,
                 )
-            if option_id not in {
-                option["optionId"] for option in record["options"]
-            }:
+            if option_id not in {option["optionId"] for option in record["options"]}:
                 raise UniverseError(
                     "AGENT_PERMISSION_OPTION_UNKNOWN",
                     "selected option is not offered by this request",
@@ -12344,8 +12374,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
             raise UniverseError(error.code, str(error)) from error
-        self.provider_model_catalog = provider_model_catalog or ProviderModelCatalogStore(
-            host_profile=self.host_profile
+        self.provider_model_catalog = (
+            provider_model_catalog
+            or ProviderModelCatalogStore(host_profile=self.host_profile)
         )
         try:
             self.provider_model_catalog.ensure_initialized()
@@ -12564,7 +12595,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
                 configuration = connector.get("configuration")
                 if isinstance(configuration, Mapping):
-                    public_base = str(configuration.get("public_base_url") or "").strip()
+                    public_base = str(
+                        configuration.get("public_base_url") or ""
+                    ).strip()
                     if public_base:
                         endpoint_url = public_base
             except Exception:  # noqa: BLE001 - optional source
@@ -12649,7 +12682,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             service = UniverseRendezvousService(config)
             service.start()
         except RendezvousClientError as error:
-            raise UniverseError(error.code, error.detail, error.status or 400) from error
+            raise UniverseError(
+                error.code, error.detail, error.status or 400
+            ) from error
         self.rendezvous_service = service
         self._rendezvous_start_error = None
         return self.rendezvous_status()
@@ -12676,7 +12711,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 else self.rendezvous_service.deny(request_id)
             )
         except RendezvousClientError as error:
-            raise UniverseError(error.code, error.detail, error.status or 400) from error
+            raise UniverseError(
+                error.code, error.detail, error.status or 400
+            ) from error
         return {
             "schema": API_SCHEMA,
             "status": "RENDEZVOUS_CONNECT_REQUEST_DECIDED",
@@ -12698,9 +12735,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         snapshot = self.store.remote_access.snapshot()
         # Surface last resume outcome + saved public URL when offline so UI is not empty.
         resume = self._remote_access_resume
-        if (
-            gateway.get("status") == "OFFLINE"
-            and isinstance(connector.get("configuration"), Mapping)
+        if gateway.get("status") == "OFFLINE" and isinstance(
+            connector.get("configuration"), Mapping
         ):
             public = str(
                 connector["configuration"].get("public_base_url") or ""
@@ -12911,11 +12947,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except RemoteAccessError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
 
-    def decide_remote_pairing(self, pairing_id: str, *, approve: bool) -> dict[str, Any]:
+    def decide_remote_pairing(
+        self, pairing_id: str, *, approve: bool
+    ) -> dict[str, Any]:
         try:
-            return self.store.remote_access.decide_pairing(
-                pairing_id, approve=approve
-            )
+            return self.store.remote_access.decide_pairing(pairing_id, approve=approve)
         except RemoteAccessError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
 
@@ -13088,14 +13124,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 database_path=Path(artifact["database_path"]),
                 manifest_path=Path(artifact["manifest_path"]),
             ) as runtime:
-                return runtime.select_governance_context({
-                    "role": "PROJECT_MASTER",
-                    "mode": "MASTER",
-                    "operation": "DELEGATE_TO_BOSS",
-                    "scope": "FEATURE",
-                    "risk": "GUARDED",
-                    "capability": "TASK_FRAME",
-                })
+                return runtime.select_governance_context(
+                    {
+                        "role": "PROJECT_MASTER",
+                        "mode": "MASTER",
+                        "operation": "DELEGATE_TO_BOSS",
+                        "scope": "FEATURE",
+                        "risk": "GUARDED",
+                        "capability": "TASK_FRAME",
+                    }
+                )
         except (ReleaseRuntimeError, OSError, sqlite3.Error) as error:
             raise ProjectMasterHostError(
                 f"PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE: {error}"
@@ -13485,13 +13523,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if self.conductor_session_host is None:
             return self.conductor_session_status()
         try:
-            provider = self._resolve_conductor_provider(
-                {"requested_provider": "AUTO"}
-            )
+            provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
             status = self.conductor_session_host.prepare(provider)
             self._conductor_session_error = None
             return status
-        except (AgentSessionError, OSError, ProjectMasterHostError, UniverseError) as error:
+        except (
+            AgentSessionError,
+            OSError,
+            ProjectMasterHostError,
+            UniverseError,
+        ) as error:
             self._conductor_session_error = {
                 "error_code": getattr(error, "code", type(error).__name__),
                 "reason": str(error),
@@ -13535,9 +13576,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "provider": provider,
                 "tool_status": tool_setting.get("status", "UNAVAILABLE"),
                 "executable": tool_setting.get("executable", "UNKNOWN"),
-                "model": capability.get(
-                    "model", tool_setting.get("model", "default")
-                ),
+                "model": capability.get("model", tool_setting.get("model", "default")),
                 "runtime_status": capability.get("status", "UNAVAILABLE"),
                 "cli_auto_approve": capability.get("cli_auto_approve", "UNKNOWN"),
                 "reason": capability.get("reason") or tool_setting.get("reason"),
@@ -13558,7 +13597,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "severity": "ACTION",
                         "target": provider,
                         "action": "VERIFY_PROVIDER_RUNTIME",
-                        "reason": str(provider_status["reason"] or "RUNTIME_UNAVAILABLE"),
+                        "reason": str(
+                            provider_status["reason"] or "RUNTIME_UNAVAILABLE"
+                        ),
                     }
                 )
             elif provider_status["cli_auto_approve"] == "UNKNOWN":
@@ -13581,7 +13622,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return {
             "schema": "universe.runtime-preflight.v1",
             "status": (
-                "READY" if required_ready and provider_ready else "CONFIGURATION_REQUIRED"
+                "READY"
+                if required_ready and provider_ready
+                else "CONFIGURATION_REQUIRED"
             ),
             "observed_at": utc_now(),
             "host_profile_path": profile.get("profile_path", "UNKNOWN"),
@@ -13595,7 +13638,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         continuity: list[dict[str, Any]] = []
         if self.continuity_coordinator is not None:
             for project in self.store.list_projects():
-                state = self.continuity_coordinator.status(Path(project["project_root"]))
+                state = self.continuity_coordinator.status(
+                    Path(project["project_root"])
+                )
                 continuity.append(
                     {
                         "project_id": project["project_id"],
@@ -13627,9 +13672,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             key=lambda item: str(item.get("updated_at") or ""),
             reverse=True,
         )
-        sessions = sorted(
-            sessions, key=lambda item: 0 if item.get("is_default") else 1
-        )
+        sessions = sorted(sessions, key=lambda item: 0 if item.get("is_default") else 1)
         sessions = sorted(
             sessions,
             key=lambda item: 0 if str(item.get("state") or "") == "LIVE" else 1,
@@ -13694,7 +13737,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if isinstance(item, Mapping)
             ]
         node = str(session.get("node") or "")
-        lease = session.get("process_lease") if isinstance(session.get("process_lease"), Mapping) else None
+        lease = (
+            session.get("process_lease")
+            if isinstance(session.get("process_lease"), Mapping)
+            else None
+        )
         lease_at = str((lease or {}).get("updated_at") or "") or None
         updated_at = str(session.get("updated_at") or "") or None
         created_at = str(session.get("created_at") or "") or None
@@ -13720,7 +13767,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             card["project_network_role"] = None
             # CONDUCTOR node is the app Mode session, not a registered project root.
             if node.upper() == "CONDUCTOR":
-                card["project_bind_note"] = "CONDUCTOR mode session (not a project root)"
+                card["project_bind_note"] = (
+                    "CONDUCTOR mode session (not a project root)"
+                )
             elif node:
                 card["project_bind_note"] = f"no registered project for node={node}"
             else:
@@ -13838,9 +13887,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "mode": str(session.get("mode") or "UNKNOWN"),
             "current_anchor_ref": current_anchor_ref,
         }
-        anchor_identity["anchor_key"] = "anchor_session_" + _json_sha256(
-            anchor_identity
-        )[:24]
+        anchor_identity["anchor_key"] = (
+            "anchor_session_" + _json_sha256(anchor_identity)[:24]
+        )
         anchor_alias = str(session.get("alias") or "").strip()
         anchor_alias = re.sub(
             r"\s+\|\s+(?:AUTO|CODEX|CLAUDE|GROK)\s*$",
@@ -13874,8 +13923,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "room_id": room_id,
             "lines": preview_lines,
             "tied_to_session": bool(preview_lines)
-            and preview_source
-            in {"MULTI_ROOM", "PROJECT_ROOM_DEFAULT"},
+            and preview_source in {"MULTI_ROOM", "PROJECT_ROOM_DEFAULT"},
         }
         return card
 
@@ -13895,7 +13943,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             (
                 str(source.get("provider") or "").upper(),
                 str(source.get("provider_session_id") or ""),
-                str(source.get("source_path") or ""),
+                _canonical_provider_source_path(source.get("source_path")),
             ): source
             for source in registered_sources
         }
@@ -13904,15 +13952,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for source in discovered:
             provider = str(source.get("provider") or "UNKNOWN").upper()
             provider_session_id = str(source.get("provider_session_id") or "")
-            source_path = str(source.get("source_path") or "")
+            source_path = _canonical_provider_source_path(source.get("source_path"))
             if not provider_session_id or not source_path:
                 continue
-            identity = {
-                "provider": provider,
-                "provider_session_id": provider_session_id,
-                "source_path": source_path,
-            }
-            chat_key = "provider_chat_" + _json_sha256(identity)[:24]
+            chat_key = "provider_chat_" + _provider_source_key(
+                {
+                    "provider": provider,
+                    "provider_session_id": provider_session_id,
+                    "source_path": source_path,
+                }
+            ).removeprefix("provider_source_")
             legacy_refs = {
                 provider_session_id,
                 Path(source_path).stem,
@@ -14331,7 +14380,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         return sorted(
             proposals,
-            key=lambda item: (item["created_at"], item["project_id"], item["proposal_id"]),
+            key=lambda item: (
+                item["created_at"],
+                item["project_id"],
+                item["proposal_id"],
+            ),
             reverse=True,
         )
 
@@ -14581,9 +14634,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 worker_message["runtime_context"] = {
                     "requested_mode": "CONDUCTOR",
                     "session_id": binding.get("session_id", "UNKNOWN"),
-                    "origin_anchor_ref": binding.get(
-                        "origin_anchor_ref", "UNKNOWN"
-                    ),
+                    "origin_anchor_ref": binding.get("origin_anchor_ref", "UNKNOWN"),
                     "origin_frame_id": binding.get("origin_frame_id", "UNKNOWN"),
                     "commander_surface": "UNIVERSE_UI",
                     "history": history[-50:],
@@ -14665,11 +14716,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )["provider"]
         if configured == "AUTO":
             configured = os.environ.get("UNIVERSE_CONDUCTOR_PROVIDER", "AUTO").upper()
-        selected = (
-            requested
-            if requested in {"GROK", "CODEX", "CLAUDE"}
-            else configured
-        )
+        selected = requested if requested in {"GROK", "CODEX", "CLAUDE"} else configured
         return self._resolve_configured_provider(selected, strict=True)
 
     def _resolve_project_master_provider(self, project_id: str) -> str:
@@ -15215,11 +15262,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/v1/session-observer/sources":
-            sources = self.server.store.list_provider_session_sources()
-            if self.headers.get("X-Universe-Access-Surface") == "REMOTE_BROWSER":
-                for source in sources:
-                    source["source_path"] = "REDACTED"
-                    source["file_identity"] = None
+            sources = [
+                _public_provider_source(source)
+                for source in self.server.store.list_provider_session_sources()
+            ]
             self._send(
                 HTTPStatus.OK,
                 {
@@ -15240,14 +15286,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             provider = (parse_qs(urlsplit(self.path).query).get("provider") or [""])[0]
             try:
+                sources = self.server.store.discover_provider_session_sources(provider)
+                for source in sources:
+                    source["source_key"] = _provider_source_key(source)
                 self._send(
                     HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
                         "status": "PROVIDER_SESSION_SOURCES_DISCOVERED",
-                        "sources": self.server.store.discover_provider_session_sources(
-                            provider
-                        ),
+                        "sources": sources,
                     },
                 )
             except UniverseError as error:
@@ -15270,9 +15317,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     {
                         "schema": API_SCHEMA,
                         "status": "PROVIDER_SESSION_ACTIVITIES_COLLECTED",
-                        "activities": self.server.store.list_provider_session_activities(
-                            source_id
-                        ),
+                        "activities": [
+                            _public_provider_activity(activity)
+                            for activity in self.server.store.list_provider_session_activities(
+                                source_id
+                            )
+                        ],
                     },
                 )
             except UniverseError as error:
@@ -15283,14 +15333,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         )
         if activity_batch is not None:
             try:
+                candidate = self.server.store.prepare_provider_activity_batch(
+                    unquote(activity_batch.group(1))
+                )
+                candidate_source = candidate.get("source")
+                if isinstance(candidate_source, Mapping):
+                    candidate = dict(candidate)
+                    candidate["source"] = {
+                        **candidate_source,
+                        "provider_session_id": "REDACTED",
+                    }
                 self._send(
                     HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
                         "status": "PROVIDER_ACTIVITY_BATCH_PREPARED",
-                        "candidate": self.server.store.prepare_provider_activity_batch(
-                            unquote(activity_batch.group(1))
-                        ),
+                        "candidate": candidate,
                     },
                 )
             except UniverseError as error:
@@ -16218,7 +16276,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            source_scan = re.fullmatch(r"/v1/session-observer/sources/([^/]+)/scan", path)
+            source_scan = re.fullmatch(
+                r"/v1/session-observer/sources/([^/]+)/scan", path
+            )
             if source_scan is not None:
                 result = self.server.store.scan_provider_session_source(
                     unquote(source_scan.group(1))
@@ -16645,9 +16705,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/runtime-lease/activate":
-                result = self.server.store.activate_shared_runtime_lease(
-                    parts[0], body
-                )
+                result = self.server.store.activate_shared_runtime_lease(parts[0], body)
                 self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
                 return
             if parts is not None and parts[1] == "/runtime-lease/renew":
@@ -17462,12 +17520,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         remainder = path[len(prefix) :]
         project_id, proposal_path = remainder.split(marker, 1)
         proposal_id = proposal_path[: -len(suffix)]
-        if (
-            not project_id
-            or "/" in project_id
-            or not proposal_id
-            or "/" in proposal_id
-        ):
+        if not project_id or "/" in project_id or not proposal_id or "/" in proposal_id:
             return None
         return unquote(project_id), unquote(proposal_id)
 
@@ -17545,7 +17598,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def _send_multi_room_error(self, error: MultiRoomError) -> None:
         self._send(
-            HTTPStatus(error.status) if error.status in {400, 403, 404, 409} else HTTPStatus.BAD_REQUEST,
+            HTTPStatus(error.status)
+            if error.status in {400, 403, 404, 409}
+            else HTTPStatus.BAD_REQUEST,
             {
                 "schema": API_SCHEMA,
                 "status": "ERROR",
@@ -17918,7 +17973,10 @@ def resolve_project_work_preflight(
                 "PROJECT_WORK_INSTALL_BINDING_INVALID",
                 "install_binding.json has an unsupported schema",
             )
-        if _project_id(str(install_binding.get("project_id") or "")) != normalized_project_id:
+        if (
+            _project_id(str(install_binding.get("project_id") or ""))
+            != normalized_project_id
+        ):
             raise UniverseError(
                 "PROJECT_WORK_PROJECT_ID_MISMATCH",
                 "install binding project_id does not match the selected Project",
@@ -17955,7 +18013,9 @@ def resolve_project_work_preflight(
             "status": "PRESENT" if install_binding is not None else "MISSING",
             "path": ".ai/universe/install_binding.json",
             "install_mode": (
-                install_binding.get("install_mode") if install_binding else "UNIVERSE_ATTACHED"
+                install_binding.get("install_mode")
+                if install_binding
+                else "UNIVERSE_ATTACHED"
             ),
             "prefer_boot": (
                 install_binding.get("prefer_boot") if install_binding else "HOST"
@@ -17968,7 +18028,9 @@ def resolve_project_work_preflight(
             {
                 "status": "PROJECT_REGISTRATION_REQUIRED",
                 "next_operation": "REGISTER_PROJECT_THROUGH_UNIVERSE",
-                "detail": proposal.get("detail", "Project is not registered in Universe"),
+                "detail": proposal.get(
+                    "detail", "Project is not registered in Universe"
+                ),
             }
         )
         return HTTPStatus.OK, response
@@ -18047,9 +18109,7 @@ def perform_session_ref_inject(
             "SESSION_INJECT_REQUEST_INVALID",
             "request body must be an object",
         )
-    normalized_provider = _required_text(
-        body.get("provider"), "provider"
-    ).upper()
+    normalized_provider = _required_text(body.get("provider"), "provider").upper()
     if normalized_provider not in {"CLAUDE", "CODEX", "GROK"}:
         raise UniverseError(
             "SESSION_PROVIDER_INVALID",
@@ -18080,9 +18140,10 @@ def perform_session_ref_inject(
             "room_id or project_id is required",
         )
     room_type = str(body.get("room_type") or "PROJECT").strip().upper() or "PROJECT"
-    slot_role = str(
-        body.get("slot_role") or body.get("role") or "MASTER"
-    ).strip().upper() or "MASTER"
+    slot_role = (
+        str(body.get("slot_role") or body.get("role") or "MASTER").strip().upper()
+        or "MASTER"
+    )
 
     # Resolve node/mode for Supervisor identity. Prefer explicit fields; else
     # project room MASTER → (project_id, MASTER).
@@ -18093,9 +18154,7 @@ def perform_session_ref_inject(
             room_type = str(room.get("room_type") or room_type).upper()
         except MultiRoomError:
             room = None
-    normalized_node = str(
-        body.get("node") or project_id or "CONDUCTOR"
-    ).strip()
+    normalized_node = str(body.get("node") or project_id or "CONDUCTOR").strip()
     if not normalized_node:
         normalized_node = "CONDUCTOR"
     normalized_mode = str(body.get("mode") or "MASTER").strip().upper() or "MASTER"
@@ -18133,8 +18192,7 @@ def perform_session_ref_inject(
             or "DISCONNECTED",
             "currentness": "UNKNOWN",
             "bounded_summary": str(
-                body.get("bounded_summary")
-                or "Harness inject of provider session ref"
+                body.get("bounded_summary") or "Harness inject of provider session ref"
             ).strip(),
         }
     )
@@ -18236,7 +18294,9 @@ def perform_session_ref_inject(
             dict(default_selection) if default_selection is not None else None
         ),
         "resident_runtime_reload": (
-            "REQUIRED" if make_default and default_selection is not None else "NOT_REQUIRED"
+            "REQUIRED"
+            if make_default and default_selection is not None
+            else "NOT_REQUIRED"
         ),
         "project_master": project_master,
         "authority": "UNASSIGNED",
@@ -18321,11 +18381,7 @@ def attach_supervisor_session(
     if make_default and not bool(session.get("is_default")):
         status, default_response = supervisor_transport.request_json(
             method="POST",
-            path=(
-                "/v1/supervisor/sessions/"
-                + quote(session_id, safe="")
-                + "/default"
-            ),
+            path=("/v1/supervisor/sessions/" + quote(session_id, safe="") + "/default"),
             payload={
                 "expected_pointer_version": session.get("default_pointer_version")
             },
@@ -18354,7 +18410,9 @@ def attach_supervisor_session(
             dict(default_selection) if default_selection is not None else None
         ),
         "resident_runtime_reload": (
-            "REQUIRED" if make_default and default_selection is not None else "NOT_REQUIRED"
+            "REQUIRED"
+            if make_default and default_selection is not None
+            else "NOT_REQUIRED"
         ),
     }
 
@@ -18650,20 +18708,14 @@ def parser() -> argparse.ArgumentParser:
         "status",
         help="Show local service PID/health from server.json",
     )
-    status_command.add_argument(
-        "--state-file", type=Path, default=default_state_path()
-    )
+    status_command.add_argument("--state-file", type=Path, default=default_state_path())
 
     start_command = commands.add_parser(
         "start",
         help="Start the local service in the background if it is not READY",
     )
-    start_command.add_argument(
-        "--state-file", type=Path, default=default_state_path()
-    )
-    start_command.add_argument(
-        "--database", type=Path, default=default_database_path()
-    )
+    start_command.add_argument("--state-file", type=Path, default=default_state_path())
+    start_command.add_argument("--database", type=Path, default=default_database_path())
     start_command.add_argument(
         "--mode-registry", type=Path, default=default_mode_registry_path()
     )
@@ -18742,9 +18794,7 @@ def parser() -> argparse.ArgumentParser:
     attach_session.set_defaults(make_default=True)
     attach_session.add_argument("--endpoint", default="")
     attach_session.add_argument("--token", default="")
-    attach_session.add_argument(
-        "--state-file", type=Path, default=default_state_path()
-    )
+    attach_session.add_argument("--state-file", type=Path, default=default_state_path())
 
     inject_session = commands.add_parser(
         "inject-session",
@@ -18779,9 +18829,7 @@ def parser() -> argparse.ArgumentParser:
     inject_session.set_defaults(make_default=None)
     inject_session.add_argument("--endpoint", default="")
     inject_session.add_argument("--token", default="")
-    inject_session.add_argument(
-        "--state-file", type=Path, default=default_state_path()
-    )
+    inject_session.add_argument("--state-file", type=Path, default=default_state_path())
 
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)

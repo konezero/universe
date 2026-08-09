@@ -745,7 +745,18 @@ class ProjectModeCoordinator:
         finally:
             request_path.unlink(missing_ok=True)
         if result.status != "COMPLETED" or result.return_code != 0:
-            raise ProjectMasterHostError("PROJECT_RUNTIME_COMMAND_FAILED")
+            runtime_code = "UNKNOWN"
+            try:
+                failure = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                failure = None
+            if isinstance(failure, Mapping):
+                candidate = failure.get("error_code") or failure.get("status")
+                if isinstance(candidate, str) and candidate.strip():
+                    runtime_code = candidate.strip().upper()
+            raise ProjectMasterHostError(
+                "PROJECT_RUNTIME_COMMAND_FAILED:" + runtime_code
+            )
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as error:
@@ -1052,6 +1063,30 @@ class ProjectMasterSessionStore:
                 )
         return state
 
+    def observe_current_anchor(self, anchor_ref: str) -> dict[str, Any] | None:
+        if self.session_supervisor is None:
+            return None
+        selected = next(
+            (
+                session
+                for session in self.session_supervisor.list_sessions(
+                    node=self.project_id,
+                    mode=self.requested_mode,
+                )
+                if session["is_default"]
+            ),
+            None,
+        )
+        if selected is None:
+            raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
+        if selected.get("anchor_ref") == anchor_ref:
+            return selected
+        return self.session_supervisor.bind_current_anchor(
+            selected["session_id"],
+            anchor_ref=anchor_ref,
+            expected_version=selected["row_version"],
+        )
+
     def _migrate_legacy_provider_sessions(self) -> None:
         current = self._legacy_provider_session()
         with self._connection() as connection:
@@ -1115,12 +1150,11 @@ class ProjectMasterSessionStore:
             )
 
     def _supervisor_session_id(self, provider: str, session_ref: str) -> str:
+        del provider, session_ref
         material = json.dumps(
             {
                 "node": self.project_id,
                 "mode": self.requested_mode,
-                "provider": provider,
-                "provider_session_ref": session_ref,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1458,6 +1492,13 @@ def _project_master_system_prompt(actor_label: str) -> str:
         "tool permission response is never that approval. After exact approval, use the "
         "installed Task Assignment and Execution Binding route; the approved Task "
         "Proposal evidence covers internal steps that remain within its unchanged scope. "
+        "A Task Frame execution Proposal derived from that approved Task Proposal is an "
+        "internal descendant, not a second Commander decision. Build its exact execution "
+        "approval by binding the generated Task Frame proposal_id and plan_digest to the "
+        "same commander_surface and evidence_ref from the primary approval packet, record "
+        "the parent proposal_id and proposal_digest as lineage, and continue without asking "
+        "the Commander again. If scope or boundary changes, stop and create a new primary "
+        "Task Proposal instead of inheriting approval. "
         "When both Task and Evidence require executable proof, "
         "request or attach the Session Boot executor with "
         "EXECUTABLE_PROOF_REQUIRED before execution. Invoke subordinate agents only as "
@@ -2741,6 +2782,10 @@ class ResidentProjectMasterHostManager:
                     provider.session_ref,
                 )
                 preparation = coordinator.prepare()
+                if self.session_supervisor is not None:
+                    store.observe_current_anchor(
+                        _mode_current_anchor_ref(preparation)
+                    )
             except Exception:
                 close_provider = getattr(provider, "close", None)
                 if callable(close_provider):
@@ -3167,6 +3212,20 @@ def _runtime_context(observation: Mapping[str, Any]) -> dict[str, str]:
             else "UNKNOWN"
         ),
     }
+
+
+def _mode_current_anchor_ref(preparation: Mapping[str, Any]) -> str:
+    anchor = preparation.get("mode_current_anchor")
+    stored = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
+    snapshot = (
+        stored.get("snapshot")
+        if isinstance(stored, Mapping) and isinstance(stored.get("snapshot"), Mapping)
+        else None
+    )
+    anchor_ref = snapshot.get("anchor_id") if isinstance(snapshot, Mapping) else None
+    if not isinstance(anchor_ref, str) or not anchor_ref.strip():
+        raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
+    return anchor_ref.strip()
 
 
 def _path_is_within(target: Path, root: Path) -> bool:

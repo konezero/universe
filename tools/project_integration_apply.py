@@ -16,6 +16,7 @@ INTEGRATION_APPROVAL_SCHEMA = "universe.project-integration-approval.v1"
 INTEGRATION_APPLY_RECEIPT_SCHEMA = "universe.project-integration-apply-receipt.v1"
 EXPECTED_ASSETS = {
     ".universe/project.json": "PROJECT_SOURCE",
+    ".ai/universe/install_binding.json": "LOCAL_RUNTIME",
     ".ai/universe/TODO_TRACKING_POLICY.md": "LOCAL_RUNTIME",
     ".ai/universe/connection.md": "LOCAL_RUNTIME",
     ".ai/memory/universe_nodes/README.md": "LOCAL_RUNTIME",

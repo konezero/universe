@@ -57,7 +57,7 @@ templates belong to Career.
 
 | Template family | Owner after migration | Consumer |
 |---|---|---|
-| `.universe/project.json`, project attach/standalone bootstrap, local `.ai` ignore rule, project root entry guidance | Universe | attached Project |
+| `.universe/project.json`, `.ai/universe/install_binding.json`, project attach/standalone bootstrap, local `.ai` ignore rule, project root entry guidance | Universe | attached Project |
 | Project Todo policy, Node Memory placement, Seed/document projection integration | Universe | attached Project |
 | Runtime package, Mode/Skill contracts, Execution Guard, lifecycle validator, release manifest | Career | Universe installer and local Project Runtime |
 | UUID manifest, discovery visibility, pairing request, route/relay configuration | Rendezvous | Universe application and remote browser |

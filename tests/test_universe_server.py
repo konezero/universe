@@ -626,7 +626,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         return value
 
     def test_runtime_host_uses_the_universe_database_for_failure_evidence(self) -> None:
-        evidence_store = self.server.runtime_host.worker_dispatcher.failure_evidence_store
+        evidence_store = (
+            self.server.runtime_host.worker_dispatcher.failure_evidence_store
+        )
         self.assertIsNotNone(evidence_store)
         self.assertEqual(
             self.server.store.database_path,
@@ -743,7 +745,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("TODOS_COLLECTED", list_result["status"])
         self.assertEqual(
-            ["Add boundary test", "Confirm broker contract", "Review nightly seed extraction"],
+            [
+                "Add boundary test",
+                "Confirm broker contract",
+                "Review nightly seed extraction",
+            ],
             [item["title"] for item in list_result["todos"]],
         )
         self.assertFalse(list_result["task_frame_created"])
@@ -813,7 +819,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("NONE", result["effects"]["project_source_write"])
         self.assertEqual(5, len(result["templates"]))
 
-    def test_project_integration_proposal_is_project_bound_and_non_executing(self) -> None:
+    def test_project_integration_proposal_is_project_bound_and_non_executing(
+        self,
+    ) -> None:
         self.server.store.register_project(self.registration())
 
         status, result = self.request(
@@ -865,11 +873,34 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertNotIn("private command", json.dumps(activities))
         self.assertNotIn("private completion", json.dumps(activities))
+        public_activity_keys = {
+            "schema",
+            "activity_id",
+            "source_id",
+            "ordinal",
+            "event_kind",
+            "activity_state",
+            "observed_at",
+            "activity_digest",
+            "active",
+            "recorded_at",
+        }
+        self.assertTrue(
+            all(
+                set(activity) <= public_activity_keys
+                for activity in activities["activities"]
+            )
+        )
+        self.assertNotIn("provider_event_id", json.dumps(activities))
+        self.assertNotIn("branch_parent_id", json.dumps(activities))
         status, batch = self.request(
             "GET", f"/v1/session-observer/sources/{source_id}/batch-candidate"
         )
         self.assertEqual(200, status)
         self.assertEqual("REVIEW_REQUIRED", batch["candidate"]["status"])
+        self.assertEqual(
+            "REDACTED", batch["candidate"]["source"]["provider_session_id"]
+        )
         status, recorded = self.request(
             "POST",
             f"/v1/session-observer/sources/{source_id}/record-memory",
@@ -887,8 +918,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {"project_id": "GCS"},
         )
         self.assertEqual(200, status)
-        self.assertEqual("PROVIDER_ACTIVITY_MEMORY_ALREADY_RECORDED", duplicate["status"])
+        self.assertEqual(
+            "PROVIDER_ACTIVITY_MEMORY_ALREADY_RECORDED", duplicate["status"]
+        )
         self.assertEqual(memory["memory_id"], duplicate["memory"]["memory_id"])
+        status, public_sources = self.request("GET", "/v1/session-observer/sources")
+        self.assertEqual(200, status)
+        self.assertEqual("REDACTED", public_sources["sources"][0]["source_path"])
+        self.assertEqual(
+            "REDACTED", public_sources["sources"][0]["provider_session_id"]
+        )
+        self.assertIsNone(public_sources["sources"][0]["file_identity"])
+        self.assertTrue(
+            public_sources["sources"][0]["source_key"].startswith("provider_source_")
+        )
         status, remote_sources = self.request(
             "GET",
             "/v1/session-observer/sources",
@@ -896,6 +939,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("REDACTED", remote_sources["sources"][0]["source_path"])
+        self.assertEqual(
+            public_sources["sources"][0]["source_key"],
+            remote_sources["sources"][0]["source_key"],
+        )
         status, denied = self.request(
             "POST",
             "/v1/session-observer/sources",
@@ -938,7 +985,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "GET", "/v1/session-observer/discover?provider=CODEX"
             )
             self.assertEqual(200, status)
-            self.assertEqual("PROVIDER_SESSION_SOURCES_DISCOVERED", discovered["status"])
+            self.assertEqual(
+                "PROVIDER_SESSION_SOURCES_DISCOVERED", discovered["status"]
+            )
             self.assertEqual([discovered_source], discovered["sources"])
             discover.assert_called_once_with("CODEX")
         status, remote_discovery = self.request(
@@ -1001,10 +1050,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "discover_provider_session_sources",
             side_effect=discovered,
         ):
-            status, catalog = self.request(
+            status, catalog = self.request("GET", "/v1/session-observer/chat-rooms")
+            repeated_status, repeated_catalog = self.request(
                 "GET", "/v1/session-observer/chat-rooms"
             )
         self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(HTTPStatus.OK, repeated_status)
         self.assertEqual(
             {"CODEX", "CLAUDE", "GROK"},
             {room["provider"] for room in catalog["rooms"]},
@@ -1012,15 +1063,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
         codex = next(room for room in catalog["rooms"] if room["provider"] == "CODEX")
         self.assertEqual("BOUND", codex["binding"]["state"])
         self.assertEqual("GCS", codex["binding"]["node"])
-        self.assertEqual("MASTER-CURRENT-GCS-001", codex["binding"]["current_anchor_ref"])
-        claude = next(
-            room for room in catalog["rooms"] if room["provider"] == "CLAUDE"
+        self.assertEqual(
+            "MASTER-CURRENT-GCS-001", codex["binding"]["current_anchor_ref"]
         )
+        claude = next(room for room in catalog["rooms"] if room["provider"] == "CLAUDE")
         self.assertEqual("UNBOUND", claude["binding"]["state"])
         rendered = json.dumps(catalog)
         self.assertNotIn("provider_session_id", rendered)
         self.assertNotIn("source_path", rendered)
+        self.assertNotIn("legacy_refs", rendered)
         self.assertEqual("EXCLUDED", catalog["transcript_content"])
+        self.assertEqual(
+            [room["chat_key"] for room in catalog["rooms"]],
+            [room["chat_key"] for room in repeated_catalog["rooms"]],
+        )
 
     def test_linked_project_master_result_advances_only_its_todo(self) -> None:
         self.server.store.register_project(self.registration())
@@ -1207,7 +1263,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("providerChatShowWorkers", script)
             self.assertIn("currentAnchorLabel", script)
             self.assertIn("dedupeRoomMessages", script)
-            self.assertIn('(?:AUTO|CODEX|CLAUDE|GROK)', script)
+            self.assertIn("(?:AUTO|CODEX|CLAUDE|GROK)", script)
             self.assertIn("/v1/settings/remote-access", script)
             self.assertIn("renderRemoteAccessSettings", script)
             self.assertIn("SSH_REVERSE_TUNNEL", script)
@@ -1280,9 +1336,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         with (
             patch("universe_server.gateway_status", return_value={"status": "OFFLINE"}),
-            patch("universe_server.connector_status", return_value={"status": "OFFLINE"}),
-            patch("universe_server.start_gateway", return_value=gateway) as start_gateway,
-            patch("universe_server.start_connector", return_value=connector) as start_connector,
+            patch(
+                "universe_server.connector_status", return_value={"status": "OFFLINE"}
+            ),
+            patch(
+                "universe_server.start_gateway", return_value=gateway
+            ) as start_gateway,
+            patch(
+                "universe_server.start_connector", return_value=connector
+            ) as start_connector,
         ):
             status, result = self.request(
                 "POST", "/v1/settings/remote-access/start", body
@@ -1399,9 +1461,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("GROK", defaults["universe_conductor"]["resolved_provider"])
         self.assertEqual(
             "UNAVAILABLE",
-            defaults["universe_conductor"]["session_connection"][
-                "connection_state"
-            ],
+            defaults["universe_conductor"]["session_connection"]["connection_state"],
         )
         self.assertEqual(
             "CONDUCTOR",
@@ -1577,7 +1637,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, audit = self.request("GET", "/v1/runtime/audit", token=self.token)
         self.assertEqual(HTTPStatus.OK, status)
         card = next(
-            item for item in audit["sessions"] if item["session_id"] == "session-gcs-master"
+            item
+            for item in audit["sessions"]
+            if item["session_id"] == "session-gcs-master"
         )
         self.assertEqual(
             "MASTER-CURRENT-GCS-001",
@@ -1696,9 +1758,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             },
         )
         self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
-        self.assertEqual(
-            "SUPERVISOR_CONTROL_TOKEN_REQUIRED", denied["error_code"]
-        )
+        self.assertEqual("SUPERVISOR_CONTROL_TOKEN_REQUIRED", denied["error_code"])
 
         status, registered = self.request(
             "POST",
@@ -1776,7 +1836,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("SESSION_BOOT_SERVE", observation["command_profile"])
         self.assertFalse(result["destructive_action_performed"])
 
-    def test_service_shutdown_endpoint_requires_auth_and_requests_clean_stop(self) -> None:
+    def test_service_shutdown_endpoint_requires_auth_and_requests_clean_stop(
+        self,
+    ) -> None:
         status, _ = self.request("POST", "/v1/service/shutdown", {})
         self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
         with patch.object(self.server, "shutdown") as shutdown:
@@ -1848,9 +1910,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         store = UniverseStore(database)
         self.assertEqual(
             "GROK",
-            store.provider_setting("UNIVERSE_CONDUCTOR", "CONDUCTOR")[
-                "provider"
-            ],
+            store.provider_setting("UNIVERSE_CONDUCTOR", "CONDUCTOR")["provider"],
         )
         updated = store.set_provider_setting(
             "UNIVERSE_CONDUCTOR",
@@ -1972,7 +2032,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(switched["last_session_ref"], restored["last_session_ref"])
         self.assertEqual("CONDUCTOR", restored["requested_mode"])
         self.assertTrue(restored["resident"])
-        self.assertTrue(all(instance.stopped for instance in FakeConductorRuntime.instances))
+        self.assertTrue(
+            all(instance.stopped for instance in FakeConductorRuntime.instances)
+        )
 
     def test_planning_runtime_binding_requires_currentness_observation(self) -> None:
         binding = {
@@ -2393,9 +2455,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 break
             time.sleep(0.02)
 
-        reply = next(
-            item for item in messages if item.get("in_reply_to") == message_id
-        )
+        reply = next(item for item in messages if item.get("in_reply_to") == message_id)
         self.assertEqual("Conductor response", reply["body"])
         self.assertEqual(
             "grok-acp:conductor-session-1",
@@ -2500,9 +2560,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
         self.assertEqual("FRESH_PROJECT_DRAFT", reply["ui_action"]["kind"])
-        self.assertEqual(
-            "Orbit Notes", reply["ui_action"]["intent"]["project"]
-        )
+        self.assertEqual("Orbit Notes", reply["ui_action"]["intent"]["project"])
         stored_reply = next(
             item
             for item in self.server.store.list_conductor_room_messages()
@@ -2623,7 +2681,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             normalize_project_attachment({"unsupported": True})
         self.assertEqual("PROJECT_ATTACHMENT_INVALID", context.exception.code)
 
-    def test_registration_exposes_attachment_and_preserves_origin_on_refresh(self) -> None:
+    def test_registration_exposes_attachment_and_preserves_origin_on_refresh(
+        self,
+    ) -> None:
         explicit = {
             "schema": "universe.project-attachment.v1",
             "install_origin": "UNIVERSE_CREATED",
@@ -2651,7 +2711,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(200, status)
-        self.assertEqual("UNIVERSE_CREATED", refreshed["project"]["attachment"]["install_origin"])
+        self.assertEqual(
+            "UNIVERSE_CREATED", refreshed["project"]["attachment"]["install_origin"]
+        )
         self.assertEqual("GCS", refreshed["project"]["project_id"])
         self.assertEqual(original_refs, refreshed["project"]["refs"])
         self.assertEqual({"label": "Trading Updated"}, refreshed["project"]["metadata"])
@@ -3150,9 +3212,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         packet = json.loads(approved["message"]["body"].splitlines()[-1])
         self.assertFalse(
-            packet["descendant_task_frame_policy"][
-                "commander_reapproval_required"
-            ]
+            packet["descendant_task_frame_policy"]["commander_reapproval_required"]
         )
         self.assertEqual(
             proposal["proposal_id"],
@@ -3172,9 +3232,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(200, status)
-        self.assertEqual(
-            "GOVERNANCE_PROPOSAL_ALREADY_APPROVED", repeated["status"]
-        )
+        self.assertEqual("GOVERNANCE_PROPOSAL_ALREADY_APPROVED", repeated["status"])
 
     def test_commander_text_approves_the_only_pending_task_proposal(self) -> None:
         proposal = self.create_task_proposal_fixture()
@@ -3249,11 +3307,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("UNIVERSE_UI", decision["commander_surface"])
         self.assertEqual(proposal["proposal_id"], decision["proposal_id"])
         messages = self.server.store.list_room_messages("GCS")
+        self.assertTrue(any(message["body"] == "\uc2b9\uc778" for message in messages))
         self.assertTrue(
-            any(message["body"] == "\uc2b9\uc778" for message in messages)
-        )
-        self.assertTrue(
-            any("descendant_task_frame_policy" in message["body"] for message in messages)
+            any(
+                "descendant_task_frame_policy" in message["body"]
+                for message in messages
+            )
         )
 
     def test_governance_proposal_decision_rejects_digest_mismatch(self) -> None:
@@ -3271,9 +3330,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(409, status)
-        self.assertEqual(
-            "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH", response["error_code"]
-        )
+        self.assertEqual("GOVERNANCE_PROPOSAL_DIGEST_MISMATCH", response["error_code"])
         self.assertTrue(self.server.wait_for_request_workers(timeout=1))
 
     def test_governance_approval_does_not_resolve_platform_permission(self) -> None:
@@ -5875,9 +5932,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("DEFAULT_AUTO", binding_snapshot["profile_id"])
         self.assertEqual(
             binding_snapshot,
-            self.server.runtime_host.request["context_pack"][
-                "worker_binding_snapshot"
-            ],
+            self.server.runtime_host.request["context_pack"]["worker_binding_snapshot"],
         )
         self.assertEqual(
             binding_snapshot["binding_digest"],
@@ -5964,8 +6019,12 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
         self.assertEqual("LEASE-HAPPY", lease["project_id"])
         self.assertIsNone(lease["selected_release_id"])
         self.assertNotIn("source_write", lease)
-        self.assertEqual("MANAGED", activated["project"]["attachment"]["universe_membership"])
-        self.assertEqual("UNIVERSE_SHARED", activated["project"]["attachment"]["runtime_host"])
+        self.assertEqual(
+            "MANAGED", activated["project"]["attachment"]["universe_membership"]
+        )
+        self.assertEqual(
+            "UNIVERSE_SHARED", activated["project"]["attachment"]["runtime_host"]
+        )
 
         inspected = self.store.inspect_shared_runtime_lease(
             "LEASE-HAPPY", now="2026-08-07T00:01:00Z"
@@ -5975,7 +6034,9 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
         listed = self.store.list_shared_runtime_leases(
             "LEASE-HAPPY", now="2026-08-07T00:01:00Z"
         )
-        self.assertEqual([lease["lease_id"]], [item["lease_id"] for item in listed["leases"]])
+        self.assertEqual(
+            [lease["lease_id"]], [item["lease_id"] for item in listed["leases"]]
+        )
 
         renewed = self.store.renew_shared_runtime_lease(
             "LEASE-HAPPY",
@@ -6000,8 +6061,12 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
         self.assertEqual("RELEASED", released["lease"]["status"])
         self.assertEqual("AVAILABLE", released["fallback"]["status"])
         self.assertEqual("PROJECT_LOCAL", released["fallback"]["runtime_host"])
-        self.assertEqual("LINKED", released["project"]["attachment"]["universe_membership"])
-        self.assertEqual("PROJECT_LOCAL", released["project"]["attachment"]["runtime_host"])
+        self.assertEqual(
+            "LINKED", released["project"]["attachment"]["universe_membership"]
+        )
+        self.assertEqual(
+            "PROJECT_LOCAL", released["project"]["attachment"]["runtime_host"]
+        )
 
         declared = self.register_project(
             "LEASE-DECLARED",
@@ -6023,7 +6088,9 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
         )
         self.assertEqual("UNHEALTHY", unhealthy["lease"]["status"])
         self.assertEqual("AVAILABLE", unhealthy["fallback"]["status"])
-        self.assertEqual("PROJECT_LOCAL", unhealthy["project"]["attachment"]["runtime_host"])
+        self.assertEqual(
+            "PROJECT_LOCAL", unhealthy["project"]["attachment"]["runtime_host"]
+        )
 
     def test_expiry_releases_to_linked_and_blocks_renewal(self) -> None:
         project = self.register_project("LEASE-EXPIRY")
@@ -6036,7 +6103,9 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
             project["project_id"], now="2026-08-07T00:01:01Z"
         )
         self.assertEqual("EXPIRED", expired["lease"]["status"])
-        self.assertEqual("LINKED", expired["project"]["attachment"]["universe_membership"])
+        self.assertEqual(
+            "LINKED", expired["project"]["attachment"]["universe_membership"]
+        )
         self.assertEqual("AVAILABLE", expired["fallback"]["status"])
         with self.assertRaises(UniverseError) as context:
             self.store.renew_shared_runtime_lease(
@@ -6063,8 +6132,12 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
         )
         self.assertEqual("UNAVAILABLE", unhealthy["fallback"]["status"])
         self.assertEqual("LOCAL_FALLBACK_NOT_DECLARED", unhealthy["fallback"]["reason"])
-        self.assertEqual("LINKED", unhealthy["project"]["attachment"]["universe_membership"])
-        self.assertEqual("UNIVERSE_SHARED", unhealthy["project"]["attachment"]["runtime_host"])
+        self.assertEqual(
+            "LINKED", unhealthy["project"]["attachment"]["universe_membership"]
+        )
+        self.assertEqual(
+            "UNIVERSE_SHARED", unhealthy["project"]["attachment"]["runtime_host"]
+        )
 
     def test_invalid_attachment_transitions_and_lease_inputs_are_rejected(self) -> None:
         detached = self.register_project(
@@ -6076,7 +6149,9 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
                 detached["project_id"],
                 self.activate_request(),
             )
-        self.assertEqual("RUNTIME_LEASE_ATTACHMENT_TRANSITION_INVALID", context.exception.code)
+        self.assertEqual(
+            "RUNTIME_LEASE_ATTACHMENT_TRANSITION_INVALID", context.exception.code
+        )
 
         linked = self.register_project("LEASE-INVALID")
         with self.assertRaises(UniverseError) as context:

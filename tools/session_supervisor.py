@@ -153,6 +153,10 @@ def _normalize_session_descriptor(value: Any) -> dict[str, Any]:
         "provider_session_ref": _optional_text(
             item.get("provider_session_ref"), "session.provider_session_ref"
         ),
+        "anchor_ref": _optional_text(
+            item.get("anchor_ref") or item.get("current_anchor_ref"),
+            "session.anchor_ref",
+        ),
         "alias": _optional_text(item.get("alias"), "session.alias"),
         "session_kind": session_kind,
         "state": state,
@@ -308,6 +312,7 @@ class SessionSupervisorStore:
                     mode TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     provider_session_ref TEXT,
+                    anchor_ref TEXT,
                     alias TEXT,
                     session_kind TEXT NOT NULL,
                     state TEXT NOT NULL,
@@ -374,15 +379,41 @@ class SessionSupervisorStore:
                 ON supervisor_event(session_id, occurred_at, event_id);
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(session_record)")
+            }
+            if "anchor_ref" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_record ADD COLUMN anchor_ref TEXT"
+                )
+            connection.execute(
+                """
+                UPDATE session_record AS record
+                SET alias = CASE
+                    WHEN record.node = record.mode THEN record.node
+                    ELSE record.node || ' ' || record.mode
+                END
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM session_binding_history AS history
+                    WHERE history.session_id = record.session_id
+                      AND record.alias = (
+                          CASE
+                              WHEN record.node = record.mode THEN record.node
+                              ELSE record.node || ' ' || record.mode
+                          END
+                      ) || ' | ' || history.provider
+                )
+                """
+            )
 
     @staticmethod
     def _default_alias(session: Mapping[str, Any]) -> str:
         node = str(session["node"])
         mode = str(session["mode"])
-        provider = str(session["provider"])
-        # Avoid "CONDUCTOR CONDUCTOR | CODEX" when node == mode.
-        head = node if node == mode else f"{node} {mode}"
-        return f"{head} | {provider}"
+        # Provider is replaceable transport, not part of the Anchor Session name.
+        return node if node == mode else f"{node} {mode}"
 
     @staticmethod
     def _event(
@@ -428,8 +459,6 @@ class SessionSupervisorStore:
                     for key in (
                         "node",
                         "mode",
-                        "provider",
-                        "provider_session_ref",
                         "session_kind",
                     )
                 }
@@ -440,13 +469,23 @@ class SessionSupervisorStore:
                         "session_id is already bound to a different identity",
                         status=409,
                     )
-                # Idempotent re-inject: refresh observation time so Observatory
-                # does not treat the card as frozen at first registration.
+                provider_changed = (
+                    material["provider"] != session["provider"]
+                    or material["provider_session_ref"]
+                    != session["provider_session_ref"]
+                )
                 summary = session.get("bounded_summary")
                 connection.execute(
                     """
                     UPDATE session_record
-                    SET updated_at = ?,
+                    SET provider = ?, provider_session_ref = ?,
+                        anchor_ref = COALESCE(?, anchor_ref),
+                        state = ?,
+                        currentness = CASE
+                            WHEN ? = 'UNKNOWN' THEN currentness
+                            ELSE ?
+                        END,
+                        updated_at = ?,
                         bounded_summary = CASE
                             WHEN ? IS NOT NULL AND TRIM(?) != '' THEN ?
                             ELSE bounded_summary
@@ -455,6 +494,12 @@ class SessionSupervisorStore:
                     WHERE session_id = ?
                     """,
                     (
+                        session["provider"],
+                        session["provider_session_ref"],
+                        session["anchor_ref"],
+                        session["state"],
+                        session["currentness"],
+                        session["currentness"],
                         now,
                         summary,
                         summary,
@@ -462,13 +507,35 @@ class SessionSupervisorStore:
                         session["session_id"],
                     ),
                 )
+                if provider_changed:
+                    connection.execute(
+                        """
+                        INSERT INTO session_binding_history(
+                            session_id, provider, provider_session_ref, mode, bound_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session["session_id"],
+                            session["provider"],
+                            session["provider_session_ref"],
+                            session["mode"],
+                            now,
+                        ),
+                    )
                 self._event(
                     connection,
                     session_id=session["session_id"],
-                    event_type="SESSION_REOBSERVED",
+                    event_type=(
+                        "PROVIDER_SESSION_REBOUND"
+                        if provider_changed
+                        else "SESSION_REOBSERVED"
+                    ),
                     prior_state=material.get("state"),
-                    state=material.get("state"),
-                    details={"source": "register_session_idempotent"},
+                    state=session["state"],
+                    details={
+                        "source": "register_session_idempotent",
+                        "provider_changed": provider_changed,
+                    },
                 )
                 row = connection.execute(
                     "SELECT * FROM session_record WHERE session_id = ?",
@@ -481,10 +548,11 @@ class SessionSupervisorStore:
             connection.execute(
                 """
                 INSERT INTO session_record(
-                    session_id, node, mode, provider, provider_session_ref, alias,
+                    session_id, node, mode, provider, provider_session_ref,
+                    anchor_ref, alias,
                     session_kind, state, currentness, bounded_summary,
                     row_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     session["session_id"],
@@ -492,6 +560,7 @@ class SessionSupervisorStore:
                     session["mode"],
                     session["provider"],
                     session["provider_session_ref"],
+                    session["anchor_ref"],
                     alias,
                     session["session_kind"],
                     session["state"],
@@ -533,6 +602,44 @@ class SessionSupervisorStore:
                     status=500,
                 )
             return self._session_material(connection, row), True
+
+    def bind_current_anchor(
+        self,
+        session_id: str,
+        *,
+        anchor_ref: Any,
+        expected_version: Any,
+    ) -> dict[str, Any]:
+        normalized_id = _required_text(session_id, "session_id")
+        normalized_anchor = _required_text(anchor_ref, "anchor_ref")
+        version = _non_negative_integer(expected_version, "expected_version")
+        now = utc_now()
+        with self._connection(immediate=True) as connection:
+            row = self._require_session(connection, normalized_id)
+            if int(row["row_version"]) != version:
+                raise SessionSupervisorError(
+                    "SESSION_VERSION_CONFLICT", "session row version changed", status=409
+                )
+            connection.execute(
+                """
+                UPDATE session_record
+                SET anchor_ref = ?, currentness = 'CURRENT',
+                    row_version = ?, updated_at = ?
+                WHERE session_id = ? AND row_version = ?
+                """,
+                (normalized_anchor, version + 1, now, normalized_id, version),
+            )
+            self._event(
+                connection,
+                session_id=normalized_id,
+                event_type="CURRENT_ANCHOR_BOUND",
+                prior_state=row["state"],
+                state=row["state"],
+                details={"anchor_ref": normalized_anchor},
+            )
+            return self._session_material(
+                connection, self._require_session(connection, normalized_id)
+            )
 
     def bind_provider_session(
         self,
@@ -1516,6 +1623,7 @@ class SessionSupervisorStore:
             "mode": row["mode"],
             "provider": row["provider"],
             "provider_session_ref": row["provider_session_ref"],
+            "anchor_ref": row["anchor_ref"],
             "alias": row["alias"],
             "session_kind": row["session_kind"],
             "state": row["state"],

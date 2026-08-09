@@ -42,6 +42,7 @@ class SessionSupervisorStoreTests(unittest.TestCase):
             "mode": "MASTER",
             "provider": "CODEX",
             "provider_session_ref": "provider-session-1",
+            "anchor_ref": "MASTER-CURRENT-GCS",
             "state": "REGISTERED",
             "currentness": "UNKNOWN",
         }
@@ -93,6 +94,7 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertNotIn("handshake_token", columns)
         self.assertIn("handshake_fingerprint", columns)
         self.assertIn("lease_token_sha256", columns)
+        self.assertIn("anchor_ref", columns)
 
     def test_only_persistent_mode_sessions_can_register(self) -> None:
         candidate = self.session()
@@ -122,7 +124,7 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertFalse(created_again)
         self.assertEqual(first["session_id"], second["session_id"])
-        self.assertEqual("GCS MASTER | CODEX", first["alias"])
+        self.assertEqual("GCS MASTER", first["alias"])
 
         conflict = self.session()
         conflict["mode"] = "CONDUCTOR"
@@ -145,6 +147,67 @@ class SessionSupervisorStoreTests(unittest.TestCase):
                 alias="Stale Alias",
                 expected_version=session["row_version"],
             )
+
+    def test_provider_rebind_preserves_anchor_session_identity(self) -> None:
+        first, created = self.store.register_session(self.session())
+        replacement = self.session()
+        replacement["provider"] = "CLAUDE"
+        replacement["provider_session_ref"] = "claude-thread-2"
+        rebound, created_again = self.store.register_session(replacement)
+
+        self.assertTrue(created)
+        self.assertFalse(created_again)
+        self.assertEqual(first["session_id"], rebound["session_id"])
+        self.assertEqual(first["anchor_ref"], rebound["anchor_ref"])
+        self.assertEqual("CLAUDE", rebound["provider"])
+        self.assertEqual(2, len(rebound["binding_history"]))
+
+        anchored = self.store.bind_current_anchor(
+            rebound["session_id"],
+            anchor_ref="MASTER-CURRENT-GCS-NEXT",
+            expected_version=rebound["row_version"],
+        )
+        self.assertEqual("MASTER-CURRENT-GCS-NEXT", anchored["anchor_ref"])
+        self.assertEqual("CURRENT", anchored["currentness"])
+
+    def test_initialize_migrates_only_legacy_provider_aliases(self) -> None:
+        legacy, _ = self.store.register_session(self.session("legacy-alias"))
+        replacement = self.session("legacy-alias")
+        replacement["provider"] = "CLAUDE"
+        replacement["provider_session_ref"] = "claude-thread-2"
+        self.store.register_session(replacement)
+        custom, _ = self.store.register_session(self.session("custom-alias"))
+        connection = sqlite3.connect(self.database)
+        try:
+            connection.execute(
+                "UPDATE session_record SET alias = ? WHERE session_id = ?",
+                ("GCS MASTER | CODEX", legacy["session_id"]),
+            )
+            connection.execute(
+                "UPDATE session_record SET alias = ? WHERE session_id = ?",
+                ("GCS MASTER | Operations", custom["session_id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened = SessionSupervisorStore(
+            self.database,
+            process_observer=lambda pid, created: {
+                "status": "PROCESS_PRESENT_EXACT",
+                "pid": pid,
+                "process_created_at": created,
+            },
+        )
+
+        self.assertEqual(
+            "GCS MASTER",
+            reopened.get_session(legacy["session_id"])["alias"],
+        )
+        self.assertEqual(
+            "GCS MASTER | Operations",
+            reopened.get_session(custom["session_id"])["alias"],
+        )
 
     def test_default_pointer_is_provider_neutral_and_uses_cas(self) -> None:
         first, _ = self.store.register_session(self.session("session-one"))

@@ -241,6 +241,32 @@ universe work .
 
 ---
 
+### Current preflight implementation
+
+The local service now provides the non-mutating half of this command:
+
+```text
+python tools/universe_server.py work <project_root> [--project-id <PROJECT_ID>]
+```
+
+It reads the host state, installed Runtime marker, Project binding, and the
+exact integration proposal. It never registers a Project, writes `.universe/`
+or `.ai/`, starts a Runtime, or consumes an approval. Its result is one of:
+
+- `UNIVERSE_WORK_READY` — host and local install binding agree; work may use
+  the host with the returned `cwd` and `project_id`.
+- `CAREER_OS_INSTALL_REQUIRED` — the Project has no local Career Runtime
+  installation yet.
+- `PROJECT_INTEGRATION_APPROVAL_REQUIRED` — the exact Universe integration
+  proposal must be approved and applied by the Project Lifecycle Host.
+- `PROJECT_REGISTRATION_REQUIRED` or `UNIVERSE_HOST_NOT_READY` — attach has
+  not reached a usable host state.
+
+The full product alias may later add explicit `ensure-host` and approved apply
+steps, but it must retain this preflight boundary.
+
+---
+
 ## 6. What lives where (fixed inventory)
 
 ### Always project-local
