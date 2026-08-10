@@ -8,8 +8,15 @@ Progress at 2026-08-10:
 
 - Runtime streaming payload store, receipt descriptor binding, byte-splice apply,
   CLI transport, compatibility path, failure cleanup, and 233-test Runtime
-  regression: complete in the clean ai-career PR269 worktree; immutable commit
-  and OS_UPDATE remain pending.
+  regression: complete in immutable ai-career commit
+  `1b882d40842abc93646745bc62b95c7f82e465e7`.
+- Universe OS_UPDATE: PASS / VERIFIED with lifecycle receipt
+  `host-runtime-lifecycle-8a4a393a364d2992a10aeddd` and validation ID
+  `16ba3f04db51353cb47e3c3c4799ab589b7331569bdd255ffa4b53e578635ca9`.
+- Live dogfood: a MODIFY whose Base64 postimage exceeded the former 1 MiB
+  request cap and a 1,245,184-byte CREATE both applied successfully. Interrupted
+  upload, wrong digest, stale preimage, expired receipt, receipt and payload
+  replay, and payload cleanup all failed closed without target residue.
 - Universe connection/auth/HTTP transport and SSE hubs: extracted behind the
   compatibility entrypoint with dedicated unit contracts.
 - Regression tiers: changed 0.29 seconds / 12 tests, smoke 1.36 seconds / 16

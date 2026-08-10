@@ -219,7 +219,7 @@ Approved plan: `docs/p0-receipt-streaming-and-server-modularization.md`.
 - [x] Add bounded Runtime-owned streaming payload staging and opaque content references in the clean PR269 worktree.
 - [x] Bind Mutation Receipts after upload to payload kind, opaque ref, digest, size, target, preimage, and expected postimage.
 - [x] Make exact byte-splice patch the default text MODIFY path; retain streamed full content for CREATE and fallback.
-- [ ] Commit the Runtime source, OS_UPDATE Universe, and dogfood large CREATE/MODIFY, interrupted streams, digest mismatch, stale preimage, expiry, replay, and cleanup.
+- [x] Commit Runtime source `1b882d40842abc93646745bc62b95c7f82e465e7`, OS_UPDATE Universe (PASS/VERIFIED; validation `16ba3f04d...`), and dogfood large CREATE/MODIFY, interrupted streams, digest mismatch, stale preimage, expiry, replay, and cleanup.
 - [ ] Continue extracting `tools/universe_server.py`; connection/auth/HTTP transport and SSE hubs are complete, while storage/services/API/runtime/CLI remain.
 - [x] Add changed-module, smoke, API/DB contract, and full regression tiers (12/16/64/566 tests; all passed on 2026-08-10).
 - [ ] Add scheduled real-Provider, browser, restart, quota, and long-running dogfood tiers.
