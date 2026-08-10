@@ -17,13 +17,14 @@ Progress at 2026-08-10:
   request cap and a 1,245,184-byte CREATE both applied successfully. Interrupted
   upload, wrong digest, stale preimage, expired receipt, receipt and payload
   replay, and payload cleanup all failed closed without target residue.
-- Universe connection/auth/HTTP transport and SSE hubs: extracted behind the
-  compatibility entrypoint with dedicated unit contracts.
-- Regression tiers: changed 0.29 seconds / 12 tests, smoke 1.36 seconds / 16
-  tests, contract 8.31 seconds / 64 tests, and full 296.77 seconds / 566 tests;
+- Universe connection/auth/HTTP transport, SSE hubs, and Memory batch
+  configuration service: extracted behind the compatibility entrypoint with
+  dedicated unit contracts.
+- Regression tiers: changed 0.29 seconds / 15 tests, smoke 1.36 seconds / 16
+  tests, contract 8.39 seconds / 67 tests, and full 303.36 seconds / 569 tests;
   all passed on the dogfood Host.
-- Remaining extraction: Memory/Bench, Session/Provider, storage, API routes, and
-  CLI/bootstrap boundaries.
+- Remaining extraction: Memory execution/Bench, Session/Provider, storage, API
+  routes, and CLI/bootstrap boundaries.
 
 ## Problem
 

@@ -35,6 +35,7 @@ class TestTierManifestTests(unittest.TestCase):
                 "tests.test_universe_connection",
                 "tests.test_universe_streaming",
                 "tests.test_universe_server.UniverseWorkPreflightTests",
+                "tests.test_memory_batch_service",
             ],
             names,
         )

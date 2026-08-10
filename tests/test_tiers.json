@@ -14,7 +14,8 @@
         "tools/universe_server.py": [
           "tests.test_universe_connection",
           "tests.test_universe_streaming",
-          "tests.test_universe_server.UniverseWorkPreflightTests"
+          "tests.test_universe_server.UniverseWorkPreflightTests",
+          "tests.test_memory_batch_service"
         ],
         "tests/test_universe_connection.py": [
           "tests.test_universe_connection"
@@ -24,6 +25,12 @@
         ],
         "tests/test_universe_streaming.py": [
           "tests.test_universe_streaming"
+        ],
+        "tools/universe_app/memory_batch_service.py": [
+          "tests.test_memory_batch_service"
+        ],
+        "tests/test_memory_batch_service.py": [
+          "tests.test_memory_batch_service"
         ]
       }
     },
@@ -46,7 +53,8 @@
         "tests.test_multi_room.MultiRoomStoreTests",
         "tests.test_memory_fast_extract.FastExtractContractTests",
         "tests.test_remote_access.RemoteAccessStoreTests",
-        "tests.test_session_supervisor.SessionSupervisorStoreTests"
+        "tests.test_session_supervisor.SessionSupervisorStoreTests",
+        "tests.test_memory_batch_service"
       ]
     },
     "full": {
