@@ -77,6 +77,8 @@ const state = {
   selectedProviderChatKey: null,
   /** Ephemeral redacted provider text keyed by opaque provider chat key. */
   providerLiveDeltas: {},
+  /** Last delivery mode observed for each opaque provider chat key. */
+  providerLiveDelivery: {},
   multiRooms: [],
   activeMultiRoomId: null,
   activeMultiRoomSnapshot: null,
@@ -643,26 +645,57 @@ function renderSelectedSessionDetail() {
           "Shared project chat is intentionally not shown (avoids identical previews)."
       )
     );
-    return;
-  }
-  preview.append(
-    node(
-      "small",
-      "session-preview-source",
-      `Preview · ${session.preview?.source || "UNKNOWN"} · match ${session.preview?.match || "?"}`
-    )
-  );
-  for (const line of lines.slice(-2)) {
-    const row = node("div", "session-preview-line");
-    row.append(
-      node("strong", "", line.author_role || "?"),
-      node("span", "", String(line.text || "").replace(/\s+/g, " ").trim())
+  } else {
+    preview.append(
+      node(
+        "small",
+        "session-preview-source",
+        `Preview · ${session.preview?.source || "UNKNOWN"} · match ${session.preview?.match || "?"}`
+      )
     );
-    if (line.created_at) {
-      row.append(node("time", "", formatSessionTime(line.created_at)));
+    for (const line of lines.slice(-2)) {
+      const row = node("div", "session-preview-line");
+      row.append(
+        node("strong", "", line.author_role || "?"),
+        node("span", "", String(line.text || "").replace(/\s+/g, " ").trim())
+      );
+      if (line.created_at) {
+        row.append(node("time", "", formatSessionTime(line.created_at)));
+      }
+      preview.append(row);
     }
-    preview.append(row);
   }
+
+  detail.querySelector(".session-detail-live")?.remove();
+  const room = providerChatRoomForSupervisorSession(session);
+  if (!room) return;
+
+  const live = node("section", "session-detail-live");
+  const heading = node("div", "session-detail-live-heading");
+  heading.append(
+    node("strong", "", "Live provider output"),
+    node("span", "", String(room.provider || "UNKNOWN").toUpperCase())
+  );
+  live.append(heading);
+
+  const feed = node("div", "session-detail-live-feed");
+  const deltas = state.providerLiveDeltas[room.chat_key] || [];
+  if (!deltas.length) {
+    feed.append(
+      node("p", "session-detail-live-empty", providerLiveDeliveryLabel(room))
+    );
+  } else {
+    for (const delta of deltas.slice(-10)) {
+      const line = node("article", "session-detail-live-line");
+      line.append(
+        node("small", "", String(delta.role || "UNKNOWN")),
+        node("p", "", String(delta.text || ""))
+      );
+      feed.append(line);
+    }
+  }
+  live.append(feed);
+  detail.append(live);
 }
 
 
@@ -741,6 +774,9 @@ async function tailProviderSessions() {
         (item) => String(item.source_id || "") === sourceId
       );
       if (!room) continue;
+      state.providerLiveDelivery[room.chat_key] = String(
+        delta.delivery || "UNKNOWN"
+      );
       const existing = state.providerLiveDeltas[room.chat_key] || [];
       const known = new Set(existing.map((item) => item.excerpt_id));
       const fresh = (delta.deltas || []).filter(
@@ -752,6 +788,7 @@ async function tailProviderSessions() {
     }
     renderSessionRail();
     renderProviderChatSummary();
+    renderSelectedSessionDetail();
   } catch (_error) {
     // The next bounded poll retries. UNKNOWN remains visible instead of being
     // promoted to a guessed live state.
@@ -1062,6 +1099,27 @@ function supervisorSessionForRoom(room) {
       session.universe_session_id === binding.universe_session_id ||
       anchorSessionKey(session) === binding.anchor_key
   );
+}
+
+function providerChatRoomForSupervisorSession(session) {
+  if (!session) return null;
+  const sessionKey = anchorSessionKey(session);
+  return (
+    (state.providerChatRooms || []).find((room) => {
+      const boundSession = supervisorSessionForRoom(room);
+      return boundSession && anchorSessionKey(boundSession) === sessionKey;
+    }) || null
+  );
+}
+
+function providerLiveDeliveryLabel(room) {
+  const delivery = state.providerLiveDelivery[room.chat_key] || "WAITING";
+  if (delivery === "TRANSIENT_REDACTED") return "Live tail active";
+  if (delivery === "ACTIVITY_ONLY") {
+    return "Activity observed; this provider exposes no text delta";
+  }
+  if (delivery === "NO_NEW_ACTIVITY") return "Watching for new provider output";
+  return "Watching for provider activity";
 }
 
 function sessionRailProjectIdentity(room) {
@@ -9182,6 +9240,9 @@ refreshLawStrip = function () {
 }
 
 bindEvents();
-refresh().finally(openConductorRoomStream);
+refresh().finally(() => {
+  openConductorRoomStream();
+  void tailProviderSessions();
+});
 window.setInterval(refreshConductorRoom, 1200);
 state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);

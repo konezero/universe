@@ -4077,6 +4077,62 @@ body {
   white-space: nowrap;
 }
 
+.session-detail-live {
+  display: grid;
+  gap: 7px;
+  border-top: 1px solid rgba(90, 160, 230, 0.2);
+  padding-top: 10px;
+}
+
+.session-detail-live-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.session-detail-live-heading strong {
+  color: var(--teal);
+}
+
+.session-detail-live-feed {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.session-detail-live-empty {
+  margin: 0;
+  color: var(--text-3, var(--text-2));
+  font-size: 12px;
+}
+
+.session-detail-live-line {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.session-detail-live-line small {
+  color: var(--teal);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.session-detail-live-line p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .session-card-heading strong,
 .session-card-meta span,
 .session-event-row span {

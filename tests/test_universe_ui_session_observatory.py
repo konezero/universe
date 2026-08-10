@@ -50,6 +50,30 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("window.setInterval(tailProviderSessions, 4000)", APP)
         self.assertIn("session-rail-row", CSS)
 
+    def test_selected_anchor_session_receives_ephemeral_provider_tail(self) -> None:
+        self.assertIn("providerChatRoomForSupervisorSession", APP)
+        self.assertIn("providerLiveDelivery", APP)
+        detail_slice = APP[
+            APP.index("function renderSelectedSessionDetail") : APP.index(
+                "async function api"
+            )
+        ]
+        self.assertIn("Live provider output", detail_slice)
+        self.assertIn("state.providerLiveDeltas[room.chat_key]", detail_slice)
+        self.assertIn("session-detail-live", detail_slice)
+        tail_slice = APP[
+            APP.index("async function tailProviderSessions") : APP.index(
+                "async function discoverProviderActivitySources"
+            )
+        ]
+        self.assertIn("state.providerLiveDelivery[room.chat_key]", tail_slice)
+        self.assertIn("renderSelectedSessionDetail();", tail_slice)
+        self.assertIn("session-detail-live-feed", CSS)
+        self.assertLess(
+            HTML.index('id="session-observatory-detail"'),
+            HTML.index('id="session-observatory-list"'),
+        )
+
     def test_approval_uses_server_owned_canonical_route(self) -> None:
         self.assertIn("/v1/governance/proposals/", APP)
         decision_slice = APP[
