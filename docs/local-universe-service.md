@@ -298,6 +298,7 @@ GET    /v1/projects/{project_id}/integration-template-proposal
 POST   /v1/projects/{project_id}/integration-template-proposal/apply
 GET    /v1/projects/{project_id}/runtime-worker-invocations
 POST   /v1/projects/{project_id}/runtime-worker-invocations
+GET    /v1/projects/{project_id}/runtime-worker-results
 GET    /v1/projects/{project_id}/dispatches
 POST   /v1/projects/{project_id}/dispatches
 GET    /v1/dispatches/{dispatch_id}

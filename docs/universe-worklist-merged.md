@@ -240,12 +240,16 @@ Completed locally:
 - Bounded Conductor delegation records, a worker queue independent from chat,
   progress/result APIs, restart recovery, Conductor UI status projection, and
   a default bounded Project Master delivery/result-reference route.
+- Redacted terminal Worker evidence persisted in the existing invocation ledger,
+  with exact Frame/Turn/Worker-run lookup that survives executor retirement and
+  never stores Provider text, Context Packs, endpoint tokens, or raw results.
 
 Required follow-up:
 
-- Preserve and surface terminal Worker result evidence before retiring or
-  replacing a Task Frame claim; the original vertical-slice Worker receipt was
-  not observable after its executor became stale.
+- Remove the installed Runtime CLI's 1 MiB request-file ceiling from
+  receipt-aware full-file mutation, or add a bounded streaming/chunk transport;
+  the Host mutation gateway accepts the payload but the CLI currently blocks
+  large source files before receipt consumption.
 - Make Project Source Work identity stable across executor restart, or persist
   the original proposal/Work Receipt restoration material; timestamp-derived
   replacement receipts cannot silently become existing Frame lineage.

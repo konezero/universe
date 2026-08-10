@@ -6887,10 +6887,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 return {
                     "status": "TASK_FRAME_RESULT_RECORDED",
                     "provider": "GROK",
+                    "model_ref": "provider://GROK/model/grok-test",
                     "worker_id": "grok-worker-001",
+                    "worker_run_ref": "worker-run-001",
                     "result_receipt_ref": "result-001",
+                    "terminal_result_verified": True,
+                    "task_frame_result_status": "TASK_FRAME_RESULT_RECORDED",
                     "skill_run_observation_count": 1,
                     "repository_write": False,
+                    "result": {"text": "provider result must not persist"},
                 }
 
         self.server.runtime_host = FakeRuntimeHost()
@@ -6921,6 +6926,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         encoded = json.dumps(created, sort_keys=True)
         self.assertNotIn("never-store-this-token", encoded)
         self.assertNotIn("must not persist", encoded)
+        self.assertNotIn("provider result must not persist", encoded)
         self.assertFalse(created["invocation"]["result"]["repository_write"])
         binding_snapshot = created["invocation"]["invocation"][
             "worker_binding_snapshot"
@@ -6942,7 +6948,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
             1,
             created["invocation"]["result"]["skill_run_observation_count"],
         )
-        self.assertNotIn("worker_run_ref", created["invocation"]["result"])
+        terminal = created["invocation"]["result"]["terminal_evidence"]
+        self.assertEqual(
+            "universe.runtime-worker-terminal-evidence.v1", terminal["schema"]
+        )
+        self.assertEqual("frame-001", terminal["frame_id"])
+        self.assertEqual("turn-001", terminal["turn_id"])
+        self.assertEqual("worker-run-001", terminal["worker_run_ref"])
+        self.assertEqual("result-001", terminal["result_receipt_ref"])
+        self.assertRegex(terminal["evidence_digest"], r"^[0-9a-f]{64}$")
         status, repeated = self.request("POST", path, payload)
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(
@@ -6951,6 +6965,84 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, listed = self.request("GET", path)
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(1, len(listed["invocations"]))
+
+        result_path = (
+            "/v1/projects/GCS/runtime-worker-results"
+            "?frame_id=frame-001&turn_id=turn-001&worker_run_ref=worker-run-001"
+        )
+        status, results = self.request("GET", result_path)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([terminal], results["results"])
+
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual(
+            [terminal],
+            reopened.list_runtime_worker_terminal_evidence(
+                "GCS",
+                frame_id="frame-001",
+                turn_id="turn-001",
+                worker_run_ref="worker-run-001",
+            ),
+        )
+        self.assertEqual(
+            [],
+            reopened.list_runtime_worker_terminal_evidence(
+                "GCS", worker_run_ref="worker-run-missing"
+            ),
+        )
+
+    def test_runtime_worker_terminal_evidence_fails_closed_when_unverified(
+        self,
+    ) -> None:
+        class FakeRuntimeHost:
+            def provider_capabilities(self) -> list[dict[str, str]]:
+                return [{"provider": "GROK", "status": "AVAILABLE"}]
+
+            def invoke_read_only(self, _request: dict[str, object]) -> dict[str, object]:
+                return {
+                    "status": "TASK_FRAME_RESULT_RECORDED",
+                    "provider": "GROK",
+                    "worker_id": "grok-worker-unverified",
+                    "result_receipt_ref": "result-unverified",
+                    "terminal_result_verified": False,
+                    "repository_write": False,
+                }
+
+        self.server.runtime_host = FakeRuntimeHost()
+        status, _ = self.request("POST", "/v1/projects/register", self.registration())
+        self.assertEqual(HTTPStatus.CREATED, status)
+        status, created = self.request(
+            "POST",
+            "/v1/projects/GCS/runtime-worker-invocations",
+            {
+                "schema": "universe.runtime-worker-invocation-request.v1",
+                "invocation_id": "runtime-worker-unverified",
+                "provider": "GROK",
+                "endpoint": "http://127.0.0.1:19090",
+                "token": "never-store-this-token",
+                "session_id": "session-unverified",
+                "frame_id": "frame-unverified",
+                "turn_id": "turn-unverified",
+                "invoker_actor_ref": "universe-host",
+                "repository_write_scope": "NONE",
+                "mutation_scope": {"operations": [], "targets": []},
+                "context_pack": {},
+                "output_contract": {"format": "review"},
+                "max_turns": 1,
+            },
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        result = created["invocation"]["result"]
+        self.assertEqual(
+            "RUNTIME_WORKER_TERMINAL_EVIDENCE_UNVERIFIED", result["status"]
+        )
+        self.assertFalse(result["terminal_result_verified"])
+        self.assertEqual({}, result["terminal_evidence"])
+        status, results = self.request(
+            "GET", "/v1/projects/GCS/runtime-worker-results"
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([], results["results"])
 
 
 class RuntimeLeaseStoreTests(unittest.TestCase):

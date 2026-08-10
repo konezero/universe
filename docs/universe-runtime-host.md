@@ -180,10 +180,19 @@ Runtime Host boundary.
 The POST body carries a current loopback Task Frame endpoint and token only for
 the duration of that request. Universe persists a redacted invocation timeline:
 provider, session/frame/turn identifiers, request/context/output digests, status,
-and the final `result_receipt_ref`. It never persists the endpoint, token,
-Context Pack
-contents, or Worker result text. The Project Task Frame journal remains the
-canonical result record.
+and the final `result_receipt_ref`. A verified terminal response also creates a
+deterministic `universe.runtime-worker-terminal-evidence.v1` record containing
+only Project, invocation, session/frame/turn, provider/model, Worker/run, terminal
+status, and receipt coordinates. Universe commits this record before the
+invocation API returns, so a caller can close or replace the Task Frame claim
+without losing the lookup surface. It never persists the endpoint, token,
+Context Pack contents, or Worker result text. The Project Task Frame journal
+remains the canonical result record; Universe stores only the redacted locator.
+
+`GET /v1/projects/{project_id}/runtime-worker-results` lists those locators and
+accepts exact `frame_id`, `turn_id`, and `worker_run_ref` filters. The lookup is
+backed by the Universe database and therefore remains available after the
+Session Boot executor or Provider Worker process exits.
 
 The route does not queue a live Worker call. Session credentials are volatile,
 so an invocation is synchronous against an already active Task Frame. A later

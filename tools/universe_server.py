@@ -277,6 +277,7 @@ EXPERIENCE_PATTERN_PROPOSAL_SCHEMA = "universe.experience-pattern-proposal.v1"
 CAREER_PROMOTION_CANDIDATE_SCHEMA = "universe.career-promotion-candidate.v1"
 CAREER_PROMOTION_QUEUE_SCHEMA = "universe.career-promotion-queue-item.v1"
 RUNTIME_WORKER_INVOCATION_SCHEMA = "universe.runtime-worker-invocation.v1"
+RUNTIME_WORKER_TERMINAL_EVIDENCE_SCHEMA = "universe.runtime-worker-terminal-evidence.v1"
 CONDUCTOR_DELEGATION_SCHEMA = "universe.conductor-delegation.v1"
 CONDUCTOR_DELEGATION_STATES = frozenset(
     {"QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}
@@ -13335,6 +13336,107 @@ class UniverseStore:
             ).fetchall()
         return [self._runtime_worker_invocation_row(row) for row in rows]
 
+    def list_runtime_worker_terminal_evidence(
+        self,
+        project_id: str,
+        *,
+        frame_id: str | None = None,
+        turn_id: str | None = None,
+        worker_run_ref: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        clauses = [
+            "project_id = ?",
+            "json_extract(result_json, '$.terminal_evidence.schema') = ?",
+        ]
+        parameters: list[Any] = [
+            project["project_id"],
+            RUNTIME_WORKER_TERMINAL_EVIDENCE_SCHEMA,
+        ]
+        for field, value in (
+            ("frame_id", frame_id),
+            ("turn_id", turn_id),
+            ("worker_run_ref", worker_run_ref),
+        ):
+            if value is None:
+                continue
+            clauses.append(
+                f"json_extract(result_json, '$.terminal_evidence.{field}') = ?"
+            )
+            parameters.append(_required_text(value, field))
+        bounded_limit = max(1, min(int(limit), 500))
+        parameters.append(bounded_limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT result_json
+                FROM runtime_worker_invocation
+                WHERE {" AND ".join(clauses)}
+                ORDER BY completed_at DESC, invocation_id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        evidence: list[dict[str, Any]] = []
+        for row in rows:
+            result = json.loads(row["result_json"])
+            terminal = result.get("terminal_evidence")
+            if isinstance(terminal, dict):
+                evidence.append(terminal)
+        return evidence
+
+    @staticmethod
+    def _runtime_worker_terminal_evidence(
+        project_id: str,
+        invocation: Mapping[str, Any],
+        result: Mapping[str, Any],
+        *,
+        recorded_at: str,
+    ) -> dict[str, Any]:
+        if result.get("terminal_result_verified") is not True:
+            return {}
+        material = {
+            "schema": RUNTIME_WORKER_TERMINAL_EVIDENCE_SCHEMA,
+            "project_id": project_id,
+            "invocation_id": _required_text(
+                invocation.get("invocation_id"), "invocation_id"
+            ),
+            "session_id": _required_text(invocation.get("session_id"), "session_id"),
+            "frame_id": _required_text(invocation.get("frame_id"), "frame_id"),
+            "turn_id": _required_text(invocation.get("turn_id"), "turn_id"),
+            "provider": _required_text(result.get("provider"), "provider"),
+            "model_ref": _required_text(result.get("model_ref"), "model_ref"),
+            "worker_id": _required_text(result.get("worker_id"), "worker_id"),
+            "worker_run_ref": _required_text(
+                result.get("worker_run_ref"), "worker_run_ref"
+            ),
+            "result_receipt_ref": _required_text(
+                result.get("result_receipt_ref"), "result_receipt_ref"
+            ),
+            "task_frame_result_status": _required_text(
+                result.get("task_frame_result_status"), "task_frame_result_status"
+            ),
+        }
+        unknown_fields = [
+            field
+            for field, value in material.items()
+            if field != "schema" and str(value).upper() == "UNKNOWN"
+        ]
+        if unknown_fields:
+            raise UniverseError(
+                "RUNTIME_WORKER_TERMINAL_EVIDENCE_INVALID",
+                "verified terminal evidence has UNKNOWN fields: "
+                + ", ".join(sorted(unknown_fields)),
+            )
+        digest = _json_sha256(material)
+        return {
+            **material,
+            "evidence_id": "worker_result_" + digest[:24],
+            "evidence_digest": digest,
+            "recorded_at": recorded_at,
+        }
+
     def invoke_runtime_worker(
         self,
         project_id: str,
@@ -13446,16 +13548,53 @@ class UniverseStore:
             or observation_count < 0
         ):
             observation_count = 0
+        completed_at = utc_now()
         result_record = {
             "status": _required_text(result.get("status"), "runtime result status"),
             "provider": redacted["provider"],
+            "model_ref": str(result.get("model_ref") or "UNKNOWN"),
             "worker_id": str(result.get("worker_id") or "UNKNOWN"),
+            "worker_run_ref": str(result.get("worker_run_ref") or "UNKNOWN"),
             "result_receipt_ref": str(result.get("result_receipt_ref") or "UNKNOWN"),
+            "terminal_result_verified": result.get("terminal_result_verified") is True,
+            "task_frame_result_status": str(
+                result.get("task_frame_result_status") or "UNKNOWN"
+            ),
             "skill_run_observation_count": observation_count,
             "repository_write": False,
         }
+        terminal_status = result_record["status"].upper()
+        is_terminal = (
+            terminal_status in {"TASK_COMPLETED", "TASK_FRAME_RESULT_RECORDED"}
+            or terminal_status.startswith("TURN_COMPLETED")
+        )
+        if result_record["terminal_result_verified"]:
+            try:
+                terminal_evidence = self._runtime_worker_terminal_evidence(
+                    project["project_id"],
+                    redacted,
+                    result_record,
+                    recorded_at=completed_at,
+                )
+            except UniverseError as error:
+                terminal_evidence = {}
+                result_record["status"] = "RUNTIME_WORKER_TERMINAL_EVIDENCE_INVALID"
+                result_record["reason"] = error.code
+                result_record["terminal_result_verified"] = False
+        else:
+            terminal_evidence = {}
+            if is_terminal:
+                result_record["status"] = (
+                    "RUNTIME_WORKER_TERMINAL_EVIDENCE_UNVERIFIED"
+                )
+                result_record["reason"] = "TERMINAL_RESULT_RECEIPT_REQUIRED"
+        result_record["terminal_evidence"] = terminal_evidence
         for field in ("reason", "stage"):
-            if isinstance(result.get(field), str) and result[field]:
+            if (
+                field not in result_record
+                and isinstance(result.get(field), str)
+                and result[field]
+            ):
                 result_record[field] = result[field]
         with self._connection() as connection:
             connection.execute(
@@ -13467,7 +13606,7 @@ class UniverseStore:
                 (
                     result_record["status"],
                     _canonical_json(result_record),
-                    utc_now(),
+                    completed_at,
                     project["project_id"],
                     redacted["invocation_id"],
                 ),
@@ -19698,6 +19837,33 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/runtime-worker-results":
+                query_map = parse_qs(urlsplit(self.path).query)
+                try:
+                    limit = int((query_map.get("limit") or ["100"])[0])
+                except ValueError as error:
+                    raise UniverseError(
+                        "RUNTIME_WORKER_RESULT_QUERY_INVALID",
+                        "limit must be an integer",
+                    ) from error
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "RUNTIME_WORKER_RESULTS_COLLECTED",
+                        "project_id": project_id,
+                        "results": self.server.store.list_runtime_worker_terminal_evidence(
+                            project_id,
+                            frame_id=(query_map.get("frame_id") or [None])[0],
+                            turn_id=(query_map.get("turn_id") or [None])[0],
+                            worker_run_ref=(query_map.get("worker_run_ref") or [None])[
+                                0
+                            ],
+                            limit=limit,
+                        ),
+                    },
+                )
+                return
             if suffix == "/dispatches":
                 self._send(
                     HTTPStatus.OK,
@@ -21875,6 +22041,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/context-packs",
             "/release-proposals/apply",
             "/release-proposals",
+            "/runtime-worker-results",
             "/runtime-worker-invocations",
             "/dispatches",
             "/discovery-dispatch",
