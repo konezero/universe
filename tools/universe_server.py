@@ -263,6 +263,10 @@ GOVERNANCE_APPROVAL_COMMANDS = frozenset(
     }
 )
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
+DIRECT_COMMANDER_ACCESS_SURFACES = frozenset(
+    {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}
+)
+UNIVERSE_COMMANDER_SURFACE = "UNIVERSE_UI"
 SKILL_OBSERVATION_CANDIDATE_SCHEMA = "ai-career.skill-observation-candidate.v1"
 SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA = (
     "universe.skill-observation-publication-approval.v1"
@@ -3235,7 +3239,7 @@ def normalize_governance_proposal_decision(value: Any) -> dict[str, str]:
         required=frozenset(
             {"decision", "proposal_digest", "source", "idempotency_key"}
         ),
-        optional=frozenset({"commander_surface"}),
+        optional=frozenset({"commander_surface", "access_surface"}),
     )
     decision = _identifier(
         request["decision"], "governance_proposal_decision.decision"
@@ -3262,8 +3266,12 @@ def normalize_governance_proposal_decision(value: Any) -> dict[str, str]:
         ),
         "source": source,
         "commander_surface": _identifier(
-            request.get("commander_surface", "UNIVERSE_UI"),
+            request.get("commander_surface", UNIVERSE_COMMANDER_SURFACE),
             "governance_proposal_decision.commander_surface",
+        ).upper(),
+        "access_surface": _identifier(
+            request.get("access_surface", "UNKNOWN"),
+            "governance_proposal_decision.access_surface",
         ).upper(),
         "idempotency_key": _required_text(
             request["idempotency_key"],
@@ -4369,6 +4377,7 @@ class UniverseStore:
                     source TEXT NOT NULL
                         CHECK(source IN ('BUTTON', 'NATURAL_LANGUAGE')),
                     commander_surface TEXT NOT NULL,
+                    access_surface TEXT,
                     idempotency_key TEXT NOT NULL,
                     evidence_ref TEXT NOT NULL UNIQUE,
                     state TEXT NOT NULL
@@ -4674,6 +4683,17 @@ class UniverseStore:
                 );
                 """
             )
+            decision_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(governance_proposal_decision)"
+                ).fetchall()
+            }
+            if "access_surface" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE governance_proposal_decision "
+                    "ADD COLUMN access_surface TEXT"
+                )
             project_connection_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -11998,6 +12018,7 @@ class UniverseStore:
             "decision": request["decision"],
             "source": request["source"],
             "commander_surface": request["commander_surface"],
+            "access_surface": request["access_surface"],
             "idempotency_key": request["idempotency_key"],
         }
         decision_id = "governance_decision_" + _json_sha256(material)[:24]
@@ -12031,6 +12052,7 @@ class UniverseStore:
                         "decision",
                         "source",
                         "commander_surface",
+                        "access_surface",
                         "idempotency_key",
                     )
                 }
@@ -12045,10 +12067,10 @@ class UniverseStore:
                 """
                 INSERT INTO governance_proposal_decision(
                     decision_id, project_id, proposal_id, proposal_digest,
-                    decision, source, commander_surface, idempotency_key,
+                    decision, source, commander_surface, access_surface, idempotency_key,
                     evidence_ref, state, result_json, error_code,
                     created_at, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', '{}', NULL, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', '{}', NULL, ?, NULL)
                 """,
                 (
                     decision_id,
@@ -12058,6 +12080,7 @@ class UniverseStore:
                     request["decision"],
                     request["source"],
                     request["commander_surface"],
+                    request["access_surface"],
                     request["idempotency_key"],
                     evidence_ref,
                     created_at,
@@ -12135,6 +12158,14 @@ class UniverseStore:
 
     @staticmethod
     def _governance_proposal_decision_row(row: sqlite3.Row) -> dict[str, Any]:
+        stored_surface = str(row["commander_surface"])
+        stored_access_surface = row["access_surface"]
+        if stored_access_surface is None and stored_surface in DIRECT_COMMANDER_ACCESS_SURFACES:
+            commander_surface = UNIVERSE_COMMANDER_SURFACE
+            access_surface = stored_surface
+        else:
+            commander_surface = stored_surface
+            access_surface = str(stored_access_surface or "UNKNOWN")
         return {
             "schema": GOVERNANCE_PROPOSAL_DECISION_SCHEMA,
             "decision_id": row["decision_id"],
@@ -12143,7 +12174,8 @@ class UniverseStore:
             "proposal_digest": row["proposal_digest"],
             "decision": row["decision"],
             "source": row["source"],
-            "commander_surface": row["commander_surface"],
+            "commander_surface": commander_surface,
+            "access_surface": access_surface,
             "idempotency_key": row["idempotency_key"],
             "evidence_ref": row["evidence_ref"],
             "state": row["state"],
@@ -15037,6 +15069,123 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
         return self.project_master_hosts.ensure(project)
 
+    def create_approved_descendant_task_frame(
+        self,
+        project_id: str,
+        proposal_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        """Materialize one exact Task Frame under an approved primary proposal.
+
+        Universe validates the durable primary approval before it reaches the
+        Project Master Host.  The Host still validates the inherited evidence,
+        source roots, and exact file targets before it creates the frame.
+        """
+
+        request = _exact_object_fields(
+            value,
+            field="approved_descendant_task_frame_request",
+            required=frozenset({"proposal_digest", "source_work", "task_frame"}),
+        )
+        project = self.store.get_project(project_id)
+        primary_id = _required_text(proposal_id, "primary_proposal_id")
+        primary_digest = _sha256(
+            request["proposal_digest"],
+            "approved_descendant_task_frame_request.proposal_digest",
+        )
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == primary_id
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        if proposal.get("proposal_digest") != primary_digest:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH",
+                "proposal digest does not match the approved primary proposal",
+                HTTPStatus.CONFLICT,
+            )
+        if proposal.get("state") != "APPROVED":
+            raise UniverseError(
+                "PRIMARY_TASK_PROPOSAL_NOT_APPROVED",
+                "an approved primary proposal is required before creating a Task Frame",
+                HTTPStatus.CONFLICT,
+            )
+        decision = self.store.find_governance_proposal_decision(
+            project["project_id"], primary_id
+        )
+        if (
+            decision is None
+            or decision.get("state") != "APPLIED"
+            or decision.get("decision") != "APPROVE"
+            or decision.get("proposal_digest") != primary_digest
+            or decision.get("commander_surface") != UNIVERSE_COMMANDER_SURFACE
+        ):
+            raise UniverseError(
+                "PRIMARY_TASK_APPROVAL_EVIDENCE_UNAVAILABLE",
+                "the durable Universe approval evidence is unavailable or inconsistent",
+                HTTPStatus.CONFLICT,
+            )
+
+        try:
+            self.ensure_project_master(project["project_id"])
+            bridge = self.store.get_master_bridge(project["project_id"])
+            receipt = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+            ).create_approved_descendant_task_frame(
+                bridge=bridge,
+                primary_proposal=proposal,
+                governance_approval={
+                    "status": "APPROVED",
+                    "proposal_id": primary_id,
+                    "proposal_digest": primary_digest,
+                    "commander_surface": UNIVERSE_COMMANDER_SURFACE,
+                    "evidence_ref": decision["evidence_ref"],
+                },
+                source_work=request["source_work"],
+                task_frame=request["task_frame"],
+            )
+        except (DispatchError, OSError, ProjectMasterHostError) as error:
+            raise UniverseError(
+                "APPROVED_DESCENDANT_TASK_FRAME_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+
+        host_result = receipt.get("host_response")
+        if (
+            not isinstance(host_result, Mapping)
+            or host_result.get("status") != "APPROVED_DESCENDANT_TASK_FRAME_READY"
+            or host_result.get("primary_proposal_id") != primary_id
+            or host_result.get("primary_proposal_digest") != primary_digest
+            or host_result.get("approval_evidence_ref") != decision["evidence_ref"]
+        ):
+            raise UniverseError(
+                "APPROVED_DESCENDANT_TASK_FRAME_RECEIPT_INVALID",
+                "Project Master did not return a matching Task Frame receipt",
+                HTTPStatus.CONFLICT,
+            )
+        self.publish_project_room_changed(project["project_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "APPROVED_DESCENDANT_TASK_FRAME_CREATED",
+            "project_id": project["project_id"],
+            "primary_proposal_id": primary_id,
+            "primary_proposal_digest": primary_digest,
+            "task_frame": dict(host_result),
+        }
+
     def _project_master_governance_context(self, project_id: str) -> dict[str, Any]:
         """Resolve the minimal immutable v2 context for one project Master."""
 
@@ -17198,10 +17347,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "approval source must be a direct button or Commander text action",
                 HTTPStatus.FORBIDDEN,
             )
-        surface = _identifier(
-            context.get("surface") or "LOCAL_BROWSER", "commander_surface"
+        access_surface = _identifier(
+            context.get("surface") or "LOCAL_BROWSER", "commander_access_surface"
         ).upper()
-        if surface not in {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}:
+        if access_surface not in DIRECT_COMMANDER_ACCESS_SURFACES:
             raise UniverseError(
                 "DIRECT_COMMANDER_SURFACE_INVALID",
                 "provider, relay, Project Master, Boss, Worker, and observer surfaces cannot approve",
@@ -17232,7 +17381,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     {
                         "proposal_id": proposal_id,
                         "proposal_digest": request["proposal_digest"],
-                        "surface": surface,
+                        "access_surface": access_surface,
                     }
                 )[:24]
             ),
@@ -17253,7 +17402,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "decision": request["decision"],
                 "proposal_digest": request["proposal_digest"],
                 "source": source,
-                "commander_surface": surface,
+                "commander_surface": UNIVERSE_COMMANDER_SURFACE,
+                "access_surface": access_surface,
                 "idempotency_key": idempotency_key,
             },
         )
@@ -17667,6 +17817,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "scope": proposal["scope"],
             "boundary": proposal["boundary"],
             "commander_surface": decision["commander_surface"],
+            "access_surface": decision["access_surface"],
             "evidence_ref": decision["evidence_ref"],
             "source": decision["source"],
             "approval_scope": "PRIMARY_TASK_PROPOSAL_AND_UNCHANGED_DESCENDANT_TASK_FRAMES",
@@ -20778,6 +20929,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     {"schema": API_SCHEMA, **result},
                 )
                 return
+            approved_task_frame_parts = self._approved_descendant_task_frame_path(path)
+            if approved_task_frame_parts is not None:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.create_approved_descendant_task_frame(
+                        approved_task_frame_parts[0],
+                        approved_task_frame_parts[1],
+                        body,
+                    ),
+                )
+                return
             parts = self._project_path(path)
             if parts is not None and parts[1] == "/master-session/prepare":
                 self._send(
@@ -21516,7 +21678,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "X-Universe-Worker-Id",
         )
         authenticated = not any(self.headers.get(name) for name in forbidden_headers)
-        if access_surface not in {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}:
+        if access_surface not in DIRECT_COMMANDER_ACCESS_SURFACES:
             authenticated = False
         return {
             "authenticated": authenticated,
@@ -21687,6 +21849,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         prefix = "/v1/projects/"
         marker = "/governance-proposals/"
         suffix = "/decision"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, proposal_path = remainder.split(marker, 1)
+        proposal_id = proposal_path[: -len(suffix)]
+        if not project_id or "/" in project_id or not proposal_id or "/" in proposal_id:
+            return None
+        return unquote(project_id), unquote(proposal_id)
+
+    @staticmethod
+    def _approved_descendant_task_frame_path(
+        path: str,
+    ) -> tuple[str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/governance-proposals/"
+        suffix = "/task-frame"
         if (
             not path.startswith(prefix)
             or marker not in path

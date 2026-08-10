@@ -15,7 +15,7 @@ from dataclasses import replace
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -4264,12 +4264,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
             approved["decision"]["evidence_ref"],
         )
         self.assertEqual("NATURAL_LANGUAGE", approved["decision"]["source"])
-        self.assertEqual("LOCAL_BROWSER", approved["decision"]["commander_surface"])
+        self.assertEqual("UNIVERSE_UI", approved["decision"]["commander_surface"])
+        self.assertEqual("LOCAL_BROWSER", approved["decision"]["access_surface"])
         self.assertIn(
             "universe.project-master-governance-approval.v1",
             approved["message"]["body"],
         )
         packet = json.loads(approved["message"]["body"].splitlines()[-1])
+        self.assertEqual("UNIVERSE_UI", packet["commander_surface"])
+        self.assertEqual("LOCAL_BROWSER", packet["access_surface"])
         self.assertFalse(
             packet["descendant_task_frame_policy"]["commander_reapproval_required"]
         )
@@ -4302,6 +4305,149 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("DIRECT_COMMANDER_REQUIRED", rejected_bridge["error_code"])
+
+    def test_approved_primary_creates_one_exact_descendant_task_frame(self) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+
+        class ApprovingAdapter(ProjectTaskProposalAdapter):
+            def approve(
+                inner_self,
+                project_root: Path,
+                *,
+                proposal_id: str,
+                proposal_digest: str,
+                evidence_ref: str,
+            ) -> JsonObject:
+                approval = {
+                    "schema": "ai-career.task-proposal-approval.v1",
+                    "status": "APPROVED",
+                    "proposal_id": proposal_id,
+                    "proposal_digest": proposal_digest,
+                    "evidence_ref": evidence_ref,
+                    "approved_at": "2026-08-10T00:01:00Z",
+                }
+                database_path = (
+                    project_root
+                    / ".ai"
+                    / "runtime"
+                    / "task_frames"
+                    / "task-proposals.sqlite3"
+                )
+                connection = sqlite3.connect(database_path)
+                try:
+                    connection.execute(
+                        """
+                        UPDATE proposal
+                        SET state = 'APPROVED', approved_at = ?, approval_json = ?
+                        WHERE proposal_id = ? AND proposal_digest = ?
+                        """,
+                        (
+                            approval["approved_at"],
+                            json.dumps(
+                                approval, sort_keys=True, separators=(",", ":")
+                            ),
+                            proposal_id,
+                            proposal_digest,
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                return {"status": "TASK_PROPOSAL_APPROVED", "approval": approval}
+
+        self.server.project_task_proposals = ApprovingAdapter()
+        status, approved = self.request(
+            "POST",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
+            {"decision": "APPROVE", "proposal_digest": proposal["proposal_digest"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        evidence_ref = approved["decision"]["evidence_ref"]
+        request = {
+            "proposal_digest": proposal["proposal_digest"],
+            "source_work": {
+                "scope_kind": "PROJECT_SOURCE_WORK",
+                "write_roots": [
+                    str(self.project_root / "tools"),
+                    str(self.project_root / "tests"),
+                ],
+                "write_operations": ["CREATE", "MODIFY"],
+                "boundary": proposal["boundary"],
+                "task_summary": proposal["task_summary"],
+                "instruction_ref": evidence_ref,
+            },
+            "task_frame": {
+                "frame_id": "gcs-bootstrap-frame-001",
+                "parent_actor_ref": "project-master/GCS",
+                "mutation_scope": {
+                    "operations": ["CREATE", "MODIFY"],
+                    "targets": [str(self.project_root / "tools" / "bootstrap.py")],
+                },
+                "turns": [{"turn_id": "/root/boss", "role": "BOSS"}],
+                "instruction_id": "instruction-bootstrap-001",
+                "instruction_text": "Create the bounded bootstrap file.",
+                "constraints": ["No commit or push."],
+                "expected_output": {"kind": "implementation"},
+            },
+        }
+        bridge = {
+            "project_id": "GCS",
+            "endpoint": "http://127.0.0.1:50123",
+            "credential_env": "TEST_MASTER_BRIDGE_TOKEN",
+        }
+        host_result = {
+            "status": "APPROVED_DESCENDANT_TASK_FRAME_READY",
+            "project_id": "GCS",
+            "primary_proposal_id": proposal["proposal_id"],
+            "primary_proposal_digest": proposal["proposal_digest"],
+            "approval_evidence_ref": evidence_ref,
+            "task_frame_id": "gcs-bootstrap-frame-001",
+            "repository_write": False,
+        }
+        client = Mock()
+        client.create_approved_descendant_task_frame.return_value = {
+            "host_response": host_result
+        }
+        with (
+            patch.object(self.server, "ensure_project_master", return_value={}),
+            patch.object(self.server.store, "get_master_bridge", return_value=bridge),
+            patch("universe_server.HttpProjectMasterBridge", return_value=client),
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/governance-proposals/"
+                "task_proposal_test_001/task-frame",
+                request,
+                self.token,
+            )
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_CREATED", result["status"])
+        self.assertEqual(host_result, result["task_frame"])
+        forwarded = client.create_approved_descendant_task_frame.call_args.kwargs
+        self.assertEqual(proposal["proposal_id"], forwarded["primary_proposal"]["proposal_id"])
+        self.assertEqual("UNIVERSE_UI", forwarded["governance_approval"]["commander_surface"])
+        self.assertEqual(evidence_ref, forwarded["governance_approval"]["evidence_ref"])
+        self.assertEqual(request["task_frame"], forwarded["task_frame"])
+
+    def test_descendant_task_frame_requires_an_approved_primary(self) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/governance-proposals/"
+            "task_proposal_test_001/task-frame",
+            {
+                "proposal_digest": proposal["proposal_digest"],
+                "source_work": {},
+                "task_frame": {},
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("PRIMARY_TASK_PROPOSAL_NOT_APPROVED", result["error_code"])
 
     def test_commander_text_approves_the_only_pending_task_proposal(self) -> None:
         proposal = self.create_task_proposal_fixture()
@@ -4373,7 +4519,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         decision = result["governance_decision"]["decision"]
         self.assertEqual("NATURAL_LANGUAGE", decision["source"])
-        self.assertEqual("LOCAL_BROWSER", decision["commander_surface"])
+        self.assertEqual("UNIVERSE_UI", decision["commander_surface"])
+        self.assertEqual("LOCAL_BROWSER", decision["access_surface"])
         self.assertEqual(proposal["proposal_id"], decision["proposal_id"])
         messages = self.server.store.list_room_messages("GCS")
         self.assertTrue(any(message["body"] == "\uc2b9\uc778" for message in messages))
@@ -4401,6 +4548,42 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("GOVERNANCE_PROPOSAL_DIGEST_MISMATCH", response["error_code"])
         self.assertTrue(self.server.wait_for_request_workers(timeout=1))
+
+    def test_legacy_direct_surface_decision_is_projected_to_universe_ui(self) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        with self.server.store._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO governance_proposal_decision(
+                    decision_id, project_id, proposal_id, proposal_digest,
+                    decision, source, commander_surface, access_surface,
+                    idempotency_key, evidence_ref, state, result_json,
+                    error_code, created_at, applied_at
+                ) VALUES (?, ?, ?, ?, 'APPROVE', 'BUTTON', ?, NULL, ?, ?,
+                          'APPLIED', '{}', NULL, ?, ?)
+                """,
+                (
+                    "governance_decision_legacy_surface_001",
+                    "GCS",
+                    proposal["proposal_id"],
+                    proposal["proposal_digest"],
+                    "LOCAL_BROWSER",
+                    "legacy-direct-surface-001",
+                    "universe://legacy/decision/001",
+                    "2026-08-10T00:00:00Z",
+                    "2026-08-10T00:00:01Z",
+                ),
+            )
+
+        decision = self.server.store.find_governance_proposal_decision(
+            "GCS", proposal["proposal_id"]
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual("UNIVERSE_UI", decision["commander_surface"])
+        self.assertEqual("LOCAL_BROWSER", decision["access_surface"])
 
     def test_governance_approval_does_not_resolve_platform_permission(self) -> None:
         proposal = self.create_task_proposal_fixture()

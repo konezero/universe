@@ -278,6 +278,99 @@ class UniverseDispatchTests(unittest.TestCase):
         self.assertEqual("GCS", payload["project_id"])
         self.assertEqual(proposal, payload["proposal"])
 
+    def test_master_bridge_creates_approved_descendant_task_frame_at_exact_route(
+        self,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        class BridgeHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                captured["path"] = self.path
+                captured["authorization"] = self.headers.get("Authorization")
+                length = int(self.headers["Content-Length"])
+                captured["payload"] = json.loads(self.rfile.read(length))
+                body = b'{"status":"APPROVED_DESCENDANT_TASK_FRAME_READY"}'
+                self.send_response(HTTPStatus.CREATED)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BridgeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address[:2]
+        host_text = host.decode("ascii") if isinstance(host, bytes) else host
+        previous = os.environ.get("UNIVERSE_TEST_MASTER_TOKEN")
+        os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = "bridge-test-token"
+        primary = {
+            "proposal_id": "task_proposal_123",
+            "proposal_digest": "a" * 64,
+        }
+        approval = {
+            "status": "APPROVED",
+            "proposal_id": primary["proposal_id"],
+            "proposal_digest": primary["proposal_digest"],
+            "commander_surface": "UNIVERSE_UI",
+            "evidence_ref": "universe://governance/decision/123",
+        }
+        source_work = {
+            "scope_kind": "PROJECT_SOURCE_WORK",
+            "write_roots": ["C:/workspace/GCS/tools"],
+            "write_operations": ["CREATE"],
+            "boundary": "bounded",
+            "task_summary": "bootstrap",
+            "instruction_ref": approval["evidence_ref"],
+        }
+        task_frame = {
+            "frame_id": "gcs-bootstrap-frame-001",
+            "parent_actor_ref": "project-master/GCS",
+            "mutation_scope": {
+                "operations": ["CREATE"],
+                "targets": ["C:/workspace/GCS/tools/bootstrap.py"],
+            },
+            "turns": [{"turn_id": "/root/boss", "role": "BOSS"}],
+            "instruction_id": "instruction-bootstrap-001",
+            "instruction_text": "Create the bounded bootstrap file.",
+            "constraints": ["No commit or push."],
+            "expected_output": {"kind": "implementation"},
+        }
+        try:
+            receipt = HttpProjectMasterBridge(
+                endpoint=f"http://{host_text}:{port}",
+                credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+            ).create_approved_descendant_task_frame(
+                bridge={"project_id": "GCS"},
+                primary_proposal=primary,
+                governance_approval=approval,
+                source_work=source_work,
+                task_frame=task_frame,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            if previous is None:
+                os.environ.pop("UNIVERSE_TEST_MASTER_TOKEN", None)
+            else:
+                os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
+
+        self.assertEqual("DELIVERED", receipt["status"])
+        self.assertEqual(
+            "/v1/project-master/task-frames/approved",
+            captured["path"],
+        )
+        self.assertEqual("Bearer bridge-test-token", captured["authorization"])
+        payload = cast(dict[str, Any], captured["payload"])
+        self.assertEqual(primary, payload["primary_proposal"])
+        self.assertEqual(approval, payload["governance_approval"])
+        self.assertEqual(source_work, payload["source_work"])
+        self.assertEqual(task_frame, payload["task_frame"])
+        self.assertNotIn("bridge-test-token", json.dumps(payload, sort_keys=True))
+
 
 if __name__ == "__main__":
     unittest.main()

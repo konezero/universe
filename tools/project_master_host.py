@@ -18,6 +18,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore
 from uuid import uuid4
@@ -67,6 +70,9 @@ PROVIDER_SESSION_CONNECTION_SCHEMA = "universe.provider-session-connection.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 TASK_PROPOSAL_DATABASE_RELATIVE_PATH = Path(
     ".ai/runtime/task_frames/task-proposals.sqlite3"
+)
+TASK_FRAME_PROFILE_RELATIVE_PATH = Path(
+    ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
 )
 
 
@@ -391,6 +397,425 @@ class ProjectModeCoordinator:
                 "content_base64": base64.b64encode(content).decode("ascii"),
             },
         )
+        return result
+
+    def create_approved_descendant_task_frame(
+        self,
+        *,
+        primary_proposal: Mapping[str, Any],
+        governance_approval: Mapping[str, Any],
+        source_work: Mapping[str, Any],
+        task_frame: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Create one exact Task Frame from an already approved primary proposal.
+
+        The primary proposal authorizes the bounded source roots.  It does not
+        authorize the Host to guess which files a Worker may change, so the
+        caller must provide an exact mutation target list for the descendant
+        frame.  The frame approval inherits the same primary evidence only
+        when every identity, boundary, root, and target check still matches.
+        """
+
+        primary_id = _text(primary_proposal.get("proposal_id"), "primary.proposal_id")
+        primary_digest = _text(
+            primary_proposal.get("proposal_digest"), "primary.proposal_digest"
+        )
+        if str(primary_proposal.get("state") or "").upper() != "APPROVED":
+            raise ProjectMasterHostError("PRIMARY_TASK_PROPOSAL_NOT_APPROVED")
+        primary_boundary = _text(primary_proposal.get("boundary"), "primary.boundary")
+        primary_summary = _text(
+            primary_proposal.get("task_summary"), "primary.task_summary"
+        )
+        primary_scope = primary_proposal.get("scope")
+        if not isinstance(primary_scope, Mapping):
+            raise ProjectMasterHostError("PRIMARY_TASK_PROPOSAL_SCOPE_INVALID")
+        stored_approval = primary_proposal.get("approval")
+        if not isinstance(stored_approval, Mapping):
+            raise ProjectMasterHostError("PRIMARY_TASK_PROPOSAL_APPROVAL_UNAVAILABLE")
+        stored_evidence_ref = _text(
+            stored_approval.get("evidence_ref"), "primary.approval.evidence_ref"
+        )
+
+        approval_id = _text(
+            governance_approval.get("proposal_id"), "governance_approval.proposal_id"
+        )
+        approval_digest = _text(
+            governance_approval.get(
+                "proposal_digest"
+            ),
+            "governance_approval.proposal_digest",
+        )
+        if (
+            str(governance_approval.get("status") or "").upper() != "APPROVED"
+            or approval_id != primary_id
+            or approval_digest != primary_digest
+            or str(governance_approval.get("commander_surface") or "").upper()
+            != "UNIVERSE_UI"
+        ):
+            raise ProjectMasterHostError("PRIMARY_TASK_APPROVAL_MISMATCH")
+        approval_evidence_ref = _text(
+            governance_approval.get("evidence_ref"),
+            "governance_approval.evidence_ref",
+        )
+        if approval_evidence_ref != stored_evidence_ref:
+            raise ProjectMasterHostError("PRIMARY_TASK_APPROVAL_EVIDENCE_MISMATCH")
+
+        normalized_work = self._approved_source_work(
+            source_work=source_work,
+            primary_scope=primary_scope,
+            primary_boundary=primary_boundary,
+            approval_evidence_ref=approval_evidence_ref,
+        )
+        normalized_frame = self._approved_task_frame_request(
+            task_frame=task_frame,
+            source_work=normalized_work,
+        )
+        binding = self._ensure_runtime()
+        work_result = self._invoke(
+            (
+                "execution-binding",
+                "begin-work",
+                "--endpoint",
+                binding["endpoint"],
+                "--token",
+                binding["token"],
+            ),
+            {
+                "session_id": binding["session_id"],
+                "work": normalized_work,
+            },
+        )
+        if work_result.get("status") != "WORK_RECEIPT_ACTIVATED":
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_ACTIVATION_FAILED")
+        work_receipt = work_result.get("work_receipt")
+        if not isinstance(work_receipt, Mapping):
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_RECEIPT_INVALID")
+        work_receipt_id = _text(work_receipt.get("work_receipt_id"), "work_receipt_id")
+
+        source_ref = _text(
+            primary_proposal.get("source_ref") or primary_proposal.get("request_ref"),
+            "primary.source_ref",
+        )
+        task_summary_ref = _text(
+            primary_proposal.get("request_ref"), "primary.request_ref"
+        )
+        execution_plan = {
+            "profile_id": "task-frame-debate-v1",
+            "requested_shape": "DEBATE",
+            "resolved_shape": "DEBATE",
+            "model_mode": "EXPLICIT",
+            "frame_id": normalized_frame["frame_id"],
+            "origin_anchor_ref": binding["anchor_id"],
+            "origin_session_id": binding["session_id"],
+            "origin_frame_id": binding["frame_id"],
+            "task_summary_ref": task_summary_ref,
+            "source_ref": source_ref,
+            "candidate_source_ref": "NONE",
+            "source_review_result": None,
+            "parent_actor_ref": normalized_frame["parent_actor_ref"],
+            "commander_surface": "UNIVERSE_UI",
+            "execution_assignment_ref": work_receipt_id,
+            "host_worker_capability": "AVAILABLE",
+            "repository_write_scope": "BOUNDED",
+            "mutation_scope": normalized_frame["mutation_scope"],
+            "fallback_reason": "NONE",
+            "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
+            "turns": normalized_frame["turns"],
+        }
+        proposal_result = self._invoke(
+            (
+                "task-frame",
+                "propose",
+                "--repo-root",
+                str(self.project_root),
+                "--profile",
+                str(TASK_FRAME_PROFILE_RELATIVE_PATH),
+            ),
+            {"execution_plan": execution_plan},
+        )
+        execution_proposal = proposal_result.get("execution_proposal")
+        if not isinstance(execution_proposal, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PROPOSAL_INVALID")
+        execution_approval = {
+            "status": "APPROVED",
+            "proposal_id": _text(
+                execution_proposal.get("proposal_id"),
+                "task_frame_execution_proposal.proposal_id",
+            ),
+            "plan_digest": _text(
+                execution_proposal.get("plan_digest"),
+                "task_frame_execution_proposal.plan_digest",
+            ),
+            "commander_surface": "UNIVERSE_UI",
+            "evidence_ref": approval_evidence_ref,
+        }
+        parent_instruction = {
+            "instruction_id": normalized_frame["instruction_id"],
+            "user_instruction_raw": normalized_frame["instruction_text"],
+            "constraints": normalized_frame["constraints"],
+            "expected_output": normalized_frame["expected_output"],
+            "repository_write_scope": "BOUNDED",
+            "mutation_scope": normalized_frame["mutation_scope"],
+        }
+        created = self._post_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/create",
+            {
+                "session_id": binding["session_id"],
+                "profile": str(TASK_FRAME_PROFILE_RELATIVE_PATH),
+                "frame": {
+                    "frame_id": normalized_frame["frame_id"],
+                    "origin_anchor_ref": binding["anchor_id"],
+                    "origin_session_id": binding["session_id"],
+                    "origin_frame_id": binding["frame_id"],
+                    "origin_governance_session_ref": "UNKNOWN",
+                    "task_summary_ref": task_summary_ref,
+                    "source_ref": source_ref,
+                    "execution_assignment_ref": work_receipt_id,
+                    "task_frame_execution_proposal": dict(execution_proposal),
+                    "task_frame_execution_approval": execution_approval,
+                    "parent_instruction": parent_instruction,
+                    "dispatch_topology": None,
+                    "parent_observation": {
+                        "status": "MATCHED",
+                        "evidence_ref": approval_evidence_ref,
+                    },
+                    "observed_at": utc_now(),
+                },
+            },
+        )
+        if created.get("status") != "TASK_FRAME_HOST_ACTIVE":
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_CREATE_FAILED")
+        declared = self._post_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/operation",
+            {
+                "session_id": binding["session_id"],
+                "frame_id": normalized_frame["frame_id"],
+                "operation": {
+                    "operation": "declare_turns",
+                    "turns": [
+                        {"turn_id": turn["turn_id"], "role": turn["role"]}
+                        for turn in normalized_frame["turns"]
+                    ],
+                    "observed_at": utc_now(),
+                },
+            },
+        )
+        output = declared.get("output")
+        if (
+            declared.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+            or not isinstance(output, Mapping)
+            or output.get("status") not in {"TASK_TURNS_DECLARED", "TASK_TURNS_ALREADY_DECLARED"}
+        ):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_TURN_DECLARATION_FAILED")
+        return {
+            "status": "APPROVED_DESCENDANT_TASK_FRAME_READY",
+            "project_id": self.project_id,
+            "primary_proposal_id": primary_id,
+            "primary_proposal_digest": primary_digest,
+            "approval_evidence_ref": approval_evidence_ref,
+            "work_receipt_id": work_receipt_id,
+            "execution_binding_id": _text(
+                work_result.get("binding_id"), "work_result.binding_id"
+            ),
+            "task_frame_id": normalized_frame["frame_id"],
+            "task_frame_proposal_id": execution_approval["proposal_id"],
+            "task_frame_plan_digest": execution_approval["plan_digest"],
+            "turns": [
+                {"turn_id": turn["turn_id"], "role": turn["role"]}
+                for turn in normalized_frame["turns"]
+            ],
+            "repository_write": False,
+        }
+
+    def _approved_source_work(
+        self,
+        *,
+        source_work: Mapping[str, Any],
+        primary_scope: Mapping[str, Any],
+        primary_boundary: str,
+        approval_evidence_ref: str,
+    ) -> dict[str, Any]:
+        required = {
+            "scope_kind",
+            "write_roots",
+            "write_operations",
+            "boundary",
+            "task_summary",
+            "instruction_ref",
+        }
+        if set(source_work) != required:
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_REQUEST_INVALID")
+        if source_work.get("scope_kind") != "PROJECT_SOURCE_WORK":
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_SCOPE_INVALID")
+        if _text(source_work.get("boundary"), "source_work.boundary") != primary_boundary:
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_BOUNDARY_MISMATCH")
+        if (
+            _text(source_work.get("instruction_ref"), "source_work.instruction_ref")
+            != approval_evidence_ref
+        ):
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_EVIDENCE_MISMATCH")
+        roots_value = source_work.get("write_roots")
+        if not isinstance(roots_value, list) or not roots_value:
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_ROOTS_INVALID")
+        declared_paths = _absolute_paths_in_value(primary_scope)
+        normalized_roots: list[str] = []
+        for item in roots_value:
+            root = _approved_source_path(item, "source_work.write_roots")
+            if not _path_is_within(root, self.project_root):
+                raise ProjectMasterHostError("APPROVED_SOURCE_WORK_ROOT_OUT_OF_SCOPE")
+            if root not in declared_paths:
+                raise ProjectMasterHostError("APPROVED_SOURCE_WORK_ROOT_NOT_PRIMARY")
+            root_text = str(root)
+            if root_text not in normalized_roots:
+                normalized_roots.append(root_text)
+        operations_value = source_work.get("write_operations")
+        if not isinstance(operations_value, list) or not operations_value:
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_OPERATIONS_INVALID")
+        operations = [
+            _text(item, "source_work.write_operations").upper()
+            for item in operations_value
+        ]
+        if len(set(operations)) != len(operations) or not set(operations).issubset(
+            {"CREATE", "MODIFY"}
+        ):
+            raise ProjectMasterHostError("APPROVED_SOURCE_WORK_OPERATIONS_INVALID")
+        return {
+            "scope_kind": "PROJECT_SOURCE_WORK",
+            "write_roots": normalized_roots,
+            "write_operations": operations,
+            "boundary": primary_boundary,
+            "task_summary": _text(source_work.get("task_summary"), "source_work.task_summary"),
+            "instruction_ref": approval_evidence_ref,
+        }
+
+    def _approved_task_frame_request(
+        self,
+        *,
+        task_frame: Mapping[str, Any],
+        source_work: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        required = {
+            "frame_id",
+            "parent_actor_ref",
+            "mutation_scope",
+            "turns",
+            "instruction_id",
+            "instruction_text",
+            "constraints",
+            "expected_output",
+        }
+        if set(task_frame) != required:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_REQUEST_INVALID")
+        mutation_scope = task_frame.get("mutation_scope")
+        if not isinstance(mutation_scope, Mapping) or set(mutation_scope) != {
+            "operations",
+            "targets",
+        }:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+        operations_value = mutation_scope.get("operations")
+        targets_value = mutation_scope.get("targets")
+        if not isinstance(operations_value, list) or not isinstance(targets_value, list):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+        operations = [
+            _text(item, "task_frame.mutation_scope.operations").upper()
+            for item in operations_value
+        ]
+        if (
+            not operations
+            or len(set(operations)) != len(operations)
+            or not set(operations).issubset(set(source_work["write_operations"]))
+        ):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+        normalized_targets: list[str] = []
+        for item in targets_value:
+            target = _approved_source_path(item, "task_frame.mutation_scope.targets")
+            if not any(
+                _path_is_within(target, Path(root))
+                for root in source_work["write_roots"]
+            ):
+                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_TARGET_OUT_OF_SCOPE")
+            target_text = str(target)
+            if target_text in normalized_targets:
+                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+            normalized_targets.append(target_text)
+        if not normalized_targets:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+        turns = task_frame.get("turns")
+        if (
+            not isinstance(turns, list)
+            or not turns
+            or not all(isinstance(turn, Mapping) for turn in turns)
+        ):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_TURNS_INVALID")
+        constraints = task_frame.get("constraints")
+        if not isinstance(constraints, list) or not all(
+            isinstance(item, str) and item.strip() for item in constraints
+        ):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_CONSTRAINTS_INVALID")
+        expected_output = task_frame.get("expected_output")
+        if not isinstance(expected_output, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_OUTPUT_INVALID")
+        return {
+            "frame_id": _text(task_frame.get("frame_id"), "task_frame.frame_id"),
+            "parent_actor_ref": _text(
+                task_frame.get("parent_actor_ref"), "task_frame.parent_actor_ref"
+            ),
+            "mutation_scope": {
+                "operations": operations,
+                "targets": normalized_targets,
+            },
+            "turns": [dict(turn) for turn in turns],
+            "instruction_id": _text(
+                task_frame.get("instruction_id"), "task_frame.instruction_id"
+            ),
+            "instruction_text": _text(
+                task_frame.get("instruction_text"), "task_frame.instruction_text"
+            ),
+            "constraints": list(constraints),
+            "expected_output": dict(expected_output),
+        }
+
+    @staticmethod
+    def _post_runtime(
+        endpoint: str,
+        token: str,
+        path: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        parsed = urlsplit(_text(endpoint, "runtime.endpoint"))
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.port
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_ENDPOINT_INVALID")
+        request = Request(
+            endpoint.rstrip("/") + path,
+            data=json.dumps(
+                dict(payload), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Anchor-Session-Memory-Token": _text(token, "runtime.token"),
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:  # nosec B310
+                result = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_UNAVAILABLE") from error
+        if not isinstance(result, dict):
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_RESULT_INVALID")
         return result
 
     def close(self) -> None:
@@ -1304,7 +1729,7 @@ class ProjectMasterSessionStore:
                 """
                 SELECT envelope_json
                 FROM inbox_message
-                WHERE state IN ('PENDING', 'FAILED')
+                WHERE state = 'PENDING'
                 ORDER BY updated_at, message_id
                 """
             ).fetchall()
@@ -1328,6 +1753,19 @@ class ProjectMasterSessionStore:
 
     def fail(self, message_id: str, error: str) -> None:
         self._transition(message_id, "FAILED", error[:1000])
+
+    def cancel(self, message_id: str) -> bool:
+        """Cancel only work that has not been claimed by the provider."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE inbox_message
+                SET state = 'CANCELLED', last_error = '', updated_at = ?
+                WHERE message_id = ? AND state IN ('PENDING', 'FAILED')
+                """,
+                (utc_now(), message_id),
+            )
+        return cursor.rowcount == 1
 
     def state(self, message_id: str) -> str:
         with self._connection() as connection:
@@ -3316,6 +3754,34 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
         ) as error:
             raise ProjectMasterBridgeError(str(error)) from error
 
+    def create_approved_descendant_task_frame(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "primary_proposal",
+            "governance_approval",
+            "source_work",
+            "task_frame",
+        }:
+            raise ProjectMasterBridgeError(
+                "APPROVED_DESCENDANT_TASK_FRAME_REQUEST_INVALID"
+            )
+        gateway = self._coordinator
+        create = getattr(gateway, "create_approved_descendant_task_frame", None)
+        if not callable(create):
+            raise ProjectMasterBridgeError(
+                "APPROVED_DESCENDANT_TASK_FRAME_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return dict(
+                create(
+                    primary_proposal=request["primary_proposal"],
+                    governance_approval=request["governance_approval"],
+                    source_work=request["source_work"],
+                    task_frame=request["task_frame"],
+                )
+            )
+        except ProjectMasterHostError as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
 
 @dataclass
 class ResidentProjectMasterHandle:
@@ -3940,6 +4406,32 @@ def _path_is_within(target: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _approved_source_path(value: Any, field: str) -> Path:
+    text = _text(value, field)
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        raise ProjectMasterHostError("APPROVED_SOURCE_PATH_NOT_ABSOLUTE")
+    return candidate.resolve(strict=False)
+
+
+def _absolute_paths_in_value(value: Any) -> set[Path]:
+    """Extract declared absolute paths without assigning semantics to unknown scope keys."""
+
+    values: list[Any] = [value]
+    paths: set[Path] = set()
+    while values:
+        current = values.pop()
+        if isinstance(current, Mapping):
+            values.extend(current.values())
+        elif isinstance(current, list):
+            values.extend(current)
+        elif isinstance(current, str):
+            candidate = Path(current).expanduser()
+            if candidate.is_absolute():
+                paths.add(candidate.resolve(strict=False))
+    return paths
 
 
 def _text(value: Any, field: str) -> str:

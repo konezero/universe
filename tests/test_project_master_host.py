@@ -1162,6 +1162,34 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(self.provider.messages))
         self.assertEqual("COMPLETE", self.state.state(self._message_id()))
 
+    def test_failed_message_requires_explicit_cancel_and_reregister(self) -> None:
+        self.assertTrue(self.state.register(self._envelope()))
+        self.assertTrue(self.state.claim(self._message_id()))
+        self.state.fail(self._message_id(), "provider timeout")
+
+        replay = self._worker()
+        replay.start()
+        try:
+            self.assertTrue(replay.wait_idle())
+        finally:
+            replay.close()
+
+        self.assertEqual([], self.provider.messages)
+        self.assertEqual("FAILED", self.state.state(self._message_id()))
+        self.assertTrue(self.state.cancel(self._message_id()))
+        self.assertEqual("CANCELLED", self.state.state(self._message_id()))
+        self.assertTrue(self.state.register(self._envelope()))
+
+        retried = self._worker()
+        retried.start()
+        try:
+            self.assertTrue(retried.wait_idle())
+        finally:
+            retried.close()
+
+        self.assertEqual(1, len(self.provider.messages))
+        self.assertEqual("COMPLETE", self.state.state(self._message_id()))
+
     def test_grok_runtime_routes_project_message_through_acp_gateway(self) -> None:
         runtime = GrokProjectMasterRuntime(
             self.root,
@@ -1774,6 +1802,223 @@ class ProjectMasterHostTests(unittest.TestCase):
             "PROJECT_RUNTIME_COMMAND_FAILED:EXECUTION_ASSIGNMENT_CURRENTNESS_UNKNOWN",
         ):
             coordinator._invoke(("execution-binding", "propose"), {})
+
+    def test_approved_primary_creates_exact_descendant_task_frame(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        tools_root = self.root / "tools"
+        tests_root = self.root / "tests"
+        tools_root.mkdir()
+        tests_root.mkdir()
+        calls: list[dict[str, Any]] = []
+
+        def runner(request):
+            payload = json.loads(
+                Path(request.arguments[request.arguments.index("--request") + 1]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            calls.append({"arguments": request.arguments, "payload": payload})
+            if "begin-work" in request.arguments:
+                response = {
+                    "status": "WORK_RECEIPT_ACTIVATED",
+                    "binding_id": "binding-work-001",
+                    "work_receipt": {"work_receipt_id": "work-receipt-001"},
+                }
+            else:
+                response = {
+                    "execution_proposal": {
+                        "proposal_id": "task_frame_proposal_001",
+                        "plan_digest": "a" * 64,
+                    }
+                }
+            return NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(response),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            native_runner=runner,
+        )
+        runtime_posts: list[dict[str, Any]] = []
+
+        def post(_endpoint, _token, path, payload):
+            runtime_posts.append({"path": path, "payload": payload})
+            if path.endswith("/create"):
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TASK_TURNS_DECLARED"},
+            }
+
+        primary = {
+            "proposal_id": "task_proposal_primary_001",
+            "proposal_digest": "b" * 64,
+            "state": "APPROVED",
+            "boundary": "P0 live room implementation",
+            "task_summary": "Implement live provider room routing.",
+            "request_ref": "universe://projects/GCS/proposals/primary-001",
+            "source_ref": "universe://projects/GCS/requests/primary-001",
+            "scope": {"roots": [str(tools_root), str(tests_root)]},
+            "approval": {
+                "status": "APPROVED",
+                "evidence_ref": "universe://projects/GCS/decisions/primary-001",
+            },
+        }
+        approval = {
+            "status": "APPROVED",
+            "proposal_id": primary["proposal_id"],
+            "proposal_digest": primary["proposal_digest"],
+            "commander_surface": "UNIVERSE_UI",
+            "evidence_ref": primary["approval"]["evidence_ref"],
+        }
+        source_work = {
+            "scope_kind": "PROJECT_SOURCE_WORK",
+            "write_roots": [str(tools_root), str(tests_root)],
+            "write_operations": ["CREATE", "MODIFY"],
+            "boundary": primary["boundary"],
+            "task_summary": primary["task_summary"],
+            "instruction_ref": approval["evidence_ref"],
+        }
+        task_frame = {
+            "frame_id": "gcs-primary-001",
+            "parent_actor_ref": "project-master:GCS",
+            "mutation_scope": {
+                "operations": ["CREATE", "MODIFY"],
+                "targets": [str(tools_root / "room_router.py"), str(tests_root / "test_room_router.py")],
+            },
+            "turns": [
+                {
+                    "turn_id": "boss",
+                    "role": "BOSS",
+                    "worker_slot_ref": "implementation-boss",
+                    "provider": "CODEX",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                }
+            ],
+            "instruction_id": "instruction:primary-001",
+            "instruction_text": primary["task_summary"],
+            "constraints": ["NO_COMMIT", "NO_PUSH"],
+            "expected_output": {"result": "implementation and tests"},
+        }
+
+        with patch.object(
+            coordinator,
+            "_ensure_runtime",
+            return_value={
+                "endpoint": "http://127.0.0.1:41992",
+                "token": "test-token",
+                "session_id": "project-master-session-001",
+                "frame_id": "master-current",
+                "anchor_id": "MASTER-CURRENT-001",
+            },
+        ), patch.object(coordinator, "_post_runtime", side_effect=post):
+            result = coordinator.create_approved_descendant_task_frame(
+                primary_proposal=primary,
+                governance_approval=approval,
+                source_work=source_work,
+                task_frame=task_frame,
+            )
+
+        self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_READY", result["status"])
+        self.assertEqual("work-receipt-001", result["work_receipt_id"])
+        self.assertEqual("task_frame_proposal_001", result["task_frame_proposal_id"])
+        self.assertEqual(2, len(calls))
+        self.assertEqual(approval["evidence_ref"], calls[0]["payload"]["work"]["instruction_ref"])
+        plan = calls[1]["payload"]["execution_plan"]
+        self.assertEqual("work-receipt-001", plan["execution_assignment_ref"])
+        self.assertEqual("UNIVERSE_UI", plan["commander_surface"])
+        self.assertEqual(task_frame["mutation_scope"], plan["mutation_scope"])
+        self.assertEqual(2, len(runtime_posts))
+        self.assertEqual(
+            approval["evidence_ref"],
+            runtime_posts[0]["payload"]["frame"]["parent_observation"]["evidence_ref"],
+        )
+        self.assertNotIn("token", result)
+        self.assertNotIn("endpoint", result)
+
+    def test_approved_descendant_rejects_target_outside_primary_roots(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        allowed_root = self.root / "tools"
+        allowed_root.mkdir()
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            native_runner=lambda _request: self.fail("runtime must not start"),
+        )
+        evidence_ref = "universe://projects/GCS/decisions/primary-002"
+        primary = {
+            "proposal_id": "task_proposal_primary_002",
+            "proposal_digest": "c" * 64,
+            "state": "APPROVED",
+            "boundary": "P0 routing",
+            "task_summary": "Implement routing.",
+            "request_ref": "universe://projects/GCS/proposals/primary-002",
+            "source_ref": "universe://projects/GCS/requests/primary-002",
+            "scope": {"roots": [str(allowed_root)]},
+            "approval": {"status": "APPROVED", "evidence_ref": evidence_ref},
+        }
+        approval = {
+            "status": "APPROVED",
+            "proposal_id": primary["proposal_id"],
+            "proposal_digest": primary["proposal_digest"],
+            "commander_surface": "UNIVERSE_UI",
+            "evidence_ref": evidence_ref,
+        }
+        source_work = {
+            "scope_kind": "PROJECT_SOURCE_WORK",
+            "write_roots": [str(allowed_root)],
+            "write_operations": ["CREATE"],
+            "boundary": primary["boundary"],
+            "task_summary": primary["task_summary"],
+            "instruction_ref": evidence_ref,
+        }
+        task_frame = {
+            "frame_id": "gcs-primary-002",
+            "parent_actor_ref": "project-master:GCS",
+            "mutation_scope": {
+                "operations": ["CREATE"],
+                "targets": [str(self.root / "outside.py")],
+            },
+            "turns": [
+                {
+                    "turn_id": "boss",
+                    "role": "BOSS",
+                    "worker_slot_ref": "implementation-boss",
+                    "provider": "CODEX",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                }
+            ],
+            "instruction_id": "instruction:primary-002",
+            "instruction_text": primary["task_summary"],
+            "constraints": ["NO_COMMIT"],
+            "expected_output": {"result": "implementation"},
+        }
+
+        with self.assertRaisesRegex(
+            ProjectMasterHostError, "DESCENDANT_TASK_FRAME_TARGET_OUT_OF_SCOPE"
+        ):
+            coordinator.create_approved_descendant_task_frame(
+                primary_proposal=primary,
+                governance_approval=approval,
+                source_work=source_work,
+                task_frame=task_frame,
+            )
 
     def test_project_stop_denial_retains_process_and_refreshes_lease_version(
         self,

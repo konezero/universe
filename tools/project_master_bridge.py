@@ -99,6 +99,11 @@ class ProjectMasterBridgeHost:
     def apply_skill_plan(self, _request: Any) -> dict[str, Any]:
         raise ProjectMasterBridgeError("PROJECT_SKILL_PLAN_CONTEXT_GATEWAY_UNAVAILABLE")
 
+    def create_approved_descendant_task_frame(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError(
+            "APPROVED_DESCENDANT_TASK_FRAME_GATEWAY_UNAVAILABLE"
+        )
+
     def _inbox(self) -> Path:
         root = self.project_root.expanduser().resolve(strict=True)
         if not root.is_dir():
@@ -151,6 +156,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             (
                 "/v1/project-master/skill-plans/apply"
             ): self.server.bridge_host.apply_skill_plan,
+            (
+                "/v1/project-master/task-frames/approved"
+            ): self.server.bridge_host.create_approved_descendant_task_frame,
         }
         operation = routes.get(self.path)
         if operation is None:
@@ -180,6 +188,7 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             "ACCEPTED",
             "PROJECT_SEED_ASSETS_APPLIED",
             "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
+            "APPROVED_DESCENDANT_TASK_FRAME_READY",
         } and not receipt.get("idempotent_replay", False)
         status = HTTPStatus.CREATED if created else HTTPStatus.OK
         self._send_json(status, receipt)

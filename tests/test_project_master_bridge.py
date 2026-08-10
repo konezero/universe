@@ -128,6 +128,49 @@ class ProjectMasterBridgeTests(unittest.TestCase):
                 "../outside",
             )
 
+    def test_extended_host_creates_approved_task_frame_at_dedicated_route(self) -> None:
+        request = {
+            "primary_proposal": {"proposal_id": "task_proposal_001"},
+            "governance_approval": {"status": "APPROVED"},
+            "source_work": {"scope_kind": "PROJECT_SOURCE_WORK"},
+            "task_frame": {"frame_id": "gcs-bootstrap-frame-001"},
+        }
+        owner = self
+
+        class ReadyHost(ProjectMasterBridgeHost):
+            def create_approved_descendant_task_frame(
+                self, received: Any
+            ) -> dict[str, Any]:
+                owner.assertEqual(request, received)
+                return {"status": "APPROVED_DESCENDANT_TASK_FRAME_READY"}
+
+        host = ReadyHost(self.root, self.token)
+        server = ProjectMasterBridgeHttpServer(("127.0.0.1", 0), host)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            payload = json.dumps(request).encode("utf-8")
+            http_request = Request(
+                endpoint + "/v1/project-master/task-frames/approved",
+                data=payload,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urlopen(http_request) as response:  # nosec B310
+                status = HTTPStatus(response.status)
+                result = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_READY", result["status"])
+
     def test_reply_posts_bound_payload_to_loopback_universe_endpoint(self) -> None:
         captured: dict[str, Any] = {}
 
