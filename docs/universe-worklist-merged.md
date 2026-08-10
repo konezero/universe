@@ -211,6 +211,20 @@ External or deliberately deferred:
 
 - Real Grok bounded-session probe while the provider quota is exhausted.
 - Long-running quota/restart recovery probes for every real Provider.
+
+### 10) P0 receipt-aware streaming and server modularization
+
+Approved plan: `docs/p0-receipt-streaming-and-server-modularization.md`.
+
+- [x] Add bounded Runtime-owned streaming payload staging and opaque content references in the clean PR269 worktree.
+- [x] Bind Mutation Receipts after upload to payload kind, opaque ref, digest, size, target, preimage, and expected postimage.
+- [x] Make exact byte-splice patch the default text MODIFY path; retain streamed full content for CREATE and fallback.
+- [ ] Commit the Runtime source, OS_UPDATE Universe, and dogfood large CREATE/MODIFY, interrupted streams, digest mismatch, stale preimage, expiry, replay, and cleanup.
+- [ ] Continue extracting `tools/universe_server.py`; connection/auth/HTTP transport and SSE hubs are complete, while storage/services/API/runtime/CLI remain.
+- [x] Add changed-module, smoke, API/DB contract, and full regression tiers (12/16/64/566 tests; all passed on 2026-08-10).
+- [ ] Add scheduled real-Provider, browser, restart, quota, and long-running dogfood tiers.
+
+Priority: **P0**. New feature work that expands `tools/universe_server.py` should wait unless it is required to complete this stabilization epic.
 - Live native-provider completion adapter for automatic meeting runs.
 - Gabia/VPS tunnel, public DNS/HTTPS, mobile Internet pairing, and signed
   MSI/MSIX deployment.

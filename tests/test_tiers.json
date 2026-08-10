@@ -1,0 +1,59 @@
+{
+  "schema": "universe.test-tiers.v1",
+  "tiers": {
+    "changed": {
+      "target_seconds": 30,
+      "tests": [
+        "tests.test_universe_connection",
+        "tests.test_universe_streaming"
+      ],
+      "path_mappings": {
+        "tools/universe_app/connection.py": [
+          "tests.test_universe_connection"
+        ],
+        "tools/universe_server.py": [
+          "tests.test_universe_connection",
+          "tests.test_universe_streaming",
+          "tests.test_universe_server.UniverseWorkPreflightTests"
+        ],
+        "tests/test_universe_connection.py": [
+          "tests.test_universe_connection"
+        ],
+        "tools/universe_app/streaming.py": [
+          "tests.test_universe_streaming"
+        ],
+        "tests/test_universe_streaming.py": [
+          "tests.test_universe_streaming"
+        ]
+      }
+    },
+    "smoke": {
+      "target_seconds": 30,
+      "tests": [
+        "tests.test_universe_connection",
+        "tests.test_universe_streaming",
+        "tests.test_universe_e2e_product_scenario",
+        "tests.test_universe_ui_session_observatory"
+      ]
+    },
+    "contract": {
+      "target_seconds": 90,
+      "tests": [
+        "tests.test_universe_connection",
+        "tests.test_universe_streaming",
+        "tests.test_universe_server.UniverseWorkPreflightTests",
+        "tests.test_universe_server.RuntimeLeaseStoreTests",
+        "tests.test_multi_room.MultiRoomStoreTests",
+        "tests.test_memory_fast_extract.FastExtractContractTests",
+        "tests.test_remote_access.RemoteAccessStoreTests",
+        "tests.test_session_supervisor.SessionSupervisorStoreTests"
+      ]
+    },
+    "full": {
+      "discovery": {
+        "start_dir": "tests",
+        "pattern": "test_*.py"
+      }
+    }
+  }
+}

@@ -95,11 +95,19 @@ authority, assign work, or authorize execution.
 
 ## Development
 
-Run the seed validation suite:
+Run the bounded regression tier that matches the change:
 
 ```powershell
-python -m unittest discover -s tests -v
+python tools/run_test_tier.py changed --path tools/universe_app/connection.py
+python tools/run_test_tier.py smoke
+python tools/run_test_tier.py contract
+python tools/run_test_tier.py full
 ```
+
+`changed` and `smoke` target 30 seconds, while `contract` targets 90 seconds.
+Use `--enforce-budget` when validating the tier budget. Run `full` before push
+and for release validation; it remains equivalent to complete `unittest`
+discovery under `tests/`.
 
 The initial contract is documented in
 `docs/official-development-seed-v0.md`.
