@@ -2087,6 +2087,7 @@ def provider_session_connection(
     store: ProjectMasterSessionStore | None,
     resident: bool,
     connection_state: str | None = None,
+    model_ref: str | None = None,
 ) -> dict[str, Any]:
     coordinate = store.last_provider_session() if store is not None else None
     state = str(connection_state or "").strip().upper()
@@ -2103,6 +2104,7 @@ def provider_session_connection(
         "last_session_ref": (
             coordinate["session_ref"] if coordinate is not None else "UNKNOWN"
         ),
+        "model_ref": _text(model_ref, "model_ref") if model_ref else "UNKNOWN",
         "connection_state": state,
         "session_persistence": "LAST_COORDINATE",
         "resident": bool(resident),
@@ -2316,6 +2318,7 @@ class CodexProjectMasterRuntime:
         store: ProjectMasterSessionStore,
         *,
         native_runner: NativeRunner = run_native_cli,
+        model: str = "",
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
     ) -> None:
@@ -2323,6 +2326,7 @@ class CodexProjectMasterRuntime:
         self.project_id = _text(project_id, "project_id")
         self.store = store
         self.native_runner = native_runner
+        self.model = model.strip()
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = (
             _text(actor_label, "actor_label")
@@ -2421,9 +2425,10 @@ class CodexProjectMasterRuntime:
             return self._gateway
         if self._permission_requester is None:
             raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
-        executable, environment, model = _resolve_codex()
+        executable, environment, default_model = _resolve_codex()
         if executable is None:
             raise ProjectMasterHostError("CODEX_CLI_UNAVAILABLE")
+        model = self.model or default_model
 
         def observe_session(session_id: str) -> None:
             self.session_id = session_id
@@ -2499,6 +2504,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         store: ProjectMasterSessionStore,
         *,
         native_runner: NativeRunner = run_native_cli,
+        model: str = "",
         max_turns: int = 8,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
@@ -2508,6 +2514,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             project_id,
             store,
             native_runner=native_runner,
+            model=model,
             requested_mode=requested_mode,
             actor_label=actor_label,
         )
@@ -2529,9 +2536,10 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             return self._gateway
         if self._permission_requester is None:
             raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
-        executable, environment, model = _resolve_claude()
+        executable, environment, default_model = _resolve_claude()
         if executable is None:
             raise ProjectMasterHostError("CLAUDE_CLI_UNAVAILABLE")
+        model = self.model or default_model
 
         def observe_session(session_id: str) -> None:
             self.session_id = session_id
@@ -3890,6 +3898,8 @@ class ResidentProjectMasterHandle:
     project_id: str
     project_root: Path
     provider: str
+    model: str
+    session_ref: str
     endpoint: str
     credential_env: str
     bridge_server: ProjectMasterBridgeHttpServer
@@ -3922,6 +3932,7 @@ class ResidentProjectMasterHostManager:
         ]
         | None = None,
         provider_resolver: Callable[[str], str] | None = None,
+        model_resolver: Callable[[str, str], str] | None = None,
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
@@ -3934,6 +3945,7 @@ class ResidentProjectMasterHostManager:
         self.continuity_coordinator = continuity_coordinator
         self.provider_factory = provider_factory
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
+        self.model_resolver = model_resolver or (lambda _project_id, _provider: "")
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
         self.completion_observer = completion_observer
@@ -3949,12 +3961,27 @@ class ResidentProjectMasterHostManager:
             .resolve(strict=True)
         )
         selected_provider = _provider(self.provider_resolver(project_id))
+        selected_model = str(
+            self.model_resolver(project_id, selected_provider) or ""
+        ).strip()
+        store = ProjectMasterSessionStore(
+            _default_state_db(project_id),
+            project_id,
+            session_supervisor=self.session_supervisor,
+            requested_mode="MASTER",
+        )
+        selected_session_ref = store.session_ref_for(selected_provider)
         with self._lock:
             handle = self._handles.get(project_id)
             if (
                 handle is not None
                 and handle.thread.is_alive()
                 and handle.provider == selected_provider
+                and handle.model == selected_model
+                and (
+                    not selected_session_ref
+                    or handle.session_ref == selected_session_ref
+                )
             ):
                 setattr(handle.worker.provider, "connection_state", "REUSED")
                 return {
@@ -3971,12 +3998,6 @@ class ResidentProjectMasterHostManager:
 
             credential_env = _managed_credential_env(project_id)
             os.environ[credential_env] = secrets.token_urlsafe(32)
-            store = ProjectMasterSessionStore(
-                _default_state_db(project_id),
-                project_id,
-                session_supervisor=self.session_supervisor,
-                requested_mode="MASTER",
-            )
             provider = (
                 self.provider_factory(project_root, project_id, store)
                 if self.provider_factory is not None
@@ -3985,6 +4006,7 @@ class ResidentProjectMasterHostManager:
                     project_root,
                     project_id,
                     store,
+                    model=selected_model,
                 )
             )
             try:
@@ -4047,6 +4069,8 @@ class ResidentProjectMasterHostManager:
                 project_id=project_id,
                 project_root=project_root,
                 provider=selected_provider,
+                model=selected_model,
+                session_ref=provider.session_ref,
                 endpoint=endpoint,
                 credential_env=credential_env,
                 bridge_server=server,
@@ -4128,13 +4152,32 @@ class ResidentProjectMasterHostManager:
                 session_supervisor=self.session_supervisor,
                 requested_mode="MASTER",
             )
+        provider = ""
+        if store is not None:
+            coordinate = store.last_provider_session()
+            provider = str(coordinate.get("provider") or "") if coordinate else ""
+        if not provider:
+            try:
+                provider = _provider(self.provider_resolver(normalized))
+            except Exception:
+                provider = ""
+        model = self._model_for(normalized, provider)
         return provider_session_connection(
             target_kind="PROJECT_MASTER",
             target_id=normalized,
             requested_mode="MASTER",
             store=store,
             resident=False,
+            model_ref=model,
         )
+
+    def _model_for(self, project_id: str, provider: str) -> str:
+        if not provider:
+            return ""
+        try:
+            return str(self.model_resolver(project_id, provider) or "").strip()
+        except Exception:
+            return ""
 
     def invalidate(self, project_id: str) -> None:
         normalized = _text(project_id, "project_id")
@@ -4343,6 +4386,7 @@ class ResidentProjectMasterHostManager:
             store=handle.worker.store,
             resident=True,
             connection_state=state if state and state != "UNKNOWN" else None,
+            model_ref=str(getattr(active, "model", "") or "").strip(),
         )
 
     @staticmethod
@@ -4351,13 +4395,20 @@ class ResidentProjectMasterHostManager:
         project_root: Path,
         project_id: str,
         store: ProjectMasterSessionStore,
+        model: str = "",
     ) -> MasterProvider:
         if provider == "GROK":
-            return GrokProjectMasterRuntime(project_root, project_id, store)
+            return GrokProjectMasterRuntime(
+                project_root, project_id, store, model=model
+            )
         if provider == "CODEX":
-            return CodexProjectMasterRuntime(project_root, project_id, store)
+            return CodexProjectMasterRuntime(
+                project_root, project_id, store, model=model
+            )
         if provider == "CLAUDE":
-            return ClaudeProjectMasterRuntime(project_root, project_id, store)
+            return ClaudeProjectMasterRuntime(
+                project_root, project_id, store, model=model
+            )
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 
     def _default_coordinator(

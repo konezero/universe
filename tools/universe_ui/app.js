@@ -158,6 +158,13 @@ const elements = {
   sessionSummarySubtitle: document.querySelector("#session-summary-subtitle"),
   sessionSummaryFacts: document.querySelector("#session-summary-facts"),
   sessionSummaryLive: document.querySelector("#session-summary-live"),
+  sessionSummaryConnection: document.querySelector("#session-summary-connection"),
+  sessionSummaryProvider: document.querySelector("#session-summary-provider"),
+  sessionSummaryModel: document.querySelector("#session-summary-model"),
+  sessionSummaryConnectionStatus: document.querySelector(
+    "#session-summary-connection-status"
+  ),
+  sessionSummaryConnect: document.querySelector("#session-summary-connect"),
   sessionSummaryOpen: document.querySelector("#session-summary-open"),
   sessionSummaryManage: document.querySelector("#session-summary-manage"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
@@ -1065,8 +1072,12 @@ async function activateAnchorSession(session) {
     (item) => item.project_id === session.node
   );
   if (project && session.mode === "MASTER") {
+    await attachSelectedMasterSession(session);
     await callProjectMaster(project.project_id, {
+      provider: session.provider,
       anchorKey: state.selectedSupervisorAnchorKey,
+      expectedProvider: session.provider,
+      expectedSessionRef: session.provider_session_ref,
     });
     expandConversationLayer();
     return;
@@ -1177,6 +1188,102 @@ function providerChatAnchorLabel(room) {
   return anchor;
 }
 
+function projectProviderSetting(projectId) {
+  return (
+    state.providerSettings?.project_masters?.find(
+      (item) => item.scope_id === projectId
+    ) || null
+  );
+}
+
+function fillSessionSummaryModelSelect(provider, selectedValue) {
+  if (!elements.sessionSummaryModel) return;
+  const key = String(provider || "").toUpperCase();
+  const catalogModels = providerCatalogModels(key);
+  const capabilityModel = providerCapability(key)?.model;
+  const models = [
+    ...new Set(
+      [
+        ...catalogModels,
+        capabilityModel,
+        state.providerModels?.providers?.[key]?.default,
+      ].filter(Boolean)
+    ),
+  ];
+  const selected = String(selectedValue || "");
+  if (selected && !models.includes(selected)) models.unshift(selected);
+  elements.sessionSummaryModel.replaceChildren();
+  for (const modelId of models) {
+    const option = node("option", "", modelId);
+    option.value = modelId;
+    elements.sessionSummaryModel.append(option);
+  }
+  if (!models.length) {
+    const option = node("option", "", "Host default");
+    option.value = "";
+    elements.sessionSummaryModel.append(option);
+  }
+  elements.sessionSummaryModel.value = selected || models[0] || "";
+}
+
+function renderSessionSummaryConnection(room, project, boundSession) {
+  const section = elements.sessionSummaryConnection;
+  if (!section) return;
+  const binding = room?.binding || {};
+  const canChoose = Boolean(
+    boundSession && binding.mode === "MASTER" && project.projectId
+  );
+  section.hidden = !canChoose;
+  if (!canChoose) return;
+
+  const setting = projectProviderSetting(project.projectId) || {};
+  const currentProvider = String(
+    room.provider || setting.resolved_provider || setting.provider || "AUTO"
+  ).toUpperCase();
+  const currentModel =
+    setting.model_ref ||
+    setting.resolved_model ||
+    providerCapability(currentProvider)?.model ||
+    "";
+  const providers = state.providerSettings?.available_providers || [];
+  elements.sessionSummaryProvider.replaceChildren();
+  for (const provider of providers) {
+    const key = String(provider.provider || "").toUpperCase();
+    if (!key) continue;
+    const option = node(
+      "option",
+      "",
+      key === "CODEX" ? "Codex" : key === "CLAUDE" ? "Claude" : "Grok"
+    );
+    option.value = key;
+    option.disabled = provider.status === "UNAVAILABLE";
+    if (provider.reason) option.title = provider.reason;
+    elements.sessionSummaryProvider.append(option);
+  }
+  if (!elements.sessionSummaryProvider.options.length) {
+    for (const key of ["CODEX", "CLAUDE", "GROK"]) {
+      const option = node("option", "", key);
+      option.value = key;
+      elements.sessionSummaryProvider.append(option);
+    }
+  }
+  elements.sessionSummaryProvider.value = currentProvider;
+  if (elements.sessionSummaryProvider.value !== currentProvider) {
+    elements.sessionSummaryProvider.selectedIndex = 0;
+  }
+  fillSessionSummaryModelSelect(
+    elements.sessionSummaryProvider.value,
+    currentModel
+  );
+  elements.sessionSummaryProvider.onchange = () => {
+    fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, "");
+  };
+  if (elements.sessionSummaryConnectionStatus) {
+    elements.sessionSummaryConnectionStatus.textContent =
+      `Current: ${currentProvider} / ${currentModel || "host default"}`;
+  }
+}
+
 function renderProviderChatSummary() {
   if (!elements.sessionSummaryDialog) return;
   const room = (state.providerChatRooms || []).find(
@@ -1215,6 +1322,7 @@ function renderProviderChatSummary() {
     fact.append(node("span", "", label), node("strong", "", value));
     elements.sessionSummaryFacts.append(fact);
   }
+  renderSessionSummaryConnection(room, project, boundSession);
   if (elements.sessionSummaryLive) {
     const deltas = state.providerLiveDeltas[room.chat_key] || [];
     elements.sessionSummaryLive.replaceChildren();
@@ -1237,7 +1345,7 @@ function renderProviderChatSummary() {
   elements.sessionSummaryOpen.disabled = !boundSession;
   elements.sessionSummaryOpen.textContent = boundSession
     ? binding.mode === "MASTER"
-      ? "Open Master"
+      ? temporality === "Past" ? "Continue this Master" : "Open Master"
       : "Open session"
     : "Not attached";
   elements.sessionSummaryManage.textContent = boundSession
@@ -1871,13 +1979,38 @@ async function callProjectMaster(projectId, options = {}) {
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
-  await api(
+  const prepareBody = {};
+  if (options.provider) prepareBody.provider = options.provider;
+  if (Object.prototype.hasOwnProperty.call(options, "modelRef")) {
+    prepareBody.model_ref = options.modelRef || "";
+  }
+  const prepared = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
     {
       method: "POST",
-      body: {},
+      body: prepareBody,
     }
   );
+  const connection = prepared.session_connection || {};
+  if (
+    options.expectedProvider &&
+    String(connection.last_provider || "").toUpperCase() !==
+      String(options.expectedProvider).toUpperCase()
+  ) {
+    throw new Error("Selected provider did not become the active Master connection");
+  }
+  if (
+    options.expectedSessionRef &&
+    connection.last_session_ref !== options.expectedSessionRef
+  ) {
+    throw new Error("Selected Master session could not be resumed");
+  }
+  if (
+    options.expectedModel &&
+    connection.model_ref !== options.expectedModel
+  ) {
+    throw new Error("Selected model did not become the active Master connection");
+  }
   state.providerSettings = await api("/v1/settings/providers");
   await selectProject(projectId);
   state.conversationTarget = {
@@ -1899,11 +2032,80 @@ async function callProjectMaster(projectId, options = {}) {
   elements.dispatchInstruction.focus();
 }
 
+async function attachSelectedMasterSession(session) {
+  const provider = String(session?.provider || "").toUpperCase();
+  const providerSessionRef = String(session?.provider_session_ref || "").trim();
+  const projectId = String(session?.node || "").trim();
+  if (session?.mode !== "MASTER" || !provider || !providerSessionRef || !projectId) {
+    throw new Error("This session cannot be attached as a Project Master");
+  }
+  const result = await api("/v1/sessions/inject", {
+    method: "POST",
+    body: {
+      project_id: projectId,
+      node: projectId,
+      mode: "MASTER",
+      room_type: "PROJECT",
+      slot_role: "MASTER",
+      provider,
+      provider_session_ref: providerSessionRef,
+      supervisor_session_id: session.session_id,
+      alias: session.alias || `${projectId} Master`,
+      display_name: "Project Master",
+      make_default: true,
+    },
+  });
+  const registered = result.supervisor_session || {};
+  if (
+    String(registered.provider || "").toUpperCase() !== provider ||
+    String(registered.provider_session_ref || "") !== providerSessionRef
+  ) {
+    throw new Error("Selected Master session was not registered exactly");
+  }
+  return registered;
+}
+
+async function connectSessionSummaryProviderModel() {
+  const room = (state.providerChatRooms || []).find(
+    (item) => item.chat_key === state.selectedProviderChatKey
+  );
+  const session = supervisorSessionForRoom(room);
+  const project = sessionRailProjectIdentity(room);
+  if (!room || !session || room.binding?.mode !== "MASTER" || !project.projectId) {
+    throw new Error("Only a bound Project Master can choose a provider and model");
+  }
+  const provider = String(elements.sessionSummaryProvider?.value || "").toUpperCase();
+  const modelRef = String(elements.sessionSummaryModel?.value || "").trim();
+  if (!provider || !modelRef) throw new Error("Choose a provider and model first");
+  if (elements.sessionSummaryConnect) {
+    elements.sessionSummaryConnect.disabled = true;
+  }
+  if (elements.sessionSummaryConnectionStatus) {
+    elements.sessionSummaryConnectionStatus.textContent =
+      `Connecting ${provider} / ${modelRef}...`;
+  }
+  try {
+    await callProjectMaster(project.projectId, {
+      provider,
+      modelRef,
+      expectedProvider: provider,
+      expectedModel: modelRef,
+    });
+    elements.sessionSummaryDialog.close();
+    toast(`Project Master connected: ${provider} / ${modelRef}`);
+  } finally {
+    if (elements.sessionSummaryConnect) {
+      elements.sessionSummaryConnect.disabled = false;
+    }
+  }
+}
+
 function sessionConnectionText(connection, fallbackMode) {
   const provider = connection?.last_provider || "UNKNOWN";
+  const model = connection?.model_ref || "model unknown";
   const connectionState = connection?.connection_state || "NOT_OPENED";
   const mode = connection?.requested_mode || fallbackMode;
-  return `${provider} / ${connectionState} / ${mode}`;
+  return `${provider} / ${model} / ${connectionState} / ${mode}`;
 }
 
 function renderComposerState() {
@@ -2079,6 +2281,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
       governanceProposalInboxResult,
       providerSettings,
       hostTools,
+      providerModelsResult,
     ] =
       await Promise.all([
       api("/v1/projects"),
@@ -2088,6 +2291,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
       api("/v1/governance-proposals"),
       api("/v1/settings/providers"),
       api("/v1/settings/host-tools"),
+      api("/v1/settings/provider-models").catch(() => null),
     ]);
     state.projects = projectResult.projects;
     state.todos = todoResult.todos;
@@ -2100,6 +2304,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.governanceProposalInbox =
       governanceProposalInboxResult.proposals || [];
     state.providerSettings = providerSettings;
+    state.providerModels = providerModelsResult?.catalog || providerModelsResult;
     state.hostTools = hostTools;
     try {
       await refreshSupervisorSessions();
@@ -8692,11 +8897,21 @@ function bindEvents() {
       const session = supervisorSessionForRoom(room);
       if (!session) return;
       try {
-        elements.sessionSummaryDialog.close();
         await activateAnchorSession(session);
+        elements.sessionSummaryDialog.close();
       } catch (error) {
         toast(error.message, true);
       }
+    });
+  }
+  if (elements.sessionSummaryConnect) {
+    elements.sessionSummaryConnect.addEventListener("click", () => {
+      connectSessionSummaryProviderModel().catch((error) => {
+        if (elements.sessionSummaryConnectionStatus) {
+          elements.sessionSummaryConnectionStatus.textContent = error.message;
+        }
+        toast(error.message, true);
+      });
     });
   }
   if (elements.sessionSummaryManage) {

@@ -1787,7 +1787,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="session-rail-show-workers"', body)
             self.assertIn(">Sessions<", body)
             self.assertIn('id="session-rail-show-hidden"', body)
-            self.assertIn("provider-chat-1", body)
+            self.assertIn("session-popup-2", body)
             self.assertIn('id="runtime-audit-grid"', body)
             self.assertIn('id="legacy-executor-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
@@ -2016,6 +2016,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "AUTO",
             defaults["project_masters"][0]["provider"],
         )
+        self.assertEqual("", defaults["project_masters"][0]["model_ref"])
         self.assertEqual("GROK", defaults["universe_conductor"]["resolved_provider"])
         self.assertEqual(
             "UNAVAILABLE",
@@ -2044,10 +2045,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, project = self.request(
             "POST",
             "/v1/projects/GCS/provider-setting",
-            {"provider": "GROK"},
+            {"provider": "GROK", "model_ref": "grok-4.5"},
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("GROK", project["setting"]["provider"])
+        self.assertEqual("grok-4.5", project["setting"]["model_ref"])
 
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(
@@ -2060,6 +2062,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "GROK",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
+        )
+        self.assertEqual(
+            "grok-4.5",
+            reopened.provider_setting("PROJECT_MASTER", "GCS")["model_ref"],
         )
 
     def test_worker_binding_profiles_resolve_by_scope_and_revision(self) -> None:

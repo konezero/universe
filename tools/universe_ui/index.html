@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=provider-chat-1">
+  <link rel="stylesheet" href="/styles.css?v=session-popup-2">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -562,6 +562,24 @@
       <span class="inspector-kicker">Live provider output</span>
       <div id="session-summary-live" class="session-summary-live"></div>
     </section>
+    <section id="session-summary-connection" class="session-summary-connection" hidden>
+      <div class="session-summary-connection-heading">
+        <span class="inspector-kicker">New connection</span>
+        <small>Choose a provider and model, or continue the selected session above.</small>
+      </div>
+      <div class="session-summary-connection-fields">
+        <label>
+          <span>Provider</span>
+          <select id="session-summary-provider"></select>
+        </label>
+        <label>
+          <span>Model</span>
+          <select id="session-summary-model"></select>
+        </label>
+      </div>
+      <p id="session-summary-connection-status" class="session-summary-connection-status" role="status"></p>
+      <button id="session-summary-connect" class="secondary-button" type="button">Use provider and model</button>
+    </section>
     <div class="dialog-actions session-summary-actions">
       <button id="session-summary-manage" class="secondary-button" type="button">View in Observatory</button>
       <button id="session-summary-open" class="primary-button" type="button">Open session</button>
@@ -992,6 +1010,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=provider-chat-1" defer></script>
+  <script src="/app.js?v=session-popup-2" defer></script>
 </body>
 </html>

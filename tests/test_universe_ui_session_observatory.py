@@ -33,6 +33,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
     def test_session_click_opens_summary_before_activation(self) -> None:
         self.assertIn('id="session-summary-dialog"', HTML)
         self.assertIn('id="session-summary-facts"', HTML)
+        self.assertIn('id="session-summary-provider"', HTML)
+        self.assertIn('id="session-summary-model"', HTML)
+        self.assertIn('id="session-summary-connect"', HTML)
         self.assertIn('id="session-summary-open"', HTML)
         self.assertIn("openProviderChatSummary(room)", APP)
         self.assertIn("renderProviderChatSummary", APP)
@@ -42,6 +45,24 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         ]
         self.assertNotIn("await activateAnchorSession(boundSession)", rail_slice)
         self.assertIn("session-summary-facts", CSS)
+
+    def test_master_popup_attaches_exact_session_before_switching_main_chat(self) -> None:
+        self.assertIn("async function attachSelectedMasterSession(session)", APP)
+        self.assertIn('"/v1/sessions/inject"', APP)
+        self.assertIn("provider_session_ref: providerSessionRef", APP)
+        self.assertIn("provider: session.provider", APP)
+        self.assertIn("expectedSessionRef", APP)
+        self.assertIn("expectedModel", APP)
+        connect_slice = APP[
+            APP.index("async function connectSessionSummaryProviderModel") : APP.index(
+                "function sessionConnectionText"
+            )
+        ]
+        self.assertLess(
+            connect_slice.index("await callProjectMaster"),
+            connect_slice.index("elements.sessionSummaryDialog.close()"),
+        )
+        self.assertIn("session-summary-connection", CSS)
 
     def test_hidden_view_and_bounded_tail_are_wired(self) -> None:
         self.assertIn('id="session-rail-show-hidden"', HTML)

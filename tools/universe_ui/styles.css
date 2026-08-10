@@ -3633,6 +3633,47 @@ body {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+.session-summary-connection {
+  margin-top: 14px;
+  padding: 11px;
+  border: 1px solid rgba(90, 150, 220, 0.16);
+  background: rgba(26, 38, 56, 0.42);
+}
+.session-summary-connection-heading {
+  display: grid;
+  gap: 3px;
+}
+.session-summary-connection-heading small {
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.session-summary-connection-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.session-summary-connection-fields label {
+  display: grid;
+  gap: 4px;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.session-summary-connection-fields select {
+  min-width: 0;
+  width: 100%;
+}
+.session-summary-connection-status {
+  min-height: 16px;
+  margin: 8px 0 0;
+  color: var(--text-3);
+  font-size: 10px;
+}
+.session-summary-connection > button {
+  width: 100%;
+  margin-top: 2px;
+}
 
 .action-inbox-dialog {
   width: min(520px, calc(100vw - 24px));

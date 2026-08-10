@@ -4655,6 +4655,7 @@ class UniverseStore:
                     scope_id TEXT NOT NULL,
                     provider TEXT NOT NULL
                         CHECK(provider IN ('AUTO', 'GROK', 'CODEX', 'CLAUDE')),
+                    model_ref TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(scope_kind, scope_id)
                 );
@@ -4804,6 +4805,7 @@ class UniverseStore:
                             CHECK(provider IN (
                                 'AUTO', 'GROK', 'CODEX', 'CLAUDE'
                             )),
+                        model_ref TEXT NOT NULL DEFAULT '',
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY(scope_kind, scope_id)
                     )
@@ -4812,13 +4814,24 @@ class UniverseStore:
                 connection.execute(
                     """
                     INSERT INTO cli_provider_setting(
-                        scope_kind, scope_id, provider, updated_at
+                        scope_kind, scope_id, provider, model_ref, updated_at
                     )
-                    SELECT scope_kind, scope_id, provider, updated_at
+                    SELECT scope_kind, scope_id, provider, '', updated_at
                     FROM cli_provider_setting_legacy
                     """
                 )
                 connection.execute("DROP TABLE cli_provider_setting_legacy")
+            provider_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(cli_provider_setting)"
+                ).fetchall()
+            }
+            if "model_ref" not in provider_columns:
+                connection.execute(
+                    "ALTER TABLE cli_provider_setting "
+                    "ADD COLUMN model_ref TEXT NOT NULL DEFAULT ''"
+                )
             delegation_table = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'conductor_delegation'"
@@ -4988,7 +5001,7 @@ class UniverseStore:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT provider, updated_at
+                SELECT provider, model_ref, updated_at
                 FROM cli_provider_setting
                 WHERE scope_kind = ? AND scope_id = ?
                 """,
@@ -4999,6 +5012,11 @@ class UniverseStore:
             "scope_kind": normalized_scope,
             "scope_id": normalized_id,
             "provider": str(row["provider"]) if row is not None else "AUTO",
+            "model_ref": (
+                str(row["model_ref"] or "")
+                if row is not None and "model_ref" in row.keys()
+                else ""
+            ),
             "updated_at": str(row["updated_at"]) if row is not None else None,
         }
 
@@ -5012,7 +5030,7 @@ class UniverseStore:
             value,
             field="provider_setting",
             required=frozenset({"provider"}),
-            optional=frozenset(),
+            optional=frozenset({"model_ref"}),
         )
         provider = _required_text(request["provider"], "provider").upper()
         if provider not in PROVIDER_SETTING_CHOICES:
@@ -5021,21 +5039,38 @@ class UniverseStore:
                 "provider must be AUTO, GROK, CODEX, or CLAUDE",
             )
         current = self.provider_setting(scope_kind, scope_id)
+        raw_model_ref = (
+            current.get("model_ref", "")
+            if "model_ref" not in request
+            else request.get("model_ref")
+        )
+        model_ref = str(raw_model_ref or "").strip()
+        if model_ref and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model_ref
+        ):
+            raise UniverseError(
+                "PROVIDER_MODEL_REF_INVALID",
+                "model_ref must use a provider model identifier",
+            )
+        if provider == "AUTO":
+            model_ref = ""
         updated_at = utc_now()
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO cli_provider_setting(
-                    scope_kind, scope_id, provider, updated_at
-                ) VALUES (?, ?, ?, ?)
+                    scope_kind, scope_id, provider, model_ref, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(scope_kind, scope_id) DO UPDATE SET
                     provider = excluded.provider,
+                    model_ref = excluded.model_ref,
                     updated_at = excluded.updated_at
                 """,
                 (
                     current["scope_kind"],
                     current["scope_id"],
                     provider,
+                    model_ref,
                     updated_at,
                 ),
             )
@@ -14711,6 +14746,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continuity_coordinator=self.continuity_coordinator,
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
+                model_resolver=self._resolve_project_master_model,
                 governance_context_resolver=self._project_master_governance_context,
                 completion_observer=self._observe_project_master_completion,
                 room_event_observer=self._observe_native_room_event,
@@ -15834,6 +15870,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 strict=False,
             )
         )
+        conductor_provider = settings["universe_conductor"]["resolved_provider"]
+        settings["universe_conductor"]["resolved_model"] = (
+            settings["universe_conductor"].get("model_ref")
+            or capabilities.get(conductor_provider, {}).get("model", "UNKNOWN")
+        )
         settings["universe_conductor"]["session_connection"] = (
             self.conductor_session_status()
         )
@@ -15842,6 +15883,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 project["provider"],
                 capabilities=capabilities,
                 strict=False,
+            )
+            project["resolved_model"] = (
+                project.get("model_ref")
+                or capabilities.get(project["resolved_provider"], {}).get(
+                    "model", "UNKNOWN"
+                )
             )
             project["session_connection"] = (
                 self.project_master_hosts.connection_status(project["scope_id"])
@@ -17324,7 +17371,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
         }
 
-    def prepare_project_master_session(self, project_id: str) -> dict[str, Any]:
+    def prepare_project_master_session(
+        self,
+        project_id: str,
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request = options if isinstance(options, Mapping) else {}
+        if "provider" in request or "model_ref" in request:
+            current = self.store.provider_setting("PROJECT_MASTER", project_id)
+            self.set_project_provider_setting(
+                project_id,
+                {
+                    "provider": request.get("provider") or current["provider"],
+                    "model_ref": request.get(
+                        "model_ref", current.get("model_ref", "")
+                    ),
+                },
+            )
         try:
             host = self.ensure_project_master(project_id)
         except ProjectMasterHostError as error:
@@ -18688,6 +18751,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             project_id,
         )["provider"]
         return self._resolve_configured_provider(selected, strict=True)
+
+    def _resolve_project_master_model(self, project_id: str, provider: str) -> str:
+        setting = self.store.provider_setting("PROJECT_MASTER", project_id)
+        configured = str(setting.get("model_ref") or "").strip()
+        if configured:
+            return configured
+        try:
+            capability = self.runtime_host.provider_capability(provider)
+        except Exception:
+            capability = None
+        if isinstance(capability, Mapping):
+            return str(capability.get("model") or "").strip()
+        return ""
 
     def _resolve_configured_provider(
         self,
@@ -21294,7 +21370,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if parts is not None and parts[1] == "/master-session/prepare":
                 self._send(
                     HTTPStatus.OK,
-                    self.server.prepare_project_master_session(parts[0]),
+                    self.server.prepare_project_master_session(parts[0], body or {}),
                 )
                 return
             if parts is not None and parts[1] == "/runtime-lease/activate":

@@ -40,6 +40,7 @@ from project_master_host import (  # noqa: E402
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
     ResidentRoomParticipantHostManager,
+    _default_state_db,
     _project_master_system_prompt,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
@@ -2235,6 +2236,55 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         self.assertEqual("GROK", first["provider"])
         self.assertEqual("CODEX", second["provider"])
+        self.assertEqual(2, len(registrations))
+
+    def test_resident_manager_restarts_when_selected_session_changes(self) -> None:
+        registrations: list[dict[str, Any]] = []
+        providers: list[PreparedFakeProvider] = []
+
+        def register(project_id, value):
+            registrations.append({"project_id": project_id, **dict(value)})
+            return {"project_id": project_id, **dict(value)}, True
+
+        def provider_factory(_root, _project_id, store):
+            provider = PreparedFakeProvider()
+            provider.prepare_session = lambda: None
+            provider.session_ref = store.session_ref_for("GROK") or (
+                f"generated-session-{len(providers) + 1}"
+            )
+            providers.append(provider)
+            return provider
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=provider_factory,
+                provider_resolver=lambda _project_id: "GROK",
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
+            )
+            try:
+                first = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                state = ProjectMasterSessionStore(
+                    _default_state_db("GCS"),
+                    "GCS",
+                )
+                state.observe_provider_session("GROK", "past-master-session")
+                second = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+            finally:
+                manager.close()
+
+        self.assertEqual("STARTED", first["status"])
+        self.assertEqual("STARTED", second["status"])
+        self.assertEqual(2, len(providers))
+        self.assertTrue(providers[0].closed)
+        self.assertEqual("past-master-session", providers[1].session_ref)
         self.assertEqual(2, len(registrations))
 
     def test_resident_manager_routes_native_room_events_for_all_provider_labels(
