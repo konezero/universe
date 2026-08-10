@@ -200,6 +200,10 @@ class FastExtractContractTests(unittest.TestCase):
         self.assertIn("review-only candidate", encoded)
         self.assertNotIn("prompt", encoded.lower())
         self.assertEqual("gpt-5.6-luna", request["context_pack"]["model_ref"])
+        candidate_schema = request["output_contract"]["json_schema"]["properties"][
+            "candidates"
+        ]["items"]
+        self.assertEqual("MEMORY", candidate_schema["properties"]["kind"]["const"])
         with self.assertRaises(FastExtractError) as captured:
             redact_activity_batch({**batch, "prompt": "secret"})
         self.assertEqual("FAST_EXTRACT_RAW_INPUT_FORBIDDEN", captured.exception.code)
@@ -257,6 +261,23 @@ class FastExtractContractTests(unittest.TestCase):
         self.assertEqual(1, len(candidates))
         self.assertEqual("REVIEW_REQUIRED", candidates[0]["state"])
         self.assertNotIn("prompt", json.dumps(candidates).lower())
+        with self.assertRaises(FastExtractError) as captured:
+            normalize_provider_candidates(
+                {
+                    "schema": FAST_EXTRACT_RESULT_SCHEMA,
+                    "candidates": [
+                        {
+                            "summary": "bounded",
+                            "kind": "runtime_entry_policy",
+                            "ref_digests": ["a" * 64],
+                        }
+                    ],
+                },
+                project_id="TEST",
+                activity_batches=[batch],
+                semantic_evidence=[{"text": "A different bounded source sentence."}],
+            )
+        self.assertEqual("MEMORY_CANDIDATE_KIND_INVALID", captured.exception.code)
         with self.assertRaises(FastExtractError) as captured:
             normalize_provider_candidates(
                 {

@@ -33,6 +33,7 @@ SOURCE_KINDS = {
 METADATA_READ_LIMIT = 256 * 1024
 METADATA_LINE_LIMIT = 192
 DEFAULT_SCAN_BYTE_LIMIT = 256 * 1024
+MAX_SINGLE_EVENT_BYTE_LIMIT = 4 * 1024 * 1024
 DEFAULT_SCAN_EVENT_LIMIT = 512
 DEFAULT_SCAN_TIME_LIMIT_SECONDS = 0.25
 SEMANTIC_EXCERPT_LIMIT = 256
@@ -718,7 +719,7 @@ class ProviderSessionObserverStore:
             raise ProviderSessionObserverError(
                 "SOURCE_REQUEST_INVALID", "scan limits must be positive"
             )
-        max_bytes = min(max_bytes, 4 * 1024 * 1024)
+        max_bytes = min(max_bytes, MAX_SINGLE_EVENT_BYTE_LIMIT)
         max_events = min(max_events, 4096)
         max_seconds = min(max_seconds, 2.0)
         started = time.monotonic()
@@ -747,24 +748,30 @@ class ProviderSessionObserverStore:
             added = 0
             scanned_bytes = 0
             scanned_events = 0
+            oversized_events = 0
             next_offset = offset
             try:
                 with path.open("rb") as handle:
                     handle.seek(offset)
                     while True:
                         start = handle.tell()
-                        raw_line = handle.readline()
+                        if scanned_events >= max_events or (
+                            scanned_events and time.monotonic() - started >= max_seconds
+                        ):
+                            break
+                        raw_line = handle.readline(MAX_SINGLE_EVENT_BYTE_LIMIT + 1)
+                        if len(raw_line) > MAX_SINGLE_EVENT_BYTE_LIMIT:
+                            raise ProviderSessionObserverError(
+                                "SOURCE_EVENT_TOO_LARGE",
+                                "JSONL event exceeds the single-event byte limit",
+                            )
                         if not raw_line or not raw_line.endswith(b"\n"):
                             break
                         if scanned_bytes + len(raw_line) > max_bytes:
-                            handle.seek(start)
-                            break
-                        if (
-                            scanned_events >= max_events
-                            or time.monotonic() - started >= max_seconds
-                        ):
-                            handle.seek(start)
-                            break
+                            if scanned_events:
+                                handle.seek(start)
+                                break
+                            oversized_events += 1
                         next_offset = handle.tell()
                         scanned_bytes += len(raw_line)
                         scanned_events += 1
@@ -803,6 +810,7 @@ class ProviderSessionObserverStore:
             "bounded_read": {
                 "bytes": scanned_bytes,
                 "events": scanned_events,
+                "oversized_events": oversized_events,
                 "byte_limit": max_bytes,
                 "event_limit": max_events,
             },

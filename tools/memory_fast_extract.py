@@ -25,6 +25,7 @@ FAST_EXTRACT_OPERATION = "MEMORY_FAST_EXTRACT"
 FAST_EXTRACT_SKILL_ID = "universe.memory.fast-extract"
 FAST_EXTRACT_SKILL_VERSION = "v1"
 FAST_EXTRACT_INPUT_SCHEMA = "universe.memory-fast-extract-context.v1"
+FAST_EXTRACT_CANDIDATE_KIND = "MEMORY"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 WORD = re.compile(r"[\w'-]+", re.UNICODE)
 SECRET_VALUE_PATTERNS = (
@@ -428,7 +429,10 @@ def build_provider_request(
                             "required": ["kind", "summary", "ref_digests"],
                             "properties": {
                                 "candidate_id": {"type": "string"},
-                                "kind": {"type": "string"},
+                                "kind": {
+                                    "type": "string",
+                                    "const": FAST_EXTRACT_CANDIDATE_KIND,
+                                },
                                 "summary": {"type": "string"},
                                 "source_range": {"type": "object"},
                                 "ref_digests": {
@@ -556,7 +560,7 @@ def normalize_provider_candidates(
         candidate = {
             "project_id": project_id,
             "stage": "FAST_EXTRACT",
-            "kind": raw.get("kind", "MEMORY"),
+            "kind": raw.get("kind", FAST_EXTRACT_CANDIDATE_KIND),
             "summary": summary,
             "candidate_id": raw.get("candidate_id"),
             "source_range": raw.get("source_range") or {},

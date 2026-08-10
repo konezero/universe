@@ -130,6 +130,28 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertGreater(second["source"]["cursor"]["offset"], first_cursor)
         self.assertEqual(1, second["added"])
 
+    def test_complete_event_larger_than_scan_budget_advances_once(self) -> None:
+        source_path = self.root / "rollout-oversized-budget.jsonl"
+        self.write(
+            source_path,
+            {"type": "turn_completed", "text": "x" * 1024},
+            {"type": "turn_started"},
+        )
+        source = self.register("CODEX", source_path)
+
+        first = self.store.scan(
+            str(source["source_id"]), max_bytes=64, max_seconds=1e-9
+        )
+        self.assertEqual(1, first["added"])
+        self.assertEqual(1, first["bounded_read"]["events"])
+        self.assertEqual(1, first["bounded_read"]["oversized_events"])
+        self.assertGreater(first["bounded_read"]["bytes"], 64)
+
+        second = self.store.scan(str(source["source_id"]), max_bytes=64)
+        self.assertEqual(1, second["added"])
+        self.assertEqual(0, second["bounded_read"]["oversized_events"])
+        self.assertEqual(source_path.stat().st_size, second["source"]["cursor"]["offset"])
+
     def test_start_at_end_skips_history_and_tails_only_new_events(self) -> None:
         source_path = self.root / "rollout-live-tail.jsonl"
         self.write(

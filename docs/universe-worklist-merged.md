@@ -231,15 +231,18 @@ Completed locally:
   excerpts, the exact `gpt-5.6-luna`/`MAX` ceiling, retryable failed runs,
   atomic review-only Candidate + SkillRunObservation/Bench persistence, and
   real-dispatcher/fake-provider integration coverage.
+- Billable live Codex/Luna `FAST_EXTRACT` verification over a registered real
+  transcript: the hardened `MEMORY`-only output contract completed on retry
+  attempt 2, created two `REVIEW_REQUIRED` candidates, retained no raw
+  transcript fields, and published one redacted Bench observation.
+- Provider-observer forward progress for complete JSONL events larger than the
+  ordinary scan budget, bounded by a 4 MiB single-event fail-closed ceiling.
 - Bounded Conductor delegation records, a worker queue independent from chat,
   progress/result APIs, restart recovery, Conductor UI status projection, and
   a default bounded Project Master delivery/result-reference route.
 
 Required follow-up:
 
-- Run one billable live Codex/Luna FAST_EXTRACT probe over a registered Codex
-  transcript and verify the terminal Task Frame receipt, review-only Candidate,
-  no persisted excerpt text, and Bench observation end to end.
 - Preserve and surface terminal Worker result evidence before retiring or
   replacing a Task Frame claim; the original vertical-slice Worker receipt was
   not observable after its executor became stale.

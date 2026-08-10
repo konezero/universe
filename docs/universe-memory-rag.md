@@ -1,6 +1,6 @@
 # Universe Memory RAG (product slice)
 
-Status: implemented foundation (governed FAST_EXTRACT adapter plus deterministic Memory RAG; live Codex extraction probe pending)
+Status: implemented and live-probed (governed FAST_EXTRACT adapter plus deterministic Memory RAG)
 Scope: project-local memory notes, configurable redacted batch stages,
 governed Codex extraction, candidate review, SkillRunObservation/Bench evidence,
 node link/unlink, search, and propose-links
@@ -104,7 +104,9 @@ verbatim transcript span are rejected.
 
 The provider receives one structured request with `repository_write_scope:
 NONE`, an empty mutation scope, and a redacted Activity context pack. Its
-structured result is normalized into a `REVIEW_REQUIRED` Memory Candidate;
+structured result contract fixes every `FAST_EXTRACT` candidate kind to
+`MEMORY`; only later synthesis stages may propose `IDEA`, `HYPOTHESIS`, or
+`PRODUCT`. The result is normalized into a `REVIEW_REQUIRED` Memory Candidate;
 there is no automatic Memory, Seed, Anchor, authority, Assignment, or source
 mutation. A completed run also records one redacted
 `ai-career.skill-observation-candidate.v1` with a result-receipt evidence
@@ -121,10 +123,19 @@ request credentials and semantic excerpts remain transient, and persisted
 execution records contain only bounded model, Worker, Task Frame, receipt,
 digest, attempt, and status references.
 
-The current integration suite exercises the real Universe Runtime Host and
-dispatcher with a fake provider process. A billable live Codex/Luna extraction
-over a registered real transcript remains a release gate and must not be
-reported as completed yet.
+The integration suite exercises the real Universe Runtime Host and dispatcher
+with a fake provider process. A billable live Codex/Luna extraction over a
+registered real transcript also completed on 2026-08-10. The first attempt was
+correctly rejected because the provider returned descriptive values outside the
+candidate kind contract. After constraining the structured schema to `MEMORY`,
+the retry completed under the same run identity as attempt 2, created two
+`REVIEW_REQUIRED` candidates, persisted no raw transcript fields, and produced
+one `universe.memory.fast-extract` SkillRunObservation visible in Bench.
+
+The observer permits one complete JSONL event to exceed the per-scan byte
+budget, up to the fixed 4 MiB single-event ceiling, so a large provider event
+cannot stall the cursor indefinitely. Events above that hard ceiling fail
+closed as `SOURCE_EVENT_TOO_LARGE`.
 
 ## Non-blocking Conductor delegation
 
