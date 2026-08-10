@@ -71,6 +71,52 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual(1, third["added"])
         self.assertEqual(3, len(self.store.list_activities(str(source["source_id"]))))
 
+    def test_codex_semantic_evidence_is_transient_redacted_and_activity_bound(self) -> None:
+        source_path = self.root / "rollout-semantic.jsonl"
+        self.write(
+            source_path,
+            {
+                "type": "response_item",
+                "id": "message-1",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Keep memory candidates review-only. "
+                                "api_key=verysecretvalue"
+                            ),
+                        }
+                    ],
+                },
+            },
+        )
+        source = self.register("CODEX", source_path)
+        self.store.scan(str(source["source_id"]))
+        activity = self.store.list_activities(str(source["source_id"]))[0]
+        evidence = self.store.build_transient_semantic_evidence(
+            str(source["source_id"]),
+            [activity],
+        )
+
+        self.assertEqual(1, len(evidence))
+        self.assertIn("review-only", evidence[0]["text"])
+        self.assertIn("[REDACTED]", evidence[0]["text"])
+        self.assertNotIn("verysecretvalue", json.dumps(evidence))
+        self.assertNotIn(
+            "review-only",
+            json.dumps(self.store.list_activities(str(source["source_id"]))),
+        )
+
+        forged = {**activity, "activity_digest": "a" * 64}
+        with self.assertRaises(ProviderSessionObserverError) as captured:
+            self.store.build_transient_semantic_evidence(
+                str(source["source_id"]), [forged]
+            )
+        self.assertEqual("SEMANTIC_ACTIVITY_NOT_ATTESTED", captured.exception.code)
+
     def test_append_keeps_file_identity_and_cursor_progresses(self) -> None:
         source_path = self.root / "rollout-append.jsonl"
         self.write(source_path, {"type": "turn_started"})

@@ -156,6 +156,10 @@ class UniverseRuntimeHostTests(unittest.TestCase):
                 "model_ref": "provider://GROK/model/grok-build",
                 "worker_id": "grok-1",
                 "result_receipt_ref": "result-1",
+                "worker_run_ref": "worker-run-1",
+                "terminal_result_verified": True,
+                "task_frame_result_status": "TASK_FRAME_RESULT_RECORDED",
+                "duration_ms": 12,
                 "skill_run_observation_count": 2,
                 "result": {"text": "bounded reply"},
             }
@@ -174,7 +178,12 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
         self.assertFalse(result["universe_coordinate_persisted"])
-        self.assertNotIn("worker_run_ref", result)
+        self.assertEqual("worker-run-1", result["worker_run_ref"])
+        self.assertTrue(result["terminal_result_verified"])
+        self.assertEqual(
+            "TASK_FRAME_RESULT_RECORDED", result["task_frame_result_status"]
+        )
+        self.assertEqual(12, result["duration_ms"])
         self.assertEqual(["GROK"], dispatcher.capability_calls)
         self.assertEqual(1, len(dispatcher.dispatch_calls))
         self.assertEqual(

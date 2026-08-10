@@ -351,6 +351,18 @@ class RuntimeWorkerDispatcher:
                 "TASK_FRAME_CLAIM",
                 "TURN_CLAIM_REJECTED",
             )
+        claimed_turn = claim["output"].get("turn")
+        if (
+            not isinstance(claimed_turn, Mapping)
+            or claimed_turn.get("turn_id") != request["turn_id"]
+            or claimed_turn.get("state") != "CLAIMED"
+            or claimed_turn.get("claimed_by") != worker_id
+        ):
+            raise WorkerDispatchError(
+                "WORKER_CLAIM_EVIDENCE_MISMATCH",
+                "TASK_FRAME_CLAIM",
+                "CLAIMED_TURN_IDENTITY_MISMATCH",
+            )
 
         try:
             started = time.monotonic()
@@ -380,6 +392,9 @@ class RuntimeWorkerDispatcher:
                 )
             provider_worker_ref = _required_text(
                 worker.get("worker_id"), "worker.worker_id"
+            )
+            result_receipt_ref = _required_text(
+                worker.get("result_receipt_ref"), "worker.result_receipt_ref"
             )
 
             recorded_result: Any = worker.get("result")
@@ -415,7 +430,7 @@ class RuntimeWorkerDispatcher:
                     "model_ref": model_ref,
                     "outcome": "SUCCEEDED",
                     "validation_state": "NOT_RUN",
-                    "evidence_refs": [worker["result_receipt_ref"]],
+                    "evidence_refs": [result_receipt_ref],
                     "metrics": {"duration_ms": duration_ms},
                 }
                 for binding in skill_bindings
@@ -424,9 +439,9 @@ class RuntimeWorkerDispatcher:
                 "turn_id": request["turn_id"],
                 "worker_id": worker_id,
                 "worker_run_ref": worker_run_ref,
-                "result_receipt_ref": worker["result_receipt_ref"],
+                "result_receipt_ref": result_receipt_ref,
                 "status": worker["status"],
-                "evidence_refs": [worker["result_receipt_ref"]],
+                "evidence_refs": [result_receipt_ref],
                 "result": recorded_result,
                 "review_decision": "",
             }
@@ -443,6 +458,16 @@ class RuntimeWorkerDispatcher:
                     "observed_at": _utc_now(),
                 },
             )
+            terminal_status = str(result.get("status") or "").upper()
+            if not (
+                terminal_status in {"TASK_COMPLETED", "TASK_FRAME_RESULT_RECORDED"}
+                or terminal_status.startswith("TURN_COMPLETED")
+            ):
+                raise WorkerDispatchError(
+                    "WORKER_RESULT_NOT_RECORDED",
+                    "TASK_FRAME_RESULT",
+                    terminal_status or "TASK_FRAME_RESULT_REJECTED",
+                )
         except Exception as error:
             failure = (
                 error
@@ -466,7 +491,11 @@ class RuntimeWorkerDispatcher:
             "model_ref": model_ref,
             "worker_id": worker_id,
             "provider_worker_ref": provider_worker_ref,
-            "result_receipt_ref": worker["result_receipt_ref"],
+            "worker_run_ref": worker_run_ref,
+            "result_receipt_ref": result_receipt_ref,
+            "terminal_result_verified": True,
+            "task_frame_result_status": terminal_status,
+            "duration_ms": duration_ms,
             "result": recorded_result,
             "skill_run_observation_count": len(observations),
             "repository_write": False,

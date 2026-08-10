@@ -183,9 +183,21 @@ class WindowsNativeCliTests(unittest.TestCase):
                         },
                     },
                 }
+            if operation["operation"] == "claim_turn":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "TURN_CLAIMED",
+                        "turn": {
+                            "turn_id": operation["turn_id"],
+                            "state": "CLAIMED",
+                            "claimed_by": operation["worker_id"],
+                        },
+                    },
+                }
             return {
                 "status": "TASK_FRAME_OPERATION_APPLIED",
-                "output": {"status": "TURN_CLAIMED"},
+                "output": {"status": "TASK_FRAME_OPERATION_UNKNOWN"},
             }
 
         request = {

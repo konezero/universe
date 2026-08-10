@@ -1,8 +1,9 @@
 # Universe Memory RAG (product slice)
 
-Status: implemented foundation (deterministic Memory RAG plus review-only batch candidates)
+Status: implemented foundation (governed FAST_EXTRACT adapter plus deterministic Memory RAG; live Codex extraction probe pending)
 Scope: project-local memory notes, configurable redacted batch stages,
-candidate review, node link/unlink, search, and propose-links
+governed Codex extraction, candidate review, SkillRunObservation/Bench evidence,
+node link/unlink, search, and propose-links
 Not: Candidate auto-adoption, Seed mutation, automatic Bench/Future promotion,
 Career promotion, or raw transcript storage
 
@@ -15,6 +16,7 @@ MEMORY_SYNC != Seed write
 MEMORY_SYNC != Task Frame / authority
 Provider activity batch -> operator-selected project Memory -> node review/link
 Provider activity refs -> FAST_EXTRACT -> CONSOLIDATE -> SYNTHESIZE -> Candidate Review
+Codex rollout cursor -> redacted Activity -> governed FAST_EXTRACT -> Candidate + Bench evidence
 Conductor chat -> bounded delegation state -> Project Master / Task Frame result
 ```
 
@@ -35,14 +37,13 @@ snapshot and resolution status are returned with the configuration.
 
 The current product slice persists and validates schedule policy, but does not
 yet run these four stages from a wall-clock scheduler. Stage execution is
-manual through the API/UI. The configured Provider, model, and effort gate
-whether a stage may run and are recorded in the run contract; candidate
-generation itself remains deterministic until the Task Frame Provider adapter
-is connected. The service must not claim that a Provider model generated a
-candidate in this state. A run therefore requires `fallback: DETERMINISTIC`
-and reports `provider_invocation: NOT_RUN`. This slice enforces `max_runs`;
-token, cost, and window budgets fail closed until Provider usage telemetry is
-connected.
+manual through the API/UI. `FAST_EXTRACT` is the governed exception: it may
+execute only through a claimed Task Frame, with Provider `CODEX`, model
+`gpt-5.6-luna`, effort `MAX`, and `fallback: NONE`. The remaining stages and
+an explicitly configured `DETERMINISTIC` fallback retain the deterministic
+route and report `provider_invocation: NOT_RUN`. This slice enforces
+`max_runs`; token, cost, and window budgets fail closed until Provider usage
+telemetry is connected.
 
 ```text
 GET  /v1/settings/memory-batch/catalog
@@ -77,6 +78,53 @@ POST /v1/memory-candidates/{candidate_id}/review
 Only `REVIEW_REQUIRED` candidates accept `IGNORE`, `KEEP`, `EXPLORE`, or
 `START_PRODUCT_DESIGN`. A second identical decision is idempotent; all other
 transitions fail closed with a conflict.
+
+## Governed FAST_EXTRACT
+
+`POST /v1/projects/{project_id}/memory-batches/run` accepts a `FAST_EXTRACT`
+request only when the stored configuration resolves to the exact Codex
+`gpt-5.6-luna`/`MAX` ceiling. The request supplies registered `source_ids` and
+a loopback Runtime binding to one READY Task Frame turn. It cannot assert a
+claim, Worker identity, Worker run, or result receipt. The Host dispatcher owns
+capability planning, claim, ephemeral Worker creation, and terminal result
+recording. The session observer owns a durable per-source byte offset and event
+ordinal. The durable provider boundary projects the selected source into
+`universe.provider-activity-batch-redacted.v1`, retaining only source/session
+identity, cursor, activity identifiers, event kinds, states, timestamps, and
+SHA-256 digests. Transcript text, prompts, source text, commands, tool
+arguments, secrets, and hidden reasoning are never persisted.
+
+For extraction only, the observer reopens the exact registered Codex JSONL
+events at their attested byte offsets, verifies their Activity digests, and
+builds a bounded transient user/assistant excerpt set. Secret-like values are
+redacted before dispatch. The excerpt text is available only in the ephemeral
+Worker context; the run identity and durable records retain its digest, not its
+content. Provider summaries that contain secret-like values or copy a long
+verbatim transcript span are rejected.
+
+The provider receives one structured request with `repository_write_scope:
+NONE`, an empty mutation scope, and a redacted Activity context pack. Its
+structured result is normalized into a `REVIEW_REQUIRED` Memory Candidate;
+there is no automatic Memory, Seed, Anchor, authority, Assignment, or source
+mutation. A completed run also records one redacted
+`ai-career.skill-observation-candidate.v1` with a result-receipt evidence
+reference. The existing `skill_run_observation` table and
+`GET /v1/bench/skills` expose that bounded observation to Bench comparisons.
+
+The run identity is derived from project, stage, resolved configuration,
+redacted Activity digests, and transient semantic-input digests. A duplicate
+completed identity is returned without invoking the Provider again; a
+concurrent `RUNNING` identity fails closed; a `FAILED` identity may be retried
+and increments its attempt counter. Candidate persistence, the redacted
+SkillRunObservation, and run completion share one SQLite transaction. Provider
+request credentials and semantic excerpts remain transient, and persisted
+execution records contain only bounded model, Worker, Task Frame, receipt,
+digest, attempt, and status references.
+
+The current integration suite exercises the real Universe Runtime Host and
+dispatcher with a fake provider process. A billable live Codex/Luna extraction
+over a registered real transcript remains a release gate and must not be
+reported as completed yet.
 
 ## Non-blocking Conductor delegation
 

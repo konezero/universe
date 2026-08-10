@@ -124,6 +124,19 @@ from universe_memory import (
     select_best_proposals,
     synthesize_memory_candidates,
 )
+from memory_fast_extract import (
+    FAST_EXTRACT_EFFORT,
+    FAST_EXTRACT_MODEL,
+    FAST_EXTRACT_PROVIDER,
+    FastExtractError,
+    build_provider_request,
+    build_skill_observation_candidate,
+    digest as fast_extract_digest,
+    normalize_provider_candidates,
+    normalize_runtime_binding,
+    redact_activity_batches,
+    redacted_execution_record,
+)
 from universe_runtime_host import (
     RuntimeHostError,
     UniverseRuntimeHost,
@@ -5612,6 +5625,500 @@ class UniverseStore:
             for row in rows
         ]
 
+    def get_memory_batch_run(self, run_id: str) -> dict[str, Any] | None:
+        normalized = _required_text(run_id, "run_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, project_id, stage, config_digest, input_digest,
+                       output_digest, status, candidate_ids_json, result_json,
+                       started_at, completed_at
+                FROM memory_batch_run
+                WHERE run_id = ?
+                """,
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "schema": MEMORY_BATCH_RUN_SCHEMA,
+            "run_id": str(row["run_id"]),
+            "project_id": str(row["project_id"]),
+            "stage": str(row["stage"]),
+            "config_digest": str(row["config_digest"]),
+            "input_digest": str(row["input_digest"]),
+            "output_digest": str(row["output_digest"]),
+            "status": str(row["status"]),
+            "candidate_ids": json.loads(row["candidate_ids_json"]),
+            "result": json.loads(row["result_json"]),
+            "started_at": str(row["started_at"]),
+            "completed_at": str(row["completed_at"]),
+        }
+
+    @staticmethod
+    def memory_batch_run_id(
+        project_id: str,
+        stage: str,
+        config: Mapping[str, Any],
+        input_material: list[str],
+    ) -> tuple[str, str, str]:
+        config_digest = _json_sha256(config)
+        input_digest = _json_sha256(sorted(str(item) for item in input_material))
+        run_id = "memory_batch_run_" + _json_sha256(
+            {
+                "project_id": project_id,
+                "stage": stage,
+                "input_digest": input_digest,
+                "config_digest": config_digest,
+            }
+        )[:24]
+        return run_id, config_digest, input_digest
+
+    def reserve_memory_batch_run(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        stage: str,
+        config_digest: str,
+        input_digest: str,
+        execution: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        now = utc_now()
+        result = {
+            "schema": MEMORY_BATCH_RUN_SCHEMA,
+            "status": "RUNNING",
+            "run_id": run_id,
+            "project_id": project["project_id"],
+            "stage": stage,
+            "config_digest": config_digest,
+            "input_digest": input_digest,
+            "output_digest": "",
+            "candidate_count": 0,
+            "created_count": 0,
+            "candidate_ids": [],
+            "candidates": [],
+            "independent_check": None,
+            "attempt": 1,
+            "execution": dict(execution),
+            "effects": {
+                "candidate_write": "NONE",
+                "memory_write": "NONE",
+                "current_anchor": "NONE",
+                "project_facts": "NONE",
+                "seed": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "auto_adoption": False,
+                "skill_observation": "NONE",
+            },
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_batch_run(
+                    run_id, project_id, stage, config_digest, input_digest,
+                    output_digest, status, candidate_ids_json, result_json,
+                    started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, '', 'RUNNING', '[]', ?, ?, '')
+                """,
+                (
+                    run_id,
+                    project["project_id"],
+                    stage,
+                    config_digest,
+                    input_digest,
+                    _canonical_json(result),
+                    now,
+                ),
+            )
+        stored = self.get_memory_batch_run(run_id)
+        if stored is None:
+            raise UniverseError(
+                "MEMORY_BATCH_RUN_UNAVAILABLE", "reserved memory batch run disappeared"
+            )
+        return stored
+
+    def fail_memory_batch_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        reason: str,
+        execution: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        current = self.get_memory_batch_run(run_id)
+        if current is None:
+            raise UniverseError(
+                "MEMORY_BATCH_RUN_UNAVAILABLE", "memory batch run does not exist"
+            )
+        result = {
+            **current["result"],
+            "status": status,
+            "execution": dict(execution),
+            "failure": {
+                "code": _required_text(status, "status"),
+                "reason": _required_text(str(reason)[:256], "reason"),
+            },
+        }
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE memory_batch_run
+                SET status = ?, result_json = ?, completed_at = ?
+                WHERE run_id = ? AND status = 'RUNNING'
+                """,
+                (status, _canonical_json(result), now, run_id),
+            )
+        return self.get_memory_batch_run(run_id) or current
+
+    def retry_memory_batch_run(
+        self,
+        run_id: str,
+        *,
+        execution: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        current = self.get_memory_batch_run(run_id)
+        if current is None or current["status"] != "FAILED":
+            raise UniverseError(
+                "MEMORY_BATCH_RETRY_NOT_AVAILABLE",
+                "only a failed memory batch run can be retried",
+                HTTPStatus.CONFLICT,
+            )
+        previous_attempt = current["result"].get("attempt", 1)
+        if isinstance(previous_attempt, bool) or not isinstance(previous_attempt, int):
+            previous_attempt = 1
+        result = {
+            **current["result"],
+            "status": "RUNNING",
+            "attempt": previous_attempt + 1,
+            "execution": dict(execution),
+        }
+        result.pop("failure", None)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE memory_batch_run
+                SET status = 'RUNNING', output_digest = '', candidate_ids_json = '[]',
+                    result_json = ?, started_at = ?, completed_at = ''
+                WHERE run_id = ? AND status = 'FAILED'
+                """,
+                (_canonical_json(result), utc_now(), run_id),
+            )
+        if cursor.rowcount != 1:
+            raise UniverseError(
+                "MEMORY_BATCH_RETRY_CONFLICT",
+                "memory batch retry state changed concurrently",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_memory_batch_run(run_id) or current
+
+    def complete_fast_extract_run(
+        self,
+        *,
+        project_id: str,
+        config: Mapping[str, Any],
+        provider_candidates: list[Mapping[str, Any]],
+        input_material: list[str],
+        run_id: str,
+        provider_execution: Mapping[str, Any],
+        skill_observation_request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically persist FAST_EXTRACT candidates, Bench evidence, and run."""
+
+        project = self.get_project(project_id)
+        candidates: list[dict[str, Any]] = []
+        for item in provider_candidates:
+            try:
+                candidate = normalize_memory_candidate(
+                    item, project_id=project["project_id"]
+                )
+            except MemoryError as error:
+                raise UniverseError(error.code, error.message) from error
+            if candidate["project_id"] != project["project_id"]:
+                raise UniverseError(
+                    "MEMORY_CANDIDATE_PROJECT_MISMATCH",
+                    "candidate project_id does not match the selected project",
+                )
+            candidates.append(candidate)
+        skill_request = normalize_skill_observation_candidate(
+            project["project_id"], skill_observation_request
+        )
+        now = utc_now()
+        input_digest = _json_sha256(sorted(input_material))
+        output_digest = _json_sha256(
+            [item["candidate_digest"] for item in candidates]
+        )
+        stored_candidates: list[dict[str, Any]] = []
+        observation_rows: list[dict[str, Any]] = []
+        created_count = 0
+        with self._connection() as connection:
+            run = connection.execute(
+                "SELECT status, started_at, result_json FROM memory_batch_run WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None or run["status"] != "RUNNING":
+                raise UniverseError(
+                    "MEMORY_BATCH_RUN_NOT_RESERVED",
+                    "FAST_EXTRACT run must be reserved before completion",
+                    HTTPStatus.CONFLICT,
+                )
+            for candidate in candidates:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM memory_candidate
+                    WHERE candidate_id = ? OR candidate_digest = ?
+                    ORDER BY candidate_id LIMIT 1
+                    """,
+                    (candidate["candidate_id"], candidate["candidate_digest"]),
+                ).fetchone()
+                if existing is not None:
+                    stored = self._memory_candidate_row(existing)
+                    if stored["candidate_digest"] != candidate["candidate_digest"]:
+                        raise UniverseError(
+                            "MEMORY_CANDIDATE_IDEMPOTENCY_CONFLICT",
+                            "candidate_id already refers to another candidate",
+                            HTTPStatus.CONFLICT,
+                        )
+                    stored_candidates.append(stored)
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO memory_candidate(
+                        candidate_id, project_id, stage, kind, state,
+                        candidate_digest, candidate_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate["candidate_id"],
+                        project["project_id"],
+                        candidate["stage"],
+                        candidate["kind"],
+                        candidate["state"],
+                        candidate["candidate_digest"],
+                        _canonical_json(candidate),
+                        now,
+                        now,
+                    ),
+                )
+                stored_candidates.append(
+                    {**candidate, "created_at": now, "updated_at": now}
+                )
+                created_count += 1
+            for candidate in stored_candidates:
+                for relation in candidate.get("relations") or []:
+                    relation_id = "memory_relation_" + _json_sha256(
+                        {
+                            "candidate_id": candidate["candidate_id"],
+                            "target_candidate_id": relation["candidate_id"],
+                            "relation": relation["relation"],
+                        }
+                    )[:24]
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_candidate_relation(
+                            relation_id, project_id, candidate_id,
+                            target_candidate_id, relation, relation_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            relation_id,
+                            project["project_id"],
+                            candidate["candidate_id"],
+                            relation["candidate_id"],
+                            relation["relation"],
+                            _canonical_json(
+                                {
+                                    "schema": "universe.memory-candidate-relation.v1",
+                                    **relation,
+                                    "candidate_id": candidate["candidate_id"],
+                                }
+                            ),
+                            now,
+                        ),
+                    )
+
+            skill_candidate = skill_request["candidate"]
+            conflicting = connection.execute(
+                """
+                SELECT DISTINCT candidate_digest FROM skill_run_observation
+                WHERE project_id = ? AND candidate_id = ?
+                """,
+                (project["project_id"], skill_request["candidate_id"]),
+            ).fetchall()
+            if any(
+                row["candidate_digest"] != skill_request["candidate_digest"]
+                for row in conflicting
+            ):
+                raise UniverseError(
+                    "SKILL_OBSERVATION_CANDIDATE_CONFLICT",
+                    "candidate_id already refers to different redacted content",
+                    HTTPStatus.CONFLICT,
+                )
+            for observation in skill_candidate["observations"]:
+                existing_observation = connection.execute(
+                    """
+                    SELECT * FROM skill_run_observation
+                    WHERE project_id = ? AND candidate_id = ? AND observation_digest = ?
+                    """,
+                    (
+                        project["project_id"],
+                        skill_request["candidate_id"],
+                        observation["observation_digest"],
+                    ),
+                ).fetchone()
+                if existing_observation is not None:
+                    observation_rows.append(
+                        self._skill_observation_row(existing_observation)
+                    )
+                    continue
+                skill = observation["skill"]
+                observation_id = "skillrun_" + _json_sha256(
+                    {
+                        "project_id": project["project_id"],
+                        "candidate_id": skill_request["candidate_id"],
+                        "observation_digest": observation["observation_digest"],
+                    }
+                )[:24]
+                connection.execute(
+                    """
+                    INSERT INTO skill_run_observation(
+                        observation_id, project_id, candidate_id, candidate_digest,
+                        task_frame_ref, source_ref, observation_digest,
+                        skill_binding_digest, skill_id, skill_version,
+                        operation_class, context_pack_digest, model_ref, provider_ref,
+                        worker_role, task_kind, node_ref, outcome, validation_state,
+                        failure_kind, quota_state, evidence_refs_json, metrics_json,
+                        observed_at, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        observation_id,
+                        project["project_id"],
+                        skill_request["candidate_id"],
+                        skill_request["candidate_digest"],
+                        skill_candidate["task_frame_ref"],
+                        skill_candidate["source_ref"],
+                        observation["observation_digest"],
+                        observation["skill_binding_digest"],
+                        skill["skill_id"],
+                        skill["skill_version"],
+                        skill["operation_class"],
+                        skill["context_pack_digest"],
+                        observation["model_ref"],
+                        observation["execution_context"]["provider_ref"],
+                        observation["execution_context"]["worker_role"],
+                        observation["execution_context"]["task_kind"],
+                        observation["execution_context"]["node_ref"],
+                        observation["outcome"],
+                        observation["validation_state"],
+                        observation["execution_context"]["failure_kind"],
+                        observation["execution_context"]["quota_state"],
+                        _canonical_json(observation["evidence_refs"]),
+                        _canonical_json(observation["metrics"]),
+                        skill_candidate["observed_at"],
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO skill_catalog(
+                        skill_id, skill_version, operation_class,
+                        first_observed_at, last_observed_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(skill_id, skill_version, operation_class)
+                    DO UPDATE SET
+                        first_observed_at = MIN(skill_catalog.first_observed_at, excluded.first_observed_at),
+                        last_observed_at = MAX(skill_catalog.last_observed_at, excluded.last_observed_at)
+                    """,
+                    (
+                        skill["skill_id"],
+                        skill["skill_version"],
+                        skill["operation_class"],
+                        skill_candidate["observed_at"],
+                        skill_candidate["observed_at"],
+                    ),
+                )
+                observation_rows.append(
+                    {
+                        "schema": SKILL_RUN_OBSERVATION_SCHEMA,
+                        "observation_id": observation_id,
+                        "project_id": project["project_id"],
+                        "candidate_id": skill_request["candidate_id"],
+                        "candidate_digest": skill_request["candidate_digest"],
+                        "task_frame_ref": skill_candidate["task_frame_ref"],
+                        "source_ref": skill_candidate["source_ref"],
+                        **observation,
+                        "observed_at": skill_candidate["observed_at"],
+                        "recorded_at": now,
+                    }
+                )
+
+            previous_result = json.loads(str(run["result_json"]))
+            attempt = previous_result.get("attempt", 1)
+            if isinstance(attempt, bool) or not isinstance(attempt, int):
+                attempt = 1
+            result = {
+                "schema": MEMORY_BATCH_RUN_SCHEMA,
+                "status": "COMPLETED",
+                "run_id": run_id,
+                "project_id": project["project_id"],
+                "stage": "FAST_EXTRACT",
+                "config_digest": _json_sha256(config),
+                "input_digest": input_digest,
+                "output_digest": output_digest,
+                "candidate_count": len(stored_candidates),
+                "created_count": created_count,
+                "candidate_ids": [item["candidate_id"] for item in stored_candidates],
+                "candidates": stored_candidates,
+                "independent_check": None,
+                "attempt": attempt,
+                "execution": dict(provider_execution),
+                "effects": {
+                    "candidate_write": "CREATED" if created_count else "IDEMPOTENT",
+                    "memory_write": "NONE",
+                    "current_anchor": "NONE",
+                    "project_facts": "NONE",
+                    "seed": "NONE",
+                    "authority": "NONE",
+                    "execution_assignment": "NONE",
+                    "auto_adoption": False,
+                    "skill_observation": "RECORDED",
+                },
+                "skill_observation": {
+                    "candidate_id": skill_request["candidate_id"],
+                    "candidate_digest": skill_request["candidate_digest"],
+                    "observation_count": len(observation_rows),
+                },
+            }
+            connection.execute(
+                """
+                UPDATE memory_batch_run
+                SET output_digest = ?, status = 'COMPLETED', candidate_ids_json = ?,
+                    result_json = ?, completed_at = ?
+                WHERE run_id = ? AND status = 'RUNNING'
+                """,
+                (
+                    output_digest,
+                    _canonical_json(result["candidate_ids"]),
+                    _canonical_json(result),
+                    now,
+                    run_id,
+                ),
+            )
+        return (
+            {**result, "started_at": str(run["started_at"]), "completed_at": now},
+            {
+                "project_id": project["project_id"],
+                "candidate_id": skill_request["candidate_id"],
+                "candidate_digest": skill_request["candidate_digest"],
+                "redaction_state": "REDACTED",
+                "observations": observation_rows,
+            },
+        )
+
     @staticmethod
     def _worker_binding_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -9828,6 +10335,12 @@ class UniverseStore:
         project_id: str,
         config: Mapping[str, Any],
         request: Mapping[str, Any] | None = None,
+        *,
+        provider_candidates: list[Mapping[str, Any]] | None = None,
+        input_material_override: list[str] | None = None,
+        run_id_override: str | None = None,
+        provider_execution: Mapping[str, Any] | None = None,
+        skill_observation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         project = self.get_project(project_id)
         request = request if isinstance(request, Mapping) else {}
@@ -9853,30 +10366,46 @@ class UniverseStore:
         check: dict[str, Any] | None = None
         input_material: list[str] = []
         if stage == "FAST_EXTRACT":
-            batches = request.get("activity_batches")
-            if batches is None:
-                batches = []
-                source_ids = request.get("source_ids")
-                if source_ids is None:
-                    source_ids = [item["source_id"] for item in self.list_provider_session_sources()]
-                if not isinstance(source_ids, list):
+            if provider_candidates is not None:
+                try:
+                    candidates = [
+                        normalize_memory_candidate(
+                            item,
+                            project_id=project["project_id"],
+                            stage="FAST_EXTRACT",
+                        )
+                        for item in provider_candidates
+                    ]
+                except MemoryError as error:
+                    raise UniverseError(error.code, error.message) from error
+                input_material = list(input_material_override or [])
+                if not input_material:
+                    input_material = [item["candidate_digest"] for item in candidates]
+            else:
+                batches = request.get("activity_batches")
+                if batches is None:
+                    batches = []
+                    source_ids = request.get("source_ids")
+                    if source_ids is None:
+                        source_ids = [item["source_id"] for item in self.list_provider_session_sources()]
+                    if not isinstance(source_ids, list):
+                        raise UniverseError(
+                            "MEMORY_BATCH_SOURCE_IDS_INVALID",
+                            "source_ids must be an array",
+                        )
+                    for source_id in source_ids:
+                        batches.append(self.prepare_provider_activity_batch(str(source_id)))
+                if not isinstance(batches, list):
                     raise UniverseError(
-                        "MEMORY_BATCH_SOURCE_IDS_INVALID",
-                        "source_ids must be an array",
+                        "MEMORY_BATCH_ACTIVITY_INVALID",
+                        "activity_batches must be an array",
                     )
-                for source_id in source_ids:
-                    batches.append(self.prepare_provider_activity_batch(str(source_id)))
-            if not isinstance(batches, list):
-                raise UniverseError(
-                    "MEMORY_BATCH_ACTIVITY_INVALID",
-                    "activity_batches must be an array",
-                )
-            for batch in batches:
-                extracted = extract_memory_candidates_from_activity_batch(
-                    batch, project_id=project["project_id"]
-                )
-                candidates.extend(extracted)
-                input_material.extend(item["candidate_digest"] for item in extracted)
+                for batch in batches:
+                    extracted = extract_memory_candidates_from_activity_batch(
+                        batch, project_id=project["project_id"]
+                    )
+                    candidates.extend(extracted)
+                    input_material.extend(item["candidate_digest"] for item in extracted)
         elif stage == "CONSOLIDATE":
             existing = self.list_memory_candidates(
                 project["project_id"], stage="FAST_EXTRACT", limit=500
@@ -9921,15 +10450,11 @@ class UniverseStore:
             )
         elif candidates:
             stored_candidates = candidates
-        run_id = "memory_batch_run_" + _json_sha256(
-            {
-                "project_id": project["project_id"],
-                "stage": stage,
-                "input_digest": input_digest,
-                "output_digest": output_digest,
-                "config_digest": _json_sha256(config),
-            }
-        )[:24]
+        run_id = run_id_override
+        if run_id is None:
+            run_id, _config_digest, _input_digest = self.memory_batch_run_id(
+                project["project_id"], stage, config, input_material
+            )
         now = utc_now()
         result: dict[str, Any] = {
             "schema": MEMORY_BATCH_RUN_SCHEMA,
@@ -9945,6 +10470,13 @@ class UniverseStore:
             "candidate_ids": [item["candidate_id"] for item in stored_candidates],
             "candidates": stored_candidates,
             "independent_check": check,
+            "execution": dict(provider_execution)
+            if provider_execution is not None
+            else {
+                "mode": "DETERMINISTIC",
+                "provider_invocation": "NOT_RUN",
+                "provider_attribution": "NONE",
+            },
             "effects": {
                 "candidate_write": "NONE" if dry_run else ("CREATED" if created_count else "IDEMPOTENT"),
                 "memory_write": "NONE",
@@ -9954,31 +10486,66 @@ class UniverseStore:
                 "authority": "NONE",
                 "execution_assignment": "NONE",
                 "auto_adoption": False,
+                "skill_observation": (
+                    "RECORDED" if skill_observation is not None else "NONE"
+                ),
             },
         }
+        if skill_observation is not None:
+            result["skill_observation"] = {
+                key: skill_observation[key]
+                for key in (
+                    "candidate_id",
+                    "candidate_digest",
+                    "observation_count",
+                )
+                if key in skill_observation
+            }
         with self._connection() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO memory_batch_run(
-                    run_id, project_id, stage, config_digest, input_digest,
-                    output_digest, status, candidate_ids_json, result_json,
-                    started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    project["project_id"],
-                    stage,
-                    result["config_digest"],
-                    input_digest,
-                    output_digest,
-                    result["status"],
-                    _canonical_json(result["candidate_ids"]),
-                    _canonical_json(result),
-                    now,
-                    now,
-                ),
-            )
+            existing = connection.execute(
+                "SELECT status FROM memory_batch_run WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO memory_batch_run(
+                        run_id, project_id, stage, config_digest, input_digest,
+                        output_digest, status, candidate_ids_json, result_json,
+                        started_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        project["project_id"],
+                        stage,
+                        result["config_digest"],
+                        input_digest,
+                        output_digest,
+                        result["status"],
+                        _canonical_json(result["candidate_ids"]),
+                        _canonical_json(result),
+                        now,
+                        now,
+                    ),
+                )
+            elif existing["status"] == "RUNNING":
+                connection.execute(
+                    """
+                    UPDATE memory_batch_run
+                    SET output_digest = ?, status = ?, candidate_ids_json = ?,
+                        result_json = ?, completed_at = ?
+                    WHERE run_id = ? AND status = 'RUNNING'
+                    """,
+                    (
+                        output_digest,
+                        result["status"],
+                        _canonical_json(result["candidate_ids"]),
+                        _canonical_json(result),
+                        now,
+                        run_id,
+                    ),
+                )
         return {**result, "started_at": now, "completed_at": now}
 
     def compare_skill_bench(
@@ -13963,6 +14530,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._planning_binding_error: dict[str, str] | None = None
         self._planning_binding_lock = threading.RLock()
         self.planning_execution_lock = threading.Lock()
+        self.memory_batch_execution_lock = threading.RLock()
         self.project_release_application_lock = threading.Lock()
         self.project_skill_plan_application_lock = threading.Lock()
         self._conductor_queue: queue.Queue[str | None] = queue.Queue()
@@ -16296,35 +16864,308 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "this slice enforces max_runs only; token, cost, and window budgets require Provider usage telemetry",
                 HTTPStatus.CONFLICT,
             )
-        if resolved.get("fallback") != "DETERMINISTIC":
-            raise UniverseError(
-                "MEMORY_BATCH_PROVIDER_EXECUTOR_UNAVAILABLE",
-                "configured Provider execution requires the governed Task Frame adapter",
-                HTTPStatus.CONFLICT,
-            )
         request = {
             key: value[key]
             for key in ("activity_batches", "source_ids", "kinds")
             if key in value
         }
-        result = self.store.run_memory_batch(project_id, resolved, request)
-        return {
-            "schema": API_SCHEMA,
-            "status": "MEMORY_BATCH_RUN_COMPLETED",
-            "config": {
-                "stage": resolved["stage"],
-                "provider": resolved["provider"],
-                "model_ref": resolved["model_ref"],
-                "fallback": resolved["fallback"],
-                "resolution": resolution,
-            },
-            "execution": {
-                "mode": "DETERMINISTIC",
-                "provider_invocation": "NOT_RUN",
-                "provider_attribution": "NONE",
-            },
-            "run": result,
-        }
+        if resolved.get("fallback") == "DETERMINISTIC":
+            result = self.store.run_memory_batch(project_id, resolved, request)
+            return {
+                "schema": API_SCHEMA,
+                "status": "MEMORY_BATCH_RUN_COMPLETED",
+                "config": {
+                    "stage": resolved["stage"],
+                    "provider": resolved["provider"],
+                    "model_ref": resolved["model_ref"],
+                    "fallback": resolved["fallback"],
+                    "resolution": resolution,
+                },
+                "execution": result.get(
+                    "execution",
+                    {
+                        "mode": "DETERMINISTIC",
+                        "provider_invocation": "NOT_RUN",
+                        "provider_attribution": "NONE",
+                    },
+                ),
+                "run": result,
+            }
+
+        if (
+            stage != "FAST_EXTRACT"
+            or resolved.get("provider") != FAST_EXTRACT_PROVIDER
+            or resolved.get("model_ref") != FAST_EXTRACT_MODEL
+            or resolved.get("effort") != FAST_EXTRACT_EFFORT
+            or resolved.get("fallback") != "NONE"
+        ):
+            raise UniverseError(
+                "MEMORY_BATCH_PROVIDER_EXECUTOR_UNAVAILABLE",
+                "only governed Codex gpt-5.6-luna MAX FAST_EXTRACT is executable",
+                HTTPStatus.CONFLICT,
+            )
+
+        try:
+            runtime_binding = normalize_runtime_binding(value.get("runtime_binding"))
+            if "activity_batches" in value:
+                raise FastExtractError(
+                    "FAST_EXTRACT_ACTIVITY_PROVENANCE_REQUIRED",
+                    "governed FAST_EXTRACT accepts registered source_ids only",
+                )
+            source_ids = value.get("source_ids")
+            if not isinstance(source_ids, list) or not source_ids:
+                raise FastExtractError(
+                    "FAST_EXTRACT_ACTIVITY_INVALID",
+                    "source_ids must contain registered sources",
+                )
+            raw_batches = [
+                self.store.prepare_provider_activity_batch(str(source_id))
+                for source_id in source_ids
+            ]
+            activity_batches = redact_activity_batches(raw_batches)
+            semantic_evidence = [
+                excerpt
+                for batch in activity_batches
+                for excerpt in self.store.provider_session_observer.build_transient_semantic_evidence(
+                    str(batch["source"]["source_id"]),
+                    batch["activity_refs"],
+                )
+            ]
+        except (FastExtractError, ProviderSessionObserverError) as error:
+            code = getattr(error, "code", "FAST_EXTRACT_ACTIVITY_INVALID")
+            detail = getattr(error, "detail", str(error))
+            raise UniverseError(code, detail, HTTPStatus.CONFLICT) from error
+
+        semantic_input_digest = fast_extract_digest(
+            [
+                {
+                    "excerpt_id": item["excerpt_id"],
+                    "activity_digest": item["activity_digest"],
+                    "text_digest": item["text_digest"],
+                }
+                for item in semantic_evidence
+            ]
+        )
+        input_material = [item["batch_digest"] for item in activity_batches]
+        input_material.append(semantic_input_digest)
+        run_id, config_digest, input_digest = self.store.memory_batch_run_id(
+            project_id, stage, resolved, input_material
+        )
+        with self.memory_batch_execution_lock:
+            retry_existing = False
+            existing = self.store.get_memory_batch_run(run_id)
+            if existing is not None:
+                if existing["status"] == "RUNNING":
+                    raise UniverseError(
+                        "MEMORY_BATCH_RUN_IN_PROGRESS",
+                        "the same FAST_EXTRACT invocation is already running",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "FAILED":
+                    retry_existing = True
+                else:
+                    return {
+                        "schema": API_SCHEMA,
+                        "status": "MEMORY_BATCH_RUN_ALREADY_RECORDED",
+                        "config": {
+                            "stage": resolved["stage"],
+                            "provider": resolved["provider"],
+                            "model_ref": resolved["model_ref"],
+                            "fallback": resolved["fallback"],
+                            "resolution": resolution,
+                        },
+                        "execution": existing["result"].get("execution", {}),
+                        "run": existing["result"],
+                    }
+
+            binding_digest = str(
+                (resolved.get("worker_binding") or {}).get("binding_digest") or ""
+            ).strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", binding_digest):
+                binding_digest = fast_extract_digest(
+                    {
+                        "stage": stage,
+                        "provider": FAST_EXTRACT_PROVIDER,
+                        "model_ref": FAST_EXTRACT_MODEL,
+                        "effort": FAST_EXTRACT_EFFORT,
+                    }
+                )
+            execution_pending = {
+                "mode": "GOVERNED_TASK_FRAME",
+                "provider_invocation": "PENDING",
+                "provider_attribution": f"provider://{FAST_EXTRACT_PROVIDER}/model/{FAST_EXTRACT_MODEL}",
+                "provider": FAST_EXTRACT_PROVIDER,
+                "model_ref": f"provider://{FAST_EXTRACT_PROVIDER}/model/{FAST_EXTRACT_MODEL}",
+                "effort": FAST_EXTRACT_EFFORT,
+                "invocation_id": run_id,
+                "task_frame_ref": runtime_binding["task_frame_ref"],
+                "worker_id": "PENDING",
+                "worker_run_ref": "PENDING",
+                "repository_write": False,
+                "result_receipt_ref": "PENDING",
+            }
+            if retry_existing:
+                self.store.retry_memory_batch_run(
+                    run_id,
+                    execution=execution_pending,
+                )
+            else:
+                self.store.reserve_memory_batch_run(
+                    run_id=run_id,
+                    project_id=project_id,
+                    stage=stage,
+                    config_digest=config_digest,
+                    input_digest=input_digest,
+                    execution=execution_pending,
+                )
+
+            try:
+                provider_request = build_provider_request(
+                    project_id=project_id,
+                    activity_batches=activity_batches,
+                    semantic_evidence=semantic_evidence,
+                    runtime_binding=runtime_binding,
+                    invocation_id=run_id,
+                    config_digest=config_digest,
+                    skill_binding_digest=binding_digest,
+                )
+                capability = getattr(self.runtime_host, "provider_capability", None)
+                if callable(capability):
+                    observed_capability = capability(FAST_EXTRACT_PROVIDER)
+                    if (
+                        observed_capability.get("status") != "AVAILABLE"
+                        or observed_capability.get("model") != FAST_EXTRACT_MODEL
+                    ):
+                        raise FastExtractError(
+                            "FAST_EXTRACT_MODEL_UNAVAILABLE",
+                            "Host capability does not attest gpt-5.6-luna",
+                        )
+                provider_result = self.runtime_host.invoke_structured(provider_request)
+                if not isinstance(provider_result, Mapping):
+                    raise FastExtractError(
+                        "FAST_EXTRACT_RESULT_INVALID", "Task Frame result must be an object"
+                    )
+                if provider_result.get("terminal_result_verified") is not True:
+                    raise FastExtractError(
+                        "FAST_EXTRACT_TERMINAL_RECEIPT_UNVERIFIED",
+                        "Task Frame Host did not attest terminal result recording",
+                    )
+                model_ref = str(provider_result.get("model_ref") or "").strip()
+                expected_model_ref = (
+                    f"provider://{FAST_EXTRACT_PROVIDER}/model/{FAST_EXTRACT_MODEL}"
+                )
+                if model_ref != expected_model_ref:
+                    raise FastExtractError(
+                        "FAST_EXTRACT_MODEL_MISMATCH",
+                        "Task Frame result model does not match the FAST_EXTRACT ceiling",
+                    )
+                structured_result = provider_result.get("structured_result")
+                candidates = normalize_provider_candidates(
+                    structured_result,
+                    project_id=project_id,
+                    activity_batches=activity_batches,
+                    semantic_evidence=semantic_evidence,
+                )
+                worker_id = _required_text(provider_result.get("worker_id"), "worker_id")
+                worker_run_ref = _required_text(
+                    provider_result.get("worker_run_ref"), "worker_run_ref"
+                )
+                result_receipt_ref = _required_text(
+                    provider_result.get("result_receipt_ref"), "result_receipt_ref"
+                )
+                source_ref = f"universe://projects/{project_id}/memory-batches/{run_id}"
+                skill_candidate = build_skill_observation_candidate(
+                    project_id=project_id,
+                    task_frame_ref=runtime_binding["task_frame_ref"],
+                    source_ref=source_ref,
+                    activity_digest=fast_extract_digest(activity_batches),
+                    skill_binding_digest=binding_digest,
+                    result_receipt_ref=result_receipt_ref,
+                    worker_id=worker_id,
+                    model_ref=model_ref,
+                    activity_count=sum(
+                        len(item["activity_refs"]) for item in activity_batches
+                    ),
+                    candidate_count=len(candidates),
+                    duration_ms=provider_result.get("duration_ms", 0),
+                )
+                normalized_skill = normalize_skill_observation_candidate(
+                    project_id, skill_candidate
+                )
+                execution = redacted_execution_record(
+                    status="COMPLETED",
+                    provider=FAST_EXTRACT_PROVIDER,
+                    model_ref=model_ref,
+                    worker_id=worker_id,
+                    worker_run_ref=worker_run_ref,
+                    result_receipt_ref=result_receipt_ref,
+                    invocation_id=run_id,
+                    task_frame_ref=runtime_binding["task_frame_ref"],
+                    skill_observation_candidate_id=normalized_skill["candidate_id"],
+                )
+                execution.update(
+                    {
+                        "mode": "GOVERNED_TASK_FRAME",
+                        "provider_invocation": "COMPLETED",
+                        "provider_attribution": model_ref,
+                        "effort": FAST_EXTRACT_EFFORT,
+                        "evidence_refs": [result_receipt_ref],
+                    }
+                )
+                result, skill_result = self.store.complete_fast_extract_run(
+                    project_id=project_id,
+                    config=resolved,
+                    provider_candidates=candidates,
+                    input_material=input_material,
+                    run_id=run_id,
+                    provider_execution=execution,
+                    skill_observation_request={
+                        "candidate_id": normalized_skill["candidate_id"],
+                        "candidate": normalized_skill["candidate"],
+                    },
+                )
+                return {
+                    "schema": API_SCHEMA,
+                    "status": "MEMORY_BATCH_RUN_COMPLETED",
+                    "config": {
+                        "stage": resolved["stage"],
+                        "provider": resolved["provider"],
+                        "model_ref": resolved["model_ref"],
+                        "fallback": resolved["fallback"],
+                        "resolution": resolution,
+                    },
+                    "execution": execution,
+                    "run": result,
+                    "skill_observation": {
+                        "candidate_id": normalized_skill["candidate_id"],
+                        "candidate_digest": normalized_skill["candidate_digest"],
+                        "observation_count": len(skill_result["observations"]),
+                    },
+                }
+            except (FastExtractError, RuntimeHostError, UniverseError) as error:
+                error_code = getattr(error, "code", "FAST_EXTRACT_FAILED")
+                failure_execution = {
+                    **execution_pending,
+                    "provider_invocation": "FAILED",
+                    "status": "FAILED",
+                    "error_code": error_code,
+                    "result_receipt_ref": "UNKNOWN",
+                    "skill_observation_candidate_id": "NONE",
+                    "evidence_refs": [],
+                }
+                self.store.fail_memory_batch_run(
+                    run_id,
+                    status="FAILED",
+                    reason=error_code,
+                    execution=failure_execution,
+                )
+                if isinstance(error, UniverseError):
+                    raise
+                raise UniverseError(
+                    error_code,
+                    getattr(error, "detail", str(error)),
+                    HTTPStatus.CONFLICT,
+                ) from error
 
     def set_host_tool(self, tool: str, value: Any) -> dict[str, Any]:
         request = _exact_object_fields(

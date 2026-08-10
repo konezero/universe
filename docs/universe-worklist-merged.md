@@ -226,18 +226,29 @@ Completed locally:
   `EXPLORE`, and `START_PRODUCT_DESIGN`.
 - Candidate writes remain separate from Memory publication, Current Anchor,
   Seed, authority, Assignment, and project source.
+- Governed Codex `FAST_EXTRACT` adapter from registered Activity sources
+  through a Host-claimed Task Frame turn, with transient redacted semantic
+  excerpts, the exact `gpt-5.6-luna`/`MAX` ceiling, retryable failed runs,
+  atomic review-only Candidate + SkillRunObservation/Bench persistence, and
+  real-dispatcher/fake-provider integration coverage.
 - Bounded Conductor delegation records, a worker queue independent from chat,
   progress/result APIs, restart recovery, Conductor UI status projection, and
   a default bounded Project Master delivery/result-reference route.
 
 Required follow-up:
 
-- Connect the configured Provider/model/effort to the governed Task Frame
-  execution adapter. Until then candidate generation is deterministic and must
-  not be attributed to a Provider model.
+- Run one billable live Codex/Luna FAST_EXTRACT probe over a registered Codex
+  transcript and verify the terminal Task Frame receipt, review-only Candidate,
+  no persisted excerpt text, and Bench observation end to end.
+- Preserve and surface terminal Worker result evidence before retiring or
+  replacing a Task Frame claim; the original vertical-slice Worker receipt was
+  not observable after its executor became stale.
+- Make Project Source Work identity stable across executor restart, or persist
+  the original proposal/Work Receipt restoration material; timestamp-derived
+  replacement receipts cannot silently become existing Frame lineage.
 - Add a clock-driven scheduler for persisted stage schedules, with due-time,
   quota-window, retry/backoff, and shutdown/restart tests.
 - Connect Boss/Worker delegation roles to the approved Task Frame executor;
   these roles currently fail closed instead of bypassing Task Frame policy.
-- Add provider-produced candidate contract tests, scheduler recovery tests,
-  and browser interaction/accessibility QA for configuration and review.
+- Extend provider-produced candidate, failure-recovery, and scheduler tests,
+  and add browser interaction/accessibility QA for configuration and review.

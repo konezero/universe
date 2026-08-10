@@ -13,6 +13,7 @@ import os
 import sqlite3
 import time
 import uuid
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,17 @@ METADATA_LINE_LIMIT = 192
 DEFAULT_SCAN_BYTE_LIMIT = 256 * 1024
 DEFAULT_SCAN_EVENT_LIMIT = 512
 DEFAULT_SCAN_TIME_LIMIT_SECONDS = 0.25
+SEMANTIC_EXCERPT_LIMIT = 256
+SEMANTIC_EXCERPT_CHAR_LIMIT = 2000
+SEMANTIC_TOTAL_CHAR_LIMIT = 32000
+SECRET_PATTERNS = (
+    re.compile(r"\b(?:sk|xai|ghp|github_pat)-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*\S{8,}",
+        re.IGNORECASE,
+    ),
+)
 
 
 class ProviderSessionObserverError(ValueError):
@@ -66,8 +78,48 @@ def _identifier(value: Any, field: str) -> str:
     return text
 
 
-def _canonical_json(value: Mapping[str, Any]) -> str:
+def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _redact_semantic_text(value: str) -> str:
+    redacted = value.replace("\x00", " ").strip()
+    for pattern in SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return " ".join(redacted.split())[:SEMANTIC_EXCERPT_CHAR_LIMIT]
+
+
+def _codex_semantic_messages(event: Mapping[str, Any]) -> list[tuple[str, str]]:
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        return []
+    payload_type = str(payload.get("type") or "").strip().lower()
+    role = str(payload.get("role") or "").strip().upper()
+    messages: list[tuple[str, str]] = []
+    if payload_type == "message" and role in {"USER", "ASSISTANT"}:
+        content = payload.get("content")
+        if isinstance(content, list):
+            chunks = []
+            for item in content:
+                if not isinstance(item, Mapping):
+                    continue
+                if str(item.get("type") or "").lower() not in {
+                    "input_text",
+                    "output_text",
+                    "text",
+                }:
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text)
+            if chunks:
+                messages.append((role, "\n".join(chunks)))
+    elif payload_type in {"user_message", "agent_message", "assistant_message"}:
+        inferred_role = "USER" if payload_type == "user_message" else "ASSISTANT"
+        text = payload.get("message") or payload.get("text")
+        if isinstance(text, str) and text.strip():
+            messages.append((inferred_role, text))
+    return messages
 
 
 def _file_identity(path: Path) -> str:
@@ -298,6 +350,7 @@ class ProviderSessionObserverStore:
                     activity_state TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     activity_digest TEXT NOT NULL,
+                    byte_offset INTEGER,
                     branch_parent_id TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
                     recorded_at TEXT NOT NULL,
@@ -308,6 +361,16 @@ class ProviderSessionObserverStore:
                 ON provider_session_activity(source_id, active, ordinal, activity_id);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(provider_session_activity)"
+                ).fetchall()
+            }
+            if "byte_offset" not in columns:
+                connection.execute(
+                    "ALTER TABLE provider_session_activity ADD COLUMN byte_offset INTEGER"
+                )
 
     def register_source(self, value: Mapping[str, Any]) -> dict[str, Any]:
         provider = _text(value.get("provider"), "provider").upper()
@@ -531,6 +594,118 @@ class ProviderSessionObserverStore:
             "raw_transcript": "EXCLUDED",
         }
 
+    def build_transient_semantic_evidence(
+        self,
+        source_id: str,
+        activity_refs: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Read exact selected Codex message events without persisting text."""
+
+        if not activity_refs or len(activity_refs) > 512:
+            raise ProviderSessionObserverError(
+                "SEMANTIC_EVIDENCE_INVALID",
+                "activity_refs must contain 1..512 items",
+            )
+        with self._connection() as connection:
+            source = connection.execute(
+                "SELECT * FROM provider_session_source WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            if source is None:
+                raise ProviderSessionObserverError("SOURCE_NOT_FOUND", source_id)
+            if str(source["provider"]) != "CODEX":
+                raise ProviderSessionObserverError(
+                    "SEMANTIC_PROVIDER_UNSUPPORTED", "Codex source required"
+                )
+            path = Path(str(source["source_path"]))
+            if not path.is_file() or _file_identity(path) != str(source["file_identity"]):
+                raise ProviderSessionObserverError(
+                    "SEMANTIC_SOURCE_NOT_CURRENT", source_id
+                )
+            selected: list[tuple[sqlite3.Row, Mapping[str, Any]]] = []
+            for ref in activity_refs:
+                activity_id = _identifier(ref.get("activity_id"), "activity_id")
+                activity_digest = _identifier(
+                    ref.get("activity_digest"), "activity_digest"
+                )
+                ordinal = ref.get("ordinal")
+                if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+                    raise ProviderSessionObserverError(
+                        "SEMANTIC_EVIDENCE_INVALID", "ordinal must be positive"
+                    )
+                row = connection.execute(
+                    """
+                    SELECT * FROM provider_session_activity
+                    WHERE source_id = ? AND activity_id = ? AND activity_digest = ?
+                      AND ordinal = ? AND active = 1
+                    """,
+                    (source_id, activity_id, activity_digest, ordinal),
+                ).fetchone()
+                if row is None or row["byte_offset"] is None:
+                    raise ProviderSessionObserverError(
+                        "SEMANTIC_ACTIVITY_NOT_ATTESTED", activity_id
+                    )
+                selected.append((row, ref))
+
+        excerpts: list[dict[str, Any]] = []
+        total_chars = 0
+        with path.open("rb") as handle:
+            for row, _ref in selected:
+                byte_offset = int(row["byte_offset"])
+                handle.seek(byte_offset)
+                raw_line = handle.readline()
+                if not raw_line.endswith(b"\n"):
+                    raise ProviderSessionObserverError(
+                        "SEMANTIC_SOURCE_NOT_CURRENT", str(row["activity_id"])
+                    )
+                try:
+                    event = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ProviderSessionObserverError(
+                        "SEMANTIC_SOURCE_NOT_CURRENT", type(error).__name__
+                    ) from error
+                if not isinstance(event, Mapping):
+                    raise ProviderSessionObserverError(
+                        "SEMANTIC_SOURCE_NOT_CURRENT", "event is not an object"
+                    )
+                safe = {
+                    "source_id": source_id,
+                    "provider_event_id": _event_id(event, f"offset-{byte_offset}"),
+                    "ordinal": int(row["ordinal"]),
+                    "event_type": _event_type(event)[:96],
+                    "parent_id": None,
+                }
+                if _sha256(_canonical_json(safe)) != str(row["activity_digest"]):
+                    raise ProviderSessionObserverError(
+                        "SEMANTIC_SOURCE_NOT_CURRENT", str(row["activity_id"])
+                    )
+                for role, raw_text in _codex_semantic_messages(event):
+                    text = _redact_semantic_text(raw_text)
+                    if not text:
+                        continue
+                    remaining = SEMANTIC_TOTAL_CHAR_LIMIT - total_chars
+                    if remaining <= 0 or len(excerpts) >= SEMANTIC_EXCERPT_LIMIT:
+                        break
+                    text = text[:remaining]
+                    total_chars += len(text)
+                    text_digest = _sha256(_canonical_json(text))
+                    excerpts.append(
+                        {
+                            "excerpt_id": "semantic_" + text_digest[:24],
+                            "activity_digest": str(row["activity_digest"]),
+                            "ordinal": int(row["ordinal"]),
+                            "role": role,
+                            "text": text,
+                            "text_digest": text_digest,
+                        }
+                    )
+        if not excerpts:
+            raise ProviderSessionObserverError(
+                "SEMANTIC_EVIDENCE_EMPTY",
+                "selected Activity has no bounded user or assistant text",
+            )
+        return excerpts
+
     def scan(
         self,
         source_id: str,
@@ -690,6 +865,8 @@ class ProviderSessionObserverStore:
         provider = str(source["provider"])
         event_type = _event_type(event)
         event_kind, activity_state = _safe_event_kind(event_type)
+        if provider == "CODEX" and _codex_semantic_messages(event):
+            event_kind, activity_state = "TURN_COMPLETED", "COMPLETED"
         event_id = _event_id(event, f"offset-{byte_offset}")
         parent_id: str | None = None
         if provider == "CLAUDE":
@@ -725,11 +902,11 @@ class ProviderSessionObserverStore:
         activity_id = "activity_" + digest[:24]
         inserted = connection.execute(
             """
-            INSERT OR IGNORE INTO provider_session_activity(
-                activity_id, source_id, provider_event_id, ordinal, event_kind,
-                activity_state, observed_at, activity_digest, branch_parent_id,
-                active, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                INSERT OR IGNORE INTO provider_session_activity(
+                    activity_id, source_id, provider_event_id, ordinal, event_kind,
+                    activity_state, observed_at, activity_digest, byte_offset,
+                    branch_parent_id, active, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """,
             (
                 activity_id,
@@ -740,6 +917,7 @@ class ProviderSessionObserverStore:
                 activity_state,
                 _event_time(event),
                 digest,
+                byte_offset,
                 parent_id,
                 _now(),
             ),

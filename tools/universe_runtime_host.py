@@ -1026,6 +1026,12 @@ class UniverseRuntimeHost:
             "result_receipt_ref": _text_or(
                 response.get("result_receipt_ref"), "UNKNOWN"
             ),
+            "worker_run_ref": _text_or(response.get("worker_run_ref"), "UNKNOWN"),
+            "terminal_result_verified": response.get("terminal_result_verified") is True,
+            "task_frame_result_status": _text_or(
+                response.get("task_frame_result_status"), "UNKNOWN"
+            ),
+            "duration_ms": response.get("duration_ms", 0),
             "skill_run_observation_count": observation_count,
             "repository_write": False,
             "session_persistence": "EPHEMERAL",

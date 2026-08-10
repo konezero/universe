@@ -209,9 +209,17 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
                         },
                     },
                 }
+            operation_payload = payload["operation"]
             return {
                 "status": "TASK_FRAME_OPERATION_APPLIED",
-                "output": {"status": "TURN_CLAIMED"},
+                "output": {
+                    "status": "TURN_CLAIMED",
+                    "turn": {
+                        "turn_id": operation_payload["turn_id"],
+                        "state": "CLAIMED",
+                        "claimed_by": operation_payload["worker_id"],
+                    },
+                },
             }
 
         class Dispatcher(RuntimeWorkerDispatcher):
@@ -250,6 +258,55 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertTrue(result["worker_id"].startswith("universe-runtime-worker:"))
         self.assertEqual("provider-worker-1", result["provider_worker_ref"])
 
+    def test_dispatch_rejects_claimed_turn_identity_mismatch(self) -> None:
+        provider_started = False
+
+        def post(_endpoint, _token, _path, payload):
+            operation = payload["operation"]
+            if operation["operation"] == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {
+                    "status": "TURN_CLAIMED",
+                    "turn": {
+                        "turn_id": operation["turn_id"],
+                        "state": "CLAIMED",
+                        "claimed_by": "different-worker",
+                    },
+                },
+            }
+
+        class Dispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, _request):
+                nonlocal provider_started
+                provider_started = True
+                raise AssertionError("provider must not start for a mismatched claim")
+
+        with self.assertRaises(WorkerDispatchError) as captured:
+            Dispatcher(self.root, post=post).dispatch(self._dispatch_request())
+
+        self.assertEqual("WORKER_CLAIM_EVIDENCE_MISMATCH", captured.exception.code)
+        self.assertFalse(provider_started)
+
     def test_provider_failure_is_persisted_before_claim_recovery(self) -> None:
         store = WorkerFailureEvidenceStore(self.root / "universe.sqlite3")
         observed_ref = ""
@@ -272,7 +329,14 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             if operation == "claim_turn":
                 return {
                     "status": "TASK_FRAME_OPERATION_APPLIED",
-                    "output": {"status": "TURN_CLAIMED"},
+                    "output": {
+                        "status": "TURN_CLAIMED",
+                        "turn": {
+                            "turn_id": payload["operation"]["turn_id"],
+                            "state": "CLAIMED",
+                            "claimed_by": payload["operation"]["worker_id"],
+                        },
+                    },
                 }
             self.assertEqual("worker_initialization_failed", operation)
             observed_ref = payload["operation"]["host_evidence_ref"]
@@ -340,7 +404,14 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             if operation == "claim_turn":
                 return {
                     "status": "TASK_FRAME_OPERATION_APPLIED",
-                    "output": {"status": "TURN_CLAIMED"},
+                    "output": {
+                        "status": "TURN_CLAIMED",
+                        "turn": {
+                            "turn_id": payload["operation"]["turn_id"],
+                            "state": "CLAIMED",
+                            "claimed_by": payload["operation"]["worker_id"],
+                        },
+                    },
                 }
             return {
                 "status": "TASK_FRAME_OPERATION_REJECTED",
