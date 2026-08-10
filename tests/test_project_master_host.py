@@ -1905,7 +1905,31 @@ class ProjectMasterHostTests(unittest.TestCase):
                     "provider": "CODEX",
                     "model": "gpt-5.6-luna",
                     "reasoning_effort": "max",
-                }
+                },
+                {
+                    "turn_id": "implementation",
+                    "role": "SUB_REVIEWER",
+                    "worker_slot_ref": "implementation-worker",
+                    "provider": "CLAUDE",
+                    "model": "sonnet",
+                    "reasoning_effort": "high",
+                },
+                {
+                    "turn_id": "review",
+                    "role": "SUB_REVIEWER",
+                    "worker_slot_ref": "security-reviewer",
+                    "provider": "CLAUDE",
+                    "model": "sonnet",
+                    "reasoning_effort": "high",
+                },
+                {
+                    "turn_id": "qa",
+                    "role": "SUB_REVIEWER",
+                    "worker_slot_ref": "qa-reviewer",
+                    "provider": "CLAUDE",
+                    "model": "sonnet",
+                    "reasoning_effort": "high",
+                },
             ],
             "instruction_id": "instruction:primary-001",
             "instruction_text": primary["task_summary"],
@@ -1944,6 +1968,27 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(
             approval["evidence_ref"],
             runtime_posts[0]["payload"]["frame"]["parent_observation"]["evidence_ref"],
+        )
+        self.assertEqual(
+            [
+                {"turn_id": "boss", "role": "BOSS", "input_turn_ids": []},
+                {
+                    "turn_id": "implementation",
+                    "role": "SUB_REVIEWER",
+                    "input_turn_ids": ["boss"],
+                },
+                {
+                    "turn_id": "review",
+                    "role": "SUB_REVIEWER",
+                    "input_turn_ids": ["implementation"],
+                },
+                {
+                    "turn_id": "qa",
+                    "role": "SUB_REVIEWER",
+                    "input_turn_ids": ["review"],
+                },
+            ],
+            runtime_posts[1]["payload"]["operation"]["turns"],
         )
         self.assertNotIn("token", result)
         self.assertNotIn("endpoint", result)

@@ -707,6 +707,67 @@ class ProviderSessionObserverStore:
             )
         return excerpts
 
+    def build_transient_live_deltas(
+        self,
+        source_id: str,
+        *,
+        added_count: int,
+    ) -> dict[str, Any]:
+        """Return only this scan's redacted message deltas in process memory.
+
+        Activity rows remain metadata-only.  The caller receives no source path
+        or provider-session identifier, and the extracted text is never written
+        back to this store.
+        """
+
+        if isinstance(added_count, bool) or not isinstance(added_count, int):
+            raise ProviderSessionObserverError(
+                "SEMANTIC_EVIDENCE_INVALID", "added_count must be an integer"
+            )
+        with self._connection() as connection:
+            source = connection.execute(
+                "SELECT * FROM provider_session_source WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        if source is None:
+            raise ProviderSessionObserverError("SOURCE_NOT_FOUND", source_id)
+        public_source = self._public_source_row(source)
+        if added_count <= 0:
+            return {
+                "schema": "universe.provider-live-delta.v1",
+                "source": public_source,
+                "delivery": "NO_NEW_ACTIVITY",
+                "deltas": [],
+            }
+        if str(source["provider"]) != "CODEX":
+            return {
+                "schema": "universe.provider-live-delta.v1",
+                "source": public_source,
+                "delivery": "ACTIVITY_ONLY",
+                "deltas": [],
+            }
+        activities = self.list_activities(source_id)[: min(added_count, SEMANTIC_EXCERPT_LIMIT)]
+        activity_refs = [
+            {
+                "activity_id": activity["activity_id"],
+                "activity_digest": activity["activity_digest"],
+                "ordinal": activity["ordinal"],
+            }
+            for activity in reversed(activities)
+        ]
+        try:
+            excerpts = self.build_transient_semantic_evidence(source_id, activity_refs)
+        except ProviderSessionObserverError as error:
+            if error.code != "SEMANTIC_EVIDENCE_EMPTY":
+                raise
+            excerpts = []
+        return {
+            "schema": "universe.provider-live-delta.v1",
+            "source": public_source,
+            "delivery": "TRANSIENT_REDACTED" if excerpts else "ACTIVITY_ONLY",
+            "deltas": excerpts,
+        }
+
     def scan(
         self,
         source_id: str,

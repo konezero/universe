@@ -258,6 +258,67 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertTrue(result["worker_id"].startswith("universe-runtime-worker:"))
         self.assertEqual("provider-worker-1", result["provider_worker_ref"])
 
+    def test_dispatch_uses_model_declared_by_task_frame(self) -> None:
+        observed_models: list[str] = []
+
+        def post(_endpoint, _token, path, payload):
+            if path == "/v1/task-frame/worker-result":
+                return {"status": "TASK_FRAME_RESULT_RECORDED"}
+            operation = payload["operation"]
+            if operation["operation"] == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "node-master-selected-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {
+                    "status": "TURN_CLAIMED",
+                    "turn": {
+                        "turn_id": operation["turn_id"],
+                        "state": "CLAIMED",
+                        "claimed_by": operation["worker_id"],
+                    },
+                },
+            }
+
+        class Dispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "host-default-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, request):
+                observed_models.append(request["model"])
+                return {
+                    "status": "COMPLETED",
+                    "worker_id": "provider-worker-1",
+                    "worker_run_ref": request["worker_run_ref"],
+                    "result_receipt_ref": "result://worker-1",
+                    "result": {"text": "done"},
+                    "session_persistence": "EPHEMERAL",
+                    "persistent_session_ref": "UNKNOWN",
+                    "universe_coordinate_persisted": False,
+                }
+
+        result = Dispatcher(self.root, post=post).dispatch(self._dispatch_request())
+
+        self.assertEqual(["node-master-selected-model"], observed_models)
+        self.assertEqual(
+            "provider://CODEX/model/node-master-selected-model",
+            result["model_ref"],
+        )
+
     def test_dispatch_rejects_claimed_turn_identity_mismatch(self) -> None:
         provider_started = False
 

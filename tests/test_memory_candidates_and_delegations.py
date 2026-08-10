@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from http import HTTPStatus
 from pathlib import Path
 from urllib.error import HTTPError
@@ -127,6 +129,79 @@ class MemoryCandidateContractTests(unittest.TestCase):
             )
         )
         self.assertTrue(all(item["effects"]["auto_adoption"] is False for item in synthesized))
+
+
+class ConductorDelegationMigrationTests(unittest.TestCase):
+    def test_legacy_delegation_table_accepts_cancellation_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database_path = Path(temp) / "legacy-universe.sqlite3"
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE conductor_delegation (
+                        delegation_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        project_id TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN (
+                            'QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED'
+                        )),
+                        progress_json TEXT NOT NULL DEFAULT '{}',
+                        result_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT
+                    )
+                    """
+                )
+            server = None
+            thread = None
+            try:
+                server = create_server(
+                    database_path=database_path,
+                    token="legacy-test-token",
+                    auto_start_project_masters=False,
+                    auto_start_conductor_runtime=False,
+                )
+                thread = threading.Thread(
+                    target=server.serve_forever,
+                    kwargs={"poll_interval": 0.05},
+                    daemon=True,
+                )
+                thread.start()
+                project_root = Path(temp) / "TEST"
+                project_root.mkdir()
+                (project_root / "REPOSITORY_MANIFEST.md").write_text(
+                    "# TEST\n", encoding="utf-8"
+                )
+                server.store.register_project(
+                    {"project_id": "TEST", "project_root": str(project_root)}
+                )
+                delegation, created = server.store.create_conductor_delegation(
+                    {
+                        "project_id": "TEST",
+                        "summary": "Exercise migrated cancellation state",
+                        "idempotency_key": "legacy-cancellation-state",
+                    }
+                )
+                self.assertTrue(created)
+                server.store.start_conductor_delegation(delegation["delegation_id"])
+                cancelled = server.store.cancel_conductor_delegation(
+                    delegation["delegation_id"], {}
+                )
+                with closing(sqlite3.connect(database_path)) as connection:
+                    schema = connection.execute(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'conductor_delegation'"
+                    ).fetchone()[0]
+                self.assertIn("CANCELLATION_REQUESTED", schema)
+                self.assertEqual("CANCELLATION_REQUESTED", cancelled["state"])
+            finally:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+                if thread is not None:
+                    thread.join(timeout=2)
 
 
 class MemoryCandidateApiTests(unittest.TestCase):
@@ -380,6 +455,85 @@ class MemoryCandidateApiTests(unittest.TestCase):
         self.assertEqual("QUEUED", after["state"])
         self.assertIn("recovered_at", after["progress"])
         self.assertNotIn("body", json.dumps(after).lower())
+
+    def test_cancellation_records_scope_without_claiming_provider_termination(
+        self,
+    ) -> None:
+        queued, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "TEST",
+                "summary": "Cancel before coordinator dispatch",
+                "idempotency_key": "delegation-cancel-queued-1",
+            }
+        )
+        self.assertTrue(created)
+        status, cancellation = self.request(
+            "POST",
+            f"/v1/conductor-room/delegations/{queued['delegation_id']}/cancel",
+            {"reason": "No longer needed"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        cancelled_queued = cancellation["delegation"]
+        self.assertEqual("CANCELLED", cancelled_queued["state"])
+        self.assertEqual(
+            "QUEUED_NOT_DISPATCHED",
+            cancelled_queued["result"]["cancellation_scope"],
+        )
+
+        running, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "TEST",
+                "summary": "Cancel after provider handoff",
+                "idempotency_key": "delegation-cancel-running-1",
+            }
+        )
+        self.assertTrue(created)
+        self.server.store.start_conductor_delegation(running["delegation_id"])
+        cancelled_running = self.server.store.cancel_conductor_delegation(
+            running["delegation_id"], {}
+        )
+        self.assertEqual("CANCELLATION_REQUESTED", cancelled_running["state"])
+        self.assertEqual(
+            "RESULT_ADOPTION_CANCELLATION_REQUESTED",
+            cancelled_running["result"]["cancellation_scope"],
+        )
+        self.assertEqual(
+            "CANCELLATION_REQUESTED", cancelled_running["progress"]["step"]
+        )
+        completed = self.server.store.complete_conductor_delegation(
+            running["delegation_id"],
+            {"result_summary": "late provider result"},
+        )
+        self.assertEqual(
+            "CANCELLED",
+            completed["state"],
+        )
+        self.assertEqual("PROVIDER_RESULT_IGNORED", completed["result"]["cancellation_scope"])
+
+        review_pending, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "TEST",
+                "summary": "Cancel a completed result before review",
+                "idempotency_key": "delegation-cancel-review-1",
+            }
+        )
+        self.assertTrue(created)
+        self.server.store.start_conductor_delegation(review_pending["delegation_id"])
+        self.server.store.update_conductor_delegation_progress(
+            review_pending["delegation_id"],
+            {
+                "summary": "Result is awaiting Conductor review",
+                "step": "WAITING_FOR_CONDUCTOR_REVIEW",
+            },
+        )
+        cancelled_review = self.server.store.cancel_conductor_delegation(
+            review_pending["delegation_id"], {}
+        )
+        self.assertEqual("CANCELLED", cancelled_review["state"])
+        self.assertEqual(
+            "TERMINAL_REVIEW_NOT_ADOPTED",
+            cancelled_review["result"]["cancellation_scope"],
+        )
 
     def test_project_master_model_override_is_rejected_before_persistence(
         self,

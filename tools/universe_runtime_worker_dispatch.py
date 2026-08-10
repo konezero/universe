@@ -292,13 +292,10 @@ class RuntimeWorkerDispatcher:
                 "TASK_FRAME_PLAN",
                 "PLANNED_PROVIDER_MISMATCH",
             )
+        # Provider capability proves that this Host can launch the selected
+        # provider. The Task Frame, created under the owning Node/Mode Master,
+        # is the authority for the declared model of this turn.
         planned_model = _required_text(planned_invocation.get("model"), "model")
-        if planned_model != capability["model"]:
-            raise WorkerDispatchError(
-                "WORKER_MODEL_PROFILE_MISMATCH",
-                "TASK_FRAME_PLAN",
-                "PLANNED_MODEL_PROFILE_MISMATCH",
-            )
 
         skill_bindings = self._skill_bindings(planned_invocation)
         worker_id = f"universe-runtime-worker:{uuid4().hex}"
@@ -715,14 +712,14 @@ class RuntimeWorkerDispatcher:
         )
 
     def _invoke_grok(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        executable, environment, configured_model = _resolve_grok()
+        executable, environment, _configured_model = _resolve_grok()
         if executable is None:
             raise WorkerDispatchError(
                 "WORKER_INVOCATION_UNAVAILABLE",
                 "WORKER_ADAPTER",
                 "GROK_CLI_UNAVAILABLE",
             )
-        model = self._request_model(request, configured_model)
+        model = self._request_model(request)
         runtime_profile = str(request.get("runtime_profile", "READ_ONLY")).upper()
         if runtime_profile not in {"READ_ONLY", "TASK_FRAME_RUNTIME"}:
             raise WorkerDispatchError(
@@ -782,14 +779,14 @@ class RuntimeWorkerDispatcher:
         }
 
     def _invoke_codex(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        executable, environment, configured_model = _resolve_codex()
+        executable, environment, _configured_model = _resolve_codex()
         if executable is None:
             raise WorkerDispatchError(
                 "WORKER_INVOCATION_UNAVAILABLE",
                 "WORKER_ADAPTER",
                 "CODEX_CLI_UNAVAILABLE",
             )
-        model = self._request_model(request, configured_model)
+        model = self._request_model(request)
         session_ids: list[str] = []
         try:
             gateway = UniverseAcpGateway(
@@ -840,14 +837,14 @@ class RuntimeWorkerDispatcher:
         }
 
     def _invoke_claude(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        executable, environment, configured_model = _resolve_claude()
+        executable, environment, _configured_model = _resolve_claude()
         if executable is None:
             raise WorkerDispatchError(
                 "WORKER_INVOCATION_UNAVAILABLE",
                 "WORKER_ADAPTER",
                 "CLAUDE_CLI_UNAVAILABLE",
             )
-        model = self._request_model(request, configured_model)
+        model = self._request_model(request)
         json_schema: dict[str, Any] | None = None
         if str(request.get("result_mode", "REDACTED")).upper() == "STRUCTURED_JSON":
             output_contract = _mapping(
@@ -915,15 +912,8 @@ class RuntimeWorkerDispatcher:
         }
 
     @staticmethod
-    def _request_model(request: Mapping[str, Any], configured_model: str) -> str:
-        model = _required_text(request.get("model"), "model")
-        if model != configured_model:
-            raise WorkerDispatchError(
-                "WORKER_MODEL_PROFILE_MISMATCH",
-                "WORKER_ADAPTER",
-                "REQUESTED_MODEL_PROFILE_MISMATCH",
-            )
-        return model
+    def _request_model(request: Mapping[str, Any]) -> str:
+        return _required_text(request.get("model"), "model")
 
     @staticmethod
     def _system_prompt(runtime_profile: str) -> str:

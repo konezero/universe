@@ -308,7 +308,14 @@ RUNTIME_WORKER_INVOCATION_SCHEMA = "universe.runtime-worker-invocation.v1"
 RUNTIME_WORKER_TERMINAL_EVIDENCE_SCHEMA = "universe.runtime-worker-terminal-evidence.v1"
 CONDUCTOR_DELEGATION_SCHEMA = "universe.conductor-delegation.v1"
 CONDUCTOR_DELEGATION_STATES = frozenset(
-    {"QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}
+    {
+        "QUEUED",
+        "RUNNING",
+        "CANCELLATION_REQUESTED",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+    }
 )
 CONDUCTOR_DELEGATION_ROLES = frozenset(
     {"PROJECT_MASTER", "BOSS", "WORKER", "IMPLEMENTER", "REVIEWER", "QA"}
@@ -4411,7 +4418,10 @@ class UniverseStore:
                         ON DELETE CASCADE,
                     request_json TEXT NOT NULL,
                     state TEXT NOT NULL
-                        CHECK(state IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
+                        CHECK(state IN (
+                            'QUEUED', 'RUNNING', 'CANCELLATION_REQUESTED',
+                            'COMPLETED', 'FAILED', 'CANCELLED'
+                        )),
                     progress_json TEXT NOT NULL DEFAULT '{}',
                     result_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
@@ -4743,6 +4753,67 @@ class UniverseStore:
                     """
                 )
                 connection.execute("DROP TABLE cli_provider_setting_legacy")
+            delegation_table = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'conductor_delegation'"
+            ).fetchone()
+            if (
+                delegation_table is not None
+                and "CANCELLATION_REQUESTED" not in str(delegation_table["sql"]).upper()
+            ):
+                connection.execute(
+                    "ALTER TABLE conductor_delegation "
+                    "RENAME TO conductor_delegation_legacy"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE conductor_delegation (
+                        delegation_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        project_id TEXT NOT NULL
+                            REFERENCES project_connection(project_id)
+                            ON DELETE CASCADE,
+                        request_json TEXT NOT NULL,
+                        state TEXT NOT NULL
+                            CHECK(state IN (
+                                'QUEUED', 'RUNNING', 'CANCELLATION_REQUESTED',
+                                'COMPLETED', 'FAILED', 'CANCELLED'
+                            )),
+                        progress_json TEXT NOT NULL DEFAULT '{}',
+                        result_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        completed_at TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO conductor_delegation(
+                        delegation_id, idempotency_key, project_id, request_json,
+                        state, progress_json, result_json, created_at, updated_at,
+                        completed_at
+                    )
+                    SELECT
+                        delegation_id, idempotency_key, project_id, request_json,
+                        state, progress_json, result_json, created_at, updated_at,
+                        completed_at
+                    FROM conductor_delegation_legacy
+                    """
+                )
+                connection.execute("DROP TABLE conductor_delegation_legacy")
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS conductor_delegation_project_time
+                    ON conductor_delegation(project_id, created_at, delegation_id)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS conductor_delegation_state_time
+                    ON conductor_delegation(state, updated_at, delegation_id)
+                    """
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO service_setting(setting_key, setting_value, updated_at)
@@ -11265,25 +11336,48 @@ class UniverseStore:
             "completed_at": now,
         }
         with self._connection() as connection:
+            current = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+            if current is None:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_NOT_FOUND",
+                    "conductor delegation does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            cancelled = current["state"] == "CANCELLATION_REQUESTED"
+            if current["state"] not in {"RUNNING", "CANCELLATION_REQUESTED"}:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "only running delegations can be completed",
+                    HTTPStatus.CONFLICT,
+                )
+            if cancelled:
+                cancellation = json.loads(current["result_json"])
+                result = {
+                    "reason": cancellation.get("reason") or "Cancellation requested",
+                    "cancelled_at": cancellation.get("cancelled_at") or now,
+                    "cancellation_scope": "PROVIDER_RESULT_IGNORED",
+                    "provider_terminal_state": "COMPLETED",
+                    "provider_completed_at": now,
+                }
             update = connection.execute(
                 """
                 UPDATE conductor_delegation
-                SET state = 'COMPLETED', result_json = ?, updated_at = ?, completed_at = ?
-                WHERE delegation_id = ? AND state = 'RUNNING'
+                SET state = ?, result_json = ?, updated_at = ?, completed_at = ?
+                WHERE delegation_id = ? AND state = ?
                 """,
-                (_canonical_json(result), now, now, normalized),
+                (
+                    "CANCELLED" if cancelled else "COMPLETED",
+                    _canonical_json(result),
+                    now,
+                    now,
+                    normalized,
+                    current["state"],
+                ),
             )
             if update.rowcount != 1:
-                row = connection.execute(
-                    "SELECT state FROM conductor_delegation WHERE delegation_id = ?",
-                    (normalized,),
-                ).fetchone()
-                if row is None:
-                    raise UniverseError(
-                        "CONDUCTOR_DELEGATION_NOT_FOUND",
-                        "conductor delegation does not exist",
-                        HTTPStatus.NOT_FOUND,
-                    )
                 raise UniverseError(
                     "CONDUCTOR_DELEGATION_STATE_CONFLICT",
                     "only running delegations can be completed",
@@ -11314,13 +11408,46 @@ class UniverseStore:
             "failed_at": now,
         }
         with self._connection() as connection:
+            current = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+            if current is None:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_NOT_FOUND",
+                    "conductor delegation does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if current["state"] not in {
+                "QUEUED",
+                "RUNNING",
+                "CANCELLATION_REQUESTED",
+            }:
+                return self._conductor_delegation_row(current)
+            cancelled = current["state"] == "CANCELLATION_REQUESTED"
+            if cancelled:
+                cancellation = json.loads(current["result_json"])
+                result = {
+                    "reason": cancellation.get("reason") or "Cancellation requested",
+                    "cancelled_at": cancellation.get("cancelled_at") or now,
+                    "cancellation_scope": "PROVIDER_RESULT_IGNORED",
+                    "provider_terminal_state": "FAILED",
+                    "provider_completed_at": now,
+                }
             update = connection.execute(
                 """
                 UPDATE conductor_delegation
-                SET state = 'FAILED', result_json = ?, updated_at = ?, completed_at = ?
-                WHERE delegation_id = ? AND state IN ('QUEUED', 'RUNNING')
+                SET state = ?, result_json = ?, updated_at = ?, completed_at = ?
+                WHERE delegation_id = ? AND state = ?
                 """,
-                (_canonical_json(result), now, now, normalized),
+                (
+                    "CANCELLED" if cancelled else "FAILED",
+                    _canonical_json(result),
+                    now,
+                    now,
+                    normalized,
+                    current["state"],
+                ),
             )
             if update.rowcount != 1:
                 row = connection.execute(
@@ -11334,6 +11461,101 @@ class UniverseStore:
                         HTTPStatus.NOT_FOUND,
                     )
                 return self._conductor_delegation_row(row)
+            updated = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        if updated is None:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_NOT_FOUND",
+                "conductor delegation does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._conductor_delegation_row(updated)
+
+    def cancel_conductor_delegation(
+        self, delegation_id: str, value: Any
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) - {"reason"}:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_CANCELLATION_INVALID",
+                "cancellation accepts an optional reason only",
+            )
+        reason = str(value.get("reason") or "Cancelled from Universe Inbox").strip()
+        if not reason or len(reason) > 1000:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_CANCELLATION_INVALID",
+                "cancellation reason must be between 1 and 1000 characters",
+            )
+        normalized = _required_text(delegation_id, "delegation_id")
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_NOT_FOUND",
+                    "conductor delegation does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            state = str(row["state"])
+            if state not in {"QUEUED", "RUNNING"}:
+                return self._conductor_delegation_row(row)
+            progress = json.loads(row["progress_json"])
+            terminal_pending_review = (
+                state == "RUNNING"
+                and progress.get("step") == "WAITING_FOR_CONDUCTOR_REVIEW"
+            )
+            cancellation_requested = state == "RUNNING" and not terminal_pending_review
+            if cancellation_requested:
+                progress.update(
+                    {
+                        "summary": (
+                            "Cancellation requested; waiting for the provider "
+                            "terminal state"
+                        ),
+                        "step": "CANCELLATION_REQUESTED",
+                        "sequence": int(progress.get("sequence") or 0) + 1,
+                        "updated_at": now,
+                    }
+                )
+            result = {
+                "reason": reason,
+                "cancelled_at": now,
+                "cancellation_scope": (
+                    "QUEUED_NOT_DISPATCHED"
+                    if state == "QUEUED"
+                    else (
+                        "TERMINAL_REVIEW_NOT_ADOPTED"
+                        if terminal_pending_review
+                        else "RESULT_ADOPTION_CANCELLATION_REQUESTED"
+                    )
+                ),
+            }
+            update = connection.execute(
+                """
+                UPDATE conductor_delegation
+                SET state = ?, progress_json = ?, result_json = ?, updated_at = ?, completed_at = ?
+                WHERE delegation_id = ? AND state = ?
+                """,
+                (
+                    "CANCELLATION_REQUESTED" if cancellation_requested else "CANCELLED",
+                    _canonical_json(progress),
+                    _canonical_json(result),
+                    now,
+                    None if cancellation_requested else now,
+                    normalized,
+                    state,
+                ),
+            )
+            if update.rowcount != 1:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_STATE_CONFLICT",
+                    "delegation changed before cancellation was recorded",
+                    HTTPStatus.CONFLICT,
+                )
             updated = connection.execute(
                 "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
                 (normalized,),
@@ -16361,6 +16583,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             row = {
                 "schema": "universe.provider-chat-room.v1",
                 "chat_key": chat_key,
+                "source_id": (
+                    str(registered["source_id"])
+                    if registered is not None
+                    else None
+                ),
                 "provider": provider,
                 "workspace_name": source.get("workspace_name")
                 or (Path(workspace).name if workspace else "Unknown workspace"),
@@ -16524,6 +16751,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 ),
             )
         return scans
+
+    def tail_live_provider_sessions(self) -> dict[str, Any]:
+        """Tail activity and expose only fresh, redacted in-memory deltas."""
+
+        scans = self.tail_bound_provider_sessions()
+        deltas: list[dict[str, Any]] = []
+        for scan in scans:
+            source = scan.get("source")
+            if not isinstance(source, Mapping):
+                continue
+            source_id = str(source.get("source_id") or "")
+            if not source_id:
+                continue
+            try:
+                delta = self.store.provider_session_observer.build_transient_live_deltas(
+                    source_id,
+                    added_count=int(scan.get("added") or 0),
+                )
+            except ProviderSessionObserverError:
+                continue
+            if delta["deltas"] or delta["delivery"] == "ACTIVITY_ONLY":
+                deltas.append(delta)
+        return {"scans": scans, "deltas": deltas}
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
@@ -19743,7 +19993,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             delegation_operation = re.fullmatch(
-                r"/v1/(?:conductor|conductor-room)/delegations/([^/]+)/(start|progress|result|fail)$",
+                r"/v1/(?:conductor|conductor-room)/delegations/([^/]+)/(start|progress|result|fail|cancel)$",
                 path,
             )
             if delegation_operation is not None:
@@ -19759,6 +20009,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     )
                 elif operation == "result":
                     delegation = self.server.store.complete_conductor_delegation(
+                        delegation_id, body
+                    )
+                elif operation == "cancel":
+                    delegation = self.server.store.cancel_conductor_delegation(
                         delegation_id, body
                     )
                 else:
@@ -19845,7 +20099,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if path == "/v1/session-observer/tail":
-                scans = self.server.tail_bound_provider_sessions()
+                tail = self.server.tail_live_provider_sessions()
+                scans = tail["scans"]
                 self._send(
                     HTTPStatus.OK,
                     {
@@ -19860,6 +20115,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             }
                             for item in scans
                         ],
+                        "deltas": tail["deltas"],
                         "catalog": self.server.provider_chat_catalog(),
                     },
                 )

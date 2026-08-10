@@ -59,6 +59,25 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("commander_surface", decision_slice)
         self.assertNotIn("idempotency_key", decision_slice)
 
+    def test_actions_are_separate_from_chat_and_keep_scroll_stable(self) -> None:
+        self.assertIn('id="action-inbox-button"', HTML)
+        self.assertIn('id="action-inbox-dialog"', HTML)
+        self.assertIn('id="action-inbox-list"', HTML)
+        self.assertIn("function renderActionInbox", APP)
+        self.assertIn("function pendingActionItems", APP)
+        self.assertIn("function finishRoomMessageRender", APP)
+        self.assertIn("CANCELLATION_REQUESTED", APP)
+        self.assertIn("/v1/conductor-room/delegations/", APP)
+        message_slice = APP[
+            APP.index("function renderRoomMessages") : APP.index(
+                "function renderGovernanceProposalCard"
+            )
+        ]
+        self.assertNotIn("renderGovernanceProposalCard(proposal)", message_slice)
+        self.assertNotIn("renderPermissionCard(permission)", message_slice)
+        self.assertNotIn("scrollRoomToPendingAction", APP)
+        self.assertIn("action-inbox-dialog", CSS)
+
     def test_project_master_delivery_labels_distinguish_queue_and_acceptance(
         self,
     ) -> None:

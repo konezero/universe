@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -587,6 +587,7 @@ class ProjectModeCoordinator:
         )
         if created.get("status") != "TASK_FRAME_HOST_ACTIVE":
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_CREATE_FAILED")
+        declaration_turns = self._sequential_declared_turns(normalized_frame["turns"])
         declared = self._post_runtime(
             binding["endpoint"],
             binding["token"],
@@ -596,10 +597,7 @@ class ProjectModeCoordinator:
                 "frame_id": normalized_frame["frame_id"],
                 "operation": {
                     "operation": "declare_turns",
-                    "turns": [
-                        {"turn_id": turn["turn_id"], "role": turn["role"]}
-                        for turn in normalized_frame["turns"]
-                    ],
+                    "turns": declaration_turns,
                     "observed_at": utc_now(),
                 },
             },
@@ -630,6 +628,42 @@ class ProjectModeCoordinator:
             ],
             "repository_write": False,
         }
+
+    @staticmethod
+    def _sequential_declared_turns(turns: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Project the approved Boss/Worker order into Runtime dependencies.
+
+        The approved execution plan carries Worker metadata, while the Runtime
+        declaration needs explicit input edges.  Without those edges every
+        turn becomes a root and the Runtime correctly rejects the frame.
+        """
+
+        declared: list[dict[str, Any]] = []
+        previous_turn_id = ""
+        root_seen = False
+        for index, turn in enumerate(turns):
+            turn_id = _text(turn.get("turn_id"), f"task_frame.turns[{index}].turn_id")
+            role = _text(turn.get("role"), f"task_frame.turns[{index}].role").upper()
+            if role == "BOSS":
+                if root_seen or index != 0:
+                    raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+                root_seen = True
+                inputs: list[str] = []
+            else:
+                if not root_seen:
+                    raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+                inputs = [previous_turn_id]
+            declared.append(
+                {
+                    "turn_id": turn_id,
+                    "role": role,
+                    "input_turn_ids": inputs,
+                }
+            )
+            previous_turn_id = turn_id
+        if not root_seen:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+        return declared
 
     def _approved_source_work(
         self,

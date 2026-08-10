@@ -75,6 +75,8 @@ const state = {
   providerChatExpandedProjects: {},
   providerChatExpandedBranches: {},
   selectedProviderChatKey: null,
+  /** Ephemeral redacted provider text keyed by opaque provider chat key. */
+  providerLiveDeltas: {},
   multiRooms: [],
   activeMultiRoomId: null,
   activeMultiRoomSnapshot: null,
@@ -153,6 +155,7 @@ const elements = {
   sessionSummaryTitle: document.querySelector("#session-summary-title"),
   sessionSummarySubtitle: document.querySelector("#session-summary-subtitle"),
   sessionSummaryFacts: document.querySelector("#session-summary-facts"),
+  sessionSummaryLive: document.querySelector("#session-summary-live"),
   sessionSummaryOpen: document.querySelector("#session-summary-open"),
   sessionSummaryManage: document.querySelector("#session-summary-manage"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
@@ -284,6 +287,11 @@ const elements = {
   conversationLayer: document.querySelector("#conversation-layer"),
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationBadge: document.querySelector("#conversation-badge"),
+  actionInboxButton: document.querySelector("#action-inbox-button"),
+  actionInboxBadge: document.querySelector("#action-inbox-badge"),
+  actionInboxDialog: document.querySelector("#action-inbox-dialog"),
+  actionInboxTitle: document.querySelector("#action-inbox-title"),
+  actionInboxList: document.querySelector("#action-inbox-list"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
   roomContext: document.querySelector("#room-context"),
@@ -727,7 +735,23 @@ async function tailProviderSessions() {
       body: {},
     });
     state.providerChatRooms = result.catalog?.rooms || state.providerChatRooms;
+    for (const delta of result.deltas || []) {
+      const sourceId = String(delta.source?.source_id || "");
+      const room = state.providerChatRooms.find(
+        (item) => String(item.source_id || "") === sourceId
+      );
+      if (!room) continue;
+      const existing = state.providerLiveDeltas[room.chat_key] || [];
+      const known = new Set(existing.map((item) => item.excerpt_id));
+      const fresh = (delta.deltas || []).filter(
+        (item) => item && !known.has(item.excerpt_id)
+      );
+      if (fresh.length) {
+        state.providerLiveDeltas[room.chat_key] = [...existing, ...fresh].slice(-80);
+      }
+    }
     renderSessionRail();
+    renderProviderChatSummary();
   } catch (_error) {
     // The next bounded poll retries. UNKNOWN remains visible instead of being
     // promoted to a guessed live state.
@@ -1132,6 +1156,25 @@ function renderProviderChatSummary() {
     const fact = node("div", "session-summary-fact");
     fact.append(node("span", "", label), node("strong", "", value));
     elements.sessionSummaryFacts.append(fact);
+  }
+  if (elements.sessionSummaryLive) {
+    const deltas = state.providerLiveDeltas[room.chat_key] || [];
+    elements.sessionSummaryLive.replaceChildren();
+    if (!deltas.length) {
+      elements.sessionSummaryLive.append(
+        node("p", "session-summary-live-empty", "No new live output")
+      );
+    } else {
+      for (const delta of deltas) {
+        const line = node("article", "session-summary-live-line");
+        line.append(
+          node("small", "", String(delta.role || "UNKNOWN")),
+          node("p", "", String(delta.text || ""))
+        );
+        elements.sessionSummaryLive.append(line);
+      }
+      elements.sessionSummaryLive.scrollTop = elements.sessionSummaryLive.scrollHeight;
+    }
   }
   elements.sessionSummaryOpen.disabled = !boundSession;
   elements.sessionSummaryOpen.textContent = boundSession
@@ -2395,23 +2438,9 @@ function mergeGovernanceProposalInbox(projectId, proposals) {
 
 function conversationMessageCount() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    return (
-      (state.conductorMessages || []).length +
-      (state.conductorPermissions || []).filter(
-        (item) => item.state === "PENDING"
-      ).length +
-      (state.governanceProposalInbox || []).filter(
-        (item) => item.state === "PROPOSED"
-      ).length
-    );
+    return (state.conductorMessages || []).length;
   }
-  return (
-    (state.roomMessages || []).length +
-    (state.projectPermissions || []).filter((item) => item.state === "PENDING").length +
-    (state.governanceProposals || []).filter(
-      (item) => item.state === "PROPOSED"
-    ).length
-  );
+  return (state.roomMessages || []).length;
 }
 
 function updateConversationBadge() {
@@ -2442,65 +2471,133 @@ function expandConversationLayer() {
   }
 }
 
-function scrollRoomToPendingAction() {
-  const pending = elements.roomMessageList.querySelector(
-    ".governance-proposal-request, .permission-request"
-  );
-  if (!pending) {
-    elements.roomMessageList.scrollTop = elements.roomMessageList.scrollHeight;
-    return;
+function pendingActionItems() {
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    return {
+      proposals: (state.governanceProposalInbox || []).filter(
+        (item) => item.state === "PROPOSED"
+      ),
+      permissions: (state.conductorPermissions || []).filter(
+        (item) => item.state === "PENDING"
+      ),
+      delegations: (state.conductorDelegations || []).filter((item) =>
+        ["QUEUED", "RUNNING", "CANCELLATION_REQUESTED"].includes(item.state)
+      ),
+    };
   }
-  const listBox = elements.roomMessageList.getBoundingClientRect();
-  const pendingBox = pending.getBoundingClientRect();
-  elements.roomMessageList.scrollTop += pendingBox.top - listBox.top;
+  return {
+    proposals: (state.governanceProposals || []).filter(
+      (item) => item.state === "PROPOSED"
+    ),
+    permissions: (state.projectPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    ),
+    delegations: [],
+  };
+}
+
+function actionInboxCount() {
+  const items = pendingActionItems();
+  return items.proposals.length + items.permissions.length + items.delegations.length;
+}
+
+function updateActionInboxBadge() {
+  if (!elements.actionInboxBadge) return;
+  const count = actionInboxCount();
+  elements.actionInboxBadge.textContent = count > 99 ? "99+" : String(count);
+  elements.actionInboxBadge.classList.toggle("hidden", count === 0);
+}
+
+function renderDelegationActionCard(delegation) {
+  const item = node("article", "action-inbox-card delegation-action-card");
+  const summary = delegation.request?.summary || "Bounded delegated work";
+  const progress = delegation.progress?.summary || "Awaiting coordinator progress";
+  item.append(
+    node(
+      "strong",
+      "",
+      `DELEGATION / ${delegation.request?.worker_role || "WORKER"}`
+    ),
+    node("p", "", summary),
+    node("small", "", `${delegation.state} / ${progress}`)
+  );
+  if (["QUEUED", "RUNNING"].includes(delegation.state)) {
+    const actions = node("div", "proposal-actions");
+    const cancel = node("button", "secondary-button", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => cancelConductorDelegation(delegation));
+    actions.append(cancel);
+    item.append(actions);
+  }
+  return item;
+}
+
+async function cancelConductorDelegation(delegation) {
+  try {
+    const result = await api(
+      `/v1/conductor-room/delegations/${encodeURIComponent(
+        delegation.delegation_id
+      )}/cancel`,
+      {
+        method: "POST",
+        body: { reason: "Cancelled from Universe Inbox" },
+      }
+    );
+    state.conductorDelegations = (state.conductorDelegations || []).map((item) =>
+      item.delegation_id === result.delegation.delegation_id
+        ? result.delegation
+        : item
+    );
+    renderRoomMessages();
+    toast(
+      result.delegation.state === "CANCELLATION_REQUESTED"
+        ? "Cancellation requested; provider completion will be tracked"
+        : "Queued delegation cancelled"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderActionInbox() {
+  updateActionInboxBadge();
+  if (!elements.actionInboxList) return;
+  const items = pendingActionItems();
+  elements.actionInboxList.replaceChildren();
+  const title = state.conversationTarget.kind === "UNIVERSE_CONDUCTOR"
+    ? "Universe actions"
+    : `${state.conversationTarget.projectId} actions`;
+  if (elements.actionInboxTitle) elements.actionInboxTitle.textContent = title;
+  for (const proposal of items.proposals) {
+    elements.actionInboxList.append(renderGovernanceProposalCard(proposal));
+  }
+  for (const permission of items.permissions) {
+    elements.actionInboxList.append(renderPermissionCard(permission));
+  }
+  for (const delegation of items.delegations) {
+    elements.actionInboxList.append(renderDelegationActionCard(delegation));
+  }
+  if (!elements.actionInboxList.childElementCount) {
+    elements.actionInboxList.append(node("p", "empty-copy", "No pending actions"));
+  }
+}
+
+function finishRoomMessageRender(previousScrollTop) {
+  elements.roomMessageList.scrollTop = previousScrollTop;
+  updateConversationBadge();
+  renderActionInbox();
 }
 
 function renderRoomMessages() {
+  const previousScrollTop = elements.roomMessageList.scrollTop;
   elements.roomMessageList.replaceChildren();
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    const pendingPermissions = state.conductorPermissions.filter(
-      (item) => item.state === "PENDING"
-    );
-    const pendingProposals = state.governanceProposalInbox.filter(
-      (item) => item.state === "PROPOSED"
-    );
-    const delegations = Array.isArray(state.conductorDelegations)
-      ? state.conductorDelegations
-      : [];
-    if (
-      !state.conductorMessages.length &&
-      !pendingPermissions.length &&
-      !pendingProposals.length &&
-      !delegations.length
-    ) {
+    if (!state.conductorMessages.length) {
       const item = node("article", "room-message conductor-message");
       item.append(
         node("strong", "", "UNIVERSE / CONDUCTOR"),
         node("p", "", "Universe control room is active."),
         node("small", "", "Send a message here or use + to call a Project Master.")
-      );
-      elements.roomMessageList.append(item);
-    }
-    for (const delegation of delegations.slice(0, 6)) {
-      const item = node("article", "room-message conductor-message delegation-message");
-      const progress = delegation.progress?.summary || "No progress summary";
-      const result = delegation.result?.summary;
-      item.append(
-        node(
-          "strong",
-          "",
-          `DELEGATION / ${delegation.request?.worker_role || "WORKER"}`
-        ),
-        node(
-          "p",
-          "",
-          delegation.request?.summary || "Bounded delegated work"
-        ),
-        node(
-          "small",
-          "",
-          `${delegation.state || "UNKNOWN"} / ${result || progress}`
-        )
       );
       elements.roomMessageList.append(item);
     }
@@ -2550,24 +2647,10 @@ function renderRoomMessages() {
       );
       elements.roomMessageList.append(item);
     }
-    for (const proposal of pendingProposals) {
-      elements.roomMessageList.append(renderGovernanceProposalCard(proposal));
-    }
-    for (const permission of pendingPermissions) {
-      elements.roomMessageList.append(renderPermissionCard(permission));
-    }
-    scrollRoomToPendingAction();
-    updateConversationBadge();
+    finishRoomMessageRender(previousScrollTop);
     return;
   }
-  const pendingProposals = state.governanceProposals.filter(
-    (item) => item.state === "PROPOSED"
-  );
-  if (
-    !state.roomMessages.length &&
-    !pendingProposals.length &&
-    !state.projectPermissions.some((item) => item.state === "PENDING")
-  ) {
+  if (!state.roomMessages.length) {
     elements.roomMessageList.append(
       node(
         "p",
@@ -2575,7 +2658,7 @@ function renderRoomMessages() {
         `No messages for ${state.conversationTarget.projectId} Master`
       )
     );
-    updateConversationBadge();
+    finishRoomMessageRender(previousScrollTop);
     return;
   }
   for (const message of state.roomMessages.slice(-8)) {
@@ -2596,16 +2679,7 @@ function renderRoomMessages() {
     );
     elements.roomMessageList.append(item);
   }
-  for (const proposal of pendingProposals) {
-    elements.roomMessageList.append(renderGovernanceProposalCard(proposal));
-  }
-  for (const permission of state.projectPermissions.filter(
-    (item) => item.state === "PENDING"
-  )) {
-    elements.roomMessageList.append(renderPermissionCard(permission));
-  }
-  scrollRoomToPendingAction();
-  updateConversationBadge();
+  finishRoomMessageRender(previousScrollTop);
 }
 
 function renderGovernanceProposalCard(proposal) {
@@ -8472,6 +8546,14 @@ function bindEvents() {
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
+  if (elements.actionInboxButton && elements.actionInboxDialog) {
+    elements.actionInboxButton.addEventListener("click", () => {
+      renderActionInbox();
+      if (!elements.actionInboxDialog.open) {
+        elements.actionInboxDialog.showModal();
+      }
+    });
+  }
   if (elements.settingsDialog) {
     elements.settingsDialog.addEventListener("click", (event) => {
       const tab = event.target.closest("[data-settings-tab]");

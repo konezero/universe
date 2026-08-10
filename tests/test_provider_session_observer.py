@@ -117,6 +117,56 @@ class ProviderSessionObserverTests(unittest.TestCase):
             )
         self.assertEqual("SEMANTIC_ACTIVITY_NOT_ATTESTED", captured.exception.code)
 
+    def test_live_deltas_are_incremental_transient_and_redacted(self) -> None:
+        source_path = self.root / "rollout-live-deltas.jsonl"
+        self.write(
+            source_path,
+            {
+                "type": "response_item",
+                "id": "history",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "historical"}],
+                },
+            },
+        )
+        source = self.register("CODEX", source_path, start_at_end=True)
+        self.store.scan(str(source["source_id"]))
+        with source_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "id": "live",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "live result api_key=secretvalue",
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        scan = self.store.scan(str(source["source_id"]))
+        delta = self.store.build_transient_live_deltas(
+            str(source["source_id"]), added_count=scan["added"]
+        )
+
+        self.assertEqual("TRANSIENT_REDACTED", delta["delivery"])
+        self.assertEqual(1, len(delta["deltas"]))
+        self.assertIn("live result", delta["deltas"][0]["text"])
+        self.assertIn("[REDACTED]", delta["deltas"][0]["text"])
+        self.assertNotIn("secretvalue", json.dumps(delta))
+        persisted = json.dumps(self.store.list_activities(str(source["source_id"])))
+        self.assertNotIn("live result", persisted)
+        self.assertNotIn("secretvalue", persisted)
+
     def test_append_keeps_file_identity_and_cursor_progresses(self) -> None:
         source_path = self.root / "rollout-append.jsonl"
         self.write(source_path, {"type": "turn_started"})

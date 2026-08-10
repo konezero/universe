@@ -145,6 +145,10 @@
               <strong id="conversation-title">Conversation</strong>
               <small id="conversation-target-label">Universe Conductor</small>
             </div>
+            <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
+              Actions
+              <span id="action-inbox-badge" class="chat-badge hidden">0</span>
+            </button>
             <label class="layer-opacity" title="Conversation transparency">
               <span>Opacity</span>
               <input id="conversation-opacity" type="range" min="25" max="100" value="92">
@@ -554,10 +558,25 @@
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
     </div>
     <div id="session-summary-facts" class="session-summary-facts"></div>
+    <section class="session-summary-live-wrap" aria-label="Live provider output">
+      <span class="inspector-kicker">Live provider output</span>
+      <div id="session-summary-live" class="session-summary-live"></div>
+    </section>
     <div class="dialog-actions session-summary-actions">
       <button id="session-summary-manage" class="secondary-button" type="button">View in Observatory</button>
       <button id="session-summary-open" class="primary-button" type="button">Open session</button>
     </div>
+  </dialog>
+
+  <dialog id="action-inbox-dialog" class="action-inbox-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Inbox</span>
+        <h2 id="action-inbox-title">Actions</h2>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div id="action-inbox-list" class="action-inbox-list"></div>
   </dialog>
 
   <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog">
