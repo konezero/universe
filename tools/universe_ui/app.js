@@ -2764,14 +2764,20 @@ function renderGovernanceProposalCard(proposal) {
   approve.type = "button";
   approve.title = `Approve ${proposal.proposal_id}`;
   approve.addEventListener("click", () =>
-    decideGovernanceProposal(proposal, "BUTTON")
+    decideGovernanceProposal(proposal, "APPROVE")
   );
-  actions.append(approve);
+  const cancel = node("button", "proposal-cancel", "Cancel");
+  cancel.type = "button";
+  cancel.title = `Cancel ${proposal.proposal_id}`;
+  cancel.addEventListener("click", () =>
+    decideGovernanceProposal(proposal, "CANCEL")
+  );
+  actions.append(cancel, approve);
   item.append(actions);
   return item;
 }
 
-async function decideGovernanceProposal(proposal, source) {
+async function decideGovernanceProposal(proposal, decision) {
   if (!state.projects.some((project) => project.project_id === proposal.project_id)) {
     toast("Proposal project is no longer attached", true);
     return false;
@@ -2784,7 +2790,7 @@ async function decideGovernanceProposal(proposal, source) {
       {
         method: "POST",
         body: {
-          decision: "APPROVE",
+          decision,
           proposal_digest: proposal.proposal_digest,
         },
       }
@@ -2818,7 +2824,11 @@ async function decideGovernanceProposal(proposal, source) {
     }
     renderProjects();
     renderRoomMessages();
-    toast("Governance Proposal approved and delivered to Project Master");
+    toast(
+      decision === "CANCEL"
+        ? "Governance Proposal cancelled"
+        : "Governance Proposal approved and delivered to Project Master"
+    );
     return true;
   } catch (error) {
     toast(error.message, true);

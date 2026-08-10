@@ -884,6 +884,7 @@ body.inspector-open .graph-hint {
 
 .proposal-actions {
   display: flex;
+  gap: 7px;
   justify-content: flex-end;
   margin-top: 9px;
 }
@@ -900,6 +901,20 @@ body.inspector-open .graph-hint {
 
 .proposal-approve:hover {
   background: #9af0e3;
+}
+
+.proposal-cancel {
+  min-height: 31px;
+  padding: 5px 12px;
+  border: 1px solid rgba(255, 166, 130, 0.72);
+  border-radius: 5px;
+  color: #ffceb9;
+  background: rgba(102, 45, 30, 0.68);
+  font-weight: 700;
+}
+
+.proposal-cancel:hover {
+  background: rgba(137, 60, 38, 0.84);
 }
 
 .room-message-actions {

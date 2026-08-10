@@ -353,6 +353,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     created_at TEXT NOT NULL,
                     approved_at TEXT,
                     approval_json TEXT,
+                    cancellation_json TEXT,
                     completed_at TEXT
                 );
                 """
@@ -361,8 +362,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 """
                 INSERT INTO proposal(
                     proposal_id, proposal_digest, proposal_json, state,
-                    created_at, approved_at, approval_json, completed_at
-                ) VALUES (?, ?, ?, 'PROPOSED', ?, NULL, NULL, NULL)
+                    created_at, approved_at, approval_json, cancellation_json,
+                    completed_at
+                ) VALUES (?, ?, ?, 'PROPOSED', ?, NULL, NULL, NULL, NULL)
                 """,
                 (
                     proposal["proposal_id"],
@@ -438,6 +440,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 sort_keys=True,
             ),
         )
+
         write(
             distribution_path,
             json.dumps(
@@ -498,6 +501,61 @@ class UniverseLocalServiceTests(unittest.TestCase):
             manifest_path=manifest,
         )
         return database, manifest
+
+    def test_legacy_governance_decision_schema_migrates_for_cancellation(self) -> None:
+        database_path = self.temp_root / "legacy-governance.sqlite3"
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE project_connection (
+                    project_id TEXT PRIMARY KEY
+                );
+                CREATE TABLE governance_proposal_decision (
+                    decision_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    proposal_id TEXT NOT NULL,
+                    proposal_digest TEXT NOT NULL,
+                    decision TEXT NOT NULL CHECK(decision = 'APPROVE'),
+                    source TEXT NOT NULL
+                        CHECK(source IN ('BUTTON', 'NATURAL_LANGUAGE')),
+                    commander_surface TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    evidence_ref TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('RECORDED', 'APPLIED', 'FAILED')),
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    UNIQUE(project_id, proposal_id),
+                    UNIQUE(project_id, idempotency_key)
+                );
+                CREATE INDEX governance_proposal_decision_project_time
+                ON governance_proposal_decision(project_id, created_at, decision_id);
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = UniverseStore(database_path)
+        with migrated._connection() as connection:
+            decision_schema = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'governance_proposal_decision'"
+                ).fetchone()["sql"]
+            )
+            index = connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' "
+                "AND name = 'governance_proposal_decision_project_time'"
+            ).fetchone()
+        self.assertIn("CANCEL", decision_schema.upper())
+        self.assertIsNotNone(index)
 
     def project_seed(self, **overrides: object) -> JsonObject:
         value: JsonObject = {
@@ -4305,6 +4363,113 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("DIRECT_COMMANDER_REQUIRED", rejected_bridge["error_code"])
+
+    def test_governance_proposal_can_be_cancelled_by_one_api(self) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+
+        class CancellingAdapter(ProjectTaskProposalAdapter):
+            def cancel(
+                inner_self,
+                project_root: Path,
+                *,
+                proposal_id: str,
+                proposal_digest: str,
+                evidence_ref: str,
+            ) -> JsonObject:
+                cancellation = {
+                    "schema": "ai-career.task-proposal-cancellation.v1",
+                    "status": "CANCELLED",
+                    "proposal_id": proposal_id,
+                    "proposal_digest": proposal_digest,
+                    "evidence_ref": evidence_ref,
+                    "cancelled_at": "2026-08-10T00:01:00Z",
+                }
+                database_path = (
+                    project_root
+                    / ".ai"
+                    / "runtime"
+                    / "task_frames"
+                    / "task-proposals.sqlite3"
+                )
+                connection = sqlite3.connect(database_path)
+                try:
+                    connection.execute(
+                        """
+                        UPDATE proposal
+                        SET state = 'CANCELLED', cancellation_json = ?, completed_at = ?
+                        WHERE proposal_id = ? AND proposal_digest = ?
+                        """,
+                        (
+                            json.dumps(
+                                cancellation, sort_keys=True, separators=(",", ":")
+                            ),
+                            cancellation["cancelled_at"],
+                            proposal_id,
+                            proposal_digest,
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                return {
+                    "status": "TASK_PROPOSAL_CANCELLED",
+                    "cancellation": cancellation,
+                }
+
+        self.server.project_task_proposals = CancellingAdapter()
+        status, cancelled = self.request(
+            "POST",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
+            {
+                "decision": "CANCEL",
+                "proposal_digest": proposal["proposal_digest"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GOVERNANCE_PROPOSAL_CANCELLED", cancelled["status"])
+        self.assertEqual("CANCELLED", cancelled["proposal"]["state"])
+        self.assertEqual("CANCEL", cancelled["decision"]["decision"])
+        self.assertEqual("APPLIED", cancelled["decision"]["state"])
+        self.assertIsNone(cancelled["message"])
+
+        status, pending = self.request(
+            "GET", "/v1/governance/proposals/pending", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertFalse(
+            any(
+                item["proposal_id"] == proposal["proposal_id"]
+                for item in pending["proposals"]
+            )
+        )
+
+        status, repeated = self.request(
+            "POST",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
+            {
+                "decision": "CANCEL",
+                "proposal_digest": proposal["proposal_digest"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GOVERNANCE_PROPOSAL_ALREADY_CANCELLED", repeated["status"])
+
+        status, conflicting = self.request(
+            "POST",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
+            {
+                "decision": "APPROVE",
+                "proposal_digest": proposal["proposal_digest"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "GOVERNANCE_PROPOSAL_DECISION_CONFLICT", conflicting["error_code"]
+        )
 
     def test_approved_primary_creates_one_exact_descendant_task_frame(self) -> None:
         proposal = self.create_task_proposal_fixture()

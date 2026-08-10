@@ -1302,7 +1302,7 @@ class ProjectModeCoordinator:
 
 
 class ProjectTaskProposalAdapter:
-    """Read and approve the installed Runtime's durable Task Proposals."""
+    """Read and decide the installed Runtime's durable Task Proposals."""
 
     def __init__(self, *, native_runner: NativeRunner = run_native_cli) -> None:
         self.native_runner = native_runner
@@ -1414,6 +1414,74 @@ class ProjectTaskProposalAdapter:
             )
             raise ProjectMasterHostError(
                 error_code or "PROJECT_TASK_PROPOSAL_APPROVAL_FAILED"
+            )
+        return dict(payload)
+
+    def cancel(
+        self,
+        project_root: Path,
+        *,
+        proposal_id: str,
+        proposal_digest: str,
+        evidence_ref: str,
+    ) -> dict[str, Any]:
+        root = project_root.expanduser().resolve(strict=True)
+        runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        if not runtime_cli.is_file():
+            raise ProjectMasterHostError("PROJECT_RUNTIME_CLI_UNAVAILABLE")
+        request_path = _runtime_tmp() / f"project-task-cancellation-{uuid4().hex}.json"
+        request_path.write_text(
+            json.dumps(
+                {
+                    "proposal_id": _text(proposal_id, "proposal_id"),
+                    "proposal_digest": _text(
+                        proposal_digest, "proposal_digest"
+                    ),
+                    "evidence_ref": _text(evidence_ref, "evidence_ref"),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        try:
+            result = self.native_runner(
+                NativeCliRequest(
+                    executable=_required_host_executable("python"),
+                    arguments=(
+                        str(runtime_cli),
+                        "task-proposal",
+                        "cancel",
+                        "--repo-root",
+                        str(root),
+                        "--request",
+                        str(request_path),
+                    ),
+                    cwd=root,
+                    timeout_seconds=30,
+                )
+            )
+        finally:
+            request_path.unlink(missing_ok=True)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ProjectMasterHostError(
+                "PROJECT_TASK_PROPOSAL_CANCELLATION_RESULT_INVALID"
+            ) from error
+        if (
+            result.status != "COMPLETED"
+            or result.return_code != 0
+            or not isinstance(payload, Mapping)
+            or payload.get("status") != "TASK_PROPOSAL_CANCELLED"
+        ):
+            error_code = (
+                str(payload.get("error_code") or "").strip()
+                if isinstance(payload, Mapping)
+                else ""
+            )
+            raise ProjectMasterHostError(
+                error_code or "PROJECT_TASK_PROPOSAL_CANCELLATION_FAILED"
             )
         return dict(payload)
 

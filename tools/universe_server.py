@@ -3251,10 +3251,10 @@ def normalize_governance_proposal_decision(value: Any) -> dict[str, str]:
     decision = _identifier(
         request["decision"], "governance_proposal_decision.decision"
     ).upper()
-    if decision != "APPROVE":
+    if decision not in {"APPROVE", "CANCEL"}:
         raise UniverseError(
             "GOVERNANCE_PROPOSAL_DECISION_UNSUPPORTED",
-            "the current Runtime Task Proposal journal supports APPROVE only",
+            "decision must be APPROVE or CANCEL",
             HTTPStatus.CONFLICT,
         )
     source = _identifier(
@@ -4380,7 +4380,7 @@ class UniverseStore:
                         ON DELETE CASCADE,
                     proposal_id TEXT NOT NULL,
                     proposal_digest TEXT NOT NULL,
-                    decision TEXT NOT NULL CHECK(decision = 'APPROVE'),
+                    decision TEXT NOT NULL CHECK(decision IN ('APPROVE', 'CANCEL')),
                     source TEXT NOT NULL
                         CHECK(source IN ('BUTTON', 'NATURAL_LANGUAGE')),
                     commander_surface TEXT NOT NULL,
@@ -4703,6 +4703,72 @@ class UniverseStore:
                 connection.execute(
                     "ALTER TABLE governance_proposal_decision "
                     "ADD COLUMN access_surface TEXT"
+                )
+            decision_table = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'governance_proposal_decision'"
+            ).fetchone()
+            if (
+                decision_table is not None
+                and "CANCEL" not in str(decision_table["sql"]).upper()
+            ):
+                connection.execute(
+                    "ALTER TABLE governance_proposal_decision "
+                    "RENAME TO governance_proposal_decision_legacy"
+                )
+                connection.execute(
+                    "DROP INDEX IF EXISTS governance_proposal_decision_project_time"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE governance_proposal_decision (
+                        decision_id TEXT PRIMARY KEY,
+                        project_id TEXT NOT NULL
+                            REFERENCES project_connection(project_id)
+                            ON DELETE CASCADE,
+                        proposal_id TEXT NOT NULL,
+                        proposal_digest TEXT NOT NULL,
+                        decision TEXT NOT NULL
+                            CHECK(decision IN ('APPROVE', 'CANCEL')),
+                        source TEXT NOT NULL
+                            CHECK(source IN ('BUTTON', 'NATURAL_LANGUAGE')),
+                        commander_surface TEXT NOT NULL,
+                        access_surface TEXT,
+                        idempotency_key TEXT NOT NULL,
+                        evidence_ref TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL
+                            CHECK(state IN ('RECORDED', 'APPLIED', 'FAILED')),
+                        result_json TEXT NOT NULL DEFAULT '{}',
+                        error_code TEXT,
+                        created_at TEXT NOT NULL,
+                        applied_at TEXT,
+                        UNIQUE(project_id, proposal_id),
+                        UNIQUE(project_id, idempotency_key)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO governance_proposal_decision(
+                        decision_id, project_id, proposal_id, proposal_digest,
+                        decision, source, commander_surface, access_surface,
+                        idempotency_key, evidence_ref, state, result_json,
+                        error_code, created_at, applied_at
+                    )
+                    SELECT
+                        decision_id, project_id, proposal_id, proposal_digest,
+                        decision, source, commander_surface, access_surface,
+                        idempotency_key, evidence_ref, state, result_json,
+                        error_code, created_at, applied_at
+                    FROM governance_proposal_decision_legacy
+                    """
+                )
+                connection.execute("DROP TABLE governance_proposal_decision_legacy")
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS governance_proposal_decision_project_time
+                    ON governance_proposal_decision(project_id, created_at, decision_id)
+                    """
                 )
             project_connection_columns = {
                 row["name"]
@@ -18025,7 +18091,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     HTTPStatus.CONFLICT,
                 )
             return {
-                "status": "GOVERNANCE_PROPOSAL_ALREADY_APPROVED",
+                "status": (
+                    "GOVERNANCE_PROPOSAL_ALREADY_APPROVED"
+                    if existing["decision"] == "APPROVE"
+                    else "GOVERNANCE_PROPOSAL_ALREADY_CANCELLED"
+                ),
                 "proposal": proposal,
                 "decision": existing,
                 "message": None,
@@ -18040,25 +18110,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             project["project_id"], proposal, request
         )
         try:
-            approval_result = self.project_task_proposals.approve(
-                Path(project["project_root"]),
-                proposal_id=proposal["proposal_id"],
-                proposal_digest=proposal["proposal_digest"],
-                evidence_ref=decision["evidence_ref"],
-            )
+            if request["decision"] == "APPROVE":
+                decision_result = self.project_task_proposals.approve(
+                    Path(project["project_root"]),
+                    proposal_id=proposal["proposal_id"],
+                    proposal_digest=proposal["proposal_digest"],
+                    evidence_ref=decision["evidence_ref"],
+                )
+            else:
+                decision_result = self.project_task_proposals.cancel(
+                    Path(project["project_root"]),
+                    proposal_id=proposal["proposal_id"],
+                    proposal_digest=proposal["proposal_digest"],
+                    evidence_ref=decision["evidence_ref"],
+                )
         except ProjectMasterHostError as error:
             failed = self.store.fail_governance_proposal_decision(
                 decision["decision_id"],
-                str(error) or "PROJECT_TASK_PROPOSAL_APPROVAL_FAILED",
+                str(error) or "PROJECT_TASK_PROPOSAL_DECISION_FAILED",
             )
             raise UniverseError(
-                "GOVERNANCE_PROPOSAL_APPROVAL_FAILED",
+                f"GOVERNANCE_PROPOSAL_{request['decision']}_FAILED",
                 failed["error_code"],
                 HTTPStatus.CONFLICT,
             ) from error
         decision = self.store.complete_governance_proposal_decision(
-            decision["decision_id"], approval_result
+            decision["decision_id"], decision_result
         )
+        if request["decision"] == "CANCEL":
+            refreshed = self.list_project_governance_proposals(project["project_id"])
+            cancelled = next(
+                (item for item in refreshed if item["proposal_id"] == proposal_id),
+                proposal,
+            )
+            return {
+                "status": "GOVERNANCE_PROPOSAL_CANCELLED",
+                "proposal": cancelled,
+                "decision": decision,
+                "message": None,
+            }
         approval_packet = {
             "schema": "universe.project-master-governance-approval.v1",
             "decision": "APPROVED",
@@ -18918,7 +19008,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 {
                     "schema": API_SCHEMA,
                     "status": "GOVERNANCE_PROPOSAL_INBOX_COLLECTED",
-                    "proposals": self.server.list_governance_proposal_inbox(),
+                    "proposals": [
+                        proposal
+                        for proposal in self.server.list_governance_proposal_inbox()
+                        if proposal.get("state") == "PROPOSED"
+                    ],
                 },
             )
             return

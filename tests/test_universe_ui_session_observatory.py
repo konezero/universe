@@ -82,6 +82,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         ]
         self.assertNotIn("commander_surface", decision_slice)
         self.assertNotIn("idempotency_key", decision_slice)
+        self.assertIn('decideGovernanceProposal(proposal, "APPROVE")', APP)
+        self.assertIn('decideGovernanceProposal(proposal, "CANCEL")', APP)
+        self.assertIn('"proposal-cancel", "Cancel"', APP)
 
     def test_actions_are_separate_from_chat_and_keep_scroll_stable(self) -> None:
         self.assertIn('id="action-inbox-button"', HTML)
