@@ -3694,6 +3694,59 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("ACCEPTED_BY_MASTER", accepted["delivery_state"])
         self.assertEqual("ACCEPTED_BY_MASTER", accepted["delivery"]["status"])
 
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/stream",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": message["message_id"],
+                    "event": "DELTA",
+                    "sequence": 1,
+                    "delta": "partial answer",
+                    "detail": "",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+        self.assertEqual(202, status)
+        self.assertEqual(
+            {
+                "in_reply_to": message["message_id"],
+                "body": "partial answer",
+                "state": "RESPONDING",
+                "sequence": 1,
+            },
+            {
+                key: value
+                for key, value in self.server.project_master_stream_snapshot("GCS").items()
+                if key != "updated_at"
+            },
+        )
+
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/stream",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": message["message_id"],
+                    "event": "COMPLETED",
+                    "sequence": 2,
+                    "delta": "",
+                    "detail": "",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+        self.assertIsNone(self.server.project_master_stream_snapshot("GCS"))
+
     def test_master_bridge_stream_event_is_authenticated_and_published(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, registered = self.request(

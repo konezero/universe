@@ -1469,6 +1469,150 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         self.assertEqual(selected, self.provider.messages[0]["governance_context"])
 
+    def test_startup_governance_snapshot_is_not_reread_per_message(self) -> None:
+        selected = {
+            "schema": "universe.release-governance-context.v1",
+            "status": "SELECTED",
+            "release_id": "core-startup",
+            "source_commit": "b" * 40,
+            "catalog_digest": "c" * 64,
+            "selector_digest": "d" * 64,
+            "units": [{"governance_id": "CORE", "content": "Use the contract."}],
+        }
+
+        def resolver(_project_id: str) -> Mapping[str, Any]:
+            raise AssertionError("startup snapshot must not resolve per message")
+
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            governance_context_resolver=resolver,
+            governance_context=selected,
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(selected, self.provider.messages[0]["governance_context"])
+
+    def test_startup_governance_snapshot_is_injected_for_native_room_event(self) -> None:
+        selected = {
+            "schema": "universe.release-governance-context.v1",
+            "status": "SELECTED",
+            "release_id": "core-room",
+            "source_commit": "e" * 40,
+            "catalog_digest": "f" * 64,
+            "selector_digest": "0" * 64,
+            "units": [{"governance_id": "CORE", "content": "Room contract."}],
+        }
+        provider = StreamingFakeProvider()
+        worker = ProjectMasterConversationWorker(
+            provider=provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            governance_context=selected,
+        )
+        worker.start()
+        try:
+            self.assertTrue(
+                worker.submit_room_event(
+                    binding={
+                        "binding_id": "binding-room-context",
+                        "provider": "GROK",
+                        "provider_session_ref": provider.session_ref,
+                    },
+                    event={
+                        "room_id": "room-context",
+                        "room_event_id": "room-event-context",
+                        "room_sequence": 1,
+                        "message": {
+                            "room_event_id": "room-event-context",
+                            "author_role": "USER",
+                            "body_text": "Use the selected context.",
+                        },
+                    },
+                    bridge_id="bridge-room-context",
+                )
+            )
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(selected, provider.messages[0]["governance_context"])
+
+    def test_resident_manager_exposes_selected_release_context_metadata(self) -> None:
+        selected = {
+            "schema": "universe.release-governance-context.v1",
+            "status": "SELECTED",
+            "release_id": "core-manager",
+            "source_commit": "1" * 40,
+            "catalog_digest": "2" * 64,
+            "selector_digest": "3" * 64,
+            "units": [{"governance_id": "CORE", "content": "Manager contract."}],
+        }
+        resolver_calls = 0
+
+        def resolver(_project_id: str) -> Mapping[str, Any]:
+            nonlocal resolver_calls
+            resolver_calls += 1
+            return selected
+
+        registrations: list[dict[str, Any]] = []
+
+        def register(project_id, value):
+            registrations.append({"project_id": project_id, **dict(value)})
+            return {"bridge_id": "bridge-manager-context", **dict(value)}, True
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: FakeProvider(),
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
+                governance_context_resolver=resolver,
+            )
+            try:
+                manager.ensure({"project_id": "GCS", "project_root": str(self.root)})
+                worker = manager._handles["GCS"].worker
+                worker.submit(self._envelope())
+                self.assertTrue(worker.wait_idle())
+                connection = manager.connection_status("GCS")
+            finally:
+                manager.close()
+
+        self.assertEqual(1, resolver_calls)
+        self.assertEqual(
+            "universe.provider-runtime-observation.v1",
+            connection["runtime_observation"]["schema"],
+        )
+        self.assertEqual("UNKNOWN", connection["runtime_observation"]["quota_state"])
+        self.assertEqual(
+            {
+                "status": "SELECTED",
+                "release_id": "core-manager",
+                "source_commit": "1" * 40,
+                "catalog_digest": "2" * 64,
+                "selector_digest": "3" * 64,
+            },
+            connection["governance_context"],
+        )
+
     def test_permission_request_blocks_until_ui_decision_is_delivered(self) -> None:
         provider = PermissionFakeProvider()
         permission_posted = threading.Event()

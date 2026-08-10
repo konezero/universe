@@ -1315,6 +1315,9 @@ function renderProviderChatSummary() {
     ["Anchor", providerChatAnchorLabel(room)],
     ["Opened from", room.workspace_name || "Unknown"],
   ];
+  const projectSetting = projectProviderSetting(project.projectId);
+  const usageLabel = sessionUsageLabel(projectSetting?.session_connection);
+  if (usageLabel) facts.push(["Usage", usageLabel]);
   const historyCount = Number(room.provider_history_count || 1);
   if (historyCount > 1) facts.push(["Provider history", String(historyCount)]);
   for (const [label, value] of facts) {
@@ -2108,6 +2111,24 @@ function sessionConnectionText(connection, fallbackMode) {
   return `${provider} / ${model} / ${connectionState} / ${mode}`;
 }
 
+function sessionUsageLabel(connection) {
+  const observation = connection?.runtime_observation;
+  if (!observation || typeof observation !== "object") return "";
+  const quota = String(observation.quota_state || "").trim().toUpperCase();
+  const usage = observation.usage;
+  const tokenTotal =
+    usage && typeof usage === "object"
+      ? ["input_tokens", "output_tokens"].reduce((total, key) => {
+          const value = Number(usage[key]);
+          return Number.isFinite(value) ? total + value : total;
+        }, 0)
+      : 0;
+  const parts = [];
+  if (tokenTotal > 0) parts.push(String(tokenTotal.toLocaleString()) + " tokens");
+  if (quota && quota !== "UNKNOWN") parts.push("quota " + quota);
+  return parts.join(" / ");
+}
+
 function renderComposerState() {
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     const setting = state.providerSettings?.universe_conductor || null;
@@ -2115,12 +2136,13 @@ function renderComposerState() {
     const autoApprove =
       providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
     const session = setting?.session_connection || null;
+    const usage = sessionUsageLabel(session);
     elements.roomContext.textContent =
       `Universe Conductor / ${sessionConnectionText(session, "CONDUCTOR")}`;
     elements.roomHint.textContent =
       state.conductorRuntimeBinding?.status === "BOUND"
-        ? `LLM connected / Auto-approve ${autoApprove}`
-        : "Waiting for Runtime binding";
+        ? "LLM connected / Auto-approve " + autoApprove + (usage ? " / " + usage : "")
+        : "Waiting for Runtime binding" + (usage ? " / " + usage : "");
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";
     if (elements.conversationTitle) {
       elements.conversationTitle.textContent = "Conversation";
@@ -2145,13 +2167,14 @@ function renderComposerState() {
   const autoApprove =
     providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
   const session = setting?.session_connection || null;
+  const usage = sessionUsageLabel(session);
   elements.roomContext.textContent =
     `${projectId} / Project Master / ${sessionConnectionText(session, "MASTER")}`;
   elements.roomHint.textContent = directBridge
-    ? `Direct bridge connected / Auto-approve ${autoApprove}`
+    ? "Direct bridge connected / Auto-approve " + autoApprove + (usage ? " / " + usage : "")
     : registeredBridge
-      ? "Bridge registered / awaiting first delivery"
-      : "Project Room only";
+      ? "Bridge registered / awaiting first delivery" + (usage ? " / " + usage : "")
+      : "Project Room only" + (usage ? " / " + usage : "");
   elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
   if (elements.conversationTitle) {
     elements.conversationTitle.textContent = "Conversation";
@@ -4714,6 +4737,19 @@ function openProjectRoomStream(projectId) {
       renderProjects();
       if (payload.type === "ROOM_CHANGED") {
         state.projectStreamReplies = {};
+      } else {
+        const active = payload.active_master_stream;
+        state.projectStreamReplies = active?.in_reply_to
+          ? {
+              [active.in_reply_to]: {
+                body: String(active.body || ""),
+                state: String(active.state || "Thinking"),
+                sequence: Number.isFinite(Number(active.sequence))
+                  ? Number(active.sequence)
+                  : -1,
+              },
+            }
+          : {};
       }
       renderRoomMessages();
       return;
@@ -4733,23 +4769,36 @@ function openProjectRoomStream(projectId) {
     }
     if (payload.type !== "MASTER_STREAM") return;
     const key = payload.in_reply_to;
+    const incomingSequence = Number(payload.sequence);
+    const current = state.projectStreamReplies[key];
+    if (
+      current &&
+      Number.isFinite(incomingSequence) &&
+      incomingSequence >= 0 &&
+      Number(current.sequence) >= incomingSequence
+    ) {
+      return;
+    }
     if (payload.event === "COMPLETED") {
       delete state.projectStreamReplies[key];
     } else if (payload.event === "FAILED") {
       state.projectStreamReplies[key] = {
-        body: state.projectStreamReplies[key]?.body || "",
+        body: current?.body || "",
         state: payload.detail || "Failed",
+        sequence: incomingSequence,
       };
     } else {
-      const current = state.projectStreamReplies[key] || {
+      const next = current || {
         body: "",
         state: "Thinking",
+        sequence: -1,
       };
       if (payload.event === "DELTA") {
-        current.body += payload.delta || "";
-        current.state = "Responding";
+        next.body += payload.delta || "";
+        next.state = "Responding";
       }
-      state.projectStreamReplies[key] = current;
+      next.sequence = incomingSequence;
+      state.projectStreamReplies[key] = next;
     }
     renderRoomMessages();
   });

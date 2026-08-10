@@ -251,6 +251,7 @@ PROJECT_MASTER_BRIDGE_SCHEMA = "universe.project-master-bridge.v1"
 PROJECT_MASTER_BRIDGE_REPLY_SCHEMA = "universe.project-master-bridge-reply.v1"
 PROJECT_MASTER_STREAM_SCHEMA = "universe.project-master-stream-event.v1"
 PROJECT_ROOM_STREAM_SCHEMA = "universe.project-room-stream.v1"
+PROJECT_MASTER_ACTIVE_STREAM_MAX_BYTES = 256 * 1024
 GOVERNANCE_APPROVAL_COMMANDS = frozenset(
     {
         "\uc2b9\uc778",
@@ -14648,6 +14649,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_session_error: dict[str, str] | None = None
         self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
+        self._project_master_stream_lock = threading.RLock()
+        self._active_project_master_streams: dict[str, dict[str, Any]] = {}
         self.multi_rooms = MultiRoomStore(str(store.database_path))
         self.multi_room_native_controls = MultiRoomNativeControlRegistry(
             self.multi_rooms
@@ -15383,14 +15386,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "universe://resident-project-master/"
             )
             if bridge.get("status") in {"REGISTERED", "AVAILABLE"} and (
-                (not managed and _loopback_endpoint_reachable(str(bridge["endpoint"])))
-                or (managed and self.project_master_hosts.is_resident(project_id))
+                not managed and _loopback_endpoint_reachable(str(bridge["endpoint"]))
             ):
                 return {
                     "status": "EXISTING_BRIDGE",
                     "project_id": project_id,
                     "bridge": bridge,
                 }
+            # A managed resident must pass through the Host manager on every
+            # prepare. Observatory attach can change the provider session while
+            # the bridge itself remains registered.
         return self.project_master_hosts.ensure(project)
 
     def create_approved_descendant_task_frame(
@@ -17791,7 +17796,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id = str(event.get("project_id") or "").strip()
         message_id = str(event.get("in_reply_to") or "").strip()
         stream_event = str(event.get("event") or "").strip().upper()
-        if not project_id or not message_id or stream_event != "STARTED":
+        if (
+            not project_id
+            or not message_id
+            or stream_event not in {"STARTED", "DELTA", "COMPLETED", "FAILED"}
+        ):
             return
         message = next(
             (
@@ -17801,10 +17810,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             None,
         )
-        if message is None or message.get("delivery_state") not in {
+        if message is None:
+            return
+        if stream_event == "STARTED" and message.get("delivery_state") not in {
             "QUEUED_FOR_MASTER",
             "ACCEPTED_BY_MASTER",
         }:
+            return
+        with self._project_master_stream_lock:
+            if stream_event == "STARTED":
+                self._active_project_master_streams[project_id] = {
+                    "in_reply_to": message_id,
+                    "body": "",
+                    "state": "THINKING",
+                    "sequence": int(event.get("sequence") or 0),
+                    "updated_at": utc_now(),
+                }
+            elif stream_event == "DELTA":
+                active = self._active_project_master_streams.get(project_id)
+                if active is None or active.get("in_reply_to") != message_id:
+                    active = {
+                        "in_reply_to": message_id,
+                        "body": "",
+                        "state": "THINKING",
+                        "sequence": -1,
+                        "updated_at": utc_now(),
+                    }
+                    self._active_project_master_streams[project_id] = active
+                body = str(active.get("body") or "") + str(event.get("delta") or "")
+                encoded = body.encode("utf-8")
+                if len(encoded) > PROJECT_MASTER_ACTIVE_STREAM_MAX_BYTES:
+                    body = encoded[-PROJECT_MASTER_ACTIVE_STREAM_MAX_BYTES:].decode(
+                        "utf-8", errors="ignore"
+                    )
+                active.update(
+                    {
+                        "body": body,
+                        "state": "RESPONDING",
+                        "sequence": int(event.get("sequence") or 0),
+                        "updated_at": utc_now(),
+                    }
+                )
+            elif stream_event in {"COMPLETED", "FAILED"}:
+                active = self._active_project_master_streams.get(project_id)
+                if active is not None and active.get("in_reply_to") == message_id:
+                    self._active_project_master_streams.pop(project_id, None)
+        if stream_event != "STARTED":
             return
         accepted = self.store._update_room_delivery(
             message,
@@ -17841,6 +17892,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             self._publish_conductor_delegation(progress)
         self.publish_project_room_changed(project_id)
+
+    def project_master_stream_snapshot(
+        self, project_id: str
+    ) -> dict[str, Any] | None:
+        """Return only the current process-local partial Master output."""
+        normalized = _required_text(project_id, "project_id")
+        with self._project_master_stream_lock:
+            active = self._active_project_master_streams.get(normalized)
+            return dict(active) if active is not None else None
 
     def _observe_project_master_completion(self, event: Mapping[str, Any]) -> None:
         project_id = event.get("project_id")
@@ -22528,6 +22588,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         ),
                         "governance_proposals": (
                             self.server.list_project_governance_proposals(project_id)
+                        ),
+                        "active_master_stream": (
+                            self.server.project_master_stream_snapshot(project_id)
                         ),
                     },
                 },

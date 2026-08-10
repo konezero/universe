@@ -3401,6 +3401,7 @@ class ProjectMasterConversationWorker:
         permission_poster: PermissionPoster = post_agent_permission_request,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
+        governance_context: Mapping[str, Any] | None = None,
         room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
         self.provider = provider
@@ -3414,6 +3415,9 @@ class ProjectMasterConversationWorker:
         self.permission_poster = permission_poster
         self.completion_observer = completion_observer
         self.governance_context_resolver = governance_context_resolver
+        self.governance_context = (
+            dict(governance_context) if governance_context is not None else None
+        )
         self.room_event_observer = room_event_observer
         self._last_completion: dict[str, Any] | None = None
         self._last_completion_at = 0.0
@@ -3557,12 +3561,9 @@ class ProjectMasterConversationWorker:
             provider_message["skill_binding_proposals"] = (
                 self.store.skill_binding_proposals()
             )
-            if self.governance_context_resolver is not None:
-                governance_context = self.governance_context_resolver(self.project_id)
-                if governance_context.get("status") == "SELECTED":
-                    provider_message["governance_context"] = dict(governance_context)
-                elif governance_context.get("status") != "ABSENT":
-                    raise ProjectMasterHostError("PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE")
+            governance_context = self._governance_context_for_message()
+            if governance_context is not None:
+                provider_message["governance_context"] = governance_context
             stream_reply = getattr(self.provider, "reply_stream", None)
             if callable(stream_reply):
                 body = stream_reply(
@@ -3680,6 +3681,9 @@ class ProjectMasterConversationWorker:
                     "correlation_id": event.get("correlation_id"),
                 },
             }
+            governance_context = self._governance_context_for_message()
+            if governance_context is not None:
+                provider_message["governance_context"] = governance_context
             stream_reply = getattr(self.provider, "reply_stream", None)
 
             def on_delta(delta: str) -> None:
@@ -3701,6 +3705,38 @@ class ProjectMasterConversationWorker:
         finally:
             self._active_bridge_id = ""
             self._active_message_id = ""
+
+    def _governance_context_for_message(self) -> dict[str, Any] | None:
+        """Return the startup-selected context without reopening Release DB."""
+        if self.governance_context is not None:
+            return dict(self.governance_context)
+        if self.governance_context_resolver is None:
+            return None
+        resolved = self.governance_context_resolver(self.project_id)
+        if not isinstance(resolved, Mapping):
+            raise ProjectMasterHostError("PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE")
+        status = str(resolved.get("status") or "").strip().upper()
+        if status == "SELECTED":
+            return dict(resolved)
+        if status == "ABSENT":
+            return None
+        raise ProjectMasterHostError("PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE")
+
+    @staticmethod
+    def _runtime_observation(provider: MasterProvider) -> dict[str, Any]:
+        observer = getattr(provider, "runtime_observation", None)
+        if callable(observer):
+            observed = observer()
+            if isinstance(observed, Mapping):
+                return dict(observed)
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "UNKNOWN",
+            "session_ref": str(getattr(provider, "session_ref", "UNKNOWN")),
+            "state": str(getattr(provider, "connection_state", "UNKNOWN")),
+            "quota_state": "UNKNOWN",
+            "usage": {},
+        }
 
     def idle_completion(self, idle_seconds: float) -> Mapping[str, Any] | None:
         if (
@@ -3907,6 +3943,7 @@ class ResidentProjectMasterHandle:
     coordinator: CommanderSurfaceObserver
     thread: threading.Thread
     bridge_id: str = ""
+    governance_context_key: str = "ABSENT"
 
     def close(self) -> None:
         self.bridge_server.shutdown()
@@ -3971,6 +4008,29 @@ class ResidentProjectMasterHostManager:
             requested_mode="MASTER",
         )
         selected_session_ref = store.session_ref_for(selected_provider)
+        governance_context: dict[str, Any] | None = None
+        governance_context_key = "ABSENT"
+        if self.governance_context_resolver is not None:
+            resolved = self.governance_context_resolver(project_id)
+            if not isinstance(resolved, Mapping):
+                raise ProjectMasterHostError(
+                    "PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE"
+                )
+            status = str(resolved.get("status") or "").strip().upper()
+            if status == "SELECTED":
+                governance_context = dict(resolved)
+                governance_context_key = ":".join(
+                    [
+                        "SELECTED",
+                        str(resolved.get("release_id") or "UNKNOWN"),
+                        str(resolved.get("source_commit") or "UNKNOWN"),
+                        str(resolved.get("selector_digest") or "UNKNOWN"),
+                    ]
+                )
+            elif status != "ABSENT":
+                raise ProjectMasterHostError(
+                    "PROJECT_GOVERNANCE_CONTEXT_UNAVAILABLE"
+                )
         with self._lock:
             handle = self._handles.get(project_id)
             if (
@@ -3982,6 +4042,7 @@ class ResidentProjectMasterHostManager:
                     not selected_session_ref
                     or handle.session_ref == selected_session_ref
                 )
+                and handle.governance_context_key == governance_context_key
             ):
                 setattr(handle.worker.provider, "connection_state", "REUSED")
                 return {
@@ -4046,7 +4107,10 @@ class ResidentProjectMasterHostManager:
                         runtime_coordinate=self._continuity_coordinate(owner),
                     )
                 ),
-                governance_context_resolver=self.governance_context_resolver,
+                # Resolve once in ensure(); the worker must not reopen Release DB
+                # for every user or room message.
+                governance_context_resolver=None,
+                governance_context=governance_context,
                 room_event_observer=self.room_event_observer,
             )
             host = LiveProjectMasterBridgeHost(
@@ -4077,6 +4141,7 @@ class ResidentProjectMasterHostManager:
                 worker=worker,
                 coordinator=coordinator,
                 thread=thread,
+                governance_context_key=governance_context_key,
             )
             self._handles[project_id] = handle
             try:
@@ -4379,7 +4444,7 @@ class ResidentProjectMasterHostManager:
     ) -> dict[str, Any]:
         active = handle.worker.provider
         state = str(getattr(active, "connection_state", "")).strip().upper()
-        return provider_session_connection(
+        connection = provider_session_connection(
             target_kind="PROJECT_MASTER",
             target_id=handle.project_id,
             requested_mode=str(getattr(active, "requested_mode", "MASTER")),
@@ -4388,6 +4453,21 @@ class ResidentProjectMasterHostManager:
             connection_state=state if state and state != "UNKNOWN" else None,
             model_ref=str(getattr(active, "model", "") or "").strip(),
         )
+        connection["runtime_observation"] = (
+            ProjectMasterConversationWorker._runtime_observation(active)
+        )
+        context = handle.worker.governance_context
+        if context is None:
+            connection["governance_context"] = {"status": "ABSENT"}
+        else:
+            connection["governance_context"] = {
+                "status": "SELECTED",
+                "release_id": context.get("release_id"),
+                "source_commit": context.get("source_commit"),
+                "catalog_digest": context.get("catalog_digest"),
+                "selector_digest": context.get("selector_digest"),
+            }
+        return connection
 
     @staticmethod
     def _default_provider(
