@@ -1108,9 +1108,9 @@ function renderProviderChatSummary() {
   const project = sessionRailProjectIdentity(room);
   const boundSession = supervisorSessionForRoom(room);
   const temporality = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)
-    ? binding.observer_currentness !== "CURRENT"
-      ? "Past"
-      : "Current"
+    ? binding.is_default === true && binding.observer_currentness === "CURRENT"
+      ? "Current"
+      : "Past"
     : "Unbound";
   elements.sessionSummaryTitle.textContent =
     binding.alias || room.display_name || "Session";
@@ -1197,7 +1197,10 @@ function renderSessionRail() {
     const group = projectGroups.get(project.key);
     if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) {
       group.unbound.push(room);
-    } else if (binding.observer_currentness === "CURRENT") {
+    } else if (
+      binding.is_default === true &&
+      binding.observer_currentness === "CURRENT"
+    ) {
       group.current.push(room);
     } else {
       group.past.push(room);
@@ -1226,7 +1229,7 @@ function renderSessionRail() {
     const copy = node("span", "session-rail-copy");
     const anchorLabel =
       isAnchored && binding.current_anchor_ref !== "UNKNOWN"
-        ? `${binding.observer_currentness === "CURRENT" ? "" : "Past · "}${binding.current_anchor_ref}`
+        ? `${binding.is_default === true && binding.observer_currentness === "CURRENT" ? "" : "Past · "}${binding.current_anchor_ref}`
         : isAnchored
           ? binding.alias || `${binding.node} ${binding.mode}`
           : `${room.provider} origin`;
@@ -6159,10 +6162,13 @@ async function submitDispatch(event) {
     }
     renderComposerState();
     renderRoomMessages();
+    const deliveryState = result.message.delivery_state;
     toast(
-      result.message.delivery_state === "DELIVERED_TO_MASTER"
-        ? "Delivered to the registered Project Master"
-        : "Message saved in the Project Room; no Inbox item was created"
+      deliveryState === "ACCEPTED_BY_MASTER"
+        ? "Accepted by the registered Project Master"
+        : deliveryState === "QUEUED_FOR_MASTER"
+          ? "Queued for the registered Project Master"
+          : "Message saved in the Project Room; no Inbox item was created"
     );
     showInspectorTab("activity");
   } catch (error) {

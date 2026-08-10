@@ -253,11 +253,16 @@ def check_live(state_path: Path, project_id: str) -> SmokeReport:
     )
     hs = handoffs.get("handoffs") or []
     if status == 200:
-        delivered = [h for h in hs if h.get("delivery_state") == "DELIVERED_TO_MASTER"]
+        queued = [
+            handoff
+            for handoff in hs
+            if handoff.get("delivery_state")
+            in {"QUEUED_FOR_MASTER", "ACCEPTED_BY_MASTER"}
+        ]
         report.add(
             "master_handoff",
-            "PASS" if delivered else "SKIP",
-            f"total={len(hs)} delivered={len(delivered)}",
+            "PASS" if queued else "SKIP",
+            f"total={len(hs)} queued_or_accepted={len(queued)}",
         )
     else:
         report.add("master_handoff", "FAIL", f"http={status}")

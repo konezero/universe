@@ -1038,6 +1038,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(HTTPStatus.CREATED, status)
+        self.server.session_supervisor.set_default(
+            "session-gcs-master",
+            expected_pointer_version=0,
+        )
 
         def discovered(provider: str) -> list[dict[str, Any]]:
             session_id = {
@@ -1239,7 +1243,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "source_version": "v1",
                     "last_modified_at": (
                         "2026-08-09T00:01:00Z"
-                        if provider == "CLAUDE"
+                        if provider == "CODEX"
                         else "2026-08-09T00:00:00Z"
                     ),
                     "workspace": r"C:\workspace\universe",
@@ -3471,8 +3475,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         self.assertEqual(201, status)
         message = delivered["message"]
-        self.assertEqual("DELIVERED_TO_MASTER", message["delivery_state"])
-        self.assertEqual("DELIVERED", message["delivery"]["status"])
+        self.assertEqual("QUEUED_FOR_MASTER", message["delivery_state"])
+        self.assertEqual("QUEUED_FOR_MASTER", message["delivery"]["status"])
         self.assertEqual(
             bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"]
         )
@@ -3556,6 +3560,75 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("MASTER_BRIDGE_INVALID", result["error_code"])
+
+    def test_master_bridge_started_marks_queued_delivery_accepted(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, registered = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        bridge = registered["bridge"]
+        receipt = {
+            "status": "DELIVERED",
+            "bridge_id": bridge["bridge_id"],
+            "project_id": "GCS",
+            "message_id": "room-placeholder",
+            "delivered_at": "2026-08-10T07:00:00Z",
+        }
+        with patch(
+            "universe_server.HttpProjectMasterBridge.deliver",
+            return_value=receipt,
+        ):
+            status, delivered = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "TASK_DRAFT",
+                    "body": "Run the bounded Master turn.",
+                    "idempotency_key": "room-master-started-001",
+                },
+                self.token,
+            )
+        self.assertEqual(201, status)
+        message = delivered["message"]
+        self.assertEqual("QUEUED_FOR_MASTER", message["delivery_state"])
+
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/stream",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": message["message_id"],
+                    "event": "STARTED",
+                    "sequence": 0,
+                    "delta": "",
+                    "detail": "",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+
+        self.assertEqual(202, status)
+        self.assertEqual("PROJECT_MASTER_STREAM_EVENT_ACCEPTED", result["status"])
+        accepted = next(
+            item
+            for item in self.server.store.list_room_messages("GCS")
+            if item["message_id"] == message["message_id"]
+        )
+        self.assertEqual("ACCEPTED_BY_MASTER", accepted["delivery_state"])
+        self.assertEqual("ACCEPTED_BY_MASTER", accepted["delivery"]["status"])
 
     def test_master_bridge_stream_event_is_authenticated_and_published(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
@@ -4190,7 +4263,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "governance-proposals/task_proposal_test_001/decisions/",
             approved["decision"]["evidence_ref"],
         )
-        self.assertEqual("BUTTON", approved["decision"]["source"])
+        self.assertEqual("NATURAL_LANGUAGE", approved["decision"]["source"])
         self.assertEqual("LOCAL_BROWSER", approved["decision"]["commander_surface"])
         self.assertIn(
             "universe.project-master-governance-approval.v1",
@@ -5438,7 +5511,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         self.assertEqual(200, status)
         self.assertEqual("PROJECT_MASTER_HANDOFF_DELIVERED", delivered["status"])
-        self.assertEqual("DELIVERED_TO_MASTER", delivered["handoff"]["delivery_state"])
+        self.assertEqual("QUEUED_FOR_MASTER", delivered["handoff"]["delivery_state"])
         self.assertIsNotNone(delivered["handoff"]["room_message_id"])
         self.assertEqual(
             bridge["bridge_id"], deliver.call_args.kwargs["bridge"]["bridge_id"]

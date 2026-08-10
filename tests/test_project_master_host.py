@@ -2285,7 +2285,7 @@ class ProjectMasterHostTests(unittest.TestCase):
                 "sender": "UNIVERSE_CONDUCTOR",
                 "body": "What should the Master review next?",
                 "content_digest": "0" * 64,
-                "delivery_state": "DELIVERED_TO_MASTER",
+                "delivery_state": "QUEUED_FOR_MASTER",
                 "created_at": "2026-07-30T00:00:00Z",
             },
         }

@@ -59,6 +59,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("commander_surface", decision_slice)
         self.assertNotIn("idempotency_key", decision_slice)
 
+    def test_project_master_delivery_labels_distinguish_queue_and_acceptance(
+        self,
+    ) -> None:
+        self.assertIn('deliveryState === "QUEUED_FOR_MASTER"', APP)
+        self.assertIn('deliveryState === "ACCEPTED_BY_MASTER"', APP)
+        self.assertNotIn("DELIVERED_TO_MASTER", APP)
+
     def test_browser_does_not_render_raw_provider_paths(self) -> None:
         activity_slice = APP[
             APP.index("function renderProviderActivitySources") :
@@ -73,6 +80,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("sessionRailActivityLabel(room)", rail_slice)
         self.assertIn("room.last_activity_at", APP)
         self.assertIn('["BOUND", "ANCHOR_OBSERVED"]', rail_slice)
+        self.assertIn('binding.is_default === true', rail_slice)
         self.assertIn('binding.observer_currentness === "CURRENT"', rail_slice)
         self.assertNotIn("binding.anchor_temporality", rail_slice)
 

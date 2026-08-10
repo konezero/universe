@@ -381,18 +381,75 @@ class MemoryCandidateApiTests(unittest.TestCase):
         self.assertIn("recovered_at", after["progress"])
         self.assertNotIn("body", json.dumps(after).lower())
 
-    def test_default_project_master_delegation_completes_from_room_reference(self) -> None:
+    def test_project_master_model_override_is_rejected_before_persistence(
+        self,
+    ) -> None:
+        status, rejected = self.request(
+            "POST",
+            "/v1/conductor/delegations",
+            {
+                "project_id": "TEST",
+                "summary": "Use a different model than the resident Master.",
+                "idempotency_key": "delegation-model-override-rejected-1",
+                "model_ref": "other-model",
+            },
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "CONDUCTOR_DELEGATION_MODEL_OVERRIDE_UNSUPPORTED",
+            rejected["error_code"],
+        )
+        self.assertEqual(
+            [],
+            self.server.store.list_conductor_delegations(
+                project_id="TEST",
+                limit=10,
+            ),
+        )
+
+    def test_project_master_provider_mismatch_is_rejected_before_persistence(
+        self,
+    ) -> None:
+        self.server.store.set_provider_setting(
+            "PROJECT_MASTER",
+            "TEST",
+            {"provider": "CODEX"},
+        )
+        status, rejected = self.request(
+            "POST",
+            "/v1/conductor/delegations",
+            {
+                "project_id": "TEST",
+                "summary": "Route this through a different provider.",
+                "idempotency_key": "delegation-provider-mismatch-rejected-1",
+                "provider": "CLAUDE",
+            },
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "CONDUCTOR_DELEGATION_PROVIDER_MISMATCH",
+            rejected["error_code"],
+        )
+        self.assertEqual(
+            [],
+            self.server.store.list_conductor_delegations(
+                project_id="TEST",
+                limit=10,
+            ),
+        )
+
+    def test_project_master_delegation_waits_for_conductor_after_result(self) -> None:
         self.server._conductor_delegation_executor = (
             self.server._dispatch_project_master_delegation
         )
-        delivered = {
+        queued = {
             "schema": "universe.project-room-message.v1",
             "message_id": "room_delegated001",
             "project_id": "TEST",
-            "delivery_state": "DELIVERED_TO_MASTER",
+            "delivery_state": "QUEUED_FOR_MASTER",
         }
         self.server.send_project_room_message = lambda _project, _value: (
-            delivered,
+            queued,
             True,
         )
         delegation, created = self.server.store.create_conductor_delegation(
@@ -409,16 +466,12 @@ class MemoryCandidateApiTests(unittest.TestCase):
         )
         self.assertEqual("RUNNING", running["state"])
         self.assertEqual(
-            "room_delegated001",
-            running["progress"]["project_room_message_id"],
-        )
-        progressed = self.server.store.update_conductor_delegation_progress(
-            delegation["delegation_id"],
-            {"summary": "Project Master is still running", "step": "IN_PROGRESS"},
+            "WAITING_FOR_MASTER_ACCEPTANCE",
+            running["progress"]["step"],
         )
         self.assertEqual(
             "room_delegated001",
-            progressed["progress"]["project_room_message_id"],
+            running["progress"]["project_room_message_id"],
         )
 
         self.server.store.create_room_message(
@@ -439,12 +492,19 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "status": "COMPLETED",
             }
         )
-        completed = self.server.store.get_conductor_delegation(
+        waiting = self.server.store.get_conductor_delegation(
             delegation["delegation_id"]
         )
-        self.assertEqual("COMPLETED", completed["state"])
-        self.assertIn("universe://projects/TEST/room/messages/", completed["result"]["result_ref"])
-        self.assertNotIn("bounded result body", json.dumps(completed))
+        self.assertEqual("RUNNING", waiting["state"])
+        self.assertEqual(
+            "WAITING_FOR_CONDUCTOR_REVIEW",
+            waiting["progress"]["step"],
+        )
+        self.assertEqual({}, waiting["result"])
+        wakeups = self.server.store.list_conductor_room_messages()
+        self.assertEqual(1, len(wakeups))
+        self.assertIn(delegation["delegation_id"], wakeups[0]["body"])
+        self.assertNotIn("bounded result body", json.dumps(waiting))
 
 
 if __name__ == "__main__":

@@ -11541,17 +11541,12 @@ class UniverseStore:
             status="AVAILABLE",
             last_delivery_at=receipt["delivered_at"],
         )
-        delivered = self._update_room_delivery(
+        queued = self._update_room_delivery(
             message,
-            delivery_state="DELIVERED_TO_MASTER",
-            delivery=receipt,
+            delivery_state="QUEUED_FOR_MASTER",
+            delivery={**receipt, "status": "QUEUED_FOR_MASTER"},
         )
-        self.apply_master_message_todo_transition(
-            project_id,
-            delivered["message_id"],
-            outcome="DELIVERED",
-        )
-        return delivered, True
+        return queued, True
 
     def apply_master_message_todo_transition(
         self,
@@ -16253,18 +16248,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }:
                 anchor_groups.setdefault(anchor_key, []).append(row)
         for grouped_rooms in anchor_groups.values():
-            current_room = max(
-                grouped_rooms,
-                key=lambda item: (
-                    str(item.get("last_activity_at") or ""),
-                    str((item.get("binding") or {}).get("state") == "BOUND"),
-                    str(item.get("chat_key") or ""),
-                ),
-            )
+            default_rooms = [
+                row
+                for row in grouped_rooms
+                if (row.get("binding") or {}).get("state") == "BOUND"
+                and (row.get("binding") or {}).get("is_default") is True
+            ]
+            current_room = default_rooms[0] if len(default_rooms) == 1 else None
             for row in grouped_rooms:
                 binding = row.get("binding") or {}
                 binding["observer_currentness"] = (
-                    "CURRENT" if row is current_room else "STALE"
+                    "CURRENT"
+                    if row is current_room
+                    else "PAST"
                 )
 
         rooms_by_anchor: dict[str, dict[str, Any]] = {}
@@ -17262,6 +17258,61 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             },
         )
 
+    def _observe_project_master_stream(self, event: Mapping[str, Any]) -> None:
+        project_id = str(event.get("project_id") or "").strip()
+        message_id = str(event.get("in_reply_to") or "").strip()
+        stream_event = str(event.get("event") or "").strip().upper()
+        if not project_id or not message_id or stream_event != "STARTED":
+            return
+        message = next(
+            (
+                item
+                for item in self.store.list_room_messages(project_id)
+                if item.get("message_id") == message_id
+            ),
+            None,
+        )
+        if message is None or message.get("delivery_state") not in {
+            "QUEUED_FOR_MASTER",
+            "ACCEPTED_BY_MASTER",
+        }:
+            return
+        accepted = self.store._update_room_delivery(
+            message,
+            delivery_state="ACCEPTED_BY_MASTER",
+            delivery={
+                **dict(message.get("delivery") or {}),
+                "status": "ACCEPTED_BY_MASTER",
+                "accepted_at": utc_now(),
+            },
+        )
+        try:
+            self.store.apply_master_message_todo_transition(
+                project_id,
+                accepted["message_id"],
+                outcome="DELIVERED",
+            )
+        except UniverseError:
+            pass
+        matching = [
+            item
+            for item in self.store.list_conductor_delegations(
+                project_id=project_id, state="RUNNING", limit=500
+            )
+            if item.get("progress", {}).get("project_room_message_id") == message_id
+        ]
+        for delegation in matching:
+            progress = self.store.update_conductor_delegation_progress(
+                delegation["delegation_id"],
+                {
+                    "summary": "Project Master accepted the delegated turn.",
+                    "step": "PROJECT_MASTER_RUNNING",
+                    "project_room_message_id": message_id,
+                },
+            )
+            self._publish_conductor_delegation(progress)
+        self.publish_project_room_changed(project_id)
+
     def _observe_project_master_completion(self, event: Mapping[str, Any]) -> None:
         project_id = event.get("project_id")
         message_id = event.get("message_id")
@@ -17318,18 +17369,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             if reply is None:
                 continue
-            resolved = self.store.complete_conductor_delegation(
+            waiting = self.store.update_conductor_delegation_progress(
                 delegation["delegation_id"],
                 {
-                    "result_summary": "Project Master completed delegated work.",
-                    "result_digest": reply.get("content_digest"),
-                    "result_ref": (
-                        f"universe://projects/{quote(project_id, safe='')}/"
-                        f"room/messages/{reply['message_id']}"
+                    "summary": (
+                        "Project Master returned a bounded result; awaiting "
+                        "Conductor review or an explicit terminal result."
                     ),
+                    "step": "WAITING_FOR_CONDUCTOR_REVIEW",
+                    "project_room_message_id": message_id,
                 },
             )
-            self._publish_conductor_delegation(resolved)
+            self._publish_conductor_delegation(waiting)
+            self._wake_conductor_for_delegation(waiting, reply)
 
     def _observe_room_participant_permission(
         self,
@@ -17715,6 +17767,37 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }
         )
 
+    def _wake_conductor_for_delegation(
+        self,
+        delegation: Mapping[str, Any],
+        reply: Mapping[str, Any],
+    ) -> None:
+        """Queue one bounded, durable native turn when a Master result arrives."""
+
+        project_id = _project_id(delegation.get("project_id"))
+        delegation_id = _required_text(
+            delegation.get("delegation_id"), "delegation_id"
+        )
+        reply_id = _required_text(reply.get("message_id"), "reply.message_id")
+        message, created = self.store.create_conductor_room_message(
+            {
+                "kind": "STATUS",
+                "sender": "UNIVERSE_SYSTEM",
+                "body": (
+                    "A Project Master result is ready for the delegated work "
+                    f"{delegation_id} in {project_id}. Inspect the bounded "
+                    f"result reference universe://projects/{quote(project_id, safe='')}/"
+                    f"room/messages/{reply_id} and continue only within the "
+                    "existing approval boundary."
+                ),
+                "idempotency_key": (
+                    f"conductor-delegation-result:{delegation_id}:{reply_id}"
+                ),
+            }
+        )
+        if created:
+            self.enqueue_conductor_message(message["message_id"])
+
     def _conductor_delegation_worker_loop(self) -> None:
         while not self._conductor_delegation_stop.is_set():
             delegation_id = self._conductor_delegation_queue.get()
@@ -17802,17 +17885,41 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 progress_value,
             )
             self._publish_conductor_delegation(progress)
-            room_message_id = progress.get("progress", {}).get(
-                "project_room_message_id"
-            )
-            if room_message_id:
-                self._resolve_project_master_delegation(
-                    {
-                        "project_id": progress["project_id"],
-                        "message_id": room_message_id,
-                        "status": "COMPLETED",
-                    }
+            # A persisted bridge enqueue is not a Provider completion. The
+            # Master stream observer or a terminal result resolves this later.
+
+    def preflight_conductor_delegation(self, value: Any) -> dict[str, Any]:
+        request = normalize_conductor_delegation(value)
+        resolved_provider: str | None = None
+        if request["worker_role"] == "PROJECT_MASTER":
+            if request["model_ref"]:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_MODEL_OVERRIDE_UNSUPPORTED",
+                    "Project Master delegation uses the Project's resident model setting",
+                    HTTPStatus.CONFLICT,
                 )
+            configured_provider = self.store.provider_setting(
+                "PROJECT_MASTER",
+                request["project_id"],
+            )["provider"]
+            resolved_provider = (
+                configured_provider if configured_provider != "AUTO" else None
+            )
+            requested_provider = request["provider"]
+            if (
+                requested_provider != "AUTO"
+                and resolved_provider is not None
+                and requested_provider != resolved_provider
+            ):
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_PROVIDER_MISMATCH",
+                    "delegation provider does not match the resident Project Master",
+                    HTTPStatus.CONFLICT,
+                )
+        return {
+            "request": request,
+            "resolved_provider": resolved_provider,
+        }
 
     def _dispatch_project_master_delegation(
         self, record: Mapping[str, Any]
@@ -17856,16 +17963,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 ),
             },
         )
-        if message.get("delivery_state") != "DELIVERED_TO_MASTER":
+        if message.get("delivery_state") not in {
+            "QUEUED_FOR_MASTER",
+            "ACCEPTED_BY_MASTER",
+        }:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_MASTER_UNAVAILABLE",
-                "Project Master did not accept the delegated message",
+                "Project Master bridge did not retain the delegated message",
                 HTTPStatus.CONFLICT,
             )
         return {
             "progress": {
-                "summary": "Delegated work is running in the Project Master.",
-                "step": "PROJECT_MASTER_RUNNING",
+                "summary": "Delegation is queued for Project Master acceptance.",
+                "step": "WAITING_FOR_MASTER_ACCEPTANCE",
                 "project_room_message_id": message["message_id"],
             }
         }
@@ -19459,7 +19569,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 "/v1/conductor/delegations",
                 "/v1/conductor-room/delegations",
             }:
-                delegation, created = self.server.store.create_conductor_delegation(body)
+                preflight = self.server.preflight_conductor_delegation(body)
+                delegation, created = self.server.store.create_conductor_delegation(
+                    body
+                )
                 if created:
                     self.server.enqueue_conductor_delegation(
                         delegation["delegation_id"]
@@ -19473,6 +19586,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             if created
                             else "CONDUCTOR_DELEGATION_ALREADY_QUEUED"
                         ),
+                        "resolved_provider": preflight["resolved_provider"],
                         "delegation": delegation,
                     },
                 )
@@ -20634,9 +20748,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "proposal_digest": (body or {}).get("proposal_digest"),
                     },
                     commander_context=self._direct_commander_context(
-                        source="BUTTON",
+                        source="NATURAL_LANGUAGE",
                         input_ref=(
-                            "universe://commander-actions/governance/"
+                            "universe://commander-actions/direct-api/governance/"
                             + quote(proposal_id, safe="")
                         ),
                     ),
@@ -20652,9 +20766,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "proposal_digest": (body or {}).get("proposal_digest"),
                     },
                     commander_context=self._direct_commander_context(
-                        source="BUTTON",
+                        source="NATURAL_LANGUAGE",
                         input_ref=(
-                            "universe://commander-actions/governance/"
+                            "universe://commander-actions/direct-api/governance/"
                             + quote(governance_parts[1], safe="")
                         ),
                     ),
@@ -20826,6 +20940,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     stream_event["bridge_id"],
                     credential,
                 )
+                self.server._observe_project_master_stream(stream_event)
                 published = self.server.project_room_events.publish(
                     parts[0],
                     {
