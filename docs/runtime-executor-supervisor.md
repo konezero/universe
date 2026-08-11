@@ -31,11 +31,14 @@ The durable store and provider-owned lease registration are implemented in:
 
 The regression suite is `tests/test_runtime_executor_supervisor.py`.
 
-The HTTP adopt/stop route and resident server shutdown hook are intentionally
-separate from this slice. The installed Runtime mutation gateway currently
-limits one JSON mutation envelope to 1 MiB; the existing `tools/universe_server.py`
-is larger than that envelope after Base64 transport. The route wiring must wait
-for the incremental/streaming file mutation transport rather than bypassing
-the governed write boundary.
+The resident Universe service exposes guarded `/v1/supervisor/executors/adopt`
+and `/v1/supervisor/executors/stop` routes. `server_close()` requests graceful
+shutdown for all adopted Runtime executors and releases leases only after
+Supervisor-observed process absence. No raw PID fallback is used.
 
-Verification on 2026-08-11: the focused Supervisor/provider suite passed 84 tests with 9 subtests, the full regression passed 597 tests with 40 subtests, and Ruff passed for every changed module. Repository-wide Ruff still reports 11 pre-existing unused imports in `tools/universe_server.py`; those edits are intentionally deferred until the streaming mutation transport is installed.
+Verification on 2026-08-11: the focused Supervisor/provider suite passed 84 tests
+with 9 subtests; the focused server suite passed 144 tests with 8 subtests,
+and the guarded route regression passed separately. The full regression passed
+598 tests with 40 subtests. Ruff passed for `tests/test_universe_server.py`;
+`tools/universe_server.py` still reports 11 pre-existing unused imports,
+which remain outside this stabilization slice.

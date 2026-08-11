@@ -2135,6 +2135,66 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PROJECT", project["snapshot"]["scope_kind"])
         self.assertEqual("CODEX", project["snapshot"]["provider"])
 
+    def test_runtime_executor_adopt_and_stop_routes_are_managed(self) -> None:
+        identity = {
+            "pid": 4242,
+            "process_created_at": "2026-08-11T12:00:00Z",
+            "executable": "C:/Tools/python.exe",
+            "command": ["C:/Tools/python.exe", "session-boot", "serve"],
+            "endpoint": "http://127.0.0.1:58333",
+            "handshake_fingerprint": hashlib.sha256(b"runtime-handshake").hexdigest(),
+        }
+        observations = []
+
+        def observe(pid: int, created: str) -> dict[str, object]:
+            observations.append((pid, created))
+            if len(observations) <= 2:
+                return {
+                    "status": "PROCESS_PRESENT_EXACT",
+                    "pid": pid,
+                    "process_created_at": created,
+                }
+            return {
+                "status": "ORIGINAL_PROCESS_ABSENT",
+                "reason": "TEST_PROCESS_EXITED",
+                "pid": pid,
+                "expected_process_created_at": created,
+            }
+
+        self.server.session_supervisor.process_observer = observe
+        status, adopted = self.request(
+            "POST",
+            "/v1/supervisor/executors/adopt",
+            {
+                "session": {
+                    "session_id": "runtime-executor-api",
+                    "node": "universe",
+                    "mode": "MASTER",
+                    "provider": "RUNTIME",
+                    "provider_session_ref": "runtime-boot-api",
+                    "anchor_ref": "MASTER-CURRENT-API-001",
+                },
+                "process_identity": identity,
+                "stop_capability": "runtime-stop-secret",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("RUNTIME_EXECUTOR_ADOPTED", adopted["status"])
+        with patch(
+            "universe_service_control.request_graceful_shutdown",
+            return_value={"status": "SERVICE_SHUTDOWN_ACCEPTED"},
+        ):
+            status, stopped = self.request(
+                "POST",
+                "/v1/supervisor/executors/stop",
+                {"session_id": "runtime-executor-api", "timeout_seconds": 1},
+                self.token,
+            )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("RUNTIME_EXECUTOR_STOPPED", stopped["status"])
+        self.assertFalse(stopped["result"]["destructive_fallback_performed"])
+
     def test_supervisor_session_registry_and_reconcile_api(self) -> None:
         status, registered = self.request(
             "POST",

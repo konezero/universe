@@ -18956,6 +18956,171 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     # Settings may have disabled or shortened interval.
                     break
 
+    def adopt_runtime_executor(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Adopt one official Session Boot executor into the resident Supervisor."""
+
+        if not isinstance(body, Mapping):
+            raise SessionSupervisorError(
+                "SESSION_SUPERVISOR_REQUEST_INVALID",
+                "runtime executor adoption body must be an object",
+            )
+        return self.session_supervisor.adopt_runtime_executor(
+            body.get("session"),
+            body.get("process_identity"),
+            stop_capability=body.get("stop_capability"),
+        )
+
+    def stop_supervised_runtime_executor(
+        self,
+        session_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        """Gracefully stop one adopted runtime executor without raw process kill."""
+
+        normalized_id = _required_text(session_id, "session_id")
+        session = self.session_supervisor.get_session(normalized_id)
+        if session.get("provider") != "RUNTIME":
+            raise SessionSupervisorError(
+                "RUNTIME_EXECUTOR_PROVIDER_REQUIRED",
+                "managed runtime stop requires provider=RUNTIME",
+                status=409,
+            )
+        lease = session.get("process_lease")
+        if not isinstance(lease, Mapping):
+            raise SessionSupervisorError(
+                "PROCESS_LEASE_NOT_FOUND",
+                "runtime executor has no process lease",
+                status=404,
+            )
+        lease_state = str(lease.get("lease_state") or "")
+        lease_version = int(lease.get("lease_version", 0))
+        if lease_state == "STOP_AUTHORIZED":
+            authorization = {
+                "schema": "universe.session-supervisor.v1",
+                "status": "MANAGED_STOP_AUTHORIZED",
+                "session_id": normalized_id,
+                "lease_version": lease_version,
+                "process_observation": {"status": "REUSED_AUTHORIZATION"},
+            }
+        else:
+            authorization = self.session_supervisor.authorize_managed_stop(
+                normalized_id,
+                expected_lease_version=lease_version,
+            )
+            lease_version = int(authorization["lease_version"])
+        capability = self.session_supervisor.get_stop_capability(normalized_id)
+        if not capability:
+            raise SessionSupervisorError(
+                "PROCESS_STOP_CAPABILITY_UNAVAILABLE",
+                "runtime executor graceful-stop capability cannot be recovered",
+                status=503,
+            )
+        identity = lease.get("process_identity")
+        if not isinstance(identity, Mapping):
+            raise SessionSupervisorError(
+                "PROCESS_LEASE_IDENTITY_UNAVAILABLE",
+                "runtime executor process identity is unavailable",
+                status=503,
+            )
+        from universe_service_control import request_graceful_shutdown
+
+        shutdown = request_graceful_shutdown(
+            str(identity.get("endpoint") or ""),
+            capability,
+            timeout=min(5.0, max(0.1, float(timeout_seconds))),
+        )
+        if not isinstance(shutdown, Mapping) or shutdown.get("status") != "SERVICE_SHUTDOWN_ACCEPTED":
+            return {
+                "schema": "universe.session-supervisor.v1",
+                "status": "RUNTIME_EXECUTOR_STOP_REQUEST_FAILED",
+                "session_id": normalized_id,
+                "lease_version": lease_version,
+                "shutdown": dict(shutdown) if isinstance(shutdown, Mapping) else None,
+                "destructive_fallback_performed": False,
+            }
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        absence: Mapping[str, Any] | None = None
+        while time.monotonic() < deadline:
+            observation = self.session_supervisor.process_observer(
+                int(identity["pid"]), str(identity["process_created_at"])
+            )
+            if isinstance(observation, Mapping) and observation.get("status") == "ORIGINAL_PROCESS_ABSENT":
+                absence = dict(observation)
+                break
+            time.sleep(0.15)
+        if absence is None:
+            return {
+                "schema": "universe.session-supervisor.v1",
+                "status": "RUNTIME_EXECUTOR_STOP_PENDING",
+                "session_id": normalized_id,
+                "lease_version": lease_version,
+                "shutdown": dict(shutdown),
+                "destructive_fallback_performed": False,
+            }
+        completed = self.session_supervisor.complete_managed_stop(
+            normalized_id,
+            expected_lease_version=lease_version,
+        )
+        return {
+            "schema": "universe.session-supervisor.v1",
+            "status": "RUNTIME_EXECUTOR_STOPPED",
+            "session_id": normalized_id,
+            "authorization": authorization,
+            "shutdown": dict(shutdown),
+            "absence_observation": absence,
+            "session": completed,
+            "destructive_fallback_performed": False,
+        }
+
+    def stop_supervised_runtime_executors(
+        self,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        """Stop all adopted runtime executors during resident service shutdown."""
+
+        results: list[dict[str, Any]] = []
+        for session in self.session_supervisor.list_sessions(include_hidden=True):
+            if str(session.get("provider") or "").upper() != "RUNTIME":
+                continue
+            lease = session.get("process_lease")
+            if not isinstance(lease, Mapping) or str(lease.get("lease_state")) not in {
+                "OWNED",
+                "STOP_AUTHORIZED",
+            }:
+                continue
+            try:
+                results.append(
+                    self.stop_supervised_runtime_executor(
+                        str(session["session_id"]),
+                        timeout_seconds=timeout_seconds,
+                    )
+                )
+            except SessionSupervisorError as error:
+                results.append(
+                    {
+                        "status": "RUNTIME_EXECUTOR_STOP_FAILED",
+                        "session_id": session.get("session_id"),
+                        "error_code": error.code,
+                        "detail": error.detail,
+                        "destructive_fallback_performed": False,
+                    }
+                )
+        failed = [
+            item
+            for item in results
+            if item.get("status") != "RUNTIME_EXECUTOR_STOPPED"
+        ]
+        return {
+            "schema": "universe.session-supervisor.v1",
+            "status": "RUNTIME_EXECUTORS_STOPPED" if not failed else "RUNTIME_EXECUTORS_STOP_INCOMPLETE",
+            "results": results,
+            "stopped_count": len(results) - len(failed),
+            "failed_count": len(failed),
+            "destructive_fallback_performed": False,
+        }
+
     def server_close(self) -> None:
         self._shutdown_errors: list[dict[str, str]] = []
 
@@ -18988,6 +19153,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             close_step(
                 "memory_maintenance_worker",
                 lambda: self._maintain_worker.join(timeout=5),
+            )
+        runtime_executor_shutdown = self.stop_supervised_runtime_executors()
+        if runtime_executor_shutdown["failed_count"]:
+            self._shutdown_errors.append(
+                {
+                    "component": "runtime_executors",
+                    "error": json.dumps(runtime_executor_shutdown, sort_keys=True),
+                }
             )
         self.conductor_permissions.cancel_all()
         self._conductor_stop.set()
@@ -20172,6 +20345,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if (
             path == "/v1/supervisor/sessions"
             or path == "/v1/supervisor/sessions/cleanup"
+            or path in {
+                "/v1/supervisor/executors/adopt",
+                "/v1/supervisor/executors/stop",
+            }
             or privileged_supervisor_match is not None
             or path == "/v1/sessions"
             or privileged_session_match is not None
@@ -20179,6 +20356,41 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self._read_json()
+            if path == "/v1/supervisor/executors/adopt":
+                result = self.server.adopt_runtime_executor(body)
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "RUNTIME_EXECUTOR_ADOPTED",
+                        "result": result,
+                    },
+                )
+                return
+            if path == "/v1/supervisor/executors/stop":
+                if not isinstance(body, Mapping):
+                    raise SessionSupervisorError(
+                        "SESSION_SUPERVISOR_REQUEST_INVALID",
+                        "runtime executor stop body must be an object",
+                    )
+                result = self.server.stop_supervised_runtime_executor(
+                    body.get("session_id"),
+                    timeout_seconds=body.get("timeout_seconds", 5.0),
+                )
+                status = (
+                    HTTPStatus.OK
+                    if result.get("status") == "RUNTIME_EXECUTOR_STOPPED"
+                    else HTTPStatus.ACCEPTED
+                )
+                self._send(
+                    status,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": result.get("status"),
+                        "result": result,
+                    },
+                )
+                return
             if path == "/v1/settings/memory-batch-config":
                 if not isinstance(body, Mapping):
                     raise UniverseError(
@@ -20464,6 +20676,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         session_id,
                         body.get("process_identity"),
                         expected_lease_version=body.get("expected_lease_version", 0),
+                        stop_capability=body.get("stop_capability"),
                     )
                 elif operation == "default":
                     result = self.server.session_supervisor.set_default(
