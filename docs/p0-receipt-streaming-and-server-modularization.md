@@ -20,9 +20,10 @@ Progress at 2026-08-10:
 - Universe connection/auth/HTTP transport, SSE hubs, and Memory batch
   configuration service: extracted behind the compatibility entrypoint with
   dedicated unit contracts.
-- Bench aggregation is now extracted to `tools/universe_app/bench_service.py`
-  behind the legacy server entrypoint, with focused contract coverage.
-- Regression: focused Bench/server 120 tests + 8 subtests and full 600 tests +
+- Bench aggregation and comparison are now extracted to
+  `tools/universe_app/bench_service.py` behind the legacy server entrypoint,
+  with focused contract coverage.
+- Regression: focused Bench/server 121 tests + 8 subtests and full 601 tests +
   40 subtests; all passed on 2026-08-11.
 - Remaining extraction: Memory execution, Bench persistence, Session/Provider,
   storage, API routes, and CLI/bootstrap boundaries.
