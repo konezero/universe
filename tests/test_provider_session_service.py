@@ -1,0 +1,416 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+import threading
+import time
+import unittest
+from typing import Any, Callable, Mapping
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+from universe_app.provider_session_service import (  # noqa: E402
+    ProviderSessionError,
+    ProviderSessionService,
+)
+
+
+CHAT_KEY = "provider_chat_0123456789abcdef01234567"
+
+
+class FakeCoordinateStore:
+    def __init__(self) -> None:
+        self.observed: list[tuple[str, str]] = []
+
+    def observe_provider_session(self, provider: str, session_ref: str) -> None:
+        self.observed.append((provider, session_ref))
+
+
+class FakeProviderHost:
+    def __init__(
+        self,
+        requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> None:
+        self.requester = requester
+        self.store = FakeCoordinateStore()
+        self.closed = False
+        self.prepared: list[str] = []
+        self.permission_waiting = False
+        self.status_calls = 0
+
+    def set_permission_requester(
+        self, requester: Callable[[Mapping[str, Any]], str | None]
+    ) -> None:
+        self.requester = requester
+
+    def prepare(self, provider: str) -> Mapping[str, Any]:
+        self.prepared.append(provider)
+        return self.status()
+
+    def status(self) -> Mapping[str, Any]:
+        self.status_calls += 1
+        if self.permission_waiting:
+            raise AssertionError("snapshot must not call host.status during permission")
+        return {
+            "connection_state": "REUSED" if self.prepared else "STORED",
+            "resident": bool(self.prepared),
+            "requested_mode": "MASTER",
+            "last_provider": "CODEX",
+            "last_session_ref": "provider-secret-session-ref",
+            "target_kind": "LOCAL_PATH",
+            "target_id": "provider-secret-session-ref",
+            "model_ref": "luna",
+            "runtime_observation": {
+                "schema": "universe.provider-runtime-observation.v1",
+                "provider": "CODEX",
+                "session_ref": "provider-secret-session-ref",
+                "state": "READY",
+                "quota_state": "AVAILABLE",
+                "rate_limit_status": "allowed",
+                "usage": {"input_tokens": 10, "private": "drop-me"},
+            },
+        }
+
+    def reply_stream(
+        self,
+        provider: str,
+        message: Mapping[str, Any],
+        on_delta: Callable[[str], None],
+    ) -> Mapping[str, Any]:
+        if str(message["body"]).startswith("permission"):
+            self.permission_waiting = True
+            try:
+                request_id = (
+                    "permission-001"
+                    if message["body"] == "permission"
+                    else str(message["body"])
+                )
+                selected = self.requester(
+                    {
+                        "request_id": request_id,
+                        "provider": provider,
+                        "session_id": "provider-secret-session-ref",
+                        "tool_call": {"title": "Read project"},
+                        "options": [
+                            {
+                                "optionId": "allow-once",
+                                "name": "Allow once",
+                                "kind": "allow_once",
+                            },
+                            {
+                                "optionId": "reject-once",
+                                "name": "Reject",
+                                "kind": "reject_once",
+                            },
+                        ],
+                    }
+                )
+            finally:
+                self.permission_waiting = False
+            text = f"selected:{selected or 'none'}"
+            on_delta(text)
+            return {"text": text, "session_ref": "provider-secret-session-ref"}
+        on_delta("hello ")
+        on_delta("world")
+        return {"text": "hello world", "session_ref": "provider-secret-session-ref"}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ProviderSessionServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.hosts: list[FakeProviderHost] = []
+        self.descriptor_overrides: dict[str, Any] = {}
+
+        def resolver(chat_key: str) -> Mapping[str, Any]:
+            return {
+                "chat_key": chat_key,
+                "provider": "CODEX",
+                "provider_session_ref": "provider-secret-session-ref",
+                "project_id": "universe",
+                "node": "universe",
+                "mode": "MASTER",
+                "repository_root": r"C:\workspace\universe",
+                "current_anchor_ref": "MASTER-CURRENT-TEST",
+                "alias": "Universe Master",
+                "model_ref": "luna",
+                "session_kind": "CHAT",
+                "identity_state": "VERIFIED",
+                **self.descriptor_overrides,
+            }
+
+        def host_factory(
+            _descriptor: Mapping[str, Any],
+            requester: Callable[[Mapping[str, Any]], str | None],
+        ) -> FakeProviderHost:
+            host = FakeProviderHost(requester)
+            self.hosts.append(host)
+            return host
+
+        self.resolver = resolver
+        self.host_factory = host_factory
+        self.service = self._new_service()
+
+    def _new_service(
+        self,
+        *,
+        retained_idempotency: int | None = None,
+        retained_permissions: int | None = None,
+    ) -> ProviderSessionService:
+        return ProviderSessionService(
+            resolver=self.resolver,
+            host_factory=self.host_factory,
+            permission_timeout_seconds=2,
+            retained_idempotency=retained_idempotency,
+            retained_permissions=retained_permissions,
+        )
+
+    def tearDown(self) -> None:
+        self.service.close()
+
+    def test_direct_turn_streams_without_room_queue_or_secret_projection(self) -> None:
+        accepted = self.service.submit(
+            CHAT_KEY,
+            {"body": "hello", "idempotency_key": "turn-001"},
+        )
+        self.assertEqual("PROVIDER_SESSION_INPUT_ACCEPTED", accepted["status"])
+        self.assertFalse(accepted["room_queue_used"])
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual(["USER", "ASSISTANT"], [m["role"] for m in snapshot["messages"]])
+        self.assertEqual("hello world", snapshot["messages"][-1]["body"])
+        self.assertEqual("COMPLETED", snapshot["messages"][-1]["state"])
+        self.assertEqual(
+            [("CODEX", "provider-secret-session-ref")],
+            self.hosts[0].store.observed,
+        )
+        public = json.dumps(snapshot)
+        self.assertNotIn("provider-secret-session-ref", public)
+        self.assertNotIn("repository_root", public)
+        self.assertNotIn("source_path", public)
+        self.assertNotIn("session_ref", public)
+        self.assertNotIn("drop-me", public)
+        self.assertEqual(
+            {"input_tokens": 10},
+            snapshot["connection"]["runtime_observation"]["usage"],
+        )
+        self.assertFalse(snapshot["room_queue_used"])
+
+    def test_permission_round_trip_is_scoped_to_opaque_chat_key(self) -> None:
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "permission", "idempotency_key": "turn-permission"},
+        )
+        deadline = time.monotonic() + 2
+        pending: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            permissions = self.service.snapshot(CHAT_KEY)["permissions"]
+            if permissions:
+                pending = permissions[0]
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual("PROVIDER_SESSION", pending["scope_kind"])
+        self.assertNotIn("session_id", pending)
+        self.assertEqual(1, self.hosts[0].status_calls)
+
+        resolved, changed = self.service.resolve_permission(
+            CHAT_KEY,
+            pending["request_id"],
+            "allow-once",
+        )
+        self.assertTrue(changed)
+        self.assertEqual("RESOLVED", resolved["state"])
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        self.assertEqual(
+            "selected:allow-once",
+            self.service.snapshot(CHAT_KEY)["messages"][-1]["body"],
+        )
+
+    def test_unverified_and_worker_targets_fail_closed(self) -> None:
+        base = self.service.resolver
+
+        def worker(chat_key: str) -> Mapping[str, Any]:
+            return {**base(chat_key), "session_kind": "WORKER"}
+
+        self.service.resolver = worker
+        with self.assertRaisesRegex(ProviderSessionError, "workers"):
+            self.service.snapshot(CHAT_KEY)
+
+        def unverified(chat_key: str) -> Mapping[str, Any]:
+            return {**base(chat_key), "identity_state": "UNKNOWN"}
+
+        self.service.resolver = unverified
+        with self.assertRaisesRegex(ProviderSessionError, "not verified"):
+            self.service.snapshot(CHAT_KEY)
+
+    def test_duplicate_idempotency_returns_same_turn(self) -> None:
+        first = self.service.submit(
+            CHAT_KEY,
+            {"body": "hello", "idempotency_key": "same-turn"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        second = self.service.submit(
+            CHAT_KEY,
+            {"body": "different", "idempotency_key": "same-turn"},
+        )
+        self.assertEqual(first["message"]["message_id"], second["message"]["message_id"])
+        self.assertEqual(2, len(self.service.snapshot(CHAT_KEY)["messages"]))
+
+    def test_concurrent_submit_is_busy_before_worker_thread_starts(self) -> None:
+        original_start = threading.Thread.start
+        provider_start_entered = threading.Event()
+        release_provider_start = threading.Event()
+        delayed = False
+
+        def delayed_start(thread: threading.Thread) -> None:
+            nonlocal delayed
+            if thread.name.startswith("provider-session-") and not delayed:
+                delayed = True
+                provider_start_entered.set()
+                release_provider_start.wait(2)
+            original_start(thread)
+
+        first_errors: list[BaseException] = []
+
+        def first_submit() -> None:
+            try:
+                self.service.submit(
+                    CHAT_KEY,
+                    {"body": "first", "idempotency_key": "concurrent-first"},
+                )
+            except BaseException as error:  # noqa: BLE001 - test captures thread error
+                first_errors.append(error)
+
+        with patch.object(threading.Thread, "start", delayed_start):
+            caller = threading.Thread(target=first_submit, name="first-submit-caller")
+            caller.start()
+            self.assertTrue(provider_start_entered.wait(1))
+            try:
+                with self.assertRaises(ProviderSessionError) as raised:
+                    self.service.submit(
+                        CHAT_KEY,
+                        {"body": "second", "idempotency_key": "concurrent-second"},
+                    )
+                self.assertEqual("PROVIDER_SESSION_BUSY", raised.exception.code)
+            finally:
+                release_provider_start.set()
+            caller.join(timeout=2)
+
+        self.assertFalse(caller.is_alive())
+        self.assertEqual([], first_errors)
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        self.assertEqual(2, len(self.service.snapshot(CHAT_KEY)["messages"]))
+
+    def test_model_change_replaces_idle_handle_and_closes_previous_host(self) -> None:
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "first", "idempotency_key": "model-first"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        first_host = self.hosts[0]
+
+        self.descriptor_overrides["model_ref"] = "terra"
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "second", "idempotency_key": "model-second"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+
+        self.assertTrue(first_host.closed)
+        self.assertEqual(2, len(self.hosts))
+        self.assertEqual("terra", self.service.snapshot(CHAT_KEY)["target"]["model_ref"])
+
+    def test_close_cancels_pending_permission_without_hanging(self) -> None:
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "permission-close", "idempotency_key": "permission-close"},
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if self.service.snapshot(CHAT_KEY)["permissions"]:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("permission request did not become pending")
+
+        closer = threading.Thread(target=self.service.close, name="service-close-test")
+        closer.start()
+        closer.join(timeout=2)
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(self.hosts[0].closed)
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+
+    def test_restart_reselects_exact_provider_coordinate_without_public_leak(self) -> None:
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "before", "idempotency_key": "restart-before"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        self.service.close()
+
+        self.service = self._new_service()
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "after", "idempotency_key": "restart-after"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        restarted = self.hosts[-1]
+        self.assertEqual(
+            [("CODEX", "provider-secret-session-ref")],
+            restarted.store.observed,
+        )
+        self.assertNotIn(
+            "provider-secret-session-ref",
+            json.dumps(self.service.snapshot(CHAT_KEY)),
+        )
+
+    def test_process_local_idempotency_and_permission_history_are_bounded(self) -> None:
+        self.service.close()
+        self.service = self._new_service(
+            retained_idempotency=2,
+            retained_permissions=2,
+        )
+        for index in range(3):
+            self.service.submit(
+                CHAT_KEY,
+                {
+                    "body": f"turn-{index}",
+                    "idempotency_key": f"bounded-turn-{index}",
+                },
+            )
+            self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        self.assertLessEqual(len(self.service._idempotency), 2)
+
+        for index in range(3):
+            request_id = f"permission-{index}"
+            self.service.submit(
+                CHAT_KEY,
+                {"body": request_id, "idempotency_key": f"bounded-{request_id}"},
+            )
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                pending = [
+                    item
+                    for item in self.service.snapshot(CHAT_KEY)["permissions"]
+                    if item["request_id"] == request_id and item["state"] == "PENDING"
+                ]
+                if pending:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail(f"{request_id} did not become pending")
+            self.service.resolve_permission(CHAT_KEY, request_id, "reject-once")
+            self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        self.assertLessEqual(len(self.service._permissions), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

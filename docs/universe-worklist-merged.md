@@ -77,7 +77,7 @@ universe 프로젝트 시드 예: install_mode 구현 Todo, packaging/E2E/Memory
 
 | 항목 | 수준 | 비고 |
 |------|------|------|
-| Live Session Room + 증분 Multi-Room 라우팅 | **ROOM_PERMISSION_DONE / MEETING_AUTOMATION_NEXT** | 정본 `docs/live-session-room-routing.md`. ordered Room event/cursor, non-replay, Codex/Claude/Grok resident Project Master 및 명시적으로 연결된 외부 Room participant 증분 입력, provider delta/final 관측, Room-scoped permission 결정, 연결 해제와 resume 좌표 불일치 fail-closed 완료. 자동 debate loop가 후속 |
+| Live Session Room + 증분 Multi-Room 라우팅 | **PARTIAL / DIRECT_PROVIDER_INPUT_IMPLEMENTED** | 정본 `docs/live-session-room-routing.md`. ordered Room event/cursor, non-replay, resident Project Master/Room participant 증분 전달, provider tail, permission, disconnect 경계와 1:1 `PROVIDER_SESSION` native input/SSE 제품 경로가 구현됨. Room queue와 직접 Provider 입력은 분리되며 실제 Claude resident turn으로 검증됨. provider-supported mobile attach/relay, 모든 Provider의 장시간 복구, 자동 debate loop는 후속 |
 | Todo UI 완성: 프로젝트/Node 연결, 편집, 우선순위 | **PARTIAL** → 개선 | CRUD·필터·draft + priority filter + **Seed worklist**. Todo는 사용자 열람/정리·지시 참고용 (Master queue/전달 경로 없음). Plan handoff Deliver는 별도 표면 |
 | UI 지도/컨트롤 정비: 그래프/선택/Inspector/대화창, 모바일 반응형 | **PARTIAL** → 개선 | 뷰 전환 노출, pan/zoom/fit, Inspector 프로젝트 상시(닫기 가능), Conversation 대상 라벨, Esc, 모바일 toolbar/hint polish |
 | 제품화 패키지: 트레이, 자동 시작, 설치 프로그램, 서버 상태/재시작, 설정 화면 | **PARTIAL** → 3 | CLI + tray + portable + **embed Python** (`--with-python`) + per-user install script. Signed MSI/MSIX 미착수 |
@@ -202,10 +202,12 @@ Completed locally:
   completed `PASS / VERIFIED` and the service returned to `READY`.
 - Service shutdown grace now covers resident-provider cleanup, preventing a
   completed shutdown from being misreported as `STOP_TIMEOUT`.
-- Desktop live visual smoke: Session Observatory, Provider worker bindings,
-  Worker Bench, and chat/map layout rendered with no fresh-page console warning
-  or error. A 390 x 844 mobile viewport also rendered without page-level
-  horizontal overflow; responsive contract tests retain the regression guard.
+- The 2026-08-10 desktop live visual smoke claim is **invalidated and reopened**.
+  It used an ad hoc fixed-port server backed by temporary state; the static shell
+  outlived its database and server cleanup did not terminate the real child.
+  Responsive source contracts remain useful, but product-browser completion now
+  requires resident-service identity, `/health`, core API, console, and process
+  lifecycle evidence. See `docs/completion-evidence-audit-2026-08-11.md`.
 
 External or deliberately deferred:
 
@@ -222,10 +224,11 @@ Approved plan: `docs/p0-receipt-streaming-and-server-modularization.md`.
 - [x] Commit Runtime source `1b882d40842abc93646745bc62b95c7f82e465e7`, OS_UPDATE Universe (PASS/VERIFIED; validation `16ba3f04d...`), and dogfood large CREATE/MODIFY, interrupted streams, digest mismatch, stale preimage, expiry, replay, and cleanup.
 - [x] Extract pure Bench aggregation and comparison into `tools/universe_app/bench_service.py` and preserve the existing UniverseStore/API contract with focused tests.
 - [x] Move Skill observation and Project observation queue SQL persistence behind `tools/universe_app/bench_repository.py`; preserve UniverseStore/API/SQLite contracts with repository tests.
-- [ ] Continue extracting `tools/universe_server.py`; connection/auth/HTTP transport, SSE hubs, Memory batch configuration/execution, and Bench aggregation/persistence are extracted, while Bench schema/bootstrap, Session/Provider, storage, API/runtime/CLI remain.
-- [x] Maintain changed-module, smoke, API/DB contract, and full regression tiers; Memory execution coverage and full `605 passed, 40 subtests` passed on 2026-08-11.
+- [ ] Continue extracting `tools/universe_server.py`; connection/auth/HTTP transport, SSE hubs, Memory batch configuration/execution, Bench aggregation/persistence, and the direct Provider Session service are extracted, while Bench schema/bootstrap, Session Supervisor/catalog, project storage, and remaining API/runtime/CLI surfaces remain.
+- [x] Maintain changed-module, smoke, API/DB contract, and full regression tiers; `changed 44`, `smoke 40`, `contract 83`, and full `625 passed` completed on 2026-08-11. This is source/contract evidence only.
 - [x] Give the tray/supervisor durable ownership of every Session Boot executor: the Supervisor store retains exact process identity and a Windows-DPAPI-protected graceful-stop capability, Conductor/Project Master leases persist it, and the resident service exposes guarded HTTP adopt/stop routes with graceful shutdown only; no raw process fallback is allowed.
-- [ ] Add scheduled real-Provider, browser, restart, quota, and long-running dogfood tiers.
+- [x] Add resident-service browser QA that reads the live state-file endpoint, checks dynamic APIs plus desktop/mobile console/layout state, and never owns or stops the resident service. Real Claude direct input also passed after a resident restart with `room_queue_used=false` and redacted provider coordinates.
+- [ ] Add scheduled all-Provider restart, quota, mobile attach/relay, and long-running dogfood tiers.
 
 Priority: **P0**. New feature work that expands `tools/universe_server.py` should wait unless it is required to complete this stabilization epic.
 - Live native-provider completion adapter for automatic meeting runs.
@@ -276,3 +279,29 @@ Required follow-up:
   these roles currently fail closed instead of bypassing Task Frame policy.
 - Extend provider-produced candidate, failure-recovery, and scheduler tests,
   and add browser interaction/accessibility QA for configuration and review.
+
+### 11) 2026-08-11 completion evidence audit and reopenings
+
+Authoritative audit: `docs/completion-evidence-audit-2026-08-11.md`.
+
+- [x] Trace functional-node provenance. Startup registers Project anchors only;
+  visible functional nodes are copied from explicit Project Seeds into current
+  Projections. The UI labels them `Project Seed node` and exposes Seed/source
+  provenance.
+- [x] Replace the isolated smoke's store-only success path with an in-process,
+  ephemeral-port HTTP lifecycle probe covering SPA, `/health`, Projects, Todos,
+  Bench, thread shutdown, and listener closure.
+- [x] Implement a distinct one-to-one `PROVIDER_SESSION` composer target and
+  provider-native input adapter. The browser uses opaque chat keys, direct
+  provider input/SSE, scoped permission decisions, and no Room queue replay.
+- [x] Add resident-service browser QA that reads the endpoint from service state,
+  verifies dynamic APIs and console state, and never starts a competing fixed
+  port server.
+- [x] Reconcile reopened source work with the local Todo DB through the Todo API.
+  `todo_cc63b1ec76734fd6bf446d0ace4ee5d1` is `IN_PROGRESS`, revision 2; direct
+  SQLite edits were not used. Mobile attach and all-Provider recovery remain in
+  that Todo.
+- [x] Run an independent Claude Opus static review of the Provider Session slice.
+  The follow-up closes the pre-start busy race, SSE cursor/snapshot event-loss
+  window, unbounded process-local retention, lock-held host creation, model
+  fingerprint omission, and public provider-coordinate leakage findings.

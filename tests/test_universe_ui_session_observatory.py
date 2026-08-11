@@ -133,6 +133,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('deliveryState === "ACCEPTED_BY_MASTER"', APP)
         self.assertNotIn("DELIVERED_TO_MASTER", APP)
 
+    def test_project_graph_labels_functional_nodes_with_seed_provenance(self) -> None:
+        self.assertIn("Project Seed node", HTML)
+        self.assertIn('projection_origin: "PROJECT_SEED"', APP)
+        self.assertIn("projection_seed_id: projection?.seed_id", APP)
+        self.assertIn("projection_source_ref: projection?.source?.ref", APP)
+        self.assertIn('addDetail(grid, "Origin", "Project Seed")', APP)
+        self.assertIn('addDetail(grid, "Seed source", data.projection_source_ref)', APP)
+
     def test_browser_does_not_render_raw_provider_paths(self) -> None:
         activity_slice = APP[
             APP.index("function renderProviderActivitySources") :

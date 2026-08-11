@@ -14,8 +14,39 @@
         "tools/universe_server.py": [
           "tests.test_universe_connection",
           "tests.test_universe_streaming",
+          "tests.test_provider_session_http",
           "tests.test_universe_server.UniverseWorkPreflightTests",
           "tests.test_memory_batch_service"
+        ],
+        "tools/universe_app/provider_session_service.py": [
+          "tests.test_provider_session_service",
+          "tests.test_provider_session_http"
+        ],
+        "tests/test_provider_session_service.py": [
+          "tests.test_provider_session_service"
+        ],
+        "tests/test_provider_session_http.py": [
+          "tests.test_provider_session_http"
+        ],
+        "tools/universe_ui/app.js": [
+          "tests.test_provider_session_ui_contract",
+          "tests.test_universe_ui_session_observatory"
+        ],
+        "tools/universe_ui/styles.css": [
+          "tests.test_provider_session_ui_contract",
+          "tests.test_universe_ui_session_observatory"
+        ],
+        "tests/test_provider_session_ui_contract.py": [
+          "tests.test_provider_session_ui_contract"
+        ],
+        "tools/universe_app/resident_webapp_qa.py": [
+          "tests.test_universe_resident_webapp_qa"
+        ],
+        "tools/universe_resident_webapp_qa.py": [
+          "tests.test_universe_resident_webapp_qa"
+        ],
+        "tests/test_universe_resident_webapp_qa.py": [
+          "tests.test_universe_resident_webapp_qa"
         ],
         "tests/test_universe_connection.py": [
           "tests.test_universe_connection"
@@ -39,6 +70,10 @@
       "tests": [
         "tests.test_universe_connection",
         "tests.test_universe_streaming",
+        "tests.test_provider_session_service",
+        "tests.test_provider_session_http",
+        "tests.test_provider_session_ui_contract",
+        "tests.test_universe_resident_webapp_qa",
         "tests.test_universe_e2e_product_scenario",
         "tests.test_universe_ui_session_observatory"
       ]
@@ -48,6 +83,9 @@
       "tests": [
         "tests.test_universe_connection",
         "tests.test_universe_streaming",
+        "tests.test_provider_session_service",
+        "tests.test_provider_session_http",
+        "tests.test_universe_resident_webapp_qa",
         "tests.test_universe_server.UniverseWorkPreflightTests",
         "tests.test_universe_server.RuntimeLeaseStoreTests",
         "tests.test_multi_room.MultiRoomStoreTests",

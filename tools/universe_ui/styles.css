@@ -2894,8 +2894,54 @@ dialog label {
     display: none;
   }
 
+  .conversation-layer-header {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "toggle title actions"
+      "toggle opacity opacity";
+    gap: 5px 8px;
+    min-height: 68px;
+    padding: 6px 8px;
+  }
+
+  .conversation-layer-header .chat-dock-toggle {
+    grid-area: toggle;
+    align-self: center;
+  }
+
+  .conversation-layer-header .conversation-title-wrap {
+    grid-area: title;
+  }
+
+  .conversation-layer-header .action-inbox-button {
+    grid-area: actions;
+    margin-left: 0;
+  }
+
+  .conversation-layer-header .layer-opacity {
+    grid-area: opacity;
+    width: 100%;
+  }
+
   .conversation-layer-header .layer-opacity input {
-    width: 56px;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .conversation-layer.collapsed .conversation-layer-header {
+    grid-template-areas: "toggle . actions";
+    min-height: 40px;
+    padding-block: 0;
+  }
+
+  .conversation-layer.collapsed .chat-dock-toggle,
+  .conversation-layer.collapsed .action-inbox-button {
+    align-self: center;
+  }
+
+  .room-message-list {
+    max-height: calc(min(240px, 32vh) - 68px);
   }
 
   .todo-dialog {

@@ -86,6 +86,12 @@ const state = {
   multiRoomLiveOutput: {},
   providerTailTimer: null,
   providerTailInFlight: false,
+  providerSessionMessages: [],
+  providerSessionPermissions: [],
+  providerSessionConnection: null,
+  providerSessionStream: null,
+  providerSessionStreamChatKey: null,
+  providerSessionStreamState: "IDLE",
   conversationTarget: {
     kind: "UNIVERSE_CONDUCTOR",
     projectId: null,
@@ -1065,20 +1071,16 @@ async function injectSessionFromObservatory() {
   toast("Session injected into Universe");
 }
 
-async function activateAnchorSession(session) {
-  state.selectedSupervisorAnchorKey = anchorSessionKey(session);
-  renderSessionRail();
-  const project = state.projects.find(
-    (item) => item.project_id === session.node
-  );
-  if (project && session.mode === "MASTER") {
-    await attachSelectedMasterSession(session);
-    await callProjectMaster(project.project_id, {
-      provider: session.provider,
-      anchorKey: state.selectedSupervisorAnchorKey,
-      expectedProvider: session.provider,
-      expectedSessionRef: session.provider_session_ref,
-    });
+async function activateAnchorSession(session, room = null) {
+  if (session) {
+    state.selectedSupervisorAnchorKey = anchorSessionKey(session);
+    renderSessionRail();
+    if (session.mode === "MASTER") {
+      await attachSelectedMasterSession(session);
+    }
+  }
+  if (room) {
+    await openProviderChatSession(room);
     expandConversationLayer();
     return;
   }
@@ -1345,11 +1347,16 @@ function renderProviderChatSummary() {
       elements.sessionSummaryLive.scrollTop = elements.sessionSummaryLive.scrollHeight;
     }
   }
-  elements.sessionSummaryOpen.disabled = !boundSession;
-  elements.sessionSummaryOpen.textContent = boundSession
+  const canOpenDirect =
+    ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state) &&
+    room.session_kind !== "WORKER";
+  elements.sessionSummaryOpen.disabled = !canOpenDirect;
+  elements.sessionSummaryOpen.textContent = canOpenDirect
     ? binding.mode === "MASTER"
-      ? temporality === "Past" ? "Continue this Master" : "Open Master"
-      : "Open session"
+      ? temporality === "Past"
+        ? "Continue live Master"
+        : "Open live Master"
+      : "Open live session"
     : "Not attached";
   elements.sessionSummaryManage.textContent = boundSession
     ? "View in Observatory"
@@ -1965,6 +1972,7 @@ function renderComposerActions() {
 }
 
 function returnToUniverseConductor() {
+  closeProviderSessionStream();
   closeProjectRoomStream();
   state.conversationTarget = {
     kind: "UNIVERSE_CONDUCTOR",
@@ -1978,6 +1986,7 @@ function returnToUniverseConductor() {
 }
 
 async function callProjectMaster(projectId, options = {}) {
+  closeProviderSessionStream();
   closeComposerActionMenu();
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
@@ -2050,7 +2059,7 @@ async function attachSelectedMasterSession(session) {
       mode: "MASTER",
       room_type: "PROJECT",
       slot_role: "MASTER",
-      provider,
+      provider: session.provider,
       provider_session_ref: providerSessionRef,
       supervisor_session_id: session.session_id,
       alias: session.alias || `${projectId} Master`,
@@ -2130,6 +2139,26 @@ function sessionUsageLabel(connection) {
 }
 
 function renderComposerState() {
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    const target = state.conversationTarget;
+    const provider = target.provider || "UNKNOWN";
+    const model = target.model_ref || "host default";
+    const connection = state.providerSessionConnection || {};
+    elements.roomContext.textContent =
+      `${target.alias || target.projectId} / ${provider} / ${model}`;
+    elements.roomHint.textContent =
+      `Direct Provider Session / ${connection.connection_state || state.providerSessionStreamState}`;
+    elements.dispatchInstruction.placeholder =
+      `Message ${target.alias || target.projectId}`;
+    if (elements.conversationTitle) {
+      elements.conversationTitle.textContent = "Conversation";
+    }
+    if (elements.conversationTargetLabel) {
+      elements.conversationTargetLabel.textContent =
+        `${target.alias || target.projectId} / ${provider} / ${model}`;
+    }
+    return;
+  }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     const setting = state.providerSettings?.universe_conductor || null;
     const provider = setting?.resolved_provider || "UNAVAILABLE";
@@ -2723,6 +2752,9 @@ function mergeGovernanceProposalInbox(projectId, proposals) {
 
 
 function conversationMessageCount() {
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    return (state.providerSessionMessages || []).length;
+  }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     return (state.conductorMessages || []).length;
   }
@@ -2758,6 +2790,15 @@ function expandConversationLayer() {
 }
 
 function pendingActionItems() {
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    return {
+      proposals: [],
+      permissions: (state.providerSessionPermissions || []).filter(
+        (item) => item.state === "PENDING"
+      ),
+      delegations: [],
+    };
+  }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     return {
       proposals: (state.governanceProposalInbox || []).filter(
@@ -2852,7 +2893,9 @@ function renderActionInbox() {
   elements.actionInboxList.replaceChildren();
   const title = state.conversationTarget.kind === "UNIVERSE_CONDUCTOR"
     ? "Universe actions"
-    : `${state.conversationTarget.projectId} actions`;
+    : state.conversationTarget.kind === "PROVIDER_SESSION"
+      ? `${state.conversationTarget.alias || state.conversationTarget.projectId} actions`
+      : `${state.conversationTarget.projectId} actions`;
   if (elements.actionInboxTitle) elements.actionInboxTitle.textContent = title;
   for (const proposal of items.proposals) {
     elements.actionInboxList.append(renderGovernanceProposalCard(proposal));
@@ -2877,6 +2920,35 @@ function finishRoomMessageRender(previousScrollTop) {
 function renderRoomMessages() {
   const previousScrollTop = elements.roomMessageList.scrollTop;
   elements.roomMessageList.replaceChildren();
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    if (!state.providerSessionMessages.length) {
+      elements.roomMessageList.append(
+        node("p", "empty-copy", "No messages observed in this live session yet")
+      );
+      finishRoomMessageRender(previousScrollTop);
+      return;
+    }
+    for (const message of state.providerSessionMessages.slice(-20)) {
+      const item = node(
+        "article",
+        `room-message provider-session-message ${String(message.role || "").toLowerCase()}`
+      );
+      item.append(
+        node("strong", "", String(message.role || "UNKNOWN")),
+        node("p", "provider-session-body", String(message.body || "")),
+        node(
+          "small",
+          "",
+          message.state === "FAILED"
+            ? `${message.state} / ${message.error_code || "PROVIDER_ERROR"}`
+            : String(message.state || "UNKNOWN")
+        )
+      );
+      elements.roomMessageList.append(item);
+    }
+    finishRoomMessageRender(previousScrollTop);
+    return;
+  }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     if (!state.conductorMessages.length) {
       const item = node("article", "room-message conductor-message");
@@ -3135,7 +3207,14 @@ async function resolveAgentPermission(permission, optionId) {
   try {
     const isConductor = permission.scope_kind === "UNIVERSE_CONDUCTOR";
     const isRoomParticipant = permission.scope_kind === "ROOM_PARTICIPANT";
-    const endpoint = isConductor
+    const isProviderSession = permission.scope_kind === "PROVIDER_SESSION";
+    const endpoint = isProviderSession
+      ? `/v1/provider-sessions/${encodeURIComponent(
+          permission.chat_key
+        )}/permissions/${encodeURIComponent(
+          permission.request_id
+        )}/decision`
+      : isConductor
       ? `/v1/conductor-room/agent-session/permissions/${encodeURIComponent(
           permission.request_id
         )}/decision`
@@ -3156,6 +3235,15 @@ async function resolveAgentPermission(permission, optionId) {
       method: "POST",
       body: { option_id: optionId },
     });
+    if (isProviderSession) {
+      state.providerSessionPermissions = state.providerSessionPermissions.map(
+        (item) =>
+          item.request_id === permission.request_id ? result.permission : item
+      );
+      renderRoomMessages();
+      toast("Agent permission decision delivered");
+      return;
+    }
     if (isRoomParticipant) {
       const snapshot = state.activeMultiRoomSnapshot;
       if (snapshot?.room?.room_id === permission.room_id) {
@@ -4677,6 +4765,149 @@ function openConductorRoomStream() {
   });
 }
 
+function dedupeProviderSessionMessages(messages) {
+  const byId = new Map();
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message?.message_id) continue;
+    byId.set(message.message_id, { ...message });
+  }
+  return [...byId.values()].sort((left, right) =>
+    String(left.created_at || "").localeCompare(String(right.created_at || ""))
+  );
+}
+
+function applyProviderSessionSnapshot(snapshot) {
+  state.providerSessionMessages = dedupeProviderSessionMessages(snapshot.messages);
+  state.providerSessionPermissions = Array.isArray(snapshot.permissions)
+    ? snapshot.permissions
+    : [];
+  state.providerSessionConnection = snapshot.connection || null;
+  if (snapshot.target && state.conversationTarget.kind === "PROVIDER_SESSION") {
+    state.conversationTarget = {
+      ...state.conversationTarget,
+      ...snapshot.target,
+      kind: "PROVIDER_SESSION",
+    };
+  }
+}
+
+function closeProviderSessionStream() {
+  if (state.providerSessionStream) state.providerSessionStream.close();
+  state.providerSessionStream = null;
+  state.providerSessionStreamChatKey = null;
+  state.providerSessionStreamState = "IDLE";
+}
+
+async function refreshProviderSession(chatKey) {
+  const snapshot = await api(
+    `/v1/provider-sessions/${encodeURIComponent(chatKey)}`
+  );
+  applyProviderSessionSnapshot(snapshot);
+  return snapshot;
+}
+
+function openProviderSessionStream(chatKey) {
+  if (
+    state.providerSessionStream &&
+    state.providerSessionStreamChatKey === chatKey
+  ) {
+    return;
+  }
+  closeProviderSessionStream();
+  const source = new EventSource(
+    `/v1/provider-sessions/${encodeURIComponent(chatKey)}/stream`
+  );
+  state.providerSessionStream = source;
+  state.providerSessionStreamChatKey = chatKey;
+  state.providerSessionStreamState = "CONNECTING";
+  source.addEventListener("provider-session", (event) => {
+    let envelope;
+    try {
+      envelope = JSON.parse(event.data);
+    } catch (error) {
+      console.warn("Provider Session stream payload is invalid", error);
+      return;
+    }
+    if (state.conversationTarget.chat_key !== chatKey) return;
+    state.providerSessionStreamState = "LIVE";
+    const payload = envelope.payload || {};
+    if (payload.type === "SNAPSHOT") {
+      applyProviderSessionSnapshot(payload);
+    } else if (payload.type === "PROVIDER_SESSION_MESSAGE") {
+      state.providerSessionMessages = dedupeProviderSessionMessages([
+        ...state.providerSessionMessages,
+        payload.message,
+      ]);
+    } else if (payload.type === "PROVIDER_SESSION_DELTA") {
+      state.providerSessionMessages = state.providerSessionMessages.map((message) =>
+        message.message_id === payload.message_id
+          ? {
+              ...message,
+              body: String(message.body || "") + String(payload.delta || ""),
+              state: "STREAMING",
+            }
+          : message
+      );
+    } else if (
+      payload.type === "PROVIDER_SESSION_PERMISSION" ||
+      payload.type === "PROVIDER_SESSION_PERMISSION_RESOLVED"
+    ) {
+      const permission = payload.permission;
+      if (permission?.request_id) {
+        state.providerSessionPermissions = [
+          ...state.providerSessionPermissions.filter(
+            (item) => item.request_id !== permission.request_id
+          ),
+          permission,
+        ];
+      }
+    }
+    renderComposerState();
+    renderRoomMessages();
+  });
+  source.addEventListener("error", () => {
+    if (state.providerSessionStream === source) {
+      state.providerSessionStreamState = "RECONNECTING";
+      renderComposerState();
+    }
+  });
+}
+
+async function openProviderChatSession(room) {
+  const binding = room?.binding || {};
+  const projectId = String(
+    binding.current_project_id || binding.node || ""
+  ).trim();
+  if (!projectId || room?.session_kind === "WORKER") {
+    throw new Error("This Provider Session cannot be opened directly");
+  }
+  if (state.selectedProject?.project_id !== projectId) {
+    await selectProject(projectId);
+  }
+  closeProjectRoomStream();
+  const setting =
+    binding.mode === "CONDUCTOR"
+      ? state.providerSettings?.universe_conductor
+      : projectProviderSetting(projectId);
+  state.conversationTarget = {
+    kind: "PROVIDER_SESSION",
+    chat_key: room.chat_key,
+    projectId,
+    node: binding.node || projectId,
+    mode: binding.mode || "MASTER",
+    provider: String(room.provider || "UNKNOWN").toUpperCase(),
+    model_ref: setting?.model_ref || setting?.resolved_model || "",
+    alias: binding.alias || room.display_name || `${projectId} session`,
+  };
+  await refreshProviderSession(room.chat_key);
+  openProviderSessionStream(room.chat_key);
+  closeComposerActionMenu();
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  elements.dispatchInstruction.focus();
+}
+
 function closeProjectRoomStream() {
   if (state.projectRoomStream) {
     state.projectRoomStream.close();
@@ -4976,7 +5207,14 @@ function buildMultiverseGraph() {
         depth: 2,
         projectId: project.project_id,
         parentId: id,
-        data: { ...item, project_id: project.project_id },
+        data: {
+          ...item,
+          project_id: project.project_id,
+          projection_origin: "PROJECT_SEED",
+          projection_seed_id: projection?.seed_id || "",
+          projection_source_ref: projection?.source?.ref || "",
+          projection_source_commit: projection?.source?.commit || "",
+        },
         x: px + Math.cos(systemAngle) * r,
         y: py + Math.sin(systemAngle) * r,
       });
@@ -6156,6 +6394,16 @@ function renderDetails() {
   if (data.project_root) addDetail(grid, "Root", data.project_root);
   if (data.project_id) addDetail(grid, "Project id", data.project_id);
   if (data.symbol) addDetail(grid, "Symbol", data.symbol);
+  if (data.projection_origin === "PROJECT_SEED") {
+    addDetail(grid, "Origin", "Project Seed");
+    if (data.projection_seed_id) addDetail(grid, "Seed", data.projection_seed_id);
+    if (data.projection_source_ref) {
+      addDetail(grid, "Seed source", data.projection_source_ref);
+    }
+    if (data.projection_source_commit) {
+      addDetail(grid, "Source commit", data.projection_source_commit);
+    }
+  }
   if (
     selected?.kind === "project" &&
     state.projection?.source?.commit &&
@@ -6467,6 +6715,40 @@ function renderEmpty() {
 async function submitDispatch(event) {
   event.preventDefault();
   const form = new FormData(elements.dispatchForm);
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    const instruction = String(form.get("instruction") || "").trim();
+    if (!instruction) return;
+    elements.dispatchSubmit.disabled = true;
+    try {
+      const result = await api(
+        `/v1/provider-sessions/${encodeURIComponent(
+          state.conversationTarget.chat_key
+        )}/messages`,
+        {
+          method: "POST",
+          body: {
+            body: instruction,
+            idempotency_key: crypto.randomUUID(),
+          },
+        }
+      );
+      elements.dispatchForm.reset();
+      state.providerSessionMessages = dedupeProviderSessionMessages([
+        ...state.providerSessionMessages,
+        result.message,
+        result.reply,
+      ]);
+      expandConversationLayer();
+      renderComposerState();
+      renderRoomMessages();
+      toast("Sent directly to the selected Provider Session");
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      elements.dispatchSubmit.disabled = false;
+    }
+    return;
+  }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     elements.dispatchSubmit.disabled = true;
     try {
@@ -8944,9 +9226,9 @@ function bindEvents() {
         (item) => item.chat_key === state.selectedProviderChatKey
       );
       const session = supervisorSessionForRoom(room);
-      if (!session) return;
+      if (!room) return;
       try {
-        await activateAnchorSession(session);
+        await activateAnchorSession(session, room);
         elements.sessionSummaryDialog.close();
       } catch (error) {
         toast(error.message, true);

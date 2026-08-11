@@ -30,6 +30,7 @@ CONTRACT_PATHS = (
     ".ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md",
 )
 PROFILE_REF = ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
+AGENT_POLICY_PATH = ".ai/agents/common/worker-policy-pack.json"
 
 
 class UniverseTaskFrameSkillObservationTests(unittest.TestCase):
@@ -37,14 +38,21 @@ class UniverseTaskFrameSkillObservationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.target = Path(self.temp.name)
-        for relative in (*CONTRACT_PATHS, PROFILE_REF):
+        for relative in (*CONTRACT_PATHS, PROFILE_REF, AGENT_POLICY_PATH):
             destination = self.target / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / relative, destination)
         rows = []
-        for relative in (*CONTRACT_PATHS, PROFILE_REF):
+        for relative in (*CONTRACT_PATHS, PROFILE_REF, AGENT_POLICY_PATH):
             rows.append(
                 {
+                    "class": (
+                        "agent"
+                        if relative == AGENT_POLICY_PATH
+                        else "core_runtime"
+                        if relative.startswith(".ai/core/")
+                        else "runtime"
+                    ),
                     "target_path": relative,
                     "local_sha256": hashlib.sha256(
                         (self.target / relative).read_bytes()

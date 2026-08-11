@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import tempfile
+import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -111,6 +113,50 @@ def _http(
         return int(error.code), payload
     except URLError as error:
         return 0, {"error": str(error.reason if hasattr(error, "reason") else error)}
+
+
+def _http_text(
+    endpoint: str,
+    path: str,
+    *,
+    timeout: float = 10.0,
+) -> tuple[int, str]:
+    request = Request(endpoint.rstrip("/") + path, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return int(response.status), response.read().decode("utf-8", errors="replace")
+    except HTTPError as error:
+        return int(error.code), error.read().decode("utf-8", errors="replace")
+    except URLError as error:
+        return 0, str(error.reason if hasattr(error, "reason") else error)
+
+
+def _stop_in_process_server(
+    server: Any,
+    thread: threading.Thread | None,
+    host: str,
+    port: int,
+) -> tuple[bool, str]:
+    errors: list[str] = []
+    if thread is not None and thread.is_alive():
+        try:
+            server.shutdown()
+        except Exception as error:  # noqa: BLE001 - smoke reports cleanup failures
+            errors.append(f"shutdown={type(error).__name__}: {error}")
+    try:
+        server.server_close()
+    except Exception as error:  # noqa: BLE001 - smoke reports cleanup failures
+        errors.append(f"server_close={type(error).__name__}: {error}")
+    if thread is not None:
+        thread.join(timeout=5)
+        if thread.is_alive():
+            errors.append("server thread remained alive")
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            errors.append("listener remained reachable")
+    except OSError:
+        pass
+    return not errors, "; ".join(errors) if errors else "thread stopped; listener closed"
 
 
 def check_live(state_path: Path, project_id: str) -> SmokeReport:
@@ -346,11 +392,16 @@ def check_live(state_path: Path, project_id: str) -> SmokeReport:
 
 
 def run_isolated() -> SmokeReport:
-    """In-process product line using create_server (no external listen)."""
+    """In-process product line with a real ephemeral HTTP listener."""
     from universe_server import create_server, universe_mode_contract
 
     report = SmokeReport(mode="run")
     temp = tempfile.TemporaryDirectory()
+    server = None
+    server_thread: threading.Thread | None = None
+    server_host = "127.0.0.1"
+    server_port = 0
+    cleanup_recorded = False
     try:
         root = Path(temp.name)
         project_root = root / "GCS"
@@ -418,8 +469,51 @@ def run_isolated() -> SmokeReport:
                 }
             ),
         )
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            name="universe-e2e-smoke",
+        )
+        server_thread.start()
+        server_host, server_port = server.server_address[:2]
+        if isinstance(server_host, bytes):
+            server_host = server_host.decode("ascii")
+        endpoint = f"http://{server_host}:{server_port}"
         store = server.store
-        report.add("service_create", "PASS", "in-process create_server")
+        report.add("service_create", "PASS", f"in-process {endpoint}")
+
+        status, page = _http_text(endpoint, "/")
+        static_ready = (
+            status == 200
+            and 'id="project-list"' in page
+            and 'id="dispatch-form"' in page
+        )
+        report.add(
+            "web_static",
+            "PASS" if static_ready else "FAIL",
+            f"http={status} shell={static_ready}",
+        )
+
+        status, health = _http(endpoint, "GET", "/health")
+        report.add(
+            "web_health",
+            "PASS" if status == 200 and health.get("status") == "READY" else "FAIL",
+            f"http={status} status={health.get('status')}",
+        )
+
+        for step_name, path, expected_status in (
+            ("web_projects", "/v1/projects", "PROJECTS_COLLECTED"),
+            ("web_todos", "/v1/todos", "TODOS_COLLECTED"),
+            ("web_bench", "/v1/bench/skills", "SKILL_BENCH_COLLECTED"),
+        ):
+            status, payload = _http(endpoint, "GET", path, token=token)
+            report.add(
+                step_name,
+                "PASS"
+                if status == 200 and payload.get("status") == expected_status
+                else "FAIL",
+                f"http={status} status={payload.get('status')}",
+            )
 
         project, _registered = store.register_project(
             {
@@ -503,23 +597,40 @@ def run_isolated() -> SmokeReport:
             "PASS",
             f"count={len(store.list_skill_bench())}",
         )
+        cleanup_ok, cleanup_detail = _stop_in_process_server(
+            server,
+            server_thread,
+            str(server_host),
+            int(server_port),
+        )
+        report.add(
+            "web_shutdown",
+            "PASS" if cleanup_ok else "FAIL",
+            cleanup_detail,
+        )
+        cleanup_recorded = True
+        server = None
+        server_thread = None
         report.finalize()
-        if all(
-            step.status in {"PASS", "SKIP"}
-            for step in report.steps
-        ) and any(
-            step.name == "discovery_complete" and step.status == "PASS"
-            for step in report.steps
-        ):
-            report.overall = "PASS"
-        else:
-            report.overall = "FAIL"
         return report
     except Exception as error:  # noqa: BLE001 - smoke must always report
         report.add("run_isolated", "FAIL", f"{type(error).__name__}: {error}")
         report.finalize()
         return report
     finally:
+        if server is not None and not cleanup_recorded:
+            cleanup_ok, cleanup_detail = _stop_in_process_server(
+                server,
+                server_thread,
+                str(server_host),
+                int(server_port),
+            )
+            report.add(
+                "web_shutdown",
+                "PASS" if cleanup_ok else "FAIL",
+                cleanup_detail,
+            )
+            report.finalize()
         temp.cleanup()
 
 

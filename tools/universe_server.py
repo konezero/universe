@@ -209,6 +209,11 @@ from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
 )
+from universe_app.provider_session_service import (
+    PROVIDER_SESSION_STREAM_SCHEMA,
+    ProviderSessionError,
+    ProviderSessionService,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
@@ -14162,6 +14167,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
         room_participant_provider_factory: Any = None,
+        provider_session_host_factory: Any = None,
         host_profile: HostProfileStore | None = None,
         provider_model_catalog: ProviderModelCatalogStore | None = None,
         service_state_path: Path | None = None,
@@ -14249,6 +14255,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             room_event_observer=self._observe_native_room_event,
             permission_observer=self._observe_room_participant_permission,
             provider_factory=room_participant_provider_factory,
+        )
+        self.provider_sessions = ProviderSessionService(
+            resolver=lambda chat_key: self.resolve_provider_chat_session(chat_key),
+            host_factory=(
+                provider_session_host_factory
+                or self._create_provider_session_host
+            ),
         )
         self.multi_room_delivery = MultiRoomDeliveryCoordinator(
             self.multi_rooms,
@@ -16396,6 +16409,121 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "providers": ["CODEX", "CLAUDE", "GROK"],
             "transcript_content": "EXCLUDED",
         }
+
+    def resolve_provider_chat_session(self, chat_key: str) -> dict[str, Any]:
+        """Resolve one opaque browser key to an adapter-private provider target."""
+
+        key = _required_text(chat_key, "chat_key")
+        catalog = self.provider_chat_catalog()
+        room = next(
+            (item for item in catalog["rooms"] if item.get("chat_key") == key),
+            None,
+        )
+        if room is None:
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_NOT_FOUND",
+                "Provider Session does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        if str(room.get("session_kind") or "CHAT").upper() == "WORKER":
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_WORKER_FORBIDDEN",
+                "Task workers cannot be opened as resident user sessions",
+                HTTPStatus.CONFLICT,
+            )
+        binding = room.get("binding") or {}
+        if binding.get("state") not in {"BOUND", "ANCHOR_OBSERVED"}:
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_NOT_ATTACHED",
+                "Attach the Provider Session to a Project Anchor before opening it",
+                HTTPStatus.CONFLICT,
+            )
+        project_id = str(
+            binding.get("current_project_id") or binding.get("node") or ""
+        ).strip()
+        if not project_id:
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_PROJECT_UNKNOWN",
+                "Provider Session has no Project coordinate",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            project = self.store.get_project(project_id)
+        except UniverseError as error:
+            raise ProviderSessionError(error.code, error.detail, error.status) from error
+
+        provider = str(room.get("provider") or "UNKNOWN").upper()
+        candidates: list[dict[str, Any]] = []
+        for source in self.store.discover_provider_session_sources(provider):
+            identity_verified = source.get("identity_state") == "VERIFIED"
+            session_kind = str(source.get("session_kind") or "CHAT").upper()
+            source_path = _canonical_provider_source_path(source.get("source_path"))
+            if not source_path:
+                continue
+            identity = {
+                "provider": provider,
+                "provider_session_id": str(
+                    source.get("provider_session_id") or ""
+                ),
+                "source_path": (
+                    "" if identity_verified and session_kind != "WORKER" else source_path
+                ),
+            }
+            candidate_key = "provider_chat_" + _provider_source_key(
+                identity
+            ).removeprefix("provider_source_")
+            if candidate_key == key and session_kind != "WORKER":
+                candidates.append(dict(source))
+        if not candidates:
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_SOURCE_UNAVAILABLE",
+                "Provider Session source is no longer available",
+                HTTPStatus.CONFLICT,
+            )
+        source = max(
+            candidates,
+            key=lambda item: str(item.get("last_modified_at") or ""),
+        )
+        setting_scope = (
+            ("UNIVERSE_CONDUCTOR", "CONDUCTOR")
+            if str(binding.get("mode") or "").upper() == "CONDUCTOR"
+            else ("PROJECT_MASTER", project_id)
+        )
+        setting = self.store.provider_setting(*setting_scope)
+        return {
+            "chat_key": key,
+            "provider": provider,
+            "provider_session_ref": str(source.get("provider_session_id") or ""),
+            "project_id": project_id,
+            "node": str(binding.get("node") or project_id),
+            "mode": str(binding.get("mode") or "MASTER").upper(),
+            "repository_root": str(project["project_root"]),
+            "current_anchor_ref": str(
+                binding.get("current_anchor_ref") or "UNKNOWN"
+            ),
+            "alias": binding.get("alias") or room.get("display_name"),
+            "model_ref": setting.get("model_ref") or "UNKNOWN",
+            "session_kind": room.get("session_kind") or "CHAT",
+            "identity_state": room.get("identity_state") or "UNKNOWN",
+        }
+
+    def _create_provider_session_host(
+        self,
+        descriptor: Mapping[str, Any],
+        permission_requester: Callable[[Mapping[str, Any]], str | None],
+    ) -> ResidentModeSessionHost:
+        chat_key = str(descriptor["chat_key"])
+        return ResidentModeSessionHost(
+            Path(str(descriptor["repository_root"])),
+            f"provider-session-{chat_key[-12:]}",
+            str(descriptor["mode"]),
+            self.store.database_path.parent / "provider-session-mode.sqlite3",
+            actor_label=str(
+                descriptor.get("alias")
+                or f"{descriptor['project_id']} {descriptor['mode']}"
+            ),
+            permission_requester=permission_requester,
+        )
 
     def tail_bound_provider_sessions(self) -> list[dict[str, Any]]:
         sessions = self.session_supervisor.list_sessions(include_hidden=False)
@@ -18771,6 +18899,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.multi_room_native_controls.close,
         )
         close_step(
+            "provider_sessions",
+            self.provider_sessions.close,
+        )
+        close_step(
             "room_participant_hosts",
             self.room_participant_hosts.close,
         )
@@ -19315,6 +19447,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "sources": sources,
                 },
             )
+            return
+        provider_session_get = re.fullmatch(
+            r"/v1/provider-sessions/([^/]+)(/stream)?", path
+        )
+        if provider_session_get is not None:
+            chat_key = unquote(provider_session_get.group(1))
+            try:
+                if provider_session_get.group(2):
+                    self._stream_provider_session(chat_key)
+                else:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.provider_sessions.snapshot(chat_key),
+                    )
+            except ProviderSessionError as error:
+                self._send_provider_session_error(error)
             return
         if path == "/v1/session-observer/chat-rooms":
             try:
@@ -20125,6 +20273,45 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "session": self.server.session_supervisor.get_public_session(
                             str(session["session_id"])
                         ),
+                    },
+                )
+                return
+            provider_session_message = re.fullmatch(
+                r"/v1/provider-sessions/([^/]+)/messages", path
+            )
+            if provider_session_message is not None:
+                result = self.server.provider_sessions.submit(
+                    unquote(provider_session_message.group(1)),
+                    body,
+                )
+                self._send(HTTPStatus.ACCEPTED, result)
+                return
+            provider_session_permission = re.fullmatch(
+                r"/v1/provider-sessions/([^/]+)/permissions/([^/]+)/decision",
+                path,
+            )
+            if provider_session_permission is not None:
+                if not isinstance(body, Mapping):
+                    raise ProviderSessionError(
+                        "PROVIDER_SESSION_REQUEST_INVALID",
+                        "request body must be an object",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                permission, changed = self.server.provider_sessions.resolve_permission(
+                    unquote(provider_session_permission.group(1)),
+                    unquote(provider_session_permission.group(2)),
+                    body.get("option_id"),
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "AGENT_PERMISSION_RESOLVED"
+                            if changed
+                            else "AGENT_PERMISSION_ALREADY_RESOLVED"
+                        ),
+                        "permission": permission,
                     },
                 )
                 return
@@ -21853,6 +22040,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
             self._not_found()
+        except ProviderSessionError as error:
+            self._send_provider_session_error(error)
         except SessionSupervisorError as error:
             self._send_supervisor_error(error)
         except UniverseError as error:
@@ -22241,6 +22430,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _send_provider_session_error(self, error: ProviderSessionError) -> None:
+        try:
+            status = HTTPStatus(int(error.status))
+        except ValueError:
+            status = HTTPStatus.CONFLICT
+        self._send(
+            status,
+            {
+                "schema": API_SCHEMA,
+                "status": "ERROR",
+                "error_code": error.code,
+                "detail": error.detail,
+            },
+        )
+
     def _send_multi_room_error(self, error: MultiRoomError) -> None:
         self._send(
             HTTPStatus(error.status)
@@ -22299,6 +22503,47 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 for event in events:
                     cursor = max(cursor, int(event["event_id"]))
                     write_event("room", event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+
+    def _stream_provider_session(self, chat_key: str) -> None:
+        cursor = self.server.provider_sessions.events.cursor()
+        snapshot = self.server.provider_sessions.snapshot(chat_key)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self._write_sse(
+                cursor,
+                {
+                    "schema": PROVIDER_SESSION_STREAM_SCHEMA,
+                    "event_id": cursor,
+                    "chat_key": chat_key,
+                    "emitted_at": utc_now(),
+                    "payload": {"type": "SNAPSHOT", **snapshot},
+                },
+                event_name="provider-session",
+            )
+            while True:
+                events = self.server.provider_sessions.events.wait(
+                    chat_key,
+                    after_event_id=cursor,
+                    timeout_seconds=15.0,
+                )
+                if not events:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                for event in events:
+                    cursor = int(event["event_id"])
+                    self._write_sse(
+                        cursor,
+                        event,
+                        event_name="provider-session",
+                    )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
 
@@ -22488,6 +22733,7 @@ def create_server(
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
     room_participant_provider_factory: Any = None,
+    provider_session_host_factory: Any = None,
     host_profile: HostProfileStore | None = None,
     provider_model_catalog: ProviderModelCatalogStore | None = None,
     service_state_path: Path | None = None,
@@ -22519,6 +22765,7 @@ def create_server(
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
         room_participant_provider_factory=room_participant_provider_factory,
+        provider_session_host_factory=provider_session_host_factory,
         host_profile=host_profile,
         provider_model_catalog=provider_model_catalog,
         service_state_path=service_state_path,

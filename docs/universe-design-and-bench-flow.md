@@ -440,6 +440,18 @@ relations remain distinct from observed evidence. Career adoption is separate.
     change still requires a candidate, shadow evidence, and the normal adoption
     boundary.
 
+16. Bind completion claims to product-plane evidence. Source and contract tests
+    prove implementation only; an HTTP smoke must use an ephemeral port, verify
+    the SPA plus `/health` and core APIs, identify isolated versus resident
+    state, and prove listener shutdown. Browser completion must target the
+    resident service endpoint and pair visible behavior with backing API and
+    console evidence. Real-Provider completion additionally requires native input,
+    incremental output, restart/disconnect, and quota observations. A later
+    dogfood failure reopens the worklist. Functional map nodes remain explicit
+    Project Seed records: startup may attach Project anchors, but it never
+    synthesizes functional nodes from repository source. See
+    `docs/completion-evidence-audit-2026-08-11.md`.
+
 ## Runtime Boundary
 
 Universe consumes the installed ai-career Skill binding and observation

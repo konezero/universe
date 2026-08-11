@@ -25,6 +25,15 @@ class UniverseE2EProductScenarioTests(unittest.TestCase):
         self.assertEqual("PASS", by_name["discovery_queue"].status)
         self.assertEqual("PASS", by_name["discovery_deliver"].status)
         self.assertEqual("PASS", by_name["discovery_complete"].status)
+        for step_name in (
+            "web_static",
+            "web_health",
+            "web_projects",
+            "web_todos",
+            "web_bench",
+            "web_shutdown",
+        ):
+            self.assertEqual("PASS", by_name[step_name].status, step_name)
         self.assertEqual("PASS", report.overall)
 
     def test_smoke_report_is_json_serializable(self) -> None:
