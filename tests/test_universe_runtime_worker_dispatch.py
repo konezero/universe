@@ -42,17 +42,20 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             "result_mode": "REDACTED",
             "runtime_profile": "TASK_FRAME_RUNTIME",
             "model": "test-model",
+            "response_timeout_seconds": 90,
         }
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def test_codex_task_frame_requests_ephemeral_provider_session(self) -> None:
-        observed: list[tuple[bool, str]] = []
+        observed: list[tuple[bool, str, float]] = []
 
         class FakeCodexSession:
-            def __init__(self, *, ephemeral, model, session_observer, **_kwargs) -> None:
-                observed.append((ephemeral, model))
+            def __init__(
+                self, *, ephemeral, model, response_timeout_seconds, session_observer, **_kwargs
+            ) -> None:
+                observed.append((ephemeral, model, response_timeout_seconds))
                 self.session_ref = "codex-app-server:ephemeral-1"
                 session_observer("ephemeral-1")
 
@@ -73,7 +76,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         ):
             result = dispatcher._invoke_codex(self.request)
 
-        self.assertEqual([(True, "test-model")], observed)
+        self.assertEqual([(True, "test-model", 90.0)], observed)
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
         self.assertFalse(result["universe_coordinate_persisted"])
@@ -109,7 +112,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertEqual("UNKNOWN", result["provider_durable_chat_state"])
 
     def test_claude_task_frame_disables_session_persistence(self) -> None:
-        observed: list[tuple[bool, int, str, object]] = []
+        observed: list[tuple[bool, int, float, str, object]] = []
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -119,9 +122,11 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
 
         class FakeClaudeSession:
             def __init__(
-                self, *, ephemeral, max_turns, model, json_schema, **_kwargs
+                self, *, ephemeral, max_turns, response_timeout_seconds, model, json_schema, **_kwargs
             ) -> None:
-                observed.append((ephemeral, max_turns, model, json_schema))
+                observed.append(
+                    (ephemeral, max_turns, response_timeout_seconds, model, json_schema)
+                )
                 self.session_ref = "claude-code:ephemeral-1"
 
         dispatcher = RuntimeWorkerDispatcher(self.root)
@@ -148,7 +153,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual([(True, 5, "test-model", schema)], observed)
+        self.assertEqual([(True, 5, 90.0, "test-model", schema)], observed)
         self.assertEqual("CLAUDE_CODE_CLI_ADAPTER", result["runtime_provider"])
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
@@ -185,6 +190,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             "context_pack": {"goal": "review"},
             "output_contract": {"type": "text"},
             "max_turns": 1,
+            "response_timeout_seconds": 90,
             "result_mode": "REDACTED",
         }
 

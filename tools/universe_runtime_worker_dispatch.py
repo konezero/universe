@@ -31,6 +31,7 @@ from worker_failure_evidence import (
 DISPATCH_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
+TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS = 90
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,17 @@ class WorkerDispatchError(Exception):
 
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 PostJson = Callable[[str, str, str, Mapping[str, Any]], dict[str, Any]]
+
+
+def _worker_response_timeout_seconds(value: Any) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value <= 0
+        or value > 300
+    ):
+        raise ValueError("worker response timeout must be between 0 and 300 seconds")
+    return float(value)
 
 
 def _required_text(value: Any, field: str) -> str:
@@ -194,11 +206,15 @@ class RuntimeWorkerDispatcher:
         native_runner: NativeRunner = run_native_cli,
         post: PostJson = post_json,
         failure_evidence_store: WorkerFailureEvidenceStore | None = None,
+        worker_response_timeout_seconds: float = TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS,
     ) -> None:
         self.repository_root = repository_root.resolve()
         self.native_runner = native_runner
         self.post = post
         self.failure_evidence_store = failure_evidence_store
+        self.worker_response_timeout_seconds = _worker_response_timeout_seconds(
+            worker_response_timeout_seconds
+        )
 
     def provider_capability(self, provider: str) -> dict[str, str]:
         normalized = _required_text(provider, "provider").upper()
@@ -317,6 +333,7 @@ class RuntimeWorkerDispatcher:
             "context_pack": request["context_pack"],
             "output_contract": request["output_contract"],
             "max_turns": request["max_turns"],
+            "response_timeout_seconds": self.worker_response_timeout_seconds,
             "result_mode": request["result_mode"],
         }
 
@@ -740,6 +757,9 @@ class RuntimeWorkerDispatcher:
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
                     ephemeral=True,
+                    response_timeout_seconds=float(
+                        request["response_timeout_seconds"]
+                    ),
                 )
             )
             try:
@@ -800,6 +820,9 @@ class RuntimeWorkerDispatcher:
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
                     ephemeral=True,
+                    response_timeout_seconds=float(
+                        request["response_timeout_seconds"]
+                    ),
                 )
             )
             try:
@@ -872,6 +895,9 @@ class RuntimeWorkerDispatcher:
                     session_observer=session_ids.append,
                     ephemeral=True,
                     max_turns=int(request.get("max_turns", 8)),
+                    response_timeout_seconds=float(
+                        request["response_timeout_seconds"]
+                    ),
                     json_schema=json_schema,
                     native_runner=self.native_runner,
                 )

@@ -536,12 +536,16 @@ class GrokAcpSession:
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
+        response_timeout_seconds: float = 300,
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
         # An ephemeral session is bounded: it never resumes a stored session
         # and never reports its id back, so nothing can be resumed later.
         self.ephemeral = bool(ephemeral)
+        self.response_timeout_seconds = _positive_timeout_seconds(
+            response_timeout_seconds, "GROK_RESPONSE_TIMEOUT_INVALID"
+        )
         self.session_id = None if self.ephemeral else session_id
         self.model = _text(model, "model")
         self.effort = _text(effort, "effort").upper()
@@ -611,7 +615,7 @@ class GrokAcpSession:
                         }
                     ],
                 },
-                timeout_seconds=300,
+                timeout_seconds=self.response_timeout_seconds,
             )
         finally:
             self._active_delta = None
@@ -737,6 +741,7 @@ class CodexAppServerSession:
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
+        response_timeout_seconds: float = 300,
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
@@ -749,6 +754,9 @@ class CodexAppServerSession:
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
         self.ephemeral = bool(ephemeral)
+        self.response_timeout_seconds = _positive_timeout_seconds(
+            response_timeout_seconds, "CODEX_RESPONSE_TIMEOUT_INVALID"
+        )
         self._active_delta: Callable[[str], None] | None = None
         self._active_final_text: str | None = None
         self._turn_events: dict[str, threading.Event] = {}
@@ -827,7 +835,7 @@ class CodexAppServerSession:
             event = self._turn_events.setdefault(turn_id, threading.Event())
             if turn_id in self._completed_turns:
                 event.set()
-            if not event.wait(300):
+            if not event.wait(self.response_timeout_seconds):
                 raise AgentSessionError("CODEX_TURN_TIMED_OUT")
             turn_status = self._turn_statuses.pop(turn_id, "completed")
             if turn_status != "completed":
@@ -1077,6 +1085,7 @@ class ClaudeCodeSession:
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         max_turns: int = 8,
+        response_timeout_seconds: float = 300,
         json_schema: Mapping[str, Any] | None = None,
         native_runner: Callable[[NativeCliRequest], NativeCliResult] = run_native_cli,
     ) -> None:
@@ -1095,6 +1104,9 @@ class ClaudeCodeSession:
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
         self.max_turns = max(1, int(max_turns))
+        self.response_timeout_seconds = _positive_timeout_seconds(
+            response_timeout_seconds, "CLAUDE_RESPONSE_TIMEOUT_INVALID"
+        )
         self.json_schema = (
             _json_object(json_schema) if json_schema is not None else None
         )
@@ -1150,7 +1162,7 @@ class ClaudeCodeSession:
                     executable=self.executable,
                     arguments=tuple(arguments),
                     cwd=self.cwd,
-                    timeout_seconds=300,
+                    timeout_seconds=self.response_timeout_seconds,
                     output_encoding="utf-8",
                     environment=self.environment,
                     stdin_path=prompt_path,
@@ -1258,6 +1270,16 @@ def _error_text(value: Any) -> str:
         if isinstance(message, str) and message:
             return message[:500]
     return str(value)[:500]
+
+
+def _positive_timeout_seconds(value: Any, error_code: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value <= 0
+    ):
+        raise AgentSessionError(error_code)
+    return float(value)
 
 
 def _text(value: Any, field: str) -> str:
