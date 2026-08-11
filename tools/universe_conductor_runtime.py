@@ -347,6 +347,7 @@ class UniverseConductorRuntime:
             session["session_id"],
             identity,
             expected_lease_version=expected_version,
+            stop_capability=token,
         )
         self._supervisor_session_id = str(session["session_id"])
         self._lease_token = str(acquired["lease_token"])

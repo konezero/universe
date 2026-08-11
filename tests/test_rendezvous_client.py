@@ -5,7 +5,6 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -11,6 +11,11 @@ from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from process_identity import process_instance_observation, redact_sensitive_argv
+from protected_capability import (
+    ProtectedCapabilityError,
+    protect_capability,
+    unprotect_capability,
+)
 
 
 SESSION_SUPERVISOR_SCHEMA = "universe.session-supervisor.v1"
@@ -437,6 +442,7 @@ class SessionSupervisorStore:
                     endpoint TEXT NOT NULL,
                     handshake_fingerprint TEXT NOT NULL,
                     lease_token_sha256 TEXT NOT NULL,
+                    stop_capability_protected TEXT,
                     lease_version INTEGER NOT NULL,
                     lease_state TEXT NOT NULL,
                     acquired_at TEXT NOT NULL,
@@ -475,6 +481,14 @@ class SessionSupervisorStore:
             if "anchor_ref" not in columns:
                 connection.execute(
                     "ALTER TABLE session_record ADD COLUMN anchor_ref TEXT"
+                )
+            lease_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(process_lease)")
+            }
+            if "stop_capability_protected" not in lease_columns:
+                connection.execute(
+                    "ALTER TABLE process_lease ADD COLUMN stop_capability_protected TEXT"
                 )
             session_column_definitions = {
                 "origin_provider": "TEXT",
@@ -1510,16 +1524,78 @@ class SessionSupervisorStore:
                 "updated_at": now,
             }
 
+    def adopt_runtime_executor(
+        self,
+        session: Any,
+        process_identity: Any,
+        *,
+        stop_capability: Any,
+    ) -> dict[str, Any]:
+        """Register one already-started Session Boot executor as owned.
+
+        The caller must provide the exact process identity and the short-lived
+        capability returned by the executor. The Supervisor probes the process
+        before creating the lease, so a matching-looking legacy PID cannot be
+        adopted by accident.
+        """
+
+        descriptor = _normalize_session_descriptor(session)
+        if descriptor["provider"] != "RUNTIME":
+            raise SessionSupervisorError(
+                "RUNTIME_EXECUTOR_PROVIDER_REQUIRED",
+                "runtime executor adoption requires provider=RUNTIME",
+                status=409,
+            )
+        identity = _normalize_process_identity(process_identity)
+        observed = self._observe_process_instance(identity)
+        if observed.get("status") != "PROCESS_PRESENT_EXACT":
+            raise SessionSupervisorError(
+                "RUNTIME_EXECUTOR_NOT_VERIFIED",
+                "runtime executor adoption requires exact Host process evidence",
+                status=409,
+            )
+        registered, _created = self.register_session(descriptor)
+        existing = registered.get("process_lease")
+        expected_version = (
+            0 if not isinstance(existing, Mapping) else int(existing["lease_version"])
+        )
+        acquired = self.acquire_lease(
+            str(registered["session_id"]),
+            identity,
+            expected_lease_version=expected_version,
+            stop_capability=stop_capability,
+        )
+        return {
+            "schema": SESSION_SUPERVISOR_SCHEMA,
+            "status": "RUNTIME_EXECUTOR_ADOPTED",
+            "session": self.get_session(str(registered["session_id"])),
+            "lease": acquired["lease"],
+            "process_observation": observed,
+        }
+
     def acquire_lease(
         self,
         session_id: str,
         process_identity: Any,
         *,
         expected_lease_version: Any = 0,
+        stop_capability: Any = None,
     ) -> dict[str, Any]:
         normalized_id = _required_text(session_id, "session_id")
         identity = _normalize_process_identity(process_identity)
         expected = _non_negative_integer(expected_lease_version, "expected_lease_version")
+        protected_capability: str | None = None
+        if stop_capability is not None:
+            try:
+                protected_capability = protect_capability(
+                    _required_text(stop_capability, "stop_capability")
+                )
+            except ProtectedCapabilityError as error:
+                raise SessionSupervisorError(
+                    "PROCESS_STOP_CAPABILITY_UNAVAILABLE",
+                    "Host cannot protect the graceful-stop capability",
+                    status=503,
+                ) from error
         raw_token = secrets.token_urlsafe(32)
         token_digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
         now = utc_now()
@@ -1560,6 +1636,11 @@ class SessionSupervisorStore:
                 identity["endpoint"],
                 identity["handshake_fingerprint"],
                 token_digest,
+                (
+                    protected_capability
+                    if protected_capability is not None
+                    else (None if current is None else current["stop_capability_protected"])
+                ),
                 next_version,
                 "OWNED",
                 now if current is None else current["acquired_at"],
@@ -1570,9 +1651,10 @@ class SessionSupervisorStore:
                 INSERT INTO process_lease(
                     lease_id, session_id, pid, process_created_at, executable,
                     command_json, endpoint, handshake_fingerprint,
-                    lease_token_sha256, lease_version, lease_state,
+                    lease_token_sha256, stop_capability_protected,
+                    lease_version, lease_state,
                     acquired_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     pid = excluded.pid,
                     process_created_at = excluded.process_created_at,
@@ -1581,6 +1663,10 @@ class SessionSupervisorStore:
                     endpoint = excluded.endpoint,
                     handshake_fingerprint = excluded.handshake_fingerprint,
                     lease_token_sha256 = excluded.lease_token_sha256,
+                    stop_capability_protected = COALESCE(
+                        excluded.stop_capability_protected,
+                        process_lease.stop_capability_protected
+                    ),
                     lease_version = excluded.lease_version,
                     lease_state = excluded.lease_state,
                     updated_at = excluded.updated_at
@@ -1837,7 +1923,9 @@ class SessionSupervisorStore:
             connection.execute(
                 """
                 UPDATE process_lease
-                SET lease_state = 'RELEASED', lease_version = ?, updated_at = ?
+                SET lease_state = 'RELEASED',
+                    stop_capability_protected = NULL,
+                    lease_version = ?, updated_at = ?
                 WHERE session_id = ? AND lease_version = ?
                 """,
                 (expected + 1, now, normalized_id, expected),
@@ -1972,7 +2060,9 @@ class SessionSupervisorStore:
             connection.execute(
                 """
                 UPDATE process_lease
-                SET lease_state = 'RELEASED', lease_version = ?, updated_at = ?
+                SET lease_state = 'RELEASED',
+                    stop_capability_protected = NULL,
+                    lease_version = ?, updated_at = ?
                 WHERE session_id = ? AND lease_version = ?
                 """,
                 (next_version, now, normalized_id, expected),
@@ -2014,6 +2104,199 @@ class SessionSupervisorStore:
             return self._session_material(
                 connection, self._require_session(connection, session_id)
             )
+
+    def get_stop_capability(self, session_id: str) -> str | None:
+        """Recover a protected capability for an internal graceful-stop route."""
+
+        with self._connection() as connection:
+            lease = self._require_lease(connection, session_id)
+            protected = lease["stop_capability_protected"]
+        if not protected:
+            return None
+        try:
+            return unprotect_capability(str(protected))
+        except ProtectedCapabilityError:
+            return None
+
+    def authorize_managed_stop(
+        self,
+        session_id: str,
+        *,
+        expected_lease_version: Any,
+    ) -> dict[str, Any]:
+        """Authorize a restart-safe runtime stop without exposing lease tokens.
+
+        The Supervisor owns the lease token after a service restart, so an
+        internal lifecycle route must prove the stored process identity rather
+        than ask a caller to reconstruct a redacted command line.
+        """
+
+        normalized_id = _required_text(session_id, "session_id")
+        expected = _non_negative_integer(
+            expected_lease_version, "expected_lease_version"
+        )
+        observation: dict[str, Any]
+        with self._connection(immediate=True) as connection:
+            session = self._require_session(connection, normalized_id)
+            if session["provider"] != "RUNTIME":
+                raise SessionSupervisorError(
+                    "RUNTIME_EXECUTOR_PROVIDER_REQUIRED",
+                    "managed runtime stop requires provider=RUNTIME",
+                    status=409,
+                )
+            lease = self._require_lease(connection, normalized_id)
+            if (
+                int(lease["lease_version"]) != expected
+                or lease["lease_state"] != "OWNED"
+            ):
+                raise SessionSupervisorError(
+                    "MANAGED_STOP_NOT_ALLOWED",
+                    "managed runtime stop requires the current owned lease",
+                    status=409,
+                )
+            if not lease["stop_capability_protected"]:
+                raise SessionSupervisorError(
+                    "PROCESS_STOP_CAPABILITY_UNAVAILABLE",
+                    "managed runtime stop has no protected graceful-stop capability",
+                    status=503,
+                )
+            identity = self._lease_identity(lease)
+            observation = self._observe_process_instance(identity)
+            if observation.get("status") != "PROCESS_PRESENT_EXACT":
+                connection.execute(
+                    """
+                    UPDATE process_lease
+                    SET lease_state = 'UNKNOWN', lease_version = ?, updated_at = ?
+                    WHERE session_id = ? AND lease_version = ?
+                    """,
+                    (expected + 1, utc_now(), normalized_id, expected),
+                )
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET state = 'UNKNOWN', row_version = row_version + 1, updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (utc_now(), normalized_id),
+                )
+                raise SessionSupervisorError(
+                    "PROCESS_STOP_IDENTITY_NOT_CURRENT",
+                    "managed runtime stop requires exact Supervisor process evidence",
+                    status=409,
+                )
+            now = utc_now()
+            next_version = expected + 1
+            connection.execute(
+                """
+                UPDATE process_lease
+                SET lease_state = 'STOP_AUTHORIZED', lease_version = ?, updated_at = ?
+                WHERE session_id = ? AND lease_version = ?
+                """,
+                (next_version, now, normalized_id, expected),
+            )
+            self._event(
+                connection,
+                session_id=normalized_id,
+                event_type="MANAGED_PROCESS_STOP_AUTHORIZED",
+                prior_state=session["state"],
+                state="LIVE",
+                details={
+                    "lease_version": next_version,
+                    "process_observation": observation,
+                    "capability": "PROTECTED_AT_REST",
+                },
+            )
+        return {
+            "schema": SESSION_SUPERVISOR_SCHEMA,
+            "status": "MANAGED_STOP_AUTHORIZED",
+            "session_id": normalized_id,
+            "lease_version": next_version,
+            "process_observation": observation,
+        }
+
+    def complete_managed_stop(
+        self,
+        session_id: str,
+        *,
+        expected_lease_version: Any,
+    ) -> dict[str, Any]:
+        """Release an authorized runtime lease only after process absence."""
+
+        normalized_id = _required_text(session_id, "session_id")
+        expected = _non_negative_integer(
+            expected_lease_version, "expected_lease_version"
+        )
+        with self._connection() as connection:
+            session = self._require_session(connection, normalized_id)
+            lease = self._require_lease(connection, normalized_id)
+            if (
+                int(lease["lease_version"]) != expected
+                or lease["lease_state"] != "STOP_AUTHORIZED"
+            ):
+                raise SessionSupervisorError(
+                    "MANAGED_STOP_COMPLETION_DENIED",
+                    "managed stop completion requires the current authorization",
+                    status=409,
+                )
+            identity = self._lease_identity(lease)
+        observation = self._observe_process_instance(identity)
+        if observation.get("status") != "ORIGINAL_PROCESS_ABSENT":
+            raise SessionSupervisorError(
+                "PROCESS_ABSENCE_NOT_PROVEN",
+                "managed stop completion requires Supervisor-observed process absence",
+                status=409,
+            )
+        with self._connection(immediate=True) as connection:
+            session = self._require_session(connection, normalized_id)
+            lease = self._require_lease(connection, normalized_id)
+            if (
+                int(lease["lease_version"]) != expected
+                or lease["lease_state"] != "STOP_AUTHORIZED"
+            ):
+                raise SessionSupervisorError(
+                    "MANAGED_STOP_COMPLETION_DENIED",
+                    "managed stop authorization changed before completion",
+                    status=409,
+                )
+            now = utc_now()
+            next_version = expected + 1
+            connection.execute(
+                """
+                UPDATE process_lease
+                SET lease_state = 'RELEASED', stop_capability_protected = NULL,
+                    lease_version = ?, updated_at = ?
+                WHERE session_id = ? AND lease_version = ?
+                """,
+                (next_version, now, normalized_id, expected),
+            )
+            connection.execute(
+                """
+                UPDATE session_record
+                SET state = 'STOPPED', row_version = row_version + 1, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (now, normalized_id),
+            )
+            self._event(
+                connection,
+                session_id=normalized_id,
+                event_type="MANAGED_PROCESS_STOPPED",
+                prior_state=session["state"],
+                state="STOPPED",
+                details={
+                    "lease_version": next_version,
+                    "absence_observation": observation,
+                },
+            )
+            result = self._session_material(
+                connection, self._require_session(connection, normalized_id)
+            )
+        result["managed_stop"] = {
+            "status": "MANAGED_STOPPED",
+            "absence_observation": observation,
+            "process_termination": "GRACEFUL_REQUEST_ONLY",
+        }
+        return result
 
     def list_sessions(
         self,

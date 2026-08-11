@@ -423,7 +423,7 @@ class ProjectModeCoordinator:
         if str(primary_proposal.get("state") or "").upper() != "APPROVED":
             raise ProjectMasterHostError("PRIMARY_TASK_PROPOSAL_NOT_APPROVED")
         primary_boundary = _text(primary_proposal.get("boundary"), "primary.boundary")
-        primary_summary = _text(
+        _text(
             primary_proposal.get("task_summary"), "primary.task_summary"
         )
         primary_scope = primary_proposal.get("scope")
@@ -1094,6 +1094,7 @@ class ProjectModeCoordinator:
             session["session_id"],
             identity,
             expected_lease_version=expected_version,
+            stop_capability=token,
         )
         self._supervisor_session_id = str(session["session_id"])
         self._lease_token = str(acquired["lease_token"])
