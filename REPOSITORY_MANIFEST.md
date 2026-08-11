@@ -39,6 +39,8 @@ Execution Binding Entry: `.ai/skills/common/execution-binding/SKILL.md`
 Task Frame Entry: `.ai/skills/common/task-frame/SKILL.md`
 Default Debate Entry: `.ai/skills/common/task-frame-debate/SKILL.md`
 Task Worker Contract: `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md`
+Common Agent Policy: `.ai/agents/common/README.md`
+Worker Policy Pack: `.ai/agents/common/worker-policy-pack.json`
 Source Review Entry: `.ai/skills/common/source-review/SKILL.md`
 Windows Shell Entry: `.ai/skills/common/windows-shell-guard/SKILL.md`
 Windows Native CLI Entry: `.ai/skills/common/windows-native-cli/SKILL.md`

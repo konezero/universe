@@ -32,6 +32,18 @@ Mode intent must resolve through
 session preparation, or Mode Current Anchor access. The project
 Registry is `MASTER_MANAGED`; MASTER cannot delete itself.
 
+## Common Agent Policy
+
+The active Parent follows `.ai/agents/common/README.md` after
+repository startup policy. Project-owned Agent policy may add
+narrower constraints but must not weaken the common package.
+
+Before Worker invocation, the Task Frame Runtime validates
+`.ai/agents/common/worker-policy-pack.json` against the installed
+distribution and injects its content into the Worker input bundle.
+A Worker consumes that pack and must not read `AGENTS.md` or restart
+repository Boot.
+
 ## Host Command Routing
 
 When current Host evidence identifies Windows, follow
