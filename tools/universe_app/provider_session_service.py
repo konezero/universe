@@ -191,6 +191,7 @@ class ProviderSessionService:
         self._permission_waiters: dict[str, dict[str, Any]] = {}
         self._active_threads: dict[str, threading.Thread] = {}
         self._active_message_ids: dict[str, str] = {}
+        self._cancelled_message_ids: set[str] = set()
         self._idempotency: OrderedDict[
             tuple[str, str], dict[str, Any]
         ] = OrderedDict()
@@ -212,7 +213,12 @@ class ProviderSessionService:
                 for item in self._permissions.values()
                 if item["chat_key"] == key
             ]
-            state = "ACTIVE" if key in self._active_message_ids else "READY"
+            active_message_id = self._active_message_ids.get(key)
+            state = (
+                "CANCELLATION_REQUESTED"
+                if active_message_id in self._cancelled_message_ids
+                else "ACTIVE" if active_message_id else "READY"
+            )
         return {
             "schema": PROVIDER_SESSION_SNAPSHOT_SCHEMA,
             "status": "PROVIDER_SESSION_SNAPSHOT_COLLECTED",
@@ -304,6 +310,79 @@ class ProviderSessionService:
                 503,
             ) from error
         return _json_copy(result)
+
+    def cancel(self, chat_key: str) -> dict[str, Any]:
+        """Suppress adoption for the active native Provider turn without claiming a stop."""
+
+        key = _chat_key(chat_key)
+        cancelled_permissions: list[dict[str, Any]] = []
+        with self._lock:
+            message_id = self._active_message_ids.get(key)
+            if message_id is None:
+                return {
+                    "schema": PROVIDER_SESSION_SNAPSHOT_SCHEMA,
+                    "status": "PROVIDER_SESSION_CANCEL_NOT_REQUIRED",
+                    "target": self._public_target(self._resolve(key)),
+                    "room_queue_used": False,
+                }
+            messages = self._messages.get(key, ())
+            reply = next(
+                (item for item in reversed(messages) if item.get("message_id") == message_id),
+                None,
+            )
+            if reply is None:
+                raise ProviderSessionError(
+                    "PROVIDER_SESSION_ACTIVE_REPLY_MISSING",
+                    "active Provider Session reply is unavailable",
+                    409,
+                )
+            if reply.get("state") in {"COMPLETED", "FAILED", "CANCELLED"}:
+                return {
+                    "schema": PROVIDER_SESSION_SNAPSHOT_SCHEMA,
+                    "status": "PROVIDER_SESSION_CANCEL_NOT_REQUIRED",
+                    "message": _json_copy(reply),
+                    "room_queue_used": False,
+                }
+            if message_id in self._cancelled_message_ids:
+                return {
+                    "schema": PROVIDER_SESSION_SNAPSHOT_SCHEMA,
+                    "status": "PROVIDER_SESSION_CANCELLATION_ALREADY_REQUESTED",
+                    "message": _json_copy(reply),
+                    "room_queue_used": False,
+                }
+            self._cancelled_message_ids.add(message_id)
+            reply["state"] = "CANCELLATION_REQUESTED"
+            reply["updated_at"] = _utc_now()
+            for request_id, record in self._permissions.items():
+                if (
+                    record.get("chat_key") == key
+                    and record.get("message_id") == message_id
+                    and record.get("state") == "PENDING"
+                ):
+                    record["state"] = "CANCELLED"
+                    record["resolved_at"] = _utc_now()
+                    waiter = self._permission_waiters.get(request_id)
+                    if waiter is not None:
+                        waiter["event"].set()
+                    cancelled_permissions.append(_json_copy(record))
+            public_reply = _json_copy(reply)
+        self.events.publish(
+            key, {"type": "PROVIDER_SESSION_MESSAGE", "message": public_reply}
+        )
+        for permission in cancelled_permissions:
+            self.events.publish(
+                key,
+                {
+                    "type": "PROVIDER_SESSION_PERMISSION_RESOLVED",
+                    "permission": permission,
+                },
+            )
+        return {
+            "schema": PROVIDER_SESSION_SNAPSHOT_SCHEMA,
+            "status": "PROVIDER_SESSION_CANCELLATION_REQUESTED",
+            "message": public_reply,
+            "room_queue_used": False,
+        }
 
     def resolve_permission(
         self,
@@ -587,9 +666,10 @@ class ProviderSessionService:
             )
             text = str(result.get("text") or "").strip()
             with self._lock:
-                if text:
+                cancelled = reply_message["message_id"] in self._cancelled_message_ids
+                if not cancelled and text:
                     reply_message["body"] = text[:12000]
-                reply_message["state"] = "COMPLETED"
+                reply_message["state"] = "CANCELLED" if cancelled else "COMPLETED"
                 reply_message["updated_at"] = _utc_now()
             self.events.publish(
                 chat_key,
@@ -598,8 +678,10 @@ class ProviderSessionService:
         except Exception as error:  # noqa: BLE001 - provider boundary is normalized
             code = str(getattr(error, "code", type(error).__name__)).upper()
             with self._lock:
-                reply_message["state"] = "FAILED"
-                reply_message["error_code"] = code[:120]
+                cancelled = reply_message["message_id"] in self._cancelled_message_ids
+                reply_message["state"] = "CANCELLED" if cancelled else "FAILED"
+                if not cancelled:
+                    reply_message["error_code"] = code[:120]
                 reply_message["updated_at"] = _utc_now()
             self.events.publish(
                 chat_key,
@@ -615,6 +697,7 @@ class ProviderSessionService:
                 if current_handle is handle and refreshed_connection is not None:
                     handle.connection = refreshed_connection
                 self._active_message_ids.pop(chat_key, None)
+                self._cancelled_message_ids.discard(reply_message["message_id"])
                 self._active_threads.pop(chat_key, None)
 
     def _append_delta(
@@ -624,6 +707,8 @@ class ProviderSessionService:
         if not delta:
             return
         with self._lock:
+            if reply_message["message_id"] in self._cancelled_message_ids:
+                return
             current = str(reply_message.get("body") or "")
             remaining = max(0, 12000 - len(current))
             accepted = delta[:remaining]

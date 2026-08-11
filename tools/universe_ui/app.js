@@ -1946,8 +1946,62 @@ function toggleComposerActionMenu(forceOpen = null) {
   );
 }
 
+function activeProviderSessionReply() {
+  if (state.conversationTarget.kind !== "PROVIDER_SESSION") return null;
+  return [...state.providerSessionMessages]
+    .reverse()
+    .find((message) =>
+      ["STARTING", "STREAMING", "CANCELLATION_REQUESTED"].includes(
+        String(message.state || "")
+      )
+    ) || null;
+}
+
+async function cancelProviderSessionTurn() {
+  const target = state.conversationTarget;
+  if (target.kind !== "PROVIDER_SESSION" || !activeProviderSessionReply()) return;
+  try {
+    const result = await api(
+      `/v1/provider-sessions/${encodeURIComponent(target.chat_key)}/cancel`,
+      { method: "POST", body: {} }
+    );
+    if (result.message) {
+      state.providerSessionMessages = dedupeProviderSessionMessages([
+        ...state.providerSessionMessages,
+        result.message,
+      ]);
+    }
+    renderComposerActions();
+    renderComposerState();
+    renderRoomMessages();
+    toast(
+      result.status === "PROVIDER_SESSION_CANCELLATION_ALREADY_REQUESTED"
+        ? "Cancellation already requested"
+        : "Provider reply cancellation requested"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function renderComposerActions() {
   elements.projectMasterActions.replaceChildren();
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    const activeReply = activeProviderSessionReply();
+    if (activeReply) {
+      const action = node("button", "composer-menu-item");
+      action.type = "button";
+      action.role = "menuitem";
+      const pending = activeReply.state === "CANCELLATION_REQUESTED";
+      action.disabled = pending;
+      action.append(
+        node("span", "", pending ? "Cancellation requested" : "Cancel reply"),
+        node("small", "", "Keep the Provider process running; ignore its final result")
+      );
+      action.addEventListener("click", cancelProviderSessionTurn);
+      elements.projectMasterActions.append(action);
+    }
+  }
   for (const project of state.projects) {
     const action = node("button", "composer-menu-item");
     action.type = "button";

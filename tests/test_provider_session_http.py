@@ -40,6 +40,8 @@ class _Host:
         self.requester = requester
         self.store = _CoordinateStore()
         self.closed = False
+        self.block_started = threading.Event()
+        self.block_release = threading.Event()
 
     def set_permission_requester(
         self, requester: Callable[[Mapping[str, Any]], str | None]
@@ -66,6 +68,12 @@ class _Host:
         on_delta: Callable[[str], None],
     ) -> Mapping[str, Any]:
         self.last_message = dict(message)
+        if message["body"] == "block":
+            on_delta("before cancel ")
+            self.block_started.set()
+            self.block_release.wait(2)
+            on_delta("after cancel")
+            return {"text": "after cancel result", "session_ref": "secret-provider-session"}
         on_delta("direct ")
         on_delta("reply")
         return {"text": "direct reply", "session_ref": "secret-provider-session"}
@@ -176,6 +184,28 @@ class ProviderSessionHttpTests(unittest.TestCase):
         public = json.dumps(snapshot)
         self.assertNotIn("secret-provider-session", public)
         self.assertNotIn("repository_root", public)
+
+    def test_cancel_endpoint_suppresses_late_provider_result(self) -> None:
+        status, accepted = self.request(
+            "POST",
+            f"/v1/provider-sessions/{CHAT_KEY}/messages",
+            {"body": "block", "idempotency_key": "cancel-http-turn"},
+        )
+        self.assertEqual(HTTPStatus.ACCEPTED, status)
+        self.assertTrue(self.hosts[0].block_started.wait(1))
+
+        status, cancelled = self.request(
+            "POST", f"/v1/provider-sessions/{CHAT_KEY}/cancel", {}
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROVIDER_SESSION_CANCELLATION_REQUESTED", cancelled["status"])
+        self.hosts[0].block_release.set()
+        self.assertTrue(self.server.provider_sessions.wait_idle(CHAT_KEY))
+
+        status, snapshot = self.request("GET", f"/v1/provider-sessions/{CHAT_KEY}")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("CANCELLED", snapshot["messages"][-1]["state"])
+        self.assertEqual("before cancel ", snapshot["messages"][-1]["body"])
 
     def test_unavailable_target_is_a_bounded_conflict(self) -> None:
         def unavailable(_chat_key: str) -> Mapping[str, Any]:

@@ -41,6 +41,8 @@ class FakeProviderHost:
         self.prepared: list[str] = []
         self.permission_waiting = False
         self.status_calls = 0
+        self.block_started = threading.Event()
+        self.block_release = threading.Event()
 
     def set_permission_requester(
         self, requester: Callable[[Mapping[str, Any]], str | None]
@@ -81,6 +83,12 @@ class FakeProviderHost:
         message: Mapping[str, Any],
         on_delta: Callable[[str], None],
     ) -> Mapping[str, Any]:
+        if message["body"] == "block":
+            on_delta("before cancel ")
+            self.block_started.set()
+            self.block_release.wait(2)
+            on_delta("after cancel")
+            return {"text": "after cancel result", "session_ref": "provider-secret-session-ref"}
         if str(message["body"]).startswith("permission"):
             self.permission_waiting = True
             try:
@@ -308,6 +316,50 @@ class ProviderSessionServiceTests(unittest.TestCase):
         self.assertEqual([], first_errors)
         self.assertTrue(self.service.wait_idle(CHAT_KEY))
         self.assertEqual(2, len(self.service.snapshot(CHAT_KEY)["messages"]))
+
+    def test_cancel_suppresses_late_provider_result_without_claiming_process_stop(self) -> None:
+        self.service.submit(CHAT_KEY, {"body": "block", "idempotency_key": "cancel-turn"})
+        host = self.hosts[0]
+        self.assertTrue(host.block_started.wait(1))
+
+        cancelled = self.service.cancel(CHAT_KEY)
+        self.assertEqual("PROVIDER_SESSION_CANCELLATION_REQUESTED", cancelled["status"])
+        self.assertEqual("CANCELLATION_REQUESTED", cancelled["message"]["state"])
+        repeated = self.service.cancel(CHAT_KEY)
+        self.assertEqual("PROVIDER_SESSION_CANCELLATION_ALREADY_REQUESTED", repeated["status"])
+
+        host.block_release.set()
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        reply = self.service.snapshot(CHAT_KEY)["messages"][-1]
+        self.assertEqual("CANCELLED", reply["state"])
+        self.assertEqual("before cancel ", reply["body"])
+        self.assertNotIn("after cancel", reply["body"])
+
+    def test_cancel_after_completed_reply_is_not_reapplied(self) -> None:
+        self.service.submit(CHAT_KEY, {"body": "hello", "idempotency_key": "complete-then-cancel"})
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+
+        cancelled = self.service.cancel(CHAT_KEY)
+
+        self.assertEqual("PROVIDER_SESSION_CANCEL_NOT_REQUIRED", cancelled["status"])
+        self.assertNotIn("message", cancelled)
+        self.assertEqual("COMPLETED", self.service.snapshot(CHAT_KEY)["messages"][-1]["state"])
+
+    def test_cancel_does_not_reapply_to_terminal_reply_during_worker_cleanup(self) -> None:
+        self.service.submit(CHAT_KEY, {"body": "block", "idempotency_key": "terminal-race"})
+        host = self.hosts[0]
+        self.assertTrue(host.block_started.wait(1))
+        with self.service._lock:
+            message_id = self.service._active_message_ids[CHAT_KEY]
+            reply = next(message for message in self.service._messages[CHAT_KEY] if message["message_id"] == message_id)
+            reply["state"] = "COMPLETED"
+
+        cancelled = self.service.cancel(CHAT_KEY)
+
+        self.assertEqual("PROVIDER_SESSION_CANCEL_NOT_REQUIRED", cancelled["status"])
+        self.assertEqual("COMPLETED", cancelled["message"]["state"])
+        host.block_release.set()
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
 
     def test_model_change_replaces_idle_handle_and_closes_previous_host(self) -> None:
         self.service.submit(

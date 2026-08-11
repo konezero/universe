@@ -42,6 +42,18 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertNotIn("provider_session_ref", stream_slice)
         self.assertNotIn("source_path", stream_slice)
 
+    def test_provider_session_cancel_uses_direct_endpoint_without_room_queue(self) -> None:
+        self.assertIn("async function cancelProviderSessionTurn()", APP)
+        cancel_slice = APP[
+            APP.index("async function cancelProviderSessionTurn()") : APP.index(
+                "function renderComposerActions()"
+            )
+        ]
+        self.assertIn("/v1/provider-sessions/${encodeURIComponent(target.chat_key)}/cancel", cancel_slice)
+        self.assertNotIn("/v1/conductor-room/messages", cancel_slice)
+        self.assertNotIn("/v1/projects/", cancel_slice)
+        self.assertIn("Cancel reply", APP)
+
     def test_mobile_conversation_header_uses_two_row_layout(self) -> None:
         self.assertIn("grid-template-areas:", CSS)
         self.assertIn('"toggle title actions"', CSS)

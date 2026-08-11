@@ -20405,6 +20405,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._send(HTTPStatus.ACCEPTED, result)
                 return
+            provider_session_cancel = re.fullmatch(
+                r"/v1/provider-sessions/([^/]+)/cancel", path
+            )
+            if provider_session_cancel is not None:
+                result = self.server.provider_sessions.cancel(
+                    unquote(provider_session_cancel.group(1))
+                )
+                self._send(HTTPStatus.OK, result)
+                return
             provider_session_permission = re.fullmatch(
                 r"/v1/provider-sessions/([^/]+)/permissions/([^/]+)/decision",
                 path,
