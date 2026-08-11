@@ -207,6 +207,7 @@ from universe_app.bench_service import (
     aggregate_skill_bench,
     compare_skill_bench as compare_skill_bench_records,
 )
+from universe_app.bench_repository import BenchObservationRepository
 from universe_app.memory_batch_service import MemoryBatchConfigurationService
 from universe_app.streaming import (
     ConductorRoomEventHub,
@@ -7246,17 +7247,13 @@ class UniverseStore:
         now = utc_now()
         rows: list[dict[str, Any]] = []
         with self._connection() as connection:
-            existing_candidate = connection.execute(
-                """
-                SELECT DISTINCT candidate_digest
-                FROM skill_run_observation
-                WHERE project_id = ? AND candidate_id = ?
-                """,
-                (project["project_id"], request["candidate_id"]),
-            ).fetchall()
+            repository = BenchObservationRepository(connection)
+            existing_candidate = repository.candidate_digests(
+                project["project_id"], request["candidate_id"]
+            )
             if existing_candidate and any(
-                row["candidate_digest"] != request["candidate_digest"]
-                for row in existing_candidate
+                digest != request["candidate_digest"]
+                for digest in existing_candidate
             ):
                 raise UniverseError(
                     "SKILL_OBSERVATION_CANDIDATE_CONFLICT",
@@ -7264,20 +7261,11 @@ class UniverseStore:
                     HTTPStatus.CONFLICT,
                 )
             for observation in candidate["observations"]:
-                existing = connection.execute(
-                    """
-                    SELECT *
-                    FROM skill_run_observation
-                    WHERE project_id = ?
-                      AND candidate_id = ?
-                      AND observation_digest = ?
-                    """,
-                    (
-                        project["project_id"],
-                        request["candidate_id"],
-                        observation["observation_digest"],
-                    ),
-                ).fetchone()
+                existing = repository.observation(
+                    project["project_id"],
+                    request["candidate_id"],
+                    observation["observation_digest"],
+                )
                 if existing is not None:
                     rows.append(self._skill_observation_row(existing))
                     continue
@@ -7292,70 +7280,40 @@ class UniverseStore:
                         }
                     )[:24]
                 )
-                connection.execute(
-                    """
-                    INSERT INTO skill_run_observation(
-                        observation_id, project_id, candidate_id, candidate_digest,
-                        task_frame_ref, source_ref, observation_digest,
-                        skill_binding_digest, skill_id, skill_version,
-                        operation_class, context_pack_digest, model_ref, provider_ref,
-                        worker_role, task_kind, node_ref, outcome, validation_state,
-                        failure_kind, quota_state, evidence_refs_json, metrics_json,
-                        observed_at, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        observation_id,
-                        project["project_id"],
-                        request["candidate_id"],
-                        request["candidate_digest"],
-                        candidate["task_frame_ref"],
-                        candidate["source_ref"],
-                        observation["observation_digest"],
-                        observation["skill_binding_digest"],
-                        skill["skill_id"],
-                        skill["skill_version"],
-                        skill["operation_class"],
-                        skill["context_pack_digest"],
-                        observation["model_ref"],
-                        observation["execution_context"]["provider_ref"],
-                        observation["execution_context"]["worker_role"],
-                        observation["execution_context"]["task_kind"],
-                        observation["execution_context"]["node_ref"],
-                        observation["outcome"],
-                        observation["validation_state"],
-                        observation["execution_context"]["failure_kind"],
-                        observation["execution_context"]["quota_state"],
-                        _canonical_json(observation["evidence_refs"]),
-                        _canonical_json(observation["metrics"]),
-                        candidate["observed_at"],
-                        now,
-                    ),
+                repository.insert_observation(
+                    {
+                        "observation_id": observation_id,
+                        "project_id": project["project_id"],
+                        "candidate_id": request["candidate_id"],
+                        "candidate_digest": request["candidate_digest"],
+                        "task_frame_ref": candidate["task_frame_ref"],
+                        "source_ref": candidate["source_ref"],
+                        "observation_digest": observation["observation_digest"],
+                        "skill_binding_digest": observation["skill_binding_digest"],
+                        "skill_id": skill["skill_id"],
+                        "skill_version": skill["skill_version"],
+                        "operation_class": skill["operation_class"],
+                        "context_pack_digest": skill["context_pack_digest"],
+                        "model_ref": observation["model_ref"],
+                        "provider_ref": observation["execution_context"]["provider_ref"],
+                        "worker_role": observation["execution_context"]["worker_role"],
+                        "task_kind": observation["execution_context"]["task_kind"],
+                        "node_ref": observation["execution_context"]["node_ref"],
+                        "outcome": observation["outcome"],
+                        "validation_state": observation["validation_state"],
+                        "failure_kind": observation["execution_context"]["failure_kind"],
+                        "quota_state": observation["execution_context"]["quota_state"],
+                        "evidence_refs_json": _canonical_json(observation["evidence_refs"]),
+                        "metrics_json": _canonical_json(observation["metrics"]),
+                        "observed_at": candidate["observed_at"],
+                        "recorded_at": now,
+                    }
                 )
-                connection.execute(
-                    """
-                    INSERT INTO skill_catalog(
-                        skill_id, skill_version, operation_class,
-                        first_observed_at, last_observed_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(skill_id, skill_version, operation_class)
-                    DO UPDATE SET
-                        first_observed_at = MIN(
-                            skill_catalog.first_observed_at,
-                            excluded.first_observed_at
-                        ),
-                        last_observed_at = MAX(
-                            skill_catalog.last_observed_at,
-                            excluded.last_observed_at
-                        )
-                    """,
-                    (
-                        skill["skill_id"],
-                        skill["skill_version"],
-                        skill["operation_class"],
-                        candidate["observed_at"],
-                        candidate["observed_at"],
-                    ),
+                repository.upsert_skill_catalog(
+                    skill_id=skill["skill_id"],
+                    skill_version=skill["skill_version"],
+                    operation_class=skill["operation_class"],
+                    observed_at=candidate["observed_at"],
                 )
                 rows.append(
                     {
@@ -7389,15 +7347,10 @@ class UniverseStore:
         request = normalize_skill_observation_publication(project["project_id"], value)
         now = utc_now()
         with self._connection() as connection:
-            existing = connection.execute(
-                """
-                SELECT queue_id, candidate_id, candidate_digest,
-                       publication_approval_json, status, queued_at, ingested_at
-                FROM project_skill_observation_queue
-                WHERE project_id = ? AND candidate_id = ?
-                """,
-                (project["project_id"], request["candidate_id"]),
-            ).fetchone()
+            repository = BenchObservationRepository(connection)
+            existing = repository.queue_item(
+                project["project_id"], request["candidate_id"]
+            )
             if existing is not None:
                 if existing["candidate_digest"] != request["candidate_digest"]:
                     raise UniverseError(
@@ -7408,38 +7361,30 @@ class UniverseStore:
                 return self._skill_observation_queue_row(
                     existing, project["project_id"]
                 ), False
-            queue_id = (
-                "observation_queue_"
-                + _json_sha256(
-                    {
-                        "project_id": project["project_id"],
-                        "candidate_id": request["candidate_id"],
-                        "candidate_digest": request["candidate_digest"],
-                    }
-                )[:24]
-            )
-            connection.execute(
-                """
-                INSERT INTO project_skill_observation_queue(
-                    queue_id, project_id, candidate_id, candidate_digest,
-                    candidate_json, publication_approval_json,
-                    status, queued_at, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, NULL)
-                """,
-                (
-                    queue_id,
-                    project["project_id"],
-                    request["candidate_id"],
-                    request["candidate_digest"],
-                    _canonical_json(
+            queue_id = "observation_queue_" + _json_sha256(
+                {
+                    "project_id": project["project_id"],
+                    "candidate_id": request["candidate_id"],
+                    "candidate_digest": request["candidate_digest"],
+                }
+            )[:24]
+            repository.insert_queue_item(
+                {
+                    "queue_id": queue_id,
+                    "project_id": project["project_id"],
+                    "candidate_id": request["candidate_id"],
+                    "candidate_digest": request["candidate_digest"],
+                    "candidate_json": _canonical_json(
                         {
                             "candidate_id": request["candidate_id"],
                             "candidate": request["candidate"],
                         }
                     ),
-                    _canonical_json(request["publication_approval"]),
-                    now,
-                ),
+                    "publication_approval_json": _canonical_json(
+                        request["publication_approval"]
+                    ),
+                    "queued_at": now,
+                }
             )
         return {
             "schema": SKILL_OBSERVATION_QUEUE_SCHEMA,
@@ -7458,18 +7403,11 @@ class UniverseStore:
         self, project_id: str, *, limit: int = 200
     ) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
+        bounded_limit = max(1, min(int(limit), 500))
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT queue_id, candidate_id, candidate_digest,
-                       publication_approval_json, status, queued_at, ingested_at
-                FROM project_skill_observation_queue
-                WHERE project_id = ?
-                ORDER BY queued_at, queue_id
-                LIMIT ?
-                """,
-                (project["project_id"], max(1, min(int(limit), 500))),
-            ).fetchall()
+            rows = BenchObservationRepository(connection).list_queue_items(
+                project["project_id"], limit=bounded_limit
+            )
         return [
             self._skill_observation_queue_row(row, project["project_id"])
             for row in rows
@@ -7480,16 +7418,9 @@ class UniverseStore:
 
         bounded_limit = max(1, min(int(limit), 500))
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT queue_id, project_id, candidate_json
-                FROM project_skill_observation_queue
-                WHERE status = 'QUEUED'
-                ORDER BY queued_at, queue_id
-                LIMIT ?
-                """,
-                (bounded_limit,),
-            ).fetchall()
+            rows = BenchObservationRepository(connection).list_queued_items(
+                limit=bounded_limit
+            )
         ingested: list[dict[str, Any]] = []
         for row in rows:
             envelope = json.loads(row["candidate_json"])
@@ -7498,13 +7429,8 @@ class UniverseStore:
             )
             now = utc_now()
             with self._connection() as connection:
-                connection.execute(
-                    """
-                    UPDATE project_skill_observation_queue
-                    SET status = 'INGESTED', ingested_at = ?
-                    WHERE queue_id = ? AND status = 'QUEUED'
-                    """,
-                    (now, row["queue_id"]),
+                BenchObservationRepository(connection).mark_queue_ingested(
+                    row["queue_id"], now
                 )
             ingested.append(
                 {
@@ -7550,37 +7476,24 @@ class UniverseStore:
         self, project_id: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
-        limit = max(1, min(int(limit), 500))
+        bounded_limit = max(1, min(int(limit), 500))
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM skill_run_observation
-                WHERE project_id = ?
-                ORDER BY observed_at DESC, observation_id DESC
-                LIMIT ?
-                """,
-                (project["project_id"], limit),
-            ).fetchall()
+            rows = BenchObservationRepository(connection).list_observations(
+                project["project_id"], limit=bounded_limit
+            )
         return [self._skill_observation_row(row) for row in rows]
 
     def list_skill_bench(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 500))
+        bounded_limit = max(1, min(int(limit), 500))
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM skill_run_observation
-                ORDER BY skill_id, skill_version, operation_class, model_ref,
-                         observed_at, observation_id
-                """
-            ).fetchall()
+            rows = BenchObservationRepository(connection).list_all_observations()
         observations = [self._skill_observation_row(row) for row in rows]
         return aggregate_skill_bench(
             observations,
             provider_ref_from_model_ref=provider_ref_from_model_ref,
-            limit=limit,
+            limit=bounded_limit,
         )
+
     def create_context_pack(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -10412,13 +10325,9 @@ class UniverseStore:
                 "group_by must be skill, model, provider, project, worker, task, or node",
             )
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM skill_run_observation
-                ORDER BY observed_at DESC, observation_id DESC
-                """
-            ).fetchall()
+            rows = BenchObservationRepository(
+                connection
+            ).list_all_observations_for_comparison()
         observations = [self._skill_observation_row(row) for row in rows]
         return compare_skill_bench_records(
             observations,

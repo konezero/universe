@@ -221,8 +221,9 @@ Approved plan: `docs/p0-receipt-streaming-and-server-modularization.md`.
 - [x] Make exact byte-splice patch the default text MODIFY path; retain streamed full content for CREATE and fallback.
 - [x] Commit Runtime source `1b882d40842abc93646745bc62b95c7f82e465e7`, OS_UPDATE Universe (PASS/VERIFIED; validation `16ba3f04d...`), and dogfood large CREATE/MODIFY, interrupted streams, digest mismatch, stale preimage, expiry, replay, and cleanup.
 - [x] Extract pure Bench aggregation and comparison into `tools/universe_app/bench_service.py` and preserve the existing UniverseStore/API contract with focused tests.
-- [ ] Continue extracting `tools/universe_server.py`; connection/auth/HTTP transport, SSE hubs, Memory batch configuration, and Bench aggregation are extracted, while Memory execution, Bench persistence, Session/Provider, storage, API/runtime/CLI remain.
-- [x] Maintain changed-module, smoke, API/DB contract, and full regression tiers; focused Bench/server 121 tests + 8 subtests and full 601 tests + 40 subtests passed on 2026-08-11.
+- [x] Move Skill observation and Project observation queue SQL persistence behind `tools/universe_app/bench_repository.py`; preserve UniverseStore/API/SQLite contracts with repository tests.
+- [ ] Continue extracting `tools/universe_server.py`; connection/auth/HTTP transport, SSE hubs, Memory batch configuration, and Bench aggregation/persistence are extracted, while Memory execution, Bench schema/bootstrap, Session/Provider, storage, API/runtime/CLI remain.
+- [x] Maintain changed-module, smoke, API/DB contract, and full regression tiers; focused Bench/server 123 tests + 8 subtests and full 603 tests + 40 subtests passed on 2026-08-11.
 - [x] Give the tray/supervisor durable ownership of every Session Boot executor: the Supervisor store retains exact process identity and a Windows-DPAPI-protected graceful-stop capability, Conductor/Project Master leases persist it, and the resident service exposes guarded HTTP adopt/stop routes with graceful shutdown only; no raw process fallback is allowed.
 - [ ] Add scheduled real-Provider, browser, restart, quota, and long-running dogfood tiers.
 
