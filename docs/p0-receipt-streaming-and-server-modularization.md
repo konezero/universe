@@ -4,7 +4,7 @@ Status: IMPLEMENTATION_IN_PROGRESS
 Priority: P0
 Observed by: Universe dogfood
 
-Progress at 2026-08-10:
+Progress at 2026-08-11:
 
 - Runtime streaming payload store, receipt descriptor binding, byte-splice apply,
   CLI transport, compatibility path, failure cleanup, and 233-test Runtime
@@ -24,10 +24,13 @@ Progress at 2026-08-10:
   are now extracted behind `tools/universe_app/bench_service.py` and
   `tools/universe_app/bench_repository.py` behind the legacy server entrypoint,
   with focused contract coverage.
-- Regression: focused Bench/server 123 tests + 8 subtests and full 603 tests +
-  40 subtests; all passed on 2026-08-11.
-- Remaining extraction: Memory execution, Bench schema/bootstrap, Session/Provider,
-  storage, API routes, and CLI/bootstrap boundaries.
+- Memory batch execution orchestration is now extracted behind
+  `tools/universe_app/memory_execution_service.py`; UniverseStore retains
+  candidate and run persistence while the API contract remains unchanged.
+- Regression: new Memory execution tests plus the full suite passed:
+  `605 passed, 40 subtests` on 2026-08-11.
+- Remaining extraction: Bench schema/bootstrap, Session/Provider, storage,
+  API routes, and CLI/bootstrap boundaries.
 
 ## Problem
 

@@ -107,10 +107,7 @@ from universe_memory import (
     MEMORY_CANDIDATE_STATES,
     MEMORY_SCHEMA,
     MemoryError,
-    consolidate_memory_candidates,
-    extract_memory_candidates_from_activity_batch,
     filter_llm_proposals,
-    independent_check_memory_candidates,
     normalize_memory_batch_config,
     normalize_memory_candidate,
     normalize_memory_create,
@@ -118,9 +115,7 @@ from universe_memory import (
     normalize_memory_maintain,
     propose_node_links,
     propose_node_links_heuristic,
-    resolve_memory_batch_config,
     select_best_proposals,
-    synthesize_memory_candidates,
 )
 from memory_fast_extract import (
     FAST_EXTRACT_EFFORT,
@@ -209,6 +204,7 @@ from universe_app.bench_service import (
 )
 from universe_app.bench_repository import BenchObservationRepository
 from universe_app.memory_batch_service import MemoryBatchConfigurationService
+from universe_app.memory_execution_service import MemoryBatchExecutionService
 from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
@@ -3831,6 +3827,7 @@ class UniverseStore:
         self.provider_session_observer = ProviderSessionObserverStore(
             self.database_path
         )
+        self.memory_batch_execution_service = MemoryBatchExecutionService(self)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -5521,6 +5518,15 @@ class UniverseStore:
             for row in rows
         ]
 
+    def count_memory_batch_runs(self, project_id: str, stage: str) -> int:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
+                (project["project_id"], stage),
+            ).fetchone()
+        return int(row["count"] or 0)
+
     def get_memory_batch_run(self, run_id: str) -> dict[str, Any] | None:
         normalized = _required_text(run_id, "run_id")
         with self._connection() as connection:
@@ -5550,6 +5556,65 @@ class UniverseStore:
             "started_at": str(row["started_at"]),
             "completed_at": str(row["completed_at"]),
         }
+
+    def persist_memory_batch_result(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        stage: str,
+        result: Mapping[str, Any],
+        input_digest: str,
+        output_digest: str,
+        now: str,
+    ) -> None:
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT status FROM memory_batch_run WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO memory_batch_run(
+                        run_id, project_id, stage, config_digest, input_digest,
+                        output_digest, status, candidate_ids_json, result_json,
+                        started_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """
+                    ,
+                    (
+                        run_id,
+                        project_id,
+                        stage,
+                        result["config_digest"],
+                        input_digest,
+                        output_digest,
+                        result["status"],
+                        _canonical_json(result["candidate_ids"]),
+                        _canonical_json(result),
+                        now,
+                        now,
+                    ),
+                )
+            elif existing["status"] == "RUNNING":
+                connection.execute(
+                    """
+                    UPDATE memory_batch_run
+                    SET output_digest = ?, status = ?, candidate_ids_json = ?,
+                        result_json = ?, completed_at = ?
+                    WHERE run_id = ? AND status = 'RUNNING'
+                    """
+                    ,
+                    (
+                        output_digest,
+                        result["status"],
+                        _canonical_json(result["candidate_ids"]),
+                        _canonical_json(result),
+                        now,
+                        run_id,
+                    ),
+                )
 
     @staticmethod
     def memory_batch_run_id(
@@ -10099,211 +10164,16 @@ class UniverseStore:
         provider_execution: Mapping[str, Any] | None = None,
         skill_observation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        project = self.get_project(project_id)
-        request = request if isinstance(request, Mapping) else {}
-        stage = str(config.get("stage") or "").strip().upper()
-        if stage not in MEMORY_BATCH_STAGES:
-            raise UniverseError("MEMORY_BATCH_STAGE_INVALID", "stage is invalid")
-        dry_run = bool(config.get("dry_run", False))
-        budget = config.get("quota_or_budget")
-        if isinstance(budget, Mapping) and budget.get("max_runs") is not None:
-            with self._connection() as connection:
-                count = connection.execute(
-                    "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
-                    (project["project_id"], stage),
-                ).fetchone()["count"]
-            if int(count) >= int(budget["max_runs"]):
-                raise UniverseError(
-                    "MEMORY_BATCH_QUOTA_EXCEEDED",
-                    "configured memory batch max_runs quota is exhausted",
-                    HTTPStatus.CONFLICT,
-                )
-
-        candidates: list[dict[str, Any]] = []
-        check: dict[str, Any] | None = None
-        input_material: list[str] = []
-        if stage == "FAST_EXTRACT":
-            if provider_candidates is not None:
-                try:
-                    candidates = [
-                        normalize_memory_candidate(
-                            item,
-                            project_id=project["project_id"],
-                            stage="FAST_EXTRACT",
-                        )
-                        for item in provider_candidates
-                    ]
-                except MemoryError as error:
-                    raise UniverseError(error.code, error.message) from error
-                input_material = list(input_material_override or [])
-                if not input_material:
-                    input_material = [item["candidate_digest"] for item in candidates]
-            else:
-                batches = request.get("activity_batches")
-                if batches is None:
-                    batches = []
-                    source_ids = request.get("source_ids")
-                    if source_ids is None:
-                        source_ids = [item["source_id"] for item in self.list_provider_session_sources()]
-                    if not isinstance(source_ids, list):
-                        raise UniverseError(
-                            "MEMORY_BATCH_SOURCE_IDS_INVALID",
-                            "source_ids must be an array",
-                        )
-                    for source_id in source_ids:
-                        batches.append(self.prepare_provider_activity_batch(str(source_id)))
-                if not isinstance(batches, list):
-                    raise UniverseError(
-                        "MEMORY_BATCH_ACTIVITY_INVALID",
-                        "activity_batches must be an array",
-                    )
-                for batch in batches:
-                    extracted = extract_memory_candidates_from_activity_batch(
-                        batch, project_id=project["project_id"]
-                    )
-                    candidates.extend(extracted)
-                    input_material.extend(item["candidate_digest"] for item in extracted)
-        elif stage == "CONSOLIDATE":
-            existing = self.list_memory_candidates(
-                project["project_id"], stage="FAST_EXTRACT", limit=500
-            )
-            input_material = [item["candidate_digest"] for item in existing]
-            candidates = consolidate_memory_candidates(existing)
-        elif stage == "SYNTHESIZE":
-            existing = self.list_memory_candidates(
-                project["project_id"], stage="CONSOLIDATE", limit=500
-            )
-            if not existing:
-                existing = self.list_memory_candidates(
-                    project["project_id"], stage="FAST_EXTRACT", limit=500
-                )
-            input_material = [item["candidate_digest"] for item in existing]
-            raw_kinds = request.get("kinds", ["IDEA", "HYPOTHESIS", "PRODUCT"])
-            if not isinstance(raw_kinds, list):
-                raise UniverseError(
-                    "MEMORY_BATCH_KINDS_INVALID", "kinds must be an array"
-                )
-            try:
-                candidates = synthesize_memory_candidates(existing, kinds=raw_kinds)
-            except MemoryError as error:
-                raise UniverseError(error.code, error.message) from error
-        else:
-            existing = self.list_memory_candidates(project["project_id"], limit=500)
-            input_material = [item["candidate_digest"] for item in existing]
-            try:
-                check = independent_check_memory_candidates(existing)
-            except MemoryError as error:
-                raise UniverseError(error.code, error.message) from error
-
-        input_digest = _json_sha256(sorted(input_material))
-        output_digest = _json_sha256(
-            check if check is not None else [item["candidate_digest"] for item in candidates]
+        return self.memory_batch_execution_service.execute(
+            project_id,
+            config,
+            request,
+            provider_candidates=provider_candidates,
+            input_material_override=input_material_override,
+            run_id_override=run_id_override,
+            provider_execution=provider_execution,
+            skill_observation=skill_observation,
         )
-        stored_candidates: list[dict[str, Any]] = []
-        created_count = 0
-        if candidates and not dry_run:
-            stored_candidates, created_count = self._insert_memory_candidates(
-                project["project_id"], candidates
-            )
-        elif candidates:
-            stored_candidates = candidates
-        run_id = run_id_override
-        if run_id is None:
-            run_id, _config_digest, _input_digest = self.memory_batch_run_id(
-                project["project_id"], stage, config, input_material
-            )
-        now = utc_now()
-        result: dict[str, Any] = {
-            "schema": MEMORY_BATCH_RUN_SCHEMA,
-            "status": "DRY_RUN_COMPLETED" if dry_run else "COMPLETED",
-            "run_id": run_id,
-            "project_id": project["project_id"],
-            "stage": stage,
-            "config_digest": _json_sha256(config),
-            "input_digest": input_digest,
-            "output_digest": output_digest,
-            "candidate_count": len(stored_candidates),
-            "created_count": created_count,
-            "candidate_ids": [item["candidate_id"] for item in stored_candidates],
-            "candidates": stored_candidates,
-            "independent_check": check,
-            "execution": dict(provider_execution)
-            if provider_execution is not None
-            else {
-                "mode": "DETERMINISTIC",
-                "provider_invocation": "NOT_RUN",
-                "provider_attribution": "NONE",
-            },
-            "effects": {
-                "candidate_write": "NONE" if dry_run else ("CREATED" if created_count else "IDEMPOTENT"),
-                "memory_write": "NONE",
-                "current_anchor": "NONE",
-                "project_facts": "NONE",
-                "seed": "NONE",
-                "authority": "NONE",
-                "execution_assignment": "NONE",
-                "auto_adoption": False,
-                "skill_observation": (
-                    "RECORDED" if skill_observation is not None else "NONE"
-                ),
-            },
-        }
-        if skill_observation is not None:
-            result["skill_observation"] = {
-                key: skill_observation[key]
-                for key in (
-                    "candidate_id",
-                    "candidate_digest",
-                    "observation_count",
-                )
-                if key in skill_observation
-            }
-        with self._connection() as connection:
-            existing = connection.execute(
-                "SELECT status FROM memory_batch_run WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO memory_batch_run(
-                        run_id, project_id, stage, config_digest, input_digest,
-                        output_digest, status, candidate_ids_json, result_json,
-                        started_at, completed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        run_id,
-                        project["project_id"],
-                        stage,
-                        result["config_digest"],
-                        input_digest,
-                        output_digest,
-                        result["status"],
-                        _canonical_json(result["candidate_ids"]),
-                        _canonical_json(result),
-                        now,
-                        now,
-                    ),
-                )
-            elif existing["status"] == "RUNNING":
-                connection.execute(
-                    """
-                    UPDATE memory_batch_run
-                    SET output_digest = ?, status = ?, candidate_ids_json = ?,
-                        result_json = ?, completed_at = ?
-                    WHERE run_id = ? AND status = 'RUNNING'
-                    """,
-                    (
-                        output_digest,
-                        result["status"],
-                        _canonical_json(result["candidate_ids"]),
-                        _canonical_json(result),
-                        now,
-                        run_id,
-                    ),
-                )
-        return {**result, "started_at": now, "completed_at": now}
 
     def compare_skill_bench(
         self, *, group_by: str = "skill", limit: int = 50
