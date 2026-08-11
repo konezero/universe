@@ -167,6 +167,52 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertNotIn("live result", persisted)
         self.assertNotIn("secretvalue", persisted)
 
+    def test_codex_live_deltas_collapse_adjacent_telemetry_twins(self) -> None:
+        source_path = self.root / "rollout-telemetry-twins.jsonl"
+        self.write(
+            source_path,
+            {
+                "type": "response_item",
+                "id": "user-response",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "same question"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "id": "user-event",
+                "payload": {"type": "user_message", "message": "same question"},
+            },
+            {
+                "type": "event_msg",
+                "id": "assistant-event",
+                "payload": {"type": "agent_message", "message": "same answer"},
+            },
+            {
+                "type": "response_item",
+                "id": "assistant-response",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "same answer"}],
+                },
+            },
+        )
+        source = self.register("CODEX", source_path)
+        scan = self.store.scan(str(source["source_id"]))
+        delta = self.store.build_transient_live_deltas(
+            str(source["source_id"]), added_count=scan["added"]
+        )
+
+        self.assertEqual("TRANSIENT_REDACTED", delta["delivery"])
+        self.assertEqual(["USER", "ASSISTANT"], [item["role"] for item in delta["deltas"]])
+        self.assertEqual(
+            ["same question", "same answer"],
+            [item["text"] for item in delta["deltas"]],
+        )
+
     def test_append_keeps_file_identity_and_cursor_progresses(self) -> None:
         source_path = self.root / "rollout-append.jsonl"
         self.write(source_path, {"type": "turn_started"})

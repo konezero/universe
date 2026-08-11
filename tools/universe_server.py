@@ -4653,6 +4653,8 @@ class UniverseStore:
                     provider TEXT NOT NULL
                         CHECK(provider IN ('AUTO', 'GROK', 'CODEX', 'CLAUDE')),
                     model_ref TEXT NOT NULL DEFAULT '',
+                    effort TEXT NOT NULL DEFAULT 'AUTO'
+                        CHECK(effort IN ('AUTO', 'LOW', 'MEDIUM', 'HIGH', 'MAX')),
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(scope_kind, scope_id)
                 );
@@ -4803,6 +4805,10 @@ class UniverseStore:
                                 'AUTO', 'GROK', 'CODEX', 'CLAUDE'
                             )),
                         model_ref TEXT NOT NULL DEFAULT '',
+                        effort TEXT NOT NULL DEFAULT 'AUTO'
+                            CHECK(effort IN (
+                                'AUTO', 'LOW', 'MEDIUM', 'HIGH', 'MAX'
+                            )),
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY(scope_kind, scope_id)
                     )
@@ -4828,6 +4834,11 @@ class UniverseStore:
                 connection.execute(
                     "ALTER TABLE cli_provider_setting "
                     "ADD COLUMN model_ref TEXT NOT NULL DEFAULT ''"
+                )
+            if "effort" not in provider_columns:
+                connection.execute(
+                    "ALTER TABLE cli_provider_setting "
+                    "ADD COLUMN effort TEXT NOT NULL DEFAULT 'AUTO'"
                 )
             delegation_table = connection.execute(
                 "SELECT sql FROM sqlite_master "
@@ -4998,7 +5009,7 @@ class UniverseStore:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT provider, model_ref, updated_at
+                SELECT provider, model_ref, effort, updated_at
                 FROM cli_provider_setting
                 WHERE scope_kind = ? AND scope_id = ?
                 """,
@@ -5014,6 +5025,11 @@ class UniverseStore:
                 if row is not None and "model_ref" in row.keys()
                 else ""
             ),
+            "effort": (
+                str(row["effort"] or "AUTO").upper()
+                if row is not None and "effort" in row.keys()
+                else "AUTO"
+            ),
             "updated_at": str(row["updated_at"]) if row is not None else None,
         }
 
@@ -5027,7 +5043,7 @@ class UniverseStore:
             value,
             field="provider_setting",
             required=frozenset({"provider"}),
-            optional=frozenset({"model_ref"}),
+            optional=frozenset({"model_ref", "effort"}),
         )
         provider = _required_text(request["provider"], "provider").upper()
         if provider not in PROVIDER_SETTING_CHOICES:
@@ -5051,16 +5067,25 @@ class UniverseStore:
             )
         if provider == "AUTO":
             model_ref = ""
+        effort = str(
+            request.get("effort", current.get("effort", "AUTO"))
+        ).strip().upper()
+        if effort not in WORKER_BINDING_EFFORTS:
+            raise UniverseError(
+                "PROVIDER_EFFORT_INVALID",
+                "effort must be AUTO, LOW, MEDIUM, HIGH, or MAX",
+            )
         updated_at = utc_now()
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO cli_provider_setting(
-                    scope_kind, scope_id, provider, model_ref, updated_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    scope_kind, scope_id, provider, model_ref, effort, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scope_kind, scope_id) DO UPDATE SET
                     provider = excluded.provider,
                     model_ref = excluded.model_ref,
+                    effort = excluded.effort,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -5068,6 +5093,7 @@ class UniverseStore:
                     current["scope_id"],
                     provider,
                     model_ref,
+                    effort,
                     updated_at,
                 ),
             )
@@ -14351,6 +14377,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
                 model_resolver=self._resolve_project_master_model,
+                effort_resolver=self._resolve_project_master_effort,
                 governance_context_resolver=self._project_master_governance_context,
                 completion_observer=self._observe_project_master_completion,
                 room_event_observer=self._observe_native_room_event,
@@ -15474,6 +15501,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 settings["universe_conductor"]["provider"],
                 capabilities=capabilities,
                 strict=False,
+                preferred_provider=self._preferred_provider_for_mode(
+                    "CONDUCTOR", "CONDUCTOR"
+                ),
             )
         )
         conductor_provider = settings["universe_conductor"]["resolved_provider"]
@@ -15481,6 +15511,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             settings["universe_conductor"].get("model_ref")
             or capabilities.get(conductor_provider, {}).get("model", "UNKNOWN")
         )
+        settings["universe_conductor"]["resolved_effort"] = settings[
+            "universe_conductor"
+        ].get("effort", "AUTO")
         settings["universe_conductor"]["session_connection"] = (
             self.conductor_session_status()
         )
@@ -15489,6 +15522,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 project["provider"],
                 capabilities=capabilities,
                 strict=False,
+                preferred_provider=self._preferred_provider_for_mode(
+                    project["scope_id"], "MASTER"
+                ),
             )
             project["resolved_model"] = (
                 project.get("model_ref")
@@ -15496,6 +15532,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "model", "UNKNOWN"
                 )
             )
+            project["resolved_effort"] = project.get("effort", "AUTO")
             project["session_connection"] = (
                 self.project_master_hosts.connection_status(project["scope_id"])
                 if self.project_master_hosts is not None
@@ -15538,8 +15575,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if self.conductor_session_host is None:
             return self.conductor_session_status()
         try:
+            setting = self.store.provider_setting(
+                "UNIVERSE_CONDUCTOR", "CONDUCTOR"
+            )
             provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
-            status = self.conductor_session_host.prepare(provider)
+            status = self.conductor_session_host.prepare(
+                provider,
+                model=str(setting.get("model_ref") or "").strip(),
+                effort=str(setting.get("effort") or "AUTO").strip().upper(),
+            )
             self._conductor_session_error = None
             return status
         except (
@@ -17098,7 +17142,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         request = options if isinstance(options, Mapping) else {}
-        if "provider" in request or "model_ref" in request:
+        if any(key in request for key in ("provider", "model_ref", "effort")):
             current = self.store.provider_setting("PROJECT_MASTER", project_id)
             self.set_project_provider_setting(
                 project_id,
@@ -17106,6 +17150,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "provider": request.get("provider") or current["provider"],
                     "model_ref": request.get(
                         "model_ref", current.get("model_ref", "")
+                    ),
+                    "effort": request.get(
+                        "effort", current.get("effort", "AUTO")
                     ),
                 },
             )
@@ -18519,14 +18566,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if configured == "AUTO":
             configured = os.environ.get("UNIVERSE_CONDUCTOR_PROVIDER", "AUTO").upper()
         selected = requested if requested in {"GROK", "CODEX", "CLAUDE"} else configured
-        return self._resolve_configured_provider(selected, strict=True)
+        return self._resolve_configured_provider(
+            selected,
+            strict=True,
+            preferred_provider=self._preferred_provider_for_mode(
+                "CONDUCTOR", "CONDUCTOR"
+            ),
+        )
 
     def _resolve_project_master_provider(self, project_id: str) -> str:
         selected = self.store.provider_setting(
             "PROJECT_MASTER",
             project_id,
         )["provider"]
-        return self._resolve_configured_provider(selected, strict=True)
+        return self._resolve_configured_provider(
+            selected,
+            strict=True,
+            preferred_provider=self._preferred_provider_for_mode(
+                project_id, "MASTER"
+            ),
+        )
 
     def _resolve_project_master_model(self, project_id: str, provider: str) -> str:
         setting = self.store.provider_setting("PROJECT_MASTER", project_id)
@@ -18541,19 +18600,51 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return str(capability.get("model") or "").strip()
         return ""
 
+    def _resolve_project_master_effort(self, project_id: str, provider: str) -> str:
+        del provider
+        setting = self.store.provider_setting("PROJECT_MASTER", project_id)
+        return str(setting.get("effort") or "AUTO").strip().upper()
+
+    def _preferred_provider_for_mode(self, node: str, mode: str) -> str | None:
+        try:
+            sessions = self.session_supervisor.list_sessions(
+                node=node,
+                mode=mode,
+                include_hidden=False,
+            )
+        except Exception:
+            return None
+        for session in sessions:
+            provider = str(session.get("provider") or "").strip().upper()
+            if bool(session.get("is_default")) and provider in {
+                "GROK",
+                "CODEX",
+                "CLAUDE",
+            }:
+                return provider
+        return None
+
     def _resolve_configured_provider(
         self,
         selected: str,
         *,
         capabilities: Mapping[str, Mapping[str, Any]] | None = None,
         strict: bool,
+        preferred_provider: str | None = None,
     ) -> str:
         normalized = str(selected or "AUTO").strip().upper()
-        candidates = (
-            [normalized]
-            if normalized in {"GROK", "CODEX", "CLAUDE"}
-            else ["GROK", "CODEX", "CLAUDE"]
-        )
+        if normalized in {"GROK", "CODEX", "CLAUDE"}:
+            candidates = [normalized]
+        else:
+            preferred = str(preferred_provider or "").strip().upper()
+            candidates = []
+            if preferred in {"GROK", "CODEX", "CLAUDE"}:
+                candidates.append(preferred)
+            candidates.extend(
+                provider
+                for provider in ("GROK", "CODEX", "CLAUDE")
+                if provider not in candidates
+            )
         unavailable: list[str] = []
         for provider in candidates:
             capability = (

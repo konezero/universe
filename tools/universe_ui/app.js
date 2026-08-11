@@ -47,6 +47,7 @@ const state = {
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
+  providerProfileTarget: null,
   /** CLI+preset model catalog from /v1/settings/provider-models */
   providerModels: null,
   workerBindings: null,
@@ -167,6 +168,7 @@ const elements = {
   sessionSummaryConnection: document.querySelector("#session-summary-connection"),
   sessionSummaryProvider: document.querySelector("#session-summary-provider"),
   sessionSummaryModel: document.querySelector("#session-summary-model"),
+  sessionSummaryEffort: document.querySelector("#session-summary-effort"),
   sessionSummaryConnectionStatus: document.querySelector(
     "#session-summary-connection-status"
   ),
@@ -209,6 +211,19 @@ const elements = {
   settingsError: document.querySelector("#settings-error"),
   localServiceStatus: document.querySelector("#local-service-status"),
   universeProviderSetting: document.querySelector("#universe-provider-setting"),
+  providerProfileDialog: document.querySelector("#provider-profile-dialog"),
+  providerProfileForm: document.querySelector("#provider-profile-form"),
+  providerProfileTitle: document.querySelector("#provider-profile-title"),
+  providerProfileSubtitle: document.querySelector("#provider-profile-subtitle"),
+  providerProfileProvider: document.querySelector("#provider-profile-provider"),
+  providerProfileModel: document.querySelector("#provider-profile-model"),
+  providerProfileModelCustom: document.querySelector(
+    "#provider-profile-model-custom"
+  ),
+  providerProfileEffort: document.querySelector("#provider-profile-effort"),
+  providerProfileStatus: document.querySelector("#provider-profile-status"),
+  providerProfileError: document.querySelector("#provider-profile-error"),
+  providerProfileSubmit: document.querySelector("#provider-profile-submit"),
   memoryMaintainInterval: document.querySelector("#memory-maintain-interval"),
   memoryMaintainStatus: document.querySelector("#memory-maintain-status"),
   universeProviderStatus: document.querySelector("#universe-provider-status"),
@@ -1247,6 +1262,9 @@ function renderSessionSummaryConnection(room, project, boundSession) {
     setting.resolved_model ||
     providerCapability(currentProvider)?.model ||
     "";
+  const currentEffort = String(
+    setting.effort || setting.resolved_effort || "AUTO"
+  ).toUpperCase();
   const providers = state.providerSettings?.available_providers || [];
   elements.sessionSummaryProvider.replaceChildren();
   for (const provider of providers) {
@@ -1280,9 +1298,12 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   elements.sessionSummaryProvider.onchange = () => {
     fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, "");
   };
+  if (elements.sessionSummaryEffort) {
+    elements.sessionSummaryEffort.value = currentEffort;
+  }
   if (elements.sessionSummaryConnectionStatus) {
     elements.sessionSummaryConnectionStatus.textContent =
-      `Current: ${currentProvider} / ${currentModel || "host default"}`;
+      `Current: ${currentProvider} / ${currentModel || "host default"} / ${currentEffort}`;
   }
 }
 
@@ -1996,6 +2017,9 @@ async function callProjectMaster(projectId, options = {}) {
   if (Object.prototype.hasOwnProperty.call(options, "modelRef")) {
     prepareBody.model_ref = options.modelRef || "";
   }
+  if (Object.prototype.hasOwnProperty.call(options, "effort")) {
+    prepareBody.effort = options.effort || "AUTO";
+  }
   const prepared = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
     {
@@ -2022,6 +2046,13 @@ async function callProjectMaster(projectId, options = {}) {
     connection.model_ref !== options.expectedModel
   ) {
     throw new Error("Selected model did not become the active Master connection");
+  }
+  if (
+    options.expectedEffort &&
+    String(connection.effort || "AUTO").toUpperCase() !==
+      String(options.expectedEffort).toUpperCase()
+  ) {
+    throw new Error("Selected effort did not become the active Master connection");
   }
   state.providerSettings = await api("/v1/settings/providers");
   await selectProject(projectId);
@@ -2088,23 +2119,28 @@ async function connectSessionSummaryProviderModel() {
   }
   const provider = String(elements.sessionSummaryProvider?.value || "").toUpperCase();
   const modelRef = String(elements.sessionSummaryModel?.value || "").trim();
-  if (!provider || !modelRef) throw new Error("Choose a provider and model first");
+  const effort = String(elements.sessionSummaryEffort?.value || "AUTO").toUpperCase();
+  if (!provider) throw new Error("Choose a provider first");
   if (elements.sessionSummaryConnect) {
     elements.sessionSummaryConnect.disabled = true;
   }
   if (elements.sessionSummaryConnectionStatus) {
     elements.sessionSummaryConnectionStatus.textContent =
-      `Connecting ${provider} / ${modelRef}...`;
+      `Connecting ${provider} / ${modelRef || "host default"} / ${effort}...`;
   }
   try {
     await callProjectMaster(project.projectId, {
       provider,
       modelRef,
+      effort,
       expectedProvider: provider,
       expectedModel: modelRef,
+      expectedEffort: effort,
     });
     elements.sessionSummaryDialog.close();
-    toast(`Project Master connected: ${provider} / ${modelRef}`);
+    toast(
+      `Project Master connected: ${provider} / ${modelRef || "host default"} / ${effort}`
+    );
   } finally {
     if (elements.sessionSummaryConnect) {
       elements.sessionSummaryConnect.disabled = false;
@@ -2115,9 +2151,10 @@ async function connectSessionSummaryProviderModel() {
 function sessionConnectionText(connection, fallbackMode) {
   const provider = connection?.last_provider || "UNKNOWN";
   const model = connection?.model_ref || "model unknown";
+  const effort = connection?.effort || "AUTO";
   const connectionState = connection?.connection_state || "NOT_OPENED";
   const mode = connection?.requested_mode || fallbackMode;
-  return `${provider} / ${model} / ${connectionState} / ${mode}`;
+  return `${provider} / ${model} / ${effort} / ${connectionState} / ${mode}`;
 }
 
 function sessionUsageLabel(connection) {
@@ -3284,13 +3321,15 @@ function providerCapability(provider) {
 function providerStatusText(setting) {
   const configured = setting?.provider || "AUTO";
   const resolved = setting?.resolved_provider || "UNAVAILABLE";
+  const model = setting?.model_ref || setting?.resolved_model || "host default";
+  const effort = setting?.effort || setting?.resolved_effort || "AUTO";
   const mode =
     setting?.scope_kind === "UNIVERSE_CONDUCTOR" ? "CONDUCTOR" : "MASTER";
   if (configured === "AUTO") {
     const providerState = resolved === "UNAVAILABLE"
       ? "Auto / no CLI available"
       : `Auto / currently ${resolved}`;
-    return `${providerState} / ${sessionConnectionText(
+    return `${providerState} / ${model} / ${effort} / ${sessionConnectionText(
       setting?.session_connection,
       mode
     )}`;
@@ -3299,17 +3338,28 @@ function providerStatusText(setting) {
   const providerState = capability?.status === "AVAILABLE"
     ? `${configured} available`
     : `${configured} unavailable / ${capability?.reason || "CLI unavailable"}`;
-  return `${providerState} / ${sessionConnectionText(
+  return `${providerState} / ${model} / ${effort} / ${sessionConnectionText(
     setting?.session_connection,
     mode
   )}`;
+}
+
+function providerProfileSetting(scopeKind, scopeId) {
+  if (scopeKind === "UNIVERSE_CONDUCTOR") {
+    return state.providerSettings?.universe_conductor || null;
+  }
+  return (
+    state.providerSettings?.project_masters?.find(
+      (item) => item.scope_id === scopeId
+    ) || null
+  );
 }
 
 function renderProviderSettings() {
   const settings = state.providerSettings;
   if (!settings) return;
   const conductor = settings.universe_conductor;
-  elements.universeProviderSetting.value = conductor?.provider || "AUTO";
+  elements.universeProviderSetting.textContent = "Configure";
   elements.universeProviderStatus.textContent = providerStatusText(conductor);
   elements.projectProviderSettings.replaceChildren();
   for (const project of state.projects) {
@@ -3317,28 +3367,27 @@ function renderProviderSettings() {
       settings.project_masters?.find(
         (item) => item.scope_id === project.project_id
       ) || { provider: "AUTO", resolved_provider: "UNAVAILABLE" };
-    const row = node("label", "project-provider-row");
+    const row = node("div", "project-provider-row provider-profile-row");
     row.dataset.projectId = project.project_id;
-    const copy = node("span", "project-provider-copy");
+    const copy = node("div", "project-provider-copy provider-profile-copy");
     copy.append(
       node("strong", "", `${project.project_id} Master`),
       node("small", "", providerStatusText(setting))
     );
-    const select = node("select", "project-provider-select");
-    select.name = `project_provider_${project.project_id}`;
-    select.dataset.projectId = project.project_id;
-    for (const [value, label] of [
-      ["AUTO", "Auto"],
-      ["GROK", "Grok"],
-      ["CODEX", "Codex"],
-      ["CLAUDE", "Claude"],
-    ]) {
-      const option = node("option", "", label);
-      option.value = value;
-      select.append(option);
-    }
-    select.value = setting.provider || "AUTO";
-    row.append(copy, select);
+    const configure = node(
+      "button",
+      "secondary-button provider-profile-button",
+      "Configure"
+    );
+    configure.type = "button";
+    configure.addEventListener("click", () => {
+      openProviderProfileDialog({
+        scopeKind: "PROJECT_MASTER",
+        scopeId: project.project_id,
+        label: `${project.project_id} Master`,
+      });
+    });
+    row.append(copy, configure);
     elements.projectProviderSettings.append(row);
   }
   if (!state.projects.length) {
@@ -3353,6 +3402,90 @@ function providerCatalogModels(provider) {
   if (!key || key === "AUTO") return [];
   const entry = state.providerModels?.providers?.[key];
   return Array.isArray(entry?.models) ? entry.models : [];
+}
+
+function fillProviderProfileModelSelect(provider, selectedValue = "") {
+  const select = elements.providerProfileModel;
+  const custom = elements.providerProfileModelCustom;
+  if (!select || !custom) return;
+  const key = String(provider || "AUTO").toUpperCase();
+  const disabled = key === "AUTO";
+  const models = providerCatalogModels(key);
+  const selected = String(selectedValue || "").trim();
+  select.replaceChildren();
+  const hostDefault = node("option", "", disabled ? "Auto provider default" : "Host default");
+  hostDefault.value = "";
+  select.append(hostDefault);
+  for (const modelId of models) {
+    const option = node("option", "", modelId);
+    option.value = modelId;
+    select.append(option);
+  }
+  const catalogSelection = selected && models.includes(selected) ? selected : "";
+  select.value = catalogSelection;
+  custom.value = selected && !catalogSelection ? selected : "";
+  select.disabled = disabled;
+  custom.disabled = disabled;
+  if (disabled) custom.value = "";
+}
+
+function openProviderProfileDialog({ scopeKind, scopeId, label }) {
+  const setting = providerProfileSetting(scopeKind, scopeId) || {
+    provider: "AUTO",
+    model_ref: "",
+    effort: "AUTO",
+  };
+  state.providerProfileTarget = { scopeKind, scopeId, label };
+  elements.providerProfileTitle.textContent = label;
+  elements.providerProfileSubtitle.textContent =
+    scopeKind === "UNIVERSE_CONDUCTOR"
+      ? "Applied to the persistent Universe Conductor session."
+      : "Applied when this Project Master is opened or resumed.";
+  elements.providerProfileProvider.value = setting.provider || "AUTO";
+  elements.providerProfileEffort.value = setting.effort || "AUTO";
+  fillProviderProfileModelSelect(
+    elements.providerProfileProvider.value,
+    setting.model_ref || ""
+  );
+  elements.providerProfileStatus.textContent = providerStatusText(setting);
+  elements.providerProfileError.textContent = "";
+  elements.providerProfileDialog.showModal();
+}
+
+async function submitProviderProfile(event) {
+  event.preventDefault();
+  const target = state.providerProfileTarget;
+  if (!target) return;
+  elements.providerProfileError.textContent = "";
+  elements.providerProfileSubmit.disabled = true;
+  const provider = String(elements.providerProfileProvider.value || "AUTO").toUpperCase();
+  const modelRef = provider === "AUTO"
+    ? ""
+    : String(
+        elements.providerProfileModelCustom.value ||
+        elements.providerProfileModel.value ||
+        ""
+      ).trim();
+  const effort = String(elements.providerProfileEffort.value || "AUTO").toUpperCase();
+  const endpoint = target.scopeKind === "UNIVERSE_CONDUCTOR"
+    ? "/v1/settings/providers/universe"
+    : `/v1/projects/${encodeURIComponent(target.scopeId)}/provider-setting`;
+  try {
+    await api(endpoint, {
+      method: "POST",
+      body: { provider, model_ref: modelRef, effort },
+    });
+    state.providerSettings = await api("/v1/settings/providers");
+    renderProviderSettings();
+    renderComposerState();
+    if (elements.sessionSummaryDialog?.open) renderProviderChatSummary();
+    elements.providerProfileDialog.close();
+    toast(`${target.label} profile updated`);
+  } catch (error) {
+    elements.providerProfileError.textContent = error.message;
+  } finally {
+    elements.providerProfileSubmit.disabled = false;
+  }
 }
 
 function fillWorkerBindingModelSelect(select, provider, selectedValue) {
@@ -4591,22 +4724,7 @@ async function submitProviderSettings(event) {
   elements.settingsError.textContent = "";
   elements.settingsForm.querySelector("button[type='submit']").disabled = true;
   try {
-    const requests = [
-      api("/v1/settings/providers/universe", {
-        method: "POST",
-        body: { provider: elements.universeProviderSetting.value },
-      }),
-    ];
-    for (const select of elements.projectProviderSettings.querySelectorAll(
-      ".project-provider-select"
-    )) {
-      requests.push(
-        api(`/v1/projects/${encodeURIComponent(select.dataset.projectId)}/provider-setting`, {
-          method: "POST",
-          body: { provider: select.value },
-        })
-      );
-    }
+    const requests = [];
     const [scopeKind, scopeId] = elements.workerBindingScope.value.split(":", 2);
     for (const row of elements.workerBindingSettings.querySelectorAll(
       ".worker-binding-row"
@@ -9150,6 +9268,22 @@ function bindEvents() {
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
+  elements.universeProviderSetting.addEventListener("click", () => {
+    openProviderProfileDialog({
+      scopeKind: "UNIVERSE_CONDUCTOR",
+      scopeId: "CONDUCTOR",
+      label: "Universe Conductor",
+    });
+  });
+  elements.providerProfileProvider.addEventListener("change", () => {
+    fillProviderProfileModelSelect(elements.providerProfileProvider.value, "");
+  });
+  elements.providerProfileModel.addEventListener("change", () => {
+    if (elements.providerProfileModel.value) {
+      elements.providerProfileModelCustom.value = "";
+    }
+  });
+  elements.providerProfileForm.addEventListener("submit", submitProviderProfile);
   if (elements.actionInboxButton && elements.actionInboxDialog) {
     elements.actionInboxButton.addEventListener("click", () => {
       renderActionInbox();

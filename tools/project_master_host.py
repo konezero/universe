@@ -2089,6 +2089,7 @@ def provider_session_connection(
     resident: bool,
     connection_state: str | None = None,
     model_ref: str | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     coordinate = store.last_provider_session() if store is not None else None
     state = str(connection_state or "").strip().upper()
@@ -2106,6 +2107,7 @@ def provider_session_connection(
             coordinate["session_ref"] if coordinate is not None else "UNKNOWN"
         ),
         "model_ref": _text(model_ref, "model_ref") if model_ref else "UNKNOWN",
+        "effort": str(effort or "AUTO").strip().upper() or "AUTO",
         "connection_state": state,
         "session_persistence": "LAST_COORDINATE",
         "resident": bool(resident),
@@ -2158,6 +2160,7 @@ class GrokProjectMasterRuntime:
         *,
         native_runner: NativeRunner = run_native_cli,
         model: str = "",
+        effort: str = "AUTO",
         max_turns: int = 8,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
@@ -2167,6 +2170,7 @@ class GrokProjectMasterRuntime:
         self.store = store
         self.native_runner = native_runner
         self.model = model.strip()
+        self.effort = str(effort or "AUTO").strip().upper()
         self.max_turns = max(1, int(max_turns))
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = (
@@ -2242,9 +2246,10 @@ class GrokProjectMasterRuntime:
             return self._gateway
         if self._permission_requester is None:
             raise ProjectMasterHostError("AGENT_PERMISSION_GATEWAY_UNBOUND")
-        executable, environment, model = _resolve_grok()
+        executable, environment, default_model = _resolve_grok()
         if executable is None:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
+        model = self.model or default_model
 
         def observe_session(session_id: str) -> None:
             self.session_id = session_id
@@ -2259,6 +2264,7 @@ class GrokProjectMasterRuntime:
                 cwd=self.project_root,
                 environment=environment,
                 model=model,
+                effort=self.effort,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
                 permission_requester=self._permission_requester,
@@ -2320,6 +2326,7 @@ class CodexProjectMasterRuntime:
         *,
         native_runner: NativeRunner = run_native_cli,
         model: str = "",
+        effort: str = "AUTO",
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
     ) -> None:
@@ -2328,6 +2335,7 @@ class CodexProjectMasterRuntime:
         self.store = store
         self.native_runner = native_runner
         self.model = model.strip()
+        self.effort = str(effort or "AUTO").strip().upper()
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = (
             _text(actor_label, "actor_label")
@@ -2444,6 +2452,7 @@ class CodexProjectMasterRuntime:
                 cwd=self.project_root,
                 environment=environment,
                 model=model,
+                effort=self.effort,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
                 permission_requester=self._permission_requester,
@@ -2506,6 +2515,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         *,
         native_runner: NativeRunner = run_native_cli,
         model: str = "",
+        effort: str = "AUTO",
         max_turns: int = 8,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
@@ -2516,6 +2526,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             store,
             native_runner=native_runner,
             model=model,
+            effort=effort,
             requested_mode=requested_mode,
             actor_label=actor_label,
         )
@@ -2571,6 +2582,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
                 # The capability token must never reach Claude's own environment.
                 environment=broker.provider_environment(environment),
                 model=model,
+                effort=self.effort,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
                 session_observer=observe_session,
@@ -2638,18 +2650,34 @@ class ResidentModeSessionHost:
             session_supervisor=session_supervisor,
             requested_mode=self.requested_mode,
         )
+        self._custom_provider_factory = provider_factory
         self.provider_factory = provider_factory or self._default_provider
+        self._profile_provider: str | None = None
+        self._desired_model = ""
+        self._desired_effort = "AUTO"
         self._provider_name: str | None = None
         self._provider: MasterProvider | None = None
         self._provider_session_ref: str | None = None
+        self._provider_model = ""
+        self._provider_effort = "AUTO"
         self._last_interaction: dict[str, str] | None = None
         self._last_interaction_at = 0.0
         self._lock = threading.RLock()
 
-    def prepare(self, provider: str) -> dict[str, Any]:
+    def prepare(
+        self,
+        provider: str,
+        *,
+        model: str = "",
+        effort: str = "AUTO",
+    ) -> dict[str, Any]:
         normalized_provider = _provider(provider)
         with self._lock:
-            active = self._ensure(normalized_provider)
+            active = self._ensure(
+                normalized_provider,
+                model=model,
+                effort=effort,
+            )
             return self._connection_status(active=active)
 
     def status(self) -> dict[str, Any]:
@@ -2745,6 +2773,8 @@ class ResidentModeSessionHost:
             )
             result: dict[str, Any] = {
                 "provider": normalized_provider,
+                "model_ref": self._provider_model or "UNKNOWN",
+                "effort": self._provider_effort,
                 "session_ref": active.session_ref,
                 "connection_state": connection_state,
                 "requested_mode": self.requested_mode,
@@ -2761,22 +2791,50 @@ class ResidentModeSessionHost:
             self._provider = None
             self._provider_name = None
             self._provider_session_ref = None
+            self._provider_model = ""
+            self._provider_effort = "AUTO"
         if provider is not None:
             self._save_continuity("NORMAL_STOP", provider, provider_name)
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
 
-    def _ensure(self, provider: str) -> MasterProvider:
+    def _ensure(
+        self,
+        provider: str,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> MasterProvider:
+        if model is not None or effort is not None:
+            self._profile_provider = provider
+            if model is not None:
+                self._desired_model = str(model or "").strip()
+            if effort is not None:
+                self._desired_effort = str(effort or "AUTO").strip().upper()
+        elif self._profile_provider != provider:
+            self._profile_provider = provider
+            self._desired_model = ""
+            self._desired_effort = "AUTO"
+        selected_model = self._desired_model
+        selected_effort = self._desired_effort
         selected_session_ref = self.store.session_ref_for(provider)
         if self._provider is not None and self._provider_name == provider:
             if (
-                selected_session_ref is None
-                or selected_session_ref == self._provider_session_ref
+                (
+                    selected_session_ref is None
+                    or selected_session_ref == self._provider_session_ref
+                )
+                and selected_model == self._provider_model
+                and selected_effort == self._provider_effort
             ):
                 setattr(self._provider, "connection_state", "REUSED")
                 return self._provider
-            replacement_trigger = "SESSION_SELECTION_CHANGED"
+            replacement_trigger = (
+                "SESSION_SELECTION_CHANGED"
+                if selected_session_ref != self._provider_session_ref
+                else "PROVIDER_PROFILE_CHANGED"
+            )
         else:
             replacement_trigger = "PROVIDER_SWITCH"
         if self._provider is not None:
@@ -2786,17 +2844,31 @@ class ResidentModeSessionHost:
             self._provider = None
             self._provider_name = None
             self._provider_session_ref = None
+            self._provider_model = ""
+            self._provider_effort = "AUTO"
             close = getattr(previous, "close", None)
             if callable(close):
                 close()
-        active = self.provider_factory(
-            provider,
-            self.repository_root,
-            self.target_id,
-            self.store,
-            self.requested_mode,
-            self.actor_label,
-        )
+        if self._custom_provider_factory is None:
+            active = self._default_provider(
+                provider,
+                self.repository_root,
+                self.target_id,
+                self.store,
+                self.requested_mode,
+                self.actor_label,
+                selected_model,
+                selected_effort,
+            )
+        else:
+            active = self.provider_factory(
+                provider,
+                self.repository_root,
+                self.target_id,
+                self.store,
+                self.requested_mode,
+                self.actor_label,
+            )
         permission_setter = getattr(active, "set_permission_requester", None)
         if callable(permission_setter):
             permission_setter(self.permission_requester)
@@ -2805,6 +2877,8 @@ class ResidentModeSessionHost:
             prepare()
         self._provider = active
         self._provider_name = provider
+        self._provider_model = selected_model
+        self._provider_effort = selected_effort
         self._provider_session_ref = self.store.session_ref_for(provider)
         if self._provider_session_ref is None:
             raw_session_id = getattr(active, "session_id", None)
@@ -2959,12 +3033,16 @@ class ResidentModeSessionHost:
         store: ProjectMasterSessionStore,
         requested_mode: str,
         actor_label: str,
+        model: str = "",
+        effort: str = "AUTO",
     ) -> MasterProvider:
         if provider == "GROK":
             return GrokProjectMasterRuntime(
                 repository_root,
                 target_id,
                 store,
+                model=model,
+                effort=effort,
                 requested_mode=requested_mode,
                 actor_label=actor_label,
             )
@@ -2973,6 +3051,8 @@ class ResidentModeSessionHost:
                 repository_root,
                 target_id,
                 store,
+                model=model,
+                effort=effort,
                 requested_mode=requested_mode,
                 actor_label=actor_label,
             )
@@ -2981,6 +3061,8 @@ class ResidentModeSessionHost:
                 repository_root,
                 target_id,
                 store,
+                model=model,
+                effort=effort,
                 requested_mode=requested_mode,
                 actor_label=actor_label,
             )
@@ -3003,6 +3085,8 @@ class ResidentModeSessionHost:
             store=self.store,
             resident=active is not None,
             connection_state=state if state and state != "UNKNOWN" else None,
+            model_ref=self._provider_model,
+            effort=self._provider_effort,
         )
         status["runtime_observation"] = (
             self._runtime_observation(active) if active is not None else None
@@ -3936,6 +4020,7 @@ class ResidentProjectMasterHandle:
     project_root: Path
     provider: str
     model: str
+    effort: str
     session_ref: str
     endpoint: str
     credential_env: str
@@ -3971,6 +4056,7 @@ class ResidentProjectMasterHostManager:
         | None = None,
         provider_resolver: Callable[[str], str] | None = None,
         model_resolver: Callable[[str, str], str] | None = None,
+        effort_resolver: Callable[[str, str], str] | None = None,
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
@@ -3984,6 +4070,9 @@ class ResidentProjectMasterHostManager:
         self.provider_factory = provider_factory
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.model_resolver = model_resolver or (lambda _project_id, _provider: "")
+        self.effort_resolver = effort_resolver or (
+            lambda _project_id, _provider: "AUTO"
+        )
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
         self.completion_observer = completion_observer
@@ -4002,6 +4091,9 @@ class ResidentProjectMasterHostManager:
         selected_model = str(
             self.model_resolver(project_id, selected_provider) or ""
         ).strip()
+        selected_effort = str(
+            self.effort_resolver(project_id, selected_provider) or "AUTO"
+        ).strip().upper()
         store = ProjectMasterSessionStore(
             _default_state_db(project_id),
             project_id,
@@ -4039,6 +4131,7 @@ class ResidentProjectMasterHostManager:
                 and handle.thread.is_alive()
                 and handle.provider == selected_provider
                 and handle.model == selected_model
+                and handle.effort == selected_effort
                 and (
                     not selected_session_ref
                     or handle.session_ref == selected_session_ref
@@ -4069,6 +4162,7 @@ class ResidentProjectMasterHostManager:
                     project_id,
                     store,
                     model=selected_model,
+                    effort=selected_effort,
                 )
             )
             try:
@@ -4135,6 +4229,7 @@ class ResidentProjectMasterHostManager:
                 project_root=project_root,
                 provider=selected_provider,
                 model=selected_model,
+                effort=selected_effort,
                 session_ref=provider.session_ref,
                 endpoint=endpoint,
                 credential_env=credential_env,
@@ -4228,6 +4323,7 @@ class ResidentProjectMasterHostManager:
             except Exception:
                 provider = ""
         model = self._model_for(normalized, provider)
+        effort = self._effort_for(normalized, provider)
         return provider_session_connection(
             target_kind="PROJECT_MASTER",
             target_id=normalized,
@@ -4235,6 +4331,7 @@ class ResidentProjectMasterHostManager:
             store=store,
             resident=False,
             model_ref=model,
+            effort=effort,
         )
 
     def _model_for(self, project_id: str, provider: str) -> str:
@@ -4244,6 +4341,16 @@ class ResidentProjectMasterHostManager:
             return str(self.model_resolver(project_id, provider) or "").strip()
         except Exception:
             return ""
+
+    def _effort_for(self, project_id: str, provider: str) -> str:
+        if not provider:
+            return "AUTO"
+        try:
+            return str(
+                self.effort_resolver(project_id, provider) or "AUTO"
+            ).strip().upper()
+        except Exception:
+            return "AUTO"
 
     def invalidate(self, project_id: str) -> None:
         normalized = _text(project_id, "project_id")
@@ -4453,6 +4560,7 @@ class ResidentProjectMasterHostManager:
             resident=True,
             connection_state=state if state and state != "UNKNOWN" else None,
             model_ref=str(getattr(active, "model", "") or "").strip(),
+            effort=str(getattr(active, "effort", "AUTO") or "AUTO").strip(),
         )
         connection["runtime_observation"] = (
             ProjectMasterConversationWorker._runtime_observation(active)
@@ -4477,18 +4585,19 @@ class ResidentProjectMasterHostManager:
         project_id: str,
         store: ProjectMasterSessionStore,
         model: str = "",
+        effort: str = "AUTO",
     ) -> MasterProvider:
         if provider == "GROK":
             return GrokProjectMasterRuntime(
-                project_root, project_id, store, model=model
+                project_root, project_id, store, model=model, effort=effort
             )
         if provider == "CODEX":
             return CodexProjectMasterRuntime(
-                project_root, project_id, store, model=model
+                project_root, project_id, store, model=model, effort=effort
             )
         if provider == "CLAUDE":
             return ClaudeProjectMasterRuntime(
-                project_root, project_id, store, model=model
+                project_root, project_id, store, model=model, effort=effort
             )
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 

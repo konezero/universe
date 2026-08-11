@@ -644,6 +644,36 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
 
+    def test_resident_mode_session_replaces_changed_provider_profile(self) -> None:
+        created: list[PreparedFakeProvider] = []
+
+        def factory(*_args):
+            instance = PreparedFakeProvider()
+            created.append(instance)
+            return instance
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-profile.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=factory,
+        )
+        try:
+            first = host.prepare("CODEX", model="gpt-a", effort="HIGH")
+            host.prepare("CODEX", model="gpt-a", effort="HIGH")
+            second = host.prepare("CODEX", model="gpt-b", effort="MAX")
+        finally:
+            host.close()
+
+        self.assertEqual(2, len(created))
+        self.assertTrue(created[0].closed)
+        self.assertEqual("gpt-a", first["model_ref"])
+        self.assertEqual("HIGH", first["effort"])
+        self.assertEqual("gpt-b", second["model_ref"])
+        self.assertEqual("MAX", second["effort"])
+
     def test_resident_mode_session_records_commander_and_provider_observations(
         self,
     ) -> None:

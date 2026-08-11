@@ -35,6 +35,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('id="session-summary-facts"', HTML)
         self.assertIn('id="session-summary-provider"', HTML)
         self.assertIn('id="session-summary-model"', HTML)
+        self.assertIn('id="session-summary-effort"', HTML)
         self.assertIn('id="session-summary-connect"', HTML)
         self.assertIn('id="session-summary-open"', HTML)
         self.assertIn("openProviderChatSummary(room)", APP)
@@ -53,6 +54,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("provider: session.provider", APP)
         self.assertIn("expectedSessionRef", APP)
         self.assertIn("expectedModel", APP)
+        self.assertIn("expectedEffort", APP)
         connect_slice = APP[
             APP.index("async function connectSessionSummaryProviderModel") : APP.index(
                 "function sessionConnectionText"
@@ -63,6 +65,18 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             connect_slice.index("elements.sessionSummaryDialog.close()"),
         )
         self.assertIn("session-summary-connection", CSS)
+
+    def test_provider_profiles_use_one_provider_model_effort_dialog(self) -> None:
+        self.assertIn('id="provider-profile-dialog"', HTML)
+        self.assertIn('id="provider-profile-provider"', HTML)
+        self.assertIn('id="provider-profile-model"', HTML)
+        self.assertIn('id="provider-profile-model-custom"', HTML)
+        self.assertIn('id="provider-profile-effort"', HTML)
+        self.assertIn("function openProviderProfileDialog", APP)
+        self.assertIn("async function submitProviderProfile", APP)
+        self.assertIn("body: { provider, model_ref: modelRef, effort }", APP)
+        self.assertIn("provider-profile-row", CSS)
+        self.assertIn("provider-profile-dialog", CSS)
 
     def test_hidden_view_and_bounded_tail_are_wired(self) -> None:
         self.assertIn('id="session-rail-show-hidden"', HTML)

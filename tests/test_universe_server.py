@@ -1991,11 +1991,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             def provider_capabilities() -> list[dict[str, str]]:
                 return [
                     {"provider": "GROK", "status": "AVAILABLE"},
-                    {
-                        "provider": "CODEX",
-                        "status": "UNAVAILABLE",
-                        "reason": "CODEX_CLI_LAUNCH_FAILED",
-                    },
+                    {"provider": "CODEX", "status": "AVAILABLE"},
                 ]
 
             @staticmethod
@@ -2017,6 +2013,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             defaults["project_masters"][0]["provider"],
         )
         self.assertEqual("", defaults["project_masters"][0]["model_ref"])
+        self.assertEqual("AUTO", defaults["universe_conductor"]["effort"])
+        self.assertEqual("AUTO", defaults["project_masters"][0]["effort"])
         self.assertEqual("GROK", defaults["universe_conductor"]["resolved_provider"])
         self.assertEqual(
             "UNAVAILABLE",
@@ -2035,21 +2033,44 @@ class UniverseLocalServiceTests(unittest.TestCase):
             defaults["universe_conductor"]["session_connection"],
         )
 
+        conductor_session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "sticky-conductor-codex",
+                "node": "CONDUCTOR",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-sticky-session",
+                "anchor_ref": "CONDUCTOR-CURRENT-STICKY",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        self.server.session_supervisor.set_default(
+            conductor_session["session_id"], expected_pointer_version=0
+        )
+        sticky = self.server.provider_settings()
+        self.assertEqual(
+            "CODEX", sticky["universe_conductor"]["resolved_provider"]
+        )
+
         status, universe = self.request(
             "POST",
             "/v1/settings/providers/universe",
-            {"provider": "CODEX"},
+            {"provider": "CODEX", "model_ref": "gpt-test", "effort": "HIGH"},
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("CODEX", universe["setting"]["provider"])
+        self.assertEqual("gpt-test", universe["setting"]["model_ref"])
+        self.assertEqual("HIGH", universe["setting"]["effort"])
         status, project = self.request(
             "POST",
             "/v1/projects/GCS/provider-setting",
-            {"provider": "GROK", "model_ref": "grok-4.5"},
+            {"provider": "GROK", "model_ref": "grok-4.5", "effort": "MAX"},
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("GROK", project["setting"]["provider"])
         self.assertEqual("grok-4.5", project["setting"]["model_ref"])
+        self.assertEqual("MAX", project["setting"]["effort"])
 
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(
@@ -2066,6 +2087,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "grok-4.5",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["model_ref"],
+        )
+        self.assertEqual(
+            "HIGH",
+            reopened.provider_setting(
+                "UNIVERSE_CONDUCTOR", "CONDUCTOR"
+            )["effort"],
+        )
+        self.assertEqual(
+            "MAX",
+            reopened.provider_setting("PROJECT_MASTER", "GCS")["effort"],
         )
 
     def test_worker_binding_profiles_resolve_by_scope_and_revision(self) -> None:
@@ -2612,12 +2643,17 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GROK",
             store.provider_setting("UNIVERSE_CONDUCTOR", "CONDUCTOR")["provider"],
         )
+        self.assertEqual(
+            "AUTO",
+            store.provider_setting("UNIVERSE_CONDUCTOR", "CONDUCTOR")["effort"],
+        )
         updated = store.set_provider_setting(
             "UNIVERSE_CONDUCTOR",
             "CONDUCTOR",
-            {"provider": "CLAUDE"},
+            {"provider": "CLAUDE", "effort": "HIGH"},
         )
         self.assertEqual("CLAUDE", updated["provider"])
+        self.assertEqual("HIGH", updated["effort"])
 
     def test_server_restart_reuses_one_conductor_provider_coordinate(self) -> None:
         class FakeRuntimeHost:

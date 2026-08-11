@@ -24,6 +24,7 @@ PERMISSION_KINDS = frozenset(
 GROK_PERMISSION_MODE = "default"
 CODEX_APPROVAL_POLICY = "on-request"
 CLAUDE_PERMISSION_MODE = "plan"
+PROVIDER_EFFORTS = frozenset({"AUTO", "LOW", "MEDIUM", "HIGH", "MAX"})
 
 # Claude Code routes permission prompts to the MCP tool named by
 # --permission-prompt-tool. Verified against claude-code 2.1.212: the flag is
@@ -531,6 +532,7 @@ class GrokAcpSession:
         system_prompt: str,
         session_id: str | None,
         model: str = "default",
+        effort: str = "AUTO",
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
@@ -542,21 +544,25 @@ class GrokAcpSession:
         self.ephemeral = bool(ephemeral)
         self.session_id = None if self.ephemeral else session_id
         self.model = _text(model, "model")
+        self.effort = _text(effort, "effort").upper()
+        if self.effort not in PROVIDER_EFFORTS:
+            raise AgentSessionError("GROK_EFFORT_INVALID")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
         self._active_delta: Callable[[str], None] | None = None
+        self._bootstrap_pending = True
+        transport_arguments = [
+            "--no-auto-update",
+            "--permission-mode",
+            GROK_PERMISSION_MODE,
+        ]
+        if self.effort != "AUTO":
+            transport_arguments.extend(("--reasoning-effort", self.effort.lower()))
+        transport_arguments.extend(("agent", "--model", self.model, "stdio"))
         self._transport = JsonRpcStdioProcess(
             executable=executable,
-            arguments=(
-                "--no-auto-update",
-                "--permission-mode",
-                GROK_PERMISSION_MODE,
-                "agent",
-                "--model",
-                self.model,
-                "stdio",
-            ),
+            arguments=tuple(transport_arguments),
             cwd=cwd,
             environment=environment,
             request_handler=self._handle_request,
@@ -589,6 +595,10 @@ class GrokAcpSession:
             on_delta(delta)
 
         self._active_delta = receive
+        prompt_text = text
+        if self._bootstrap_pending:
+            prompt_text = f"{self.system_prompt}\n\n{text}"
+            self._bootstrap_pending = False
         try:
             result = self._transport.request(
                 "session/prompt",
@@ -597,7 +607,7 @@ class GrokAcpSession:
                     "prompt": [
                         {
                             "type": "text",
-                            "text": f"{self.system_prompt}\n\n{text}",
+                            "text": prompt_text,
                         }
                     ],
                 },
@@ -723,6 +733,7 @@ class CodexAppServerSession:
         system_prompt: str,
         session_id: str | None,
         model: str = "default",
+        effort: str = "AUTO",
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
@@ -731,6 +742,9 @@ class CodexAppServerSession:
         self.system_prompt = system_prompt
         self.session_id = session_id
         self.model = _text(model, "model")
+        self.effort = _text(effort, "effort").upper()
+        if self.effort not in PROVIDER_EFFORTS:
+            raise AgentSessionError("CODEX_EFFORT_INVALID")
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
@@ -740,9 +754,14 @@ class CodexAppServerSession:
         self._turn_events: dict[str, threading.Event] = {}
         self._completed_turns: set[str] = set()
         self._turn_statuses: dict[str, str] = {}
+        self._bootstrap_pending = False
         transport_arguments = ["app-server"]
         if self.model.casefold() not in {"auto", "default"}:
             transport_arguments.extend(("-c", f"model={json.dumps(self.model)}"))
+        if self.effort != "AUTO":
+            transport_arguments.extend(
+                ("-c", f"model_reasoning_effort={json.dumps(self.effort.lower())}")
+            )
         transport_arguments.extend(("--listen", "stdio://"))
         self._transport = JsonRpcStdioProcess(
             executable=executable,
@@ -780,6 +799,10 @@ class CodexAppServerSession:
 
         self._active_delta = receive
         self._active_final_text = None
+        prompt_text = text
+        if self._bootstrap_pending:
+            prompt_text = f"{self.system_prompt}\n\n{text}"
+            self._bootstrap_pending = False
         try:
             result = self._transport.request(
                 "turn/start",
@@ -788,7 +811,7 @@ class CodexAppServerSession:
                     "input": [
                         {
                             "type": "text",
-                            "text": f"{self.system_prompt}\n\n{text}",
+                            "text": prompt_text,
                         }
                     ],
                     "approvalPolicy": CODEX_APPROVAL_POLICY,
@@ -858,6 +881,7 @@ class CodexAppServerSession:
                     },
                     timeout_seconds=30,
                 )
+                self._bootstrap_pending = True
             except AgentSessionError:
                 session_result = None
         else:

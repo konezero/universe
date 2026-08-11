@@ -115,7 +115,7 @@ class ClaudeResidentSessionTests(unittest.TestCase):
         self.assertEqual(2, len(FakeClaudeProcess.instances[0].sent))
 
     def test_stream_arguments_use_stream_json_and_no_shell(self) -> None:
-        session = self._session()
+        session = self._session(effort="MAX")
         session.send_message("one", lambda _d: None)
         arguments = FakeClaudeProcess.instances[0].arguments
 
@@ -127,6 +127,7 @@ class ClaudeResidentSessionTests(unittest.TestCase):
             "stream-json", arguments[arguments.index("--output-format") + 1]
         )
         self.assertIn("--verbose", arguments)
+        self.assertEqual("max", arguments[arguments.index("--effort") + 1])
 
     def test_delta_order_is_preserved(self) -> None:
         session = self._session()

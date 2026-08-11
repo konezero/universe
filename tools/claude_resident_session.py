@@ -64,6 +64,7 @@ CLAUDE_FORBIDDEN_ARGUMENTS = frozenset(
 # Lifecycle states are owned by the shared gateway contract, not redefined
 # here, so Codex / Grok / Claude report one vocabulary upward.
 from agent_session_gateway import (  # noqa: E402
+    PROVIDER_EFFORTS,
     SESSION_BUSY,
     SESSION_CONNECTING,
     SESSION_FAILED,
@@ -249,6 +250,7 @@ class ClaudeResidentSession:
         session_id: str | None,
         session_observer: Callable[[str], None],
         model: str = "default",
+        effort: str = "AUTO",
         extra_arguments: tuple[str, ...] = (),
         turn_timeout_seconds: float = 600.0,
         permission_mcp_config: Path | None = None,
@@ -272,6 +274,9 @@ class ClaudeResidentSession:
             raise ClaudeResidentError("CLAUDE_PERMISSION_TOKEN_LEAKED_TO_PROVIDER")
         self.system_prompt = str(system_prompt)
         self.model = str(model or "default")
+        self.effort = str(effort or "AUTO").strip().upper()
+        if self.effort not in PROVIDER_EFFORTS:
+            raise ClaudeResidentError("CLAUDE_EFFORT_INVALID")
         self.session_id = session_id or None
         # A session id supplied by the store means this is a restore.
         self._resume = bool(session_id)
@@ -463,6 +468,8 @@ class ClaudeResidentSession:
 
     def _arguments(self) -> tuple[str, ...]:
         arguments = [*CLAUDE_STREAM_ARGUMENTS, "--model", self.model]
+        if self.effort != "AUTO":
+            arguments.extend(("--effort", self.effort.lower()))
         if self._resume and self.session_id:
             arguments.extend(("--resume", self.session_id))
         elif self.session_id:

@@ -648,8 +648,11 @@ class ProviderSessionObserverStore:
                     )
                 selected.append((row, ref))
 
+        selected.sort(key=lambda item: int(item[0]["ordinal"]))
         excerpts: list[dict[str, Any]] = []
         total_chars = 0
+        previous_semantic_key: tuple[str, str] | None = None
+        previous_ordinal: int | None = None
         with path.open("rb") as handle:
             for row, _ref in selected:
                 byte_offset = int(row["byte_offset"])
@@ -688,13 +691,24 @@ class ProviderSessionObserverStore:
                     if remaining <= 0 or len(excerpts) >= SEMANTIC_EXCERPT_LIMIT:
                         break
                     text = text[:remaining]
-                    total_chars += len(text)
                     text_digest = _sha256(_canonical_json(text))
+                    ordinal = int(row["ordinal"])
+                    semantic_key = (role, text_digest)
+                    is_adjacent_telemetry_twin = (
+                        semantic_key == previous_semantic_key
+                        and previous_ordinal is not None
+                        and ordinal == previous_ordinal + 1
+                    )
+                    previous_semantic_key = semantic_key
+                    previous_ordinal = ordinal
+                    if is_adjacent_telemetry_twin:
+                        continue
+                    total_chars += len(text)
                     excerpts.append(
                         {
                             "excerpt_id": "semantic_" + text_digest[:24],
                             "activity_digest": str(row["activity_digest"]),
-                            "ordinal": int(row["ordinal"]),
+                            "ordinal": ordinal,
                             "role": role,
                             "text": text,
                             "text_digest": text_digest,

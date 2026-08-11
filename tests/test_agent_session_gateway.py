@@ -396,6 +396,39 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("GROK", selected[0]["provider"])
         self.assertTrue(transport.closed)
 
+    def test_grok_bootstraps_once_and_passes_effort(self) -> None:
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-session-existing",
+                model="grok-4",
+                effort="MAX",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            session.prompt("First", lambda _delta: None)
+            session.prompt("Second", lambda _delta: None)
+            session.close()
+
+        transport = FakeJsonRpcTransport.instances[0]
+        self.assertIn("--reasoning-effort", transport.arguments)
+        self.assertEqual(
+            "max",
+            transport.arguments[transport.arguments.index("--reasoning-effort") + 1],
+        )
+        prompts = [
+            params["prompt"][0]["text"]
+            for method, params in transport.requests
+            if method == "session/prompt"
+        ]
+        self.assertEqual(["System\n\nFirst", "Second"], prompts)
+
     def test_grok_load_keeps_requested_session_when_response_is_empty(self) -> None:
         sessions: list[str] = []
         with patch(
@@ -555,6 +588,65 @@ class AgentSessionGatewayTests(unittest.TestCase):
         )
         self.assertFalse(start["ephemeral"])
         self.assertTrue(transport.closed)
+
+    def test_codex_new_thread_uses_developer_bootstrap_and_passes_effort(self) -> None:
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id=None,
+                model="gpt-test",
+                effort="MAX",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            session.prompt("First", lambda _delta: None)
+            session.prompt("Second", lambda _delta: None)
+            session.close()
+
+        transport = FakeJsonRpcTransport.instances[0]
+        self.assertIn('model_reasoning_effort="max"', transport.arguments)
+        started = next(
+            params for method, params in transport.requests if method == "thread/start"
+        )
+        self.assertEqual("System", started["developerInstructions"])
+        prompts = [
+            params["input"][0]["text"]
+            for method, params in transport.requests
+            if method == "turn/start"
+        ]
+        self.assertEqual(["First", "Second"], prompts)
+
+    def test_codex_resumed_thread_bootstraps_first_turn_only(self) -> None:
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="codex-thread-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            session.prompt("First", lambda _delta: None)
+            session.prompt("Second", lambda _delta: None)
+            session.close()
+
+        transport = FakeJsonRpcTransport.instances[0]
+        prompts = [
+            params["input"][0]["text"]
+            for method, params in transport.requests
+            if method == "turn/start"
+        ]
+        self.assertEqual(["System\n\nFirst", "Second"], prompts)
 
     def test_codex_additional_permissions_preserve_profile_and_scope(self) -> None:
         selected: list[dict[str, Any]] = []
