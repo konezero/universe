@@ -452,6 +452,19 @@ relations remain distinct from observed evidence. Career adoption is separate.
     synthesizes functional nodes from repository source. See
     `docs/completion-evidence-audit-2026-08-11.md`.
 
+
+17. Add a common `implementation-validation` Skill to the ai-career package and
+    consume it from Universe and Project Task Frames. Classify each change as
+    `NARROW`, `MODULE`, `SHARED`, or `RELEASE` from changed paths, dependency
+    boundaries, contract/data/runtime risk, and user-visible behavior. Select the
+    smallest sufficient unit, integration, browser, or provider validation set,
+    then expand one level when evidence fails or impact cannot be bounded. Keep
+    implementer completion claims separate from independent verification. Full
+    regression remains mandatory for Release, `OS_UPDATE`, shared Runtime or
+    contract changes, database migration, and Provider/session lifecycle changes.
+    The Result Packet reports the selected tier, executed evidence, unverified
+    scope, and residual risk without treating skipped tests as passed.
+
 ## Runtime Boundary
 
 Universe consumes the installed ai-career Skill binding and observation
