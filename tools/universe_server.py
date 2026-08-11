@@ -199,6 +199,13 @@ from universe_app.connection import (
     local_connection_profile,
     local_http_interface_profile,
 )
+from universe_app.bench_service import (
+    SKILL_FAILURE_KINDS,
+    SKILL_OUTCOMES,
+    SKILL_QUOTA_STATES,
+    SKILL_VALIDATION_STATES,
+    aggregate_skill_bench,
+)
 from universe_app.memory_batch_service import MemoryBatchConfigurationService
 from universe_app.streaming import (
     ConductorRoomEventHub,
@@ -274,7 +281,6 @@ SKILL_OBSERVATION_PUBLICATION_APPROVAL_SCHEMA = (
 )
 SKILL_RUN_OBSERVATION_SCHEMA = "universe.skill-run-observation.v1"
 SKILL_OBSERVATION_QUEUE_SCHEMA = "universe.skill-observation-queue-item.v1"
-SKILL_BENCH_SCHEMA = "universe.skill-bench.v1"
 PROJECT_CONTEXT_PACK_SCHEMA = "universe.project-context-pack.v1"
 PROJECT_SKILL_PLAN_SCHEMA = "universe.project-skill-plan.v1"
 PROJECT_SKILL_PLAN_ADOPTION_SCHEMA = "universe.project-skill-plan-adoption.v1"
@@ -345,20 +351,6 @@ INTERFACE_KINDS = frozenset({"HTTP_API", "MCP", "CLI"})
 ADAPTER_DIRECTIONS = frozenset({"INBOUND", "OUTBOUND"})
 AUTH_TYPES = frozenset({"NONE", "LOCAL_TOKEN", "OAUTH2", "PEER_KEY"})
 SKILL_OPERATION_CLASSES = frozenset({"READ", "PROPOSE", "EXECUTE"})
-SKILL_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "UNKNOWN"})
-SKILL_VALIDATION_STATES = frozenset({"PASS", "FAIL", "NOT_RUN", "UNKNOWN"})
-SKILL_FAILURE_KINDS = frozenset(
-    {
-        "NONE",
-        "PROVIDER_QUOTA",
-        "PROVIDER_ERROR",
-        "VALIDATION",
-        "TIMEOUT",
-        "CANCELLED",
-        "UNKNOWN",
-    }
-)
-SKILL_QUOTA_STATES = frozenset({"AVAILABLE", "WARNING", "EXHAUSTED", "UNKNOWN"})
 TODO_SCOPE_KINDS = frozenset({"UNIVERSE", "PROJECT", "NODE"})
 TODO_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
 TODO_STATES = frozenset({"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
@@ -7582,63 +7574,12 @@ class UniverseStore:
                          observed_at, observation_id
                 """
             ).fetchall()
-        grouped: dict[tuple[str, str, str, str, str, str, str], dict[str, Any]] = {}
-        for row in rows:
-            item = self._skill_observation_row(row)
-            skill = item["skill"]
-            execution_context = item["execution_context"]
-            provider_ref = execution_context["provider_ref"]
-            if provider_ref == "UNKNOWN":
-                provider_ref = provider_ref_from_model_ref(item["model_ref"])
-            key = (
-                skill["skill_id"],
-                skill["skill_version"],
-                skill["operation_class"],
-                item["model_ref"],
-                provider_ref,
-                execution_context["worker_role"],
-                execution_context["task_kind"],
-            )
-            group = grouped.setdefault(
-                key,
-                {
-                    "schema": SKILL_BENCH_SCHEMA,
-                    "skill": skill,
-                    "model_ref": item["model_ref"],
-                    "provider_ref": provider_ref,
-                    "worker_role": execution_context["worker_role"],
-                    "task_kind": execution_context["task_kind"],
-                    "observation_count": 0,
-                    "outcomes": {state: 0 for state in sorted(SKILL_OUTCOMES)},
-                    "validation_states": {
-                        state: 0 for state in sorted(SKILL_VALIDATION_STATES)
-                    },
-                    "failure_kinds": {
-                        state: 0 for state in sorted(SKILL_FAILURE_KINDS)
-                    },
-                    "quota_states": {state: 0 for state in sorted(SKILL_QUOTA_STATES)},
-                    "metric_totals": {},
-                    "first_observed_at": item["observed_at"],
-                    "last_observed_at": item["observed_at"],
-                },
-            )
-            group["observation_count"] += 1
-            group["outcomes"][item["outcome"]] += 1
-            group["validation_states"][item["validation_state"]] += 1
-            group["failure_kinds"][execution_context["failure_kind"]] += 1
-            group["quota_states"][execution_context["quota_state"]] += 1
-            group["first_observed_at"] = min(
-                group["first_observed_at"], item["observed_at"]
-            )
-            group["last_observed_at"] = max(
-                group["last_observed_at"], item["observed_at"]
-            )
-            for metric_key, metric_value in item["metrics"].items():
-                group["metric_totals"][metric_key] = (
-                    group["metric_totals"].get(metric_key, 0) + metric_value
-                )
-        return list(grouped.values())[:limit]
-
+        observations = [self._skill_observation_row(row) for row in rows]
+        return aggregate_skill_bench(
+            observations,
+            provider_ref_from_model_ref=provider_ref_from_model_ref,
+            limit=limit,
+        )
     def create_context_pack(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
