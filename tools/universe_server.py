@@ -16257,7 +16257,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for item in supervisor_sessions
                 if str(item.get("provider") or "").upper() == provider
                 and str(item.get("provider_session_ref") or "") in legacy_refs
-                and anchor_observation is not None
+                and (
+                    anchor_observation is not None
+                    or (
+                        bool(item.get("is_default"))
+                        and str(item.get("currentness") or "").upper()
+                        == "CURRENT"
+                    )
+                )
             ]
             matches.sort(
                 key=lambda item: (
@@ -16269,14 +16276,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             bound = matches[0] if matches else None
             binding: dict[str, Any] = {"state": "UNBOUND"}
-            if anchor_observation is not None:
-                node = str(anchor_observation.get("node") or "UNKNOWN")
-                mode = str(anchor_observation.get("mode") or "UNKNOWN")
+            binding_observation = anchor_observation
+            if binding_observation is None and bound is not None:
+                bound_node = str(bound.get("node") or "UNKNOWN")
+                bound_project_id = str(
+                    bound.get("current_project_id")
+                    or (bound_node if bound_node != "UNKNOWN" else "")
+                ).strip()
+                bound_anchor_ref = str(bound.get("anchor_ref") or "UNKNOWN")
+                binding_observation = {
+                    "project_id": bound_project_id or None,
+                    "node": bound_node,
+                    "mode": str(bound.get("mode") or "UNKNOWN"),
+                    "anchor_ref": bound_anchor_ref,
+                    "observed_anchor_ref": bound_anchor_ref,
+                    "temporality": "SUPERVISOR_CURRENT",
+                    "observed_at": (
+                        bound.get("last_seen_at")
+                        or bound.get("updated_at")
+                        or "UNKNOWN"
+                    ),
+                }
+            if binding_observation is not None:
+                node = str(binding_observation.get("node") or "UNKNOWN")
+                mode = str(binding_observation.get("mode") or "UNKNOWN")
                 anchor_ref = str(
-                    anchor_observation.get("anchor_ref") or "UNKNOWN"
+                    binding_observation.get("anchor_ref") or "UNKNOWN"
                 )
                 anchor_identity = {
-                    "project_id": anchor_observation.get("project_id")
+                    "project_id": binding_observation.get("project_id")
                     or (node if node != "UNKNOWN" else None),
                     "node": node,
                     "mode": mode,
@@ -16292,11 +16320,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         bound.get("alias") if bound is not None else None
                     ),
                     "current_anchor_ref": anchor_ref,
-                    "origin_anchor_ref": anchor_observation.get(
+                    "origin_anchor_ref": binding_observation.get(
                         "observed_anchor_ref"
                     )
                     or anchor_ref,
-                    "origin_anchor_temporality": anchor_observation[
+                    "origin_anchor_temporality": binding_observation[
                         "temporality"
                     ],
                     "observer_currentness": (

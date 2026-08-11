@@ -1221,6 +1221,78 @@ class UniverseLocalServiceTests(unittest.TestCase):
             [room["chat_key"] for room in repeated_catalog["rooms"]],
         )
 
+    def test_provider_chat_catalog_binds_current_default_without_anchor_observation(
+        self,
+    ) -> None:
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-universe-master-current",
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-current-master",
+                "anchor_ref": "MASTER-CURRENT-LIVE",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        self.server.session_supervisor.set_default(
+            session["session_id"],
+            expected_pointer_version=session["default_pointer_version"],
+        )
+
+        def discovered(provider: str) -> list[dict[str, Any]]:
+            if provider != "CODEX":
+                return []
+            return [
+                {
+                    "schema": "universe.provider-session-source.v1",
+                    "status": "DISCOVERED",
+                    "provider": "CODEX",
+                    "provider_session_id": "codex-current-master",
+                    "source_path": str(self.temp_root / "CODEX" / "current.jsonl"),
+                    "source_kind": "CODEX_ROLLOUT_JSONL",
+                    "source_version": "v1",
+                    "last_modified_at": "2026-08-11T15:24:04Z",
+                    "workspace": r"C:\workspace\universe",
+                    "workspace_name": "universe",
+                    "display_name": "Codex session",
+                    "session_kind": "CHAT",
+                    "identity_state": "VERIFIED",
+                    "transcript_content": "EXCLUDED",
+                }
+            ]
+
+        with (
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                side_effect=discovered,
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_observations",
+                return_value=[],
+            ),
+        ):
+            catalog = self.server.provider_chat_catalog()
+
+        self.assertEqual(1, len(catalog["rooms"]))
+        room = catalog["rooms"][0]
+        self.assertEqual("CODEX", room["provider"])
+        self.assertEqual("BOUND", room["binding"]["state"])
+        self.assertTrue(room["binding"]["is_default"])
+        self.assertEqual("CURRENT", room["binding"]["observer_currentness"])
+        self.assertEqual("universe", room["binding"]["current_project_id"])
+        self.assertEqual("MASTER", room["binding"]["mode"])
+        self.assertEqual(
+            "MASTER-CURRENT-LIVE", room["binding"]["current_anchor_ref"]
+        )
+        self.assertEqual(
+            "session-universe-master-current",
+            room["binding"]["universe_session_id"],
+        )
+
     def test_provider_chat_catalog_deduplicates_rotated_chat_files_but_keeps_workers(
         self,
     ) -> None:
