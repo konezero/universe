@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import json
 from unittest import mock
 from pathlib import Path
 
@@ -19,6 +20,44 @@ from universe_server import (  # noqa: E402
 
 
 class NetworkAnchorProjectTests(unittest.TestCase):
+    def _write_private_root(
+        self,
+        private_root: Path,
+        nodes: list[dict[str, object]],
+    ) -> None:
+        private_root.mkdir(parents=True)
+        (private_root / "README.md").write_text("# Private\n", encoding="utf-8")
+        (private_root / "universe-root.json").write_text(
+            json.dumps(
+                {
+                    "schema": "universe.private-root.v1",
+                    "node_id": "private-node-root",
+                    "display_name": "Private Node Root",
+                    "projects_root": "projects",
+                }
+            ),
+            encoding="utf-8",
+        )
+        for node in nodes:
+            node_id = str(node["node_id"])
+            node_root = private_root / "projects" / node_id
+            node_root.mkdir(parents=True)
+            (node_root / "README.md").write_text("# Node\n", encoding="utf-8")
+            (node_root / "universe-node.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.project-node.v1",
+                        "node_id": node_id,
+                        "display_name": node["display_name"],
+                        "visibility": "private",
+                        "kind": "product",
+                        "network_role": node.get("network_role", "PRODUCT_NODE"),
+                        "legacy_project_ids": node.get("legacy_project_ids", []),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
     def test_discover_includes_universe_home(self) -> None:
         candidates = discover_network_anchor_candidates(universe_root=ROOT)
         ids = {item["project_id"] for item in candidates}
@@ -48,12 +87,18 @@ class NetworkAnchorProjectTests(unittest.TestCase):
     def test_configured_private_career_root_takes_precedence(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             private_root = Path(tmp) / "universe-private"
-            (private_root / "README.md").parent.mkdir(parents=True)
-            (private_root / "README.md").write_text("# Private\n", encoding="utf-8")
-            for node in ("career", "rendezvous"):
-                node_root = private_root / "projects" / node
-                node_root.mkdir(parents=True)
-                (node_root / "README.md").write_text("# Node\n", encoding="utf-8")
+            self._write_private_root(
+                private_root,
+                [
+                    {
+                        "node_id": "career",
+                        "display_name": "Career",
+                        "network_role": "CAREER_SOURCE",
+                    },
+                    {"node_id": "rendezvous", "display_name": "Rendezvous"},
+                    {"node_id": "new-product", "display_name": "New Product"},
+                ],
+            )
             with mock.patch.dict(
                 os.environ,
                 {
@@ -71,22 +116,31 @@ class NetworkAnchorProjectTests(unittest.TestCase):
                     career["project_root"],
                 )
                 self.assertEqual(
-                    "universe-private", career["metadata"]["parent_project_id"]
+                    "private-node-root", career["metadata"]["parent_project_id"]
                 )
                 self.assertIn(
                     "rendezvous", {item["project_id"] for item in candidates}
+                )
+                self.assertIn(
+                    "new-product", {item["project_id"] for item in candidates}
                 )
 
     def test_private_node_registration_migrates_legacy_todos(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             private_root = root / "universe-private"
-            private_root.mkdir()
-            (private_root / "README.md").write_text("# Private\n", encoding="utf-8")
-            for node in ("career", "rendezvous"):
-                node_root = private_root / "projects" / node
-                node_root.mkdir(parents=True)
-                (node_root / "README.md").write_text("# Node\n", encoding="utf-8")
+            self._write_private_root(
+                private_root,
+                [
+                    {
+                        "node_id": "career",
+                        "display_name": "Career",
+                        "network_role": "CAREER_SOURCE",
+                        "legacy_project_ids": ["ai-career"],
+                    },
+                    {"node_id": "rendezvous", "display_name": "Rendezvous"},
+                ],
+            )
             legacy_root = root / "legacy-career"
             legacy_root.mkdir()
             (legacy_root / "README.md").write_text("# Legacy\n", encoding="utf-8")

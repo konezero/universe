@@ -168,16 +168,19 @@ built-in multiverse nodes when their roots exist next to this repository:
 | project_id | default root | role |
 |------------|--------------|------|
 | `universe` | this repo (`tools/..`) | `UNIVERSE_HOME` |
-| `universe-private` | `UNIVERSE_PRIVATE_ROOT` | private source container |
-| `career` | `UNIVERSE_PRIVATE_ROOT/projects/career`, otherwise `UNIVERSE_CAREER_SOURCE_ROOT`, then sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
-| `rendezvous` | `UNIVERSE_PRIVATE_ROOT/projects/rendezvous` | `PRODUCT_NODE` |
+| private container | `UNIVERSE_PRIVATE_ROOT/universe-root.json` | manifest-defined private source container |
+| private product Node | `UNIVERSE_PRIVATE_ROOT/<projects_root>/*/universe-node.json` | manifest-defined role |
+| legacy Career fallback | `UNIVERSE_CAREER_SOURCE_ROOT`, then sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
 
-When `UNIVERSE_PRIVATE_ROOT` is configured, the left project rail and
-Multiverse graph show **Universe Private** as a logical container with
-**Career** and **Universe Rendezvous** beneath it. Existing standalone records
-are retained for history, but their Todos are moved to the private product
-Nodes and the legacy entries are hidden. Ordinary product projects (GCS, etc.)
-still register explicitly.
+When `UNIVERSE_PRIVATE_ROOT` is configured, the service reads its
+`universe-root.json`, then discovers every immediate product folder containing
+`universe-node.json` below the declared `projects_root`. The manifests define
+the container identity, product identity, display name, network role, and any
+legacy Todo migrations. The left project rail and Multiverse graph consume
+that registered hierarchy; adding a private product requires no public-server
+change. Existing standalone records are retained for history, while manifest-
+declared legacy Todos move to their private product Nodes and legacy entries
+are hidden. Ordinary product projects (GCS, etc.) still register explicitly.
 
 Career may use `VERSION_MANIFEST.md` / `AGENTS.md` / `README.md` as identity
 when `REPOSITORY_MANIFEST.md` is absent (`network_role=CAREER_SOURCE`).

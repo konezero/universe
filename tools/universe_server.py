@@ -384,18 +384,11 @@ NETWORK_ANCHOR_ROLES = frozenset(
 )
 # Private product Nodes may live outside the public Universe repository.
 PRIVATE_UNIVERSE_ROOT_ENV = "UNIVERSE_PRIVATE_ROOT"
+PRIVATE_UNIVERSE_ROOT_MANIFEST = "universe-root.json"
+PRIVATE_PRODUCT_NODE_MANIFEST = "universe-node.json"
 CAREER_SOURCE_ROOT_ENV = "UNIVERSE_CAREER_SOURCE_ROOT"
 # Prefer first existing sibling folder name for legacy Career source discovery.
 CAREER_ROOT_CANDIDATES = ("ai-career", "career")
-PRIVATE_UNIVERSE_PROJECT_ID = "universe-private"
-PRIVATE_PRODUCT_NODES = (
-    ("career", "Career", "CAREER_SOURCE"),
-    ("rendezvous", "Universe Rendezvous", "PRODUCT_NODE"),
-)
-LEGACY_PROJECT_MIGRATIONS = (
-    ("ai-career", "career"),
-    ("universe-rendezvous", "rendezvous"),
-)
 DOCUMENT_ROLES = frozenset(
     {
         "ARCHITECTURE",
@@ -939,11 +932,108 @@ def _resolve_registration_manifest_rel(
     )
 
 
+def _load_private_universe_candidates(private_root: Path) -> list[dict[str, Any]] | None:
+    """Load a private Universe container and its product Nodes from manifests.
+
+    The public server deliberately knows only these manifest names. Product ids,
+    labels, roles, and legacy migrations remain private-root data so adding a
+    product does not require a public-server release.
+    """
+    root_manifest_path = private_root / PRIVATE_UNIVERSE_ROOT_MANIFEST
+    try:
+        root_manifest = json.loads(root_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(root_manifest, dict):
+        return None
+    if root_manifest.get("schema") != "universe.private-root.v1":
+        return None
+
+    try:
+        container_id = _project_id(root_manifest.get("node_id"))
+        display_name = _required_text(root_manifest.get("display_name"), "display_name")
+        projects_root_value = _required_text(
+            root_manifest.get("projects_root", "projects"), "projects_root"
+        )
+        projects_relative = Path(projects_root_value)
+        if projects_relative.is_absolute() or ".." in projects_relative.parts:
+            return None
+        projects_root = (private_root / projects_relative).resolve()
+        if not projects_root.is_relative_to(private_root) or not projects_root.is_dir():
+            return None
+    except UniverseError:
+        return None
+
+    candidates: list[dict[str, Any]] = [
+        {
+            "project_id": container_id,
+            "project_root": private_root,
+            "metadata": {
+                "network_role": "NETWORK_ANCHOR",
+                "node_kind": "CONTAINER",
+                "display_name": display_name,
+                "label": "private source root",
+            },
+        }
+    ]
+    seen_ids = {"universe", container_id}
+    for node_root in sorted(projects_root.iterdir(), key=lambda entry: entry.name.casefold()):
+        if not node_root.is_dir() or node_root.is_symlink():
+            continue
+        node_manifest_path = node_root / PRIVATE_PRODUCT_NODE_MANIFEST
+        try:
+            node_manifest = json.loads(node_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(node_manifest, dict):
+            continue
+        if node_manifest.get("schema") != "universe.project-node.v1":
+            continue
+        if str(node_manifest.get("kind", "")).lower() != "product":
+            continue
+        try:
+            node_id = _project_id(node_manifest.get("node_id"))
+            node_display_name = _required_text(
+                node_manifest.get("display_name"), "display_name"
+            )
+            network_role = _required_text(
+                node_manifest.get("network_role", "PRODUCT_NODE"), "network_role"
+            ).upper()
+            if network_role not in NETWORK_ANCHOR_ROLES or node_id in seen_ids:
+                continue
+            legacy_project_ids_raw = node_manifest.get("legacy_project_ids", [])
+            if not isinstance(legacy_project_ids_raw, list):
+                continue
+            legacy_project_ids = tuple(
+                dict.fromkeys(_project_id(value) for value in legacy_project_ids_raw)
+            )
+        except UniverseError:
+            continue
+        seen_ids.add(node_id)
+        logical_path = node_root.relative_to(private_root).as_posix()
+        candidates.append(
+            {
+                "project_id": node_id,
+                "project_root": node_root.resolve(),
+                "metadata": {
+                    "network_role": network_role,
+                    "node_kind": "PRODUCT",
+                    "parent_project_id": container_id,
+                    "logical_path": logical_path,
+                    "display_name": node_display_name,
+                    "label": "private product node",
+                    "legacy_project_ids": list(legacy_project_ids),
+                },
+            }
+        )
+    return candidates
+
+
 def discover_network_anchor_candidates(
     *,
     universe_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Built-in multiverse nodes: this Universe repo + sibling Career source."""
+    """Discover the public home and any manifest-defined private product Nodes."""
     home = (universe_root or Path(__file__).resolve().parents[1]).expanduser()
     home = home.resolve()
     candidates: list[dict[str, Any]] = [
@@ -960,38 +1050,11 @@ def discover_network_anchor_candidates(
     configured_private_root = os.environ.get(PRIVATE_UNIVERSE_ROOT_ENV)
     if configured_private_root:
         private_root = Path(configured_private_root).expanduser().resolve()
-        if private_root.is_dir() and (private_root / "README.md").is_file():
-            candidates.append(
-                {
-                    "project_id": PRIVATE_UNIVERSE_PROJECT_ID,
-                    "project_root": private_root,
-                    "metadata": {
-                        "network_role": "NETWORK_ANCHOR",
-                        "node_kind": "CONTAINER",
-                        "display_name": "Universe Private",
-                        "label": "private source root",
-                    },
-                }
-            )
-            for project_id, display_name, network_role in PRIVATE_PRODUCT_NODES:
-                project_root = private_root / "projects" / project_id
-                if not project_root.is_dir():
-                    continue
-                candidates.append(
-                    {
-                        "project_id": project_id,
-                        "project_root": project_root,
-                        "metadata": {
-                            "network_role": network_role,
-                            "node_kind": "PRODUCT",
-                            "parent_project_id": PRIVATE_UNIVERSE_PROJECT_ID,
-                            "logical_path": f"projects/{project_id}",
-                            "display_name": display_name,
-                            "label": "private product node",
-                        },
-                    }
-                )
-            return candidates
+        if private_root.is_dir():
+            private_candidates = _load_private_universe_candidates(private_root)
+            if private_candidates is not None:
+                candidates.extend(private_candidates)
+                return candidates
 
     configured_career_root = os.environ.get(CAREER_SOURCE_ROOT_ENV)
     if configured_career_root:
@@ -1037,7 +1100,7 @@ def ensure_network_anchor_projects(
     *,
     universe_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Idempotently attach Universe + Career as project nodes when roots exist."""
+    """Idempotently attach discovered network and product Nodes."""
     ensured: list[dict[str, Any]] = []
     for candidate in discover_network_anchor_candidates(universe_root=universe_root):
         root = Path(candidate["project_root"])
@@ -1055,15 +1118,17 @@ def ensure_network_anchor_projects(
         except UniverseError:
             # Skip unreadable / mismatched roots; do not block the service.
             continue
-    for source_project_id, target_project_id in LEGACY_PROJECT_MIGRATIONS:
-        try:
-            store.migrate_legacy_project_todos(
-                source_project_id=source_project_id,
-                target_project_id=target_project_id,
-            )
-        except UniverseError as error:
-            if error.code != "PROJECT_NOT_FOUND":
-                raise
+        for source_project_id in candidate.get("metadata", {}).get(
+            "legacy_project_ids", []
+        ):
+            try:
+                store.migrate_legacy_project_todos(
+                    source_project_id=source_project_id,
+                    target_project_id=candidate["project_id"],
+                )
+            except UniverseError as error:
+                if error.code != "PROJECT_NOT_FOUND":
+                    raise
     return ensured
 
 
