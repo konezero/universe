@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_conductor_runtime import (  # noqa: E402
     UniverseConductorRuntime,
+    UniverseConductorRuntimeError,
 )
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
 from windows_native_cli import NativeCliResult  # noqa: E402
@@ -45,6 +46,20 @@ class FakeProcess:
 
 
 class UniverseConductorRuntimeTests(unittest.TestCase):
+    def test_start_requires_selected_release_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+            runtime_cli.parent.mkdir(parents=True)
+            runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
+
+            runtime = UniverseConductorRuntime(root)
+            with self.assertRaisesRegex(
+                UniverseConductorRuntimeError,
+                "UNIVERSE_RELEASE_SELECTION_REQUIRED",
+            ):
+                runtime._resolved_source_binding()
+
     def test_prepare_without_mode_boot_binding_fails_before_process_start(self) -> None:
         prepared = {
             "status": "SESSION_PREPARED",
@@ -161,7 +176,6 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             runtime = UniverseConductorRuntime(
                 root,
                 native_runner=native_runner,
-                source_commit_resolver=lambda _: "a" * 40,
                 source_binding_resolver=lambda _root: {
                     "status": "SELECTED",
                     "release_id": "core-test",
@@ -288,7 +302,6 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
 
             runtime = UniverseConductorRuntime(
                 root,
-                source_commit_resolver=lambda _: "a" * 40,
                 session_supervisor=DenyingSupervisor(),
             )
             process = FakeProcess({})

@@ -118,7 +118,6 @@ StreamPoster = Callable[..., dict[str, Any]]
 PermissionPoster = Callable[..., dict[str, Any]]
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
-SourceCommitResolver = Callable[[Path], str]
 SourceBindingResolver = Callable[[Path], Mapping[str, Any]]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
 NativeRoomObserver = Callable[[Mapping[str, Any]], None]
@@ -146,7 +145,6 @@ class ProjectModeCoordinator:
         host_session_ref: str,
         *,
         native_runner: NativeRunner = run_native_cli,
-        source_commit_resolver: SourceCommitResolver | None = None,
         source_binding_resolver: SourceBindingResolver | None = None,
         session_supervisor: SessionSupervisorStore | None = None,
     ) -> None:
@@ -154,7 +152,6 @@ class ProjectModeCoordinator:
         self.project_id = _text(project_id, "project_id")
         self.host_session_ref = _text(host_session_ref, "host_session_ref")
         self.native_runner = native_runner
-        self.source_commit_resolver = source_commit_resolver or self._git_head
         self.source_binding_resolver = source_binding_resolver
         self.session_supervisor = session_supervisor
         self.runtime_cli = (
@@ -972,38 +969,32 @@ class ProjectModeCoordinator:
         if self._source_binding is not None:
             return dict(self._source_binding)
         if self.source_binding_resolver is None:
-            source_commit = self.source_commit_resolver(self.project_root)
-            binding = {
-                "source_ref": f"git-object-database://{self.project_id}@{source_commit}",
-                "source_commit": source_commit,
-                "source_repository": str(self.project_root),
-            }
-        else:
-            candidate = self.source_binding_resolver(self.project_root)
-            if not isinstance(candidate, Mapping):
-                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_UNAVAILABLE")
-            if str(candidate.get("status") or "").upper() != "SELECTED":
-                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_REQUIRED")
-            release_id = _text(candidate.get("release_id"), "release_id")
-            source_repository = _text(
-                candidate.get("source_repository"), "source_repository"
-            )
-            source_commit = _text(candidate.get("source_commit"), "source_commit").lower()
-            database_sha256 = _text(
-                candidate.get("database_sha256"), "database_sha256"
-            ).lower()
-            if (
-                len(source_commit) != 40
-                or any(character not in "0123456789abcdef" for character in source_commit)
-                or len(database_sha256) != 64
-                or any(character not in "0123456789abcdef" for character in database_sha256)
-            ):
-                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_INVALID")
-            binding = {
-                "source_ref": f"universe-release-db://{release_id}@{database_sha256}",
-                "source_commit": source_commit,
-                "source_repository": source_repository,
-            }
+            raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_REQUIRED")
+        candidate = self.source_binding_resolver(self.project_root)
+        if not isinstance(candidate, Mapping):
+            raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_UNAVAILABLE")
+        if str(candidate.get("status") or "").upper() != "SELECTED":
+            raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_REQUIRED")
+        release_id = _text(candidate.get("release_id"), "release_id")
+        source_repository = _text(
+            candidate.get("source_repository"), "source_repository"
+        )
+        source_commit = _text(candidate.get("source_commit"), "source_commit").lower()
+        database_sha256 = _text(
+            candidate.get("database_sha256"), "database_sha256"
+        ).lower()
+        if (
+            len(source_commit) != 40
+            or any(character not in "0123456789abcdef" for character in source_commit)
+            or len(database_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in database_sha256)
+        ):
+            raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_INVALID")
+        binding = {
+            "source_ref": f"universe-release-db://{release_id}@{database_sha256}",
+            "source_commit": source_commit,
+            "source_repository": source_repository,
+        }
         self._source_binding = binding
         return dict(binding)
 
@@ -1367,28 +1358,6 @@ class ProjectModeCoordinator:
         if not isinstance(payload, Mapping):
             raise ProjectMasterHostError("PROJECT_RUNTIME_RESULT_INVALID")
         return payload
-
-    def _git_head(self, project_root: Path) -> str:
-        result = self.native_runner(
-            NativeCliRequest(
-                executable=_required_host_executable("git"),
-                arguments=("rev-parse", "HEAD"),
-                cwd=project_root,
-                timeout_seconds=15,
-            )
-        )
-        source_commit = result.stdout.strip()
-        if (
-            result.status != "COMPLETED"
-            or result.return_code != 0
-            or len(source_commit) != 40
-            or any(
-                character not in "0123456789abcdefABCDEF" for character in source_commit
-            )
-        ):
-            raise ProjectMasterHostError("PROJECT_SOURCE_COMMIT_UNAVAILABLE")
-        return source_commit.lower()
-
 
 class ProjectTaskProposalAdapter:
     """Read and decide the installed Runtime's durable Task Proposals."""

@@ -361,6 +361,16 @@ class FakeSurfaceObserver:
 
 
 class ProjectMasterHostTests(unittest.TestCase):
+    @staticmethod
+    def _selected_release() -> dict[str, str]:
+        return {
+            "status": "SELECTED",
+            "release_id": "core-test",
+            "source_repository": "fixture/universe-private",
+            "source_commit": "b" * 40,
+            "database_sha256": "c" * 64,
+        }
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -1770,7 +1780,6 @@ class ProjectMasterHostTests(unittest.TestCase):
             "GCS",
             "grok-cli:session-001",
             native_runner=runner,
-            source_commit_resolver=lambda _root: "a" * 40,
             source_binding_resolver=lambda _root: {
                 "status": "SELECTED",
                 "release_id": "core-test",
@@ -1827,6 +1836,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             self.root,
             "GCS",
             "codex:session-001",
+            source_binding_resolver=lambda _root: self._selected_release(),
             native_runner=lambda _request: NativeCliResult(
                 contract="universe.windows-native-cli.v1",
                 status="COMPLETED",
@@ -1847,7 +1857,6 @@ class ProjectMasterHostTests(unittest.TestCase):
                 stdout_truncated=False,
                 stderr_truncated=False,
             ),
-            source_commit_resolver=lambda _root: "a" * 40,
         )
 
         with self.assertRaisesRegex(
@@ -1864,7 +1873,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             self.root,
             "GCS",
             "codex:session-001",
-            source_commit_resolver=lambda _root: "a" * 40,
+            source_binding_resolver=lambda _root: self._selected_release(),
         )
         coordinator._prepared = {
             "status": "SESSION_PREPARED",
@@ -2318,7 +2327,6 @@ class ProjectMasterHostTests(unittest.TestCase):
             self.root,
             "GCS",
             "provider-session",
-            source_commit_resolver=lambda _root: "a" * 40,
             session_supervisor=DenyingSupervisor(),
         )
         process = RunningProcess()
