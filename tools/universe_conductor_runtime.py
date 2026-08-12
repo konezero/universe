@@ -214,6 +214,9 @@ class UniverseConductorRuntime:
                 "session_id": session_id,
                 "origin_anchor_ref": anchor_id,
                 "origin_frame_id": frame_id,
+                "source_ref": source["source_ref"],
+                "source_commit": source["source_commit"],
+                "source_repository": source["source_repository"],
                 "runtime_currentness_observation": str(
                     runtime_state["executable_runtime_currentness"]
                 ),

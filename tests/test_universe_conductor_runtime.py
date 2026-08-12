@@ -216,6 +216,11 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 "CURRENT", binding["runtime_currentness_observation"]
             )
             self.assertEqual("http://127.0.0.1:41991", binding["endpoint"])
+            self.assertEqual(
+                f"universe-release-db://core-test@{'c' * 64}",
+                binding["source_ref"],
+            )
+            self.assertEqual("b" * 40, binding["source_commit"])
             self.assertEqual("COMMANDER_INPUT_OBSERVED", observed["status"])
             self.assertEqual("CONDUCTOR", requests[0]["mode"])
             self.assertEqual("CONDUCTOR", requests[0]["role"])
