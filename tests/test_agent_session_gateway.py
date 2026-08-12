@@ -840,6 +840,75 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertIn("thread/resume", methods)
         self.assertIn("thread/start", methods)
 
+    def test_grok_rebinds_loaded_session_before_changing_cwd(self) -> None:
+        target = self.root / "target"
+        target.mkdir()
+        with patch("agent_session_gateway.JsonRpcStdioProcess", FakeJsonRpcTransport):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            rebound = session.rebind_working_directory(target)
+            session.close()
+        self.assertEqual(str(target.resolve()), rebound)
+        self.assertEqual(target.resolve(), session.cwd)
+        method, params = FakeJsonRpcTransport.instances[0].requests[-1]
+        self.assertEqual("session/load", method)
+        self.assertEqual("grok-existing", params["sessionId"])
+        self.assertEqual(str(target.resolve()), params["cwd"])
+
+    def test_grok_failed_rebind_preserves_previous_cwd(self) -> None:
+        class FailedRebindTransport(FakeJsonRpcTransport):
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "session/load" and params.get("cwd", "").endswith("target"):
+                    self.requests.append((method, dict(params)))
+                    return {}
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        target = self.root / "target"
+        target.mkdir()
+        with patch("agent_session_gateway.JsonRpcStdioProcess", FailedRebindTransport):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            with self.assertRaisesRegex(AgentSessionError, "GROK_ACP_CWD_REBIND_FAILED"):
+                session.rebind_working_directory(target)
+            self.assertEqual(self.root.resolve(), session.cwd)
+            session.close()
+
+    def test_codex_rebinds_resumed_thread_before_changing_cwd(self) -> None:
+        target = self.root / "target"
+        target.mkdir()
+        with patch("agent_session_gateway.JsonRpcStdioProcess", FakeJsonRpcTransport):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="codex-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            rebound = session.rebind_working_directory(target)
+            session.close()
+        self.assertEqual(str(target.resolve()), rebound)
+        self.assertEqual(target.resolve(), session.cwd)
+        method, params = FakeJsonRpcTransport.instances[0].requests[-1]
+        self.assertEqual("thread/resume", method)
+        self.assertEqual("codex-existing", params["threadId"])
+        self.assertEqual(str(target.resolve()), params["cwd"])
+
 
 if __name__ == "__main__":
     unittest.main()

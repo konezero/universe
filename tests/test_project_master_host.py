@@ -2507,6 +2507,156 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertTrue(provider.closed)
 
+    def test_resident_manager_rebinds_master_to_project_with_stable_session(self) -> None:
+        source_root = self.root / "source"
+        target_root = self.root / "target"
+        source_root.mkdir()
+        target_root.mkdir()
+        supervisor = SessionSupervisorStore(self.root / "supervisor-rebind.sqlite3")
+        providers: list[Any] = []
+
+        class RebindProvider(PreparedFakeProvider):
+            def __init__(self, store: ProjectMasterSessionStore, root: Path) -> None:
+                super().__init__()
+                self.store = store
+                self.root = root
+
+            def prepare_session(self) -> None:
+                self.prepare_count += 1
+                self.session_ref = self.store.session_ref_for("CLAUDE") or "claude-code:stable-session"
+                self.store.observe_provider_session("CLAUDE", self.session_ref)
+
+        def provider_factory(root, _project_id, store):
+            provider = RebindProvider(store, root)
+            providers.append(provider)
+            return provider
+
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        class RebindSurfaceObserver(FakeSurfaceObserver):
+            def prepare(self) -> Mapping[str, Any]:
+                self.prepare_count += 1
+                return {
+                    "status": "SESSION_PREPARED",
+                    "mode_current_anchor": {
+                        "snapshot": {"snapshot": {"anchor_id": "MASTER-CURRENT-REBIND"}}
+                    },
+                }
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                session_supervisor=supervisor,
+                provider_factory=provider_factory,
+                provider_resolver=lambda _project_id: "CLAUDE",
+                coordinator_factory=lambda _root, _project_id, _session: RebindSurfaceObserver(),
+            )
+            try:
+                manager.ensure({"project_id": "SOURCE", "project_root": str(source_root)})
+                before = next(
+                    item for item in supervisor.list_sessions(node="SOURCE", mode="MASTER")
+                    if item["is_default"]
+                )
+                result = manager.rebind_working_directory(
+                    before["session_id"],
+                    {"project_id": "TARGET", "project_root": str(target_root)},
+                    expected_version=before["row_version"],
+                )
+                after = supervisor.get_session(before["session_id"])
+                self.assertTrue(manager.is_resident("TARGET"))
+                self.assertFalse(manager.is_resident("SOURCE"))
+            finally:
+                manager.close()
+        self.assertEqual("PROVIDER_WORKING_DIRECTORY_REBOUND", result["status"])
+        self.assertEqual(before["session_id"], after["session_id"])
+        self.assertEqual("TARGET", after["node"])
+        self.assertTrue(after["is_default"])
+        self.assertEqual("claude-code:stable-session", after["provider_session_ref"])
+        self.assertTrue(providers[0].closed)
+        self.assertEqual(target_root.resolve(), providers[1].root.resolve())
+
+    def test_failed_master_rebind_restores_source_and_target_defaults(self) -> None:
+        source_root = self.root / "source-rollback"
+        target_root = self.root / "target-rollback"
+        source_root.mkdir()
+        target_root.mkdir()
+        supervisor = SessionSupervisorStore(self.root / "supervisor-rollback.sqlite3")
+
+        class RollbackProvider(PreparedFakeProvider):
+            def __init__(self, store: ProjectMasterSessionStore, root: Path) -> None:
+                super().__init__()
+                self.store = store
+                self.root = root
+
+            def prepare_session(self) -> None:
+                if self.root == target_root.resolve():
+                    raise ProjectMasterHostError("TARGET_PROVIDER_START_FAILED")
+                self.session_ref = self.store.session_ref_for("CLAUDE") or "claude-code:rollback-session"
+                self.store.observe_provider_session("CLAUDE", self.session_ref)
+
+        target_history, _ = supervisor.register_session(
+            {
+                "session_id": "target-history",
+                "project_id": "TARGET",
+                "node": "TARGET",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-target-history",
+            }
+        )
+        if not target_history["is_default"]:
+            supervisor.set_default(
+                target_history["session_id"],
+                expected_pointer_version=target_history["default_pointer_version"],
+            )
+
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        class RollbackSurfaceObserver(FakeSurfaceObserver):
+            def prepare(self) -> Mapping[str, Any]:
+                return {
+                    "status": "SESSION_PREPARED",
+                    "mode_current_anchor": {
+                        "snapshot": {"snapshot": {"anchor_id": "MASTER-CURRENT-ROLLBACK"}}
+                    },
+                }
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                session_supervisor=supervisor,
+                provider_factory=lambda root, _project_id, store: RollbackProvider(store, root),
+                provider_resolver=lambda _project_id: "CLAUDE",
+                coordinator_factory=lambda _root, _project_id, _session: RollbackSurfaceObserver(),
+            )
+            try:
+                manager.ensure({"project_id": "SOURCE", "project_root": str(source_root)})
+                before = next(
+                    item for item in supervisor.list_sessions(node="SOURCE", mode="MASTER")
+                    if item["is_default"]
+                )
+                with self.assertRaisesRegex(ProjectMasterHostError, "SESSION_CWD_REBIND_FAILED"):
+                    manager.rebind_working_directory(
+                        before["session_id"],
+                        {"project_id": "TARGET", "project_root": str(target_root)},
+                        expected_version=before["row_version"],
+                    )
+                restored = supervisor.get_session(before["session_id"])
+                target_default = next(
+                    item for item in supervisor.list_sessions(node="TARGET", mode="MASTER")
+                    if item["is_default"]
+                )
+                self.assertTrue(manager.is_resident("SOURCE"))
+            finally:
+                manager.close()
+        self.assertEqual("SOURCE", restored["node"])
+        self.assertTrue(restored["is_default"])
+        self.assertEqual("target-history", target_default["session_id"])
+
     def test_resident_manager_bootstraps_fresh_supervisor_session_before_prepare(
         self,
     ) -> None:

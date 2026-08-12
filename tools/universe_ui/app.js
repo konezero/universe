@@ -3,6 +3,9 @@
 const state = {
   projects: [],
   todos: [],
+  goals: [],
+  unassignedTodos: [],
+  expandedGoals: {},
   selectedProject: null,
   projection: null,
   /** project_id -> projection; multiverse always expands from this cache */
@@ -115,6 +118,7 @@ const state = {
   /** Hovered graph node id (for icon map tooltips). */
   hoveredNodeId: null,
   inspectorDismissed: false,
+  selectedGoalId: null,
 };
 
 const elements = {
@@ -179,6 +183,16 @@ const elements = {
   sessionObservatoryDetailMeta: document.querySelector(
     "#session-observatory-detail-meta"
   ),
+  sessionWorkingDirectory: document.querySelector("#session-working-directory"),
+  sessionWorkingDirectoryProject: document.querySelector(
+    "#session-working-directory-project"
+  ),
+  sessionWorkingDirectoryApply: document.querySelector(
+    "#session-working-directory-apply"
+  ),
+  sessionWorkingDirectoryStatus: document.querySelector(
+    "#session-working-directory-status"
+  ),
   sessionObservatoryDetailPreview: document.querySelector(
     "#session-observatory-detail-preview"
   ),
@@ -189,6 +203,29 @@ const elements = {
   runtimeAuditGrid: document.querySelector("#runtime-audit-grid"),
   refreshSessionsButton: document.querySelector("#refresh-sessions-button"),
   primaryNav: document.querySelector("#primary-nav"),
+  goalPlanWorkspace: document.querySelector("#goal-plan-workspace"),
+  goalPlanBreadcrumb: document.querySelector("#goal-plan-breadcrumb"),
+  goalPlanTitle: document.querySelector("#goal-plan-title"),
+  goalPlanSubtitle: document.querySelector("#goal-plan-subtitle"),
+  goalPlanSummary: document.querySelector("#goal-plan-summary"),
+  goalPlanList: document.querySelector("#goal-plan-list"),
+  unassignedWorkList: document.querySelector("#unassigned-work-list"),
+  unassignedWorkCount: document.querySelector("#unassigned-work-count"),
+  addGoalButton: document.querySelector("#add-goal-button"),
+  goalPlanMap: document.querySelector("#goal-plan-map"),
+  utilityRail: document.querySelector(".utility-rail"),
+  mobileWorkTabs: document.querySelector(".mobile-work-tabs"),
+  mobileDelegateGoal: document.querySelector("#mobile-delegate-goal"),
+  mobileEditPlan: document.querySelector("#mobile-edit-plan"),
+  mobileAddMilestone: document.querySelector("#mobile-add-milestone"),
+  quickConductorButton: document.querySelector("#quick-conductor-button"),
+  quickTaskButton: document.querySelector("#quick-task-button"),
+  goalDialog: document.querySelector("#goal-dialog"),
+  goalForm: document.querySelector("#goal-form"),
+  goalFormError: document.querySelector("#goal-form-error"),
+  milestoneDialog: document.querySelector("#milestone-dialog"),
+  milestoneForm: document.querySelector("#milestone-form"),
+  milestoneFormError: document.querySelector("#milestone-form-error"),
   metricProjects: document.querySelector("#metric-projects"),
   metricTodos: document.querySelector("#metric-todos"),
   metricDispatches: document.querySelector("#metric-dispatches"),
@@ -617,6 +654,43 @@ function selectSupervisorSession(session) {
   renderSessionObservatory();
 }
 
+function renderSessionWorkingDirectory(session) {
+  const panel = elements.sessionWorkingDirectory;
+  const select = elements.sessionWorkingDirectoryProject;
+  const apply = elements.sessionWorkingDirectoryApply;
+  const status = elements.sessionWorkingDirectoryStatus;
+  if (!panel || !select || !apply || !status) return;
+  const movable =
+    session?.mode === "MASTER" &&
+    Boolean(session?.provider_session_attached) &&
+    !["WORKER", "BOSS"].includes(String(session?.session_kind || "").toUpperCase());
+  panel.classList.toggle("hidden", !movable);
+  if (!movable) {
+    select.replaceChildren();
+    status.textContent = "";
+    return;
+  }
+  const currentProject = String(
+    session.current_project_id || session.current_location?.project_id || session.node || ""
+  );
+  const priorSelection = select.value;
+  select.replaceChildren();
+  for (const project of state.projects || []) {
+    const option = document.createElement("option");
+    option.value = project.project_id;
+    option.textContent = project.project_id;
+    select.append(option);
+  }
+  select.value =
+    [...select.options].some((option) => option.value === priorSelection)
+      ? priorSelection
+      : currentProject;
+  apply.disabled = !select.value;
+  status.textContent = currentProject
+    ? `Current: ${currentProject}`
+    : "Choose a registered project.";
+}
+
 function renderSelectedSessionDetail() {
   const detail = elements.sessionObservatoryDetail;
   const meta = elements.sessionObservatoryDetailMeta;
@@ -662,6 +736,7 @@ function renderSelectedSessionDetail() {
     );
   }
   meta.append(node("div", "session-detail-ref", currentAnchorLabel(session)));
+  renderSessionWorkingDirectory(session);
   preview.replaceChildren();
   const lines = session.preview?.lines || [];
   if (!lines.length || !session.preview?.tied_to_session) {
@@ -724,6 +799,43 @@ function renderSelectedSessionDetail() {
   }
   live.append(feed);
   detail.append(live);
+}
+
+async function rebindSelectedSessionWorkingDirectory() {
+  const session = (state.supervisorSessions || []).find(
+    (item) => anchorSessionKey(item) === state.selectedSupervisorAnchorKey
+  );
+  const projectId = String(elements.sessionWorkingDirectoryProject?.value || "");
+  const sessionId = String(
+    session?.session_id || session?.universe_session_id || ""
+  );
+  if (!session || !sessionId || session.mode !== "MASTER" || !projectId) {
+    throw new Error("Choose a persistent Project Master session and project");
+  }
+  elements.sessionWorkingDirectoryApply.disabled = true;
+  elements.sessionWorkingDirectoryStatus.textContent = `Moving to ${projectId}...`;
+  try {
+    await api(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/working-directory`,
+      {
+        method: "POST",
+        body: {
+          project_id: projectId,
+          expected_version: session.row_version,
+        },
+      }
+    );
+    await selectProject(projectId);
+    state.conversationTarget = { kind: "PROJECT_MASTER", projectId };
+    openProjectRoomStream(projectId);
+    await refreshSupervisorSessions();
+    renderComposerActions();
+    renderComposerState();
+    renderRoomMessages();
+    toast(`Session moved to ${projectId}`);
+  } finally {
+    elements.sessionWorkingDirectoryApply.disabled = false;
+  }
 }
 
 
@@ -2319,6 +2431,7 @@ function showGraphView(view) {
   const allowed = new Set(["universe", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
   state.view = view;
+  document.body.classList.add("graph-mode");
   state.selectedNode = null;
   state.focusedNodeId = null;
   elements.nodeBreadcrumb?.classList.add("hidden");
@@ -2327,6 +2440,13 @@ function showGraphView(view) {
   );
   buildGraph();
   renderDetails();
+}
+
+function showGoalPlanView() {
+  state.view = "work";
+  document.body.classList.remove("graph-mode");
+  syncPrimaryNavSelection("work");
+  renderGoalPlan();
 }
 
 /** Highlight top nav without toast placeholders. */
@@ -2595,7 +2715,11 @@ function projectButton(project, { nested = false } = {}) {
       );
       button.title = `${pendingApprovalCount} governance Proposal approval required`;
     }
-    button.addEventListener("click", () => selectProject(project.project_id));
+    button.addEventListener("click", () =>
+      selectProject(project.project_id, {
+        revealInspector: window.innerWidth > 720,
+      })
+    );
     return button;
 }
 
@@ -2866,6 +2990,11 @@ async function selectProject(
   state.memoryBatchConfigs = memoryBatchConfigResult.configs || [];
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
   state.memoryCandidates = memoryCandidateResult.candidates || [];
+  const goalPlanResult = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/goals`
+  ).catch(() => ({ goals: [], unassigned_todos: [] }));
+  state.goals = goalPlanResult.goals || [];
+  state.unassignedTodos = goalPlanResult.unassigned_todos || [];
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -2888,6 +3017,7 @@ async function selectProject(
     elements.todoScopeFilter.value = "PROJECT";
   }
   renderTodos();
+  renderGoalPlan();
 }
 
 function mergeGovernanceProposalInbox(projectId, proposals) {
@@ -7526,6 +7656,182 @@ function todoSelect(values, selectedValue, className) {
   return select;
 }
 
+function planStateLabel(value) {
+  return String(value || "PLANNED")
+    .toLowerCase()
+    .replaceAll("_", " ")
+    .replace(/^./, (letter) => letter.toUpperCase());
+}
+
+function goalProgress(goal) {
+  const todos = [
+    ...(goal.todos || []),
+    ...(goal.milestones || []).flatMap((milestone) => milestone.todos || []),
+  ];
+  if (!todos.length) return 0;
+  return Math.round((todos.filter((todo) => todo.state === "DONE").length / todos.length) * 100);
+}
+
+async function refreshGoalPlan() {
+  if (!state.selectedProject) {
+    state.goals = [];
+    state.unassignedTodos = [];
+    renderGoalPlan();
+    return;
+  }
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`
+  );
+  state.goals = result.goals || [];
+  state.unassignedTodos = result.unassigned_todos || [];
+  renderGoalPlan();
+}
+
+function planTodoRow(todo) {
+  const row = node("article", "plan-todo-row");
+  row.append(
+    node("span", `todo-priority ${String(todo.priority).toLowerCase()}`, todo.priority),
+    node("span", "plan-todo-title", todo.title),
+    node("span", `plan-state ${String(todo.state).toLowerCase()}`, planStateLabel(todo.state))
+  );
+  return row;
+}
+
+function renderGoalPlan() {
+  if (!elements.goalPlanList) return;
+  if (!document.body.classList.contains("graph-mode")) {
+    syncPrimaryNavSelection("work");
+  }
+  const project = state.selectedProject;
+  elements.goalPlanTitle.textContent = "Goal Plan";
+  if (elements.goalPlanBreadcrumb) {
+    elements.goalPlanBreadcrumb.textContent = project
+      ? `${projectDisplayName(project)} > Goal Plan`
+      : "Project > Goal Plan";
+  }
+  elements.goalPlanSubtitle.textContent = project
+    ? "Goal -> Milestone / Phase -> Todo"
+    : "Select a project to shape its delivery plan.";
+  elements.addGoalButton.disabled = !project;
+  const todos = state.goals.flatMap((goal) => [
+    ...(goal.todos || []),
+    ...(goal.milestones || []).flatMap((milestone) => milestone.todos || []),
+  ]);
+  const done = todos.filter((todo) => todo.state === "DONE").length;
+  const progress = todos.length ? Math.round((done / todos.length) * 100) : 0;
+  const readyGoals = state.goals.filter((goal) => ["READY", "IN_PROGRESS", "DONE"].includes(goal.state)).length;
+  const readiness = state.goals.length ? Math.round((readyGoals / state.goals.length) * 100) : 0;
+  const milestoneCount = state.goals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
+  const owner = state.goals[0]?.owner || "Project Master";
+  elements.goalPlanSummary.replaceChildren();
+  for (const [label, value] of [
+    ["Design readiness", `${readiness}%`],
+    ["Progress", `${progress}%`],
+    ["Owner", owner],
+    ["Milestones", milestoneCount],
+  ]) {
+    const metric = node("article", "goal-summary-item");
+    metric.append(node("span", "", label), node("strong", "", String(value)));
+    elements.goalPlanSummary.append(metric);
+  }
+  elements.goalPlanList.replaceChildren();
+  if (!project) {
+    elements.goalPlanList.append(node("div", "goal-plan-empty", "Choose a project to begin planning."));
+  } else if (!state.goals.length) {
+    const empty = node("div", "goal-plan-empty");
+    empty.append(
+      node("strong", "", "No goals yet"),
+      node("p", "", "Start with the outcome you want, then break it into milestones and Todo."),
+    );
+    const add = node("button", "primary-button", "Create first goal");
+    add.type = "button";
+    add.addEventListener("click", () => elements.goalDialog.showModal());
+    empty.append(add);
+    elements.goalPlanList.append(empty);
+  }
+  for (const goal of state.goals) {
+    const card = node("article", "goal-card");
+    card.tabIndex = 0;
+    card.classList.toggle("selected", state.selectedGoalId === goal.goal_id);
+    card.addEventListener("click", () => {
+      state.selectedGoalId = goal.goal_id;
+      renderGoalPlan();
+    });
+    const header = node("header", "goal-card-header");
+    const titleWrap = node("div", "goal-card-title");
+    titleWrap.append(
+      node("span", "goal-owner", goal.owner),
+      node("h2", "", goal.title),
+      node("p", "", goal.description || "No outcome description yet.")
+    );
+    const progress = goalProgress(goal);
+    const actions = node("div", "goal-card-actions");
+    const delegate = node("button", "secondary-button", "Delegate Goal");
+    delegate.type = "button";
+    delegate.addEventListener("click", () => {
+      elements.dispatchInstruction.value = `Delegate goal \"${goal.title}\" to the Project Master. Use this goal plan as the planning reference and do not start execution until the plan is confirmed.`;
+      elements.dispatchInstruction.focus();
+      toast("Delegation draft is ready. Review it before sending.");
+    });
+    const addMilestone = node("button", "icon-button compact", "+");
+    addMilestone.type = "button";
+    addMilestone.title = "Add milestone";
+    addMilestone.addEventListener("click", () => {
+      elements.milestoneForm.elements.goal_id.value = goal.goal_id;
+      elements.milestoneDialog.showModal();
+    });
+    actions.append(node("span", `plan-state ${goal.state.toLowerCase()}`, planStateLabel(goal.state)), delegate, addMilestone);
+    header.append(titleWrap, actions);
+    const progressBar = node("div", "goal-progress");
+    const fill = node("span", "goal-progress-fill");
+    fill.style.width = `${progress}%`;
+    progressBar.append(fill);
+    const progressLabel = node("small", "goal-progress-label", `${progress}% complete`);
+    const milestones = node("div", "milestone-list");
+    for (const milestone of goal.milestones || []) {
+      const item = node("section", "milestone-block");
+      const itemHeader = node("header", "milestone-header");
+      itemHeader.append(
+        node("span", "milestone-marker", ""),
+        node("strong", "", milestone.title),
+        node("span", `plan-state ${milestone.state.toLowerCase()}`, planStateLabel(milestone.state))
+      );
+      item.append(itemHeader);
+      if (milestone.description) item.append(node("p", "milestone-description", milestone.description));
+      const list = node("div", "milestone-todos");
+      for (const todo of milestone.todos || []) list.append(planTodoRow(todo));
+      if (!list.childElementCount) list.append(node("small", "empty-copy", "No work assigned to this milestone."));
+      item.append(list);
+      milestones.append(item);
+    }
+    for (const todo of goal.todos || []) milestones.append(planTodoRow(todo));
+    if (!milestones.childElementCount) milestones.append(node("div", "milestone-empty", "Add a milestone to shape the delivery path."));
+    card.append(header, progressBar, progressLabel, milestones);
+    elements.goalPlanList.append(card);
+  }
+
+  elements.unassignedWorkCount.textContent = String(state.unassignedTodos.length);
+  elements.unassignedWorkList.replaceChildren();
+  if (!state.unassignedTodos.length) {
+    elements.unassignedWorkList.append(node("div", "goal-plan-empty compact", "Everything is connected to a goal."));
+  }
+  for (const todo of state.unassignedTodos) {
+    const row = planTodoRow(todo);
+    const select = node("select", "goal-assign-select");
+    select.append(new Option("Add to goal...", ""));
+    for (const goal of state.goals) select.append(new Option(goal.title, goal.goal_id));
+    select.disabled = !state.goals.length;
+    select.addEventListener("change", async () => {
+      const goalId = select.value;
+      if (!goalId) return;
+      await updateTodo(todo, { ...todo, goal_id: goalId, milestone_id: null });
+      await refreshGoalPlan();
+    });
+    row.append(select);
+    elements.unassignedWorkList.append(row);
+  }
+}
+
 function renderTodos() {
   if (!elements.todoList) return;
   const todos = visibleTodos();
@@ -7659,6 +7965,8 @@ async function updateTodo(todo, changes) {
     state: changes.state,
     source_kind: todo.source_kind,
     sort_order: todo.sort_order,
+    goal_id: changes.goal_id ?? todo.goal_id ?? null,
+    milestone_id: changes.milestone_id ?? todo.milestone_id ?? null,
     revision: todo.revision,
   };
   if (body.project_id === null) delete body.project_id;
@@ -9638,6 +9946,16 @@ function bindEvents() {
       }
     });
   }
+  if (elements.sessionWorkingDirectoryApply) {
+    elements.sessionWorkingDirectoryApply.addEventListener("click", () => {
+      rebindSelectedSessionWorkingDirectory().catch((error) => {
+        if (elements.sessionWorkingDirectoryStatus) {
+          elements.sessionWorkingDirectoryStatus.textContent = error.message;
+        }
+        toast(error.message, true);
+      });
+    });
+  }
   if (elements.discoverProviderActivity) {
     elements.discoverProviderActivity.addEventListener("click", () => {
       discoverProviderActivitySources().catch((error) => toast(error.message, true));
@@ -9845,6 +10163,10 @@ function bindEvents() {
   document.querySelectorAll(".ghost-action[data-primary-view]").forEach((button) => {
     button.addEventListener("click", () => {
       const view = button.getAttribute("data-primary-view");
+      if (view === "work") {
+        showGoalPlanView();
+        return;
+      }
       const nav = elements.primaryNav?.querySelector(`[data-primary-view="${view}"]`);
       if (nav) nav.click();
       else if (["memory", "future", "bench", "activity", "details"].includes(view)) {
@@ -9878,6 +10200,10 @@ function bindEvents() {
       if (!button) return;
       const view = button.getAttribute("data-primary-view");
       // Graph surfaces (single place — not also on left rail / toolbar).
+      if (view === "work") {
+        showGoalPlanView();
+        return;
+      }
       if (view === "map" || view === "network" || view === "project" || view === "ecosystem") {
         showGraphView("universe");
         if (view === "ecosystem") {
@@ -9905,6 +10231,97 @@ function syncConductorSummaryToggle(collapsed) {
   elements.conductorSummaryToggle.title = title;
   elements.conductorSummaryToggle.setAttribute("aria-label", title);
   elements.conductorSummaryToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function bindGoalPlanEvents() {
+  elements.addGoalButton?.addEventListener("click", () => {
+    if (!state.selectedProject) return;
+    elements.goalForm.reset();
+    elements.goalForm.elements.owner.value = "Project Master";
+    elements.goalFormError.textContent = "";
+    elements.goalDialog.showModal();
+  });
+  elements.goalPlanMap?.addEventListener("click", () => showGraphView("universe"));
+  const handleWorkspaceNav = (event) => {
+    const button = event.target.closest("[data-primary-view]");
+    if (!button) return;
+    const view = button.getAttribute("data-primary-view");
+    if (view === "work") showGoalPlanView();
+    else if (view === "map") showGraphView("universe");
+    else if (["memory", "bench", "activity", "details"].includes(view)) openInspectorSurface(view);
+  };
+  elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
+  elements.quickConductorButton?.addEventListener("click", () => elements.dispatchInstruction?.focus());
+  elements.quickTaskButton?.addEventListener("click", () => openTodoDialog(true));
+  elements.mobileWorkTabs?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-mobile-work-view]");
+    if (!button) return;
+    for (const item of elements.mobileWorkTabs.querySelectorAll("button")) item.classList.toggle("selected", item === button);
+    const view = button.getAttribute("data-mobile-work-view");
+    if (view === "goals") showGoalPlanView();
+    else if (view === "sessions") elements.sessionObservatoryDialog?.showModal();
+    else openInspectorSurface("activity");
+  });
+  const activeGoal = () => state.goals.find((goal) => goal.goal_id === state.selectedGoalId) || state.goals[0];
+  elements.mobileDelegateGoal?.addEventListener("click", () => {
+    const goal = activeGoal();
+    if (!goal) return;
+    elements.dispatchInstruction.value = `Delegate goal \"${goal.title}\" to the Project Master. Use this goal plan as the planning reference.`;
+    elements.dispatchInstruction.focus();
+  });
+  elements.mobileEditPlan?.addEventListener("click", () => elements.addGoalButton?.click());
+  elements.mobileAddMilestone?.addEventListener("click", () => {
+    const goal = activeGoal();
+    if (!goal) return;
+    elements.milestoneForm.elements.goal_id.value = goal.goal_id;
+    elements.milestoneDialog.showModal();
+  });
+  elements.goalForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!state.selectedProject) return;
+    const data = new FormData(elements.goalForm);
+    try {
+      await api(`/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`, {
+        method: "POST",
+        body: {
+          title: String(data.get("title") || "").trim(),
+          description: String(data.get("description") || "").trim(),
+          owner: String(data.get("owner") || "").trim(),
+          state: String(data.get("state") || "DESIGNING"),
+          sort_order: state.goals.length,
+        },
+      });
+      elements.goalDialog.close();
+      await refreshGoalPlan();
+      toast("Goal created");
+    } catch (error) {
+      elements.goalFormError.textContent = error.message;
+    }
+  });
+  elements.milestoneForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(elements.milestoneForm);
+    const goalId = String(data.get("goal_id") || "");
+    const goal = state.goals.find((item) => item.goal_id === goalId);
+    if (!goal) return;
+    try {
+      await api(`/v1/goals/${encodeURIComponent(goalId)}/milestones`, {
+        method: "POST",
+        body: {
+          title: String(data.get("title") || "").trim(),
+          description: String(data.get("description") || "").trim(),
+          state: "PLANNED",
+          sort_order: (goal.milestones || []).length,
+        },
+      });
+      elements.milestoneDialog.close();
+      elements.milestoneForm.reset();
+      await refreshGoalPlan();
+      toast("Milestone added");
+    } catch (error) {
+      elements.milestoneFormError.textContent = error.message;
+    }
+  });
 }
 
 refreshConductorPanel = function () {
@@ -10157,6 +10574,7 @@ refreshLawStrip = function () {
   });
   const resize = new ResizeObserver(drawGraph);
   resize.observe(elements.canvas);
+  bindGoalPlanEvents();
 }
 
 bindEvents();

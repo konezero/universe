@@ -464,6 +464,39 @@ class ClaudeResidentSession:
         self.cancel_turn()
         self._set_state(SESSION_STOPPED)
 
+    def rebind_working_directory(self, cwd: Path) -> str:
+        target = cwd.expanduser().resolve(strict=True)
+        if not target.is_dir():
+            raise ClaudeResidentError("CLAUDE_CWD_INVALID")
+        if not self.session_id:
+            raise ClaudeResidentError("CLAUDE_CWD_REBIND_SESSION_UNAVAILABLE")
+        if not self._turn_lock.acquire(blocking=False):
+            raise ClaudeResidentError("CLAUDE_TURN_ALREADY_ACTIVE")
+        previous = self.cwd
+        try:
+            process, self._process = self._process, None
+            if process is not None:
+                process.close()
+            self.cwd = target
+            self._resume = True
+            self._set_state(SESSION_STOPPED)
+            try:
+                self.start_or_resume()
+            except Exception as error:
+                self.cwd = previous
+                self._process = None
+                self._set_state(SESSION_STOPPED)
+                try:
+                    self.start_or_resume()
+                except Exception as rollback_error:
+                    raise ClaudeResidentError(
+                        "CLAUDE_CWD_REBIND_ROLLBACK_FAILED"
+                    ) from rollback_error
+                raise ClaudeResidentError("CLAUDE_CWD_REBIND_FAILED") from error
+            return str(target)
+        finally:
+            self._turn_lock.release()
+
     # -- internals ------------------------------------------------------
 
     def _arguments(self) -> tuple[str, ...]:

@@ -1348,6 +1348,15 @@ class SessionSupervisorStore:
                 raise SessionSupervisorError(
                     "SESSION_VERSION_CONFLICT", "session row version changed", status=409
                 )
+            prior_default = connection.execute(
+                "SELECT * FROM target_default_session WHERE node = ? AND mode = ?",
+                (row["node"], row["mode"]),
+            ).fetchone()
+            moving_default = (
+                prior_default is not None
+                and prior_default["session_id"] == normalized_id
+                and (row["node"] != normalized_node or row["mode"] != normalized_mode)
+            )
             self._append_location(
                 connection,
                 session_id=normalized_id,
@@ -1377,6 +1386,38 @@ class SessionSupervisorStore:
                     version,
                 ),
             )
+            if moving_default:
+                connection.execute(
+                    "DELETE FROM target_default_session WHERE node = ? AND mode = ?",
+                    (row["node"], row["mode"]),
+                )
+                target_default = connection.execute(
+                    "SELECT pointer_version FROM target_default_session WHERE node = ? AND mode = ?",
+                    (normalized_node, normalized_mode),
+                ).fetchone()
+                next_pointer_version = (
+                    1
+                    if target_default is None
+                    else int(target_default["pointer_version"]) + 1
+                )
+                connection.execute(
+                    """
+                    INSERT INTO target_default_session(
+                        node, mode, session_id, pointer_version, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(node, mode) DO UPDATE SET
+                        session_id = excluded.session_id,
+                        pointer_version = excluded.pointer_version,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        normalized_node,
+                        normalized_mode,
+                        normalized_id,
+                        next_pointer_version,
+                        now,
+                    ),
+                )
             self._event(
                 connection,
                 session_id=normalized_id,

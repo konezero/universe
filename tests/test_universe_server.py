@@ -872,6 +872,124 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("TODO_SCOPE_COORDINATE_INVALID", invalid["error_code"])
 
+    def test_project_goal_plan_is_hierarchical_and_execution_neutral(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+        status, goal_result = self.request(
+            "POST",
+            "/v1/projects/GCS/goals",
+            {
+                "title": "Ship the operator work spine",
+                "description": "Make planning visible before execution.",
+                "owner": "Project Master",
+                "state": "DESIGNING",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status)
+        self.assertFalse(goal_result["task_frame_created"])
+        self.assertFalse(goal_result["execution_assignment_created"])
+        goal = goal_result["goal"]
+
+        status, milestone_result = self.request(
+            "POST",
+            f"/v1/goals/{goal['goal_id']}/milestones",
+            {
+                "title": "Confirm the product flow",
+                "description": "The project plan works on desktop and mobile.",
+                "state": "PLANNED",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status)
+        milestone = milestone_result["milestone"]
+
+        status, todo_result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "goal_id": goal["goal_id"],
+                "milestone_id": milestone["milestone_id"],
+                "title": "Verify the responsive hierarchy",
+                "detail": "",
+                "priority": "P0",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status)
+
+        status, plan = self.request("GET", "/v1/projects/GCS/goals")
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_GOAL_PLAN_COLLECTED", plan["status"])
+        self.assertFalse(plan["task_frame_created"])
+        self.assertEqual([], plan["unassigned_todos"])
+        self.assertEqual(
+            todo_result["todo"]["todo_id"],
+            plan["goals"][0]["milestones"][0]["todos"][0]["todo_id"],
+        )
+
+        stale = {
+            "title": goal["title"],
+            "description": goal["description"],
+            "owner": goal["owner"],
+            "state": "READY",
+            "sort_order": goal["sort_order"],
+            "revision": goal["revision"],
+        }
+        status, updated = self.request(
+            "PATCH", f"/v1/goals/{goal['goal_id']}", stale
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, updated["goal"]["revision"])
+        status, conflict = self.request(
+            "PATCH", f"/v1/goals/{goal['goal_id']}", stale
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("GOAL_REVISION_CONFLICT", conflict["error_code"])
+
+    def test_todo_cannot_bind_to_a_goal_from_another_project(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+        _, goal_result = self.request(
+            "POST",
+            "/v1/projects/GCS/goals",
+            {
+                "title": "Foreign goal",
+                "description": "",
+                "owner": "Project Master",
+                "state": "DESIGNING",
+                "sort_order": 0,
+            },
+        )
+        connection = sqlite3.connect(self.server.store.database_path)
+        try:
+            connection.execute(
+                "UPDATE project_goal SET project_id = 'OTHER' WHERE goal_id = ?",
+                (goal_result["goal"]["goal_id"],),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "goal_id": goal_result["goal"]["goal_id"],
+                "title": "Invalid cross-project binding",
+                "detail": "",
+                "priority": "P1",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("TODO_PLAN_COORDINATE_INVALID", result["error_code"])
+
     def test_project_integration_catalog_is_read_only_and_digest_bound(self) -> None:
         status, result = self.request("GET", "/v1/project-templates")
 
@@ -2537,6 +2655,74 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual([], visible["sessions"])
         status, all_sessions = self.request("GET", "/v1/sessions?include_hidden=true")
         self.assertEqual(1, len(all_sessions["sessions"]))
+
+    def test_working_directory_api_uses_host_confirmed_session_move(self) -> None:
+        target_root = self.temp_root / "TARGET"
+        target_root.mkdir()
+        (target_root / "REPOSITORY_MANIFEST.md").write_text(
+            "# Target Repository Manifest\n", encoding="utf-8"
+        )
+        self.server.store.register_project(
+            self.registration(project_id="TARGET", project_root=str(target_root))
+        )
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-cwd-1",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "thread-cwd-1",
+            }
+        )
+
+        class ConfirmingHost:
+            def close(_self):
+                return None
+
+            def rebind_working_directory(_self, session_id, project, *, expected_version):
+                moved = self.server.session_supervisor.bind_current_location(
+                    session_id,
+                    project_id=project["project_id"],
+                    node=project["project_id"],
+                    mode="MASTER",
+                    evidence_ref="test://provider-confirmed-cwd",
+                    expected_version=expected_version,
+                )
+                return {
+                    "status": "PROVIDER_WORKING_DIRECTORY_REBOUND",
+                    "project_id": project["project_id"],
+                    "session": moved,
+                    "session_connection": {"connection_state": "REUSED"},
+                }
+
+        self.server.project_master_hosts = ConfirmingHost()
+        card = self.server._session_observatory_card(
+            session,
+            continuity_by_project={},
+            projects_by_id={},
+        )
+        self.assertTrue(card["provider_session_attached"])
+        self.assertNotIn("provider_session_ref", card)
+
+        status, denied = self.request(
+            "POST",
+            "/v1/sessions/session-cwd-1/working-directory",
+            {"project_id": "TARGET", "expected_version": session["row_version"]},
+        )
+        self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+        self.assertEqual("SUPERVISOR_CONTROL_TOKEN_REQUIRED", denied["error_code"])
+
+        status, result = self.request(
+            "POST",
+            "/v1/sessions/session-cwd-1/working-directory",
+            {"project_id": "TARGET", "expected_version": session["row_version"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROVIDER_WORKING_DIRECTORY_REBOUND", result["status"])
+        self.assertEqual("TARGET", result["session"]["current_location"]["project_id"])
+        self.assertNotIn("thread-cwd-1", json.dumps(result))
 
     def test_attach_session_requires_explicit_ref_outside_codex_desktop(self) -> None:
         with self.assertRaises(UniverseError) as raised:

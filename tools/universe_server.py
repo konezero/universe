@@ -224,6 +224,8 @@ RUNTIME_LEASE_SCHEMA = "universe.shared-runtime-lease.v1"
 RUNTIME_LEASE_OPERATION_SCHEMA = "universe.shared-runtime-lease-operation.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 TODO_SCHEMA = "universe.todo.v1"
+GOAL_SCHEMA = "universe.goal.v1"
+MILESTONE_SCHEMA = "universe.milestone.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
 PROJECT_SEED_ASSET_PROPOSAL_SCHEMA = "universe.project-seed-asset-proposal.v1"
 PROJECT_PROJECTION_SCHEMA = "universe.project-projection.v1"
@@ -362,6 +364,8 @@ SKILL_OPERATION_CLASSES = frozenset({"READ", "PROPOSE", "EXECUTE"})
 TODO_SCOPE_KINDS = frozenset({"UNIVERSE", "PROJECT", "NODE"})
 TODO_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
 TODO_STATES = frozenset({"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
+GOAL_STATES = frozenset({"DESIGNING", "READY", "ACTIVE", "BLOCKED", "DONE"})
+MILESTONE_STATES = frozenset({"PLANNED", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
 TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
@@ -1240,7 +1244,9 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
         value,
         field="todo",
         required=frozenset(required),
-        optional=frozenset({"todo_id", "project_id", "node_ref"}),
+        optional=frozenset(
+            {"todo_id", "project_id", "node_ref", "goal_id", "milestone_id"}
+        ),
     )
     scope_kind = _required_text(request["scope_kind"], "scope_kind").upper()
     if scope_kind not in TODO_SCOPE_KINDS:
@@ -1311,6 +1317,10 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
         "state": state,
         "source_kind": source_kind,
         "sort_order": sort_order,
+        "goal_id": _optional_identifier(request.get("goal_id"), "goal_id"),
+        "milestone_id": _optional_identifier(
+            request.get("milestone_id"), "milestone_id"
+        ),
     }
     if "todo_id" in request:
         normalized["todo_id"] = _identifier(request["todo_id"], "todo_id")
@@ -1320,6 +1330,97 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
             raise UniverseError(
                 "TODO_REVISION_INVALID",
                 "revision must be a positive integer",
+            )
+        normalized["revision"] = revision
+    return normalized
+
+
+def _optional_identifier(value: Any, field: str) -> str | None:
+    if value is None or value == "":
+        return None
+    return _identifier(value, field)
+
+
+def normalize_goal(project_id: str, value: Any, *, updating: bool = False) -> dict[str, Any]:
+    required = {"title", "description", "owner", "state", "sort_order"}
+    if updating:
+        required.add("revision")
+    request = _exact_object_fields(
+        value,
+        field="goal",
+        required=frozenset(required),
+        optional=frozenset({"goal_id"}),
+    )
+    title = _required_text(request["title"], "title")
+    description = request["description"]
+    if len(title) > 160 or not isinstance(description, str) or len(description) > 4000:
+        raise UniverseError("GOAL_TEXT_INVALID", "goal title or description is too long")
+    state = _required_text(request["state"], "state").upper()
+    if state not in GOAL_STATES:
+        raise UniverseError("GOAL_STATE_INVALID", "unsupported goal state")
+    sort_order = request["sort_order"]
+    if isinstance(sort_order, bool) or not isinstance(sort_order, int):
+        raise UniverseError("GOAL_SORT_ORDER_INVALID", "sort_order must be an integer")
+    normalized = {
+        "project_id": _project_id(project_id),
+        "title": title,
+        "description": description,
+        "owner": _required_text(request["owner"], "owner"),
+        "state": state,
+        "sort_order": sort_order,
+    }
+    if "goal_id" in request:
+        normalized["goal_id"] = _identifier(request["goal_id"], "goal_id")
+    if updating:
+        revision = request["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise UniverseError(
+                "GOAL_REVISION_INVALID", "revision must be a positive integer"
+            )
+        normalized["revision"] = revision
+    return normalized
+
+
+def normalize_milestone(goal_id: str, value: Any, *, updating: bool = False) -> dict[str, Any]:
+    required = {"title", "description", "state", "sort_order"}
+    if updating:
+        required.add("revision")
+    request = _exact_object_fields(
+        value,
+        field="milestone",
+        required=frozenset(required),
+        optional=frozenset({"milestone_id"}),
+    )
+    title = _required_text(request["title"], "title")
+    description = request["description"]
+    if len(title) > 160 or not isinstance(description, str) or len(description) > 4000:
+        raise UniverseError(
+            "MILESTONE_TEXT_INVALID", "milestone title or description is too long"
+        )
+    state = _required_text(request["state"], "state").upper()
+    if state not in MILESTONE_STATES:
+        raise UniverseError("MILESTONE_STATE_INVALID", "unsupported milestone state")
+    sort_order = request["sort_order"]
+    if isinstance(sort_order, bool) or not isinstance(sort_order, int):
+        raise UniverseError(
+            "MILESTONE_SORT_ORDER_INVALID", "sort_order must be an integer"
+        )
+    normalized = {
+        "goal_id": _identifier(goal_id, "goal_id"),
+        "title": title,
+        "description": description,
+        "state": state,
+        "sort_order": sort_order,
+    }
+    if "milestone_id" in request:
+        normalized["milestone_id"] = _identifier(
+            request["milestone_id"], "milestone_id"
+        )
+    if updating:
+        revision = request["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise UniverseError(
+                "MILESTONE_REVISION_INVALID", "revision must be a positive integer"
             )
         normalized["revision"] = revision
     return normalized
@@ -4051,6 +4152,43 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_event_project_time
                 ON project_event(project_id, created_at, event_id);
 
+                CREATE TABLE IF NOT EXISTS project_goal (
+                    goal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('DESIGNING', 'READY', 'ACTIVE', 'BLOCKED', 'DONE')),
+                    sort_order INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_goal_project_order
+                ON project_goal(project_id, sort_order, updated_at, goal_id);
+
+                CREATE TABLE IF NOT EXISTS project_milestone (
+                    milestone_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('PLANNED', 'READY', 'IN_PROGRESS', 'BLOCKED', 'DONE')),
+                    sort_order INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_milestone_goal_order
+                ON project_milestone(goal_id, sort_order, updated_at, milestone_id);
+
                 CREATE TABLE IF NOT EXISTS project_todo (
                     todo_id TEXT PRIMARY KEY,
                     scope_kind TEXT NOT NULL,
@@ -4058,6 +4196,10 @@ class UniverseStore:
                         REFERENCES project_connection(project_id)
                         ON DELETE CASCADE,
                     node_ref TEXT,
+                    goal_id TEXT REFERENCES project_goal(goal_id) ON DELETE SET NULL,
+                    milestone_id TEXT
+                        REFERENCES project_milestone(milestone_id)
+                        ON DELETE SET NULL,
                     title TEXT NOT NULL,
                     detail TEXT NOT NULL,
                     priority TEXT NOT NULL,
@@ -4854,6 +4996,20 @@ class UniverseStore:
                 );
                 """
             )
+            todo_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(project_todo)").fetchall()
+            }
+            if "goal_id" not in todo_columns:
+                connection.execute(
+                    "ALTER TABLE project_todo ADD COLUMN goal_id TEXT "
+                    "REFERENCES project_goal(goal_id) ON DELETE SET NULL"
+                )
+            if "milestone_id" not in todo_columns:
+                connection.execute(
+                    "ALTER TABLE project_todo ADD COLUMN milestone_id TEXT "
+                    "REFERENCES project_milestone(milestone_id) ON DELETE SET NULL"
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO project_release_selection(
@@ -7433,10 +7589,168 @@ class UniverseStore:
             for row in rows
         ]
 
+    def list_project_goals(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            goal_rows = connection.execute(
+                "SELECT * FROM project_goal WHERE project_id = ? "
+                "ORDER BY sort_order, updated_at, goal_id",
+                (project["project_id"],),
+            ).fetchall()
+            milestone_rows = connection.execute(
+                "SELECT milestone.* FROM project_milestone AS milestone "
+                "JOIN project_goal AS goal ON goal.goal_id = milestone.goal_id "
+                "WHERE goal.project_id = ? "
+                "ORDER BY milestone.sort_order, milestone.updated_at, milestone.milestone_id",
+                (project["project_id"],),
+            ).fetchall()
+            todo_rows = connection.execute(
+                "SELECT * FROM project_todo WHERE project_id = ? "
+                "ORDER BY sort_order, updated_at, todo_id",
+                (project["project_id"],),
+            ).fetchall()
+        todos = [self._todo_row(row) for row in todo_rows]
+        milestones_by_goal: dict[str, list[dict[str, Any]]] = {}
+        for row in milestone_rows:
+            milestone = self._milestone_row(row)
+            milestone["todos"] = [
+                todo for todo in todos if todo["milestone_id"] == milestone["milestone_id"]
+            ]
+            milestones_by_goal.setdefault(milestone["goal_id"], []).append(milestone)
+        goals = []
+        for row in goal_rows:
+            goal = self._goal_row(row)
+            goal["milestones"] = milestones_by_goal.get(goal["goal_id"], [])
+            goal["todos"] = [
+                todo
+                for todo in todos
+                if todo["goal_id"] == goal["goal_id"] and todo["milestone_id"] is None
+            ]
+            goals.append(goal)
+        return goals
+
+    def create_goal(self, project_id: str, value: Any) -> dict[str, Any]:
+        self.get_project(project_id)
+        goal = normalize_goal(project_id, value)
+        goal_id = goal.get("goal_id") or "goal_" + uuid.uuid4().hex
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO project_goal(goal_id, project_id, title, description, owner, "
+                "state, sort_order, revision, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    goal_id, goal["project_id"], goal["title"], goal["description"],
+                    goal["owner"], goal["state"], goal["sort_order"], now, now,
+                ),
+            )
+        return self.get_goal(goal_id)
+
+    def get_goal(self, goal_id: str) -> dict[str, Any]:
+        normalized = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM project_goal WHERE goal_id = ?", (normalized,)
+            ).fetchone()
+        if row is None:
+            raise UniverseError("GOAL_NOT_FOUND", f"Goal does not exist: {normalized}", HTTPStatus.NOT_FOUND)
+        return self._goal_row(row)
+
+    def update_goal(self, goal_id: str, value: Any) -> dict[str, Any]:
+        current = self.get_goal(goal_id)
+        goal = normalize_goal(current["project_id"], value, updating=True)
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_goal SET title = ?, description = ?, owner = ?, state = ?, "
+                "sort_order = ?, revision = revision + 1, updated_at = ? "
+                "WHERE goal_id = ? AND revision = ?",
+                (
+                    goal["title"], goal["description"], goal["owner"], goal["state"],
+                    goal["sort_order"], now, current["goal_id"], goal["revision"],
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed", HTTPStatus.CONFLICT)
+        return self.get_goal(goal_id)
+
+    def create_milestone(self, goal_id: str, value: Any) -> dict[str, Any]:
+        self.get_goal(goal_id)
+        milestone = normalize_milestone(goal_id, value)
+        milestone_id = milestone.get("milestone_id") or "milestone_" + uuid.uuid4().hex
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO project_milestone(milestone_id, goal_id, title, description, "
+                "state, sort_order, revision, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    milestone_id, milestone["goal_id"], milestone["title"],
+                    milestone["description"], milestone["state"],
+                    milestone["sort_order"], now, now,
+                ),
+            )
+        return self.get_milestone(milestone_id)
+
+    def get_milestone(self, milestone_id: str) -> dict[str, Any]:
+        normalized = _identifier(milestone_id, "milestone_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM project_milestone WHERE milestone_id = ?", (normalized,)
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "MILESTONE_NOT_FOUND", f"Milestone does not exist: {normalized}", HTTPStatus.NOT_FOUND
+            )
+        return self._milestone_row(row)
+
+    def update_milestone(self, milestone_id: str, value: Any) -> dict[str, Any]:
+        current = self.get_milestone(milestone_id)
+        milestone = normalize_milestone(current["goal_id"], value, updating=True)
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_milestone SET title = ?, description = ?, state = ?, "
+                "sort_order = ?, revision = revision + 1, updated_at = ? "
+                "WHERE milestone_id = ? AND revision = ?",
+                (
+                    milestone["title"], milestone["description"], milestone["state"],
+                    milestone["sort_order"], now, current["milestone_id"],
+                    milestone["revision"],
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise UniverseError(
+                "MILESTONE_REVISION_CONFLICT", "Milestone revision changed", HTTPStatus.CONFLICT
+            )
+        return self.get_milestone(milestone_id)
+
+    def _validate_todo_plan_binding(self, todo: Mapping[str, Any]) -> None:
+        goal_id = todo.get("goal_id")
+        milestone_id = todo.get("milestone_id")
+        if milestone_id and not goal_id:
+            raise UniverseError(
+                "TODO_PLAN_COORDINATE_INVALID", "milestone_id requires goal_id"
+            )
+        if not goal_id:
+            return
+        goal = self.get_goal(str(goal_id))
+        if goal["project_id"] != todo.get("project_id"):
+            raise UniverseError(
+                "TODO_PLAN_COORDINATE_INVALID", "Todo and Goal must belong to the same project"
+            )
+        if milestone_id:
+            milestone = self.get_milestone(str(milestone_id))
+            if milestone["goal_id"] != goal["goal_id"]:
+                raise UniverseError(
+                    "TODO_PLAN_COORDINATE_INVALID", "Milestone does not belong to Goal"
+                )
+
     def create_todo(self, value: Any) -> dict[str, Any]:
         todo = normalize_todo(value)
         if todo["project_id"] is not None:
             self.get_project(todo["project_id"])
+        self._validate_todo_plan_binding(todo)
         todo_id = todo.get("todo_id") or "todo_" + uuid.uuid4().hex
         now = utc_now()
         with self._connection() as connection:
@@ -7444,16 +7758,18 @@ class UniverseStore:
                 connection.execute(
                     """
                     INSERT INTO project_todo(
-                        todo_id, scope_kind, project_id, node_ref, title, detail,
+                        todo_id, scope_kind, project_id, node_ref, goal_id, milestone_id, title, detail,
                         priority, state, source_kind, sort_order, revision,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     (
                         todo_id,
                         todo["scope_kind"],
                         todo["project_id"],
                         todo["node_ref"],
+                        todo["goal_id"],
+                        todo["milestone_id"],
                         todo["title"],
                         todo["detail"],
                         todo["priority"],
@@ -7476,7 +7792,7 @@ class UniverseStore:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT todo_id, scope_kind, project_id, node_ref, title, detail,
+                SELECT todo_id, scope_kind, project_id, node_ref, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
                        created_at, updated_at
                 FROM project_todo
@@ -7504,7 +7820,7 @@ class UniverseStore:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT todo_id, scope_kind, project_id, node_ref, title, detail,
+                SELECT todo_id, scope_kind, project_id, node_ref, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
                        created_at, updated_at
                 FROM project_todo
@@ -7530,12 +7846,13 @@ class UniverseStore:
             )
         if todo["project_id"] is not None:
             self.get_project(todo["project_id"])
+        self._validate_todo_plan_binding(todo)
         now = utc_now()
         with self._connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE project_todo
-                SET scope_kind = ?, project_id = ?, node_ref = ?, title = ?,
+                SET scope_kind = ?, project_id = ?, node_ref = ?, goal_id = ?, milestone_id = ?, title = ?,
                     detail = ?, priority = ?, state = ?, source_kind = ?,
                     sort_order = ?, revision = revision + 1, updated_at = ?
                 WHERE todo_id = ? AND revision = ?
@@ -7544,6 +7861,8 @@ class UniverseStore:
                     todo["scope_kind"],
                     todo["project_id"],
                     todo["node_ref"],
+                    todo["goal_id"],
+                    todo["milestone_id"],
                     todo["title"],
                     todo["detail"],
                     todo["priority"],
@@ -14194,6 +14513,37 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _goal_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_SCHEMA,
+            "goal_id": row["goal_id"],
+            "project_id": row["project_id"],
+            "title": row["title"],
+            "description": row["description"],
+            "owner": row["owner"],
+            "state": row["state"],
+            "sort_order": row["sort_order"],
+            "revision": row["revision"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _milestone_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": MILESTONE_SCHEMA,
+            "milestone_id": row["milestone_id"],
+            "goal_id": row["goal_id"],
+            "title": row["title"],
+            "description": row["description"],
+            "state": row["state"],
+            "sort_order": row["sort_order"],
+            "revision": row["revision"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
     def _todo_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "schema": TODO_SCHEMA,
@@ -14201,6 +14551,8 @@ class UniverseStore:
             "scope_kind": row["scope_kind"],
             "project_id": row["project_id"],
             "node_ref": row["node_ref"],
+            "goal_id": row["goal_id"],
+            "milestone_id": row["milestone_id"],
             "title": row["title"],
             "detail": row["detail"],
             "priority": row["priority"],
@@ -16163,6 +16515,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     ) -> dict[str, Any]:
         """Add last-activity + short chat preview for Observatory disambiguation."""
         card = dict(session)
+        card["provider_session_attached"] = bool(session.get("provider_session_ref"))
         card.pop("provider_session_ref", None)
         history = card.get("binding_history")
         if isinstance(history, list):
@@ -20063,6 +20416,44 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        project_goals = re.fullmatch(r"/v1/projects/([^/]+)/goals", path)
+        if project_goals is not None:
+            try:
+                project_id = unquote(project_goals.group(1))
+                goals = self.server.store.list_project_goals(project_id)
+                assigned = {
+                    todo["todo_id"]
+                    for goal in goals
+                    for todo in (
+                        list(goal["todos"])
+                        + [
+                            item
+                            for milestone in goal["milestones"]
+                            for item in milestone["todos"]
+                        ]
+                    )
+                }
+                unassigned = [
+                    todo
+                    for todo in self.server.store.list_todos()
+                    if todo["project_id"] == project_id
+                    and todo["todo_id"] not in assigned
+                ]
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_GOAL_PLAN_COLLECTED",
+                        "project_id": project_id,
+                        "goals": goals,
+                        "unassigned_todos": unassigned,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/todos":
             self._send(
                 HTTPStatus.OK,
@@ -20729,7 +21120,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             path,
         )
         privileged_session_match = re.fullmatch(
-            r"/v1/sessions/[^/]+/(location|provider)", path
+            r"/v1/sessions/[^/]+/(location|provider|working-directory)", path
         )
         if (
             path == "/v1/supervisor/sessions"
@@ -20996,6 +21387,49 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         ],
                         "deltas": tail["deltas"],
                         "catalog": self.server.provider_chat_catalog(),
+                    },
+                )
+                return
+            working_directory_rebind = re.fullmatch(
+                r"/v1/sessions/([^/]+)/working-directory", path
+            )
+            if working_directory_rebind is not None:
+                if not isinstance(body, Mapping):
+                    raise SessionSupervisorError(
+                        "SESSION_SUPERVISOR_REQUEST_INVALID",
+                        "request body must be an object",
+                    )
+                if self.server.project_master_hosts is None:
+                    raise UniverseError(
+                        "PROJECT_MASTER_HOST_UNAVAILABLE",
+                        "Project Master host is not enabled",
+                        HTTPStatus.CONFLICT,
+                    )
+                target_project = self.server.store.get_project(
+                    _required_text(body.get("project_id"), "project_id")
+                )
+                try:
+                    result = self.server.project_master_hosts.rebind_working_directory(
+                        unquote(working_directory_rebind.group(1)),
+                        target_project,
+                        expected_version=body.get("expected_version"),
+                    )
+                except ProjectMasterHostError as error:
+                    raise UniverseError(
+                        str(error),
+                        str(error),
+                        HTTPStatus.CONFLICT,
+                    ) from error
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": result["status"],
+                        "project_id": result["project_id"],
+                        "session": self.server.session_supervisor._public_session(
+                            result["session"]
+                        ),
+                        "session_connection": result.get("session_connection"),
                     },
                 )
                 return
@@ -21587,6 +22021,38 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         if created
                         else "PROJECT_REFRESHED",
                         "project": project,
+                    },
+                )
+                return
+            project_goals = re.fullmatch(r"/v1/projects/([^/]+)/goals", path)
+            if project_goals is not None:
+                goal = self.server.store.create_goal(
+                    unquote(project_goals.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_RECORDED",
+                        "goal": goal,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            goal_milestones = re.fullmatch(r"/v1/goals/([^/]+)/milestones", path)
+            if goal_milestones is not None:
+                milestone = self.server.store.create_milestone(
+                    unquote(goal_milestones.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MILESTONE_RECORDED",
+                        "milestone": milestone,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
                     },
                 )
                 return
@@ -22726,12 +23192,44 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         if not self._authorize():
             return
-        todo_id = self._todo_path(urlsplit(self.path).path)
-        if todo_id is None:
-            self._not_found()
-            return
+        path = urlsplit(self.path).path
         try:
-            todo = self.server.store.update_todo(todo_id, self._read_json())
+            body = self._read_json()
+            goal_match = re.fullmatch(r"/v1/goals/([^/]+)", path)
+            if goal_match is not None:
+                goal = self.server.store.update_goal(unquote(goal_match.group(1)), body)
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_UPDATED",
+                        "goal": goal,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            milestone_match = re.fullmatch(r"/v1/milestones/([^/]+)", path)
+            if milestone_match is not None:
+                milestone = self.server.store.update_milestone(
+                    unquote(milestone_match.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MILESTONE_UPDATED",
+                        "milestone": milestone,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            todo_id = self._todo_path(path)
+            if todo_id is None:
+                self._not_found()
+                return
+            todo = self.server.store.update_todo(todo_id, body)
             self._send(
                 HTTPStatus.OK,
                 {

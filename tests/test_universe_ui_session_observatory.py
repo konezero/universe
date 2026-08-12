@@ -109,6 +109,23 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             HTML.index('id="session-observatory-list"'),
         )
 
+    def test_master_session_can_rebind_to_registered_project(self) -> None:
+        self.assertIn('id="session-working-directory-project"', HTML)
+        self.assertIn('id="session-working-directory-apply"', HTML)
+        self.assertIn("function renderSessionWorkingDirectory", APP)
+        self.assertIn("async function rebindSelectedSessionWorkingDirectory", APP)
+        self.assertIn("/working-directory`,", APP)
+        rebind_slice = APP[
+            APP.index("async function rebindSelectedSessionWorkingDirectory") : APP.index(
+                "async function api"
+            )
+        ]
+        self.assertIn("expected_version: session.row_version", rebind_slice)
+        self.assertIn("await refreshSupervisorSessions()", rebind_slice)
+        self.assertIn("session?.provider_session_attached", APP)
+        self.assertIn("session-working-directory", CSS)
+        self.assertIn(".session-working-directory.hidden", CSS)
+
     def test_approval_uses_server_owned_canonical_route(self) -> None:
         self.assertIn("/v1/governance/proposals/", APP)
         decision_slice = APP[

@@ -258,6 +258,32 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         current = self.store.get_session(session["session_id"])
         self.assertEqual(1, sum(item["is_current"] for item in current["location_history"]))
 
+    def test_moving_default_session_moves_default_pointer_with_identity(self) -> None:
+        session, _ = self.store.register_session(self.session())
+        if not session["is_default"]:
+            self.store.set_default(
+                session["session_id"],
+                expected_pointer_version=session["default_pointer_version"],
+            )
+            session = self.store.get_session(session["session_id"])
+        moved = self.store.bind_current_location(
+            session["session_id"],
+            project_id="RENDEZVOUS",
+            node="RENDEZVOUS",
+            mode="MASTER",
+            evidence_ref="test://provider-cwd-rebind",
+            expected_version=session["row_version"],
+        )
+        self.assertEqual(session["session_id"], moved["session_id"])
+        self.assertEqual("RENDEZVOUS", moved["node"])
+        self.assertTrue(moved["is_default"])
+        self.assertFalse(
+            any(
+                item["is_default"]
+                for item in self.store.list_sessions(node="GCS", mode="MASTER")
+            )
+        )
+
     def test_alias_is_display_only_and_uses_session_row_cas(self) -> None:
         session, _ = self.store.register_session(self.session())
         updated = self.store.update_alias(

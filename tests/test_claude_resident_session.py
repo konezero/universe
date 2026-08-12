@@ -185,6 +185,43 @@ class ClaudeResidentSessionTests(unittest.TestCase):
         self.assertIn("--session-id", arguments)
         self.assertNotIn("--resume", arguments)
 
+    def test_rebind_restarts_same_session_in_target_directory(self) -> None:
+        target = self.root / "target"
+        target.mkdir()
+        session = self._session(session_id="existing")
+        session.start_or_resume()
+        rebound = session.rebind_working_directory(target)
+        self.assertEqual(str(target.resolve()), rebound)
+        self.assertEqual(2, session.launch_count)
+        self.assertTrue(FakeClaudeProcess.instances[0].closed)
+        replacement = FakeClaudeProcess.instances[1]
+        self.assertEqual(target.resolve(), replacement.cwd)
+        self.assertIn("--resume", replacement.arguments)
+        self.assertEqual(
+            "existing", replacement.arguments[replacement.arguments.index("--resume") + 1]
+        )
+
+    def test_failed_rebind_restores_previous_directory_and_process(self) -> None:
+        target = self.root / "target"
+        target.mkdir()
+        launches = 0
+
+        def factory(**kwargs):
+            nonlocal launches
+            launches += 1
+            if launches == 2:
+                raise OSError("target launch failed")
+            return FakeClaudeProcess(**kwargs)
+
+        session = self._session(session_id="existing", process_factory=factory)
+        session.start_or_resume()
+        with self.assertRaisesRegex(ClaudeResidentError, "CLAUDE_CWD_REBIND_FAILED"):
+            session.rebind_working_directory(target)
+        self.assertEqual(self.root.resolve(), session.cwd)
+        self.assertEqual(2, session.launch_count)
+        self.assertEqual(self.root.resolve(), FakeClaudeProcess.instances[-1].cwd)
+        self.assertEqual(SESSION_READY, session.session_status())
+
     def test_greeting_sent_once_on_new_session_only(self) -> None:
         session = self._session()
         session.send_message("first", lambda _d: None)

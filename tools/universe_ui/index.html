@@ -12,10 +12,10 @@
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
-        <strong>Universe</strong>
+        <span class="brand-copy"><strong>Universe</strong><small>Work Spine Command Center</small></span>
       </div>
       <nav id="primary-nav" class="primary-nav" aria-label="Workspace surfaces">
-        <button type="button" class="selected" data-primary-view="map" title="Multiverse map">Map</button>
+        <button type="button" class="selected" data-primary-view="work" title="Project goal plan">Work Spine</button>
         <button type="button" data-primary-view="timeline" title="Project timeline graph">Timeline</button>
         <button type="button" data-primary-view="documents" title="Document graph">Documents</button>
         <button type="button" data-primary-view="memory" title="Project memory (inspector)">Memory</button>
@@ -40,9 +40,18 @@
       </div>
     </header>
 
+    <nav class="utility-rail" aria-label="Universe tools">
+      <button class="selected" type="button" data-primary-view="work" title="Home"><span aria-hidden="true">&#8962;</span><small>Home</small></button>
+      <button type="button" data-primary-view="map" title="Graph"><span aria-hidden="true">&#9675;</span><small>Graph</small></button>
+      <button type="button" data-primary-view="memory" title="Memory"><span aria-hidden="true">&#9673;</span><small>Memory</small></button>
+      <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
+      <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
+      <button type="button" data-primary-view="meeting" title="Meeting Room"><span aria-hidden="true">&#9672;</span><small>Meeting</small></button>
+    </nav>
+
     <aside class="project-rail universe-rail">
       <div class="section-heading">
-        <span>Universes</span>
+          <span>Projects</span>
         <span class="section-actions">
           <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project">&#10022;</button>
           <button id="add-project-button" class="icon-button compact" type="button" title="Connect project" aria-label="Connect project">+</button>
@@ -69,9 +78,45 @@
         <div id="session-rail-list" class="session-rail-list" aria-label="Universe sessions"></div>
         <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
+      <div class="rail-quick-actions">
+        <button id="quick-conductor-button" type="button"><span aria-hidden="true">+</span> New Conductor conversation</button>
+        <button id="quick-task-button" type="button"><span aria-hidden="true">&#9745;</span> Create task</button>
+      </div>
     </aside>
 
     <main class="graph-workspace">
+      <nav class="mobile-work-tabs" aria-label="Project workspace">
+        <button class="selected" type="button" data-mobile-work-view="goals">Goals</button>
+        <button type="button" data-mobile-work-view="sessions">Sessions</button>
+        <button type="button" data-mobile-work-view="activity">Activity</button>
+      </nav>
+      <section id="goal-plan-workspace" class="goal-plan-workspace" aria-label="Project goal plan">
+        <header class="goal-plan-header">
+          <div>
+            <span id="goal-plan-breadcrumb" class="goal-plan-kicker">Project &gt; Goal Plan</span>
+            <h1 id="goal-plan-title">Goal Plan</h1>
+            <p id="goal-plan-subtitle">Goal &rarr; Milestone / Phase &rarr; Todo</p>
+          </div>
+          <div class="goal-plan-actions">
+            <button id="goal-plan-map" class="secondary-button" type="button">Open map</button>
+            <button id="add-goal-button" class="primary-button" type="button">Add goal</button>
+          </div>
+        </header>
+        <div id="goal-plan-summary" class="goal-plan-summary" aria-label="Goal plan summary"></div>
+        <div id="goal-plan-list" class="goal-plan-list">
+          <div class="goal-plan-empty">Choose a project to begin planning.</div>
+        </div>
+        <section class="unassigned-work" aria-label="Unassigned project work">
+          <header>
+            <div>
+              <span class="goal-plan-kicker">Planning inbox</span>
+              <h2>Unassigned work</h2>
+            </div>
+            <span id="unassigned-work-count" class="count-badge">0</span>
+          </header>
+          <div id="unassigned-work-list" class="unassigned-work-list"></div>
+        </section>
+      </section>
       <div class="graph-toolbar glass-bar">
         <div class="toolbar-filters">
           <div class="graph-map-controls" aria-label="Map controls">
@@ -177,6 +222,11 @@
           </div>
         </form>
       </section>
+      <nav class="mobile-goal-actions" aria-label="Goal actions">
+        <button id="mobile-delegate-goal" type="button">Delegate</button>
+        <button id="mobile-edit-plan" type="button">Edit plan</button>
+        <button id="mobile-add-milestone" type="button">Add milestone</button>
+      </nav>
     </main>
 
     <aside class="inspector" aria-label="Selected project context">
@@ -235,6 +285,37 @@
         <button type="submit" class="primary-button">Connect</button>
       </div>
       <p id="project-form-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <dialog id="goal-dialog" class="goal-dialog">
+    <form id="goal-form" method="dialog">
+      <div class="dialog-heading">
+        <div><span class="goal-plan-kicker">Project plan</span><h2>New goal</h2></div>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <label>Goal title<input name="title" maxlength="160" required></label>
+      <label>Outcome<textarea name="description" rows="4" maxlength="4000" required></textarea></label>
+      <div class="form-grid two-columns">
+        <label>Owner<input name="owner" maxlength="80" value="Project Master" required></label>
+        <label>State<select name="state"><option value="DESIGNING">Designing</option><option value="READY">Ready</option><option value="IN_PROGRESS">In progress</option><option value="BLOCKED">Blocked</option><option value="DONE">Done</option></select></label>
+      </div>
+      <div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Create goal</button></div>
+      <p id="goal-form-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
+  <dialog id="milestone-dialog" class="goal-dialog">
+    <form id="milestone-form" method="dialog">
+      <input name="goal_id" type="hidden">
+      <div class="dialog-heading">
+        <div><span class="goal-plan-kicker">Goal phase</span><h2>New milestone</h2></div>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <label>Milestone title<input name="title" maxlength="160" required></label>
+      <label>Definition of done<textarea name="description" rows="3" maxlength="4000" required></textarea></label>
+      <div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Add milestone</button></div>
+      <p id="milestone-form-error" class="form-error" role="alert"></p>
     </form>
   </dialog>
 
@@ -690,6 +771,16 @@
         <section id="session-observatory-detail" class="session-observatory-detail hidden">
           <div class="section-heading"><span>Selected session</span></div>
           <div id="session-observatory-detail-meta" class="session-detail-meta"></div>
+          <div id="session-working-directory" class="session-working-directory hidden">
+            <label>
+              Working project
+              <select id="session-working-directory-project"></select>
+            </label>
+            <button id="session-working-directory-apply" class="secondary-button" type="button">
+              Move session
+            </button>
+            <p id="session-working-directory-status" class="section-note" role="status"></p>
+          </div>
           <div id="session-observatory-detail-preview" class="session-detail-preview"></div>
         </section>
         <div id="session-observatory-list" class="session-observatory-list"></div>

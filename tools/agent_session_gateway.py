@@ -518,6 +518,12 @@ class UniverseAcpGateway:
             "usage": {},
         }
 
+    def rebind_working_directory(self, cwd: Path) -> str:
+        rebind = getattr(self.session, "rebind_working_directory", None)
+        if not callable(rebind):
+            raise AgentSessionError("AGENT_SESSION_CWD_REBIND_UNAVAILABLE")
+        return str(rebind(cwd))
+
     def close(self) -> None:
         self.session.close()
 
@@ -628,6 +634,29 @@ class GrokAcpSession:
 
     def close(self) -> None:
         self._transport.close()
+
+    def rebind_working_directory(self, cwd: Path) -> str:
+        if self.ephemeral or not self.session_id:
+            raise AgentSessionError("GROK_ACP_CWD_REBIND_UNAVAILABLE")
+        target = cwd.expanduser().resolve(strict=True)
+        if not target.is_dir():
+            raise AgentSessionError("GROK_ACP_CWD_INVALID")
+        result = self._transport.request(
+            "session/load",
+            {
+                "sessionId": self.session_id,
+                "cwd": str(target),
+                "mcpServers": [],
+            },
+            timeout_seconds=30,
+        )
+        if (
+            not isinstance(result, Mapping)
+            or result.get("sessionId") != self.session_id
+        ):
+            raise AgentSessionError("GROK_ACP_CWD_REBIND_FAILED")
+        self.cwd = target
+        return str(target)
 
     def _initialize(self) -> None:
         result = self._transport.request(
@@ -856,6 +885,32 @@ class CodexAppServerSession:
 
     def close(self) -> None:
         self._transport.close()
+
+    def rebind_working_directory(self, cwd: Path) -> str:
+        if self.ephemeral or not self.session_id:
+            raise AgentSessionError("CODEX_APP_CWD_REBIND_UNAVAILABLE")
+        target = cwd.expanduser().resolve(strict=True)
+        if not target.is_dir():
+            raise AgentSessionError("CODEX_APP_CWD_INVALID")
+        result = self._transport.request(
+            "thread/resume",
+            {
+                "threadId": self.session_id,
+                "cwd": str(target),
+                "approvalPolicy": CODEX_APPROVAL_POLICY,
+                "approvalsReviewer": "user",
+                "sandbox": "read-only",
+            },
+            timeout_seconds=30,
+        )
+        if not isinstance(result, Mapping) or not isinstance(
+            result.get("thread"), Mapping
+        ):
+            raise AgentSessionError("CODEX_APP_CWD_REBIND_FAILED")
+        if _text(result["thread"].get("id"), "thread.id") != self.session_id:
+            raise AgentSessionError("CODEX_APP_CWD_REBIND_SESSION_MISMATCH")
+        self.cwd = target
+        return str(target)
 
     def _initialize(self) -> None:
         result = self._transport.request(

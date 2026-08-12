@@ -33,7 +33,7 @@ from agent_session_gateway import (
 )
 from claude_permission_bridge import ClaudePermissionBridge
 from claude_permission_broker import ClaudePermissionBroker
-from claude_resident_session import ClaudeResidentSession
+from claude_resident_session import ClaudeResidentError, ClaudeResidentSession
 from host_profile import resolve_host_tool
 from project_master_bridge import (
     ProjectMasterBridgeHost,
@@ -1715,20 +1715,43 @@ class ProjectMasterSessionStore:
         else:
             state = "REPLACED"
         if self.session_supervisor is not None:
-            supervisor_session_id = self._supervisor_session_id(
-                normalized_provider, normalized_session
+            sessions = self.session_supervisor.list_sessions(
+                node=self.project_id,
+                mode=self.requested_mode,
             )
-            candidate, _ = self.session_supervisor.register_session(
-                {
-                    "session_id": supervisor_session_id,
-                    "node": self.project_id,
-                    "mode": self.requested_mode,
-                    "provider": normalized_provider,
-                    "provider_session_ref": normalized_session,
-                    "state": "LIVE",
-                    "currentness": "UNKNOWN",
-                }
+            selected = next(
+                (session for session in sessions if session["is_default"]),
+                None,
             )
+            if selected is not None:
+                supervisor_session_id = str(selected["session_id"])
+                if (
+                    selected.get("provider") == normalized_provider
+                    and selected.get("provider_session_ref") == normalized_session
+                ):
+                    candidate = selected
+                else:
+                    candidate = self.session_supervisor.bind_provider_session(
+                        supervisor_session_id,
+                        provider=normalized_provider,
+                        provider_session_ref=normalized_session,
+                        expected_version=selected["row_version"],
+                    )
+            else:
+                supervisor_session_id = self._supervisor_session_id(
+                    normalized_provider, normalized_session
+                )
+                candidate, _ = self.session_supervisor.register_session(
+                    {
+                        "session_id": supervisor_session_id,
+                        "node": self.project_id,
+                        "mode": self.requested_mode,
+                        "provider": normalized_provider,
+                        "provider_session_ref": normalized_session,
+                        "state": "LIVE",
+                        "currentness": "UNKNOWN",
+                    }
+                )
             if not candidate["is_default"]:
                 self.session_supervisor.set_default(
                     supervisor_session_id,
@@ -2390,6 +2413,14 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError(str(error)) from error
         return self.session_ref
 
+    def rebind_working_directory(self, cwd: Path) -> str:
+        try:
+            rebound = self._acp_gateway().rebind_working_directory(cwd)
+        except AgentSessionError as error:
+            raise ProjectMasterHostError(str(error)) from error
+        self.project_root = Path(rebound)
+        return rebound
+
     def runtime_observation(self) -> dict[str, Any]:
         if self._gateway is not None:
             return self._gateway.runtime_observation()
@@ -2591,6 +2622,14 @@ class CodexProjectMasterRuntime:
         except AgentSessionError as error:
             raise ProjectMasterHostError(str(error)) from error
         return self.session_ref
+
+    def rebind_working_directory(self, cwd: Path) -> str:
+        try:
+            rebound = self._acp_gateway().rebind_working_directory(cwd)
+        except (AgentSessionError, ClaudeResidentError) as error:
+            raise ProjectMasterHostError(str(error)) from error
+        self.project_root = Path(rebound)
+        return rebound
 
     def close(self) -> None:
         if self._gateway is not None:
@@ -2866,6 +2905,19 @@ class ResidentModeSessionHost:
             if isinstance(session_ref, str) and session_ref.strip():
                 return session_ref.strip()
             return None
+
+    def rebind_working_directory(self, cwd: Path) -> str:
+        target = cwd.expanduser().resolve(strict=True)
+        with self._lock:
+            active = self._provider
+            if active is None:
+                raise ProjectMasterHostError("MODE_SESSION_NOT_RESIDENT")
+            rebind = getattr(active, "rebind_working_directory", None)
+            if not callable(rebind):
+                raise ProjectMasterHostError("MODE_SESSION_CWD_REBIND_UNAVAILABLE")
+            rebound = str(rebind(target))
+            self.repository_root = Path(rebound)
+            return rebound
 
     def set_permission_requester(
         self,
@@ -4554,6 +4606,146 @@ class ResidentProjectMasterHostManager:
             model_ref=model,
             effort=effort,
         )
+
+    def rebind_working_directory(
+        self,
+        session_id: str,
+        target_project: Mapping[str, Any],
+        *,
+        expected_version: Any,
+    ) -> dict[str, Any]:
+        if self.session_supervisor is None:
+            raise ProjectMasterHostError("SESSION_SUPERVISOR_UNAVAILABLE")
+        target_id = _text(target_project.get("project_id"), "project.project_id")
+        target_root = (
+            Path(_text(target_project.get("project_root"), "project.project_root"))
+            .expanduser()
+            .resolve(strict=True)
+        )
+        session = self.session_supervisor.get_session(session_id)
+        try:
+            requested_version = int(expected_version)
+        except (TypeError, ValueError) as error:
+            raise ProjectMasterHostError("SESSION_VERSION_INVALID") from error
+        if requested_version < 0 or int(session.get("row_version", -1)) != requested_version:
+            raise ProjectMasterHostError("SESSION_VERSION_CONFLICT")
+        if str(session.get("mode") or "").upper() != "MASTER":
+            raise ProjectMasterHostError("SESSION_CWD_REBIND_MASTER_REQUIRED")
+        provider_ref = str(session.get("provider_session_ref") or "").strip()
+        provider = str(session.get("provider") or "").strip().upper()
+        if not provider_ref or not provider:
+            raise ProjectMasterHostError("SESSION_CWD_REBIND_PROVIDER_UNAVAILABLE")
+        source_id = str(session.get("current_project_id") or session.get("node") or "")
+        if not source_id:
+            raise ProjectMasterHostError("SESSION_CWD_REBIND_SOURCE_UNAVAILABLE")
+
+        with self._lock:
+            source_handle = self._handles.get(source_id)
+            if source_handle is None or not source_handle.thread.is_alive():
+                raise ProjectMasterHostError("SESSION_CWD_REBIND_RESIDENT_REQUIRED")
+            if not _same_provider_session_ref(
+                provider,
+                source_handle.worker.provider.session_ref,
+                provider_ref,
+            ):
+                raise ProjectMasterHostError("SESSION_CWD_REBIND_SESSION_MISMATCH")
+            target_handle = self._handles.get(target_id)
+            if target_id != source_id and target_handle is not None:
+                raise ProjectMasterHostError("SESSION_CWD_TARGET_MASTER_BUSY")
+
+        old_root = source_handle.project_root
+        old_anchor = session.get("anchor_ref")
+        if target_id == source_id:
+            rebind = getattr(
+                source_handle.worker.provider,
+                "rebind_working_directory",
+                None,
+            )
+            if not callable(rebind):
+                raise ProjectMasterHostError("SESSION_CWD_REBIND_UNAVAILABLE")
+            rebound = str(rebind(target_root))
+            source_handle.project_root = Path(rebound)
+            moved = self.session_supervisor.bind_current_location(
+                session_id,
+                project_id=target_id,
+                node=target_id,
+                mode="MASTER",
+                anchor_ref=old_anchor,
+                evidence_ref=f"universe://provider-cwd-rebind/{target_id}",
+                expected_version=requested_version,
+            )
+            return {
+                "status": "PROVIDER_WORKING_DIRECTORY_REBOUND",
+                "project_id": target_id,
+                "working_directory": rebound,
+                "session": moved,
+                "session_connection": self._handle_connection(source_handle),
+            }
+
+        prior_target_default = next(
+            (
+                item
+                for item in self.session_supervisor.list_sessions(
+                    node=target_id,
+                    mode="MASTER",
+                )
+                if item["is_default"] and item["session_id"] != session_id
+            ),
+            None,
+        )
+        moved: dict[str, Any] | None = None
+        try:
+            moved = self.session_supervisor.bind_current_location(
+                session_id,
+                project_id=target_id,
+                node=target_id,
+                mode="MASTER",
+                anchor_ref=old_anchor,
+                evidence_ref=f"universe://provider-cwd-rebind/{target_id}",
+                expected_version=requested_version,
+            )
+            if not self.stop(source_id):
+                raise ProjectMasterHostError("SESSION_CWD_REBIND_RESIDENT_LOST")
+            started = self.ensure(target_project)
+        except Exception as error:
+            rollback_version = (
+                moved["row_version"]
+                if isinstance(moved, Mapping)
+                else requested_version
+            )
+            try:
+                if isinstance(moved, Mapping):
+                    self.session_supervisor.bind_current_location(
+                        session_id,
+                        project_id=source_id,
+                        node=source_id,
+                        mode="MASTER",
+                        anchor_ref=old_anchor,
+                        evidence_ref=(
+                            f"universe://provider-cwd-rebind-rollback/{source_id}"
+                        ),
+                        expected_version=rollback_version,
+                    )
+                    if prior_target_default is not None:
+                        self.session_supervisor.set_default(
+                            prior_target_default["session_id"],
+                            expected_pointer_version=0,
+                        )
+                self.ensure(
+                    {"project_id": source_id, "project_root": str(old_root)}
+                )
+            except Exception as rollback_error:
+                raise ProjectMasterHostError(
+                    "SESSION_CWD_REBIND_ROLLBACK_FAILED"
+                ) from rollback_error
+            raise ProjectMasterHostError("SESSION_CWD_REBIND_FAILED") from error
+        return {
+            "status": "PROVIDER_WORKING_DIRECTORY_REBOUND",
+            "project_id": target_id,
+            "working_directory": str(target_root),
+            "session": self.session_supervisor.get_session(session_id),
+            "session_connection": started.get("session_connection"),
+        }
 
     def _model_for(self, project_id: str, provider: str) -> str:
         if not provider:
