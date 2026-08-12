@@ -341,6 +341,26 @@ a.text-button:hover {
   padding: 8px;
 }
 
+.project-group {
+  margin: 4px 0 8px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(126, 151, 184, 0.3);
+}
+
+.project-group-label {
+  padding: 5px 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.project-item-nested {
+  width: calc(100% - 6px);
+  margin-left: 6px;
+}
+
 .project-item {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);

@@ -379,11 +379,23 @@ DEFAULT_REFS = {
     "anchor_store": ".ai/runtime/anchor_store",
     "master_inbox": ".ai/inbox/MASTER",
 }
-NETWORK_ANCHOR_ROLES = frozenset({"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR"})
-# A private Career Node may live outside the public Universe repository.
+NETWORK_ANCHOR_ROLES = frozenset(
+    {"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR", "PRODUCT_NODE"}
+)
+# Private product Nodes may live outside the public Universe repository.
+PRIVATE_UNIVERSE_ROOT_ENV = "UNIVERSE_PRIVATE_ROOT"
 CAREER_SOURCE_ROOT_ENV = "UNIVERSE_CAREER_SOURCE_ROOT"
 # Prefer first existing sibling folder name for legacy Career source discovery.
 CAREER_ROOT_CANDIDATES = ("ai-career", "career")
+PRIVATE_UNIVERSE_PROJECT_ID = "universe-private"
+PRIVATE_PRODUCT_NODES = (
+    ("career", "Career", "CAREER_SOURCE"),
+    ("rendezvous", "Universe Rendezvous", "PRODUCT_NODE"),
+)
+LEGACY_PROJECT_MIGRATIONS = (
+    ("ai-career", "career"),
+    ("universe-rendezvous", "rendezvous"),
+)
 DOCUMENT_ROLES = frozenset(
     {
         "ARCHITECTURE",
@@ -945,6 +957,42 @@ def discover_network_anchor_candidates(
             },
         }
     ]
+    configured_private_root = os.environ.get(PRIVATE_UNIVERSE_ROOT_ENV)
+    if configured_private_root:
+        private_root = Path(configured_private_root).expanduser().resolve()
+        if private_root.is_dir() and (private_root / "README.md").is_file():
+            candidates.append(
+                {
+                    "project_id": PRIVATE_UNIVERSE_PROJECT_ID,
+                    "project_root": private_root,
+                    "metadata": {
+                        "network_role": "NETWORK_ANCHOR",
+                        "node_kind": "CONTAINER",
+                        "display_name": "Universe Private",
+                        "label": "private source root",
+                    },
+                }
+            )
+            for project_id, display_name, network_role in PRIVATE_PRODUCT_NODES:
+                project_root = private_root / "projects" / project_id
+                if not project_root.is_dir():
+                    continue
+                candidates.append(
+                    {
+                        "project_id": project_id,
+                        "project_root": project_root,
+                        "metadata": {
+                            "network_role": network_role,
+                            "node_kind": "PRODUCT",
+                            "parent_project_id": PRIVATE_UNIVERSE_PROJECT_ID,
+                            "logical_path": f"projects/{project_id}",
+                            "display_name": display_name,
+                            "label": "private product node",
+                        },
+                    }
+                )
+            return candidates
+
     configured_career_root = os.environ.get(CAREER_SOURCE_ROOT_ENV)
     if configured_career_root:
         career_root = Path(configured_career_root).expanduser().resolve()
@@ -1007,6 +1055,15 @@ def ensure_network_anchor_projects(
         except UniverseError:
             # Skip unreadable / mismatched roots; do not block the service.
             continue
+    for source_project_id, target_project_id in LEGACY_PROJECT_MIGRATIONS:
+        try:
+            store.migrate_legacy_project_todos(
+                source_project_id=source_project_id,
+                target_project_id=target_project_id,
+            )
+        except UniverseError as error:
+            if error.code != "PROJECT_NOT_FOUND":
+                raise
     return ensured
 
 
@@ -7012,6 +7069,62 @@ class UniverseStore:
                 HTTPStatus.NOT_FOUND,
             )
         return {"project_id": normalized, "detached": True}
+
+    def migrate_legacy_project_todos(
+        self,
+        *,
+        source_project_id: str,
+        target_project_id: str,
+    ) -> dict[str, Any]:
+        """Move Todo ownership while retaining the legacy project history."""
+
+        source_id = _project_id(source_project_id)
+        target_id = _project_id(target_project_id)
+        if source_id == target_id:
+            raise UniverseError(
+                "PROJECT_MIGRATION_INVALID",
+                "legacy and target project IDs must differ",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            source = self._project_for_connection(connection, source_id)
+            self._project_for_connection(connection, target_id)
+            cursor = connection.execute(
+                """
+                UPDATE project_todo
+                SET project_id = ?, revision = revision + 1, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (target_id, now, source_id),
+            )
+            metadata = dict(source.get("metadata") or {})
+            desired_metadata = {
+                **metadata,
+                "visibility": "MIGRATED_LEGACY",
+                "migrated_to_project_id": target_id,
+            }
+            hidden = metadata == desired_metadata
+            if not hidden:
+                connection.execute(
+                    """
+                    UPDATE project_connection
+                    SET metadata_json = ?, updated_at = ?
+                    WHERE project_id = ?
+                    """,
+                    (
+                        json.dumps(
+                            desired_metadata, sort_keys=True, separators=(",", ":")
+                        ),
+                        now,
+                        source_id,
+                    ),
+                )
+        return {
+            "source_project_id": source_id,
+            "target_project_id": target_id,
+            "todos_migrated": cursor.rowcount,
+            "legacy_hidden": not hidden,
+        }
 
     def append_event(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
         event = normalize_event(project_id, value)

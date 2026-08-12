@@ -168,10 +168,16 @@ built-in multiverse nodes when their roots exist next to this repository:
 | project_id | default root | role |
 |------------|--------------|------|
 | `universe` | this repo (`tools/..`) | `UNIVERSE_HOME` |
-| `career` | `UNIVERSE_CAREER_SOURCE_ROOT`, otherwise sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
+| `universe-private` | `UNIVERSE_PRIVATE_ROOT` | private source container |
+| `career` | `UNIVERSE_PRIVATE_ROOT/projects/career`, otherwise `UNIVERSE_CAREER_SOURCE_ROOT`, then sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
+| `rendezvous` | `UNIVERSE_PRIVATE_ROOT/projects/rendezvous` | `PRODUCT_NODE` |
 
-These appear in the left project rail as **Universe** / **Career**. Ordinary
-product projects (GCS, etc.) still register explicitly.
+When `UNIVERSE_PRIVATE_ROOT` is configured, the left project rail and
+Multiverse graph show **Universe Private** as a logical container with
+**Career** and **Universe Rendezvous** beneath it. Existing standalone records
+are retained for history, but their Todos are moved to the private product
+Nodes and the legacy entries are hidden. Ordinary product projects (GCS, etc.)
+still register explicitly.
 
 Career may use `VERSION_MANIFEST.md` / `AGENTS.md` / `README.md` as identity
 when `REPOSITORY_MANIFEST.md` is absent (`network_role=CAREER_SOURCE`).

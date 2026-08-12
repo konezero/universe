@@ -2002,7 +2002,7 @@ function renderComposerActions() {
       elements.projectMasterActions.append(action);
     }
   }
-  for (const project of state.projects) {
+  for (const project of operableProjects()) {
     const action = node("button", "composer-menu-item");
     action.type = "button";
     action.role = "menuitem";
@@ -2509,13 +2509,27 @@ function projectSortKey(project) {
   return `2:${project?.project_id || ""}`;
 }
 
-function renderProjects() {
-  elements.projectList.replaceChildren();
-  const projects = (state.projects || [])
-    .slice()
-    .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
-  for (const project of projects) {
-    const button = node("button", "project-item");
+function isLegacyProject(project) {
+  return project?.metadata?.visibility === "MIGRATED_LEGACY";
+}
+
+function isProjectContainer(project) {
+  return project?.metadata?.node_kind === "CONTAINER";
+}
+
+function visibleProjects() {
+  return (state.projects || []).filter((project) => !isLegacyProject(project));
+}
+
+function operableProjects() {
+  return visibleProjects().filter((project) => !isProjectContainer(project));
+}
+
+function projectButton(project, { nested = false } = {}) {
+    const button = node(
+      "button",
+      nested ? "project-item project-item-nested" : "project-item"
+    );
     button.type = "button";
     button.role = "option";
     button.dataset.projectId = project.project_id;
@@ -2574,7 +2588,43 @@ function renderProjects() {
       button.title = `${pendingApprovalCount} governance Proposal approval required`;
     }
     button.addEventListener("click", () => selectProject(project.project_id));
-    elements.projectList.append(button);
+    return button;
+}
+
+function renderProjects() {
+  elements.projectList.replaceChildren();
+  const projects = visibleProjects()
+    .slice()
+    .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
+  const projectIds = new Set(projects.map((project) => project.project_id));
+  const childrenByParent = new Map();
+  for (const project of projects) {
+    const parentId = String(project.metadata?.parent_project_id || "");
+    if (!parentId || !projectIds.has(parentId)) continue;
+    const children = childrenByParent.get(parentId) || [];
+    children.push(project);
+    childrenByParent.set(parentId, children);
+  }
+  const roots = projects.filter((project) => {
+    const parentId = String(project.metadata?.parent_project_id || "");
+    return !parentId || !projectIds.has(parentId);
+  });
+  for (const project of roots) {
+    if (!isProjectContainer(project)) {
+      elements.projectList.append(projectButton(project));
+      continue;
+    }
+    const group = node("section", "project-group");
+    const header = node("div", "project-group-label", projectDisplayName(project));
+    header.title = project.metadata?.label || project.project_id;
+    group.append(header);
+    const children = (childrenByParent.get(project.project_id) || [])
+      .slice()
+      .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
+    for (const child of children) {
+      group.append(projectButton(child, { nested: true }));
+    }
+    elements.projectList.append(group);
   }
 }
 
@@ -3416,7 +3466,7 @@ function renderProviderSettings() {
   elements.universeProviderSetting.textContent = "Configure";
   elements.universeProviderStatus.textContent = providerStatusText(conductor);
   elements.projectProviderSettings.replaceChildren();
-  for (const project of state.projects) {
+  for (const project of operableProjects()) {
     const setting =
       settings.project_masters?.find(
         (item) => item.scope_id === project.project_id
@@ -3570,7 +3620,7 @@ function renderWorkerBindingSettings() {
   elements.workerBindingScope.replaceChildren();
   const scopes = [
     { value: "UNIVERSE:UNIVERSE", label: "Universe defaults" },
-    ...state.projects.map((project) => ({
+    ...operableProjects().map((project) => ({
       value: `PROJECT:${project.project_id}`,
       label: `${project.project_id} project`,
     })),
@@ -5251,7 +5301,9 @@ function buildGraph() {
 
 /** Fetch projections for every attached project so multiverse can stay fully expanded. */
 async function loadAllProjectProjections() {
-  const projects = state.projects || [];
+  const projects = visibleProjects().filter(
+    (project) => !isProjectContainer(project)
+  );
   if (!projects.length) {
     state.projectionsByProject = {};
     return;
@@ -5305,7 +5357,7 @@ function buildMultiverseGraph() {
   };
   const graphNodes = [hub];
   const graphEdges = [];
-  const projects = (state.projects || [])
+  const projects = visibleProjects()
     .slice()
     .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
 
@@ -5327,46 +5379,60 @@ function buildMultiverseGraph() {
     return;
   }
 
-  // Room for always-expanded system fans around each project card.
-  const maxSystems = projects.reduce((max, project) => {
+  const projectIds = new Set(projects.map((project) => project.project_id));
+  const childrenByParent = new Map();
+  for (const project of projects) {
+    const parentId = String(project.metadata?.parent_project_id || "");
+    if (!parentId || !projectIds.has(parentId)) continue;
+    const children = childrenByParent.get(parentId) || [];
+    children.push(project);
+    childrenByParent.set(parentId, children);
+  }
+  const topLevelProjects = projects.filter((project) => {
+    const parentId = String(project.metadata?.parent_project_id || "");
+    return !parentId || !projectIds.has(parentId);
+  });
+
+  // Room for always-expanded system fans around each product leaf.
+  const maxSystems = projects
+    .filter((project) => !isProjectContainer(project))
+    .reduce((max, project) => {
     const count = (projectionForProject(project.project_id)?.nodes || []).length;
     return Math.max(max, count);
   }, 0);
   const projectRadius = Math.max(230, 180 + maxSystems * 8);
 
-  projects.forEach((project, index) => {
-    const angle =
-      (Math.PI * 2 * index) / Math.max(projects.length, 1) - Math.PI / 2;
+  function appendProject(project, { parentId, px, py, depth, systemRadius }) {
     const selected =
       state.selectedProject?.project_id === project.project_id;
     const id = `project:${project.project_id}`;
-    const px = Math.cos(angle) * projectRadius;
-    const py = Math.sin(angle) * projectRadius;
     graphNodes.push({
       id,
       label: projectDisplayName(project),
       kind: "project",
-      depth: 1,
+      depth,
       projectId: project.project_id,
-      parentId: hub.id,
+      parentId,
       data: project,
       x: px,
       y: py,
       selectedProject: selected,
     });
     graphEdges.push({
-      from: hub.id,
+      from: parentId,
       to: id,
       kind: "project-link",
     });
 
-    // Always expand this project's functional nodes (depth 2).
+    if (isProjectContainer(project)) return id;
+
+    // Always expand this product's functional nodes.
     const projection = projectionForProject(project.project_id);
     const systems = projection?.nodes || [];
     const count = Math.max(systems.length, 1);
     systems.forEach((item, systemIndex) => {
       const systemAngle = (Math.PI * 2 * systemIndex) / count - Math.PI / 2;
-      const r = 96 + (systemIndex % 3) * 14;
+      const r = systemRadius + (systemIndex % 3) * 14;
       const systemId = `node:${project.project_id}:${item.node_id}`;
       // Prefer global node id when unique; fall back to project-scoped id to avoid collisions.
       const plainId = `node:${item.node_id}`;
@@ -5376,7 +5442,7 @@ function buildMultiverseGraph() {
         id: nodeId,
         label: item.title,
         kind: "system",
-        depth: 2,
+        depth: depth + 1,
         projectId: project.project_id,
         parentId: id,
         data: {
@@ -5419,6 +5485,36 @@ function buildMultiverseGraph() {
         });
       }
     }
+    return id;
+  }
+
+  topLevelProjects.forEach((project, index) => {
+    const angle =
+      (Math.PI * 2 * index) / Math.max(topLevelProjects.length, 1) - Math.PI / 2;
+    const px = Math.cos(angle) * projectRadius;
+    const py = Math.sin(angle) * projectRadius;
+    const projectId = appendProject(project, {
+      parentId: hub.id,
+      px,
+      py,
+      depth: 1,
+      systemRadius: 96,
+    });
+    const children = (childrenByParent.get(project.project_id) || [])
+      .slice()
+      .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
+    children.forEach((child, childIndex) => {
+      const childAngle =
+        (Math.PI * 2 * childIndex) / Math.max(children.length, 1) - Math.PI / 2;
+      const childRadius = Math.max(122, 98 + children.length * 12);
+      appendProject(child, {
+        parentId: projectId,
+        px: px + Math.cos(childAngle) * childRadius,
+        py: py + Math.sin(childAngle) * childRadius,
+        depth: 2,
+        systemRadius: 78,
+      });
+    });
   });
 
   state.graph.nodes = graphNodes;
