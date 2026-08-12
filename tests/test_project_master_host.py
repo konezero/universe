@@ -2507,6 +2507,80 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertTrue(provider.closed)
 
+    def test_resident_manager_bootstraps_fresh_supervisor_session_before_prepare(
+        self,
+    ) -> None:
+        supervisor = SessionSupervisorStore(self.root / "supervisor.sqlite3")
+        observed: list[dict[str, Any]] = []
+
+        class AnchorSurfaceObserver(FakeSurfaceObserver):
+            def prepare(self) -> Mapping[str, Any]:
+                self.prepare_count += 1
+                return {
+                    "status": "SESSION_PREPARED",
+                    "mode_current_anchor": {
+                        "snapshot": {
+                            "snapshot": {"anchor_id": "MASTER-CURRENT-FRESH"}
+                        }
+                    },
+                }
+
+        class SupervisorAwareProvider(PreparedFakeProvider):
+            def __init__(self, store: ProjectMasterSessionStore) -> None:
+                super().__init__()
+                self.store = store
+
+            def prepare_session(self) -> None:
+                sessions = supervisor.list_sessions(node="GCS", mode="MASTER")
+                selected = next(
+                    (session for session in sessions if session["is_default"]),
+                    None,
+                )
+                if selected is None:
+                    raise ProjectMasterHostError(
+                        "SUPERVISOR_PROJECT_SESSION_UNAVAILABLE"
+                    )
+                observed.append(dict(selected))
+                self.session_ref = "fake-provider:actual-session"
+                self.store.observe_provider_session("CLAUDE", self.session_ref)
+
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                session_supervisor=supervisor,
+                provider_factory=lambda _root, _project_id, store: (
+                    SupervisorAwareProvider(store)
+                ),
+                provider_resolver=lambda _project_id: "CLAUDE",
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    AnchorSurfaceObserver()
+                ),
+            )
+            try:
+                result = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+            finally:
+                manager.close()
+
+        self.assertEqual("STARTED", result["status"])
+        self.assertEqual(1, len(observed))
+        self.assertIsNone(observed[0]["provider_session_ref"])
+        self.assertEqual("UNKNOWN", observed[0]["currentness"])
+        selected = next(
+            session
+            for session in supervisor.list_sessions(node="GCS", mode="MASTER")
+            if session["is_default"]
+        )
+        self.assertEqual("CLAUDE", selected["provider"])
+        self.assertEqual(
+            "fake-provider:actual-session", selected["provider_session_ref"]
+        )
+
     def test_resident_manager_restarts_when_provider_selection_changes(self) -> None:
         registrations: list[dict[str, Any]] = []
         selected = {"provider": "GROK"}

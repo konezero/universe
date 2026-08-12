@@ -1655,6 +1655,52 @@ class ProjectMasterSessionStore:
             return None
         return coordinate["session_ref"]
 
+    def ensure_supervisor_session(self, provider: str) -> dict[str, Any] | None:
+        """Create the persistent Mode-session slot before its processes start."""
+        if self.session_supervisor is None:
+            return None
+        sessions = self.session_supervisor.list_sessions(
+            node=self.project_id,
+            mode=self.requested_mode,
+        )
+        selected = next(
+            (session for session in sessions if session["is_default"]),
+            None,
+        )
+        if selected is not None:
+            return selected
+        normalized_provider = _provider(provider)
+        supervisor_session_id = self._supervisor_session_id(normalized_provider, "")
+        session, _ = self.session_supervisor.register_session(
+            {
+                "session_id": supervisor_session_id,
+                "node": self.project_id,
+                "mode": self.requested_mode,
+                "provider": normalized_provider,
+                "provider_session_ref": None,
+                "state": "REGISTERED",
+                "currentness": "UNKNOWN",
+                "activity_state": "BOOTSTRAPPING",
+                "location_evidence_ref": (
+                    "universe://project-master-bootstrap/"
+                    f"{self.project_id}/{self.requested_mode}"
+                ),
+            }
+        )
+        if not session["is_default"]:
+            self.session_supervisor.set_default(
+                supervisor_session_id,
+                expected_pointer_version=session["default_pointer_version"],
+            )
+        return next(
+            item
+            for item in self.session_supervisor.list_sessions(
+                node=self.project_id,
+                mode=self.requested_mode,
+            )
+            if item["is_default"]
+        )
+
     def observe_provider_session(self, provider: str, session_ref: str) -> str:
         normalized_provider = _provider(provider)
         normalized_session = _text(session_ref, "session_ref")
@@ -4323,6 +4369,11 @@ class ResidentProjectMasterHostManager:
                 )
             )
             try:
+                # A fresh Project has no provider coordinate yet, but the Boot
+                # executor must acquire its lease before a provider can report
+                # one. Reserve only the persistent node/mode slot here; the
+                # real provider session replaces the UNKNOWN binding later.
+                store.ensure_supervisor_session(selected_provider)
                 bind_permission = getattr(provider, "set_permission_requester", None)
                 if callable(bind_permission):
                     bind_permission(self._permission_before_worker)
