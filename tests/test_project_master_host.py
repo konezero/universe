@@ -1774,6 +1774,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             source_binding_resolver=lambda _root: {
                 "status": "SELECTED",
                 "release_id": "core-test",
+                "source_repository": "fixture/universe-private",
                 "source_commit": "b" * 40,
                 "database_sha256": "c" * 64,
             },
@@ -1791,6 +1792,9 @@ class ProjectMasterHostTests(unittest.TestCase):
             requests[0]["source_ref"],
         )
         self.assertEqual("b" * 40, requests[0]["source_commit"])
+        self.assertEqual(
+            "fixture/universe-private", requests[0]["source_repository"]
+        )
         self.assertEqual("grok-cli:session-001", requests[0]["host_session_ref"])
         self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
         self.assertEqual(

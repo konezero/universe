@@ -165,6 +165,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 source_binding_resolver=lambda _root: {
                     "status": "SELECTED",
                     "release_id": "core-test",
+                    "source_repository": "fixture/universe-private",
                     "source_commit": "b" * 40,
                     "database_sha256": "c" * 64,
                 },
@@ -221,6 +222,9 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 binding["source_ref"],
             )
             self.assertEqual("b" * 40, binding["source_commit"])
+            self.assertEqual(
+                "fixture/universe-private", binding["source_repository"]
+            )
             self.assertEqual("COMMANDER_INPUT_OBSERVED", observed["status"])
             self.assertEqual("CONDUCTOR", requests[0]["mode"])
             self.assertEqual("CONDUCTOR", requests[0]["role"])

@@ -609,6 +609,9 @@ class UniverseConductorRuntime:
                     "UNIVERSE_RELEASE_SELECTION_REQUIRED"
                 )
             release_id = _text(candidate.get("release_id"), "release_id")
+            source_repository = _text(
+                candidate.get("source_repository"), "source_repository"
+            )
             source_commit = _text(candidate.get("source_commit"), "source_commit").lower()
             database_sha256 = _text(
                 candidate.get("database_sha256"), "database_sha256"
@@ -625,7 +628,7 @@ class UniverseConductorRuntime:
             binding = {
                 "source_ref": f"universe-release-db://{release_id}@{database_sha256}",
                 "source_commit": source_commit,
-                "source_repository": str(self.repository_root),
+                "source_repository": source_repository,
             }
         self._source_binding = binding
         return dict(binding)
