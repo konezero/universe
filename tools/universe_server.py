@@ -382,13 +382,15 @@ DEFAULT_REFS = {
 NETWORK_ANCHOR_ROLES = frozenset(
     {"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR", "PRODUCT_NODE"}
 )
-# Private product Nodes may live outside the public Universe repository.
-PRIVATE_UNIVERSE_ROOT_ENV = "UNIVERSE_PRIVATE_ROOT"
-PRIVATE_UNIVERSE_ROOT_MANIFEST = "universe-root.json"
-PRIVATE_PRODUCT_NODE_MANIFEST = "universe-node.json"
-CAREER_SOURCE_ROOT_ENV = "UNIVERSE_CAREER_SOURCE_ROOT"
-# Prefer first existing sibling folder name for legacy Career source discovery.
-CAREER_ROOT_CANDIDATES = ("ai-career", "career")
+# Node roots are local-machine configuration, not a product catalog. Each path
+# points to a directory with universe-node.json and may add child Nodes through
+# universe-node-catalog.json.
+NODE_ROOTS_ENV = "UNIVERSE_NODE_ROOTS"
+NODE_MANIFEST = "universe-node.json"
+NODE_CATALOG_MANIFEST = "universe-node-catalog.json"
+NODE_MANIFEST_SCHEMA = "universe.project-node.v1"
+NODE_CATALOG_SCHEMA = "universe.node-catalog.v1"
+NODE_KINDS = frozenset({"INSTANCE", "CONTAINER", "PRODUCT", "RUNTIME_SOURCE", "PROJECT"})
 DOCUMENT_ROLES = frozenset(
     {
         "ARCHITECTURE",
@@ -932,105 +934,6 @@ def _resolve_registration_manifest_rel(
     )
 
 
-def _load_private_universe_candidates(private_root: Path) -> list[dict[str, Any]] | None:
-    """Load a private Universe container and its product Nodes from manifests.
-
-    The public server deliberately knows only these manifest names. Product ids,
-    labels, roles, and legacy migrations remain private-root data so adding a
-    product does not require a public-server release.
-    """
-    root_manifest_path = private_root / PRIVATE_UNIVERSE_ROOT_MANIFEST
-    try:
-        root_manifest = json.loads(root_manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(root_manifest, dict):
-        return None
-    if root_manifest.get("schema") != "universe.private-root.v1":
-        return None
-
-    try:
-        container_id = _project_id(root_manifest.get("node_id"))
-        display_name = _required_text(root_manifest.get("display_name"), "display_name")
-        projects_root_value = _required_text(
-            root_manifest.get("projects_root", "projects"), "projects_root"
-        )
-        projects_relative = Path(projects_root_value)
-        if projects_relative.is_absolute() or ".." in projects_relative.parts:
-            return None
-        projects_root = (private_root / projects_relative).resolve()
-        if not projects_root.is_relative_to(private_root) or not projects_root.is_dir():
-            return None
-    except UniverseError:
-        return None
-
-    candidates: list[dict[str, Any]] = [
-        {
-            "project_id": container_id,
-            "project_root": private_root,
-            "metadata": {
-                "network_role": "NETWORK_ANCHOR",
-                "node_kind": "CONTAINER",
-                "node_tag": _node_tag_from_project_root(private_root),
-                "display_name": display_name,
-                "label": "private source root",
-            },
-        }
-    ]
-    seen_ids = {"universe", container_id}
-    for node_root in sorted(projects_root.iterdir(), key=lambda entry: entry.name.casefold()):
-        if not node_root.is_dir() or node_root.is_symlink():
-            continue
-        node_manifest_path = node_root / PRIVATE_PRODUCT_NODE_MANIFEST
-        try:
-            node_manifest = json.loads(node_manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(node_manifest, dict):
-            continue
-        if node_manifest.get("schema") != "universe.project-node.v1":
-            continue
-        if str(node_manifest.get("kind", "")).lower() != "product":
-            continue
-        try:
-            node_id = _project_id(node_manifest.get("node_id"))
-            node_display_name = _required_text(
-                node_manifest.get("display_name"), "display_name"
-            )
-            network_role = _required_text(
-                node_manifest.get("network_role", "PRODUCT_NODE"), "network_role"
-            ).upper()
-            if network_role not in NETWORK_ANCHOR_ROLES or node_id in seen_ids:
-                continue
-            legacy_project_ids_raw = node_manifest.get("legacy_project_ids", [])
-            if not isinstance(legacy_project_ids_raw, list):
-                continue
-            legacy_project_ids = tuple(
-                dict.fromkeys(_project_id(value) for value in legacy_project_ids_raw)
-            )
-        except UniverseError:
-            continue
-        seen_ids.add(node_id)
-        logical_path = node_root.relative_to(private_root).as_posix()
-        candidates.append(
-            {
-                "project_id": node_id,
-                "project_root": node_root.resolve(),
-                "metadata": {
-                    "network_role": network_role,
-                    "node_kind": "PRODUCT",
-                    "node_tag": _node_tag_from_project_root(node_root),
-                    "parent_project_id": container_id,
-                    "logical_path": logical_path,
-                    "display_name": node_display_name,
-                    "label": "private product node",
-                    "legacy_project_ids": list(legacy_project_ids),
-                },
-            }
-        )
-    return candidates
-
-
 def _node_tag_from_project_root(project_root: Path) -> str:
     """Return the default Node tag from the directory that owns `.ai`.
 
@@ -1041,72 +944,128 @@ def _node_tag_from_project_root(project_root: Path) -> str:
     return project_root.resolve().name
 
 
+def _read_node_manifest(node_root: Path) -> dict[str, Any] | None:
+    try:
+        manifest = json.loads((node_root / NODE_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def _node_candidate_from_manifest(
+    node_root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    parent_project_id: str | None = None,
+    logical_path: str | None = None,
+) -> dict[str, Any] | None:
+    if manifest.get("schema") != NODE_MANIFEST_SCHEMA:
+        return None
+    try:
+        node_id = _project_id(manifest.get("node_id"))
+        display_name = _required_text(manifest.get("display_name"), "display_name")
+        node_kind = _required_text(manifest.get("kind"), "kind").upper()
+        network_role = _required_text(
+            manifest.get("network_role", "PRODUCT_NODE"), "network_role"
+        ).upper()
+        if node_kind not in NODE_KINDS or network_role not in NETWORK_ANCHOR_ROLES:
+            return None
+        legacy_raw = manifest.get("legacy_project_ids", [])
+        if not isinstance(legacy_raw, list):
+            return None
+        legacy_project_ids = list(dict.fromkeys(_project_id(value) for value in legacy_raw))
+    except UniverseError:
+        return None
+    metadata: dict[str, Any] = {
+        "network_role": network_role,
+        "node_kind": node_kind,
+        "node_tag": _node_tag_from_project_root(node_root),
+        "display_name": display_name,
+        "label": _required_text(manifest.get("label", node_kind.title()), "label"),
+        "legacy_project_ids": legacy_project_ids,
+    }
+    if parent_project_id is not None:
+        metadata["parent_project_id"] = parent_project_id
+    if logical_path is not None:
+        metadata["logical_path"] = logical_path
+    return {
+        "project_id": node_id,
+        "project_root": node_root.resolve(),
+        "metadata": metadata,
+    }
+
+
+def _discover_node_tree(node_root: Path) -> list[dict[str, Any]]:
+    root_manifest = _read_node_manifest(node_root)
+    if root_manifest is None:
+        return []
+    root_candidate = _node_candidate_from_manifest(
+        node_root, root_manifest, logical_path="."
+    )
+    if root_candidate is None:
+        return []
+    candidates = [root_candidate]
+    catalog_path = node_root / NODE_CATALOG_MANIFEST
+    if not catalog_path.is_file():
+        return candidates
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return candidates
+    if not isinstance(catalog, dict) or catalog.get("schema") != NODE_CATALOG_SCHEMA:
+        return candidates
+    try:
+        children_relative = Path(
+            _required_text(catalog.get("children_root"), "children_root")
+        )
+        if children_relative.is_absolute() or ".." in children_relative.parts:
+            return candidates
+        children_root = (node_root / children_relative).resolve()
+        if not children_root.is_relative_to(node_root) or not children_root.is_dir():
+            return candidates
+    except UniverseError:
+        return candidates
+    seen_ids = {root_candidate["project_id"]}
+    for child_root in sorted(children_root.iterdir(), key=lambda entry: entry.name.casefold()):
+        if not child_root.is_dir() or child_root.is_symlink():
+            continue
+        candidate = _node_candidate_from_manifest(
+            child_root,
+            _read_node_manifest(child_root) or {},
+            parent_project_id=root_candidate["project_id"],
+            logical_path=child_root.relative_to(node_root).as_posix(),
+        )
+        if candidate is None or candidate["project_id"] in seen_ids:
+            continue
+        seen_ids.add(candidate["project_id"])
+        candidates.append(candidate)
+    return candidates
+
+
 def discover_network_anchor_candidates(
     *,
     universe_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Discover the public home and any manifest-defined private product Nodes."""
+    """Discover manifest-defined Node trees from local Node root configuration."""
     home = (universe_root or Path(__file__).resolve().parents[1]).expanduser()
     home = home.resolve()
-    candidates: list[dict[str, Any]] = [
-        {
-            "project_id": "universe",
-            "project_root": home,
-            "metadata": {
-                "network_role": "UNIVERSE_HOME",
-                "node_tag": _node_tag_from_project_root(home),
-                "display_name": "Universe",
-                "label": "Universe home",
-            },
-        }
-    ]
-    configured_private_root = os.environ.get(PRIVATE_UNIVERSE_ROOT_ENV)
-    if configured_private_root:
-        private_root = Path(configured_private_root).expanduser().resolve()
-        if private_root.is_dir():
-            private_candidates = _load_private_universe_candidates(private_root)
-            if private_candidates is not None:
-                candidates.extend(private_candidates)
-                return candidates
-
-    configured_career_root = os.environ.get(CAREER_SOURCE_ROOT_ENV)
-    if configured_career_root:
-        career_root = Path(configured_career_root).expanduser().resolve()
-        if career_root.is_dir():
-            candidates.append(
-                {
-                    "project_id": "career",
-                    "project_root": career_root,
-                    "metadata": {
-                        "network_role": "CAREER_SOURCE",
-                        "node_tag": _node_tag_from_project_root(career_root),
-                        "display_name": "Career",
-                        "label": "private Career source",
-                    },
-                }
-            )
-            return candidates
-
-    parent = home.parent
-    for folder in CAREER_ROOT_CANDIDATES:
-        career_root = (parent / folder).resolve()
-        if not career_root.is_dir():
+    roots = [home]
+    configured_roots = os.environ.get(NODE_ROOTS_ENV, "")
+    for raw_root in configured_roots.split(os.pathsep):
+        if raw_root.strip():
+            roots.append(Path(raw_root).expanduser().resolve())
+    candidates: list[dict[str, Any]] = []
+    seen_roots: set[Path] = set()
+    seen_ids: set[str] = set()
+    for node_root in roots:
+        if node_root in seen_roots or not node_root.is_dir():
             continue
-        # Registry owner is usually "ai-career"; prefer that id when folder matches.
-        project_id = "ai-career" if folder == "ai-career" else "career"
-        candidates.append(
-            {
-                "project_id": project_id,
-                "project_root": career_root,
-                "metadata": {
-                    "network_role": "CAREER_SOURCE",
-                    "node_tag": _node_tag_from_project_root(career_root),
-                    "display_name": "Career",
-                    "label": "ai-career source",
-                },
-            }
-        )
-        break
+        seen_roots.add(node_root)
+        for candidate in _discover_node_tree(node_root):
+            if candidate["project_id"] in seen_ids:
+                continue
+            seen_ids.add(candidate["project_id"])
+            candidates.append(candidate)
     return candidates
 
 
@@ -14564,7 +14523,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.multi_room_native_controls.send_input,
         )
         self.conductor_permissions = ConductorPermissionBridge()
-        # Multiverse rail: Universe home + Career source as project nodes.
+        # Register all local manifest-defined Node trees without product names.
         try:
             ensure_network_anchor_projects(
                 self.store,
@@ -17653,7 +17612,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         project_id = room.get("project_id")
         repository_root = Path(__file__).resolve().parents[1]
-        node = str(project_id or "universe")
+        node = str(project_id or _node_tag_from_project_root(repository_root))
         mode = "CONDUCTOR" if binding.get("slot_role") == "CONDUCTOR" else "MASTER"
         supervisor_session_id = binding.get("supervisor_session_id")
         if isinstance(project_id, str) and project_id:

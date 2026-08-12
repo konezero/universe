@@ -997,8 +997,13 @@ function prefillsObservatoryInjectForm() {
 }
 
 function selectedIsConductorProject() {
-  const project = (elements.observatoryInjectProject?.value || "").trim();
-  return project === "CONDUCTOR" || project === "universe";
+  const projectId = (elements.observatoryInjectProject?.value || "").trim();
+  if (projectId === "CONDUCTOR") return true;
+  return (state.projects || []).some(
+    (project) =>
+      project.project_id === projectId &&
+      String(project.metadata?.node_kind || "").toUpperCase() === "INSTANCE"
+  );
 }
 
 async function cleanupSupervisorSessions() {
@@ -2503,10 +2508,9 @@ function projectDisplayName(project) {
 }
 
 function projectSortKey(project) {
-  const role = String(project?.metadata?.network_role || "");
-  if (role === "UNIVERSE_HOME") return "0";
-  if (role === "CAREER_SOURCE") return "1";
-  return `2:${project?.project_id || ""}`;
+  const kind = String(project?.metadata?.node_kind || "PROJECT").toUpperCase();
+  const order = kind === "INSTANCE" ? "0" : kind === "CONTAINER" ? "1" : "2";
+  return `${order}:${project?.metadata?.node_tag || project?.project_id || ""}`;
 }
 
 function isLegacyProject(project) {
@@ -2558,19 +2562,23 @@ function projectButton(project, { nested = false } = {}) {
         proposal.project_id === project.project_id &&
         proposal.state === "PROPOSED"
     ).length;
+    const kind = String(project.metadata?.node_kind || "").toLowerCase();
+    const role = String(project.metadata?.network_role || "");
     const roleTag =
-      project.metadata?.network_role === "UNIVERSE_HOME"
-        ? "home"
-        : project.metadata?.network_role === "CAREER_SOURCE"
-          ? "career"
-          : "";
+      kind === "instance"
+        ? "instance"
+        : kind === "container"
+          ? "container"
+          : role.endsWith("_SOURCE")
+            ? "source"
+            : "";
     copy.append(
       node("span", "project-name", label),
       node(
         "span",
         "project-meta",
         `${roleTag ? `${roleTag} · ` : ""}${
-          project.metadata.label || project.project_id
+          project.metadata.node_tag || project.metadata.label || project.project_id
         }${openTodoCount ? ` / ${openTodoCount} open` : ""}${
           pendingApprovalCount ? ` / ${pendingApprovalCount} approval` : ""
         }`

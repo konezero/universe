@@ -10,9 +10,9 @@
     "manifest_digest": null,
     "note": "Attached mode may leave pin null and follow host-current runtime."
   },
-  "career_source": {
-    "project_id": "ai-career",
-    "role": "CAREER_SOURCE"
+  "runtime_source": {
+    "network_role": "CAREER_SOURCE",
+    "resolution": "NODE_REGISTRY_EXACTLY_ONE"
   },
   "universe_host": {
     "discovery": "LOCAL_SERVER_JSON",

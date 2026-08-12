@@ -20,6 +20,30 @@ from universe_server import (  # noqa: E402
 
 
 class NetworkAnchorProjectTests(unittest.TestCase):
+    def _write_node_root(
+        self,
+        root: Path,
+        *,
+        node_id: str,
+        display_name: str,
+        kind: str = "instance",
+        network_role: str = "NETWORK_ANCHOR",
+    ) -> None:
+        root.mkdir(parents=True)
+        (root / "README.md").write_text("# Node\n", encoding="utf-8")
+        (root / "universe-node.json").write_text(
+            json.dumps(
+                {
+                    "schema": "universe.project-node.v1",
+                    "node_id": node_id,
+                    "display_name": display_name,
+                    "kind": kind,
+                    "network_role": network_role,
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def _write_private_root(
         self,
         private_root: Path,
@@ -27,13 +51,23 @@ class NetworkAnchorProjectTests(unittest.TestCase):
     ) -> None:
         private_root.mkdir(parents=True)
         (private_root / "README.md").write_text("# Private\n", encoding="utf-8")
-        (private_root / "universe-root.json").write_text(
+        (private_root / "universe-node.json").write_text(
             json.dumps(
                 {
-                    "schema": "universe.private-root.v1",
+                    "schema": "universe.project-node.v1",
                     "node_id": "private-node-root",
                     "display_name": "Private Node Root",
-                    "projects_root": "projects",
+                    "kind": "container",
+                    "network_role": "NETWORK_ANCHOR",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (private_root / "universe-node-catalog.json").write_text(
+            json.dumps(
+                {
+                    "schema": "universe.node-catalog.v1",
+                    "children_root": "projects",
                 }
             ),
             encoding="utf-8",
@@ -83,26 +117,36 @@ class NetworkAnchorProjectTests(unittest.TestCase):
                 "fresh-imported-product", project["metadata"]["node_tag"]
             )
 
-    def test_ensure_registers_universe_and_career_when_present(self) -> None:
+    def test_node_roots_support_multiple_instance_trees(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            alpha = root / "alpha-host"
+            beta = root / "beta-host"
+            self._write_node_root(alpha, node_id="alpha-id", display_name="Alpha")
+            self._write_node_root(beta, node_id="beta-id", display_name="Beta")
+            with mock.patch.dict(
+                os.environ,
+                {"UNIVERSE_NODE_ROOTS": os.pathsep.join((str(alpha), str(beta)))},
+                clear=False,
+            ):
+                candidates = discover_network_anchor_candidates(universe_root=root)
+            by_id = {item["project_id"]: item for item in candidates}
+            self.assertEqual({"alpha-id", "beta-id"}, set(by_id))
+            self.assertEqual("alpha-host", by_id["alpha-id"]["metadata"]["node_tag"])
+            self.assertEqual("beta-host", by_id["beta-id"]["metadata"]["node_tag"])
+
+    def test_ensure_registers_manifest_defined_home(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db = Path(tmp) / "u.sqlite3"
             store = UniverseStore(db)
-            ensured = ensure_network_anchor_projects(store, universe_root=ROOT)
+            with mock.patch.dict(os.environ, {"UNIVERSE_NODE_ROOTS": ""}):
+                ensured = ensure_network_anchor_projects(store, universe_root=ROOT)
             ids = {item["project_id"] for item in ensured}
             self.assertIn("universe", ids)
             listed = {item["project_id"] for item in store.list_projects()}
             self.assertIn("universe", listed)
-            # Sibling career root exists on this workstation as C:\workspace\ai-career
-            career = ROOT.parent / "ai-career"
-            if career.is_dir():
-                self.assertIn("ai-career", ids)
-                project = store.get_project("ai-career")
-                self.assertEqual(
-                    "CAREER_SOURCE",
-                    (project.get("metadata") or {}).get("network_role"),
-                )
 
-    def test_configured_private_career_root_takes_precedence(self) -> None:
+    def test_configured_node_roots_discover_generic_child_nodes(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             private_root = Path(tmp) / "universe-private"
             self._write_private_root(
@@ -120,8 +164,7 @@ class NetworkAnchorProjectTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "UNIVERSE_PRIVATE_ROOT": str(private_root),
-                    "UNIVERSE_CAREER_SOURCE_ROOT": "",
+                    "UNIVERSE_NODE_ROOTS": str(private_root),
                 },
                 clear=False,
             ):
@@ -185,7 +228,7 @@ class NetworkAnchorProjectTests(unittest.TestCase):
             )
             with mock.patch.dict(
                 os.environ,
-                {"UNIVERSE_PRIVATE_ROOT": str(private_root)},
+                {"UNIVERSE_NODE_ROOTS": str(private_root)},
                 clear=False,
             ):
                 ensure_network_anchor_projects(store, universe_root=ROOT)

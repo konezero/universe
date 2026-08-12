@@ -1,0 +1,8 @@
+{
+  "schema": "universe.project-node.v1",
+  "node_id": "universe",
+  "display_name": "Universe",
+  "kind": "instance",
+  "network_role": "UNIVERSE_HOME",
+  "label": "local control plane"
+}

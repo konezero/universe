@@ -168,19 +168,20 @@ built-in multiverse nodes when their roots exist next to this repository:
 | project_id | default root | role |
 |------------|--------------|------|
 | `universe` | this repo (`tools/..`) | `UNIVERSE_HOME` |
-| private container | `UNIVERSE_PRIVATE_ROOT/universe-root.json` | manifest-defined private source container |
-| private product Node | `UNIVERSE_PRIVATE_ROOT/<projects_root>/*/universe-node.json` | manifest-defined role |
-| legacy Career fallback | `UNIVERSE_CAREER_SOURCE_ROOT`, then sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
+| local Node root | server repository root or an entry in `UNIVERSE_NODE_ROOTS` | `universe-node.json` |
+| Node children | `<node-root>/universe-node-catalog.json` | manifest-defined child directory |
+| child Node | `<children_root>/*/universe-node.json` | manifest-defined role |
 
-When `UNIVERSE_PRIVATE_ROOT` is configured, the service reads its
-`universe-root.json`, then discovers every immediate product folder containing
-`universe-node.json` below the declared `projects_root`. The manifests define
-the container identity, product identity, display name, network role, and any
-legacy Todo migrations. The left project rail and Multiverse graph consume
-that registered hierarchy; adding a private product requires no public-server
+The service reads the repository root and every path in `UNIVERSE_NODE_ROOTS`
+using the same Node manifest. A root may optionally declare a child directory
+in `universe-node-catalog.json`; every immediate child with
+`universe-node.json` becomes a registered Node. The manifests define identity,
+display name, network role, hierarchy, and any legacy Todo migrations. The
+left project rail and Multiverse graph consume that registered hierarchy;
+adding a product or another Universe instance requires no public-server
 change. Existing standalone records are retained for history, while manifest-
-declared legacy Todos move to their private product Nodes and legacy entries
-are hidden. Ordinary product projects (GCS, etc.) still register explicitly.
+declared legacy Todos move to their replacement Nodes and legacy entries are
+hidden. Ordinary product projects still register explicitly.
 
 ### Node tags
 
