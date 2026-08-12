@@ -2056,6 +2056,24 @@ class ProjectMasterHostTests(unittest.TestCase):
             "proposal_digest": primary["proposal_digest"],
             "commander_surface": "UNIVERSE_UI",
             "evidence_ref": primary["approval"]["evidence_ref"],
+            "active_work": {
+                "schema": "universe.active-work-reference.v1",
+                "active_work_ref": "universe://projects/GCS/active-work/primary-001",
+                "work_batch_id": "work_batch_primary_001",
+                "parent_instruction_ref": primary["request_ref"],
+                "proposal_id": primary["proposal_id"],
+                "proposal_digest": primary["proposal_digest"],
+                "approval_evidence_ref": primary["approval"]["evidence_ref"],
+                "commander_surface": "UNIVERSE_UI",
+                "access_surface": "CODEX_DESKTOP",
+                "anchor": {
+                    "session_id": "project-master-session-001",
+                    "anchor_ref": "MASTER-CURRENT-001",
+                    "provider": "CODEX",
+                    "currentness": "CURRENT",
+                },
+                "recorded_at": "2026-08-12T01:00:00Z",
+            },
         }
         source_work = {
             "scope_kind": "PROJECT_SOURCE_WORK",
@@ -2139,10 +2157,17 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("work-receipt-001", plan["execution_assignment_ref"])
         self.assertEqual("UNIVERSE_UI", plan["commander_surface"])
         self.assertEqual(task_frame["mutation_scope"], plan["mutation_scope"])
+        self.assertEqual(
+            approval["active_work"]["active_work_ref"], plan["task_summary_ref"]
+        )
         self.assertEqual(2, len(runtime_posts))
         self.assertEqual(
             approval["evidence_ref"],
             runtime_posts[0]["payload"]["frame"]["parent_observation"]["evidence_ref"],
+        )
+        self.assertEqual(
+            "project-master-session-001",
+            runtime_posts[0]["payload"]["frame"]["origin_governance_session_ref"],
         )
         self.assertEqual(
             [
@@ -2522,6 +2547,71 @@ class ProjectMasterHostTests(unittest.TestCase):
 
                 self.assertEqual("one incremental event", provider.messages[0]["body"])
                 self.assertEqual("COMPLETED", observed[-1]["event"])
+
+    def test_resident_manager_accepts_codex_transport_prefixed_session_ref(
+        self,
+    ) -> None:
+        provider = StreamingPreparedFakeProvider()
+        observed: list[dict[str, Any]] = []
+
+        def prepare_session() -> None:
+            provider.prepare_count += 1
+            provider.session_ref = "codex-app-server:session-transport-001"
+
+        def register(project_id, value):
+            return {
+                "bridge_id": "bridge-codex-transport",
+                "project_id": project_id,
+                **dict(value),
+            }, True
+
+        provider.prepare_session = prepare_session
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: provider,
+                provider_resolver=lambda _project_id: "CODEX",
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
+                room_event_observer=lambda event: observed.append(dict(event)),
+            )
+            binding = {
+                "binding_id": "bind-codex-transport",
+                "provider": "CODEX",
+                "provider_session_ref": "session-transport-001",
+            }
+            event = {
+                "room_id": "room_native",
+                "room_event_id": "event-codex-transport",
+                "room_sequence": 1,
+                "message": {
+                    "room_event_id": "event-codex-transport",
+                    "author_role": "USER",
+                    "body_text": "Deliver to the resident Codex session",
+                },
+            }
+            try:
+                manager.ensure({"project_id": "GCS", "project_root": str(self.root)})
+                self.assertTrue(manager.submit_room_event("GCS", binding, event))
+                self.assertTrue(manager._handles["GCS"].worker.wait_idle())
+                with self.assertRaisesRegex(
+                    ProjectMasterHostError,
+                    "PROJECT_MASTER_NATIVE_SESSION_MISMATCH",
+                ):
+                    manager.submit_room_event(
+                        "GCS",
+                        {**binding, "provider_session_ref": "other-session"},
+                        event,
+                    )
+            finally:
+                manager.close()
+
+        self.assertEqual(
+            "Deliver to the resident Codex session", provider.messages[0]["body"]
+        )
+        self.assertEqual("COMPLETED", observed[-1]["event"])
 
     def test_room_participant_manager_resumes_and_routes_all_provider_labels(
         self,

@@ -547,6 +547,7 @@ class MultiRoomStore:
             limit=128,
         )
         display_name = _optional_text(value.get("display_name"), "display_name", limit=120)
+        resume_pending_delivery = value.get("resume_pending_delivery") is True
         participant_state = str(value.get("participant_state") or "OBSERVED").upper()
         if participant_state not in PARTICIPANT_STATES:
             raise MultiRoomError(
@@ -566,6 +567,45 @@ class MultiRoomStore:
                 ).fetchone()[0]
             )
             if slot_role in SINGLETON_SLOT_ROLES:
+                if resume_pending_delivery:
+                    retryable = connection.execute(
+                        """
+                        SELECT MIN(delivery.room_sequence)
+                        FROM chat_room_delivery delivery
+                        JOIN chat_room_session binding
+                          ON binding.binding_id = delivery.binding_id
+                        WHERE binding.room_id = ?
+                          AND binding.slot_role = ?
+                          AND delivery.status IN ('UNCERTAIN', 'DISCONNECTED')
+                        """,
+                        (room["room_id"], slot_role),
+                    ).fetchone()[0]
+                    if retryable is not None:
+                        initial_delivery_sequence = min(
+                            initial_delivery_sequence,
+                            max(0, int(retryable) - 1),
+                        )
+                previous_cursor = connection.execute(
+                    """
+                    SELECT cursor.delivery_sequence
+                    FROM chat_room_session binding
+                    JOIN chat_room_participant_cursor cursor
+                      ON cursor.binding_id = binding.binding_id
+                    WHERE binding.room_id = ?
+                      AND binding.slot_role = ?
+                      AND binding.state = 'ACTIVE'
+                    ORDER BY binding.updated_at DESC, binding.binding_id DESC
+                    LIMIT 1
+                    """,
+                    (room["room_id"], slot_role),
+                ).fetchone()
+                if previous_cursor is not None:
+                    # Replacement bindings resume only room work the previous
+                    # singleton had not accepted; late joins still skip history.
+                    initial_delivery_sequence = min(
+                        initial_delivery_sequence,
+                        int(previous_cursor[0]),
+                    )
                 connection.execute(
                     """
                     UPDATE chat_room_session

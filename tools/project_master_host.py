@@ -459,6 +459,38 @@ class ProjectModeCoordinator:
         )
         if approval_evidence_ref != stored_evidence_ref:
             raise ProjectMasterHostError("PRIMARY_TASK_APPROVAL_EVIDENCE_MISMATCH")
+        active_work = governance_approval.get("active_work")
+        if active_work is None:
+            active_work = None
+        elif not isinstance(active_work, Mapping):
+            raise ProjectMasterHostError("PRIMARY_TASK_ACTIVE_WORK_INVALID")
+        active_work_required = {
+            "schema",
+            "active_work_ref",
+            "work_batch_id",
+            "parent_instruction_ref",
+            "proposal_id",
+            "proposal_digest",
+            "approval_evidence_ref",
+            "commander_surface",
+            "access_surface",
+            "anchor",
+            "recorded_at",
+        }
+        if active_work is not None and set(active_work) != active_work_required:
+            raise ProjectMasterHostError("PRIMARY_TASK_ACTIVE_WORK_INVALID")
+        active_anchor = active_work.get("anchor") if active_work is not None else None
+        if active_work is not None and (
+            active_work.get("schema") != "universe.active-work-reference.v1"
+            or active_work.get("proposal_id") != primary_id
+            or active_work.get("proposal_digest") != primary_digest
+            or active_work.get("approval_evidence_ref") != approval_evidence_ref
+            or active_work.get("commander_surface") != "UNIVERSE_UI"
+            or not isinstance(active_anchor, Mapping)
+            or set(active_anchor) != {"session_id", "anchor_ref", "provider", "currentness"}
+            or active_anchor.get("currentness") != "CURRENT"
+        ):
+            raise ProjectMasterHostError("PRIMARY_TASK_ACTIVE_WORK_MISMATCH")
 
         normalized_work = self._approved_source_work(
             source_work=source_work,
@@ -471,6 +503,8 @@ class ProjectModeCoordinator:
             source_work=normalized_work,
         )
         binding = self._ensure_runtime()
+        if active_anchor is not None and binding["anchor_id"] != active_anchor["anchor_ref"]:
+            raise ProjectMasterHostError("PRIMARY_TASK_ACTIVE_WORK_ANCHOR_MISMATCH")
         work_result = self._invoke(
             (
                 "execution-binding",
@@ -497,7 +531,12 @@ class ProjectModeCoordinator:
             "primary.source_ref",
         )
         task_summary_ref = _text(
-            primary_proposal.get("request_ref"), "primary.request_ref"
+            (
+                active_work["active_work_ref"]
+                if active_work is not None
+                else primary_proposal.get("request_ref")
+            ),
+            "active_work.active_work_ref" if active_work is not None else "primary.request_ref",
         )
         execution_plan = {
             "profile_id": "task-frame-debate-v1",
@@ -569,7 +608,14 @@ class ProjectModeCoordinator:
                     "origin_anchor_ref": binding["anchor_id"],
                     "origin_session_id": binding["session_id"],
                     "origin_frame_id": binding["frame_id"],
-                    "origin_governance_session_ref": "UNKNOWN",
+                    "origin_governance_session_ref": (
+                        _text(
+                            active_anchor["session_id"],
+                            "active_work.anchor.session_id",
+                        )
+                        if active_anchor is not None
+                        else "UNKNOWN"
+                    ),
                     "task_summary_ref": task_summary_ref,
                     "source_ref": source_ref,
                     "execution_assignment_ref": work_receipt_id,
@@ -3363,7 +3409,11 @@ class ResidentRoomParticipantHostManager:
                 current is not None
                 and current.worker.is_alive()
                 and current.provider == provider
-                and current.provider_session_ref == session_ref
+                and _same_provider_session_ref(
+                    provider,
+                    current.provider_session_ref,
+                    session_ref,
+                )
             ):
                 return {
                     "status": "RESIDENT",
@@ -3387,7 +3437,11 @@ class ResidentRoomParticipantHostManager:
             try:
                 connection = host.prepare(provider)
                 observed_ref = host.active_provider_session_ref()
-                if observed_ref != session_ref:
+                if not _same_provider_session_ref(
+                    provider,
+                    observed_ref,
+                    session_ref,
+                ):
                     raise ProjectMasterHostError(
                         "ROOM_PARTICIPANT_SESSION_RESUME_MISMATCH"
                     )
@@ -3429,7 +3483,11 @@ class ResidentRoomParticipantHostManager:
             raise ProjectMasterHostError("ROOM_PARTICIPANT_NATIVE_CONTROL_UNAVAILABLE")
         if str(binding.get("provider") or "").upper() != handle.provider:
             raise ProjectMasterHostError("ROOM_PARTICIPANT_NATIVE_PROVIDER_MISMATCH")
-        if binding.get("provider_session_ref") != handle.provider_session_ref:
+        if not _same_provider_session_ref(
+            handle.provider,
+            binding.get("provider_session_ref"),
+            handle.provider_session_ref,
+        ):
             raise ProjectMasterHostError("ROOM_PARTICIPANT_NATIVE_SESSION_MISMATCH")
         return handle.worker.submit(binding, event)
 
@@ -4134,7 +4192,11 @@ class ResidentProjectMasterHostManager:
                 and handle.effort == selected_effort
                 and (
                     not selected_session_ref
-                    or handle.session_ref == selected_session_ref
+                    or _same_provider_session_ref(
+                        selected_provider,
+                        handle.session_ref,
+                        selected_session_ref,
+                    )
                 )
                 and handle.governance_context_key == governance_context_key
             ):
@@ -4283,7 +4345,11 @@ class ResidentProjectMasterHostManager:
             raise ProjectMasterHostError("PROJECT_MASTER_NATIVE_CONTROL_UNAVAILABLE")
         if str(binding.get("provider") or "").upper() != handle.provider:
             raise ProjectMasterHostError("PROJECT_MASTER_NATIVE_PROVIDER_MISMATCH")
-        if binding.get("provider_session_ref") != handle.worker.provider.session_ref:
+        if not _same_provider_session_ref(
+            handle.provider,
+            binding.get("provider_session_ref"),
+            handle.worker.provider.session_ref,
+        ):
             raise ProjectMasterHostError("PROJECT_MASTER_NATIVE_SESSION_MISMATCH")
         if not handle.bridge_id:
             raise ProjectMasterHostError("PROJECT_MASTER_BRIDGE_ID_UNAVAILABLE")
@@ -4788,6 +4854,36 @@ def _provider(value: Any) -> str:
     if normalized not in SUPPORTED_PROVIDERS:
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
     return normalized
+
+
+def _same_provider_session_ref(provider: str, left: Any, right: Any) -> bool:
+    """Compare native session coordinates without changing their stored form."""
+
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    return _provider_session_identity(provider, left) == _provider_session_identity(
+        provider,
+        right,
+    )
+
+
+def _provider_session_identity(provider: str, value: str) -> str:
+    """Remove only the known transport label for a Provider session reference."""
+
+    normalized_provider = _provider(provider)
+    normalized_value = value.strip()
+    prefixes = {
+        "CODEX": ("codex-app-server:",),
+        "CLAUDE": ("claude-code:",),
+        "GROK": ("grok-acp:", "grok-cli:"),
+    }[normalized_provider]
+    lowered = normalized_value.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            suffix = normalized_value[len(prefix) :].strip()
+            if suffix:
+                return suffix
+    return normalized_value
 
 
 def main() -> int:

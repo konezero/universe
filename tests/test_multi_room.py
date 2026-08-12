@@ -566,6 +566,104 @@ class MultiRoomStoreTests(unittest.TestCase):
         coordinator.deliver_binding(binding["binding_id"])
         self.assertEqual([current["room_event_id"]], calls)
 
+    def test_singleton_replacement_retries_only_unaccepted_room_events(self) -> None:
+        room = self.store.ensure_project_room("proj_master_restart")
+        first = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "master-session-old",
+            },
+        )["binding"]
+        delivered = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "already accepted"},
+        )
+        self.store.record_delivery_observation(
+            first["binding_id"], delivered["room_event_id"], status="ACCEPTED"
+        )
+        pending = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "retry after restart"},
+        )
+
+        replacement = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "master-session-new",
+                "participant_state": "LIVE",
+            },
+        )["binding"]
+        received: list[str] = []
+        self.assertEqual(
+            1,
+            self.store.participant_cursor(replacement["binding_id"])[
+                "delivery_sequence"
+            ],
+        )
+        result = MultiRoomDeliveryCoordinator(
+            self.store,
+            lambda _binding, event: (
+                received.append(event["room_event_id"]) or {"status": "ACCEPTED"}
+            ),
+        ).deliver_binding(replacement["binding_id"])
+
+        self.assertEqual(
+            2,
+            self.store.participant_cursor(replacement["binding_id"])[
+                "delivery_sequence"
+            ],
+        )
+        self.assertEqual([pending["room_event_id"]], received)
+        self.assertEqual("PARTICIPANT_DELIVERY_COMPLETED", result["status"])
+
+    def test_explicit_singleton_recovery_retries_prior_uncertain_delivery(self) -> None:
+        room = self.store.ensure_project_room("proj_master_recovery")
+        first = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "master-session-old",
+            },
+        )["binding"]
+        pending = self.store.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "recover this delivery"},
+        )
+        self.store.record_delivery_observation(
+            first["binding_id"], pending["room_event_id"], status="UNCERTAIN"
+        )
+
+        replacement = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "master-session-new",
+                "participant_state": "LIVE",
+                "resume_pending_delivery": True,
+            },
+        )["binding"]
+        self.assertEqual(
+            0,
+            self.store.participant_cursor(replacement["binding_id"])[
+                "delivery_sequence"
+            ],
+        )
+        received: list[str] = []
+        MultiRoomDeliveryCoordinator(
+            self.store,
+            lambda _binding, event: (
+                received.append(event["room_event_id"]) or {"status": "ACCEPTED"}
+            ),
+        ).deliver_binding(replacement["binding_id"])
+
+        self.assertEqual([pending["room_event_id"]], received)
+
     def test_legacy_room_rows_gain_events_and_non_replaying_cursors(self) -> None:
         legacy_db = Path(self.temp.name) / "legacy.sqlite3"
         now = "2026-08-09T00:00:00Z"

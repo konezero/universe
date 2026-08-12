@@ -274,6 +274,7 @@ GOVERNANCE_APPROVAL_COMMANDS = frozenset(
     }
 )
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
+ACTIVE_WORK_REFERENCE_SCHEMA = "universe.active-work-reference.v1"
 DIRECT_COMMANDER_ACCESS_SURFACES = frozenset(
     {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}
 )
@@ -4384,6 +4385,7 @@ class UniverseStore:
                     access_surface TEXT,
                     idempotency_key TEXT NOT NULL,
                     evidence_ref TEXT NOT NULL UNIQUE,
+                    active_work_json TEXT NOT NULL DEFAULT '{}',
                     state TEXT NOT NULL
                         CHECK(state IN ('RECORDED', 'APPLIED', 'FAILED')),
                     result_json TEXT NOT NULL DEFAULT '{}',
@@ -4704,6 +4706,11 @@ class UniverseStore:
                     "ALTER TABLE governance_proposal_decision "
                     "ADD COLUMN access_surface TEXT"
                 )
+            if "active_work_json" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE governance_proposal_decision "
+                    "ADD COLUMN active_work_json TEXT NOT NULL DEFAULT '{}'"
+                )
             decision_table = connection.execute(
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'table' AND name = 'governance_proposal_decision'"
@@ -4736,6 +4743,7 @@ class UniverseStore:
                         access_surface TEXT,
                         idempotency_key TEXT NOT NULL,
                         evidence_ref TEXT NOT NULL UNIQUE,
+                        active_work_json TEXT NOT NULL DEFAULT '{}',
                         state TEXT NOT NULL
                             CHECK(state IN ('RECORDED', 'APPLIED', 'FAILED')),
                         result_json TEXT NOT NULL DEFAULT '{}',
@@ -4752,13 +4760,13 @@ class UniverseStore:
                     INSERT INTO governance_proposal_decision(
                         decision_id, project_id, proposal_id, proposal_digest,
                         decision, source, commander_surface, access_surface,
-                        idempotency_key, evidence_ref, state, result_json,
+                        idempotency_key, evidence_ref, active_work_json, state, result_json,
                         error_code, created_at, applied_at
                     )
                     SELECT
                         decision_id, project_id, proposal_id, proposal_digest,
                         decision, source, commander_surface, access_surface,
-                        idempotency_key, evidence_ref, state, result_json,
+                        idempotency_key, evidence_ref, '{}', state, result_json,
                         error_code, created_at, applied_at
                     FROM governance_proposal_decision_legacy
                     """
@@ -11944,6 +11952,8 @@ class UniverseStore:
         project_id: str,
         proposal: Mapping[str, Any],
         request: Mapping[str, str],
+        *,
+        active_anchor: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         project = self.get_project(project_id)
         proposal_id = _identifier(proposal.get("proposal_id"), "proposal_id")
@@ -11971,6 +11981,40 @@ class UniverseStore:
             f"decisions/{decision_id}"
         )
         created_at = utc_now()
+        active_work: dict[str, Any] = {}
+        if request["decision"] == "APPROVE" and active_anchor is not None:
+            if not isinstance(active_anchor, Mapping):
+                raise UniverseError(
+                    "ACTIVE_WORK_ANCHOR_INVALID",
+                    "active work anchor must be an object",
+                    HTTPStatus.CONFLICT,
+                )
+            active_work = {
+                "schema": ACTIVE_WORK_REFERENCE_SCHEMA,
+                "active_work_ref": (
+                    f"universe://projects/{quote(project['project_id'], safe='')}/"
+                    f"active-work/{decision_id}"
+                ),
+                "work_batch_id": "work_batch_"
+                + _json_sha256(
+                    {
+                        "decision_id": decision_id,
+                        "proposal_id": proposal_id,
+                        "proposal_digest": proposal_digest,
+                        "anchor": dict(active_anchor),
+                    }
+                )[:24],
+                "parent_instruction_ref": _required_text(
+                    proposal.get("request_ref"), "proposal.request_ref"
+                ),
+                "proposal_id": proposal_id,
+                "proposal_digest": proposal_digest,
+                "approval_evidence_ref": evidence_ref,
+                "commander_surface": request["commander_surface"],
+                "access_surface": request["access_surface"],
+                "anchor": dict(active_anchor),
+                "recorded_at": created_at,
+            }
         with self._connection() as connection:
             existing = connection.execute(
                 """
@@ -12011,9 +12055,9 @@ class UniverseStore:
                 INSERT INTO governance_proposal_decision(
                     decision_id, project_id, proposal_id, proposal_digest,
                     decision, source, commander_surface, access_surface, idempotency_key,
-                    evidence_ref, state, result_json, error_code,
+                    evidence_ref, active_work_json, state, result_json, error_code,
                     created_at, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', '{}', NULL, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECORDED', '{}', NULL, ?, NULL)
                 """,
                 (
                     decision_id,
@@ -12026,6 +12070,7 @@ class UniverseStore:
                     request["access_surface"],
                     request["idempotency_key"],
                     evidence_ref,
+                    _canonical_json(active_work),
                     created_at,
                 ),
             )
@@ -12109,6 +12154,12 @@ class UniverseStore:
         else:
             commander_surface = stored_surface
             access_surface = str(stored_access_surface or "UNKNOWN")
+        active_work_json = (
+            row["active_work_json"]
+            if "active_work_json" in row.keys()
+            else "{}"
+        )
+        active_work = json.loads(str(active_work_json or "{}"))
         return {
             "schema": GOVERNANCE_PROPOSAL_DECISION_SCHEMA,
             "decision_id": row["decision_id"],
@@ -12121,6 +12172,7 @@ class UniverseStore:
             "access_surface": access_surface,
             "idempotency_key": row["idempotency_key"],
             "evidence_ref": row["evidence_ref"],
+            "active_work": active_work or None,
             "state": row["state"],
             "result": json.loads(row["result_json"]),
             "error_code": row["error_code"],
@@ -15093,6 +15145,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "the durable Universe approval evidence is unavailable or inconsistent",
                 HTTPStatus.CONFLICT,
             )
+        active_work = decision.get("active_work")
+        requires_active_work = isinstance(proposal.get("scope"), Mapping) and (
+            "parent_work_unit" in proposal["scope"]
+            or "anchor_and_approval_lineage" in proposal["scope"]
+        )
+        if requires_active_work and (
+            not isinstance(active_work, Mapping)
+            or active_work.get("schema") != ACTIVE_WORK_REFERENCE_SCHEMA
+            or active_work.get("proposal_id") != primary_id
+            or active_work.get("proposal_digest") != primary_digest
+            or active_work.get("approval_evidence_ref") != decision["evidence_ref"]
+            or not isinstance(active_work.get("anchor"), Mapping)
+        ):
+            raise UniverseError(
+                "PRIMARY_TASK_ACTIVE_WORK_UNAVAILABLE",
+                "the approved primary proposal has no matching active-work lineage",
+                HTTPStatus.CONFLICT,
+            )
+        if requires_active_work:
+            assert isinstance(active_work, Mapping)
+            self._require_active_work_current(project["project_id"], active_work)
 
         try:
             self.ensure_project_master(project["project_id"])
@@ -15109,6 +15182,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "proposal_digest": primary_digest,
                     "commander_surface": UNIVERSE_COMMANDER_SURFACE,
                     "evidence_ref": decision["evidence_ref"],
+                    "active_work": (
+                        dict(active_work)
+                        if isinstance(active_work, Mapping)
+                        else None
+                    ),
                 },
                 source_work=request["source_work"],
                 task_frame=request["task_frame"],
@@ -17237,6 +17315,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         or connection.get("last_session_ref")
                         or connection.get("provider_session_ref"),
                         "display_name": "Project Master",
+                        # A re-prepared Project Master is an explicit recovery
+                        # action, so it may retry only a prior failed delivery.
+                        "resume_pending_delivery": True,
                     },
                 )
                 binding = attached["binding"]
@@ -17582,6 +17663,72 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "idempotency_key": idempotency_key,
             },
         )
+
+    def _current_active_work_anchor(self, project_id: str) -> dict[str, str]:
+        candidates = [
+            session
+            for session in self.session_supervisor.list_sessions(
+                node=project_id,
+                mode="MASTER",
+                include_hidden=False,
+            )
+            if str(session.get("state") or "").upper() == "LIVE"
+            and str(session.get("currentness") or "").upper() == "CURRENT"
+            and isinstance(session.get("anchor_ref"), str)
+            and str(session["anchor_ref"]).strip()
+        ]
+        if len(candidates) != 1:
+            raise UniverseError(
+                "ACTIVE_WORK_ANCHOR_UNAVAILABLE",
+                "exactly one LIVE and CURRENT Project Master anchor is required",
+                HTTPStatus.CONFLICT,
+            )
+        session = candidates[0]
+        return {
+            "session_id": _required_text(session.get("session_id"), "active_work.session_id"),
+            "anchor_ref": _required_text(session.get("anchor_ref"), "active_work.anchor_ref"),
+            "provider": _identifier(session.get("provider"), "active_work.provider").upper(),
+            "currentness": "CURRENT",
+        }
+
+    def _require_active_work_current(
+        self, project_id: str, active_work: Mapping[str, Any]
+    ) -> None:
+        recorded_anchor = active_work.get("anchor")
+        if not isinstance(recorded_anchor, Mapping):
+            raise UniverseError(
+                "PRIMARY_TASK_ACTIVE_WORK_UNAVAILABLE",
+                "active work has no recorded anchor",
+                HTTPStatus.CONFLICT,
+            )
+        current_anchor = self._current_active_work_anchor(project_id)
+        expected = {
+            key: _required_text(recorded_anchor.get(key), f"active_work.anchor.{key}")
+            for key in ("session_id", "anchor_ref", "provider")
+        }
+        if any(current_anchor[key] != expected[key] for key in expected):
+            raise UniverseError(
+                "ACTIVE_WORK_REALIGNMENT_REQUIRED",
+                "the current Project Master anchor no longer matches the approved work",
+                HTTPStatus.CONFLICT,
+            )
+
+    @staticmethod
+    def _reject_prebound_proposal_anchor(proposal: Mapping[str, Any]) -> None:
+        scope = proposal.get("scope")
+        lineage = (
+            scope.get("anchor_and_approval_lineage")
+            if isinstance(scope, Mapping)
+            else None
+        )
+        if not isinstance(lineage, Mapping):
+            return
+        if lineage.get("observed_anchor_reference") is not None:
+            raise UniverseError(
+                "PROPOSAL_ANCHOR_PREBIND_FORBIDDEN",
+                "a proposal must not claim an anchor before direct approval creates active work",
+                HTTPStatus.CONFLICT,
+            )
 
     def _observe_project_master_stream(self, event: Mapping[str, Any]) -> None:
         project_id = str(event.get("project_id") or "").strip()
@@ -18020,8 +18167,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 f"Proposal is not awaiting approval: {proposal['state']}",
                 HTTPStatus.CONFLICT,
             )
+        active_anchor = None
+        requires_active_work = False
+        scope = proposal.get("scope")
+        if isinstance(scope, Mapping):
+            requires_active_work = "parent_work_unit" in scope or "anchor_and_approval_lineage" in scope
+        if request["decision"] == "APPROVE" and requires_active_work:
+            self._reject_prebound_proposal_anchor(proposal)
+            active_anchor = self._current_active_work_anchor(project["project_id"])
         decision, _created = self.store.record_governance_proposal_decision(
-            project["project_id"], proposal, request
+            project["project_id"], proposal, request, active_anchor=active_anchor
         )
         try:
             if request["decision"] == "APPROVE":
@@ -18073,6 +18228,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "commander_surface": decision["commander_surface"],
             "access_surface": decision["access_surface"],
             "evidence_ref": decision["evidence_ref"],
+            "active_work": decision["active_work"],
             "source": decision["source"],
             "approval_scope": "PRIMARY_TASK_PROPOSAL_AND_UNCHANGED_DESCENDANT_TASK_FRAMES",
             "descendant_task_frame_policy": {

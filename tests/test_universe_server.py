@@ -315,7 +315,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def create_task_proposal_fixture(self) -> JsonObject:
+    def create_task_proposal_fixture(
+        self, *, scope: JsonObject | None = None
+    ) -> JsonObject:
         database_path = (
             self.project_root
             / ".ai"
@@ -334,7 +336,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "task_summary": "Implement the rendezvous endpoint",
             "boundary": "tools and tests only",
             "request_ref": "universe://project-room/messages/request-001",
-            "scope": {"operations": ["MODIFY"], "roots": ["tools", "tests"]},
+            "scope": scope or {"operations": ["MODIFY"], "roots": ["tools", "tests"]},
             "source_ref": "git:" + "b" * 40,
             "created_at": "2026-08-03T00:00:00Z",
             "approval_required": True,
@@ -4940,6 +4942,85 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("GOVERNANCE_PROPOSAL_DIGEST_MISMATCH", response["error_code"])
         self.assertTrue(self.server.wait_for_request_workers(timeout=1))
+
+    def test_parent_work_approval_records_current_active_work_lineage(self) -> None:
+        proposal = self.create_task_proposal_fixture(
+            scope={
+                "parent_work_unit": {"cardinality": "EXACTLY_ONE"},
+                "anchor_and_approval_lineage": {"required_active_work_reference": True},
+            }
+        )
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-gcs-master-current",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:current",
+                "anchor_ref": "MASTER-CURRENT-GCS-ACTIVE",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        with patch.object(
+            self.server.project_task_proposals,
+            "approve",
+            return_value={"status": "TASK_PROPOSAL_APPROVED"},
+        ):
+            status, response = self.request(
+                "POST",
+                "/v1/governance/proposals/task_proposal_test_001/decision",
+                {"decision": "APPROVE", "proposal_digest": proposal["proposal_digest"]},
+                self.token,
+                {"X-Universe-Access-Surface": "CODEX_DESKTOP"},
+            )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        active_work = response["decision"]["active_work"]
+        self.assertEqual("universe.active-work-reference.v1", active_work["schema"])
+        self.assertEqual(proposal["proposal_id"], active_work["proposal_id"])
+        self.assertEqual(
+            "MASTER-CURRENT-GCS-ACTIVE", active_work["anchor"]["anchor_ref"]
+        )
+        self.assertEqual("CODEX", active_work["anchor"]["provider"])
+        self.assertTrue(active_work["work_batch_id"].startswith("work_batch_"))
+
+    def test_parent_work_approval_rejects_proposal_prebound_to_history(self) -> None:
+        self.create_task_proposal_fixture(
+            scope={
+                "parent_work_unit": {"cardinality": "EXACTLY_ONE"},
+                "anchor_and_approval_lineage": {
+                    "observed_anchor_reference": {
+                        "session_id": "historical-grok",
+                        "anchor_id": "MASTER-CURRENT-HISTORICAL",
+                    }
+                },
+            }
+        )
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-gcs-master-current",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "anchor_ref": "MASTER-CURRENT-GCS-ACTIVE",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        status, response = self.request(
+            "POST",
+            "/v1/governance/proposals/task_proposal_test_001/decision",
+            {"decision": "APPROVE", "proposal_digest": "a" * 64},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("PROPOSAL_ANCHOR_PREBIND_FORBIDDEN", response["error_code"])
 
     def test_legacy_direct_surface_decision_is_projected_to_universe_ui(self) -> None:
         proposal = self.create_task_proposal_fixture()
