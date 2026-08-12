@@ -971,6 +971,7 @@ def _load_private_universe_candidates(private_root: Path) -> list[dict[str, Any]
             "metadata": {
                 "network_role": "NETWORK_ANCHOR",
                 "node_kind": "CONTAINER",
+                "node_tag": _node_tag_from_project_root(private_root),
                 "display_name": display_name,
                 "label": "private source root",
             },
@@ -1018,6 +1019,7 @@ def _load_private_universe_candidates(private_root: Path) -> list[dict[str, Any]
                 "metadata": {
                     "network_role": network_role,
                     "node_kind": "PRODUCT",
+                    "node_tag": _node_tag_from_project_root(node_root),
                     "parent_project_id": container_id,
                     "logical_path": logical_path,
                     "display_name": node_display_name,
@@ -1027,6 +1029,16 @@ def _load_private_universe_candidates(private_root: Path) -> list[dict[str, Any]
             }
         )
     return candidates
+
+
+def _node_tag_from_project_root(project_root: Path) -> str:
+    """Return the default Node tag from the directory that owns `.ai`.
+
+    Source-only Nodes can be registered before their local Workspace exists;
+    their declared project root is still the future `.ai` parent and therefore
+    yields the same tag after installation.
+    """
+    return project_root.resolve().name
 
 
 def discover_network_anchor_candidates(
@@ -1042,6 +1054,7 @@ def discover_network_anchor_candidates(
             "project_root": home,
             "metadata": {
                 "network_role": "UNIVERSE_HOME",
+                "node_tag": _node_tag_from_project_root(home),
                 "display_name": "Universe",
                 "label": "Universe home",
             },
@@ -1066,6 +1079,7 @@ def discover_network_anchor_candidates(
                     "project_root": career_root,
                     "metadata": {
                         "network_role": "CAREER_SOURCE",
+                        "node_tag": _node_tag_from_project_root(career_root),
                         "display_name": "Career",
                         "label": "private Career source",
                     },
@@ -1086,6 +1100,7 @@ def discover_network_anchor_candidates(
                 "project_root": career_root,
                 "metadata": {
                     "network_role": "CAREER_SOURCE",
+                    "node_tag": _node_tag_from_project_root(career_root),
                     "display_name": "Career",
                     "label": "ai-career source",
                 },
@@ -1138,9 +1153,15 @@ def normalize_registration(value: Any) -> dict[str, Any]:
     project_id = _project_id(value.get("project_id"))
     project_root = _canonical_project_root(value.get("project_root"))
 
-    metadata = value.get("metadata", {})
-    if not isinstance(metadata, dict):
+    metadata_value = value.get("metadata", {})
+    if not isinstance(metadata_value, dict):
         raise UniverseError("PROJECT_METADATA_INVALID", "metadata must be an object")
+    metadata = dict(metadata_value)
+    node_tag = metadata.get("node_tag")
+    if node_tag is None:
+        metadata["node_tag"] = _node_tag_from_project_root(project_root)
+    else:
+        metadata["node_tag"] = _required_text(node_tag, "metadata.node_tag")
     network_role = _registration_network_role(metadata)
     legacy_install_mode = value.get("install_mode")
     if legacy_install_mode is None and "install_mode" in metadata:

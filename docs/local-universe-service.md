@@ -182,6 +182,15 @@ change. Existing standalone records are retained for history, while manifest-
 declared legacy Todos move to their private product Nodes and legacy entries
 are hidden. Ordinary product projects (GCS, etc.) still register explicitly.
 
+### Node tags
+
+Every project registration derives its default `node_tag` from the directory
+that owns its local `.ai` Workspace. In other words,
+`C:\workspace\example\.ai` registers the default tag `example`. The stable
+`project_id` and the user-facing display name remain separate from this local
+path-derived tag. The same registration boundary is used for discovered,
+Fresh Project, and imported projects.
+
 Career may use `VERSION_MANIFEST.md` / `AGENTS.md` / `README.md` as identity
 when `REPOSITORY_MANIFEST.md` is absent (`network_role=CAREER_SOURCE`).
 

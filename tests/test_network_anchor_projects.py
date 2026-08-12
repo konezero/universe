@@ -64,6 +64,24 @@ class NetworkAnchorProjectTests(unittest.TestCase):
         self.assertIn("universe", ids)
         universe = next(item for item in candidates if item["project_id"] == "universe")
         self.assertEqual("UNIVERSE_HOME", universe["metadata"]["network_role"])
+        self.assertEqual(ROOT.name, universe["metadata"]["node_tag"])
+
+    def test_registration_defaults_node_tag_from_ai_parent(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp) / "fresh-imported-product"
+            (root / ".ai").mkdir(parents=True)
+            (root / "REPOSITORY_MANIFEST.md").write_text("# Manifest\n", encoding="utf-8")
+            store = UniverseStore(Path(tmp) / "u.sqlite3")
+            project, _created = store.register_project(
+                {
+                    "project_id": "stable-product-id",
+                    "project_root": str(root),
+                    "metadata": {},
+                }
+            )
+            self.assertEqual(
+                "fresh-imported-product", project["metadata"]["node_tag"]
+            )
 
     def test_ensure_registers_universe_and_career_when_present(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -118,6 +136,7 @@ class NetworkAnchorProjectTests(unittest.TestCase):
                 self.assertEqual(
                     "private-node-root", career["metadata"]["parent_project_id"]
                 )
+                self.assertEqual("career", career["metadata"]["node_tag"])
                 self.assertIn(
                     "rendezvous", {item["project_id"] for item in candidates}
                 )
