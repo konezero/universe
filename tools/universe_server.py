@@ -15309,6 +15309,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "runtime_currentness_observation"
             ],
         }
+        for field in ("source_ref", "source_commit", "source_repository"):
+            if field in binding:
+                evidence[field] = binding[field]
         return {
             "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
             "status": "BOUND",

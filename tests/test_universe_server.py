@@ -3127,6 +3127,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "parent_evidence_ref": "host://parent/current",
                 "binding_evidence_ref": "host://runtime/binding",
                 "runtime_currentness_observation": "CURRENT",
+                "source_ref": "universe-release-db://core-test@" + "a" * 64,
+                "source_commit": "b" * 40,
+                "source_repository": "fixture/universe-private",
             },
             self.token,
         )
@@ -6033,6 +6036,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         runtime_token = "runtime-token-never-persist-41aab"
         runtime_endpoint = "http://127.0.0.1:41991"
+        release_source_ref = "universe-release-db://core-test@" + "a" * 64
         status, bound = self.request(
             "POST",
             "/v1/runtime/planning-binding",
@@ -6047,6 +6051,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "parent_evidence_ref": "host://parent/current",
                 "binding_evidence_ref": "host://runtime/binding",
                 "runtime_currentness_observation": "CURRENT",
+                "source_ref": release_source_ref,
+                "source_commit": "b" * 40,
+                "source_repository": "fixture/universe-private",
             },
             self.token,
         )
@@ -6054,6 +6061,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("BOUND", bound["status"])
         self.assertNotIn("token", bound)
         self.assertNotIn("endpoint", bound)
+        self.assertEqual(release_source_ref, bound["source_ref"])
+        self.assertEqual("b" * 40, bound["source_commit"])
+        self.assertEqual("fixture/universe-private", bound["source_repository"])
         status, observed_binding = self.request(
             "GET", "/v1/runtime/planning-binding", token=self.token
         )
