@@ -2858,9 +2858,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "parent_evidence_ref": "host://parent/current",
             "binding_evidence_ref": "host://runtime/binding",
             "runtime_currentness_observation": "UNKNOWN",
+            "source_ref": "universe-release-db://core-test@" + "a" * 64,
+            "source_commit": "b" * 40,
+            "source_repository": "fixture/universe-private",
         }
         normalized = normalize_planning_runtime_binding(binding)
         self.assertEqual("UNKNOWN", normalized["runtime_currentness_observation"])
+        self.assertEqual(binding["source_ref"], normalized["source_ref"])
+        self.assertEqual(binding["source_commit"], normalized["source_commit"])
+        self.assertEqual(binding["source_repository"], normalized["source_repository"])
         del binding["runtime_currentness_observation"]
         with self.assertRaisesRegex(UniverseError, "missing"):
             normalize_planning_runtime_binding(binding)

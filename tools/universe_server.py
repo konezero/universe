@@ -2092,6 +2092,13 @@ def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
                 "runtime_currentness_observation",
             }
         ),
+        optional=frozenset(
+            {
+                "source_ref",
+                "source_commit",
+                "source_repository",
+            }
+        ),
     )
     if binding["schema"] != PLANNING_RUNTIME_BINDING_SCHEMA:
         raise UniverseError(
@@ -2119,7 +2126,7 @@ def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
             "PLANNING_RUNTIME_CURRENTNESS_INVALID",
             "Planning Runtime currentness observation is unsupported",
         )
-    return {
+    normalized = {
         "schema": PLANNING_RUNTIME_BINDING_SCHEMA,
         "endpoint": endpoint.rstrip("/"),
         "token": _required_text(binding["token"], "planning_runtime_binding.token"),
@@ -2148,6 +2155,18 @@ def normalize_planning_runtime_binding(value: Any) -> dict[str, Any]:
         ),
         "runtime_currentness_observation": currentness,
     }
+    if "source_ref" in binding:
+        normalized["source_ref"] = _required_text(
+            binding["source_ref"], "planning_runtime_binding.source_ref"
+        )
+    if "source_commit" in binding:
+        normalized["source_commit"] = _source_commit(binding["source_commit"])
+    if "source_repository" in binding:
+        normalized["source_repository"] = _required_text(
+            binding["source_repository"],
+            "planning_runtime_binding.source_repository",
+        )
+    return normalized
 
 
 def normalize_fresh_project_refinement_run_request(value: Any) -> dict[str, str]:
