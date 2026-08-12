@@ -7142,6 +7142,28 @@ async function submitDispatch(event) {
       ),
       result.message,
     ]);
+    if (result.release_proposal) {
+      state.releaseProposals = [
+        result.release_proposal,
+        ...state.releaseProposals.filter(
+          (item) => item.proposal_id !== result.release_proposal.proposal_id
+        ),
+      ];
+      showReleaseProposal(result.release_proposal);
+      renderComposerState();
+      renderRoomMessages();
+      toast("Project update plan recorded; approval is required to apply it");
+      showInspectorTab("activity");
+      return;
+    }
+    if (result.status === "PROJECT_RELEASE_SELECTION_REQUIRED") {
+      renderReleaseCatalog();
+      renderComposerState();
+      renderRoomMessages();
+      toast("Choose one imported Release DB before OS_UPDATE", true);
+      showInspectorTab("activity");
+      return;
+    }
     if (result.status === "GOVERNANCE_APPROVAL_SELECTION_REQUIRED") {
       state.governanceProposals = result.pending_proposals || [];
       mergeGovernanceProposalInbox(

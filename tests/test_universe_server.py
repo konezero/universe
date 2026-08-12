@@ -5303,6 +5303,83 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, stale_status)
         self.assertEqual("PROJECT_RELEASE_APPROVAL_STALE", stale["error_code"])
 
+    def test_os_update_room_command_routes_to_release_lifecycle_not_master(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        database, manifest = self.build_release_fixture()
+        _, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        release_id = imported["release"]["release_id"]
+
+        with patch.object(self.server, "ensure_project_master") as ensure_master:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "QUESTION",
+                    "body": f"OS_UPDATE {release_id} 기준으로 진행해",
+                    "idempotency_key": "room-os-update-release-001",
+                },
+                self.token,
+            )
+
+        self.assertEqual(201, status)
+        self.assertEqual(
+            "PROJECT_RELEASE_PROPOSAL_RECORDED_FROM_COMMANDER_TEXT",
+            result["status"],
+        )
+        self.assertEqual(release_id, result["release_proposal"]["release_id"])
+        self.assertEqual(
+            "ROUTED_TO_RELEASE_LIFECYCLE", result["message"]["delivery_state"]
+        )
+        self.assertEqual(
+            result["release_proposal"]["proposal_id"],
+            result["message"]["delivery"]["proposal_id"],
+        )
+        ensure_master.assert_not_called()
+
+    def test_os_update_room_command_requires_one_imported_release_id(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        database, manifest = self.build_release_fixture()
+        self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+
+        with patch.object(self.server, "ensure_project_master") as ensure_master:
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "QUESTION",
+                    "body": "OS_UPDATE 진행해",
+                    "idempotency_key": "room-os-update-release-selection-001",
+                },
+                self.token,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("PROJECT_RELEASE_SELECTION_REQUIRED", result["status"])
+        self.assertIsNone(result["release_proposal"])
+        self.assertEqual(
+            "RELEASE_SELECTION_REQUIRED", result["message"]["delivery_state"]
+        )
+        self.assertEqual(1, len(result["available_releases"]))
+        ensure_master.assert_not_called()
+
     def test_release_lifecycle_requires_master_and_rejects_tampering(self) -> None:
         database, manifest = self.build_release_fixture()
         status, blocked = self.request(

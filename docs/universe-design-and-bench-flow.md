@@ -465,6 +465,17 @@ relations remain distinct from observed evidence. Career adoption is separate.
     The Result Packet reports the selected tier, executed evidence, unverified
     scope, and residual risk without treating skipped tests as passed.
 
+18. Rebind a persistent Provider Session to a user-selected Project working
+    directory without replacing its stable Universe Session identity. Universe
+    validates the selected Project root, preserves the Provider Session ref,
+    and delegates the move through the provider adapter: Codex supplies `cwd`
+    on app-server resume/turn start, Grok resumes or loads with `--cwd`, and
+    Claude restarts the resident process in the target directory with
+    `--resume`. Only a provider-confirmed rebind updates the mutable current
+    location and appends location history; failure preserves the previous PWD,
+    Anchor binding, and active connection. The immutable origin Provider/PWD
+    remains unchanged.
+
 ## Runtime Boundary
 
 Universe consumes the installed ai-career Skill binding and observation

@@ -273,6 +273,10 @@ GOVERNANCE_APPROVAL_COMMANDS = frozenset(
         "approve",
     }
 )
+PROJECT_RELEASE_ROOM_COMMAND_PATTERN = re.compile(
+    r"(?<![A-Z0-9])OS[_ -]?UPDATE(?![A-Z0-9])",
+    re.IGNORECASE,
+)
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
 ACTIVE_WORK_REFERENCE_SCHEMA = "universe.active-work-reference.v1"
 DIRECT_COMMANDER_ACCESS_SURFACES = frozenset(
@@ -17818,6 +17822,67 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             trusted_commander
             and body.casefold() in GOVERNANCE_APPROVAL_COMMANDS
         )
+        is_project_release_command = bool(
+            trusted_commander and PROJECT_RELEASE_ROOM_COMMAND_PATTERN.search(body)
+        )
+        if is_project_release_command:
+            releases = self.store.list_releases()
+            release_ids = sorted(
+                {
+                    str(release["release_id"])
+                    for release in releases
+                    if re.search(
+                        rf"(?<![A-Za-z0-9_.-])"
+                        rf"{re.escape(str(release['release_id']))}"
+                        rf"(?![A-Za-z0-9_.-])",
+                        body,
+                    )
+                }
+            )
+            if len(release_ids) != 1:
+                message, created = self.store.create_room_message(
+                    project_id,
+                    value,
+                    delivery_state="RELEASE_SELECTION_REQUIRED",
+                    delivery={
+                        "status": "RELEASE_SELECTION_REQUIRED",
+                        "candidate_release_ids": release_ids,
+                    },
+                )
+                self.publish_project_room_changed(project_id)
+                return {
+                    "status": "PROJECT_RELEASE_SELECTION_REQUIRED",
+                    "message": message,
+                    "release_proposal": None,
+                    "available_releases": releases,
+                }
+
+            proposal, proposal_created = self.store.create_project_release_proposal(
+                project_id,
+                {"release_id": release_ids[0], "mode": MASTER_MODE},
+            )
+            message, message_created = self.store.create_room_message(
+                project_id,
+                value,
+                delivery_state="ROUTED_TO_RELEASE_LIFECYCLE",
+                delivery={
+                    "status": "RELEASE_PROPOSAL_RECORDED",
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                    "release_id": proposal["release_id"],
+                },
+            )
+            self.publish_project_room_changed(project_id)
+            return {
+                "status": (
+                    "PROJECT_RELEASE_PROPOSAL_RECORDED_FROM_COMMANDER_TEXT"
+                    if proposal_created
+                    else "PROJECT_RELEASE_PROPOSAL_ALREADY_RECORDED_FROM_COMMANDER_TEXT"
+                ),
+                "message": message,
+                "message_created": message_created,
+                "release_proposal": proposal,
+            }
         if not is_commander_approval:
             message, created = self.send_project_room_message(project_id, value)
             return {
@@ -22156,7 +22221,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     (
                         HTTPStatus.CREATED
-                        if result["status"] == "PROJECT_ROOM_MESSAGE_RECORDED"
+                        if result["status"]
+                        in {
+                            "PROJECT_ROOM_MESSAGE_RECORDED",
+                            "PROJECT_RELEASE_PROPOSAL_RECORDED_FROM_COMMANDER_TEXT",
+                        }
                         else HTTPStatus.OK
                     ),
                     {
