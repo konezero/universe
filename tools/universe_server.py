@@ -17521,6 +17521,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id: str,
         value: Any,
     ) -> dict[str, Any]:
+        previous = self.store.provider_setting("PROJECT_MASTER", project_id)
         setting = self.store.set_provider_setting(
             "PROJECT_MASTER",
             project_id,
@@ -17528,6 +17529,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         if self.project_master_hosts is not None:
             self.project_master_hosts.invalidate(project_id)
+            if previous["provider"] != setting["provider"]:
+                self.project_master_hosts.requeue_provider_start_timeouts(project_id)
         return {
             "schema": API_SCHEMA,
             "status": "CLI_PROVIDER_SETTING_UPDATED",

@@ -563,6 +563,8 @@ class ProjectMasterHostTests(unittest.TestCase):
             resumed.close()
 
         self.assertIn("Enter MASTER Mode", prompts[0])
+        self.assertIn("Project Room message is the current work request", prompts[0])
+        self.assertIn("status?", prompts[0])
         self.assertNotIn("Enter MASTER Mode", prompts[1])
         self.assertNotIn("Enter MASTER Mode", prompts[2])
 
@@ -1203,6 +1205,43 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(self.provider.messages))
         self.assertEqual("COMPLETE", self.state.state(self._message_id()))
 
+    def test_pending_message_recovery_rebinds_current_bridge_transport(self) -> None:
+        self.assertTrue(self.state.register(self._envelope()))
+        worker = self._worker()
+        worker.start(
+            recovery_bridge_id="bridge_abcdef0123456789abcd",
+            recovery_session_ref="grok-acp:resumed-master-session",
+        )
+        try:
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(1, len(self.replies))
+        self.assertEqual("bridge_abcdef0123456789abcd", self.replies[0]["bridge_id"])
+        self.assertEqual("COMPLETE", self.state.state(self._message_id()))
+        connection = sqlite3.connect(self.state.database_path)
+        try:
+            row = connection.execute(
+                "SELECT envelope_json FROM inbox_message WHERE message_id = ?",
+                (self._message_id(),),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(row)
+        recovered = json.loads(str(row[0]))
+        self.assertEqual("bridge_abcdef0123456789abcd", recovered["bridge_id"])
+        self.assertEqual(
+            "grok-acp:resumed-master-session",
+            recovered["master_session_ref"],
+        )
+
+    def test_recovery_rejects_partial_transport_rebinding(self) -> None:
+        with self.assertRaisesRegex(
+            ProjectMasterHostError, "MASTER_RECOVERY_TRANSPORT_INCOMPLETE"
+        ):
+            self.state.recover(bridge_id="bridge_abcdef0123456789abcd")
+
     def test_failed_message_requires_explicit_cancel_and_reregister(self) -> None:
         self.assertTrue(self.state.register(self._envelope()))
         self.assertTrue(self.state.claim(self._message_id()))
@@ -1227,6 +1266,47 @@ class ProjectMasterHostTests(unittest.TestCase):
             self.assertTrue(retried.wait_idle())
         finally:
             retried.close()
+
+        self.assertEqual(1, len(self.provider.messages))
+        self.assertEqual("COMPLETE", self.state.state(self._message_id()))
+
+    def test_stale_bridge_reply_failure_is_recovered_on_reprepare(self) -> None:
+        self.assertTrue(self.state.register(self._envelope()))
+        self.assertTrue(self.state.claim(self._message_id()))
+        self.state.fail(
+            self._message_id(),
+            "ProjectMasterBridgeError: UNIVERSE_REPLY_HTTP_409",
+        )
+
+        worker = self._worker()
+        worker.start(
+            recovery_bridge_id="bridge_abcdef0123456789abcd",
+            recovery_session_ref="grok-acp:resumed-master-session",
+        )
+        try:
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(1, len(self.provider.messages))
+        self.assertEqual("COMPLETE", self.state.state(self._message_id()))
+        self.assertEqual("bridge_abcdef0123456789abcd", self.replies[0]["bridge_id"])
+
+    def test_provider_start_timeout_is_requeued_only_by_explicit_recovery(self) -> None:
+        self.assertTrue(self.state.register(self._envelope()))
+        self.assertTrue(self.state.claim(self._message_id()))
+        self.state.fail(
+            self._message_id(),
+            "ProjectMasterHostError: AGENT_RPC_TIMEOUT:session/prompt",
+        )
+
+        self.assertEqual(1, self.state.requeue_provider_start_timeouts())
+        worker = self._worker()
+        worker.start()
+        try:
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
 
         self.assertEqual(1, len(self.provider.messages))
         self.assertEqual("COMPLETE", self.state.state(self._message_id()))

@@ -1875,25 +1875,74 @@ class ProjectMasterSessionStore:
             )
         return True
 
-    def recover(self) -> list[dict[str, Any]]:
+    def recover(
+        self,
+        *,
+        bridge_id: str | None = None,
+        master_session_ref: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if (bridge_id is None) != (master_session_ref is None):
+            raise ProjectMasterHostError(
+                "MASTER_RECOVERY_TRANSPORT_INCOMPLETE"
+            )
+        normalized_bridge_id = (
+            None if bridge_id is None else _text(bridge_id, "bridge_id")
+        )
+        normalized_session_ref = (
+            None
+            if master_session_ref is None
+            else _text(master_session_ref, "master_session_ref")
+        )
         with self._connection() as connection:
             connection.execute(
                 """
                 UPDATE inbox_message
                 SET state = 'PENDING', updated_at = ?
                 WHERE state = 'PROCESSING'
+                   OR (
+                        state = 'FAILED'
+                    AND last_error = 'ProjectMasterBridgeError: UNIVERSE_REPLY_HTTP_409'
+                   )
                 """,
                 (utc_now(),),
             )
             rows = connection.execute(
                 """
-                SELECT envelope_json
+                SELECT message_id, envelope_json
                 FROM inbox_message
                 WHERE state = 'PENDING'
                 ORDER BY updated_at, message_id
                 """
             ).fetchall()
-        return [json.loads(str(row["envelope_json"])) for row in rows]
+            recovered = []
+            for row in rows:
+                envelope = json.loads(str(row["envelope_json"]))
+                if (
+                    normalized_bridge_id is not None
+                    and normalized_session_ref is not None
+                ):
+                    envelope["bridge_id"] = normalized_bridge_id
+                    envelope["master_session_ref"] = normalized_session_ref
+                    envelope = normalize_bridge_envelope(envelope)
+                    connection.execute(
+                        """
+                        UPDATE inbox_message
+                        SET envelope_json = ?, updated_at = ?
+                        WHERE message_id = ?
+                        """,
+                        (
+                            json.dumps(
+                                envelope,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            utc_now(),
+                            str(row["message_id"]),
+                        ),
+                    )
+                recovered.append(envelope)
+        return recovered
 
     def claim(self, message_id: str) -> bool:
         with self._connection() as connection:
@@ -1926,6 +1975,20 @@ class ProjectMasterSessionStore:
                 (utc_now(), message_id),
             )
         return cursor.rowcount == 1
+
+    def requeue_provider_start_timeouts(self) -> int:
+        """Requeue only a prior provider startup timeout after an explicit switch."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE inbox_message
+                SET state = 'PENDING', last_error = '', updated_at = ?
+                WHERE state = 'FAILED'
+                  AND last_error = 'ProjectMasterHostError: AGENT_RPC_TIMEOUT:session/prompt'
+                """,
+                (utc_now(),),
+            )
+        return int(cursor.rowcount)
 
     def state(self, message_id: str) -> str:
         with self._connection() as connection:
@@ -2338,7 +2401,9 @@ class GrokProjectMasterRuntime:
             f"Enter {self.requested_mode} Mode for this connection. "
             "Follow the repository entry order, resolve the requested Mode through "
             "the installed Mode Registry, and perform the Session's own preparation "
-            "and currentness checks. Treat this as Mode intent only."
+            "and currentness checks as setup for the Project Room message below. "
+            "The Project Room message is the current work request: do not answer only "
+            "with Mode-entry status or treat this setup text as a replacement for it."
         )
 
     def _prompt(self, message: Mapping[str, Any]) -> str:
@@ -2526,7 +2591,9 @@ class CodexProjectMasterRuntime:
             f"Enter {self.requested_mode} Mode for this connection. "
             "Follow the repository entry order, resolve the requested Mode through "
             "the installed Mode Registry, and perform the Session's own preparation "
-            "and currentness checks. Treat this as Mode intent only."
+            "and currentness checks as setup for the Project Room message below. "
+            "The Project Room message is the current work request: do not answer only "
+            "with Mode-entry status or treat this setup text as a replacement for it."
         )
 
     @staticmethod
@@ -3590,12 +3657,20 @@ class ProjectMasterConversationWorker:
         if callable(bind_permission):
             bind_permission(self._request_permission)
 
-    def start(self) -> None:
+    def start(
+        self,
+        *,
+        recovery_bridge_id: str | None = None,
+        recovery_session_ref: str | None = None,
+    ) -> None:
         if self._started:
             return
         self._started = True
         self._thread.start()
-        for envelope in self.store.recover():
+        for envelope in self.store.recover(
+            bridge_id=recovery_bridge_id,
+            master_session_ref=recovery_session_ref,
+        ):
             self._queue.put(envelope)
 
     def submit(self, envelope: Mapping[str, Any]) -> bool:
@@ -4304,7 +4379,6 @@ class ResidentProjectMasterHostManager:
                 name=f"resident-project-master-{project_id}",
                 daemon=True,
             )
-            worker.start()
             thread.start()
             handle = ResidentProjectMasterHandle(
                 project_id=project_id,
@@ -4338,6 +4412,16 @@ class ResidentProjectMasterHostManager:
                 registered_bridge_id = bridge.get("bridge_id")
                 if isinstance(registered_bridge_id, str) and registered_bridge_id:
                     handle.bridge_id = registered_bridge_id
+                worker.start(
+                    recovery_bridge_id=registered_bridge_id
+                    if isinstance(registered_bridge_id, str)
+                    and registered_bridge_id
+                    else None,
+                    recovery_session_ref=provider.session_ref
+                    if isinstance(registered_bridge_id, str)
+                    and registered_bridge_id
+                    else None,
+                )
             except Exception:
                 self._handles.pop(project_id, None)
                 handle.close()
@@ -4445,6 +4529,16 @@ class ResidentProjectMasterHostManager:
         if handle is not None:
             self._save_handle_continuity(handle, "NORMAL_STOP")
             handle.close()
+
+    def requeue_provider_start_timeouts(self, project_id: str) -> int:
+        normalized = _text(project_id, "project_id")
+        store = ProjectMasterSessionStore(
+            _default_state_db(normalized),
+            normalized,
+            session_supervisor=self.session_supervisor,
+            requested_mode="MASTER",
+        )
+        return store.requeue_provider_start_timeouts()
 
     def stop(self, project_id: str) -> bool:
         normalized = _text(project_id, "project_id")
