@@ -6334,18 +6334,34 @@ function drawGraph() {
   context.restore();
 }
 
-/** Stable HSL accent so projects read as different icons without full labels. */
-function projectAccentColor(projectId) {
-  const text = String(projectId || "project");
-  let hash = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+/** Colors express node meaning. Do not derive semantic UI state from an ID hash. */
+function graphAccentColor(item) {
+  const networkRole = String(item?.data?.network_role || "");
+  if (item.kind === "predicted") {
+    return {
+      fill: "rgba(74, 48, 112, 0.92)",
+      stroke: "#bd9cff",
+      soft: "rgba(177, 139, 255, 0.28)",
+    };
   }
-  const hue = hash % 360;
+  if (item.kind === "setup") {
+    return {
+      fill: "rgba(82, 61, 24, 0.92)",
+      stroke: "#f0c46d",
+      soft: "rgba(240, 196, 109, 0.24)",
+    };
+  }
+  if (networkRole.endsWith("_SOURCE")) {
+    return {
+      fill: "rgba(25, 60, 104, 0.92)",
+      stroke: "#78b8ff",
+      soft: "rgba(120, 184, 255, 0.24)",
+    };
+  }
   return {
-    fill: `hsla(${hue}, 52%, 42%, 0.92)`,
-    stroke: `hsla(${hue}, 70%, 68%, 0.95)`,
-    soft: `hsla(${hue}, 55%, 55%, 0.28)`,
+    fill: "rgba(20, 73, 79, 0.92)",
+    stroke: "#61d2ca",
+    soft: "rgba(97, 210, 202, 0.24)",
   };
 }
 
@@ -6389,9 +6405,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   const emphasized = style.emphasis || selected;
   const hovered = state.hoveredNodeId === item.id;
   const metrics = graphNodeMetrics(item);
-  const accent = projectAccentColor(
-    item.projectId || item.data?.project_id || item.id
-  );
+  const accent = graphAccentColor(item);
   const r = metrics.radius * (selected ? 1.08 : hovered ? 1.05 : 1);
   context.globalAlpha = style.alpha;
   if (selected || hovered) {
