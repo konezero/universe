@@ -5022,6 +5022,49 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status)
         self.assertEqual("PROPOSAL_ANCHOR_PREBIND_FORBIDDEN", response["error_code"])
 
+    def test_active_work_requires_realignment_after_master_provider_switch(self) -> None:
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-gcs-master-codex",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "anchor_ref": "MASTER-CURRENT-GCS-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        active_work = {
+            "anchor": {
+                "session_id": "session-gcs-master-codex",
+                "anchor_ref": "MASTER-CURRENT-GCS-001",
+                "provider": "CODEX",
+                "currentness": "CURRENT",
+            }
+        }
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-gcs-master-claude",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "anchor_ref": "MASTER-CURRENT-GCS-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        self.server.session_supervisor.observe_session_activity(
+            "session-gcs-master-claude",
+            event_type="PROVIDER_ACTIVITY_OBSERVED",
+            activity_state="ACTIVE",
+            evidence_ref="observation://test/provider-switch",
+            observed_at="2026-08-12T23:00:00Z",
+        )
+
+        with self.assertRaises(UniverseError) as raised:
+            self.server._require_active_work_current("GCS", active_work)
+        self.assertEqual("ACTIVE_WORK_REALIGNMENT_REQUIRED", raised.exception.code)
+
     def test_legacy_direct_surface_decision_is_projected_to_universe_ui(self) -> None:
         proposal = self.create_task_proposal_fixture()
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
