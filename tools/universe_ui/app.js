@@ -5365,9 +5365,14 @@ function buildMultiverseGraph() {
   };
   const graphNodes = [hub];
   const graphEdges = [];
-  const projects = visibleProjects()
+  const registeredProjects = visibleProjects()
     .slice()
     .sort((a, b) => projectSortKey(a).localeCompare(projectSortKey(b)));
+  // Containers retain registry/tree ownership but are not product nodes on the
+  // map. Render their descendants directly under the nearest visible parent.
+  const projects = registeredProjects.filter(
+    (project) => !isProjectContainer(project)
+  );
 
   if (!projects.length) {
     state.graph.nodes = graphNodes;
@@ -5388,17 +5393,31 @@ function buildMultiverseGraph() {
   }
 
   const projectIds = new Set(projects.map((project) => project.project_id));
+  const registeredById = new Map(
+    registeredProjects.map((project) => [project.project_id, project])
+  );
+  function visibleParentId(project) {
+    let parentId = String(project.metadata?.parent_project_id || "");
+    const visited = new Set();
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId);
+      if (projectIds.has(parentId)) return parentId;
+      const parent = registeredById.get(parentId);
+      if (!parent) return "";
+      parentId = String(parent.metadata?.parent_project_id || "");
+    }
+    return "";
+  }
   const childrenByParent = new Map();
   for (const project of projects) {
-    const parentId = String(project.metadata?.parent_project_id || "");
-    if (!parentId || !projectIds.has(parentId)) continue;
+    const parentId = visibleParentId(project);
+    if (!parentId) continue;
     const children = childrenByParent.get(parentId) || [];
     children.push(project);
     childrenByParent.set(parentId, children);
   }
   const topLevelProjects = projects.filter((project) => {
-    const parentId = String(project.metadata?.parent_project_id || "");
-    return !parentId || !projectIds.has(parentId);
+    return !visibleParentId(project);
   });
 
   // Room for always-expanded system fans around each product leaf.
@@ -5431,8 +5450,6 @@ function buildMultiverseGraph() {
       to: id,
       kind: "project-link",
     });
-
-    if (isProjectContainer(project)) return id;
 
     // Always expand this product's functional nodes.
     const projection = projectionForProject(project.project_id);
@@ -5963,8 +5980,23 @@ function buildTimelineGraph() {
   });
 
   if (!functional.length) {
-    nodes.push({ id: "seed:pending", label: "Prepare Project Seed", kind: "predicted", data: {}, x: -80, y: 0 });
-    edges.push({ from: `project:${project.project_id}`, to: "seed:pending", kind: "predicts" });
+    nodes.push({
+      id: "runtime:uninitialized",
+      label: "Project runtime not installed",
+      kind: "setup",
+      data: {
+        kind: "PROJECT_RUNTIME_UNINITIALIZED",
+        project_id: project.project_id,
+        note: "Registered product without a current project projection.",
+      },
+      x: -80,
+      y: 0,
+    });
+    edges.push({
+      from: `project:${project.project_id}`,
+      to: "runtime:uninitialized",
+      kind: "setup-required",
+    });
   }
 
   if (!focus && !rootSelected) {
@@ -6656,7 +6688,11 @@ function renderDetails() {
   addDetail(
     grid,
     "State",
-    selected?.kind === "predicted" ? "USER_SELECTION_REQUIRED" : "CURRENT"
+    selected?.kind === "predicted"
+      ? "USER_SELECTION_REQUIRED"
+      : selected?.kind === "setup"
+        ? "PROJECT_RUNTIME_UNINITIALIZED"
+        : "CURRENT"
   );
   if (data.kind) addDetail(grid, "Kind", data.kind);
   if (data.role) addDetail(grid, "Role", data.role);
