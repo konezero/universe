@@ -255,6 +255,39 @@ def validate_release_path(value: str) -> str:
     return normalized
 
 
+def validate_source_tree_root(value: str) -> str:
+    """Validate an optional Git-tree prefix without changing package paths."""
+    if value == "":
+        return ""
+    return validate_release_path(value)
+
+
+def _source_tree_path(source_tree_root: str, package_path: str) -> str:
+    logical_path = validate_release_path(package_path)
+    if not source_tree_root:
+        return logical_path
+    return f"{source_tree_root}/{logical_path}"
+
+
+def _read_package_blob(
+    reader: GitObjectReader,
+    commit: str,
+    source_tree_root: str,
+    package_path: str,
+) -> GitBlob:
+    logical_path = validate_release_path(package_path)
+    source_blob = reader.read_blob(
+        commit,
+        _source_tree_path(source_tree_root, logical_path),
+    )
+    return GitBlob(
+        path=logical_path,
+        mode=source_blob.mode,
+        object_id=source_blob.object_id,
+        content=source_blob.content,
+    )
+
+
 def canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -282,6 +315,7 @@ def _source_inventory(
     reader: GitObjectReader,
     commit: str,
     source_index_path: str,
+    source_tree_root: str = "",
 ) -> tuple[
     dict[str, Any],
     dict[str, Any],
@@ -289,7 +323,12 @@ def _source_inventory(
     ReleaseCatalog | None,
     str,
 ]:
-    source_index_blob = reader.read_blob(commit, source_index_path)
+    source_index_blob = _read_package_blob(
+        reader,
+        commit,
+        source_tree_root,
+        source_index_path,
+    )
     if len(source_index_blob.content) > MAX_INDEX_BYTES:
         raise CoreReleaseError("source index exceeds size limit")
     source_index = _json_object(source_index_blob.content, "source index")
@@ -316,7 +355,10 @@ def _source_inventory(
         if path not in paths:
             raise CoreReleaseError(f"source index reference is not packaged: {field}")
 
-    blobs = [reader.read_blob(commit, path) for path in sorted(paths)]
+    blobs = [
+        _read_package_blob(reader, commit, source_tree_root, path)
+        for path in sorted(paths)
+    ]
     total_bytes = sum(len(blob.content) for blob in blobs)
     if total_bytes > MAX_RELEASE_BYTES:
         raise CoreReleaseError("release payload exceeds size limit")
@@ -427,6 +469,7 @@ def _payload_material(
     source_index_sha256: str,
     distribution_manifest_sha256: str,
     files: list[dict[str, Any]],
+    source_tree_root: str = "",
     schema: str = RELEASE_SCHEMA,
     profile_catalog: dict[str, Any] | None = None,
     governance_catalog: dict[str, Any] | None = None,
@@ -441,6 +484,8 @@ def _payload_material(
         "distribution_manifest_sha256": distribution_manifest_sha256,
         "files": files,
     }
+    if source_tree_root:
+        result["source_tree_root"] = source_tree_root
     if profile_catalog is not None:
         result["profile_catalog"] = profile_catalog
     if governance_catalog is not None:
@@ -457,11 +502,13 @@ def build_release(
     manifest_path: Path,
     expected_commit: str = "",
     source_index_path: str = DEFAULT_SOURCE_INDEX,
+    source_tree_root: str = "",
 ) -> dict[str, Any]:
     normalized_repository = source_repository.strip()
     if not normalized_repository:
         raise CoreReleaseError("source_repository is required")
     source_index_path = validate_release_path(source_index_path)
+    source_tree_root = validate_source_tree_root(source_tree_root)
     reader = GitObjectReader(source_repo)
     source_commit = reader.resolve_commit(source_ref)
     if expected_commit and source_commit != expected_commit.strip().lower():
@@ -472,6 +519,7 @@ def build_release(
         reader,
         source_commit,
         source_index_path,
+        source_tree_root,
         )
     )
     blob_by_path = {blob.path: blob for blob in blobs}
@@ -503,6 +551,7 @@ def build_release(
         source_index_sha256=blob_by_path[source_index_path].sha256,
         distribution_manifest_sha256=blob_by_path[distribution_path].sha256,
         files=file_material,
+        source_tree_root=source_tree_root,
         profile_catalog=profile_material,
         governance_catalog=(
             governance_material
@@ -565,6 +614,8 @@ def build_release(
             governance_material["governance_override_count"]
         ),
     }
+    if source_tree_root:
+        metadata["source_tree_root"] = source_tree_root
     _write_database(database_path, metadata, blobs, catalog=profile_catalog)
     database_sha256 = sha256_bytes(database_path.read_bytes())
     manifest = {
@@ -584,6 +635,8 @@ def build_release(
         "candidate_execution": "FORBIDDEN",
         "profile_catalog": profile_material,
     }
+    if source_tree_root:
+        manifest["source_tree_root"] = source_tree_root
     if isinstance(profile_catalog, GovernanceCatalog):
         manifest["governance_catalog"] = governance_material
     _write_json_atomic(manifest_path, manifest)
@@ -946,6 +999,9 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             "",
         ),
         files=files,
+        source_tree_root=validate_source_tree_root(
+            str(metadata.get("source_tree_root", ""))
+        ),
         schema=metadata["schema"],
         profile_catalog=profile_material,
         governance_catalog=(
@@ -973,6 +1029,8 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         expected_manifest["profile_catalog"] = profile_material
     if governance_material is not None and governance_material["status"] == "PRESENT":
         expected_manifest["governance_catalog"] = governance_material
+    if "source_tree_root" in metadata:
+        expected_manifest["source_tree_root"] = metadata["source_tree_root"]
     for field, value in expected_manifest.items():
         if manifest.get(field) != value:
             raise CoreReleaseError(f"release manifest field mismatch: {field}")
@@ -1341,6 +1399,11 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--source-repository", required=True)
     build.add_argument("--expected-commit", default="")
     build.add_argument("--source-index", default=DEFAULT_SOURCE_INDEX)
+    build.add_argument(
+        "--source-tree-root",
+        default="",
+        help="Git-tree prefix containing the logical runtime package.",
+    )
     build.add_argument("--database", type=Path, required=True)
     build.add_argument("--manifest", type=Path, required=True)
 
@@ -1360,6 +1423,7 @@ def main() -> int:
                 source_repository=args.source_repository,
                 expected_commit=args.expected_commit,
                 source_index_path=args.source_index,
+                source_tree_root=args.source_tree_root,
                 database_path=args.database,
                 manifest_path=args.manifest,
             )

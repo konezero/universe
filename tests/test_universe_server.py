@@ -5264,6 +5264,21 @@ class UniverseLocalServiceTests(unittest.TestCase):
             applied["receipt"]["application_id"],
             repeated["receipt"]["application_id"],
         )
+        selection_status, selection = self.request(
+            "GET",
+            "/v1/projects/GCS/release-selection",
+            token=self.token,
+        )
+        self.assertEqual(200, selection_status)
+        self.assertEqual("PROJECT_RELEASE_SELECTION_COLLECTED", selection["status"])
+        self.assertEqual("SELECTED", selection["selection"]["status"])
+        self.assertEqual(
+            imported["release"]["release_id"], selection["selection"]["release_id"]
+        )
+        self.assertEqual(
+            applied["receipt"]["application_id"],
+            selection["selection"]["application_id"],
+        )
         apply_release.assert_called_once()
         call = apply_release.call_args.kwargs
         self.assertEqual(self.project_root, call["project_root"])

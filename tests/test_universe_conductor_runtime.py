@@ -162,6 +162,12 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 root,
                 native_runner=native_runner,
                 source_commit_resolver=lambda _: "a" * 40,
+                source_binding_resolver=lambda _root: {
+                    "status": "SELECTED",
+                    "release_id": "core-test",
+                    "source_commit": "b" * 40,
+                    "database_sha256": "c" * 64,
+                },
                 process_factory=process_factory,
                 session_supervisor=(
                     supervisor := SessionSupervisorStore(
@@ -213,6 +219,11 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             self.assertEqual("COMMANDER_INPUT_OBSERVED", observed["status"])
             self.assertEqual("CONDUCTOR", requests[0]["mode"])
             self.assertEqual("CONDUCTOR", requests[0]["role"])
+            self.assertEqual(
+                f"universe-release-db://core-test@{'c' * 64}",
+                requests[0]["source_ref"],
+            )
+            self.assertEqual("b" * 40, requests[0]["source_commit"])
             self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
             self.assertIn("session-boot", process.command)
             self.assertEqual(

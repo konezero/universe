@@ -1771,6 +1771,12 @@ class ProjectMasterHostTests(unittest.TestCase):
             "grok-cli:session-001",
             native_runner=runner,
             source_commit_resolver=lambda _root: "a" * 40,
+            source_binding_resolver=lambda _root: {
+                "status": "SELECTED",
+                "release_id": "core-test",
+                "source_commit": "b" * 40,
+                "database_sha256": "c" * 64,
+            },
         )
         with patch(
             "project_master_host._required_host_executable",
@@ -1780,6 +1786,11 @@ class ProjectMasterHostTests(unittest.TestCase):
             coordinator.observe(self._envelope()["message"])
 
         self.assertEqual("MASTER", requests[0]["mode"])
+        self.assertEqual(
+            f"universe-release-db://core-test@{'c' * 64}",
+            requests[0]["source_ref"],
+        )
+        self.assertEqual("b" * 40, requests[0]["source_commit"])
         self.assertEqual("grok-cli:session-001", requests[0]["host_session_ref"])
         self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
         self.assertEqual(

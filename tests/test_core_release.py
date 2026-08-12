@@ -284,6 +284,43 @@ class CoreReleaseTests(unittest.TestCase):
             connection.close()
         self.assertEqual(0, governance_rows)
 
+    def test_builds_logical_package_from_nested_git_tree(self) -> None:
+        source_tree_root = "core/runtime-source"
+        nested_root = self.repo / source_tree_root
+        nested_root.mkdir(parents=True)
+        (self.repo / ".ai").rename(nested_root / ".ai")
+        self.commit = self._commit("nest-runtime-source")
+
+        manifest = build_release(
+            source_repo=self.repo,
+            source_ref=self.commit,
+            expected_commit=self.commit,
+            source_repository="fixture/ai-career",
+            source_tree_root=source_tree_root,
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+        verified = verify_release(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+
+        self.assertEqual(source_tree_root, manifest["source_tree_root"])
+        self.assertEqual("CORE_RELEASE_VERIFIED", verified["status"])
+        connection = sqlite3.connect(self.database)
+        try:
+            paths = {
+                row[0]
+                for row in connection.execute("SELECT path FROM release_file")
+            }
+        finally:
+            connection.close()
+        self.assertIn(".ai/core/CORE_SURFACE_REGISTRY.md", paths)
+        self.assertNotIn(
+            "core/runtime-source/.ai/core/CORE_SURFACE_REGISTRY.md",
+            paths,
+        )
+
     def test_database_tampering_is_rejected(self) -> None:
         self._build()
         connection = sqlite3.connect(self.database)

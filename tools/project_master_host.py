@@ -119,6 +119,7 @@ PermissionPoster = Callable[..., dict[str, Any]]
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceCommitResolver = Callable[[Path], str]
+SourceBindingResolver = Callable[[Path], Mapping[str, Any]]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
 NativeRoomObserver = Callable[[Mapping[str, Any]], None]
 RoomPermissionObserver = Callable[
@@ -146,6 +147,7 @@ class ProjectModeCoordinator:
         *,
         native_runner: NativeRunner = run_native_cli,
         source_commit_resolver: SourceCommitResolver | None = None,
+        source_binding_resolver: SourceBindingResolver | None = None,
         session_supervisor: SessionSupervisorStore | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
@@ -153,6 +155,7 @@ class ProjectModeCoordinator:
         self.host_session_ref = _text(host_session_ref, "host_session_ref")
         self.native_runner = native_runner
         self.source_commit_resolver = source_commit_resolver or self._git_head
+        self.source_binding_resolver = source_binding_resolver
         self.session_supervisor = session_supervisor
         self.runtime_cli = (
             self.project_root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
@@ -169,16 +172,17 @@ class ProjectModeCoordinator:
         self._lease_token: str | None = None
         self._lease_version: int | None = None
         self._process_identity: dict[str, Any] | None = None
+        self._source_binding: dict[str, str] | None = None
 
     def prepare(self) -> Mapping[str, Any]:
         definition = self._master_definition()
-        source_commit = self.source_commit_resolver(self.project_root)
+        source = self._resolved_source_binding()
         request = {
             "command": "BOOT",
             "source_state": "SOURCE_READY",
-            "source_ref": (f"git-object-database://{self.project_id}@{source_commit}"),
-            "source_commit": source_commit,
-            "source_repository": str(self.project_root),
+            "source_ref": source["source_ref"],
+            "source_commit": source["source_commit"],
+            "source_repository": source["source_repository"],
             "mode": "MASTER",
             "role": definition["role"],
             "scope": definition["scope"],
@@ -960,10 +964,45 @@ class ProjectModeCoordinator:
             "anchor_id": binding["anchor_id"],
             "currentness": binding["runtime_currentness_observation"],
             "source_ref": (
-                f"git-object-database://{self.project_id}@"
-                + self.source_commit_resolver(self.project_root)
+                self._resolved_source_binding()["source_ref"]
             ),
         }
+
+    def _resolved_source_binding(self) -> dict[str, str]:
+        if self._source_binding is not None:
+            return dict(self._source_binding)
+        if self.source_binding_resolver is None:
+            source_commit = self.source_commit_resolver(self.project_root)
+            binding = {
+                "source_ref": f"git-object-database://{self.project_id}@{source_commit}",
+                "source_commit": source_commit,
+                "source_repository": str(self.project_root),
+            }
+        else:
+            candidate = self.source_binding_resolver(self.project_root)
+            if not isinstance(candidate, Mapping):
+                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_UNAVAILABLE")
+            if str(candidate.get("status") or "").upper() != "SELECTED":
+                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_REQUIRED")
+            release_id = _text(candidate.get("release_id"), "release_id")
+            source_commit = _text(candidate.get("source_commit"), "source_commit").lower()
+            database_sha256 = _text(
+                candidate.get("database_sha256"), "database_sha256"
+            ).lower()
+            if (
+                len(source_commit) != 40
+                or any(character not in "0123456789abcdef" for character in source_commit)
+                or len(database_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in database_sha256)
+            ):
+                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_INVALID")
+            binding = {
+                "source_ref": f"universe-release-db://{release_id}@{database_sha256}",
+                "source_commit": source_commit,
+                "source_repository": str(self.project_root),
+            }
+        self._source_binding = binding
+        return dict(binding)
 
     def _ensure_runtime(self) -> dict[str, str]:
         with self._runtime_lock:
@@ -4118,6 +4157,7 @@ class ResidentProjectMasterHostManager:
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
+        release_source_binding_resolver: GovernanceContextResolver | None = None,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
@@ -4133,6 +4173,7 @@ class ResidentProjectMasterHostManager:
         )
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
+        self.release_source_binding_resolver = release_source_binding_resolver
         self.completion_observer = completion_observer
         self.room_event_observer = room_event_observer
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
@@ -4145,6 +4186,13 @@ class ResidentProjectMasterHostManager:
             .expanduser()
             .resolve(strict=True)
         )
+        if self.release_source_binding_resolver is not None:
+            release_binding = self.release_source_binding_resolver(project_id)
+            if (
+                not isinstance(release_binding, Mapping)
+                or str(release_binding.get("status") or "").upper() != "SELECTED"
+            ):
+                raise ProjectMasterHostError("PROJECT_RELEASE_SELECTION_REQUIRED")
         selected_provider = _provider(self.provider_resolver(project_id))
         selected_model = str(
             self.model_resolver(project_id, selected_provider) or ""
@@ -4677,6 +4725,11 @@ class ResidentProjectMasterHostManager:
             project_root,
             project_id,
             host_session_ref,
+            source_binding_resolver=(
+                (lambda _root: self.release_source_binding_resolver(project_id))
+                if self.release_source_binding_resolver is not None
+                else None
+            ),
             session_supervisor=self.session_supervisor,
         )
 

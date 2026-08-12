@@ -4763,6 +4763,21 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_release_application_project_time
                 ON project_release_application(project_id, applied_at, application_id);
 
+                CREATE TABLE IF NOT EXISTS project_release_selection (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    release_id TEXT NOT NULL
+                        REFERENCES release_artifact(release_id),
+                    application_id TEXT NOT NULL UNIQUE
+                        REFERENCES project_release_application(application_id)
+                        ON DELETE CASCADE,
+                    selected_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_release_selection_release
+                ON project_release_selection(release_id);
+
                 CREATE TABLE IF NOT EXISTS universe_identity (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     universe_id TEXT NOT NULL UNIQUE,
@@ -4814,6 +4829,28 @@ class UniverseStore:
                     setting_value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_release_selection(
+                    project_id, release_id, application_id, selected_at
+                )
+                SELECT application.project_id, application.release_id,
+                       application.application_id, application.applied_at
+                FROM project_release_application AS application
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM project_release_application AS newer
+                    WHERE newer.project_id = application.project_id
+                      AND (
+                        newer.applied_at > application.applied_at
+                        OR (
+                            newer.applied_at = application.applied_at
+                            AND newer.application_id > application.application_id
+                        )
+                      )
+                )
                 """
             )
             decision_columns = {
@@ -13098,6 +13135,40 @@ class UniverseStore:
             "database_sha256": row["database_sha256"],
         }
 
+    def selected_project_release_binding(self, project_id: str) -> dict[str, Any]:
+        """Return the durable, installed Release DB selection for one Node."""
+
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT selection.release_id, selection.application_id,
+                       selection.selected_at, artifact.source_repository,
+                       artifact.source_commit, artifact.database_sha256
+                FROM project_release_selection AS selection
+                JOIN release_artifact AS artifact
+                  ON artifact.release_id = selection.release_id
+                WHERE selection.project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchone()
+        if row is None:
+            return {
+                "status": "ABSENT",
+                "project_id": project["project_id"],
+                "reason": "RELEASE_SELECTION_REQUIRED",
+            }
+        return {
+            "status": "SELECTED",
+            "project_id": project["project_id"],
+            "release_id": str(row["release_id"]),
+            "application_id": str(row["application_id"]),
+            "selected_at": str(row["selected_at"]),
+            "source_repository": str(row["source_repository"]),
+            "source_commit": str(row["source_commit"]),
+            "database_sha256": str(row["database_sha256"]),
+        }
+
     def get_project_release_application(
         self,
         proposal_id: str,
@@ -13178,6 +13249,23 @@ class UniverseStore:
                     release_id,
                     normalized_approval,
                     _canonical_json(stored_receipt),
+                    applied_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO project_release_selection(
+                    project_id, release_id, application_id, selected_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    release_id = excluded.release_id,
+                    application_id = excluded.application_id,
+                    selected_at = excluded.selected_at
+                """,
+                (
+                    project["project_id"],
+                    release_id,
+                    application_id,
                     applied_at,
                 ),
             )
@@ -14563,6 +14651,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     if conductor_runtime_factory is not None
                     else UniverseConductorRuntime(
                         Path(__file__).resolve().parents[1],
+                        source_binding_resolver=(
+                            lambda _root: self.store.selected_project_release_binding(
+                                "universe"
+                            )
+                        ),
                         session_supervisor=self.session_supervisor,
                     )
                 )
@@ -14608,6 +14701,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 model_resolver=self._resolve_project_master_model,
                 effort_resolver=self._resolve_project_master_effort,
                 governance_context_resolver=self._project_master_governance_context,
+                release_source_binding_resolver=(
+                    lambda project_id: self.store.selected_project_release_binding(
+                        project_id
+                    )
+                ),
                 completion_observer=self._observe_project_master_completion,
                 room_event_observer=self._observe_native_room_event,
             )
@@ -15401,9 +15499,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _project_master_governance_context(self, project_id: str) -> dict[str, Any]:
         """Resolve the minimal immutable v2 context for one project Master."""
 
-        release_id = self.store.active_shared_runtime_release_id(project_id)
-        if release_id is None:
-            return {"status": "ABSENT", "reason": "NO_SHARED_RELEASE"}
+        selection = self.store.selected_project_release_binding(project_id)
+        if selection["status"] != "SELECTED":
+            return dict(selection)
+        release_id = str(selection["release_id"])
         artifact = self.store.get_release_artifact_binding(release_id)
         try:
             with ReleaseRuntime(
@@ -20468,6 +20567,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/release-selection":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_RELEASE_SELECTION_COLLECTED",
+                        "selection": self.server.store.selected_project_release_binding(
+                            project_id
+                        ),
+                    },
+                )
+                return
             if suffix == "/seed":
                 self._send(
                     HTTPStatus.OK,
@@ -22733,6 +22844,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/context-packs",
             "/release-proposals/apply",
             "/release-proposals",
+            "/release-selection",
             "/runtime-worker-results",
             "/runtime-worker-invocations",
             "/dispatches",

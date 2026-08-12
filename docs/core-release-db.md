@@ -61,6 +61,10 @@ Implemented:
   bytes;
 - receipt-aware Project Lifecycle Host application after exact plan approval;
 - durable, idempotent application receipts.
+- durable per-Project release selection created only by a successful lifecycle
+  application;
+- Resident Universe Conductor and Project Master Boot source binding resolved
+  from the selected Release DB, rather than the mutable working-tree `HEAD`.
 
 Not implemented yet:
 
@@ -88,6 +92,34 @@ A proposal resolves the current Project lifecycle as `OS_INSTALL` or
 `OS_UPDATE` and binds the target root, Project identity, Release DB identity,
 source commit, installed manifest digest, and plan digest. Proposal creation is
 read-only and persists `project_write: NONE`.
+
+## Release Selection and Boot
+
+`project_release_application` is an immutable history of applied lifecycle
+receipts. `project_release_selection` is the one current release that a
+Project is allowed to use for resident runtime Boot. A successful, validated
+application updates that selection atomically; merely importing a Release DB,
+creating a proposal, or creating a temporary Runtime lease does not.
+
+```text
+Release DB import
+  -> approved OS_INSTALL / OS_UPDATE
+  -> verified lifecycle application receipt
+  -> durable Project release selection
+  -> Conductor / Project Master Boot source binding
+```
+
+At Boot, the runtime receives a source reference in this form:
+
+```text
+universe-release-db://<release_id>@<release_database_sha256>
+```
+
+and the pinned source commit from the same selected artifact. It must not
+resolve its source identity from the mutable Project worktree. If the Project
+has no selected release, resident Boot fails closed with a release-selection
+required state. This does not affect standalone command-line/test adapters
+that are intentionally constructed without the Universe release resolver.
 
 The apply route accepts only `APPROVED` plus the exact proposal ID and digest.
 The Universe-owned Project Lifecycle Host then:

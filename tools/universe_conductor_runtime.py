@@ -26,6 +26,7 @@ class UniverseConductorRuntimeError(RuntimeError):
 
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 SourceCommitResolver = Callable[[Path], str]
+SourceBindingResolver = Callable[[Path], Mapping[str, Any]]
 
 
 class RuntimeProcess(Protocol):
@@ -54,6 +55,7 @@ class UniverseConductorRuntime:
         *,
         native_runner: NativeRunner = run_native_cli,
         source_commit_resolver: SourceCommitResolver | None = None,
+        source_binding_resolver: SourceBindingResolver | None = None,
         process_factory: ProcessFactory = subprocess.Popen,
         startup_timeout: float = 30,
         session_supervisor: SessionSupervisorStore | None = None,
@@ -61,6 +63,7 @@ class UniverseConductorRuntime:
         self.repository_root = repository_root.expanduser().resolve(strict=True)
         self.native_runner = native_runner
         self.source_commit_resolver = source_commit_resolver or self._git_head
+        self.source_binding_resolver = source_binding_resolver
         self.process_factory = process_factory
         self.startup_timeout = startup_timeout
         self.session_supervisor = session_supervisor
@@ -81,6 +84,7 @@ class UniverseConductorRuntime:
         self._lease_token: str | None = None
         self._lease_version: int | None = None
         self._process_identity: dict[str, Any] | None = None
+        self._source_binding: dict[str, str] | None = None
 
     def start(self) -> Mapping[str, Any]:
         if self._binding is not None and self._process is not None:
@@ -93,18 +97,16 @@ class UniverseConductorRuntime:
             self._process = None
 
         definition = self._conductor_definition()
-        source_commit = self.source_commit_resolver(self.repository_root)
+        source = self._resolved_source_binding()
         host_session_ref = f"universe://local-service/conductor/{uuid4().hex}"
         prepared = self._invoke(
             ("prepare-session", "--repo-root", str(self.repository_root)),
             {
                 "command": "BOOT",
                 "source_state": "SOURCE_READY",
-                "source_ref": (
-                    f"git-object-database://universe@{source_commit}"
-                ),
-                "source_commit": source_commit,
-                "source_repository": str(self.repository_root),
+                "source_ref": source["source_ref"],
+                "source_commit": source["source_commit"],
+                "source_repository": source["source_repository"],
                 "mode": "CONDUCTOR",
                 "role": definition["role"],
                 "scope": definition["scope"],
@@ -308,10 +310,7 @@ class UniverseConductorRuntime:
             "currentness": str(
                 self._binding["runtime_currentness_observation"]
             ),
-            "source_ref": (
-                "git-object-database://universe@"
-                + self.source_commit_resolver(self.repository_root)
-            ),
+            "source_ref": self._resolved_source_binding()["source_ref"],
         }
 
     def _register_process_lease(
@@ -585,6 +584,48 @@ class UniverseConductorRuntime:
                 "UNIVERSE_MODE_BOOT_BINDING_MISMATCH"
             )
         return normalized
+
+    def _resolved_source_binding(self) -> dict[str, str]:
+        if self._source_binding is not None:
+            return dict(self._source_binding)
+        if self.source_binding_resolver is None:
+            source_commit = self.source_commit_resolver(self.repository_root)
+            binding = {
+                "source_ref": f"git-object-database://universe@{source_commit}",
+                "source_commit": source_commit,
+                "source_repository": str(self.repository_root),
+            }
+        else:
+            candidate = self.source_binding_resolver(self.repository_root)
+            if not isinstance(candidate, Mapping):
+                raise UniverseConductorRuntimeError(
+                    "UNIVERSE_RELEASE_SELECTION_UNAVAILABLE"
+                )
+            if str(candidate.get("status") or "").upper() != "SELECTED":
+                raise UniverseConductorRuntimeError(
+                    "UNIVERSE_RELEASE_SELECTION_REQUIRED"
+                )
+            release_id = _text(candidate.get("release_id"), "release_id")
+            source_commit = _text(candidate.get("source_commit"), "source_commit").lower()
+            database_sha256 = _text(
+                candidate.get("database_sha256"), "database_sha256"
+            ).lower()
+            if (
+                len(source_commit) != 40
+                or any(character not in "0123456789abcdef" for character in source_commit)
+                or len(database_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in database_sha256)
+            ):
+                raise UniverseConductorRuntimeError(
+                    "UNIVERSE_RELEASE_SELECTION_INVALID"
+                )
+            binding = {
+                "source_ref": f"universe-release-db://{release_id}@{database_sha256}",
+                "source_commit": source_commit,
+                "source_repository": str(self.repository_root),
+            }
+        self._source_binding = binding
+        return dict(binding)
 
     def _git_head(self, repository_root: Path) -> str:
         result = self.native_runner(
