@@ -659,6 +659,18 @@ class ClaudeResidentSession:
         if subtype in QUOTA_RESULT_SUBTYPES:
             self._handle_rate_limit(event)
             return
+        errors = event.get("errors")
+        if (
+            subtype == "error_during_execution"
+            and isinstance(errors, list)
+            and any(
+                "No conversation found with session ID:" in str(error)
+                for error in errors
+            )
+        ):
+            self._turn_error = "CLAUDE_SESSION_RESUME_NOT_FOUND"
+            self._turn_done.set()
+            return
         if event.get("is_error") is True or subtype != "success":
             self._turn_error = f"CLAUDE_RESULT_FAILED:{subtype or 'unknown'}"
             self._turn_done.set()

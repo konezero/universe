@@ -213,6 +213,7 @@ const elements = {
   unassignedWorkCount: document.querySelector("#unassigned-work-count"),
   addGoalButton: document.querySelector("#add-goal-button"),
   goalPlanMap: document.querySelector("#goal-plan-map"),
+  editSelectedGoal: document.querySelector("#edit-selected-goal"),
   utilityRail: document.querySelector(".utility-rail"),
   mobileWorkTabs: document.querySelector(".mobile-work-tabs"),
   mobileDelegateGoal: document.querySelector("#mobile-delegate-goal"),
@@ -353,6 +354,7 @@ const elements = {
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
   conversationLayer: document.querySelector("#conversation-layer"),
   conversationToggle: document.querySelector("#conversation-toggle"),
+  conversationExpand: document.querySelector("#conversation-expand"),
   conversationBadge: document.querySelector("#conversation-badge"),
   actionInboxButton: document.querySelector("#action-inbox-button"),
   actionInboxBadge: document.querySelector("#action-inbox-badge"),
@@ -394,6 +396,8 @@ const elements = {
     "#fresh-project-handoff-status"
   ),
 };
+
+let conversationLayerHome = null;
 
 function node(tag, className, text) {
   const item = document.createElement(tag);
@@ -652,6 +656,37 @@ function uniqueTimeRows(session) {
 function selectSupervisorSession(session) {
   state.selectedSupervisorAnchorKey = session ? anchorSessionKey(session) : null;
   renderSessionObservatory();
+}
+
+function markdownBody(text) {
+  const root = node("div", "markdown-body");
+  const lines = String(text || "").replaceAll("\r\n", "\n").split("\n");
+  let code = null;
+  for (const line of lines) {
+    if (line.startsWith("```")) {
+      if (code) {
+        root.append(code);
+        code = null;
+      } else {
+        code = node("pre", "markdown-code");
+      }
+      continue;
+    }
+    if (code) {
+      code.textContent += `${line}\n`;
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      root.append(node(`h${heading[1].length + 2}`, "", heading[2]));
+    } else if (/^[-*]\s+/.test(line)) {
+      root.append(node("div", "markdown-list-item", line.replace(/^[-*]\s+/, "")));
+    } else if (line.trim()) {
+      root.append(node("p", "", line));
+    }
+  }
+  if (code) root.append(code);
+  return root;
 }
 
 function renderSessionWorkingDirectory(session) {
@@ -3190,31 +3225,44 @@ function renderActionInbox() {
   }
 }
 
-function finishRoomMessageRender(previousScrollTop) {
-  elements.roomMessageList.scrollTop = previousScrollTop;
+function finishRoomMessageRender(previousScrollTop, stickToBottom = false) {
+  elements.roomMessageList.scrollTop = stickToBottom
+    ? elements.roomMessageList.scrollHeight
+    : previousScrollTop;
   updateConversationBadge();
   renderActionInbox();
 }
 
 function renderRoomMessages() {
   const previousScrollTop = elements.roomMessageList.scrollTop;
+  const stickToBottom =
+    elements.roomMessageList.scrollHeight -
+      elements.roomMessageList.clientHeight -
+      previousScrollTop < 48;
+  const transcriptExpanded = Boolean(
+    elements.conversationLayer?.classList.contains("expanded") ||
+      elements.conversationExpand?.checked
+  );
   elements.roomMessageList.replaceChildren();
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     if (!state.providerSessionMessages.length) {
       elements.roomMessageList.append(
         node("p", "empty-copy", "No messages observed in this live session yet")
       );
-      finishRoomMessageRender(previousScrollTop);
+      finishRoomMessageRender(previousScrollTop, stickToBottom);
       return;
     }
-    for (const message of state.providerSessionMessages.slice(-20)) {
+    const providerMessages = transcriptExpanded
+      ? state.providerSessionMessages
+      : state.providerSessionMessages.slice(-20);
+    for (const message of providerMessages) {
       const item = node(
         "article",
         `room-message provider-session-message ${String(message.role || "").toLowerCase()}`
       );
       item.append(
         node("strong", "", String(message.role || "UNKNOWN")),
-        node("p", "provider-session-body", String(message.body || "")),
+        markdownBody(message.body),
         node(
           "small",
           "",
@@ -3225,7 +3273,7 @@ function renderRoomMessages() {
       );
       elements.roomMessageList.append(item);
     }
-    finishRoomMessageRender(previousScrollTop);
+    finishRoomMessageRender(previousScrollTop, stickToBottom);
     return;
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
@@ -3238,7 +3286,10 @@ function renderRoomMessages() {
       );
       elements.roomMessageList.append(item);
     }
-    for (const message of state.conductorMessages.slice(-8)) {
+    const conductorMessages = transcriptExpanded
+      ? state.conductorMessages
+      : state.conductorMessages.slice(-8);
+    for (const message of conductorMessages) {
       const item = node("article", "room-message conductor-message");
       const failure = message.failure?.reason
         ? ` / ${message.failure.reason}`
@@ -3246,7 +3297,7 @@ function renderRoomMessages() {
       const provider = message.provider ? ` / ${message.provider}` : "";
       item.append(
         node("strong", "", `${message.sender} / ${message.kind}`),
-        node("p", "", message.body),
+        markdownBody(message.body),
         node(
           "small",
           "",
@@ -3279,12 +3330,12 @@ function renderRoomMessages() {
       const item = node("article", "room-message conductor-message streaming");
       item.append(
         node("strong", "", "CONDUCTOR / LIVE"),
-        node("p", "", stream.body || stream.state || "Thinking"),
+        markdownBody(stream.body || stream.state || "Thinking"),
         node("small", "", stream.state || "Responding")
       );
       elements.roomMessageList.append(item);
     }
-    finishRoomMessageRender(previousScrollTop);
+    finishRoomMessageRender(previousScrollTop, stickToBottom);
     return;
   }
   if (!state.roomMessages.length) {
@@ -3295,14 +3346,17 @@ function renderRoomMessages() {
         `No messages for ${state.conversationTarget.projectId} Master`
       )
     );
-    finishRoomMessageRender(previousScrollTop);
+    finishRoomMessageRender(previousScrollTop, stickToBottom);
     return;
   }
-  for (const message of state.roomMessages.slice(-8)) {
+  const roomMessages = transcriptExpanded
+    ? state.roomMessages
+    : state.roomMessages.slice(-8);
+  for (const message of roomMessages) {
     const item = node("article", "room-message");
     item.append(
       node("strong", "", `${message.sender} / ${message.kind}`),
-      node("p", "", message.body),
+      markdownBody(message.body),
       node("small", "", message.delivery_state)
     );
     elements.roomMessageList.append(item);
@@ -3311,12 +3365,12 @@ function renderRoomMessages() {
     const item = node("article", "room-message streaming");
     item.append(
       node("strong", "", "PROJECT_MASTER / LIVE"),
-      node("p", "", reply.body || "Thinking..."),
+      markdownBody(reply.body || "Thinking..."),
       node("small", "", reply.state)
     );
     elements.roomMessageList.append(item);
   }
-  finishRoomMessageRender(previousScrollTop);
+  finishRoomMessageRender(previousScrollTop, stickToBottom);
 }
 
 function renderGovernanceProposalCard(proposal) {
@@ -7684,6 +7738,9 @@ async function refreshGoalPlan() {
   );
   state.goals = result.goals || [];
   state.unassignedTodos = result.unassigned_todos || [];
+  if (!state.goals.some((goal) => goal.goal_id === state.selectedGoalId)) {
+    state.selectedGoalId = state.goals[0]?.goal_id || null;
+  }
   renderGoalPlan();
 }
 
@@ -7695,6 +7752,79 @@ function planTodoRow(todo) {
     node("span", `plan-state ${String(todo.state).toLowerCase()}`, planStateLabel(todo.state))
   );
   return row;
+}
+
+function renderGoalInspector(goal, index) {
+  if (!goal || !elements.details) return;
+  const progress = goalProgress(goal);
+  const todos = [
+    ...(goal.todos || []),
+    ...(goal.milestones || []).flatMap((item) => item.todos || []),
+  ];
+  const blocked = todos.filter((todo) => todo.state === "BLOCKED").length;
+  elements.inspectorTitle.textContent = `${index + 1}. ${goal.title}`;
+  elements.inspectorSubtitle.textContent = `${planStateLabel(goal.state)} / Goal details`;
+  elements.details.replaceChildren();
+  const actions = node("div", "goal-inspector-actions");
+  const delegate = node("button", "primary-button", "Delegate goal");
+  delegate.type = "button";
+  delegate.addEventListener("click", () => {
+    elements.dispatchInstruction.value = `Delegate goal "${goal.title}" to the Project Master.`;
+    elements.dispatchInstruction.focus();
+  });
+  const edit = node("button", "secondary-button", "Edit plan");
+  edit.type = "button";
+  edit.addEventListener("click", () => openGoalEditor(goal));
+  actions.append(delegate, edit);
+  const description = node("section", "goal-detail-section");
+  description.append(node("h3", "", "Description"), node("p", "", goal.description || "No description yet."));
+  const metrics = node("section", "goal-detail-section goal-detail-metrics");
+  for (const [label, value, tone] of [
+    ["Design readiness", goal.state === "DESIGNING" ? 35 : goal.state === "READY" ? 80 : 100, "readiness"],
+    ["Progress", progress, "progress"],
+  ]) {
+    const item = node("div", `detail-meter ${tone}`);
+    const heading = node("div", "detail-meter-heading");
+    heading.append(node("span", "", label), node("strong", "", `${value}%`));
+    const track = node("div", "detail-meter-track");
+    const fill = node("i", "");
+    fill.style.width = `${value}%`;
+    track.append(fill);
+    item.append(heading, track);
+    metrics.append(item);
+  }
+  const facts = node("dl", "goal-detail-facts");
+  for (const [label, value] of [
+    ["Owner / Agent", goal.owner || "Project Master"],
+    ["Milestones", String((goal.milestones || []).length)],
+    ["Needs attention", String(blocked)],
+    ["Started", goal.created_at || "Unknown"],
+    ["Last updated", goal.updated_at || "Unknown"],
+  ]) addDetail(facts, label, value);
+  const activity = node("section", "goal-detail-section");
+  activity.append(node("h3", "", "Activity"));
+  const timeline = node("div", "goal-activity-list");
+  const recent = todos.slice().sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, 5);
+  if (!recent.length) timeline.append(node("p", "empty-copy", "No activity yet."));
+  for (const todo of recent) {
+    const row = node("div", "goal-activity-item");
+    row.append(node("i", ""), node("span", "", `${todo.title} / ${planStateLabel(todo.state)}`), node("time", "", todo.updated_at || ""));
+    timeline.append(row);
+  }
+  activity.append(timeline);
+  elements.details.append(actions, description, metrics, facts, activity);
+}
+
+function openGoalEditor(goal) {
+  if (!goal) return;
+  elements.goalForm.dataset.goalId = goal.goal_id;
+  elements.goalForm.elements.title.value = goal.title || "";
+  elements.goalForm.elements.description.value = goal.description || "";
+  elements.goalForm.elements.owner.value = goal.owner || "Project Master";
+  elements.goalForm.elements.state.value = goal.state || "DESIGNING";
+  elements.goalDialog.querySelector("h2").textContent = "Edit goal";
+  elements.goalDialog.querySelector('[type="submit"]').textContent = "Save goal";
+  elements.goalDialog.showModal();
 }
 
 function renderGoalPlan() {
@@ -7719,15 +7849,16 @@ function renderGoalPlan() {
   ]);
   const done = todos.filter((todo) => todo.state === "DONE").length;
   const progress = todos.length ? Math.round((done / todos.length) * 100) : 0;
-  const readyGoals = state.goals.filter((goal) => ["READY", "IN_PROGRESS", "DONE"].includes(goal.state)).length;
+  const readyGoals = state.goals.filter((goal) => ["READY", "ACTIVE", "DONE"].includes(goal.state)).length;
   const readiness = state.goals.length ? Math.round((readyGoals / state.goals.length) * 100) : 0;
   const milestoneCount = state.goals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
   const owner = state.goals[0]?.owner || "Project Master";
   elements.goalPlanSummary.replaceChildren();
+  const needsYou = state.unassignedTodos.length + todos.filter((todo) => todo.state === "BLOCKED").length;
   for (const [label, value] of [
     ["Design readiness", `${readiness}%`],
     ["Progress", `${progress}%`],
-    ["Owner", owner],
+    ["Needs you", needsYou],
     ["Milestones", milestoneCount],
   ]) {
     const metric = node("article", "goal-summary-item");
@@ -7749,7 +7880,7 @@ function renderGoalPlan() {
     empty.append(add);
     elements.goalPlanList.append(empty);
   }
-  for (const goal of state.goals) {
+  state.goals.forEach((goal, goalIndex) => {
     const card = node("article", "goal-card");
     card.tabIndex = 0;
     card.classList.toggle("selected", state.selectedGoalId === goal.goal_id);
@@ -7760,7 +7891,7 @@ function renderGoalPlan() {
     const header = node("header", "goal-card-header");
     const titleWrap = node("div", "goal-card-title");
     titleWrap.append(
-      node("span", "goal-owner", goal.owner),
+      node("span", "goal-index", String(goalIndex + 1).padStart(2, "0")),
       node("h2", "", goal.title),
       node("p", "", goal.description || "No outcome description yet.")
     );
@@ -7780,7 +7911,15 @@ function renderGoalPlan() {
       elements.milestoneForm.elements.goal_id.value = goal.goal_id;
       elements.milestoneDialog.showModal();
     });
-    actions.append(node("span", `plan-state ${goal.state.toLowerCase()}`, planStateLabel(goal.state)), delegate, addMilestone);
+    const collapse = node("button", "icon-button compact goal-collapse", state.expandedGoals[goal.goal_id] === false ? "+" : "−");
+    collapse.type = "button";
+    collapse.title = "Expand or collapse goal";
+    collapse.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.expandedGoals[goal.goal_id] = state.expandedGoals[goal.goal_id] === false;
+      renderGoalPlan();
+    });
+    actions.append(node("span", `plan-state ${goal.state.toLowerCase()}`, planStateLabel(goal.state)), delegate, addMilestone, collapse);
     header.append(titleWrap, actions);
     const progressBar = node("div", "goal-progress");
     const fill = node("span", "goal-progress-fill");
@@ -7806,9 +7945,11 @@ function renderGoalPlan() {
     }
     for (const todo of goal.todos || []) milestones.append(planTodoRow(todo));
     if (!milestones.childElementCount) milestones.append(node("div", "milestone-empty", "Add a milestone to shape the delivery path."));
+    milestones.hidden = state.expandedGoals[goal.goal_id] === false;
     card.append(header, progressBar, progressLabel, milestones);
     elements.goalPlanList.append(card);
-  }
+    if (state.selectedGoalId === goal.goal_id) renderGoalInspector(goal, goalIndex);
+  });
 
   elements.unassignedWorkCount.textContent = String(state.unassignedTodos.length);
   elements.unassignedWorkList.replaceChildren();
@@ -10237,17 +10378,51 @@ function bindGoalPlanEvents() {
   elements.addGoalButton?.addEventListener("click", () => {
     if (!state.selectedProject) return;
     elements.goalForm.reset();
+    delete elements.goalForm.dataset.goalId;
+    elements.goalDialog.querySelector("h2").textContent = "New goal";
+    elements.goalDialog.querySelector('[type="submit"]').textContent = "Create goal";
     elements.goalForm.elements.owner.value = "Project Master";
     elements.goalFormError.textContent = "";
     elements.goalDialog.showModal();
   });
+  if (elements.conversationExpand) {
+    let parent = elements.conversationLayer.parentElement;
+    let nextSibling = elements.conversationLayer.nextElementSibling;
+    elements.conversationExpand.addEventListener("change", () => {
+      const expanded = elements.conversationExpand.checked;
+      elements.conversationLayer.classList.toggle("expanded", expanded);
+      elements.conversationLayer.classList.remove("collapsed");
+      syncConversationToggle(false);
+      elements.conversationExpand.setAttribute(
+        "aria-label",
+        expanded ? "Close expanded conversation" : "Expand conversation"
+      );
+      if (expanded) {
+        parent = elements.conversationLayer.parentElement;
+        nextSibling = elements.conversationLayer.nextElementSibling;
+        document.body.append(elements.conversationLayer);
+      } else if (parent) {
+        parent.insertBefore(elements.conversationLayer, nextSibling);
+      }
+      renderRoomMessages();
+    });
+  }
   elements.goalPlanMap?.addEventListener("click", () => showGraphView("universe"));
+  elements.editSelectedGoal?.addEventListener("click", () => {
+    const goal = state.goals.find((item) => item.goal_id === state.selectedGoalId);
+    if (goal) openGoalEditor(goal);
+  });
   const handleWorkspaceNav = (event) => {
     const button = event.target.closest("[data-primary-view]");
     if (!button) return;
     const view = button.getAttribute("data-primary-view");
     if (view === "work") showGoalPlanView();
     else if (view === "map") showGraphView("universe");
+    else if (view === "documents") showGraphView("documents");
+    else if (view === "meeting") {
+      state.settingsTab = "rooms";
+      openSettings().catch((error) => toast(error.message, true));
+    }
     else if (["memory", "bench", "activity", "details"].includes(view)) openInspectorSurface(view);
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
@@ -10281,19 +10456,27 @@ function bindGoalPlanEvents() {
     if (!state.selectedProject) return;
     const data = new FormData(elements.goalForm);
     try {
-      await api(`/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`, {
-        method: "POST",
+      const goalId = elements.goalForm.dataset.goalId;
+      await api(
+        goalId
+          ? `/v1/goals/${encodeURIComponent(goalId)}`
+          : `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`, {
+        method: goalId ? "PATCH" : "POST",
         body: {
           title: String(data.get("title") || "").trim(),
           description: String(data.get("description") || "").trim(),
           owner: String(data.get("owner") || "").trim(),
           state: String(data.get("state") || "DESIGNING"),
-          sort_order: state.goals.length,
+          sort_order: goalId
+            ? state.goals.find((goal) => goal.goal_id === goalId)?.sort_order || 0
+            : state.goals.length,
+          ...(goalId ? { revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision } : {}),
         },
       });
       elements.goalDialog.close();
+      delete elements.goalForm.dataset.goalId;
       await refreshGoalPlan();
-      toast("Goal created");
+      toast(goalId ? "Goal updated" : "Goal created");
     } catch (error) {
       elements.goalFormError.textContent = error.message;
     }

@@ -44,6 +44,7 @@ from agent_session_gateway import (
 )
 from host_profile import HostProfileError, HostProfileStore
 from provider_model_catalog import (
+    DEFAULT_PRESETS,
     ProviderModelCatalogError,
     ProviderModelCatalogStore,
 )
@@ -2913,7 +2914,7 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
             "ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind"
         )
     body = _required_text(value.get("body"), "body")
-    if len(body) > 12000:
+    if len(body) > 200000:
         raise UniverseError("ROOM_MESSAGE_BODY_INVALID", "body is too long")
     sender = _identifier(value.get("sender", "UNIVERSE_CONDUCTOR"), "sender").upper()
     idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
@@ -3160,7 +3161,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
             "unsupported conductor room message kind",
         )
     body = _required_text(value.get("body"), "body")
-    if len(body) > 12000:
+    if len(body) > 200000:
         raise UniverseError("CONDUCTOR_ROOM_MESSAGE_BODY_INVALID", "body is too long")
     sender = _identifier(value.get("sender", "USER"), "sender").upper()
     requested_provider = _identifier(value.get("provider", "AUTO"), "provider").upper()
@@ -5403,6 +5404,9 @@ class UniverseStore:
             else request.get("model_ref")
         )
         model_ref = str(raw_model_ref or "").strip()
+        provider_changed = provider != str(current.get("provider") or "AUTO")
+        if provider != "AUTO" and "model_ref" not in request and provider_changed:
+            model_ref = str(DEFAULT_PRESETS[provider]["default"])
         if model_ref and not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model_ref
         ):
@@ -19373,7 +19377,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.store.complete_conductor_room_message(
                     message_id,
                     provider=provider,
-                    body=str(session_result["text"]).strip()[:12000],
+                    body=str(session_result["text"]).strip()[:200000],
                     result_receipt_ref=str(session_result["session_ref"]),
                     ui_action=normalize_conductor_ui_action({"kind": "NONE"}),
                 )
@@ -19421,7 +19425,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.store.complete_conductor_room_message(
                 message_id,
                 provider=provider,
-                body=reply_text.strip()[:12000],
+                body=reply_text.strip()[:200000],
                 result_receipt_ref=str(
                     invocation.get("result_receipt_ref") or "UNKNOWN"
                 ),

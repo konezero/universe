@@ -11,6 +11,16 @@ CSS = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8"
 
 
 class SessionObservatoryUiContractTests(unittest.TestCase):
+    def test_conversation_expansion_escapes_and_restores_the_dock(self) -> None:
+        self.assertIn('id="conversation-expand"', HTML)
+        expand_slice = APP[
+            APP.index('elements.conversationExpand.addEventListener("change"') :
+            APP.index("elements.goalPlanMap?.addEventListener")
+        ]
+        self.assertIn("document.body.append(elements.conversationLayer)", expand_slice)
+        self.assertIn("parent.insertBefore(", expand_slice)
+        self.assertIn('classList.toggle("expanded", expanded)', expand_slice)
+
     def test_sessions_group_into_collapsible_project_tree(self) -> None:
         self.assertIn("binding.current_project_id", APP)
         self.assertIn("sessionRailProjectIdentity", APP)

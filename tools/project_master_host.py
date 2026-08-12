@@ -2752,6 +2752,42 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             else f"claude-code:pending:{self.project_id}"
         )
 
+    def reply_stream(
+        self,
+        message: Mapping[str, Any],
+        on_delta: Callable[[str], None],
+    ) -> str:
+        base_prompt = self._prompt(message)
+        emitted_delta = False
+
+        def tracked_delta(delta: str) -> None:
+            nonlocal emitted_delta
+            emitted_delta = True
+            on_delta(delta)
+
+        for attempt in range(2):
+            try:
+                gateway = self._acp_gateway()
+                prompt = base_prompt
+                if self._greeting_pending:
+                    prompt = f"{self._mode_greeting()}\n\n{prompt}"
+                    self._greeting_pending = False
+                return gateway.reply_stream(prompt, tracked_delta)
+            except ClaudeResidentError as error:
+                can_replace_stale_resume = (
+                    attempt == 0
+                    and str(error) == "CLAUDE_SESSION_RESUME_NOT_FOUND"
+                    and self.session_id is not None
+                    and not emitted_delta
+                )
+                if not can_replace_stale_resume:
+                    raise ProjectMasterHostError(str(error)) from error
+                self.close()
+                self.session_id = None
+                self.connection_state = "UNKNOWN"
+                self._greeting_pending = False
+        raise ProjectMasterHostError("CLAUDE_SESSION_RECOVERY_FAILED")
+
     def _acp_gateway(self) -> UniverseAcpGateway:
         if self._gateway is not None:
             return self._gateway

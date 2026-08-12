@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from agent_session_gateway import AgentSessionError  # noqa: E402
+from claude_resident_session import ClaudeResidentError  # noqa: E402
 from project_master_bridge import (  # noqa: E402
     MASTER_BRIDGE_ENVELOPE_SCHEMA,
     ProjectMasterBridgeError,
@@ -1391,6 +1392,37 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("claude-answer", answer)
         self.assertIn("Universe Project Room message", gateway.prompts[0])
         self.assertTrue(runtime.session_ref.startswith("claude-code:"))
+
+    def test_claude_runtime_replaces_missing_resumed_session_once(self) -> None:
+        class MissingResumeGateway(FakeAgentGateway):
+            def reply_stream(self, prompt: str, on_delta) -> str:
+                del on_delta
+                self.prompts.append(prompt)
+                raise ClaudeResidentError("CLAUDE_SESSION_RESUME_NOT_FOUND")
+
+        self.state.observe_provider_session("CLAUDE", "stale-session")
+        runtime = ClaudeProjectMasterRuntime(self.root, "GCS", self.state)
+        failed = MissingResumeGateway("unused")
+        recovered = FakeAgentGateway("recovered-answer")
+        gateways = iter((failed, recovered))
+
+        def next_gateway():
+            gateway = next(gateways)
+            runtime._gateway = gateway
+            if gateway is recovered:
+                runtime.session_id = "fresh-session"
+                runtime.connection_state = "REPLACED"
+                runtime._greeting_pending = True
+            return gateway
+
+        with patch.object(runtime, "_acp_gateway", side_effect=next_gateway):
+            answer = runtime.reply(self._envelope()["message"])
+
+        self.assertEqual("recovered-answer", answer)
+        self.assertTrue(failed.closed)
+        self.assertEqual(1, len(failed.prompts))
+        self.assertEqual(1, len(recovered.prompts))
+        self.assertTrue(recovered.prompts[0].startswith("Enter MASTER Mode"))
 
     def test_claude_runtime_cleans_mcp_config_when_resident_launch_fails(self) -> None:
         runtime = ClaudeProjectMasterRuntime(self.root, "GCS", self.state)

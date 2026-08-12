@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=session-popup-2">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-9">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -102,6 +102,12 @@
             <button id="add-goal-button" class="primary-button" type="button">Add goal</button>
           </div>
         </header>
+        <div class="goal-plan-toolbar" aria-label="Goal plan controls">
+          <div class="goal-plan-view-toggle"><button class="selected" type="button">Plan</button><button type="button" disabled>Board</button></div>
+          <span>Group by <strong>Goal</strong></span>
+          <span>Sort <strong>Priority</strong></span>
+          <button id="edit-selected-goal" class="secondary-button" type="button">Edit plan</button>
+        </div>
         <div id="goal-plan-summary" class="goal-plan-summary" aria-label="Goal plan summary"></div>
         <div id="goal-plan-list" class="goal-plan-list">
           <div class="goal-plan-empty">Choose a project to begin planning.</div>
@@ -190,6 +196,7 @@
               <strong id="conversation-title">Conversation</strong>
               <small id="conversation-target-label">Universe Conductor</small>
             </div>
+            <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>
             <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
               Actions
               <span id="action-inbox-badge" class="chat-badge hidden">0</span>
@@ -298,7 +305,7 @@
       <label>Outcome<textarea name="description" rows="4" maxlength="4000" required></textarea></label>
       <div class="form-grid two-columns">
         <label>Owner<input name="owner" maxlength="80" value="Project Master" required></label>
-        <label>State<select name="state"><option value="DESIGNING">Designing</option><option value="READY">Ready</option><option value="IN_PROGRESS">In progress</option><option value="BLOCKED">Blocked</option><option value="DONE">Done</option></select></label>
+        <label>State<select name="state"><option value="DESIGNING">Designing</option><option value="READY">Ready</option><option value="ACTIVE">Active</option><option value="BLOCKED">Blocked</option><option value="DONE">Done</option></select></label>
       </div>
       <div class="dialog-actions"><button type="button" class="secondary-button" data-close-dialog>Cancel</button><button type="submit" class="primary-button">Create goal</button></div>
       <p id="goal-form-error" class="form-error" role="alert"></p>
@@ -1160,6 +1167,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=session-popup-2" defer></script>
+  <script src="/app.js?v=work-spine-9" defer></script>
 </body>
 </html>

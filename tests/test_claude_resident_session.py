@@ -495,6 +495,33 @@ class ClaudeResidentSessionTests(unittest.TestCase):
             session.send_message("go", lambda _d: None)
         self.assertIn("CLAUDE_RESULT_FAILED", str(caught.exception))
 
+    def test_missing_resumed_conversation_has_specific_failure(self) -> None:
+        def factory(**kwargs):
+            process = FakeClaudeProcess(**kwargs)
+            process.script = [
+                [
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "errors": [
+                            "No conversation found with session ID: stale-session"
+                        ],
+                    }
+                ]
+            ]
+            return process
+
+        session = self._session(
+            process_factory=factory,
+            session_id="stale-session",
+        )
+        with self.assertRaisesRegex(
+            ClaudeResidentError,
+            "CLAUDE_SESSION_RESUME_NOT_FOUND",
+        ):
+            session.send_message("go", lambda _d: None)
+
 
 if __name__ == "__main__":
     unittest.main()

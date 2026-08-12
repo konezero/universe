@@ -48,6 +48,8 @@ from universe_server import (  # noqa: E402
     interface_profile,
     local_connection_profile,
     normalize_conductor_ui_action,
+    normalize_conductor_room_message,
+    normalize_room_message,
     normalize_planning_runtime_binding,
     normalize_project_attachment,
     normalize_skill_observation_candidate,
@@ -1979,7 +1981,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="session-rail-show-workers"', body)
             self.assertIn(">Sessions<", body)
             self.assertIn('id="session-rail-show-hidden"', body)
-            self.assertIn("session-popup-2", body)
+            self.assertIn("work-spine-", body)
             self.assertIn('id="runtime-audit-grid"', body)
             self.assertIn('id="legacy-executor-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
@@ -2114,6 +2116,52 @@ class UniverseLocalServiceTests(unittest.TestCase):
             start_connector.call_args.kwargs["config"]["transport_kind"],
         )
 
+    def test_room_transcripts_accept_full_provider_replies(self) -> None:
+        long_body = "section\n" + ("provider transcript line\n" * 700)
+        self.assertGreater(len(long_body), 12000)
+        project_message = normalize_room_message(
+            "GCS",
+            {
+                "kind": "RESULT",
+                "body": long_body,
+                "sender": "PROJECT_MASTER",
+                "idempotency_key": "long-project-master-reply",
+            },
+        )
+        conductor_message = normalize_conductor_room_message(
+            {
+                "kind": "RESULT",
+                "body": long_body,
+                "sender": "UNIVERSE_CONDUCTOR",
+                "provider": "CLAUDE",
+                "idempotency_key": "long-conductor-reply",
+            }
+        )
+        self.assertEqual(long_body.strip(), project_message["body"])
+        self.assertEqual(long_body.strip(), conductor_message["body"])
+
+    def test_room_transcripts_reject_unbounded_provider_replies(self) -> None:
+        too_large = "x" * 200001
+        with self.assertRaisesRegex(UniverseError, "body is too long"):
+            normalize_room_message(
+                "GCS",
+                {
+                    "kind": "RESULT",
+                    "body": too_large,
+                    "sender": "PROJECT_MASTER",
+                    "idempotency_key": "oversize-project-master-reply",
+                },
+            )
+        with self.assertRaisesRegex(UniverseError, "body is too long"):
+            normalize_conductor_room_message(
+                {
+                    "kind": "RESULT",
+                    "body": too_large,
+                    "sender": "UNIVERSE_CONDUCTOR",
+                    "provider": "CLAUDE",
+                    "idempotency_key": "oversize-conductor-reply",
+                }
+            )
     def test_conductor_fresh_project_draft_is_partial_and_review_only(self) -> None:
         action = normalize_conductor_ui_action(
             {
@@ -2264,6 +2312,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("grok-4.5", project["setting"]["model_ref"])
         self.assertEqual("MAX", project["setting"]["effort"])
 
+        status, switched = self.request(
+            "POST",
+            "/v1/projects/GCS/provider-setting",
+            {"provider": "CLAUDE"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("CLAUDE", switched["setting"]["provider"])
+        self.assertEqual("sonnet", switched["setting"]["model_ref"])
+
+        status, explicit = self.request(
+            "POST",
+            "/v1/projects/GCS/provider-setting",
+            {"provider": "CLAUDE", "model_ref": "custom-claude-model"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("custom-claude-model", explicit["setting"]["model_ref"])
+
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(
             "CODEX",
@@ -2273,11 +2338,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )["provider"],
         )
         self.assertEqual(
-            "GROK",
+            "CLAUDE",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["provider"],
         )
         self.assertEqual(
-            "grok-4.5",
+            "custom-claude-model",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["model_ref"],
         )
         self.assertEqual(
@@ -3774,7 +3839,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("GCS", refreshed["project"]["project_id"])
         self.assertEqual(original_refs, refreshed["project"]["refs"])
-        self.assertEqual({"label": "Trading Updated"}, refreshed["project"]["metadata"])
+        self.assertEqual(
+            {"label": "Trading Updated", "node_tag": "GCS"},
+            refreshed["project"]["metadata"],
+        )
         self.assertNotEqual(original_metadata, refreshed["project"]["metadata"])
 
         status, result = self.request(
@@ -3831,7 +3899,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         project = self.server.store.get_project("GCS")
         self.assertEqual(original["project_id"], project["project_id"])
         self.assertEqual(original["refs"], project["refs"])
-        self.assertEqual(metadata, project["metadata"])
+        self.assertEqual({**metadata, "node_tag": "GCS"}, project["metadata"])
         self.assertEqual("LINKED", project["attachment"]["universe_membership"])
         self.assertEqual("PROJECT_LOCAL", project["attachment"]["runtime_host"])
 
@@ -3864,6 +3932,24 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(201, status)
         self.assertEqual("RECORDED", result["message"]["delivery_state"])
         self.assertEqual({}, result["message"]["delivery"])
+
+    def test_room_accepts_a_long_master_report_without_truncation(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        report = "implementation evidence\n" * 900
+
+        status, result = self.request(
+            "POST",
+            "/v1/projects/GCS/room/messages",
+            {
+                "kind": "RESULT",
+                "body": report,
+                "idempotency_key": "room-long-master-report-001",
+            },
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual(report.rstrip(), result["message"]["body"])
 
     def test_master_bridge_delivers_room_message_and_accepts_bound_reply(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
