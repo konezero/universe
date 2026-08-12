@@ -171,6 +171,48 @@ class ProjectMasterBridgeTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_READY", result["status"])
 
+    def test_extended_host_runs_approved_task_frame_at_dedicated_route(self) -> None:
+        request = {
+            "task_frame_id": "gcs-bootstrap-frame-001",
+            "primary_proposal_id": "task_proposal_001",
+            "primary_proposal_digest": "a" * 64,
+            "approval_evidence_ref": "universe://governance/decision/001",
+        }
+        owner = self
+
+        class CompletedHost(ProjectMasterBridgeHost):
+            def run_approved_descendant_task_frame(
+                self, received: Any
+            ) -> dict[str, Any]:
+                owner.assertEqual(request, received)
+                return {"status": "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED"}
+
+        host = CompletedHost(self.root, self.token)
+        server = ProjectMasterBridgeHttpServer(("127.0.0.1", 0), host)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            http_request = Request(
+                endpoint + "/v1/project-master/task-frames/run",
+                data=json.dumps(request).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urlopen(http_request) as response:  # nosec B310
+                status = HTTPStatus(response.status)
+                result = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_COMPLETED", result["status"])
+
     def test_reply_posts_bound_payload_to_loopback_universe_endpoint(self) -> None:
         captured: dict[str, Any] = {}
 

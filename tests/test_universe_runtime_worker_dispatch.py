@@ -82,6 +82,28 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertFalse(result["universe_coordinate_persisted"])
         self.assertEqual("NOT_PERSISTED", result["provider_durable_chat_state"])
 
+    def test_dispatch_normalizes_runtime_provider_aliases(self) -> None:
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+
+        self.assertEqual(
+            "CODEX",
+            dispatcher._normalize_request(
+                {**self._dispatch_request(), "provider": "openai"}
+            )["provider"],
+        )
+        self.assertEqual(
+            "CLAUDE",
+            dispatcher._normalize_request(
+                {**self._dispatch_request(), "provider": "anthropic"}
+            )["provider"],
+        )
+        self.assertEqual(
+            "GROK",
+            dispatcher._normalize_request(
+                {**self._dispatch_request(), "provider": "xai"}
+            )["provider"],
+        )
+
     def test_grok_task_frame_does_not_publish_persistent_session_ref(self) -> None:
         class FakeGrokSession:
             def __init__(self, *, model, session_observer, **_kwargs) -> None:
@@ -263,6 +285,79 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         )
         self.assertTrue(result["worker_id"].startswith("universe-runtime-worker:"))
         self.assertEqual("provider-worker-1", result["provider_worker_ref"])
+
+    def test_root_boss_can_defer_terminal_result_until_children_finish(self) -> None:
+        events: list[str] = []
+
+        def post(_endpoint, _token, path, payload):
+            if path == "/v1/task-frame/worker-result":
+                events.append("result")
+                return {"status": "TASK_COMPLETED"}
+            operation = payload["operation"]["operation"]
+            events.append(operation)
+            if operation == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "role": "BOSS",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            claimed = payload["operation"]
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {
+                    "status": "TURN_CLAIMED",
+                    "turn": {
+                        "turn_id": claimed["turn_id"],
+                        "state": "CLAIMED",
+                        "claimed_by": claimed["worker_id"],
+                    },
+                },
+            }
+
+        class Dispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, request):
+                events.append("provider")
+                return {
+                    "status": "COMPLETED",
+                    "worker_id": "provider-boss-1",
+                    "worker_run_ref": request["worker_run_ref"],
+                    "result_receipt_ref": "result://boss-1",
+                    "result": {"text": "{}"},
+                    "session_persistence": "EPHEMERAL",
+                    "persistent_session_ref": "UNKNOWN",
+                    "universe_coordinate_persisted": False,
+                }
+
+        request = {**self._dispatch_request(), "defer_terminal_result": True}
+        dispatcher = Dispatcher(self.root, post=post)
+        captured = dispatcher.dispatch(request)
+
+        self.assertEqual("WORKER_OUTPUT_CAPTURED", captured["status"])
+        self.assertEqual(
+            ["worker_invocation_plan", "claim_turn", "provider"], events
+        )
+        completed = dispatcher.record_captured_result(
+            request, captured["worker_envelope"]
+        )
+        self.assertEqual("TASK_COMPLETED", completed["status"])
+        self.assertEqual(
+            ["worker_invocation_plan", "claim_turn", "provider", "result"], events
+        )
 
     def test_dispatch_uses_model_declared_by_task_frame(self) -> None:
         observed_models: list[str] = []

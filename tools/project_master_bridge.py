@@ -104,6 +104,11 @@ class ProjectMasterBridgeHost:
             "APPROVED_DESCENDANT_TASK_FRAME_GATEWAY_UNAVAILABLE"
         )
 
+    def run_approved_descendant_task_frame(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError(
+            "APPROVED_DESCENDANT_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
+        )
+
     def _inbox(self) -> Path:
         root = self.project_root.expanduser().resolve(strict=True)
         if not root.is_dir():
@@ -159,6 +164,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             (
                 "/v1/project-master/task-frames/approved"
             ): self.server.bridge_host.create_approved_descendant_task_frame,
+            (
+                "/v1/project-master/task-frames/run"
+            ): self.server.bridge_host.run_approved_descendant_task_frame,
         }
         operation = routes.get(self.path)
         if operation is None:

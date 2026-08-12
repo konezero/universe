@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import secrets
 import sqlite3
 import subprocess  # nosec B404
@@ -19,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore
@@ -62,6 +63,11 @@ from project_skill_plan_apply import (
 )
 from process_identity import WindowsKillOnCloseJob, launched_process_identity
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
+from universe_runtime_worker_dispatch import (
+    RuntimeWorkerDispatcher,
+    WorkerDispatchError,
+)
+from worker_failure_evidence import WorkerFailureEvidenceStore
 
 
 PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
@@ -147,6 +153,7 @@ class ProjectModeCoordinator:
         native_runner: NativeRunner = run_native_cli,
         source_binding_resolver: SourceBindingResolver | None = None,
         session_supervisor: SessionSupervisorStore | None = None,
+        worker_dispatcher: RuntimeWorkerDispatcher | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
@@ -170,6 +177,12 @@ class ProjectModeCoordinator:
         self._lease_version: int | None = None
         self._process_identity: dict[str, Any] | None = None
         self._source_binding: dict[str, str] | None = None
+        self.worker_dispatcher = worker_dispatcher or RuntimeWorkerDispatcher(
+            self.project_root,
+            failure_evidence_store=WorkerFailureEvidenceStore(
+                _default_state_db(self.project_id)
+            ),
+        )
 
     def prepare(self) -> Mapping[str, Any]:
         definition = self._master_definition()
@@ -676,6 +689,369 @@ class ProjectModeCoordinator:
             "repository_write": False,
         }
 
+    def run_approved_descendant_task_frame(
+        self,
+        *,
+        task_frame_id: str,
+        primary_proposal_id: str,
+        primary_proposal_digest: str,
+        approval_evidence_ref: str,
+    ) -> Mapping[str, Any]:
+        """Run one approved Frame through the Host-owned worker dispatcher.
+
+        The Runtime owns turn state.  This coordinator only supplies the
+        Parent-facing transport and forwards the exact Runtime-selected
+        provider/model for each declared turn.
+        """
+
+        frame_id = _text(task_frame_id, "task_frame_id")
+        primary_id = _text(primary_proposal_id, "primary_proposal_id")
+        primary_digest = _text(primary_proposal_digest, "primary_proposal_digest")
+        approval_ref = _text(approval_evidence_ref, "approval_evidence_ref")
+        binding = self._ensure_runtime(recover_task_frame_id=frame_id)
+        self._reopen_task_frame_from_runtime_store(
+            binding=binding,
+            task_frame_id=frame_id,
+        )
+        status = self._get_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/status",
+            {"session_id": binding["session_id"], "frame_id": frame_id},
+        )
+        if status.get("status") != "TASK_FRAME_HOST_ACTIVE":
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_HOST_UNAVAILABLE")
+        execution = status.get("execution_evidence")
+        if not isinstance(execution, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_EVIDENCE_INVALID")
+        gate = execution.get("execution_gate")
+        if not isinstance(gate, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_GATE_UNAVAILABLE")
+        if gate.get("approval_ref") != approval_ref:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_LINEAGE_MISMATCH")
+        plan = gate.get("execution_plan")
+        if not isinstance(plan, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PLAN_INVALID")
+        if _text(plan.get("frame_id"), "execution_plan.frame_id") != frame_id:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PLAN_MISMATCH")
+        parent_actor_ref = _text(
+            plan.get("parent_actor_ref"), "execution_plan.parent_actor_ref"
+        )
+        turns = plan.get("turns")
+        if not isinstance(turns, list) or not all(isinstance(turn, Mapping) for turn in turns):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_TURNS_INVALID")
+        boss = next(
+            (
+                dict(turn)
+                for turn in turns
+                if str(turn.get("role") or "").upper() == "BOSS"
+            ),
+            None,
+        )
+        if boss is None:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_MISSING")
+        boss_turn_id = _text(boss.get("turn_id"), "execution_plan.boss.turn_id")
+        boss_input = self._task_frame_operation(
+            binding,
+            frame_id,
+            {"operation": "input_bundle", "turn_id": boss_turn_id},
+        )
+        parent_bundle = boss_input.get("parent_instruction_bundle")
+        if not isinstance(parent_bundle, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_INSTRUCTION_BUNDLE_INVALID")
+        instructions = parent_bundle.get("instructions")
+        if not isinstance(instructions, list) or not instructions:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_INSTRUCTION_BUNDLE_INVALID")
+        instruction_digests = [
+            _text(item.get("instruction_digest"), "instruction.instruction_digest")
+            for item in instructions
+            if isinstance(item, Mapping)
+        ]
+        if len(instruction_digests) != len(instructions):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_INSTRUCTION_BUNDLE_INVALID")
+
+        boss_request = {
+            "schema": "universe.task-frame-worker-dispatch-request.v1",
+            "provider": _text(boss.get("provider"), "execution_plan.boss.provider"),
+            "endpoint": binding["endpoint"],
+            "token": binding["token"],
+            "session_id": binding["session_id"],
+            "frame_id": frame_id,
+            "turn_id": boss_turn_id,
+            "invoker_actor_ref": parent_actor_ref,
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "context_pack": {
+                "schema": "universe.task-frame-boss-context.v1",
+                "frame_id": frame_id,
+                "execution_plan": dict(plan),
+                "input_bundle": boss_input,
+            },
+            "output_contract": self._boss_allocation_output_contract(),
+            "max_turns": 1,
+            "result_mode": "STRUCTURED_JSON",
+            "defer_terminal_result": True,
+        }
+        self._recover_stale_boss_claim(
+            binding=binding,
+            task_frame_id=frame_id,
+            boss_request=boss_request,
+        )
+        try:
+            boss_result = self.worker_dispatcher.dispatch(boss_request)
+        except WorkerDispatchError as error:
+            raise ProjectMasterHostError(error.code) from error
+        if boss_result.get("status") != "WORKER_OUTPUT_CAPTURED":
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_CAPTURE_FAILED")
+        captured_envelope = boss_result.get("worker_envelope")
+        structured_result = boss_result.get("structured_result")
+        if not isinstance(captured_envelope, Mapping) or not isinstance(
+            structured_result, Mapping
+        ):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_OUTPUT_INVALID")
+        try:
+            allocations = self._canonical_boss_allocations(
+                structured_result.get("worker_allocations"),
+                turns=turns,
+                summary=str(structured_result.get("summary") or "").strip(),
+            )
+            allocation_result = self._task_frame_operation(
+                binding,
+                frame_id,
+                {
+                    "operation": "submit_boss_allocations",
+                    "boss_turn_id": boss_turn_id,
+                    "boss_worker_id": _text(boss_result.get("worker_id"), "boss.worker_id"),
+                    "worker_run_ref": _text(
+                        boss_result.get("worker_run_ref"), "boss.worker_run_ref"
+                    ),
+                    "instruction_digests": instruction_digests,
+                    "worker_allocations": allocations,
+                    "observed_at": utc_now(),
+                },
+            )
+            if allocation_result.get("status") != "BOSS_ALLOCATIONS_RECORDED":
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_FAILED"
+                )
+        except ProjectMasterHostError as error:
+            self._recover_captured_boss_claim(
+                boss_request=boss_request,
+                boss_result=boss_result,
+                reason=str(error),
+            )
+            raise
+
+        child_results: list[dict[str, str]] = []
+        boss_actor_ref = _text(boss_result.get("worker_id"), "boss.worker_id")
+        for turn in turns:
+            if str(turn.get("role") or "").upper() != "SUB_REVIEWER":
+                continue
+            turn_id = _text(turn.get("turn_id"), "execution_plan.turn.turn_id")
+            input_bundle = self._task_frame_operation(
+                binding,
+                frame_id,
+                {"operation": "input_bundle", "turn_id": turn_id},
+            )
+            request = {
+                "schema": "universe.task-frame-worker-dispatch-request.v1",
+                "provider": _text(turn.get("provider"), "execution_plan.turn.provider"),
+                "endpoint": binding["endpoint"],
+                "token": binding["token"],
+                "session_id": binding["session_id"],
+                "frame_id": frame_id,
+                "turn_id": turn_id,
+                "invoker_actor_ref": boss_actor_ref,
+                "repository_write_scope": "NONE",
+                "mutation_scope": {"operations": [], "targets": []},
+                "context_pack": {
+                    "schema": "universe.task-frame-sub-worker-context.v1",
+                    "frame_id": frame_id,
+                    "input_bundle": input_bundle,
+                },
+                "output_contract": {
+                    "schema": "universe.task-frame-sub-worker-result.v1",
+                    "instruction": "Return a concise, evidence-backed review result for the supplied allocation.",
+                },
+                "max_turns": 1,
+                "result_mode": "REDACTED",
+            }
+            try:
+                child_result = self.worker_dispatcher.dispatch(request)
+            except WorkerDispatchError as error:
+                raise ProjectMasterHostError(error.code) from error
+            terminal_status = _text(child_result.get("status"), "child.status")
+            if terminal_status not in {
+                "TASK_COMPLETED",
+                "TASK_FRAME_RESULT_RECORDED",
+                "TURN_COMPLETED",
+            }:
+                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_CHILD_RESULT_FAILED")
+            child_results.append({"turn_id": turn_id, "status": terminal_status})
+
+        try:
+            boss_completion = self.worker_dispatcher.record_captured_result(
+                boss_request, captured_envelope
+            )
+        except WorkerDispatchError as error:
+            raise ProjectMasterHostError(error.code) from error
+        if boss_completion.get("status") != "TASK_COMPLETED":
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_COMPLETION_FAILED")
+        return {
+            "status": "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED",
+            "project_id": self.project_id,
+            "primary_proposal_id": primary_id,
+            "task_frame_id": frame_id,
+            "boss_turn_id": boss_turn_id,
+            "child_results": child_results,
+            "repository_write": False,
+        }
+
+    @staticmethod
+    def _canonical_boss_allocations(
+        raw_allocations: Any,
+        *,
+        turns: Sequence[Mapping[str, Any]],
+        summary: str,
+    ) -> list[dict[str, Any]]:
+        declared = {
+            _text(turn.get("turn_id"), "execution_plan.turn.turn_id"): turn
+            for turn in turns
+            if str(turn.get("role") or "").upper() == "SUB_REVIEWER"
+        }
+        proposals: dict[str, Mapping[str, Any]] = {}
+        unassigned: list[Mapping[str, Any]] = []
+        if isinstance(raw_allocations, list):
+            for item in raw_allocations:
+                if not isinstance(item, Mapping):
+                    continue
+                turn_id = item.get("turn_id")
+                if (
+                    isinstance(turn_id, str)
+                    and turn_id.strip() in declared
+                    and turn_id.strip() not in proposals
+                ):
+                    proposals[turn_id.strip()] = item
+                else:
+                    unassigned.append(item)
+        summary_hint = summary[:1_000] if summary else "No Boss allocation summary was returned."
+        canonical: list[dict[str, Any]] = []
+        unassigned_iter = iter(unassigned)
+        for turn_id, turn in declared.items():
+            leaf = turn_id.rsplit("/", 1)[-1]
+            if not re.fullmatch(r"[a-zA-Z0-9._-]+", leaf):
+                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+            proposal = proposals.get(turn_id)
+            if proposal is None:
+                proposal = next(unassigned_iter, None)
+            task = (
+                str(proposal.get("task") or "").strip()
+                if isinstance(proposal, Mapping)
+                else ""
+            )
+            if not task:
+                task = (
+                    "Review the approved parent instruction and prior turn evidence. "
+                    f"Boss context: {summary_hint}"
+                )
+            expected_output = (
+                proposal.get("expected_output")
+                if isinstance(proposal, Mapping)
+                else None
+            )
+            if not isinstance(expected_output, Mapping):
+                expected_output = {
+                    "kind": "bounded_sub_review",
+                    "turn_id": turn_id,
+                }
+            canonical.append(
+                {
+                    "turn_id": turn_id,
+                    "worker_slot_ref": _text(
+                        turn.get("worker_slot_ref"),
+                        "execution_plan.turn.worker_slot_ref",
+                    ),
+                    "worker_path": f"/root/boss/{leaf}",
+                    "task": task,
+                    "expected_output": dict(expected_output),
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "skill_bindings": [],
+                }
+            )
+        return canonical
+
+    def _recover_captured_boss_claim(
+        self,
+        *,
+        boss_request: Mapping[str, Any],
+        boss_result: Mapping[str, Any],
+        reason: str,
+    ) -> None:
+        try:
+            self.worker_dispatcher.recover_claimed_worker(
+                boss_request,
+                worker_id=_text(boss_result.get("worker_id"), "boss.worker_id"),
+                worker_run_ref=_text(
+                    boss_result.get("worker_run_ref"), "boss.worker_run_ref"
+                ),
+                failure_code="WORKER_PARENT_FINALIZATION_FAILED",
+                failure_reason=_text(reason, "boss_finalization_reason"),
+            )
+        except WorkerDispatchError as error:
+            raise ProjectMasterHostError(error.code) from error
+
+    @staticmethod
+    def _boss_allocation_output_contract() -> dict[str, Any]:
+        allocation = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "turn_id",
+                "task",
+                "expected_output",
+            ],
+            "properties": {
+                "turn_id": {"type": "string"},
+                "task": {"type": "string"},
+                "expected_output": {"type": "object"},
+            },
+        }
+        return {
+            "schema": "universe.task-frame-boss-allocation.v1",
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["summary"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "worker_allocations": {"type": "array", "items": allocation},
+                },
+            },
+        }
+
+    def _task_frame_operation(
+        self,
+        binding: Mapping[str, str],
+        frame_id: str,
+        operation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        result = self._post_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/operation",
+            {
+                "session_id": binding["session_id"],
+                "frame_id": frame_id,
+                "operation": dict(operation),
+            },
+        )
+        output = result.get("output")
+        if result.get("status") != "TASK_FRAME_OPERATION_APPLIED" or not isinstance(
+            output, Mapping
+        ):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_OPERATION_FAILED")
+        return dict(output)
+
     @staticmethod
     def _sequential_declared_turns(turns: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Project the approved Boss/Worker order into Runtime dependencies.
@@ -899,6 +1275,41 @@ class ProjectModeCoordinator:
             raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_RESULT_INVALID")
         return result
 
+    @staticmethod
+    def _get_runtime(
+        endpoint: str,
+        token: str,
+        path: str,
+        query: Mapping[str, str],
+    ) -> dict[str, Any]:
+        parsed = urlsplit(_text(endpoint, "runtime.endpoint"))
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.port
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_ENDPOINT_INVALID")
+        request = Request(
+            endpoint.rstrip("/") + path + "?" + urlencode(dict(query)),
+            headers={
+                "X-Anchor-Session-Memory-Token": _text(token, "runtime.token"),
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:  # nosec B310
+                result = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_UNAVAILABLE") from error
+        if not isinstance(result, dict):
+            raise ProjectMasterHostError("PROJECT_MASTER_RUNTIME_RESULT_INVALID")
+        return result
+
     def close(self) -> None:
         with self._runtime_lock:
             process = self._runtime_process
@@ -998,7 +1409,9 @@ class ProjectModeCoordinator:
         self._source_binding = binding
         return dict(binding)
 
-    def _ensure_runtime(self) -> dict[str, str]:
+    def _ensure_runtime(
+        self, *, recover_task_frame_id: str | None = None
+    ) -> dict[str, str]:
         with self._runtime_lock:
             if (
                 self._runtime_binding is not None
@@ -1026,8 +1439,12 @@ class ProjectModeCoordinator:
             )
             if mode_boot_binding["anchor_id"] != anchor_id:
                 raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_MISMATCH")
-            session_id = f"project-master-{uuid4().hex}"
             frame_id = mode_boot_binding["frame_id"]
+            session_id = self._runtime_session_id(
+                anchor_id=anchor_id,
+                frame_id=frame_id,
+                recover_task_frame_id=recover_task_frame_id,
+            )
             token = secrets.token_urlsafe(32)
             python = _required_host_executable("python")
             command = [
@@ -1141,6 +1558,286 @@ class ProjectModeCoordinator:
                 runtime_job.close()
                 raise
             return dict(self._runtime_binding)
+
+    def _runtime_session_id(
+        self,
+        *,
+        anchor_id: str,
+        frame_id: str,
+        recover_task_frame_id: str | None,
+    ) -> str:
+        if recover_task_frame_id is not None:
+            recovered = self._recover_task_frame_session_id(
+                task_frame_id=_text(recover_task_frame_id, "task_frame_id"),
+                anchor_id=anchor_id,
+                frame_id=frame_id,
+            )
+            if recovered is not None:
+                return recovered
+        return "project-master-" + self.project_id.lower() + "-master"
+
+    def _recover_task_frame_session_id(
+        self,
+        *,
+        task_frame_id: str,
+        anchor_id: str,
+        frame_id: str,
+    ) -> str | None:
+        """Recover only one exact, unfinished Frame from Runtime-owned storage."""
+
+        frames_root = self.project_root / ".ai" / "runtime" / "task_frames"
+        if not frames_root.is_dir():
+            return None
+        matches: set[str] = set()
+        for database_path in frames_root.glob("*.sqlite3"):
+            try:
+                connection = sqlite3.connect(
+                    f"file:{database_path.as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=1,
+                )
+                try:
+                    row = connection.execute(
+                        """
+                        SELECT origin_session_id, origin_anchor_ref, origin_frame_id,
+                               task_state
+                        FROM task_frame_context WHERE singleton = 1
+                        """
+                    ).fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.Error:
+                continue
+            if row is None:
+                continue
+            session_id, stored_anchor_id, stored_frame_id, task_state = row
+            if (
+                str(stored_anchor_id) == anchor_id
+                and str(stored_frame_id) == frame_id
+                and str(task_state) not in {"COMPLETED", "CLOSED"}
+            ):
+                # Frame id is a durable field in the file itself. It is read
+                # separately because only the requested frame may be revived.
+                try:
+                    connection = sqlite3.connect(
+                        f"file:{database_path.as_posix()}?mode=ro",
+                        uri=True,
+                        timeout=1,
+                    )
+                    try:
+                        identity = connection.execute(
+                            "SELECT frame_id FROM task_frame_context WHERE singleton = 1"
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                except sqlite3.Error:
+                    continue
+                if identity is not None and str(identity[0]) == task_frame_id:
+                    matches.add(_text(session_id, "task_frame.origin_session_id"))
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def _reopen_task_frame_from_runtime_store(
+        self,
+        *,
+        binding: Mapping[str, str],
+        task_frame_id: str,
+    ) -> None:
+        """Register one exact persisted Frame with a replacement Host process."""
+
+        frames_root = self.project_root / ".ai" / "runtime" / "task_frames"
+        if not frames_root.is_dir():
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_RECOVERY_NOT_FOUND")
+        candidates: list[dict[str, Any]] = []
+        for database_path in frames_root.glob("*.sqlite3"):
+            try:
+                connection = sqlite3.connect(
+                    f"file:{database_path.as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=1,
+                )
+                connection.row_factory = sqlite3.Row
+                try:
+                    context = connection.execute(
+                        "SELECT * FROM task_frame_context WHERE singleton = 1"
+                    ).fetchone()
+                    observation = connection.execute(
+                        """
+                        SELECT status, evidence_ref, observed_at
+                        FROM parent_observations
+                        ORDER BY observation_ordinal DESC LIMIT 1
+                        """
+                    ).fetchone()
+                    instruction = connection.execute(
+                        """
+                        SELECT * FROM task_instructions
+                        ORDER BY instruction_ordinal ASC LIMIT 1
+                        """
+                    ).fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.Error:
+                continue
+            if context is None or observation is None or instruction is None:
+                continue
+            if (
+                str(context["frame_id"]) != task_frame_id
+                or str(context["origin_session_id"]) != binding["session_id"]
+                or str(context["origin_anchor_ref"]) != binding["anchor_id"]
+                or str(context["origin_frame_id"]) != binding["frame_id"]
+                or str(context["task_state"]) in {"COMPLETED", "CLOSED"}
+            ):
+                continue
+            try:
+                constraints = json.loads(str(instruction["constraints_json"]))
+                expected_output = json.loads(str(instruction["expected_output_json"]))
+                mutation_scope = json.loads(str(instruction["mutation_scope_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(constraints, list)
+                or not isinstance(expected_output, Mapping)
+                or not isinstance(mutation_scope, Mapping)
+            ):
+                continue
+            candidates.append(
+                {
+                    "profile": str(context["profile_path"]),
+                    "frame": {
+                        "frame_id": str(context["frame_id"]),
+                        "origin_anchor_ref": str(context["origin_anchor_ref"]),
+                        "origin_session_id": str(context["origin_session_id"]),
+                        "origin_frame_id": str(context["origin_frame_id"]),
+                        "task_summary_ref": str(context["task_summary_ref"]),
+                        "source_ref": str(context["source_ref"]),
+                        "execution_assignment_ref": str(
+                            context["execution_assignment_ref"]
+                        ),
+                        "parent_instruction": {
+                            "instruction_id": str(instruction["instruction_id"]),
+                            "user_instruction_raw": str(
+                                instruction["user_instruction_raw"]
+                            ),
+                            "constraints": constraints,
+                            "expected_output": dict(expected_output),
+                            "repository_write_scope": str(
+                                instruction["repository_write_scope"]
+                            ),
+                            "mutation_scope": dict(mutation_scope),
+                        },
+                        "parent_observation": {
+                            "status": str(observation["status"]),
+                            "evidence_ref": str(observation["evidence_ref"]),
+                        },
+                        "observed_at": str(observation["observed_at"]),
+                    },
+                }
+            )
+        if len(candidates) != 1:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_RECOVERY_AMBIGUOUS")
+        reopened = self._post_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/create",
+            {
+                "session_id": binding["session_id"],
+                "profile": candidates[0]["profile"],
+                "frame": candidates[0]["frame"],
+            },
+        )
+        if reopened.get("status") not in {
+            "TASK_FRAME_HOST_ACTIVE",
+            "TASK_FRAME_ALREADY_ACTIVE",
+        }:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_RECOVERY_FAILED")
+
+    def _recover_stale_boss_claim(
+        self,
+        *,
+        binding: Mapping[str, str],
+        task_frame_id: str,
+        boss_request: Mapping[str, Any],
+    ) -> None:
+        """Release a captured Boss claim left behind by a prior Host process."""
+
+        frames_root = self.project_root / ".ai" / "runtime" / "task_frames"
+        stale_claims: list[tuple[str, str]] = []
+        if not frames_root.is_dir():
+            return
+        for database_path in frames_root.glob("*.sqlite3"):
+            try:
+                connection = sqlite3.connect(
+                    f"file:{database_path.as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=1,
+                )
+                connection.row_factory = sqlite3.Row
+                try:
+                    context = connection.execute(
+                        "SELECT frame_id, origin_session_id, origin_anchor_ref, origin_frame_id FROM task_frame_context WHERE singleton = 1"
+                    ).fetchone()
+                    if (
+                        context is None
+                        or str(context["frame_id"]) != task_frame_id
+                        or str(context["origin_session_id"]) != binding["session_id"]
+                        or str(context["origin_anchor_ref"]) != binding["anchor_id"]
+                        or str(context["origin_frame_id"]) != binding["frame_id"]
+                    ):
+                        continue
+                    allocation_count = connection.execute(
+                        "SELECT COUNT(*) FROM boss_allocations"
+                    ).fetchone()[0]
+                    boss = connection.execute(
+                        """
+                        SELECT turn_id, state, claimed_by
+                        FROM task_turns
+                        WHERE role = 'BOSS' AND input_turn_ids_json = '[]'
+                        """
+                    ).fetchone()
+                    if (
+                        boss is None
+                        or str(boss["state"]) != "CLAIMED"
+                        or allocation_count != 0
+                    ):
+                        continue
+                    execution = connection.execute(
+                        """
+                        SELECT worker_actor_ref, worker_run_ref, worker_result_envelope_json
+                        FROM worker_execution_state WHERE turn_id = ?
+                        """,
+                        (str(boss["turn_id"]),),
+                    ).fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.Error:
+                continue
+            if (
+                execution is not None
+                and not str(execution["worker_result_envelope_json"] or "").strip()
+                and str(execution["worker_actor_ref"] or "").strip()
+                == str(boss["claimed_by"] or "").strip()
+                and str(execution["worker_run_ref"] or "").strip()
+            ):
+                stale_claims.append(
+                    (
+                        str(execution["worker_actor_ref"]),
+                        str(execution["worker_run_ref"]),
+                    )
+                )
+        if not stale_claims:
+            return
+        if len(stale_claims) != 1:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_STALE_CLAIM_AMBIGUOUS")
+        worker_id, worker_run_ref = stale_claims[0]
+        try:
+            self.worker_dispatcher.recover_claimed_worker(
+                boss_request,
+                worker_id=worker_id,
+                worker_run_ref=worker_run_ref,
+                failure_code="WORKER_CAPTURE_FINALIZATION_UNRECORDED",
+                failure_reason="replacement Host found a claimed Boss without allocation or result evidence",
+            )
+        except WorkerDispatchError as error:
+            raise ProjectMasterHostError(error.code) from error
 
     def _register_process_lease(
         self,
@@ -4286,6 +4983,33 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
                     governance_approval=request["governance_approval"],
                     source_work=request["source_work"],
                     task_frame=request["task_frame"],
+                )
+            )
+        except ProjectMasterHostError as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
+    def run_approved_descendant_task_frame(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "task_frame_id",
+            "primary_proposal_id",
+            "primary_proposal_digest",
+            "approval_evidence_ref",
+        }:
+            raise ProjectMasterBridgeError(
+                "APPROVED_DESCENDANT_TASK_FRAME_RUN_REQUEST_INVALID"
+            )
+        run = getattr(self._coordinator, "run_approved_descendant_task_frame", None)
+        if not callable(run):
+            raise ProjectMasterBridgeError(
+                "APPROVED_DESCENDANT_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return dict(
+                run(
+                    task_frame_id=request["task_frame_id"],
+                    primary_proposal_id=request["primary_proposal_id"],
+                    primary_proposal_digest=request["primary_proposal_digest"],
+                    approval_evidence_ref=request["approval_evidence_ref"],
                 )
             )
         except ProjectMasterHostError as error:

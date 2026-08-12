@@ -30,6 +30,11 @@ from worker_failure_evidence import (
 
 DISPATCH_SCHEMA = "universe.task-frame-worker-dispatch-request.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
+PROVIDER_ALIASES = {
+    "OPENAI": "CODEX",
+    "ANTHROPIC": "CLAUDE",
+    "XAI": "GROK",
+}
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS = 90
 
@@ -74,6 +79,13 @@ def _required_text(value: Any, field: str) -> str:
             f"{field.upper()}_REQUIRED",
         )
     return value.strip()
+
+
+def _canonical_provider(value: Any, field: str = "provider") -> str:
+    """Map Runtime provider names to the local CLI adapter names."""
+
+    normalized = _required_text(value, field).upper()
+    return PROVIDER_ALIASES.get(normalized, normalized)
 
 
 def _mapping(value: Any, field: str) -> dict[str, Any]:
@@ -217,7 +229,7 @@ class RuntimeWorkerDispatcher:
         )
 
     def provider_capability(self, provider: str) -> dict[str, str]:
-        normalized = _required_text(provider, "provider").upper()
+        normalized = _canonical_provider(provider)
         if normalized not in SUPPORTED_PROVIDERS:
             return {
                 "status": "UNAVAILABLE",
@@ -301,7 +313,12 @@ class RuntimeWorkerDispatcher:
             plan["output"].get("worker_invocation"),
             "worker_invocation",
         )
-        planned_provider = str(planned_invocation.get("provider", "")).upper()
+        planned_provider_value = planned_invocation.get("provider", "")
+        planned_provider = (
+            _canonical_provider(planned_provider_value, "worker_invocation.provider")
+            if isinstance(planned_provider_value, str) and planned_provider_value.strip()
+            else ""
+        )
         if planned_provider and planned_provider != provider:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_PLAN_MISMATCH",
@@ -312,6 +329,12 @@ class RuntimeWorkerDispatcher:
         # provider. The Task Frame, created under the owning Node/Mode Master,
         # is the authority for the declared model of this turn.
         planned_model = _required_text(planned_invocation.get("model"), "model")
+        if request["defer_terminal_result"] and planned_invocation.get("role") != "BOSS":
+            raise WorkerDispatchError(
+                "WORKER_DEFERRED_RESULT_INVALID",
+                "TASK_FRAME_PLAN",
+                "DEFERRED_RESULT_REQUIRES_ROOT_BOSS",
+            )
 
         skill_bindings = self._skill_bindings(planned_invocation)
         worker_id = f"universe-runtime-worker:{uuid4().hex}"
@@ -461,6 +484,31 @@ class RuntimeWorkerDispatcher:
             }
             if observations:
                 envelope["skill_run_observations"] = observations
+            if request["defer_terminal_result"]:
+                return {
+                    "status": "WORKER_OUTPUT_CAPTURED",
+                    "provider": provider,
+                    "model_ref": model_ref,
+                    "worker_id": worker_id,
+                    "provider_worker_ref": provider_worker_ref,
+                    "worker_run_ref": worker_run_ref,
+                    "result_receipt_ref": result_receipt_ref,
+                    "terminal_result_verified": True,
+                    "duration_ms": duration_ms,
+                    "result": recorded_result,
+                    "structured_result": structured_result,
+                    "skill_run_observation_count": len(observations),
+                    "repository_write": False,
+                    "session_persistence": worker["session_persistence"],
+                    "persistent_session_ref": worker["persistent_session_ref"],
+                    "universe_coordinate_persisted": worker[
+                        "universe_coordinate_persisted"
+                    ],
+                    "provider_durable_chat_state": worker.get(
+                        "provider_durable_chat_state", "UNKNOWN"
+                    ),
+                    "worker_envelope": envelope,
+                }
             result = self.post(
                 request["endpoint"],
                 request["token"],
@@ -526,6 +574,88 @@ class RuntimeWorkerDispatcher:
         if structured_result is not None:
             response["structured_result"] = structured_result
         return response
+
+    def record_captured_result(
+        self,
+        raw_request: Mapping[str, Any],
+        envelope: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Commit one previously captured root-Boss result after child turns finish."""
+
+        request = self._normalize_request(raw_request)
+        if not request["defer_terminal_result"]:
+            raise WorkerDispatchError(
+                "WORKER_DEFERRED_RESULT_INVALID",
+                "RESULT_COMMIT",
+                "DEFERRED_RESULT_NOT_REQUESTED",
+            )
+        normalized_envelope = _mapping(envelope, "worker_envelope")
+        if normalized_envelope.get("turn_id") != request["turn_id"]:
+            raise WorkerDispatchError(
+                "WORKER_DEFERRED_RESULT_INVALID",
+                "RESULT_COMMIT",
+                "DEFERRED_RESULT_TURN_MISMATCH",
+            )
+        result = self.post(
+            request["endpoint"],
+            request["token"],
+            "/v1/task-frame/worker-result",
+            {
+                "session_id": request["session_id"],
+                "frame_id": request["frame_id"],
+                "envelope": normalized_envelope,
+                "observed_at": _utc_now(),
+            },
+        )
+        terminal_status = str(result.get("status") or "").upper()
+        if terminal_status not in {"TASK_COMPLETED", "TASK_FRAME_RESULT_RECORDED"} and not terminal_status.startswith("TURN_COMPLETED"):
+            raise WorkerDispatchError(
+                "WORKER_RESULT_NOT_RECORDED",
+                "TASK_FRAME_RESULT",
+                terminal_status or "TASK_FRAME_RESULT_REJECTED",
+            )
+        return {
+            "status": terminal_status,
+            "task_frame_result_status": terminal_status,
+            "runtime_result": result,
+            "repository_write": False,
+        }
+
+    def recover_claimed_worker(
+        self,
+        raw_request: Mapping[str, Any],
+        *,
+        worker_id: str,
+        worker_run_ref: str,
+        failure_code: str,
+        failure_reason: str,
+    ) -> dict[str, Any]:
+        """Fail-close a claimed Worker when its Parent cannot resume it."""
+
+        request = self._normalize_request(raw_request)
+        failure = WorkerDispatchError(
+            _required_text(failure_code, "failure_code"),
+            "PARENT_FINALIZATION",
+            _required_text(failure_reason, "failure_reason"),
+        )
+        recovered = self._recover_claim_failure(
+            request=request,
+            worker_id=_required_text(worker_id, "worker_id"),
+            worker_run_ref=_required_text(worker_run_ref, "worker_run_ref"),
+            failure=failure,
+        )
+        if recovered.recovery_status not in {
+            "WORKER_INITIALIZATION_FAILURE_RECORDED",
+            "WORKER_INITIALIZATION_FAILURE_REPLAYED",
+        }:
+            raise recovered
+        return {
+            "status": "WORKER_CLAIM_RECOVERED",
+            "failure_code": failure.code,
+            "host_evidence_ref": recovered.host_evidence_ref,
+            "recovery_status": recovered.recovery_status,
+            "repository_write": False,
+        }
 
     def _recover_claim_failure(
         self,
@@ -644,7 +774,7 @@ class RuntimeWorkerDispatcher:
                 "REQUEST_LOAD",
                 "DISPATCH_SCHEMA_INVALID",
             )
-        provider = _required_text(raw.get("provider"), "provider").upper()
+        provider = _canonical_provider(raw.get("provider"))
         if provider not in SUPPORTED_PROVIDERS:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_UNSUPPORTED",
@@ -680,6 +810,13 @@ class RuntimeWorkerDispatcher:
                 "REQUEST_LOAD",
                 "MAX_TURNS_INVALID",
             )
+        defer_terminal_result = raw.get("defer_terminal_result", False)
+        if not isinstance(defer_terminal_result, bool):
+            raise WorkerDispatchError(
+                "WORKER_TRANSPORT_FAILED",
+                "REQUEST_LOAD",
+                "DEFER_TERMINAL_RESULT_INVALID",
+            )
         return {
             "provider": provider,
             "endpoint": _loopback_endpoint(raw.get("endpoint")),
@@ -694,6 +831,7 @@ class RuntimeWorkerDispatcher:
             "output_contract": _mapping(raw.get("output_contract"), "output_contract"),
             "max_turns": max_turns,
             "result_mode": result_mode,
+            "defer_terminal_result": defer_terminal_result,
         }
 
     @staticmethod

@@ -2329,6 +2329,209 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertNotIn("token", result)
         self.assertNotIn("endpoint", result)
 
+    def test_runtime_session_id_recovers_exact_unfinished_task_frame(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        frames_root = self.root / ".ai/runtime/task_frames"
+        frames_root.mkdir(parents=True)
+        database = frames_root / "recoverable.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE task_frame_context (
+                    singleton INTEGER PRIMARY KEY,
+                    frame_id TEXT NOT NULL,
+                    origin_session_id TEXT NOT NULL,
+                    origin_anchor_ref TEXT NOT NULL,
+                    origin_frame_id TEXT NOT NULL,
+                    task_state TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO task_frame_context (
+                    singleton, frame_id, origin_session_id, origin_anchor_ref,
+                    origin_frame_id, task_state
+                ) VALUES (1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "gcs-recover-001",
+                    "project-master-original-session",
+                    "MASTER-CURRENT-001",
+                    "current",
+                    "ACTIVE",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            native_runner=lambda _request: self.fail("runtime must not start"),
+        )
+
+        self.assertEqual(
+            "project-master-original-session",
+            coordinator._runtime_session_id(
+                anchor_id="MASTER-CURRENT-001",
+                frame_id="current",
+                recover_task_frame_id="gcs-recover-001",
+            ),
+        )
+        self.assertEqual(
+            "project-master-gcs-master",
+            coordinator._runtime_session_id(
+                anchor_id="MASTER-CURRENT-OTHER",
+                frame_id="current",
+                recover_task_frame_id="gcs-recover-001",
+            ),
+        )
+
+    def test_approved_descendant_runs_boss_then_declared_child_turns(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        dispatches: list[dict[str, Any]] = []
+
+        class Dispatcher:
+            def dispatch(self, request: Mapping[str, Any]) -> dict[str, Any]:
+                dispatches.append(dict(request))
+                if request["turn_id"] == "boss":
+                    return {
+                        "status": "WORKER_OUTPUT_CAPTURED",
+                        "worker_id": "boss-worker-001",
+                        "worker_run_ref": "boss-run-001",
+                        "worker_envelope": {
+                            "turn_id": "boss",
+                            "worker_id": "boss-worker-001",
+                            "worker_run_ref": "boss-run-001",
+                            "result_receipt_ref": "result://boss",
+                            "status": "COMPLETED",
+                            "evidence_refs": ["result://boss"],
+                            "result": {"text": "boss plan"},
+                            "review_decision": "",
+                        },
+                        "structured_result": {
+                            "summary": "Delegate the focused verification.",
+                            "worker_allocations": [
+                                {
+                                    "turn_id": "review",
+                                    "worker_slot_ref": "review-worker",
+                                    "worker_path": "/root/boss/review",
+                                    "task": "Review the approved work.",
+                                    "expected_output": {"result": "review"},
+                                    "mutation_scope": {
+                                        "operations": [],
+                                        "targets": [],
+                                    },
+                                    "skill_bindings": [],
+                                }
+                            ],
+                        },
+                    }
+                return {
+                    "status": "TURN_COMPLETED",
+                    "worker_id": "review-worker-001",
+                }
+
+            def record_captured_result(self, request, envelope):
+                self.recorded_request = dict(request)
+                self.recorded_envelope = dict(envelope)
+                return {"status": "TASK_COMPLETED"}
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            worker_dispatcher=Dispatcher(),
+        )
+        binding = {
+            "endpoint": "http://127.0.0.1:41992",
+            "token": "test-token",
+            "session_id": "project-master-session-001",
+            "frame_id": "master-current",
+            "anchor_id": "MASTER-CURRENT-001",
+        }
+        plan = {
+            "frame_id": "gcs-primary-001",
+            "parent_actor_ref": "project-master:GCS",
+            "turns": [
+                {
+                    "turn_id": "boss",
+                    "role": "BOSS",
+                    "worker_slot_ref": "boss-worker",
+                    "provider": "CODEX",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                },
+                {
+                    "turn_id": "review",
+                    "role": "SUB_REVIEWER",
+                    "worker_slot_ref": "review-worker",
+                    "provider": "GROK",
+                    "model": "grok-4.5",
+                    "reasoning_effort": "high",
+                },
+            ],
+        }
+        operations: list[dict[str, Any]] = []
+
+        def task_operation(_binding, _frame_id, operation):
+            operations.append(dict(operation))
+            if operation["operation"] == "input_bundle" and operation["turn_id"] == "boss":
+                return {
+                    "status": "TURN_INPUTS_READY",
+                    "parent_instruction_bundle": {
+                        "instructions": [
+                            {"instruction_digest": "a" * 64}
+                        ]
+                    },
+                }
+            if operation["operation"] == "submit_boss_allocations":
+                return {"status": "BOSS_ALLOCATIONS_RECORDED"}
+            return {"status": "TURN_INPUTS_READY", "inputs": []}
+
+        with (
+            patch.object(coordinator, "_ensure_runtime", return_value=binding),
+            patch.object(coordinator, "_reopen_task_frame_from_runtime_store") as reopen,
+            patch.object(
+                coordinator,
+                "_get_runtime",
+                return_value={
+                    "status": "TASK_FRAME_HOST_ACTIVE",
+                    "execution_evidence": {
+                        "execution_gate": {
+                            "approval_ref": "universe://projects/GCS/decisions/primary-001",
+                            "execution_plan": plan,
+                        }
+                    },
+                },
+            ),
+            patch.object(coordinator, "_task_frame_operation", side_effect=task_operation),
+        ):
+            result = coordinator.run_approved_descendant_task_frame(
+                task_frame_id="gcs-primary-001",
+                primary_proposal_id="task_proposal_primary_001",
+                primary_proposal_digest="b" * 64,
+                approval_evidence_ref="universe://projects/GCS/decisions/primary-001",
+            )
+
+        self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_COMPLETED", result["status"])
+        reopen.assert_called_once_with(
+            binding=binding,
+            task_frame_id="gcs-primary-001",
+        )
+        self.assertEqual(["boss", "review"], [call["turn_id"] for call in dispatches])
+        self.assertTrue(dispatches[0]["defer_terminal_result"])
+        self.assertEqual("boss-worker-001", dispatches[1]["invoker_actor_ref"])
+        self.assertEqual("submit_boss_allocations", operations[1]["operation"])
+
     def test_approved_descendant_rejects_target_outside_primary_roots(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)

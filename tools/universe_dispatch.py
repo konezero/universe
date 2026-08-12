@@ -477,6 +477,72 @@ class HttpProjectMasterBridge:
             "delivered_at": utc_now(),
         }
 
+    def run_approved_descendant_task_frame(
+        self,
+        *,
+        bridge: dict[str, Any],
+        task_frame_id: str,
+        primary_proposal_id: str,
+        primary_proposal_digest: str,
+        approval_evidence_ref: str,
+    ) -> dict[str, Any]:
+        endpoint = self.validate()
+        credential_env = _environment_name(self.credential_env)
+        token = os.environ.get(credential_env)
+        if not token:
+            raise DispatchError("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE")
+        project_id = _project_id(bridge.get("project_id"))
+        frame_id = _text(task_frame_id, "task_frame_id")
+        body = json.dumps(
+            {
+                "task_frame_id": frame_id,
+                "primary_proposal_id": _text(
+                    primary_proposal_id, "primary_proposal_id"
+                ),
+                "primary_proposal_digest": _text(
+                    primary_proposal_digest, "primary_proposal_digest"
+                ),
+                "approval_evidence_ref": _text(
+                    approval_evidence_ref, "approval_evidence_ref"
+                ),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        request = Request(
+            endpoint + "/v1/project-master/task-frames/run",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=max(self.timeout_seconds, 300.0)) as response:  # nosec B310
+                payload = json.loads(response.read().decode("utf-8"))
+                status_code = response.status
+        except HTTPError as error:
+            try:
+                detail = json.loads(error.read().decode("utf-8"))
+                code = str(detail.get("error_code") or f"HTTP_{error.code}")
+            except (UnicodeError, json.JSONDecodeError):
+                code = f"HTTP_{error.code}"
+            raise DispatchError("MASTER_TASK_FRAME_RUN_" + code) from error
+        except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise DispatchError("MASTER_TASK_FRAME_RUN_UNAVAILABLE") from error
+        if not 200 <= status_code < 300 or not isinstance(payload, dict):
+            raise DispatchError("MASTER_TASK_FRAME_RUN_REJECTED")
+        return {
+            "schema": MASTER_BRIDGE_RECEIPT_SCHEMA,
+            "status": "DELIVERED",
+            "project_id": project_id,
+            "task_frame_id": frame_id,
+            "endpoint": endpoint,
+            "host_response": payload,
+            "delivered_at": utc_now(),
+        }
+
 
 def normalize_dispatch_request(project_id: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):

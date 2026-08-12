@@ -21,6 +21,18 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("parent.insertBefore(", expand_slice)
         self.assertIn('classList.toggle("expanded", expanded)', expand_slice)
 
+    def test_goal_plan_editor_preserves_revision_and_selection(self) -> None:
+        self.assertIn('class="goal-plan-toolbar"', HTML)
+        self.assertIn('id="edit-selected-goal"', HTML)
+        self.assertIn('state.selectedGoalId = state.goals[0]?.goal_id || null;', APP)
+        self.assertIn(
+            'revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision',
+            APP,
+        )
+        goal_dialog = HTML[HTML.index('id="goal-dialog"') : HTML.index('id="milestone-dialog"')]
+        self.assertIn('value="ACTIVE"', goal_dialog)
+        self.assertNotIn('value="IN_PROGRESS"', goal_dialog)
+
     def test_sessions_group_into_collapsible_project_tree(self) -> None:
         self.assertIn("binding.current_project_id", APP)
         self.assertIn("sessionRailProjectIdentity", APP)

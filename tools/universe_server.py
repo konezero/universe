@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import webbrowser
 from contextlib import contextmanager
@@ -3208,6 +3209,30 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
     if in_reply_to is not None:
         message["in_reply_to"] = in_reply_to
     return message
+
+
+def conductor_governance_approval_target(value: Any) -> dict[str, str] | None:
+    normalized = unicodedata.normalize("NFC", str(value or "")).strip()
+    if normalized.casefold() in GOVERNANCE_APPROVAL_COMMANDS:
+        return {}
+    matched = re.fullmatch(
+        r"(?:approve|승인)\s+"
+        r"(?P<proposal_id>task_proposal_[A-Za-z0-9_]+)"
+        r"(?:\s+(?P<proposal_digest>[a-fA-F0-9]{64}))?",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if matched is None:
+        return None
+    target = {"proposal_id": matched.group("proposal_id")}
+    proposal_digest = matched.group("proposal_digest")
+    if proposal_digest is not None:
+        target["proposal_digest"] = proposal_digest.lower()
+    return target
+
+
+def is_governance_approval_command(value: Any) -> bool:
+    return conductor_governance_approval_target(value) is not None
 
 
 def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
@@ -15824,6 +15849,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             assert isinstance(active_work, Mapping)
             self._require_active_work_current(project["project_id"], active_work)
 
+        inherited_evidence_ref = decision["evidence_ref"]
+        decision_result = decision.get("result")
+        stored_approval = proposal.get("approval")
+        if (
+            isinstance(decision_result, Mapping)
+            and decision_result.get("reconciled") is True
+            and isinstance(stored_approval, Mapping)
+        ):
+            inherited_evidence_ref = _required_text(
+                stored_approval.get("evidence_ref"),
+                "primary.approval.evidence_ref",
+            )
+
         try:
             self.ensure_project_master(project["project_id"])
             bridge = self.store.get_master_bridge(project["project_id"])
@@ -15838,7 +15876,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "proposal_id": primary_id,
                     "proposal_digest": primary_digest,
                     "commander_surface": UNIVERSE_COMMANDER_SURFACE,
-                    "evidence_ref": decision["evidence_ref"],
+                    "evidence_ref": inherited_evidence_ref,
                     "active_work": (
                         dict(active_work)
                         if isinstance(active_work, Mapping)
@@ -15861,7 +15899,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             or host_result.get("status") != "APPROVED_DESCENDANT_TASK_FRAME_READY"
             or host_result.get("primary_proposal_id") != primary_id
             or host_result.get("primary_proposal_digest") != primary_digest
-            or host_result.get("approval_evidence_ref") != decision["evidence_ref"]
+            or host_result.get("approval_evidence_ref") != inherited_evidence_ref
         ):
             raise UniverseError(
                 "APPROVED_DESCENDANT_TASK_FRAME_RECEIPT_INVALID",
@@ -15875,6 +15913,110 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project["project_id"],
             "primary_proposal_id": primary_id,
             "primary_proposal_digest": primary_digest,
+            "task_frame": dict(host_result),
+        }
+
+    def run_approved_descendant_task_frame(
+        self,
+        project_id: str,
+        proposal_id: str,
+        task_frame_id: str,
+    ) -> dict[str, Any]:
+        """Start an active descendant only through its approved primary lineage."""
+
+        project = self.store.get_project(project_id)
+        primary_id = _required_text(proposal_id, "primary_proposal_id")
+        frame_id = _required_text(task_frame_id, "task_frame_id")
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == primary_id
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        primary_digest = _sha256(
+            proposal.get("proposal_digest"), "primary_proposal.proposal_digest"
+        )
+        if proposal.get("state") != "APPROVED":
+            raise UniverseError(
+                "PRIMARY_TASK_PROPOSAL_NOT_APPROVED",
+                "an approved primary proposal is required before running a Task Frame",
+                HTTPStatus.CONFLICT,
+            )
+        decision = self.store.find_governance_proposal_decision(
+            project["project_id"], primary_id
+        )
+        if (
+            decision is None
+            or decision.get("state") != "APPLIED"
+            or decision.get("decision") != "APPROVE"
+            or decision.get("proposal_digest") != primary_digest
+            or decision.get("commander_surface") != UNIVERSE_COMMANDER_SURFACE
+        ):
+            raise UniverseError(
+                "PRIMARY_TASK_APPROVAL_EVIDENCE_UNAVAILABLE",
+                "the durable Universe approval evidence is unavailable or inconsistent",
+                HTTPStatus.CONFLICT,
+            )
+        inherited_evidence_ref = decision["evidence_ref"]
+        decision_result = decision.get("result")
+        stored_approval = proposal.get("approval")
+        if (
+            isinstance(decision_result, Mapping)
+            and decision_result.get("reconciled") is True
+            and isinstance(stored_approval, Mapping)
+        ):
+            inherited_evidence_ref = _required_text(
+                stored_approval.get("evidence_ref"),
+                "primary.approval.evidence_ref",
+            )
+        try:
+            self.ensure_project_master(project["project_id"])
+            bridge = self.store.get_master_bridge(project["project_id"])
+            receipt = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+            ).run_approved_descendant_task_frame(
+                bridge=bridge,
+                task_frame_id=frame_id,
+                primary_proposal_id=primary_id,
+                primary_proposal_digest=primary_digest,
+                approval_evidence_ref=inherited_evidence_ref,
+            )
+        except (DispatchError, OSError, ProjectMasterHostError) as error:
+            raise UniverseError(
+                "APPROVED_DESCENDANT_TASK_FRAME_RUN_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        host_result = receipt.get("host_response")
+        if (
+            not isinstance(host_result, Mapping)
+            or host_result.get("status") != "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED"
+            or host_result.get("project_id") != project["project_id"]
+            or host_result.get("primary_proposal_id") != primary_id
+            or host_result.get("task_frame_id") != frame_id
+        ):
+            raise UniverseError(
+                "APPROVED_DESCENDANT_TASK_FRAME_RUN_RECEIPT_INVALID",
+                "Project Master did not return a matching Task Frame completion receipt",
+                HTTPStatus.CONFLICT,
+            )
+        self.publish_project_room_changed(project["project_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED",
+            "project_id": project["project_id"],
+            "primary_proposal_id": primary_id,
             "task_frame": dict(host_result),
         }
 
@@ -18177,7 +18319,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         is_commander_approval = (
             trusted_commander
-            and body.casefold() in GOVERNANCE_APPROVAL_COMMANDS
+            and is_governance_approval_command(body)
         )
         is_project_release_command = bool(
             trusted_commander and PROJECT_RELEASE_ROOM_COMMAND_PATTERN.search(body)
@@ -18884,7 +19026,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "decision": existing,
                 "message": None,
             }
-        if proposal["state"] != "PROPOSED":
+        approval_reconciliation = (
+            request["decision"] == "APPROVE"
+            and proposal["state"] == "APPROVED"
+        )
+        if proposal["state"] != "PROPOSED" and not approval_reconciliation:
             raise UniverseError(
                 "GOVERNANCE_PROPOSAL_STATE_INVALID",
                 f"Proposal is not awaiting approval: {proposal['state']}",
@@ -18902,7 +19048,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             project["project_id"], proposal, request, active_anchor=active_anchor
         )
         try:
-            if request["decision"] == "APPROVE":
+            if approval_reconciliation:
+                runtime_approval = proposal.get("approval")
+                if not isinstance(runtime_approval, Mapping):
+                    raise ProjectMasterHostError(
+                        "PROJECT_TASK_PROPOSAL_APPROVAL_EVIDENCE_UNAVAILABLE"
+                    )
+                decision_result = {
+                    "status": "TASK_PROPOSAL_APPROVAL_RECONCILED",
+                    "approval": dict(runtime_approval),
+                    "reconciled": True,
+                }
+            elif request["decision"] == "APPROVE":
                 decision_result = self.project_task_proposals.approve(
                     Path(project["project_root"]),
                     proposal_id=proposal["proposal_id"],
@@ -19294,7 +19451,129 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except UniverseError:
             pass
 
+    def _try_apply_conductor_governance_approval(
+        self, message_id: str
+    ) -> dict[str, Any] | None:
+        """Apply one direct Commander approval before invoking a provider.
+
+        A short approval command belongs to the Universe governance surface,
+        not to a provider turn.  Keeping it in the server preserves the same
+        durable decision and evidence chain used by the action controls.
+        """
+
+        message = self.store.get_conductor_room_message(message_id)
+        if str(message.get("sender") or "").upper() != "USER":
+            return None
+        approval_target = conductor_governance_approval_target(message.get("body"))
+        if approval_target is None:
+            return None
+        ui_context = message.get("ui_context")
+        selected_project_id = (
+            str(ui_context.get("selected_project_id"))
+            if isinstance(ui_context, Mapping)
+            and ui_context.get("selected_project_id") is not None
+            else None
+        )
+        candidates = [
+            proposal
+            for proposal in self.list_governance_proposal_inbox()
+            if (
+                proposal.get("state") == "PROPOSED"
+                or (
+                    proposal.get("state") == "APPROVED"
+                    and self.store.find_governance_proposal_decision(
+                        str(proposal["project_id"]), str(proposal["proposal_id"])
+                    )
+                    is None
+                )
+            )
+        ]
+        if selected_project_id is not None:
+            candidates = [
+                proposal
+                for proposal in candidates
+                if proposal.get("project_id") == selected_project_id
+            ]
+        if approval_target.get("proposal_id") is not None:
+            candidates = [
+                proposal
+                for proposal in candidates
+                if proposal.get("proposal_id") == approval_target["proposal_id"]
+                and (
+                    approval_target.get("proposal_digest") is None
+                    or proposal.get("proposal_digest")
+                    == approval_target["proposal_digest"]
+                )
+            ]
+        if len(candidates) != 1:
+            self.store.claim_conductor_room_message(message_id, provider="AUTO")
+            self.store.complete_conductor_room_message(
+                message_id,
+                provider="AUTO",
+                body="Governance approval needs an exact Proposal selection.",
+                result_receipt_ref="UNKNOWN",
+                ui_action=normalize_conductor_ui_action({"kind": "NONE"}),
+            )
+            self.conductor_room_events.publish(
+                {
+                    "type": "CONDUCTOR_GOVERNANCE_APPROVAL_SELECTION_REQUIRED",
+                    "message_id": message_id,
+                    "project_id": selected_project_id,
+                    "proposal_count": len(candidates),
+                }
+            )
+            return {
+                "status": "GOVERNANCE_APPROVAL_SELECTION_REQUIRED",
+                "pending_proposals": candidates,
+            }
+        proposal = candidates[0]
+        decision = self.decide_pending_proposal(
+            str(proposal["proposal_id"]),
+            {
+                "decision": "APPROVE",
+                "proposal_digest": str(proposal["proposal_digest"]),
+            },
+            commander_context={
+                "authenticated": True,
+                "surface": "LOCAL_BROWSER",
+                "source": "NATURAL_LANGUAGE",
+                "input_ref": (
+                    "universe://conductor-room/messages/"
+                    + quote(message_id, safe="")
+                ),
+            },
+        )
+        self.store.claim_conductor_room_message(message_id, provider="AUTO")
+        self.store.complete_conductor_room_message(
+            message_id,
+            provider="AUTO",
+            body=(
+                "Governance approval recorded for "
+                f"{proposal['proposal_id']}."
+            ),
+            result_receipt_ref=str(
+                decision["decision"].get("evidence_ref") or "UNKNOWN"
+            ),
+            ui_action=normalize_conductor_ui_action({"kind": "NONE"}),
+        )
+        self.conductor_room_events.publish(
+            {
+                "type": "CONDUCTOR_GOVERNANCE_APPROVED",
+                "message_id": message_id,
+                "proposal_id": proposal["proposal_id"],
+                "proposal_digest": proposal["proposal_digest"],
+                "evidence_ref": decision["decision"].get("evidence_ref"),
+            }
+        )
+        return {
+            "status": "GOVERNANCE_PROPOSAL_APPROVED_FROM_COMMANDER_TEXT",
+            "proposal": proposal,
+            "decision": decision["decision"],
+        }
+
     def _process_conductor_message(self, message_id: str) -> None:
+        if self._try_apply_conductor_governance_approval(message_id) is not None:
+            return
         with self._planning_binding_lock:
             binding = (
                 dict(self._planning_binding)
@@ -22129,18 +22408,49 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/conductor-room/messages":
                 message, created = self.server.store.create_conductor_room_message(body)
+                governance_result = (
+                    self.server._try_apply_conductor_governance_approval(
+                        message["message_id"]
+                    )
+                    if created
+                    else None
+                )
                 if created:
-                    self.server.enqueue_conductor_message(message["message_id"])
+                    if governance_result is None:
+                        self.server.enqueue_conductor_message(message["message_id"])
+                    else:
+                        message = self.server.store.get_conductor_room_message(
+                            message["message_id"]
+                        )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
                         "status": (
-                            "CONDUCTOR_ROOM_MESSAGE_RECORDED"
-                            if created
-                            else "CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED"
+                            governance_result["status"]
+                            if governance_result is not None
+                            else (
+                                "CONDUCTOR_ROOM_MESSAGE_RECORDED"
+                                if created
+                                else "CONDUCTOR_ROOM_MESSAGE_ALREADY_RECORDED"
+                            )
                         ),
                         "message": message,
+                        "proposal": (
+                            governance_result.get("proposal")
+                            if governance_result is not None
+                            else None
+                        ),
+                        "governance_decision": (
+                            governance_result.get("decision")
+                            if governance_result is not None
+                            else None
+                        ),
+                        "pending_proposals": (
+                            governance_result.get("pending_proposals", [])
+                            if governance_result is not None
+                            else []
+                        ),
                         "runtime_binding": self.server.planning_binding_status(),
                     },
                 )
@@ -22536,6 +22846,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             approved_task_frame_parts = self._approved_descendant_task_frame_path(path)
+            approved_task_frame_run_parts = self._approved_descendant_task_frame_run_path(path)
+            if approved_task_frame_run_parts is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.run_approved_descendant_task_frame(
+                        approved_task_frame_run_parts[0],
+                        approved_task_frame_run_parts[1],
+                        approved_task_frame_run_parts[2],
+                    ),
+                )
+                return
             if approved_task_frame_parts is not None:
                 self._send(
                     HTTPStatus.CREATED,
@@ -23526,6 +23847,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not project_id or "/" in project_id or not proposal_id or "/" in proposal_id:
             return None
         return unquote(project_id), unquote(proposal_id)
+
+    @staticmethod
+    def _approved_descendant_task_frame_run_path(
+        path: str,
+    ) -> tuple[str, str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/governance-proposals/"
+        separator = "/task-frames/"
+        suffix = "/run"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or separator not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, proposal_path = remainder.split(marker, 1)
+        proposal_id, frame_path = proposal_path.split(separator, 1)
+        frame_id = frame_path[: -len(suffix)]
+        if (
+            not project_id
+            or "/" in project_id
+            or not proposal_id
+            or "/" in proposal_id
+            or not frame_id
+            or "/" in frame_id
+        ):
+            return None
+        return unquote(project_id), unquote(proposal_id), unquote(frame_id)
 
     @staticmethod
     def _release_path(path: str) -> str | None:
