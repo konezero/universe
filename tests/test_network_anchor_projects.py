@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -41,6 +43,25 @@ class NetworkAnchorProjectTests(unittest.TestCase):
                 self.assertEqual(
                     "CAREER_SOURCE",
                     (project.get("metadata") or {}).get("network_role"),
+                )
+
+    def test_configured_private_career_root_takes_precedence(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            private_root = Path(tmp) / "universe-private" / "projects" / "career"
+            private_root.mkdir(parents=True)
+            (private_root / "README.md").write_text("# Career\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"UNIVERSE_CAREER_SOURCE_ROOT": str(private_root)},
+                clear=False,
+            ):
+                candidates = discover_network_anchor_candidates(universe_root=ROOT)
+                career = next(
+                    item for item in candidates if item["project_id"] == "career"
+                )
+                self.assertEqual(private_root.resolve(), career["project_root"])
+                self.assertEqual(
+                    "private Career source", career["metadata"]["label"]
                 )
 
 

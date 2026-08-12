@@ -95,7 +95,7 @@ def _validate_install_binding(content: bytes) -> dict[str, Any]:
             "manifest_digest": None,
             "note": "Attached mode follows the installed Career Runtime and Universe host.",
         },
-        "career_source": {"project_id": "ai-career", "role": "CAREER_SOURCE"},
+        "career_source": {"project_id": "career", "role": "CAREER_SOURCE"},
         "universe_host": {
             "discovery": "LOCAL_SERVER_JSON",
             "state_file_hint": "%LOCALAPPDATA%\\Universe\\server.json",

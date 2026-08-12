@@ -4,5 +4,10 @@ __pycache__/
 # Universe-managed local AI Workspace
 .ai/
 
+# Product Nodes receive their local Workspace from Universe. Never track it
+# inside a product source import.
+projects/*/.ai/
+projects/*/.universe/
+
 dist/portable/
 

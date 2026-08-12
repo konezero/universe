@@ -11,7 +11,7 @@
     "note": "Attached mode follows the installed Career Runtime and Universe host."
   },
   "career_source": {
-    "project_id": "ai-career",
+    "project_id": "career",
     "role": "CAREER_SOURCE"
   },
   "universe_host": {

@@ -168,7 +168,7 @@ built-in multiverse nodes when their roots exist next to this repository:
 | project_id | default root | role |
 |------------|--------------|------|
 | `universe` | this repo (`tools/..`) | `UNIVERSE_HOME` |
-| `ai-career` | sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
+| `career` | `UNIVERSE_CAREER_SOURCE_ROOT`, otherwise sibling `../ai-career` (or `../career`) | `CAREER_SOURCE` |
 
 These appear in the left project rail as **Universe** / **Career**. Ordinary
 product projects (GCS, etc.) still register explicitly.

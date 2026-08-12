@@ -380,7 +380,9 @@ DEFAULT_REFS = {
     "master_inbox": ".ai/inbox/MASTER",
 }
 NETWORK_ANCHOR_ROLES = frozenset({"UNIVERSE_HOME", "CAREER_SOURCE", "NETWORK_ANCHOR"})
-# Prefer first existing sibling folder name for Career source.
+# A private Career Node may live outside the public Universe repository.
+CAREER_SOURCE_ROOT_ENV = "UNIVERSE_CAREER_SOURCE_ROOT"
+# Prefer first existing sibling folder name for legacy Career source discovery.
 CAREER_ROOT_CANDIDATES = ("ai-career", "career")
 DOCUMENT_ROLES = frozenset(
     {
@@ -943,6 +945,23 @@ def discover_network_anchor_candidates(
             },
         }
     ]
+    configured_career_root = os.environ.get(CAREER_SOURCE_ROOT_ENV)
+    if configured_career_root:
+        career_root = Path(configured_career_root).expanduser().resolve()
+        if career_root.is_dir():
+            candidates.append(
+                {
+                    "project_id": "career",
+                    "project_root": career_root,
+                    "metadata": {
+                        "network_role": "CAREER_SOURCE",
+                        "display_name": "Career",
+                        "label": "private Career source",
+                    },
+                }
+            )
+            return candidates
+
     parent = home.parent
     for folder in CAREER_ROOT_CANDIDATES:
         career_root = (parent / folder).resolve()
