@@ -5735,6 +5735,30 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.server._require_active_work_current("GCS", active_work)
         self.assertEqual("ACTIVE_WORK_REALIGNMENT_REQUIRED", raised.exception.code)
 
+    def test_active_work_anchor_rejects_tied_latest_observations(self) -> None:
+        observed_at = "2026-08-12T23:00:00Z"
+        for session_id, provider in (
+            ("session-gcs-master-codex", "CODEX"),
+            ("session-gcs-master-claude", "CLAUDE"),
+        ):
+            self.server.session_supervisor.register_session(
+                {
+                    "session_id": session_id,
+                    "node": "GCS",
+                    "mode": "MASTER",
+                    "provider": provider,
+                    "anchor_ref": "MASTER-CURRENT-GCS-001",
+                    "state": "LIVE",
+                    "currentness": "CURRENT",
+                    "last_seen_at": observed_at,
+                }
+            )
+
+        with self.assertRaises(UniverseError) as raised:
+            self.server._current_active_work_anchor("GCS")
+
+        self.assertEqual("ACTIVE_WORK_ANCHOR_UNAVAILABLE", raised.exception.code)
+
     def test_legacy_direct_surface_decision_is_projected_to_universe_ui(self) -> None:
         proposal = self.create_task_proposal_fixture()
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

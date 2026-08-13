@@ -154,6 +154,8 @@ class ProjectModeCoordinator:
         project_id: str,
         host_session_ref: str,
         *,
+        session_node: str | None = None,
+        requested_mode: str = "MASTER",
         native_runner: NativeRunner = run_native_cli,
         source_binding_resolver: SourceBindingResolver | None = None,
         session_supervisor: SessionSupervisorStore | None = None,
@@ -161,6 +163,9 @@ class ProjectModeCoordinator:
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
+        self.session_node = _text(session_node or self.project_id, "session_node")
+        self.requested_mode = _text(requested_mode, "requested_mode").upper()
+        self._mode_role: str | None = None
         self.host_session_ref = _text(host_session_ref, "host_session_ref")
         self.native_runner = native_runner
         self.source_binding_resolver = source_binding_resolver
@@ -189,7 +194,8 @@ class ProjectModeCoordinator:
         )
 
     def prepare(self) -> Mapping[str, Any]:
-        definition = self._master_definition()
+        definition = self._mode_definition()
+        self._mode_role = definition["role"]
         source = self._resolved_source_binding()
         request = {
             "command": "BOOT",
@@ -197,7 +203,7 @@ class ProjectModeCoordinator:
             "source_ref": source["source_ref"],
             "source_commit": source["source_commit"],
             "source_repository": source["source_repository"],
-            "mode": "MASTER",
+            "mode": self.requested_mode,
             "role": definition["role"],
             "scope": definition["scope"],
             "host_session_ref": self.host_session_ref,
@@ -218,7 +224,11 @@ class ProjectModeCoordinator:
             "MODE_CURRENT_ANCHOR_OBSERVED",
         }:
             raise ProjectMasterHostError("PROJECT_MASTER_SESSION_PREPARATION_FAILED")
-        _mode_boot_binding(result, expected_mode="MASTER", expected_role="MASTER")
+        _mode_boot_binding(
+            result,
+            expected_mode=self.requested_mode,
+            expected_role=definition["role"],
+        )
         self._prepared = dict(result)
         return result
 
@@ -232,7 +242,7 @@ class ProjectModeCoordinator:
                 str(self.project_root),
             ),
             {
-                "mode": "MASTER",
+                "mode": self.requested_mode,
                 "commander_surface": "UNIVERSE_UI",
                 "evidence_ref": (f"universe://project-room/messages/{message_id}"),
             },
@@ -255,7 +265,7 @@ class ProjectModeCoordinator:
                 str(self.project_root),
             ),
             {
-                "mode": "MASTER",
+                "mode": self.requested_mode,
                 "commander_surface": "UNIVERSE_UI",
                 "evidence_ref": (
                     f"universe://rooms/{room_id}/events/{room_event_id}"
@@ -1369,8 +1379,8 @@ class ProjectModeCoordinator:
         if binding is None or process is None or process.poll() is not None:
             return None
         return {
-            "node": self.project_id,
-            "mode": "MASTER",
+            "node": self.session_node,
+            "mode": self.requested_mode,
             "session_id": binding["session_id"],
             "frame_id": binding["frame_id"],
             "anchor_id": binding["anchor_id"],
@@ -1436,11 +1446,23 @@ class ProjectModeCoordinator:
             )
             if not anchor_id:
                 raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
+            prepared_binding = prepared.get("mode_boot_binding")
+            prepared_role = (
+                str(prepared_binding.get("role") or "").strip().upper()
+                if isinstance(prepared_binding, Mapping)
+                else ""
+            )
+            expected_role = (
+                self._mode_role
+                or prepared_role
+                or self._mode_definition()["role"]
+            )
             mode_boot_binding = _mode_boot_binding(
                 prepared,
-                expected_mode="MASTER",
-                expected_role="MASTER",
+                expected_mode=self.requested_mode,
+                expected_role=expected_role,
             )
+            self._mode_role = expected_role
             if mode_boot_binding["anchor_id"] != anchor_id:
                 raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_MISMATCH")
             frame_id = mode_boot_binding["frame_id"]
@@ -1504,8 +1526,8 @@ class ProjectModeCoordinator:
                     or not isinstance(host_adapter, Mapping)
                     or not isinstance(runtime_state, Mapping)
                     or runtime_state.get("anchor_id") != anchor_id
-                    or runtime_state.get("mode") != "MASTER"
-                    or runtime_state.get("role") != "MASTER"
+                    or runtime_state.get("mode") != self.requested_mode
+                    or runtime_state.get("role") != self._mode_role
                     or runtime_state.get("executable_runtime_currentness") != "CURRENT"
                     or not isinstance(startup.get("mode_boot_binding"), Mapping)
                     or startup["mode_boot_binding"].get("binding_id")
@@ -1578,7 +1600,16 @@ class ProjectModeCoordinator:
             )
             if recovered is not None:
                 return recovered
-        return "project-master-" + self.project_id.lower() + "-master"
+        if self.session_node == self.project_id and self.requested_mode == "MASTER":
+            return "project-master-" + self.project_id.lower() + "-master"
+        return (
+            "project-mode-"
+            + self.session_node.lower()
+            + "-"
+            + self.project_id.lower()
+            + "-"
+            + self.requested_mode.lower()
+        )
 
     def _recover_task_frame_session_id(
         self,
@@ -1854,7 +1885,7 @@ class ProjectModeCoordinator:
         if self.session_supervisor is None:
             return
         sessions = self.session_supervisor.list_sessions(
-            node=self.project_id, mode="MASTER"
+            node=self.session_node, mode=self.requested_mode
         )
         session = next((item for item in sessions if item["is_default"]), None)
         if session is None:
@@ -1990,7 +2021,7 @@ class ProjectModeCoordinator:
         except (OSError, UnicodeError):
             return
 
-    def _master_definition(self) -> Mapping[str, str]:
+    def _mode_definition(self) -> Mapping[str, str]:
         registry_path = (
             self.project_root
             / ".ai"
@@ -2000,18 +2031,23 @@ class ProjectModeCoordinator:
         )
         try:
             registry = json.loads(registry_path.read_text(encoding="utf-8"))
-            definition = registry["modes"]["MASTER"]
+            definition = registry["modes"][self.requested_mode]
         except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
             raise ProjectMasterHostError("PROJECT_MASTER_MODE_UNAVAILABLE") from error
         if not isinstance(definition, Mapping):
             raise ProjectMasterHostError("PROJECT_MASTER_MODE_UNAVAILABLE")
+        role = _text(definition.get("role"), f"{self.requested_mode}.role").upper()
         return {
-            "role": _text(definition.get("role"), "MASTER.role"),
-            "scope": _text(definition.get("scope"), "MASTER.scope"),
+            "role": role,
+            "scope": _text(definition.get("scope"), f"{self.requested_mode}.scope"),
             "mode_profile": _text(
-                definition.get("mode_profile"), "MASTER.mode_profile"
+                definition.get("mode_profile"), f"{self.requested_mode}.mode_profile"
             ),
         }
+
+    # Compatibility for callers that still use the old private helper name.
+    def _master_definition(self) -> Mapping[str, str]:
+        return self._mode_definition()
 
     def _invoke(
         self,
@@ -2299,11 +2335,13 @@ class ProjectMasterSessionStore:
         database_path: Path,
         project_id: str,
         *,
+        session_node: str | None = None,
         session_supervisor: SessionSupervisorStore | None = None,
         requested_mode: str = "MASTER",
     ) -> None:
         self.database_path = database_path.expanduser().resolve()
         self.project_id = _text(project_id, "project_id")
+        self.session_node = _text(session_node or self.project_id, "session_node")
         self.session_supervisor = session_supervisor
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2315,7 +2353,7 @@ class ProjectMasterSessionStore:
     def last_provider_session(self) -> dict[str, str] | None:
         if self.session_supervisor is not None:
             sessions = self.session_supervisor.list_sessions(
-                node=self.project_id,
+                node=self.session_node,
                 mode=self.requested_mode,
             )
             selected = next(
@@ -2361,7 +2399,7 @@ class ProjectMasterSessionStore:
         if self.session_supervisor is None:
             return None
         sessions = self.session_supervisor.list_sessions(
-            node=self.project_id,
+            node=self.session_node,
             mode=self.requested_mode,
         )
         selected = next(
@@ -2375,7 +2413,7 @@ class ProjectMasterSessionStore:
         session, _ = self.session_supervisor.register_session(
             {
                 "session_id": supervisor_session_id,
-                "node": self.project_id,
+                "node": self.session_node,
                 "mode": self.requested_mode,
                 "provider": normalized_provider,
                 "provider_session_ref": None,
@@ -2383,8 +2421,8 @@ class ProjectMasterSessionStore:
                 "currentness": "UNKNOWN",
                 "activity_state": "BOOTSTRAPPING",
                 "location_evidence_ref": (
-                    "universe://project-master-bootstrap/"
-                    f"{self.project_id}/{self.requested_mode}"
+                    "universe://mode-session-bootstrap/"
+                    f"{self.session_node}/{self.requested_mode}"
                 ),
             }
         )
@@ -2396,7 +2434,7 @@ class ProjectMasterSessionStore:
         return next(
             item
             for item in self.session_supervisor.list_sessions(
-                node=self.project_id,
+                node=self.session_node,
                 mode=self.requested_mode,
             )
             if item["is_default"]
@@ -2417,7 +2455,7 @@ class ProjectMasterSessionStore:
             state = "REPLACED"
         if self.session_supervisor is not None:
             sessions = self.session_supervisor.list_sessions(
-                node=self.project_id,
+                node=self.session_node,
                 mode=self.requested_mode,
             )
             selected = next(
@@ -2445,7 +2483,7 @@ class ProjectMasterSessionStore:
                 candidate, _ = self.session_supervisor.register_session(
                     {
                         "session_id": supervisor_session_id,
-                        "node": self.project_id,
+                        "node": self.session_node,
                         "mode": self.requested_mode,
                         "provider": normalized_provider,
                         "provider_session_ref": normalized_session,
@@ -2464,7 +2502,7 @@ class ProjectMasterSessionStore:
                 activity_state="ATTACHED",
                 evidence_ref=(
                     "universe://session-observer/"
-                    f"{self.project_id}/{self.requested_mode}/provider-attach"
+                    f"{self.session_node}/{self.requested_mode}/provider-attach"
                 ),
             )
         with self._connection() as connection:
@@ -2519,7 +2557,7 @@ class ProjectMasterSessionStore:
             (
                 session
                 for session in self.session_supervisor.list_sessions(
-                    node=self.project_id,
+                    node=self.session_node,
                     mode=self.requested_mode,
                 )
                 if session["is_default"]
@@ -2570,7 +2608,7 @@ class ProjectMasterSessionStore:
         if any(
             session["is_default"]
             for session in self.session_supervisor.list_sessions(
-                node=self.project_id,
+                node=self.session_node,
                 mode=self.requested_mode,
             )
         ):
@@ -2584,7 +2622,7 @@ class ProjectMasterSessionStore:
         session, _ = self.session_supervisor.register_session(
             {
                 "session_id": supervisor_session_id,
-                "node": self.project_id,
+                "node": self.session_node,
                 "mode": self.requested_mode,
                 "provider": legacy["provider"],
                 "provider_session_ref": legacy["session_ref"],
@@ -2602,7 +2640,7 @@ class ProjectMasterSessionStore:
         del provider, session_ref
         material = json.dumps(
             {
-                "node": self.project_id,
+                "node": self.session_node,
                 "mode": self.requested_mode,
             },
             sort_keys=True,
@@ -3622,6 +3660,8 @@ class ResidentModeSessionHost:
         database_path: Path,
         *,
         actor_label: str,
+        session_node: str | None = None,
+        target_kind: str = "PROJECT_MASTER",
         session_supervisor: SessionSupervisorStore | None = None,
         supervisor_endpoint: str = "http://127.0.0.1:1",
         continuity_coordinator: ContinuitySaver | None = None,
@@ -3638,6 +3678,8 @@ class ResidentModeSessionHost:
         self.target_id = _text(target_id, "target_id")
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = _text(actor_label, "actor_label")
+        self.session_node = _text(session_node or self.target_id, "session_node")
+        self.target_kind = _text(target_kind, "target_kind").upper()
         self.session_supervisor = session_supervisor
         self._supervisor_endpoint = _normalize_supervisor_endpoint(
             supervisor_endpoint
@@ -3649,6 +3691,7 @@ class ResidentModeSessionHost:
         self.store = ProjectMasterSessionStore(
             database_path,
             self.target_id,
+            session_node=self.session_node,
             session_supervisor=session_supervisor,
             requested_mode=self.requested_mode,
         )
@@ -4214,7 +4257,7 @@ class ResidentModeSessionHost:
             else None
         )
         status = provider_session_connection(
-            target_kind="UNIVERSE_CONDUCTOR",
+            target_kind=self.target_kind,
             target_id=self.target_id,
             requested_mode=self.requested_mode,
             store=self.store,
@@ -4519,6 +4562,8 @@ class ResidentRoomParticipantHostManager:
                 normalized_mode,
                 _default_room_participant_db(binding_id),
                 actor_label=str(binding.get("display_name") or binding.get("slot_role") or "Room Participant"),
+                session_node=normalized_node,
+                target_kind="ROOM_PARTICIPANT",
                 permission_requester=self._permission_unavailable,
                 provider_factory=self.provider_factory,
             )

@@ -1975,6 +1975,77 @@ class ProjectMasterHostTests(unittest.TestCase):
             requests[1]["evidence_ref"],
         )
 
+    def test_project_mode_coordinator_resolves_role_from_selected_mode(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        registry = self.root / ".ai/runtime/project_instance/mode_registry.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "modes": {
+                        "DESIGN": {
+                            "role": "DESIGNER",
+                            "scope": "product/ux",
+                            "mode_profile": "GOVERNANCE_ONLY",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        requests: list[dict[str, Any]] = []
+
+        def runner(request):
+            request_path = Path(
+                request.arguments[request.arguments.index("--request") + 1]
+            )
+            requests.append(json.loads(request_path.read_text(encoding="utf-8")))
+            payload = {
+                "status": "SESSION_PREPARED",
+                "mode_current_anchor": {
+                    "status": "MODE_CURRENT_ANCHOR_OBSERVED",
+                    "snapshot": {"snapshot": {"anchor_id": "DESIGN-CURRENT-001"}},
+                },
+                "mode_boot_binding": {
+                    "status": "PREPARED",
+                    "binding_id": "mode-boot-design-001",
+                    "mode": "DESIGN",
+                    "role": "DESIGNER",
+                    "frame_id": "current",
+                    "anchor_id": "DESIGN-CURRENT-001",
+                },
+            }
+            return NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(payload),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-design-001",
+            session_node="universe",
+            requested_mode="DESIGN",
+            native_runner=runner,
+            source_binding_resolver=lambda _root: self._selected_release(),
+        )
+
+        coordinator.prepare()
+
+        self.assertEqual("universe", coordinator.session_node)
+        self.assertEqual("DESIGN", coordinator.requested_mode)
+        self.assertEqual("DESIGNER", coordinator._mode_role)
+        self.assertEqual("DESIGN", requests[0]["mode"])
+        self.assertEqual("DESIGNER", requests[0]["role"])
+
     def test_project_mode_coordinator_requires_mode_boot_binding(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)

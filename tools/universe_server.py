@@ -15061,6 +15061,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     if conductor_runtime_factory is not None
                     else UniverseConductorRuntime(
                         Path(__file__).resolve().parents[1],
+                        session_node="universe",
+                        requested_mode="CONDUCTOR",
                         source_binding_resolver=(
                             lambda _root: self.store.selected_project_release_binding(
                                 "universe"
@@ -16445,6 +16447,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     self.store.database_path.parent
                     / "conductor-mode-session.sqlite",
                     actor_label="Universe Conductor",
+                    session_node="universe",
+                    target_kind="UNIVERSE_CONDUCTOR",
                     session_supervisor=self.session_supervisor,
                     supervisor_endpoint=(
                         f"http://127.0.0.1:{self.server_address[1]}"
@@ -17676,6 +17680,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 descriptor.get("alias")
                 or f"{descriptor['project_id']} {descriptor['mode']}"
             ),
+            session_node=str(
+                descriptor.get("node") or descriptor.get("project_id")
+            ),
+            target_kind="PROVIDER_SESSION",
             permission_requester=permission_requester,
         )
 
@@ -18753,19 +18761,48 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and isinstance(session.get("anchor_ref"), str)
             and str(session["anchor_ref"]).strip()
         ]
-        if len(candidates) != 1:
+        if not candidates:
             raise UniverseError(
                 "ACTIVE_WORK_ANCHOR_UNAVAILABLE",
-                "exactly one LIVE and CURRENT Project Master anchor is required",
+                "a LIVE and CURRENT Project Master anchor is required",
                 HTTPStatus.CONFLICT,
             )
-        session = candidates[0]
+        observation_keys = {
+            id(session): self._session_observation_key(session)
+            for session in candidates
+        }
+        newest_key = max(observation_keys.values())
+        newest = [
+            session
+            for session in candidates
+            if observation_keys[id(session)] == newest_key
+        ]
+        if len(newest) != 1:
+            raise UniverseError(
+                "ACTIVE_WORK_ANCHOR_UNAVAILABLE",
+                "Project Master anchor observation time is ambiguous",
+                HTTPStatus.CONFLICT,
+            )
+        session = newest[0]
         return {
             "session_id": _required_text(session.get("session_id"), "active_work.session_id"),
             "anchor_ref": _required_text(session.get("anchor_ref"), "active_work.anchor_ref"),
             "provider": _identifier(session.get("provider"), "active_work.provider").upper(),
             "currentness": "CURRENT",
         }
+
+    @staticmethod
+    def _session_observation_key(session: Mapping[str, Any]) -> datetime:
+        observed_at = str(session.get("last_seen_at") or "").strip()
+        if not observed_at:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _require_active_work_current(
         self, project_id: str, active_work: Mapping[str, Any]
