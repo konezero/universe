@@ -218,6 +218,10 @@ from universe_app.provider_session_service import (
 )
 
 API_SCHEMA = "universe.local-service.v1"
+_AMBIENT_BROWSER_CONTEXT_RE = re.compile(
+    r"<in-app-browser-context\b[^>]*>.*?(?:</in-app-browser-context>|\Z)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
@@ -2904,6 +2908,19 @@ def normalize_project_seed(project: dict[str, Any], value: Any) -> dict[str, Any
     return normalized
 
 
+def _strip_ambient_browser_context(value: Any, *, field: str = "body") -> str:
+    """Remove Host UI metadata before a room message is persisted or relayed."""
+
+    text = _required_text(value, field)
+    cleaned = _AMBIENT_BROWSER_CONTEXT_RE.sub("", text).strip()
+    if not cleaned:
+        raise UniverseError(
+            "ROOM_MESSAGE_BODY_INVALID",
+            f"{field} is empty after removing ambient browser context",
+        )
+    return cleaned
+
+
 def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UniverseError("REQUEST_INVALID", "room message body must be an object")
@@ -2912,7 +2929,7 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
         raise UniverseError(
             "ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind"
         )
-    body = _required_text(value.get("body"), "body")
+    body = _strip_ambient_browser_context(value.get("body"), field="body")
     if len(body) > 200000:
         raise UniverseError("ROOM_MESSAGE_BODY_INVALID", "body is too long")
     sender = _identifier(value.get("sender", "UNIVERSE_CONDUCTOR"), "sender").upper()
@@ -3159,7 +3176,7 @@ def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
             "CONDUCTOR_ROOM_MESSAGE_KIND_INVALID",
             "unsupported conductor room message kind",
         )
-    body = _required_text(value.get("body"), "body")
+    body = _strip_ambient_browser_context(value.get("body"), field="body")
     if len(body) > 200000:
         raise UniverseError("CONDUCTOR_ROOM_MESSAGE_BODY_INVALID", "body is too long")
     sender = _identifier(value.get("sender", "USER"), "sender").upper()
@@ -14986,6 +15003,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_delegation_queue_lock = threading.RLock()
         self._conductor_delegation_stop = threading.Event()
         self._conductor_session_error: dict[str, str] | None = None
+        self._conductor_session_provider_factory = conductor_session_provider_factory
+        self._conductor_session_host_lock = threading.RLock()
         self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
         self._project_master_stream_lock = threading.RLock()
@@ -15027,23 +15046,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._request_workers_idle = threading.Event()
         self._request_workers_idle.set()
         super().__init__(address, UniverseRequestHandler)
-        self.conductor_session_host = (
-            ResidentModeSessionHost(
-                Path(__file__).resolve().parents[1],
-                "CONDUCTOR",
-                "CONDUCTOR",
-                self.store.database_path.parent / "conductor-mode-session.sqlite",
-                actor_label="Universe Conductor",
-                session_supervisor=self.session_supervisor,
-                continuity_coordinator=self.continuity_coordinator,
-                coordinate_resolver=self._conductor_continuity_coordinate,
-                permission_requester=self.conductor_permissions.request,
-                provider_factory=conductor_session_provider_factory,
-            )
-            if auto_start_conductor_runtime
-            else None
-        )
-        if self.conductor_session_host is not None:
+        # Conductor follows the same lazy Resident lifecycle as Project Master.
+        # The legacy constructor flag may still opt into the old eager path for
+        # compatibility, but the normal service path starts detached.
+        self.conductor_session_host: ResidentModeSessionHost | None = None
+        if auto_start_conductor_runtime:
+            self._ensure_conductor_session_host()
             self.prepare_conductor_session()
         self.conductor_runtime: UniverseConductorRuntime | None = None
         if auto_start_conductor_runtime:
@@ -16427,35 +16435,76 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         settings["status"] = "CLI_PROVIDER_SETTINGS_COLLECTED"
         return settings
 
+    def _ensure_conductor_session_host(self) -> ResidentModeSessionHost:
+        with self._conductor_session_host_lock:
+            if self.conductor_session_host is None:
+                self.conductor_session_host = ResidentModeSessionHost(
+                    Path(__file__).resolve().parents[1],
+                    "CONDUCTOR",
+                    "CONDUCTOR",
+                    self.store.database_path.parent
+                    / "conductor-mode-session.sqlite",
+                    actor_label="Universe Conductor",
+                    session_supervisor=self.session_supervisor,
+                    continuity_coordinator=self.continuity_coordinator,
+                    coordinate_resolver=self._conductor_continuity_coordinate,
+                    permission_requester=self.conductor_permissions.request,
+                    provider_factory=self._conductor_session_provider_factory,
+                )
+            return self.conductor_session_host
+
     def conductor_session_status(self) -> dict[str, Any]:
         if self.conductor_session_host is None:
-            return {
+            status = {
                 "schema": "universe.provider-session-connection.v1",
                 "target_kind": "UNIVERSE_CONDUCTOR",
                 "target_id": "CONDUCTOR",
                 "requested_mode": "CONDUCTOR",
                 "last_provider": "UNKNOWN",
                 "last_session_ref": "UNKNOWN",
-                "connection_state": "UNAVAILABLE",
+                "connection_state": "NOT_OPENED",
                 "session_persistence": "LAST_COORDINATE",
                 "resident": False,
-                "reason": "CONDUCTOR_SESSION_HOST_DISABLED",
             }
+            if self._conductor_session_error is not None:
+                status["connection_state"] = "UNAVAILABLE"
+                status["reason"] = self._conductor_session_error["reason"]
+            return status
         status = self.conductor_session_host.status()
         if self._conductor_session_error is not None and not status["resident"]:
             status["connection_state"] = "UNAVAILABLE"
             status["reason"] = self._conductor_session_error["reason"]
         return status
 
-    def prepare_conductor_session(self) -> dict[str, Any]:
-        if self.conductor_session_host is None:
-            return self.conductor_session_status()
+    def prepare_conductor_session(
+        self,
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request = options if isinstance(options, Mapping) else {}
         try:
+            if any(key in request for key in ("provider", "model_ref", "effort")):
+                current = self.store.provider_setting(
+                    "UNIVERSE_CONDUCTOR", "CONDUCTOR"
+                )
+                self.store.set_provider_setting(
+                    "UNIVERSE_CONDUCTOR",
+                    "CONDUCTOR",
+                    {
+                        "provider": request.get("provider") or current["provider"],
+                        "model_ref": request.get(
+                            "model_ref", current.get("model_ref", "")
+                        ),
+                        "effort": request.get(
+                            "effort", current.get("effort", "AUTO")
+                        ),
+                    },
+                )
             setting = self.store.provider_setting(
                 "UNIVERSE_CONDUCTOR", "CONDUCTOR"
             )
             provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
-            status = self.conductor_session_host.prepare(
+            host = self._ensure_conductor_session_host()
+            status = host.prepare(
                 provider,
                 model=str(setting.get("model_ref") or "").strip(),
                 effort=str(setting.get("effort") or "AUTO").strip().upper(),
@@ -18154,6 +18203,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.project_master_hosts.close()
         if self.conductor_session_host is not None:
             self.conductor_session_host.close()
+            self.conductor_session_host = None
             self._conductor_session_error = None
         return profile
 
@@ -18163,11 +18213,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "CONDUCTOR",
             value,
         )
+        with self._conductor_session_host_lock:
+            host = self.conductor_session_host
+            self.conductor_session_host = None
+        if host is not None:
+            host.close()
+        self._conductor_session_error = None
         return {
             "schema": API_SCHEMA,
             "status": "CLI_PROVIDER_SETTING_UPDATED",
             "setting": setting,
-            "session_connection": self.prepare_conductor_session(),
+            "resident_host": "PREPARE_REQUIRED",
+            "session_connection": self.conductor_session_status(),
         }
 
     def set_project_provider_setting(
@@ -19753,6 +19810,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         try:
             worker_message = dict(claimed)
+            # Guard legacy rows as well as new HTTP messages at the Provider
+            # boundary; old rows may predate room normalization.
+            worker_message["body"] = _strip_ambient_browser_context(
+                worker_message.get("body"), field="body"
+            )
             worker_message["available_projects"] = [
                 {
                     "project_id": project["project_id"],
@@ -19764,7 +19826,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
                 for project in self.store.list_projects()[:50]
             ]
-            if self.conductor_session_host is not None:
+            with self._conductor_session_host_lock:
+                host = self.conductor_session_host
+            if host is None:
+                # A direct Conductor message is also an attach request. Keep
+                # the normal service detached at startup, but do not fall back
+                # to the planning runtime merely because the UI did not open
+                # the session first.
+                self.prepare_conductor_session()
+                with self._conductor_session_host_lock:
+                    host = self.conductor_session_host
+            if host is not None:
                 worker_message["runtime_context"] = {
                     "requested_mode": "CONDUCTOR",
                     "session_id": binding.get("session_id", "UNKNOWN"),
@@ -19791,7 +19863,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 with self.conductor_permissions.message_context(message_id):
                     emit("STARTED")
                     stream_reply = getattr(
-                        self.conductor_session_host, "reply_stream", None
+                        host, "reply_stream", None
                     )
                     if callable(stream_reply):
                         session_result = stream_reply(
@@ -19800,7 +19872,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             lambda delta: emit("DELTA", delta=delta),
                         )
                     else:
-                        session_result = self.conductor_session_host.reply(
+                        session_result = host.reply(
                             provider,
                             worker_message,
                         )
@@ -21570,6 +21642,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self._read_json()
+            if path == "/v1/conductor-session/prepare":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "CONDUCTOR_SESSION_PREPARED",
+                        "session_connection": self.server.prepare_conductor_session(
+                            body or {}
+                        ),
+                    },
+                )
+                return
             if path == "/v1/supervisor/executors/adopt":
                 result = self.server.adopt_runtime_executor(body)
                 self._send(

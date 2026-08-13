@@ -2092,6 +2092,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
             self.assertIn("/provider-setting", script)
             self.assertIn("/master-session/prepare", script)
+            self.assertIn("/v1/conductor-session/prepare", script)
             self.assertIn('state.modeContract?.mode === "CONDUCTOR"', script)
             self.assertIn("sessionConnectionText", script)
             self.assertIn("/v1/supervisor/sessions", script)
@@ -2321,7 +2322,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("AUTO", defaults["project_masters"][0]["effort"])
         self.assertEqual("GROK", defaults["universe_conductor"]["resolved_provider"])
         self.assertEqual(
-            "UNAVAILABLE",
+            "NOT_OPENED",
             defaults["universe_conductor"]["session_connection"]["connection_state"],
         )
         self.assertEqual(
@@ -2419,6 +2420,104 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "MAX",
             reopened.provider_setting("PROJECT_MASTER", "GCS")["effort"],
         )
+
+    def test_room_messages_drop_platform_ambient_context_before_persistence(self) -> None:
+        ambient = (
+            '<in-app-browser-context source="ambient-ui-state">'
+            "hidden host metadata"
+            "</in-app-browser-context>"
+        )
+        project_message = normalize_room_message(
+            "GCS",
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": f"Keep this\n{ambient}",
+                "idempotency_key": "ambient-project-message-001",
+            },
+        )
+        conductor_message = normalize_conductor_room_message(
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": f"Keep this\n{ambient}",
+                "idempotency_key": "ambient-conductor-message-001",
+            }
+        )
+        self.assertEqual("Keep this", project_message["body"])
+        self.assertEqual("Keep this", conductor_message["body"])
+        self.assertNotIn("in-app-browser-context", project_message["body"])
+        self.assertNotIn("in-app-browser-context", conductor_message["body"])
+
+    def test_conductor_host_is_lazy_and_setting_changes_require_prepare(self) -> None:
+        fake_host = Mock()
+        fake_host.prepare.return_value = {
+            "schema": "universe.provider-session-connection.v1",
+            "target_kind": "UNIVERSE_CONDUCTOR",
+            "target_id": "CONDUCTOR",
+            "requested_mode": "CONDUCTOR",
+            "last_provider": "CODEX",
+            "last_session_ref": "codex:conductor",
+            "model_ref": "gpt-test",
+            "effort": "HIGH",
+            "connection_state": "NEW",
+            "session_persistence": "LAST_COORDINATE",
+            "resident": True,
+        }
+        with (
+            patch(
+                "universe_server.ResidentModeSessionHost",
+                return_value=fake_host,
+            ) as host_factory,
+            patch.object(
+                self.server,
+                "_resolve_conductor_provider",
+                return_value="CODEX",
+            ),
+        ):
+            self.assertIsNone(self.server.conductor_session_host)
+            prepared = self.server.prepare_conductor_session(
+                {"provider": "CODEX", "model_ref": "gpt-test", "effort": "HIGH"}
+            )
+            self.assertTrue(prepared["resident"])
+            host_factory.assert_called_once()
+            fake_host.prepare.assert_called_once_with(
+                "CODEX", model="gpt-test", effort="HIGH"
+            )
+
+            changed = self.server.set_universe_provider_setting(
+                {"provider": "GROK"}
+            )
+            self.assertEqual("PREPARE_REQUIRED", changed["resident_host"])
+            self.assertEqual(
+                "NOT_OPENED",
+                changed["session_connection"]["connection_state"],
+            )
+            fake_host.close.assert_called_once()
+            self.assertIsNone(self.server.conductor_session_host)
+
+    def test_conductor_prepare_route_uses_lazy_host_boundary(self) -> None:
+        connection = {
+            "target_kind": "UNIVERSE_CONDUCTOR",
+            "requested_mode": "CONDUCTOR",
+            "connection_state": "NEW",
+            "resident": True,
+        }
+        with patch.object(
+            self.server,
+            "prepare_conductor_session",
+            return_value=connection,
+        ) as prepare:
+            status, result = self.request(
+                "POST",
+                "/v1/conductor-session/prepare",
+                {"provider": "CODEX"},
+                token=self.token,
+            )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("CONDUCTOR_SESSION_PREPARED", result["status"])
+        self.assertEqual(connection, result["session_connection"])
+        prepare.assert_called_once_with({"provider": "CODEX"})
 
     def test_worker_binding_profiles_resolve_by_scope_and_revision(self) -> None:
         status, _ = self.request("POST", "/v1/projects/register", self.registration())
@@ -3132,9 +3231,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             initial = first.provider_settings()["universe_conductor"][
                 "session_connection"
             ]
-            switched = first.set_universe_provider_setting({"provider": "CODEX"})[
-                "session_connection"
-            ]
+            first.set_universe_provider_setting({"provider": "CODEX"})
+            switched = first.prepare_conductor_session()
         finally:
             first.server_close()
 

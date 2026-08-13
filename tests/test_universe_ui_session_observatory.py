@@ -160,14 +160,31 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("await activateAnchorSession(boundSession)", rail_slice)
         self.assertIn("session-summary-facts", CSS)
 
-    def test_master_popup_attaches_exact_session_before_switching_main_chat(self) -> None:
-        self.assertIn("async function attachSelectedMasterSession(session)", APP)
-        self.assertIn('"/v1/sessions/inject"', APP)
-        self.assertIn("provider_session_ref: providerSessionRef", APP)
-        self.assertIn("provider: session.provider", APP)
-        self.assertIn("expectedSessionRef", APP)
-        self.assertIn("expectedModel", APP)
-        self.assertIn("expectedEffort", APP)
+    def test_master_popup_opens_current_project_master_without_provider_ref(self) -> None:
+        attach_slice = APP[
+            APP.index("async function attachSelectedMasterSession(session)") : APP.index(
+                "async function connectSessionSummaryProviderModel"
+            )
+        ]
+        self.assertIn("await callProjectMaster(projectId", attach_slice)
+        self.assertIn("provider,", attach_slice)
+        self.assertIn("anchorKey: anchorSessionKey(session)", attach_slice)
+        self.assertNotIn("/v1/sessions/inject", attach_slice)
+        self.assertNotIn("providerSessionRef", attach_slice)
+        self.assertNotIn("provider_session_ref", attach_slice)
+        activate_slice = APP[
+            APP.index("async function activateAnchorSession") : APP.index(
+                "function sessionRailActivityLabel"
+            )
+        ]
+        master_branch_start = activate_slice.index("if (session.mode === \"MASTER\")")
+        room_branch_start = activate_slice.index("if (room)")
+        master_branch = activate_slice[master_branch_start:room_branch_start]
+        self.assertIn("await attachSelectedMasterSession(session)", master_branch)
+        self.assertIn("await refreshSupervisorSessions()", master_branch)
+        self.assertIn("expandConversationLayer();", master_branch)
+        self.assertIn("return;", master_branch)
+        self.assertNotIn("openProviderChatSession(room)", master_branch)
         connect_slice = APP[
             APP.index("async function connectSessionSummaryProviderModel") : APP.index(
                 "function sessionConnectionText"
@@ -178,6 +195,27 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             connect_slice.index("elements.sessionSummaryDialog.close()"),
         )
         self.assertIn("session-summary-connection", CSS)
+
+    def test_conductor_session_uses_the_same_lazy_prepare_attach_route(self) -> None:
+        self.assertIn('async function callUniverseConductor(options = {})', APP)
+        self.assertIn('"/v1/conductor-session/prepare"', APP)
+        self.assertIn("async function attachSelectedConductorSession(session)", APP)
+        activate_slice = APP[
+            APP.index("async function activateAnchorSession") : APP.index(
+                "function sessionRailActivityLabel"
+            )
+        ]
+        conductor_branch_start = activate_slice.index(
+            'if (session.mode === "CONDUCTOR")'
+        )
+        conductor_branch = activate_slice[conductor_branch_start:]
+        self.assertIn("await attachSelectedConductorSession(session)", conductor_branch)
+        self.assertIn("await refreshSupervisorSessions()", conductor_branch)
+        self.assertIn("expandConversationLayer();", conductor_branch)
+        self.assertIn(
+            'elements.returnToConductor.addEventListener("click", async () =>',
+            APP,
+        )
 
     def test_provider_profiles_use_one_provider_model_effort_dialog(self) -> None:
         self.assertIn('id="provider-profile-dialog"', HTML)

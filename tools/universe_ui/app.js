@@ -1255,6 +1255,15 @@ async function activateAnchorSession(session, room = null) {
     renderSessionRail();
     if (session.mode === "MASTER") {
       await attachSelectedMasterSession(session);
+      await refreshSupervisorSessions();
+      expandConversationLayer();
+      return;
+    }
+    if (session.mode === "CONDUCTOR") {
+      await attachSelectedConductorSession(session);
+      await refreshSupervisorSessions();
+      expandConversationLayer();
+      return;
     }
   }
   if (room) {
@@ -2179,6 +2188,11 @@ function renderSessionObservatory() {
           await callProjectMaster(project.project_id, {
             anchorKey: state.selectedSupervisorAnchorKey,
           });
+        } else if (session.mode === "CONDUCTOR") {
+          await callUniverseConductor({
+            provider: session.provider,
+            anchorKey: state.selectedSupervisorAnchorKey,
+          });
         } else {
           returnToUniverseConductor();
         }
@@ -2459,6 +2473,58 @@ function returnToUniverseConductor() {
   elements.dispatchInstruction.focus();
 }
 
+async function callUniverseConductor(options = {}) {
+  closeComposerActionMenu();
+  const prepareBody = {};
+  if (options.provider) prepareBody.provider = options.provider;
+  if (Object.prototype.hasOwnProperty.call(options, "modelRef")) {
+    prepareBody.model_ref = options.modelRef || "";
+  }
+  if (Object.prototype.hasOwnProperty.call(options, "effort")) {
+    prepareBody.effort = options.effort || "AUTO";
+  }
+  const prepared = await api("/v1/conductor-session/prepare", {
+    method: "POST",
+    body: prepareBody,
+  });
+  const connection = prepared.session_connection || {};
+  if (
+    options.expectedProvider &&
+    String(connection.last_provider || "").toUpperCase() !==
+      String(options.expectedProvider).toUpperCase()
+  ) {
+    throw new Error("Selected provider did not become the active Conductor connection");
+  }
+  if (
+    options.expectedModel &&
+    connection.model_ref !== options.expectedModel
+  ) {
+    throw new Error("Selected model did not become the active Conductor connection");
+  }
+  if (
+    options.expectedEffort &&
+    String(connection.effort || "AUTO").toUpperCase() !==
+      String(options.expectedEffort).toUpperCase()
+  ) {
+    throw new Error("Selected effort did not become the active Conductor connection");
+  }
+  state.providerSettings = await api("/v1/settings/providers");
+  returnToUniverseConductor();
+  if (options.anchorKey) {
+    state.selectedSupervisorAnchorKey = options.anchorKey;
+  }
+  try {
+    await refreshSupervisorSessions();
+  } catch (error) {
+    console.warn("Anchor Session refresh after Conductor prepare failed", error);
+  }
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  elements.dispatchInstruction.focus();
+  return connection;
+}
+
 async function callProjectMaster(projectId, options = {}) {
   closeComposerActionMenu();
   if (state.selectedProject?.project_id !== projectId) {
@@ -2529,35 +2595,27 @@ async function callProjectMaster(projectId, options = {}) {
 
 async function attachSelectedMasterSession(session) {
   const provider = String(session?.provider || "").toUpperCase();
-  const providerSessionRef = String(session?.provider_session_ref || "").trim();
   const projectId = String(session?.node || "").trim();
-  if (session?.mode !== "MASTER" || !provider || !providerSessionRef || !projectId) {
-    throw new Error("This session cannot be attached as a Project Master");
+  if (session?.mode !== "MASTER" || !provider || !projectId) {
+    throw new Error("This session cannot open a Project Master");
   }
-  const result = await api("/v1/sessions/inject", {
-    method: "POST",
-    body: {
-      project_id: projectId,
-      node: projectId,
-      mode: "MASTER",
-      room_type: "PROJECT",
-      slot_role: "MASTER",
-      provider: session.provider,
-      provider_session_ref: providerSessionRef,
-      supervisor_session_id: session.session_id,
-      alias: session.alias || `${projectId} Master`,
-      display_name: "Project Master",
-      make_default: true,
-    },
+  await callProjectMaster(projectId, {
+    provider,
+    anchorKey: anchorSessionKey(session),
   });
-  const registered = result.supervisor_session || {};
-  if (
-    String(registered.provider || "").toUpperCase() !== provider ||
-    String(registered.provider_session_ref || "") !== providerSessionRef
-  ) {
-    throw new Error("Selected Master session was not registered exactly");
+  return session;
+}
+
+async function attachSelectedConductorSession(session) {
+  const provider = String(session?.provider || "").toUpperCase();
+  if (session?.mode !== "CONDUCTOR" || !provider) {
+    throw new Error("This session cannot open the Universe Conductor");
   }
-  return registered;
+  await callUniverseConductor({
+    provider,
+    anchorKey: anchorSessionKey(session),
+  });
+  return session;
 }
 
 async function connectSessionSummaryProviderModel() {
@@ -10942,10 +11000,13 @@ function bindEvents() {
   elements.composerActionButton.addEventListener("click", () =>
     toggleComposerActionMenu()
   );
-  elements.returnToConductor.addEventListener(
-    "click",
-    returnToUniverseConductor
-  );
+  elements.returnToConductor.addEventListener("click", async () => {
+    try {
+      await callUniverseConductor();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
   document.addEventListener("click", (event) => {
     if (
       !elements.composerActionMenu.contains(event.target) &&

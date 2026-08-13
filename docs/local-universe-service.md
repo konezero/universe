@@ -62,7 +62,12 @@ Frame Boss or Worker opens an ephemeral Provider execution, never reads or
 replaces the Conductor's last Provider Session coordinate, and does not leave a
 Universe-owned durable Provider chat.
 
-The HTTP request does not wait for the provider. The UI polls the durable room
+The Conductor Host is detached at service startup, just like a Project Master
+Host. Selecting the Conductor or sending its first message calls the explicit
+prepare route, which creates one Resident Host for the current Provider/Profile.
+Selecting a new Provider/Profile closes the old Host and requires the next
+prepare to attach the replacement. The HTTP request does not wait for the provider.
+The UI polls the durable room
 for `PROCESSING`, `ANSWERED`, or `FAILED`. Restart recovery returns interrupted
 `PROCESSING` messages to `QUEUED` and the service creates a new process-local
 binding before replay. `WAITING_FOR_RUNTIME_BINDING` is the observation-only
@@ -71,6 +76,15 @@ state when no separate Mode Host has bound a Conductor Runtime. Explicit
 failed owned Runtime startup is reported as `START_FAILED`; messages must
 not wait indefinitely. Raw CLI transcripts, tokens, endpoint credentials,
 and repository contents are not Conductor Room records.
+
+`POST /v1/conductor-session/prepare` is the normal attach boundary. Provider
+settings only return `PREPARE_REQUIRED`; they do not start a Host. The same
+Resident Host lifecycle is used for Conductor and Project Master.
+
+Host-provided `<in-app-browser-context>` metadata is not part of a user's room
+message. If a platform forwards that block as message text, room normalization
+removes it before the message is persisted or sent to a Provider. The Host
+platform itself owns whether the block is shown in its outer chat transcript.
 
 The Conductor Worker returns a bounded structured reply with no UI action, one
 `TODO_DRAFT`, or one `FRESH_PROJECT_DRAFT`. A Todo draft is validated against
@@ -253,6 +267,7 @@ DELETE /v1/todos/{todo_id}
 GET    /v1/runtime/providers
 GET    /v1/settings/providers
 POST   /v1/settings/providers/universe
+POST   /v1/conductor-session/prepare
 GET    /v1/settings/host-tools
 POST   /v1/settings/host-tools/discover
 POST   /v1/settings/host-tools/{tool}/select
