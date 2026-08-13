@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
+from process_identity import launched_process_identity
 from windows_native_cli import NativeCliRequest, NativeCliResult, open_native_cli, run_native_cli
 
 
@@ -284,10 +285,12 @@ class JsonRpcStdioProcess:
         request_handler: Callable[[str, Mapping[str, Any]], Any],
         notification_handler: Callable[[str, Mapping[str, Any]], None],
     ) -> None:
+        self._executable = executable.expanduser().resolve()
+        self._arguments = tuple(arguments)
         self._process = open_native_cli(
             NativeCliRequest(
-                executable=executable,
-                arguments=arguments,
+                executable=self._executable,
+                arguments=self._arguments,
                 cwd=cwd,
                 timeout_seconds=300,
                 output_encoding="utf-8",
@@ -375,6 +378,19 @@ class JsonRpcStdioProcess:
             item.event.set()
         self._reader.join(timeout=1)
         self._stderr_reader.join(timeout=1)
+
+    def supervisor_process_identity(
+        self, endpoint: str, handshake_token: str
+    ) -> dict[str, Any]:
+        if self._process.poll() is not None:
+            raise AgentSessionError("AGENT_PROCESS_NOT_ALIVE")
+        return launched_process_identity(
+            self._process,
+            executable=self._executable,
+            command=[str(self._executable), *self._arguments],
+            endpoint=endpoint,
+            handshake_token=handshake_token,
+        )
 
     def _send(self, message: Mapping[str, Any]) -> None:
         if self._closed.is_set() or self._process.poll() is not None:
@@ -524,6 +540,14 @@ class UniverseAcpGateway:
             raise AgentSessionError("AGENT_SESSION_CWD_REBIND_UNAVAILABLE")
         return str(rebind(cwd))
 
+    def supervisor_process_identity(
+        self, endpoint: str, handshake_token: str
+    ) -> dict[str, Any]:
+        resolver = getattr(self.session, "supervisor_process_identity", None)
+        if not callable(resolver):
+            raise AgentSessionError("AGENT_PROCESS_IDENTITY_UNAVAILABLE")
+        return dict(resolver(endpoint, handshake_token))
+
     def close(self) -> None:
         self.session.close()
 
@@ -634,6 +658,11 @@ class GrokAcpSession:
 
     def close(self) -> None:
         self._transport.close()
+
+    def supervisor_process_identity(
+        self, endpoint: str, handshake_token: str
+    ) -> dict[str, Any]:
+        return self._transport.supervisor_process_identity(endpoint, handshake_token)
 
     def rebind_working_directory(self, cwd: Path) -> str:
         if self.ephemeral or not self.session_id:
@@ -885,6 +914,11 @@ class CodexAppServerSession:
 
     def close(self) -> None:
         self._transport.close()
+
+    def supervisor_process_identity(
+        self, endpoint: str, handshake_token: str
+    ) -> dict[str, Any]:
+        return self._transport.supervisor_process_identity(endpoint, handshake_token)
 
     def rebind_working_directory(self, cwd: Path) -> str:
         if self.ephemeral or not self.session_id:

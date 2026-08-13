@@ -2709,6 +2709,75 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, self.surface_observer.prepare_count)
         self.assertNotIn(registrations[0]["credential_env"], os.environ)
 
+    def test_resident_manager_tracks_provider_process_lease_lifecycle(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "provider-lease.sqlite3")
+        provider_holder: list[PreparedFakeProvider] = []
+
+        class LeasePreparedProvider(PreparedFakeProvider):
+            def supervisor_process_identity(
+                self, endpoint: str, handshake_token: str
+            ) -> dict[str, Any]:
+                return {
+                    "pid": 4321,
+                    "process_created_at": "2026-08-13T00:00:00Z",
+                    "executable": "C:\\fake\\provider.exe",
+                    "command": ["C:\\fake\\provider.exe", "stdio"],
+                    "endpoint": endpoint,
+                    "handshake_fingerprint": hashlib.sha256(
+                        handshake_token.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+        class AnchorObserver(FakeSurfaceObserver):
+            def prepare(self) -> Mapping[str, Any]:
+                self.prepare_count += 1
+                return {
+                    "status": "SESSION_PREPARED",
+                    "mode_current_anchor": {
+                        "snapshot": {
+                            "snapshot": {"anchor_id": "MASTER-CURRENT-LEASE"}
+                        }
+                    },
+                }
+
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        def provider_factory(_root, _project_id, _store):
+            provider = LeasePreparedProvider()
+            provider_holder.append(provider)
+            return provider
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                session_supervisor=supervisor,
+                provider_factory=provider_factory,
+                provider_resolver=lambda _project_id: "CLAUDE",
+                coordinator_factory=lambda _root, _project_id, _session: AnchorObserver(),
+            )
+            try:
+                result = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                live = next(
+                    item
+                    for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+                    if item["is_default"]
+                )
+                self.assertEqual("STARTED", result["status"])
+                self.assertEqual("LIVE", live["state"])
+                self.assertEqual("OWNED", live["process_lease"]["lease_state"])
+                self.assertEqual(4321, live["process_lease"]["process_identity"]["pid"])
+            finally:
+                manager.close()
+
+        closed = supervisor.get_session(live["session_id"])
+        self.assertEqual("DISCONNECTED", closed["state"])
+        self.assertEqual("STALE", closed["process_lease"]["lease_state"])
+        self.assertTrue(provider_holder[0].closed)
+
     def test_resident_manager_registers_prepared_agent_session_ref(self) -> None:
         registrations: list[dict[str, Any]] = []
         provider = PreparedFakeProvider()

@@ -39,17 +39,18 @@ class ProviderSessionUiContractTests(unittest.TestCase):
                 "function closeProjectRoomStream"
             )
         ]
+        self.assertIn("state.providerSessionStreams[key]", stream_slice)
+        self.assertIn("envelope.chat_key", stream_slice)
         self.assertNotIn("provider_session_ref", stream_slice)
         self.assertNotIn("source_path", stream_slice)
-
     def test_provider_session_streams_are_chat_key_scoped_and_backgrounded(self) -> None:
         self.assertIn("providerSessionStreams: {}", APP)
         self.assertIn("providerSessionRoomCaches: {}", APP)
         self.assertIn("providerSessionUnreadCount(room)", APP)
         self.assertIn("requestedKey && requestedKey !== selectedKey", APP)
         self.assertIn("function providerSessionRoomIsEligible(room)", APP)
-        self.assertIn("function reconcileProviderSessionStreams()", APP)
-        self.assertIn("reconcileProviderSessionStreams();", APP)
+        self.assertIn("function syncProviderSessionSubscriptions()", APP)
+        self.assertIn("syncProviderSessionSubscriptions();", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(
                 "function openProviderChatSession"
@@ -66,17 +67,18 @@ class ProviderSessionUiContractTests(unittest.TestCase):
             )
         ]
         self.assertNotIn("closeProviderSessionStream()", focus_slice)
-
-    def test_background_subscriptions_exclude_workers_and_unbound_rooms(self) -> None:
+    def test_background_subscriptions_exclude_workers_unbound_and_past_rooms(self) -> None:
         eligibility = APP[
             APP.index("function providerSessionRoomIsEligible") : APP.index(
-                "function markProviderSessionRead"
+                "function providerSessionRoomCacheFor"
             )
         ]
         self.assertIn('sessionKind !== "WORKER"', eligibility)
         self.assertIn('"BOUND", "ANCHOR_OBSERVED"', eligibility)
+        self.assertIn('currentness === "CURRENT"', eligibility)
+        self.assertIn("providerSessionRoomIsEligible(room)", APP)
+        self.assertIn("delete state.providerSessionRoomCaches[key]", APP)
         self.assertIn("closeProviderSessionStream(chatKey)", APP)
-
     def test_provider_session_cancel_uses_direct_endpoint_without_room_queue(self) -> None:
         self.assertIn("async function cancelProviderSessionTurn()", APP)
         cancel_slice = APP[

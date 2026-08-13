@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from process_identity import launched_process_identity
 from windows_native_cli import NativeCliRequest, open_native_cli
 
 # Environment names that carry the permission capability token. They belong to
@@ -110,9 +111,11 @@ class ClaudeStreamProcess:
         event_handler: Callable[[Mapping[str, Any]], None],
         opener: Callable[..., subprocess.Popen[str]] | None = None,
     ) -> None:
+        self._executable = executable.expanduser().resolve()
+        self._arguments = tuple(arguments)
         request = NativeCliRequest(
-            executable=executable,
-            arguments=arguments,
+            executable=self._executable,
+            arguments=self._arguments,
             cwd=cwd,
             timeout_seconds=300,
             output_encoding="utf-8",
@@ -180,6 +183,19 @@ class ClaudeStreamProcess:
                 self._process.wait(timeout=3)
         self._reader.join(timeout=1)
         self._stderr_reader.join(timeout=1)
+
+    def supervisor_process_identity(
+        self, endpoint: str, handshake_token: str
+    ) -> dict[str, Any]:
+        if self._process.poll() is not None:
+            raise ClaudeResidentError("CLAUDE_PROCESS_NOT_ALIVE")
+        return launched_process_identity(
+            self._process,
+            executable=self._executable,
+            command=[str(self._executable), *self._arguments],
+            endpoint=endpoint,
+            handshake_token=handshake_token,
+        )
 
     def _send(self, message: Mapping[str, Any]) -> None:
         if self._closed.is_set() or self._process.poll() is not None:
@@ -375,6 +391,14 @@ class ClaudeResidentSession:
             "rate_limit_status": self.last_rate_limit_status or "UNKNOWN",
             "usage": usage,
         }
+
+    def supervisor_process_identity(
+        self, endpoint: str, handshake_token: str
+    ) -> dict[str, Any]:
+        process = self._process
+        if process is None or not process.alive:
+            raise ClaudeResidentError("CLAUDE_PROCESS_NOT_ALIVE")
+        return process.supervisor_process_identity(endpoint, handshake_token)
 
     def start_or_resume(self) -> str:
         """Start the resident process, or reuse the live one."""

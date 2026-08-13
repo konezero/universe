@@ -304,5 +304,39 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("binding.anchor_temporality", rail_slice)
 
 
+    def test_provider_session_background_events_keep_selected_transcript_focused(self) -> None:
+        selection_slice = APP[
+            APP.index("function syncSelectedProviderSessionState") : APP.index(
+                "function mergeProviderSessionMessages"
+            )
+        ]
+        self.assertIn("requestedKey && requestedKey !== selectedKey", selection_slice)
+        self.assertIn("providerSessionRoomCacheFor(selectedKey)", selection_slice)
+
+        payload_slice = APP[
+            APP.index("function applyProviderSessionPayload") : APP.index(
+                "function closeProviderSessionStream"
+            )
+        ]
+        self.assertIn("markProviderSessionActivity(key, type, envelope)", payload_slice)
+        self.assertIn("PROVIDER_SESSION_DELTA", payload_slice)
+        self.assertIn("PROVIDER_SESSION_PERMISSION_RESOLVED", payload_slice)
+
+        stream_slice = APP[
+            APP.index("function openProviderSessionStream") : APP.index(
+                "function openProviderChatSession"
+            )
+        ]
+        self.assertIn("if (providerSessionRoomIsSelected(key))", stream_slice)
+        self.assertIn("renderRoomMessages()", stream_slice)
+        self.assertIn("renderSessionRail()", stream_slice)
+        self.assertNotIn(
+            "state.providerSessionMessages = dedupeProviderSessionMessages",
+            stream_slice,
+        )
+        self.assertIn("syncProviderSessionSubscriptions();", APP)
+        self.assertIn("providerSessionActivityState(room)", APP)
+        self.assertIn("providerSessionUnreadCount(room)", APP)
+
 if __name__ == "__main__":
     unittest.main()
