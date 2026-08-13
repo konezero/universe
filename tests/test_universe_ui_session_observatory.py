@@ -102,6 +102,47 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("transform: translateX(-100%)", CSS)
         self.assertIn("transition:\n    transform 220ms ease", CSS)
 
+    def test_project_and_universe_selection_do_not_auto_open_inspector(self) -> None:
+        refresh_slice = APP[
+            APP.index("async function refresh(") : APP.index("function projectDisplayName")
+        ]
+        self.assertIn("revealInspector: false,", refresh_slice)
+        self.assertIn("syncAssets: syncSelectedProject", refresh_slice)
+
+        project_slice = APP[
+            APP.index("function projectButton") : APP.index("function renderProjects")
+        ]
+        self.assertIn("revealInspector: false", project_slice)
+
+        node_mode_slice = APP[
+            APP.index("function selectNodeModeNode") : APP.index(
+                "function openNodeModeCoordinate"
+            )
+        ]
+        self.assertIn("revealInspector: false", node_mode_slice)
+
+        universe_slice = APP[
+            APP.index('if (selected.kind === "universe")') : APP.index(
+                'if (selected.kind === "project")'
+            )
+        ]
+        self.assertIn("state.inspectorDismissed = true;", universe_slice)
+        self.assertIn("renderDetails();", universe_slice)
+
+        graph_node_slice = APP[
+            APP.index('if (selected.kind === "project")') : APP.index(
+                'if (["system", "related", "focus"].includes(selected.kind))'
+            )
+        ]
+        self.assertIn("revealInspector: true", graph_node_slice)
+        self.assertIn('showInspectorTab("details")', graph_node_slice)
+
+        explicit_surface = APP[
+            APP.index("function openInspectorSurface") : APP.index("function fitGraphView")
+        ]
+        self.assertIn("state.inspectorDismissed = false;", explicit_surface)
+        self.assertIn('document.body.classList.add("inspector-open")', explicit_surface)
+
     def test_session_click_opens_summary_before_activation(self) -> None:
         self.assertIn('id="session-summary-dialog"', HTML)
         self.assertIn('id="session-summary-facts"', HTML)

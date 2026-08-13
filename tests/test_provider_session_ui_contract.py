@@ -33,7 +33,7 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("function openProviderSessionStream(chatKey)", APP)
         self.assertIn("PROVIDER_SESSION_DELTA", APP)
         self.assertIn("PROVIDER_SESSION_PERMISSION", APP)
-        self.assertIn("closeProviderSessionStream()", APP)
+        self.assertIn("function closeProviderSessionStream(chatKey)", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(
                 "function closeProjectRoomStream"
@@ -41,6 +41,41 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         ]
         self.assertNotIn("provider_session_ref", stream_slice)
         self.assertNotIn("source_path", stream_slice)
+
+    def test_provider_session_streams_are_chat_key_scoped_and_backgrounded(self) -> None:
+        self.assertIn("providerSessionStreams: {}", APP)
+        self.assertIn("providerSessionRoomCaches: {}", APP)
+        self.assertIn("providerSessionUnreadCount(room)", APP)
+        self.assertIn("requestedKey && requestedKey !== selectedKey", APP)
+        self.assertIn("function providerSessionRoomIsEligible(room)", APP)
+        self.assertIn("function reconcileProviderSessionStreams()", APP)
+        self.assertIn("reconcileProviderSessionStreams();", APP)
+        stream_slice = APP[
+            APP.index("function openProviderSessionStream") : APP.index(
+                "function openProviderChatSession"
+            )
+        ]
+        self.assertIn("state.providerSessionStreams[key]", stream_slice)
+        self.assertIn("providerSessionRoomCacheFor(key)", stream_slice)
+        self.assertIn("markProviderSessionActivity(key, type, envelope)", APP)
+        self.assertIn("providerSessionRoomIsSelected(key)", stream_slice)
+        self.assertNotIn("closeProviderSessionStream();", stream_slice)
+        focus_slice = APP[
+            APP.index("function returnToUniverseConductor") : APP.index(
+                "async function callProjectMaster"
+            )
+        ]
+        self.assertNotIn("closeProviderSessionStream()", focus_slice)
+
+    def test_background_subscriptions_exclude_workers_and_unbound_rooms(self) -> None:
+        eligibility = APP[
+            APP.index("function providerSessionRoomIsEligible") : APP.index(
+                "function markProviderSessionRead"
+            )
+        ]
+        self.assertIn('sessionKind !== "WORKER"', eligibility)
+        self.assertIn('"BOUND", "ANCHOR_OBSERVED"', eligibility)
+        self.assertIn("closeProviderSessionStream(chatKey)", APP)
 
     def test_provider_session_cancel_uses_direct_endpoint_without_room_queue(self) -> None:
         self.assertIn("async function cancelProviderSessionTurn()", APP)

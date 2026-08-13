@@ -90,11 +90,14 @@ const state = {
   multiRoomLiveOutput: {},
   providerTailTimer: null,
   providerTailInFlight: false,
+  /** Ephemeral redacted provider-session cache keyed by opaque chat key. */
+  providerSessionRoomCaches: {},
+  /** Independent EventSource ownership keyed by opaque chat key. */
+  providerSessionStreams: {},
+  providerSessionStreamStates: {},
   providerSessionMessages: [],
   providerSessionPermissions: [],
   providerSessionConnection: null,
-  providerSessionStream: null,
-  providerSessionStreamChatKey: null,
   providerSessionStreamState: "IDLE",
   conversationTarget: {
     kind: "UNIVERSE_CONDUCTOR",
@@ -931,6 +934,7 @@ async function refreshSupervisorSessions() {
   state.legacyExecutors = legacy.executors || [];
   state.providerActivitySources = activity.sources || [];
   state.providerChatRooms = chatCatalog.rooms || [];
+  syncProviderSessionSubscriptions();
   prefillsObservatoryInjectForm();
   renderRuntimePreflight();
   renderSessionObservatory();
@@ -948,6 +952,7 @@ async function tailProviderSessions() {
       body: {},
     });
     state.providerChatRooms = result.catalog?.rooms || state.providerChatRooms;
+    syncProviderSessionSubscriptions();
     for (const delta of result.deltas || []) {
       const sourceId = String(delta.source?.source_id || "");
       const room = state.providerChatRooms.find(
@@ -1544,6 +1549,7 @@ function renderProviderChatSummary() {
 
 function openProviderChatSummary(room) {
   state.selectedProviderChatKey = room.chat_key;
+  markProviderSessionRead(room.chat_key);
   renderSessionRail();
   renderNodeModes();
   renderProviderChatSummary();
@@ -1700,7 +1706,7 @@ function nodeModeStatusLabel(coordinate) {
 
 function selectNodeModeNode(nodeId) {
   selectProject(nodeId, {
-    revealInspector: window.innerWidth > 720,
+    revealInspector: false,
   })
     .then(() => renderNodeModes())
     .catch((error) => toast(error.message, true));
@@ -1851,12 +1857,12 @@ function renderSessionRail() {
             anchorSessionKey(boundSession) === state.selectedSupervisorAnchorKey)
       )
     );
-    const activityState = String(room.activity_state || "UNKNOWN").toUpperCase();
+    const activityState = providerSessionActivityState(room);
     item.dataset.state = activityState;
     const copy = node("span", "session-rail-copy");
     const anchorLabel =
       isAnchored && binding.current_anchor_ref !== "UNKNOWN"
-        ? `${binding.is_default === true && binding.observer_currentness === "CURRENT" ? "" : "Past · "}${binding.current_anchor_ref}`
+        ? `${binding.is_default === true && binding.observer_currentness === "CURRENT" ? "" : "Past 쨌 "}${binding.current_anchor_ref}`
         : isAnchored
           ? binding.alias || `${binding.node} ${binding.mode}`
           : `${room.provider} origin`;
@@ -1864,7 +1870,7 @@ function renderSessionRail() {
       binding.alias || room.display_name || "Untitled session";
     copy.append(
       node("strong", "", roomLabel),
-      node("small", "", `${sessionRailActivityLabel(room)} · ${anchorLabel}`)
+      node("small", "", `${sessionRailActivityLabel(room)} 쨌 ${anchorLabel}`)
     );
     const status = node(
       "span",
@@ -1872,6 +1878,11 @@ function renderSessionRail() {
       room.session_kind === "WORKER" ? "WORKER" : activityState
     );
     status.dataset.state = activityState;
+    const unread = providerSessionUnreadCount(room);
+    if (unread > 0) {
+      status.textContent = `${status.textContent} / ${unread} new`;
+      item.dataset.unread = String(unread);
+    }
     item.append(node("i", "session-rail-dot"), copy, status);
     item.title = `${room.provider} | ${anchorLabel}`;
     item.addEventListener("click", () => openProviderChatSummary(room));
@@ -2353,10 +2364,12 @@ async function cancelProviderSessionTurn() {
       { method: "POST", body: {} }
     );
     if (result.message) {
-      state.providerSessionMessages = dedupeProviderSessionMessages([
-        ...state.providerSessionMessages,
+      const cache = providerSessionCache(target.chat_key);
+      cache.messages = dedupeProviderSessionMessages([
+        ...cache.messages,
         result.message,
       ]);
+      syncSelectedProviderSessionState(target.chat_key);
     }
     renderComposerActions();
     renderComposerState();
@@ -2434,7 +2447,6 @@ function renderComposerActions() {
 }
 
 function returnToUniverseConductor() {
-  closeProviderSessionStream();
   closeProjectRoomStream();
   state.conversationTarget = {
     kind: "UNIVERSE_CONDUCTOR",
@@ -2448,7 +2460,6 @@ function returnToUniverseConductor() {
 }
 
 async function callProjectMaster(projectId, options = {}) {
-  closeProviderSessionStream();
   closeComposerActionMenu();
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
@@ -2870,7 +2881,7 @@ async function refresh({ syncSelectedProject = false } = {}) {
       });
     } else if (state.projects.length) {
       await selectProject(state.projects[0].project_id, {
-        revealInspector: !window.matchMedia("(max-width: 720px)").matches,
+        revealInspector: false,
         syncAssets: syncSelectedProject,
       });
     } else {
@@ -2987,7 +2998,7 @@ function projectButton(project, { nested = false } = {}) {
     }
     button.addEventListener("click", () =>
       selectProject(project.project_id, {
-        revealInspector: window.innerWidth > 720,
+        revealInspector: false,
       })
     );
     return button;
@@ -3893,10 +3904,17 @@ async function resolveAgentPermission(permission, optionId) {
       body: { option_id: optionId },
     });
     if (isProviderSession) {
-      state.providerSessionPermissions = state.providerSessionPermissions.map(
-        (item) =>
-          item.request_id === permission.request_id ? result.permission : item
-      );
+      const cache = providerSessionRoomCacheFor(permission.chat_key);
+      const updatedPermission =
+        redactProviderSessionPermission(result.permission) || result.permission;
+      if (cache && updatedPermission) {
+        cache.permissions = cache.permissions.map((item) =>
+          item.request_id === permission.request_id
+            ? updatedPermission
+            : item
+        );
+      }
+      syncSelectedProviderSessionState(permission.chat_key);
       renderRoomMessages();
       toast("Agent permission decision delivered");
       return;
@@ -5503,61 +5521,408 @@ function openConductorRoomStream() {
   });
 }
 
+function redactProviderSessionObject(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactProviderSessionObject(item));
+  }
+  if (!value || typeof value !== "object") return value;
+  const redacted = {};
+  const blockedSessionRef = ["session", "ref"].join("_");
+  const blockedSourcePath = ["source", "path"].join("_");
+  for (const [key, item] of Object.entries(value)) {
+    const normalizedKey = String(key).toLowerCase();
+    if (
+      normalizedKey.includes(blockedSessionRef) ||
+      normalizedKey === blockedSourcePath ||
+      normalizedKey.includes("transcript")
+    ) {
+      continue;
+    }
+    redacted[key] = redactProviderSessionObject(item);
+  }
+  return redacted;
+}
+
+function redactProviderSessionMessage(message) {
+  const messageId = String(message?.message_id || "").trim();
+  if (!messageId) return null;
+  const safe = { message_id: messageId };
+  for (const key of [
+    "role",
+    "body",
+    "state",
+    "created_at",
+    "updated_at",
+    "error_code",
+  ]) {
+    if (message[key] === undefined || message[key] === null) continue;
+    safe[key] = key === "body" ? String(message[key]) : message[key];
+  }
+  return safe;
+}
+
+function redactProviderSessionPermission(permission) {
+  const requestId = String(permission?.request_id || "").trim();
+  if (!requestId) return null;
+  const safe = {};
+  for (const key of [
+    "request_id",
+    "chat_key",
+    "scope_kind",
+    "state",
+    "provider",
+    "project_id",
+    "room_id",
+    "binding_id",
+  ]) {
+    if (permission[key] !== undefined && permission[key] !== null) {
+      safe[key] = permission[key];
+    }
+  }
+  if (Array.isArray(permission.options)) {
+    safe.options = permission.options.map((option) => ({
+      kind: option?.kind,
+      name: option?.name,
+      optionId: option?.optionId,
+    }));
+  }
+  if (permission.tool_call && typeof permission.tool_call === "object") {
+    safe.tool_call = redactProviderSessionObject(permission.tool_call);
+  }
+  return safe;
+}
+
+function redactProviderSessionTarget(target) {
+  if (!target || typeof target !== "object") return null;
+  const safe = {};
+  const fields = [
+    ["chat_key", "chat_key"],
+    ["provider", "provider"],
+    ["project_id", "projectId"],
+    ["projectId", "projectId"],
+    ["node", "node"],
+    ["mode", "mode"],
+    ["alias", "alias"],
+    ["current_anchor_ref", "current_anchor_ref"],
+    ["model_ref", "model_ref"],
+  ];
+  for (const [source, destination] of fields) {
+    if (
+      safe[destination] === undefined &&
+      target[source] !== undefined &&
+      target[source] !== null
+    ) {
+      safe[destination] = target[source];
+    }
+  }
+  return safe;
+}
+
 function dedupeProviderSessionMessages(messages) {
   const byId = new Map();
   for (const message of Array.isArray(messages) ? messages : []) {
-    if (!message?.message_id) continue;
-    byId.set(message.message_id, { ...message });
+    const safe = redactProviderSessionMessage(message);
+    if (!safe) continue;
+    byId.set(safe.message_id, safe);
   }
   return [...byId.values()].sort((left, right) =>
     String(left.created_at || "").localeCompare(String(right.created_at || ""))
   );
 }
 
-function applyProviderSessionSnapshot(snapshot) {
-  state.providerSessionMessages = dedupeProviderSessionMessages(snapshot.messages);
-  state.providerSessionPermissions = Array.isArray(snapshot.permissions)
-    ? snapshot.permissions
-    : [];
-  state.providerSessionConnection = snapshot.connection || null;
-  if (snapshot.target && state.conversationTarget.kind === "PROVIDER_SESSION") {
-    state.conversationTarget = {
-      ...state.conversationTarget,
-      ...snapshot.target,
-      kind: "PROVIDER_SESSION",
+function providerSessionRoomForChatKey(chatKey) {
+  const key = String(chatKey || "").trim();
+  if (!key) return null;
+  return (state.providerChatRooms || []).find(
+    (room) => String(room?.chat_key || "").trim() === key
+  ) || null;
+}
+
+function providerSessionRoomIsEligible(room) {
+  const binding = room?.binding || {};
+  const chatKey = String(room?.chat_key || "").trim();
+  const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
+  const bindingState = String(binding.state || "").toUpperCase();
+  const currentness = String(binding.observer_currentness || "").toUpperCase();
+  const projectId = String(
+    binding.current_project_id || binding.node || ""
+  ).trim();
+  return Boolean(
+    chatKey &&
+      projectId &&
+      sessionKind !== "WORKER" &&
+      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
+      currentness === "CURRENT"
+  );
+}
+
+function providerSessionRoomCacheFor(chatKey) {
+  const key = String(chatKey || "").trim();
+  if (!key) return null;
+  if (!state.providerSessionRoomCaches[key]) {
+    const room = providerSessionRoomForChatKey(key);
+    state.providerSessionRoomCaches[key] = {
+      chat_key: key,
+      messages: [],
+      permissions: [],
+      connection: null,
+      target: null,
+      streamState: "IDLE",
+      unread: 0,
+      activityState: String(room?.activity_state || "UNKNOWN").toUpperCase(),
+      lastEventAt: null,
+      lastEventType: null,
     };
+  }
+  return state.providerSessionRoomCaches[key];
+}
+
+function providerSessionCache(chatKey) {
+  return providerSessionRoomCacheFor(chatKey);
+}
+
+function providerSessionRoomIsSelected(chatKey) {
+  return (
+    state.conversationTarget.kind === "PROVIDER_SESSION" &&
+    String(state.conversationTarget.chat_key || "").trim() ===
+      String(chatKey || "").trim()
+  );
+}
+
+function syncSelectedProviderSessionState(chatKey = null) {
+  const selectedKey =
+    state.conversationTarget.kind === "PROVIDER_SESSION"
+      ? String(state.conversationTarget.chat_key || "").trim()
+      : "";
+  const requestedKey = String(chatKey || "").trim();
+  if (requestedKey && requestedKey !== selectedKey) return;
+  const cache = providerSessionRoomCacheFor(selectedKey);
+  state.providerSessionMessages = cache ? cache.messages : [];
+  state.providerSessionPermissions = cache ? cache.permissions : [];
+  state.providerSessionConnection = cache ? cache.connection : null;
+  state.providerSessionStreamState = selectedKey
+    ? state.providerSessionStreamStates[selectedKey] ||
+      cache?.streamState ||
+      "IDLE"
+    : "IDLE";
+}
+
+function mergeProviderSessionMessages(chatKey, messages) {
+  const cache = providerSessionRoomCacheFor(chatKey);
+  if (!cache) return;
+  cache.messages = dedupeProviderSessionMessages([
+    ...cache.messages,
+    ...(Array.isArray(messages) ? messages : [messages]),
+  ]);
+  syncSelectedProviderSessionState(chatKey);
+}
+
+function mergeProviderSessionPermission(chatKey, permission) {
+  const safe = redactProviderSessionPermission(permission);
+  const cache = providerSessionRoomCacheFor(chatKey);
+  if (!cache || !safe) return;
+  cache.permissions = [
+    ...cache.permissions.filter((item) => item.request_id !== safe.request_id),
+    safe,
+  ];
+  syncSelectedProviderSessionState(chatKey);
+}
+
+function clearProviderSessionUnread(chatKey) {
+  const cache = providerSessionRoomCacheFor(chatKey);
+  if (!cache) return;
+  cache.unread = 0;
+  renderSessionRail();
+}
+
+function markProviderSessionRead(chatKey) {
+  clearProviderSessionUnread(chatKey);
+}
+
+function markProviderSessionActivity(chatKey, type, envelope) {
+  const cache = providerSessionRoomCacheFor(chatKey);
+  if (!cache) return;
+  cache.lastEventType = type;
+  cache.lastEventAt = String(
+    envelope?.emitted_at || new Date().toISOString()
+  );
+  cache.activityState = "LIVE";
+  if (!providerSessionRoomIsSelected(chatKey)) {
+    cache.unread = Math.min(99, Number(cache.unread || 0) + 1);
   }
 }
 
-function closeProviderSessionStream() {
-  if (state.providerSessionStream) state.providerSessionStream.close();
-  state.providerSessionStream = null;
-  state.providerSessionStreamChatKey = null;
-  state.providerSessionStreamState = "IDLE";
+function providerSessionActivityState(room) {
+  const key = String(room?.chat_key || "").trim();
+  const cache = key ? state.providerSessionRoomCaches[key] : null;
+  return String(
+    cache?.activityState || room?.activity_state || "UNKNOWN"
+  ).toUpperCase();
+}
+
+function providerSessionUnreadCount(room) {
+  const key = String(room?.chat_key || "").trim();
+  const cache = key ? state.providerSessionRoomCaches[key] : null;
+  return Math.max(0, Number(cache?.unread || 0));
+}
+
+function applyProviderSessionSnapshot(snapshot, chatKey = null) {
+  const key = String(
+    chatKey ||
+      snapshot?.chat_key ||
+      state.conversationTarget.chat_key ||
+      ""
+  ).trim();
+  const cache = providerSessionRoomCacheFor(key);
+  if (!cache) return false;
+  cache.messages = dedupeProviderSessionMessages(snapshot.messages);
+  cache.permissions = (
+    Array.isArray(snapshot.permissions) ? snapshot.permissions : []
+  )
+    .map((permission) => redactProviderSessionPermission(permission))
+    .filter(Boolean);
+  cache.connection = redactProviderSessionObject(snapshot.connection || null);
+  cache.target = redactProviderSessionTarget(snapshot.target) || cache.target;
+  if (providerSessionRoomIsSelected(key) && cache.target) {
+    state.conversationTarget = {
+      ...state.conversationTarget,
+      ...cache.target,
+      kind: "PROVIDER_SESSION",
+    };
+  }
+  syncSelectedProviderSessionState(key);
+  return true;
+}
+
+function applyProviderSessionPayload(chatKey, payload, envelope) {
+  const key = String(chatKey || "").trim();
+  const cache = providerSessionRoomCacheFor(key);
+  const type = String(payload?.type || "").toUpperCase();
+  if (!cache || !type) return false;
+  let handled = false;
+  if (type === "SNAPSHOT") {
+    handled = applyProviderSessionSnapshot(payload, key);
+  } else if (type === "PROVIDER_SESSION_MESSAGE") {
+    const message = redactProviderSessionMessage(payload.message);
+    if (message) mergeProviderSessionMessages(key, message);
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_DELTA") {
+    const messageId = String(payload.message_id || "");
+    const delta = String(payload.delta || "");
+    cache.messages = cache.messages.map((message) =>
+      message.message_id === messageId
+        ? {
+            ...message,
+            body: String(message.body || "") + delta,
+            state: "STREAMING",
+          }
+        : message
+    );
+    syncSelectedProviderSessionState(key);
+    handled = true;
+  } else if (
+    type === "PROVIDER_SESSION_PERMISSION" ||
+    type === "PROVIDER_SESSION_PERMISSION_RESOLVED"
+  ) {
+    mergeProviderSessionPermission(key, payload.permission);
+    handled = true;
+  }
+  if (!handled) return false;
+  cache.streamState = "LIVE";
+  state.providerSessionStreamStates[key] = "LIVE";
+  syncSelectedProviderSessionState(key);
+  if (type !== "SNAPSHOT") {
+    markProviderSessionActivity(key, type, envelope);
+  }
+  return true;
+}
+
+function closeProviderSessionStream(chatKey) {
+  const key = String(chatKey || "").trim();
+  if (!key) return;
+  const source = state.providerSessionStreams[key];
+  if (source) source.close();
+  delete state.providerSessionStreams[key];
+  state.providerSessionStreamStates[key] = "IDLE";
+  const cache = providerSessionRoomCacheFor(key);
+  if (cache) cache.streamState = "IDLE";
+  if (providerSessionRoomIsSelected(key)) {
+    state.providerSessionStreamState = "IDLE";
+    renderComposerState();
+  }
+  renderSessionRail();
+}
+
+function closeAllProviderSessionStreams() {
+  for (const key of Object.keys(state.providerSessionStreams)) {
+    closeProviderSessionStream(key);
+  }
+}
+
+function syncProviderSessionSubscriptions() {
+  const eligible = new Set(
+    (state.providerChatRooms || [])
+      .filter((room) => providerSessionRoomIsEligible(room))
+      .map((room) => String(room.chat_key || "").trim())
+      .filter(Boolean)
+  );
+  for (const key of Object.keys(state.providerSessionStreams)) {
+    if (eligible.has(key)) continue;
+    closeProviderSessionStream(key);
+    delete state.providerSessionRoomCaches[key];
+    delete state.providerSessionStreamStates[key];
+  }
+  for (const key of Object.keys(state.providerSessionRoomCaches)) {
+    if (eligible.has(key)) continue;
+    delete state.providerSessionRoomCaches[key];
+  }
+  for (const key of eligible) {
+    openProviderSessionStream(key);
+  }
+  syncSelectedProviderSessionState();
+}
+
+function reconcileProviderSessionStreams() {
+  syncProviderSessionSubscriptions();
 }
 
 async function refreshProviderSession(chatKey) {
+  const key = String(chatKey || "").trim();
+  if (!providerSessionRoomIsEligible(providerSessionRoomForChatKey(key))) {
+    throw new Error("This Provider Session is not a current attached session");
+  }
   const snapshot = await api(
-    `/v1/provider-sessions/${encodeURIComponent(chatKey)}`
+    "/v1/provider-sessions/" + encodeURIComponent(key)
   );
-  applyProviderSessionSnapshot(snapshot);
+  applyProviderSessionSnapshot(snapshot, key);
+  clearProviderSessionUnread(key);
   return snapshot;
 }
 
 function openProviderSessionStream(chatKey) {
-  if (
-    state.providerSessionStream &&
-    state.providerSessionStreamChatKey === chatKey
-  ) {
-    return;
+  const key = String(chatKey || "").trim();
+  const room = providerSessionRoomForChatKey(key);
+  if (!providerSessionRoomIsEligible(room)) return null;
+  if (state.providerSessionStreams[key]) {
+    syncSelectedProviderSessionState(key);
+    return state.providerSessionStreams[key];
   }
-  closeProviderSessionStream();
+  const cache = providerSessionRoomCacheFor(key);
   const source = new EventSource(
-    `/v1/provider-sessions/${encodeURIComponent(chatKey)}/stream`
+    "/v1/provider-sessions/" + encodeURIComponent(key) + "/stream"
   );
-  state.providerSessionStream = source;
-  state.providerSessionStreamChatKey = chatKey;
-  state.providerSessionStreamState = "CONNECTING";
+  state.providerSessionStreams[key] = source;
+  state.providerSessionStreamStates[key] = "CONNECTING";
+  if (cache) cache.streamState = "CONNECTING";
+  syncSelectedProviderSessionState(key);
+  renderSessionRail();
+  source.addEventListener("open", () => {
+    if (state.providerSessionStreams[key] !== source) return;
+    state.providerSessionStreamStates[key] = "LIVE";
+    if (cache) cache.streamState = "LIVE";
+    syncSelectedProviderSessionState(key);
+    renderSessionRail();
+  });
   source.addEventListener("provider-session", (event) => {
     let envelope;
     try {
@@ -5566,49 +5931,30 @@ function openProviderSessionStream(chatKey) {
       console.warn("Provider Session stream payload is invalid", error);
       return;
     }
-    if (state.conversationTarget.chat_key !== chatKey) return;
-    state.providerSessionStreamState = "LIVE";
+    if (String(envelope.chat_key || key).trim() !== key) return;
+    if (state.providerSessionStreams[key] !== source) return;
     const payload = envelope.payload || {};
-    if (payload.type === "SNAPSHOT") {
-      applyProviderSessionSnapshot(payload);
-    } else if (payload.type === "PROVIDER_SESSION_MESSAGE") {
-      state.providerSessionMessages = dedupeProviderSessionMessages([
-        ...state.providerSessionMessages,
-        payload.message,
-      ]);
-    } else if (payload.type === "PROVIDER_SESSION_DELTA") {
-      state.providerSessionMessages = state.providerSessionMessages.map((message) =>
-        message.message_id === payload.message_id
-          ? {
-              ...message,
-              body: String(message.body || "") + String(payload.delta || ""),
-              state: "STREAMING",
-            }
-          : message
-      );
-    } else if (
-      payload.type === "PROVIDER_SESSION_PERMISSION" ||
-      payload.type === "PROVIDER_SESSION_PERMISSION_RESOLVED"
-    ) {
-      const permission = payload.permission;
-      if (permission?.request_id) {
-        state.providerSessionPermissions = [
-          ...state.providerSessionPermissions.filter(
-            (item) => item.request_id !== permission.request_id
-          ),
-          permission,
-        ];
-      }
+    if (!applyProviderSessionPayload(key, payload, envelope)) return;
+    if (providerSessionRoomIsSelected(key)) {
+      renderComposerState();
+      renderComposerActions();
+      renderRoomMessages();
+    } else {
+      renderSessionRail();
+      renderNodeModes();
     }
-    renderComposerState();
-    renderRoomMessages();
   });
   source.addEventListener("error", () => {
-    if (state.providerSessionStream === source) {
+    if (state.providerSessionStreams[key] !== source) return;
+    state.providerSessionStreamStates[key] = "RECONNECTING";
+    if (cache) cache.streamState = "RECONNECTING";
+    if (providerSessionRoomIsSelected(key)) {
       state.providerSessionStreamState = "RECONNECTING";
       renderComposerState();
     }
+    renderSessionRail();
   });
+  return source;
 }
 
 async function openProviderChatSession(room) {
@@ -5616,29 +5962,33 @@ async function openProviderChatSession(room) {
   const projectId = String(
     binding.current_project_id || binding.node || ""
   ).trim();
-  if (!projectId || room?.session_kind === "WORKER") {
-    throw new Error("This Provider Session cannot be opened directly");
+  const chatKey = String(room?.chat_key || "").trim();
+  if (!projectId || !providerSessionRoomIsEligible(room)) {
+    throw new Error("This Provider Session is not a current attached session");
   }
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
   closeProjectRoomStream();
+  state.selectedProviderChatKey = chatKey;
   const setting =
     binding.mode === "CONDUCTOR"
       ? state.providerSettings?.universe_conductor
       : projectProviderSetting(projectId);
   state.conversationTarget = {
     kind: "PROVIDER_SESSION",
-    chat_key: room.chat_key,
+    chat_key: chatKey,
     projectId,
     node: binding.node || projectId,
     mode: binding.mode || "MASTER",
     provider: String(room.provider || "UNKNOWN").toUpperCase(),
     model_ref: setting?.model_ref || setting?.resolved_model || "",
-    alias: binding.alias || room.display_name || `${projectId} session`,
+    alias: binding.alias || room.display_name || projectId + " session",
   };
-  await refreshProviderSession(room.chat_key);
-  openProviderSessionStream(room.chat_key);
+  clearProviderSessionUnread(chatKey);
+  syncSelectedProviderSessionState(chatKey);
+  await refreshProviderSession(chatKey);
+  openProviderSessionStream(chatKey);
   closeComposerActionMenu();
   renderComposerActions();
   renderComposerState();
@@ -7090,6 +7440,7 @@ function selectGraphNode(event) {
   if (selected.kind === "universe") {
     // Depth 0 focus — tree stays fully expanded; only dim shifts.
     state.focusedNodeId = null;
+    state.inspectorDismissed = true;
     state.selectedNode = selected;
     if (state.view === "universe") {
       drawGraph();
@@ -7567,11 +7918,14 @@ async function submitDispatch(event) {
         }
       );
       elements.dispatchForm.reset();
-      state.providerSessionMessages = dedupeProviderSessionMessages([
-        ...state.providerSessionMessages,
+      const cache = providerSessionCache(state.conversationTarget.chat_key);
+      cache.messages = dedupeProviderSessionMessages([
+        ...cache.messages,
         result.message,
         result.reply,
       ]);
+      markProviderSessionRead(state.conversationTarget.chat_key);
+      syncSelectedProviderSessionState(state.conversationTarget.chat_key);
       expandConversationLayer();
       renderComposerState();
       renderRoomMessages();
@@ -11086,6 +11440,7 @@ refreshLawStrip = function () {
 }
 
 bindEvents();
+window.addEventListener("beforeunload", closeAllProviderSessionStreams);
 refresh().finally(() => {
   openConductorRoomStream();
   void tailProviderSessions();
