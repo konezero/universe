@@ -5844,3 +5844,473 @@ body:not(.graph-mode) .conductor-panel {
     backdrop-filter: none;
   }
 }
+
+/* The left rail is a node-to-mode switcher; legacy project/session surfaces remain in the DOM for existing flows. */
+.legacy-rail-surface {
+  display: none !important;
+}
+.node-mode-heading {
+  flex: 0 0 44px;
+}
+.node-mode-count {
+  display: inline-grid;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 5px;
+  place-items: center;
+  border: 1px solid rgba(61, 224, 255, 0.26);
+  border-radius: 999px;
+  background: rgba(61, 224, 255, 0.08);
+  color: var(--cyan);
+  font-size: 10px;
+}
+.node-mode-list {
+  display: grid;
+  flex: 1 1 auto;
+  align-content: start;
+  gap: 10px;
+  min-height: 0;
+  padding: 10px 8px 14px;
+  overflow-y: auto;
+}
+.node-mode-group {
+  display: grid;
+  gap: 5px;
+}
+.node-mode-group-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 5px;
+  color: var(--text-1);
+}
+.node-mode-group-heading strong {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-mode-group-heading small {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  font-size: 9px;
+}
+.node-mode-group-list {
+  display: grid;
+  gap: 4px;
+}
+.node-mode-item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 5px 7px;
+  border: 1px solid rgba(90, 150, 210, 0.16);
+  border-radius: 7px;
+  background: rgba(7, 21, 38, 0.54);
+  color: var(--text-2);
+  text-align: left;
+}
+.node-mode-item:hover,
+.node-mode-item:focus-visible,
+.node-mode-item[aria-selected="true"] {
+  border-color: rgba(61, 224, 255, 0.42);
+  background: rgba(61, 224, 255, 0.1);
+  color: var(--text-1);
+}
+.node-mode-item[data-current="true"] {
+  box-shadow: inset 2px 0 0 var(--cyan);
+}
+.node-mode-mark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid rgba(61, 224, 255, 0.3);
+  border-radius: 6px;
+  background: rgba(61, 224, 255, 0.1);
+  color: var(--cyan);
+  font-size: 11px;
+  font-weight: 800;
+}
+.node-mode-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.node-mode-copy strong,
+.node-mode-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-mode-copy strong {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.node-mode-copy small {
+  color: var(--text-3);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+}
+.node-mode-empty {
+  margin: 8px 4px;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.node-mode-node {
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 5px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-1);
+  text-align: left;
+}
+.node-mode-node:hover,
+.node-mode-node:focus-visible,
+.node-mode-node[aria-selected="true"] {
+  border-color: rgba(61, 224, 255, 0.28);
+  background: rgba(61, 224, 255, 0.07);
+}
+.node-mode-node[aria-selected="true"] {
+  box-shadow: inset 2px 0 0 var(--cyan);
+}
+.node-mode-item[data-active="false"] {
+  border-style: dashed;
+  border-color: rgba(126, 151, 184, 0.2);
+  background: rgba(7, 21, 38, 0.24);
+  color: var(--text-3);
+}
+.node-mode-item[data-active="false"] .node-mode-mark {
+  border-color: rgba(126, 151, 184, 0.24);
+  background: transparent;
+  color: var(--text-3);
+}
+.node-mode-item[data-active="true"] .node-mode-copy small {
+  color: var(--green);
+}
+.node-mode-item[data-active="false"] .node-mode-copy small {
+  color: var(--amber);
+}
+
+/* Fixed right chat dock and sliding inspector drawer. */
+.app-shell.mockup-shell {
+  --utility-rail-width: 66px;
+  --mode-panel-width: 238px;
+  --chat-panel-width: 380px;
+  --inspector-popup-width: 340px;
+  --inspector-track-width: 0px;
+  grid-template-columns:
+    var(--utility-rail-width)
+    var(--mode-panel-width)
+    var(--inspector-track-width)
+    minmax(0, 1fr);
+  transition: grid-template-columns 220ms ease;
+  grid-template-rows: var(--topbar-h) minmax(0, 1fr) var(--statusbar-h);
+}
+
+.app-shell.mockup-shell > .topbar {
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+.app-shell.mockup-shell > .utility-rail {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.app-shell.mockup-shell > .project-rail {
+  position: relative;
+  z-index: 7;
+  grid-column: 2;
+  grid-row: 2;
+  width: var(--mode-panel-width);
+}
+
+.app-shell.mockup-shell > .graph-workspace {
+  grid-column: 4;
+  grid-row: 2;
+  min-width: 0;
+  padding-right: var(--chat-panel-width);
+}
+
+.app-shell.mockup-shell > .status-bar {
+  grid-column: 1 / -1;
+  grid-row: 3;
+}
+
+/* Inspector occupies a real track between modes and the central view. */
+.app-shell.mockup-shell > .inspector {
+  position: relative;
+  inset: auto;
+  z-index: 6;
+  display: flex;
+  grid-column: 3;
+  grid-row: 2;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  transform: translateX(-100%);
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  border: 0;
+  border-right: 1px solid var(--ws-line);
+  box-shadow: 14px 0 38px rgba(0, 0, 0, .24);
+  transition:
+    transform 220ms ease,
+    opacity 160ms ease,
+    visibility 0s linear 220ms;
+}
+
+body.inspector-open .app-shell.mockup-shell {
+  --inspector-track-width: var(--inspector-popup-width);
+}
+
+body.inspector-open .app-shell.mockup-shell > .inspector {
+  transform: translateX(0);
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+/* The conductor panel is the permanent chat column on the far right. */
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: auto;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  width: var(--chat-panel-width);
+  height: auto;
+  max-height: none;
+  margin: 0;
+  overflow: hidden;
+  transform: none;
+  border: 0;
+  border-left: 1px solid var(--ws-line);
+  border-radius: 0;
+  background: #091714;
+  box-shadow: -14px 0 32px rgba(0, 0, 0, .24);
+}
+
+.chat-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 32;
+  width: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.chat-resize-handle::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+  content: "";
+  transition: width 120ms ease, background 120ms ease;
+}
+
+.chat-resize-handle:hover::after,
+.chat-resize-handle:focus-visible::after,
+body.chat-resizing .chat-resize-handle::after {
+  width: 3px;
+  background: var(--ws-teal);
+}
+
+body.chat-resizing,
+body.chat-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conductor-summary {
+  display: none;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  width: auto;
+  min-height: 0;
+  max-height: none;
+  margin: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .conversation-layer-header {
+  flex: 0 0 48px;
+  min-height: 48px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--ws-line);
+  background: #0a1917;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel .action-inbox-button {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .room-message-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+  padding: 14px 12px;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer.collapsed {
+  flex: 0 0 48px;
+  max-height: 48px;
+  margin-bottom: 0;
+}
+
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .command-composer.conductor-composer {
+  flex: 0 0 auto;
+  width: auto;
+  margin: 0;
+  padding: 10px;
+  border: 0;
+  border-top: 1px solid var(--ws-line);
+  border-radius: 0;
+  background: #0a1917;
+}
+
+@media (min-width: 1181px) and (max-width: 1360px) {
+  .app-shell.mockup-shell {
+    --utility-rail-width: 62px;
+    --mode-panel-width: 220px;
+    --chat-panel-width: 330px;
+    --inspector-popup-width: 320px;
+    grid-template-columns:
+      var(--utility-rail-width)
+      var(--mode-panel-width)
+      var(--inspector-track-width)
+      minmax(0, 1fr);
+  }
+
+  .app-shell.mockup-shell > .project-rail {
+    width: var(--mode-panel-width);
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1180px) {
+  .app-shell.mockup-shell {
+    --utility-rail-width: 62px;
+    --mode-panel-width: 218px;
+    --chat-panel-width: min(360px, 42vw);
+    --inspector-popup-width: min(320px, calc(100vw - var(--utility-rail-width) - var(--mode-panel-width) - var(--chat-panel-width) - 24px));
+    grid-template-columns:
+      var(--utility-rail-width)
+      var(--mode-panel-width)
+      var(--inspector-track-width)
+      minmax(0, 1fr);
+  }
+
+  .app-shell.mockup-shell > .project-rail {
+    width: var(--mode-panel-width);
+  }
+}
+
+@media (max-width: 720px) {
+  .app-shell.mockup-shell {
+    --chat-panel-width: 0px;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: var(--topbar-h) minmax(0, 1fr);
+  }
+
+  .app-shell.mockup-shell > .utility-rail,
+  .app-shell.mockup-shell > .project-rail,
+  .app-shell.mockup-shell > .inspector,
+  .app-shell.mockup-shell > .status-bar {
+    display: none !important;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace {
+    grid-column: 1;
+    grid-row: 2;
+    padding-right: 0;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel {
+    top: auto;
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    display: block;
+    width: auto;
+    height: auto;
+    max-height: 174px;
+    overflow: visible;
+    border: 1px solid var(--ws-line);
+    border-radius: 8px;
+    box-shadow: 0 16px 32px rgba(0, 0, 0, .35);
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle {
+    display: none;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer {
+    display: block;
+    flex: none;
+    max-height: 38px;
+    overflow: hidden;
+    border: 1px solid var(--ws-line);
+    border-radius: 7px;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer.expanded {
+    position: fixed;
+    top: var(--topbar-h);
+    right: 0;
+    bottom: 50px;
+    left: 0;
+    z-index: 80;
+    display: block;
+    width: auto;
+    height: auto;
+    max-height: none;
+    border: 1px solid var(--ws-line);
+    border-radius: 0;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer.expanded .room-message-list {
+    height: calc(100% - 46px);
+    max-height: none;
+    overflow-y: auto;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .command-composer.conductor-composer {
+    display: grid;
+    padding: 8px;
+    border-top: 0;
+    border-radius: 0 0 8px 8px;
+  }
+}

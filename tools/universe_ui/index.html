@@ -50,16 +50,21 @@
     </nav>
 
     <aside class="project-rail universe-rail">
-      <div class="section-heading">
+      <div class="section-heading node-mode-heading">
+        <span>Node modes</span>
+        <span id="node-mode-count" class="node-mode-count">0</span>
+      </div>
+      <div id="node-mode-list" class="node-mode-list" role="listbox" aria-label="Node modes"></div>
+      <div class="section-heading legacy-rail-surface">
           <span>Projects</span>
         <span class="section-actions">
           <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project">&#10022;</button>
           <button id="add-project-button" class="icon-button compact" type="button" title="Connect project" aria-label="Connect project">+</button>
         </span>
       </div>
-      <div id="project-list" class="project-list" role="listbox" aria-label="Projects"></div>
+      <div id="project-list" class="project-list legacy-rail-surface" role="listbox" aria-label="Projects"></div>
 
-      <div class="rail-block session-block">
+      <div class="rail-block session-block legacy-rail-surface">
         <div class="section-heading rail-subhead">
           <span>Sessions</span>
           <button id="session-observatory-button" class="icon-button compact" type="button" title="Manage sessions" aria-label="Manage sessions">&#8943;</button>
@@ -78,7 +83,7 @@
         <div id="session-rail-list" class="session-rail-list" aria-label="Universe sessions"></div>
         <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
-      <div class="rail-quick-actions">
+      <div class="rail-quick-actions legacy-rail-surface">
         <button id="quick-conductor-button" type="button"><span aria-hidden="true">+</span> New Conductor conversation</button>
         <button id="quick-task-button" type="button"><span aria-hidden="true">&#9745;</span> Create task</button>
       </div>
@@ -153,6 +158,7 @@
       </div>
 
       <section class="conductor-panel glass-panel" aria-label="Universe Conductor">
+        <div id="chat-resize-handle" class="chat-resize-handle" role="separator" aria-orientation="vertical" aria-valuemin="300" aria-valuemax="560" aria-valuenow="380" aria-label="Resize chat panel" tabindex="0"></div>
         <div id="conductor-summary" class="conductor-summary collapsed">
           <button id="conductor-summary-toggle" class="summary-dock-toggle" type="button" title="Expand overview" aria-label="Expand overview" aria-expanded="false">
             <span class="summary-dock-icon" aria-hidden="true">&#9638;</span>

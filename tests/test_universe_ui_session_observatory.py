@@ -52,6 +52,56 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             APP.index('appendBranch("Past", group.past)'),
         )
 
+    def test_left_rail_renders_nodes_with_fixed_modes_and_session_state(self) -> None:
+        self.assertIn('id="node-mode-list"', HTML)
+        self.assertIn('id="node-mode-count"', HTML)
+        self.assertIn('class="section-heading legacy-rail-surface"', HTML)
+        self.assertIn('class="project-list legacy-rail-surface"', HTML)
+        self.assertIn("function normalizeNodeModeNode(nodeId)", APP)
+        self.assertIn("function nodeModeCatalog(project)", APP)
+        self.assertIn('const modes = isUniverseHome ? ["MASTER", "CONDUCTOR"] : ["MASTER"];', APP)
+        self.assertIn("function nodeModeSessionIsActive(session)", APP)
+        self.assertIn('if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;', APP)
+        self.assertIn("if (coordinate.room)", APP)
+        self.assertIn("node-mode-item", CSS)
+        self.assertIn(".node-mode-node", CSS)
+        self.assertIn('data-active="false"', CSS)
+
+    def test_right_chat_dock_and_sliding_inspector_contract(self) -> None:
+        self.assertIn('class="conductor-panel glass-panel"', HTML)
+        self.assertIn('id="conversation-layer"', HTML)
+        self.assertIn('id="action-inbox-button"', HTML)
+        self.assertIn('id="close-inspector"', HTML)
+        header_start = HTML.index('<header class="conversation-layer-header">')
+        self.assertLess(
+            HTML.index('id="action-inbox-button"', header_start),
+            HTML.index('id="room-message-list"', header_start),
+        )
+        self.assertIn(
+            ".app-shell.mockup-shell > .graph-workspace > .conductor-panel",
+            CSS,
+        )
+        self.assertIn(
+            "var(--inspector-track-width)",
+            CSS,
+        )
+        self.assertIn(
+            "body.inspector-open .app-shell.mockup-shell > .inspector",
+            CSS,
+        )
+        self.assertIn('id="chat-resize-handle"', HTML)
+        self.assertIn("if (coordinate.room)", APP)
+        self.assertIn("openProviderChatSummary(coordinate.room)", APP)
+        self.assertIn("initChatPanelResize()", APP)
+        self.assertIn("--chat-panel-width: 380px", CSS)
+        self.assertIn("chat-resize-handle", CSS)
+        self.assertIn("--inspector-track-width: 0px", CSS)
+        self.assertIn("grid-column: 3", CSS)
+        self.assertIn("grid-column: 4", CSS)
+        self.assertIn("grid-template-columns 220ms ease", CSS)
+        self.assertIn("transform: translateX(-100%)", CSS)
+        self.assertIn("transition:\n    transform 220ms ease", CSS)
+
     def test_session_click_opens_summary_before_activation(self) -> None:
         self.assertIn('id="session-summary-dialog"', HTML)
         self.assertIn('id="session-summary-facts"', HTML)

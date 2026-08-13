@@ -118,6 +118,7 @@ const state = {
   /** Hovered graph node id (for icon map tooltips). */
   hoveredNodeId: null,
   inspectorDismissed: false,
+  chatPanelWidth: 380,
   selectedGoalId: null,
 };
 
@@ -125,6 +126,8 @@ const elements = {
   serviceStatus: document.querySelector("#service-status"),
   modeStatus: document.querySelector("#mode-status"),
   projectList: document.querySelector("#project-list"),
+  nodeModeList: document.querySelector("#node-mode-list"),
+  nodeModeCount: document.querySelector("#node-mode-count"),
   workspaceTitle: document.querySelector("#workspace-title"),
   workspaceSubtitle: document.querySelector("#workspace-subtitle"),
   canvas: document.querySelector("#universe-graph"),
@@ -353,6 +356,7 @@ const elements = {
   releaseFormError: document.querySelector("#release-form-error"),
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
   conversationLayer: document.querySelector("#conversation-layer"),
+  chatResizeHandle: document.querySelector("#chat-resize-handle"),
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationExpand: document.querySelector("#conversation-expand"),
   conversationBadge: document.querySelector("#conversation-badge"),
@@ -931,6 +935,7 @@ async function refreshSupervisorSessions() {
   renderRuntimePreflight();
   renderSessionObservatory();
   renderSessionRail();
+  renderNodeModes();
   renderProviderActivitySources();
 }
 
@@ -962,6 +967,7 @@ async function tailProviderSessions() {
       }
     }
     renderSessionRail();
+    renderNodeModes();
     renderProviderChatSummary();
     renderSelectedSessionDetail();
   } catch (_error) {
@@ -1539,9 +1545,238 @@ function renderProviderChatSummary() {
 function openProviderChatSummary(room) {
   state.selectedProviderChatKey = room.chat_key;
   renderSessionRail();
+  renderNodeModes();
   renderProviderChatSummary();
   if (!elements.sessionSummaryDialog.open) {
     elements.sessionSummaryDialog.showModal();
+  }
+}
+
+function normalizeNodeModeNode(nodeId) {
+  const rawNode = String(nodeId || "").trim();
+  return rawNode.toUpperCase() === "CONDUCTOR" ? "universe" : rawNode;
+}
+
+function nodeModeCatalog(project) {
+  const projectId = String(project?.project_id || "").toLowerCase();
+  const isUniverseHome =
+    String(project?.metadata?.network_role || "").toUpperCase() === "UNIVERSE_HOME" ||
+    projectId === "universe";
+  const modes = isUniverseHome ? ["MASTER", "CONDUCTOR"] : ["MASTER"];
+  const observedModes = [
+    ...(state.supervisorSessions || [])
+      .filter(
+        (session) =>
+          normalizeNodeModeNode(session.node).toLowerCase() === projectId
+      )
+      .map((session) => String(session.mode || "").trim().toUpperCase()),
+    ...(state.providerChatRooms || [])
+      .filter((room) => {
+        const binding = room.binding || {};
+        return (
+          ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state) &&
+          normalizeNodeModeNode(
+            binding.current_project_id || binding.node
+          ).toLowerCase() === projectId
+        );
+      })
+      .map((room) => String(room.binding?.mode || "").trim().toUpperCase()),
+  ];
+  return [...new Set([...modes, ...observedModes])]
+    .filter(Boolean)
+    .sort((left, right) => {
+      if (left === "MASTER") return -1;
+      if (right === "MASTER") return 1;
+      return left.localeCompare(right);
+    });
+}
+
+function nodeModeSessionIsActive(session) {
+  return ["LIVE", "STARTING"].includes(
+    String(session?.state || "").trim().toUpperCase()
+  );
+}
+
+function nodeModeRoomIsActive(room) {
+  const boundSession = supervisorSessionForRoom(room);
+  return (
+    nodeModeSessionIsActive(boundSession) ||
+    ["LIVE", "STARTING"].includes(
+      String(room?.activity_state || "").trim().toUpperCase()
+    )
+  );
+}
+
+function nodeModeCoordinates() {
+  const projects = visibleProjects()
+    .filter((project) => !isProjectContainer(project))
+    .sort((left, right) =>
+      projectSortKey(left).localeCompare(projectSortKey(right))
+    );
+  const projectsById = new Map(
+    projects.map((project) => [String(project.project_id).toLowerCase(), project])
+  );
+  const coordinates = new Map();
+  const record = (nodeId, mode, source = {}) => {
+    const normalizedNode = normalizeNodeModeNode(nodeId);
+    const normalizedMode = String(mode || "").trim().toUpperCase();
+    const project = projectsById.get(normalizedNode.toLowerCase());
+    if (!project || !normalizedMode) return;
+    const key = `${normalizedNode.toLowerCase()}::${normalizedMode}`;
+    const coordinate = coordinates.get(key) || {
+      key,
+      nodeId: project.project_id,
+      project,
+      mode: normalizedMode,
+      active: false,
+      current: false,
+      hasSession: false,
+      room: null,
+      session: null,
+    };
+    coordinate.active = coordinate.active || source.active === true;
+    coordinate.current = coordinate.current || source.current === true;
+    coordinate.hasSession = coordinate.hasSession || source.hasSession === true;
+    if (source.room && (!coordinate.room || source.active || source.current)) {
+      coordinate.room = source.room;
+    }
+    if (source.session && (!coordinate.session || source.active || source.current)) {
+      coordinate.session = source.session;
+    }
+    coordinates.set(key, coordinate);
+  };
+
+  for (const room of state.providerChatRooms || []) {
+    const binding = room.binding || {};
+    if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;
+    const boundSession = supervisorSessionForRoom(room);
+    record(binding.current_project_id || binding.node, binding.mode, {
+      room,
+      session: boundSession,
+      active: nodeModeRoomIsActive(room),
+      hasSession: Boolean(binding.universe_session_id || boundSession),
+      current: binding.is_default === true && binding.observer_currentness === "CURRENT",
+    });
+  }
+  for (const session of state.supervisorSessions || []) {
+    const room = providerChatRoomForSupervisorSession(session);
+    record(session.node, session.mode, {
+      room,
+      session,
+      active: nodeModeSessionIsActive(session),
+      hasSession: true,
+      current:
+        session.is_default === true &&
+        ["CURRENT"].includes(
+          String(session.observer_currentness || session.currentness || "").toUpperCase()
+        ),
+    });
+  }
+
+  const groups = projects.map((project) => {
+    const nodeId = project.project_id;
+    const modes = nodeModeCatalog(project).map((mode) =>
+      coordinates.get(`${String(nodeId).toLowerCase()}::${mode}`) || {
+        key: `${String(nodeId).toLowerCase()}::${mode}`,
+        nodeId,
+        project,
+        mode,
+        active: false,
+        current: false,
+        hasSession: false,
+        room: null,
+        session: null,
+      }
+    );
+    return { nodeId, project, modes };
+  });
+  return groups;
+}
+
+function nodeModeStatusLabel(coordinate) {
+  if (coordinate.active) return coordinate.current ? "ACTIVE · CURRENT" : "ACTIVE";
+  return coordinate.hasSession ? "INACTIVE" : "NO SESSION";
+}
+
+function selectNodeModeNode(nodeId) {
+  selectProject(nodeId, {
+    revealInspector: window.innerWidth > 720,
+  })
+    .then(() => renderNodeModes())
+    .catch((error) => toast(error.message, true));
+}
+
+function openNodeModeCoordinate(coordinate) {
+  // A mode with a registered room always opens the session switch summary,
+  // even when the observed provider is currently inactive or disconnected.
+  if (coordinate.room) {
+    openProviderChatSummary(coordinate.room);
+    return;
+  }
+  selectNodeModeNode(coordinate.nodeId);
+}
+
+function renderNodeModes() {
+  if (!elements.nodeModeList) return;
+  const groups = nodeModeCoordinates();
+  const modeCount = groups.reduce((total, group) => total + group.modes.length, 0);
+  const activeModeCount = groups.reduce(
+    (total, group) => total + group.modes.filter((mode) => mode.active).length,
+    0
+  );
+  elements.nodeModeList.replaceChildren();
+  if (elements.nodeModeCount) {
+    elements.nodeModeCount.textContent = `${activeModeCount}/${modeCount}`;
+    elements.nodeModeCount.title = `${activeModeCount} active sessions / ${modeCount} node modes`;
+  }
+  if (!groups.length) {
+    elements.nodeModeList.append(
+      node("p", "node-mode-empty", "No nodes registered")
+    );
+    return;
+  }
+
+  for (const group of groups) {
+    const section = node("section", "node-mode-group");
+    section.dataset.nodeId = group.nodeId;
+    const activeCount = group.modes.filter((mode) => mode.active).length;
+    const heading = node("button", "node-mode-group-heading node-mode-node");
+    heading.type = "button";
+    heading.dataset.nodeId = group.nodeId;
+    heading.ariaSelected = String(
+      state.selectedProject?.project_id === group.nodeId
+    );
+    heading.title = `Select ${projectDisplayName(group.project)} node`;
+    heading.append(
+      node("strong", "", projectDisplayName(group.project)),
+      node("small", "", `${activeCount}/${group.modes.length} active`)
+    );
+    heading.addEventListener("click", () => selectNodeModeNode(group.nodeId));
+    section.append(heading);
+    const list = node("div", "node-mode-group-list");
+    for (const coordinate of group.modes) {
+      const item = node("button", "node-mode-item");
+      item.type = "button";
+      item.role = "option";
+      item.dataset.nodeId = coordinate.nodeId;
+      item.dataset.mode = coordinate.mode;
+      item.dataset.active = String(coordinate.active);
+      item.dataset.current = String(coordinate.current);
+      item.ariaSelected = String(
+        coordinate.room?.chat_key === state.selectedProviderChatKey
+      );
+      item.title = `${projectDisplayName(group.project)} / ${coordinate.mode} · ${nodeModeStatusLabel(coordinate)}`;
+      const copy = node("span", "node-mode-copy");
+      copy.append(
+        node("strong", "", coordinate.mode),
+        node("small", "", nodeModeStatusLabel(coordinate))
+      );
+      item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
+      item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
+      list.append(item);
+    }
+    section.append(list);
+    elements.nodeModeList.append(section);
   }
 }
 
@@ -3101,6 +3336,95 @@ function expandConversationLayer() {
     elements.conversationLayer.classList.remove("collapsed");
     syncConversationToggle(false);
   }
+}
+
+const CHAT_PANEL_MIN_WIDTH = 300;
+const CHAT_PANEL_MAX_WIDTH = 560;
+
+function clampChatPanelWidth(width) {
+  const requested = Number(width);
+  const safeWidth = Number.isFinite(requested) ? requested : state.chatPanelWidth;
+  const viewportMax = Math.max(
+    CHAT_PANEL_MIN_WIDTH,
+    window.innerWidth - 420
+  );
+  return Math.round(
+    Math.min(
+      CHAT_PANEL_MAX_WIDTH,
+      viewportMax,
+      Math.max(CHAT_PANEL_MIN_WIDTH, safeWidth)
+    )
+  );
+}
+
+function setChatPanelWidth(width, { persist = false } = {}) {
+  const shell = document.querySelector(".app-shell.mockup-shell");
+  if (!shell || window.innerWidth <= 720) return;
+  const next = clampChatPanelWidth(width);
+  state.chatPanelWidth = next;
+  shell.style.setProperty("--chat-panel-width", String(next) + "px");
+  if (elements.chatResizeHandle) {
+    elements.chatResizeHandle.setAttribute("aria-valuenow", String(next));
+  }
+  if (persist) {
+    try {
+      window.localStorage.setItem("universe.chatPanelWidth", String(next));
+    } catch (_error) {
+      // Local preference storage is optional.
+    }
+  }
+}
+
+function initChatPanelResize() {
+  const handle = elements.chatResizeHandle;
+  if (!handle) return;
+  let storedWidth = null;
+  try {
+    storedWidth = Number(window.localStorage.getItem("universe.chatPanelWidth"));
+  } catch (_error) {
+    storedWidth = null;
+  }
+  setChatPanelWidth(
+    Number.isFinite(storedWidth) && storedWidth > 0
+      ? storedWidth
+      : state.chatPanelWidth
+  );
+
+  let dragging = false;
+  const move = (event) => {
+    if (!dragging) return;
+    setChatPanelWidth(window.innerWidth - event.clientX);
+  };
+  const finish = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove("chat-resizing");
+    setChatPanelWidth(state.chatPanelWidth, { persist: true });
+  };
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (window.innerWidth <= 720) return;
+    event.preventDefault();
+    dragging = true;
+    document.body.classList.add("chat-resizing");
+    handle.setPointerCapture?.(event.pointerId);
+  });
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", finish);
+  window.addEventListener("pointercancel", finish);
+  handle.addEventListener("keydown", (event) => {
+    let next = null;
+    if (event.key === "ArrowLeft") next = state.chatPanelWidth + 20;
+    if (event.key === "ArrowRight") next = state.chatPanelWidth - 20;
+    if (event.key === "Home") next = CHAT_PANEL_MAX_WIDTH;
+    if (event.key === "End") next = CHAT_PANEL_MIN_WIDTH;
+    if (next === null) return;
+    event.preventDefault();
+    setChatPanelWidth(next, { persist: true });
+  });
+  window.addEventListener("resize", () => {
+    setChatPanelWidth(state.chatPanelWidth);
+  });
 }
 
 function pendingActionItems() {
@@ -9906,6 +10230,7 @@ let refreshConductorPanel = () => {};
 let refreshLawStrip = () => {};
 
 function bindEvents() {
+  initChatPanelResize();
   document
     .querySelector("#refresh-button")
     .addEventListener("click", () => refresh({ syncSelectedProject: true }));
