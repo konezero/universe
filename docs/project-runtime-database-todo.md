@@ -17,7 +17,8 @@ Status: P0 and P1 implemented, released, installed, and verified
 - [x] Commit the Career Runtime source change and produce an immutable release
   at `b98a74693d779841f2b913cfdc82cb388bfc2181` on ai-career PR #269.
 - [x] OS_UPDATE the Universe installation from that release and run live
-  CONDUCTOR plus non-default `UNIVERSE` Mode dogfood.
+  Conductor Mode dogfood through the Universe app/observatory without treating
+  UNIVERSE as a Mode.
 
 ## P1 - Runtime state consolidation
 

@@ -15,9 +15,14 @@ CONDUCTOR:
   mode_profile: GOVERNANCE_ONLY
 ```
 
-Application startup requests registered `CONDUCTOR` Mode. `UNIVERSE` remains a
-compatibility alias with the same Role, Scope, and Profile. The Role always
+`UNIVERSE` is the app and observatory name. It is not a Mode, Role, Mode alias,
+or Mode Registry entry. Only `MASTER` and `CONDUCTOR` are Mode coordinates.
+Application observation uses registered `CONDUCTOR` Mode. The Role always
 resolves from the Mode Registry.
+
+A separate Mode Host owns Conductor BOOT, Current Anchor, provider session,
+and lifecycle. The Universe app server observes; it must not BOOT, prepare,
+bind, own, or start a Conductor Mode session or runtime.
 
 The installed Distribution Manifest Mode is only a first-start default. A
 prepared Session binds the Registry-resolved Mode, Role, Scope, Current Anchor,
@@ -55,10 +60,12 @@ source-write authority.
 
 ```text
 CONDUCTOR Mode MUST resolve Role CONDUCTOR.
-Universe and Conductor intent MUST resolve Mode CONDUCTOR.
+Conductor intent MUST resolve Mode CONDUCTOR.
+Universe / UNIVERSE intent MUST NOT resolve as a Mode or alias.
 Session Boot Mode MUST equal its prepared Mode Boot Binding Mode.
 Missing, stale, reused, or mismatched Mode Boot Bindings MUST fail closed.
-UNIVERSE compatibility Mode MUST NOT become the application startup Mode.
+UNIVERSE MUST NOT appear under modes in the Mode Registry.
+A separate Mode Host MUST own Conductor lifecycle; the Universe app observes.
 Release lifecycle mutation MUST require MASTER Mode.
 Mode or Role MUST NOT create authority or execution permission.
 ```

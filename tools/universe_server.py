@@ -421,20 +421,15 @@ IMPLEMENTATION_BINDING_RELATIONS = frozenset(
     {"IMPLEMENTS", "SUPPORTS", "ADAPTS", "EXPOSES"}
 )
 MASTER_MODE = "MASTER"
-UNIVERSE_MODE = "CONDUCTOR"
-UNIVERSE_ALIAS_MODE = "UNIVERSE"
-UNIVERSE_ROLE = "CONDUCTOR"
-UNIVERSE_SCOPE = "project-network/navigation/distribution"
-UNIVERSE_MODE_PROFILE = "GOVERNANCE_ONLY"
-UNIVERSE_MODE_INTENTS = {
-    "UNIVERSE": UNIVERSE_MODE,
-    "UNIVERSE MODE": UNIVERSE_MODE,
-    "CONDUCTOR": UNIVERSE_MODE,
-    "CONDUCTOR MODE": UNIVERSE_MODE,
-    "\uc720\ub2c8\ubc84\uc2a4": UNIVERSE_MODE,
-    "\uc720\ub2c8\ubc84\uc2a4\ubaa8\ub4dc": UNIVERSE_MODE,
-    "\ucee8\ub355\ud130": UNIVERSE_MODE,
-    "\ucee8\ub355\ud130\ubaa8\ub4dc": UNIVERSE_MODE,
+CONDUCTOR_MODE = "CONDUCTOR"
+CONDUCTOR_ROLE = "CONDUCTOR"
+CONDUCTOR_SCOPE = "project-network/navigation/distribution"
+CONDUCTOR_MODE_PROFILE = "GOVERNANCE_ONLY"
+CONDUCTOR_MODE_INTENTS = {
+    "CONDUCTOR": CONDUCTOR_MODE,
+    "CONDUCTOR MODE": CONDUCTOR_MODE,
+    "\ucee8\ub355\ud130": CONDUCTOR_MODE,
+    "\ucee8\ub355\ud130\ubaa8\ub4dc": CONDUCTOR_MODE,
 }
 
 
@@ -503,11 +498,11 @@ def provider_ref_from_model_ref(model_ref: Any) -> str:
 def resolve_universe_mode_intent(value: Any) -> str:
     intent = _required_text(value, "mode_intent").upper()
     try:
-        return UNIVERSE_MODE_INTENTS[intent]
+        return CONDUCTOR_MODE_INTENTS[intent]
     except KeyError as error:
         raise UniverseError(
             "MODE_INTENT_UNSUPPORTED",
-            "Universe accepts only Universe or Conductor Mode intent",
+            "Universe accepts only Conductor Mode intent",
         ) from error
 
 
@@ -545,17 +540,20 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
             "scope": "architecture/governance",
             "mode_profile": "GOVERNANCE_ONLY",
         },
-        UNIVERSE_MODE: {
-            "role": UNIVERSE_ROLE,
-            "scope": UNIVERSE_SCOPE,
-            "mode_profile": UNIVERSE_MODE_PROFILE,
-        },
-        UNIVERSE_ALIAS_MODE: {
-            "role": UNIVERSE_ROLE,
-            "scope": UNIVERSE_SCOPE,
-            "mode_profile": UNIVERSE_MODE_PROFILE,
+        CONDUCTOR_MODE: {
+            "role": CONDUCTOR_ROLE,
+            "scope": CONDUCTOR_SCOPE,
+            "mode_profile": CONDUCTOR_MODE_PROFILE,
         },
     }
+    unexpected = sorted(set(modes) - set(expected))
+    missing = sorted(set(expected) - set(modes))
+    if unexpected or missing:
+        raise UniverseError(
+            "UNIVERSE_MODE_CONTRACT_MISMATCH",
+            "Universe Mode Registry entry does not match the required contract: "
+            f"{(unexpected or missing)[0]}",
+        )
     for mode, definition in expected.items():
         if modes.get(mode) != definition:
             raise UniverseError(
@@ -566,11 +564,11 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
 
 
 def universe_mode_contract(registry: dict[str, Any]) -> dict[str, Any]:
-    definition = registry["modes"][UNIVERSE_MODE]
+    definition = registry["modes"][CONDUCTOR_MODE]
     return {
         "schema": UNIVERSE_MODE_CONTRACT_SCHEMA,
         "status": "ACTIVE",
-        "mode": UNIVERSE_MODE,
+        "mode": CONDUCTOR_MODE,
         "role": definition["role"],
         "scope": definition["scope"],
         "mode_profile": definition["mode_profile"],
@@ -582,10 +580,10 @@ def unknown_universe_mode_contract() -> dict[str, Any]:
     return {
         "schema": UNIVERSE_MODE_CONTRACT_SCHEMA,
         "status": "UNKNOWN",
-        "mode": UNIVERSE_MODE,
-        "role": UNIVERSE_ROLE,
-        "scope": UNIVERSE_SCOPE,
-        "mode_profile": UNIVERSE_MODE_PROFILE,
+        "mode": CONDUCTOR_MODE,
+        "role": CONDUCTOR_ROLE,
+        "scope": CONDUCTOR_SCOPE,
+        "mode_profile": CONDUCTOR_MODE_PROFILE,
         "registry_revision": "UNKNOWN",
     }
 
@@ -17284,6 +17282,112 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ):
                 rows_by_key[chat_key] = row
 
+        # App-server sessions can be project-bound without a provider-owned
+        # transcript file. Project them as opaque rooms and resolve them through
+        # the Supervisor record instead of treating the missing file as absence.
+        for supervisor in supervisor_sessions:
+            provider = str(supervisor.get("provider") or "").upper()
+            provider_session_ref = str(
+                supervisor.get("provider_session_ref") or ""
+            ).strip()
+            session_kind = str(supervisor.get("session_kind") or "").upper()
+            project_id = str(
+                supervisor.get("current_project_id")
+                or supervisor.get("node")
+                or ""
+            ).strip()
+            mode = str(supervisor.get("mode") or "").upper()
+            if (
+                provider not in {"CODEX", "CLAUDE", "GROK"}
+                or not provider_session_ref
+                or session_kind == "WORKER"
+                or not project_id
+                or project_id == "UNKNOWN"
+                or not mode
+                or mode == "UNKNOWN"
+            ):
+                continue
+
+            chat_identity = {
+                "provider": provider,
+                "provider_session_id": provider_session_ref,
+                "source_path": "",
+            }
+            chat_key = "provider_chat_" + _provider_source_key(
+                chat_identity
+            ).removeprefix("provider_source_")
+            if chat_key in rows_by_key:
+                continue
+
+            anchor_ref = str(supervisor.get("anchor_ref") or "UNKNOWN")
+            anchor_identity = {
+                "project_id": project_id,
+                "node": str(supervisor.get("node") or project_id),
+                "mode": mode,
+                "current_anchor_ref": anchor_ref,
+            }
+            origin = supervisor.get("origin") or {}
+            workspace_key = (
+                str(origin.get("workspace_key") or "").strip()
+                if isinstance(origin, Mapping)
+                else ""
+            )
+            observed_at = str(
+                supervisor.get("last_seen_at")
+                or supervisor.get("updated_at")
+                or ""
+            )
+            session_state = str(supervisor.get("state") or "UNKNOWN").upper()
+            rows_by_key[chat_key] = {
+                "schema": "universe.provider-chat-room.v1",
+                "chat_key": chat_key,
+                "source_id": None,
+                "provider": provider,
+                "workspace_name": (
+                    Path(workspace_key).name if workspace_key else project_id
+                ),
+                "display_name": (
+                    supervisor.get("alias") or f"{project_id} {mode}"
+                ),
+                "session_kind": "CHAT",
+                "last_activity_at": observed_at or None,
+                "activity_state": (
+                    supervisor.get("current_activity_state")
+                    or session_state
+                ),
+                "identity_state": "SUPERVISOR_OBSERVED",
+                "registered": False,
+                "binding": {
+                    "state": "BOUND",
+                    "current_project_id": project_id,
+                    "node": anchor_identity["node"],
+                    "mode": mode,
+                    "alias": supervisor.get("alias") or f"{project_id} {mode}",
+                    "transport_alias": supervisor.get("alias"),
+                    "current_anchor_ref": anchor_ref,
+                    "origin_anchor_ref": anchor_ref,
+                    "origin_anchor_temporality": (
+                        "SUPERVISOR_CURRENT"
+                        if str(supervisor.get("currentness") or "").upper()
+                        == "CURRENT"
+                        else "SUPERVISOR_OBSERVED"
+                    ),
+                    "observer_currentness": (
+                        supervisor.get("currentness") or "UNKNOWN"
+                    ),
+                    "anchor_key": "anchor_session_"
+                    + _json_sha256(anchor_identity)[:24],
+                    "universe_session_id": (
+                        supervisor.get("universe_session_id")
+                        or supervisor.get("session_id")
+                    ),
+                    "visibility": supervisor.get("visibility") or "VISIBLE",
+                    "row_version": supervisor.get("row_version"),
+                    "is_default": bool(supervisor.get("is_default")),
+                },
+                "transcript_content": "EXCLUDED",
+            }
+
         anchor_groups: dict[str, list[dict[str, Any]]] = {}
         for row in rows_by_key.values():
             binding = row.get("binding") or {}
@@ -17404,6 +17508,53 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise ProviderSessionError(error.code, error.detail, error.status) from error
 
         provider = str(room.get("provider") or "UNKNOWN").upper()
+        supervisor_session_id = str(
+            binding.get("universe_session_id") or ""
+        ).strip()
+        if supervisor_session_id and room.get("source_id") is None:
+            try:
+                supervisor_session = self.session_supervisor.get_session(
+                    supervisor_session_id
+                )
+            except SessionSupervisorError:
+                supervisor_session = None
+            supervisor_provider = (
+                str((supervisor_session or {}).get("provider") or "").upper()
+            )
+            supervisor_ref = str(
+                (supervisor_session or {}).get("provider_session_ref") or ""
+            ).strip()
+            supervisor_kind = str(
+                (supervisor_session or {}).get("session_kind") or ""
+            ).upper()
+            if (
+                supervisor_session is not None
+                and supervisor_provider == provider
+                and supervisor_ref
+                and supervisor_kind != "WORKER"
+            ):
+                setting_scope = (
+                    ("UNIVERSE_CONDUCTOR", "CONDUCTOR")
+                    if str(binding.get("mode") or "").upper() == "CONDUCTOR"
+                    else ("PROJECT_MASTER", project_id)
+                )
+                setting = self.store.provider_setting(*setting_scope)
+                return {
+                    "chat_key": key,
+                    "provider": provider,
+                    "provider_session_ref": supervisor_ref,
+                    "project_id": project_id,
+                    "node": str(binding.get("node") or project_id),
+                    "mode": str(binding.get("mode") or "MASTER").upper(),
+                    "repository_root": str(project["project_root"]),
+                    "current_anchor_ref": str(
+                        binding.get("current_anchor_ref") or "UNKNOWN"
+                    ),
+                    "alias": binding.get("alias") or room.get("display_name"),
+                    "model_ref": setting.get("model_ref") or "UNKNOWN",
+                    "session_kind": room.get("session_kind") or "CHAT",
+                    "identity_state": room.get("identity_state") or "UNKNOWN",
+                }
         candidates: list[dict[str, Any]] = []
         for source in self.store.discover_provider_session_sources(provider):
             identity_verified = source.get("identity_state") == "VERIFIED"
@@ -25520,7 +25671,7 @@ def main() -> int:
                 host=args.host,
                 port=args.port,
                 mode_contract=mode_contract,
-                auto_start_conductor_runtime=True,
+                auto_start_conductor_runtime=False,
                 service_state_path=args.state_file,
             )
             host, port = server.server_address[:2]

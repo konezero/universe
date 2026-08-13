@@ -237,11 +237,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
                             "scope": "project-network/navigation/distribution",
                             "mode_profile": "GOVERNANCE_ONLY",
                         },
-                        "UNIVERSE": {
-                            "role": "CONDUCTOR",
-                            "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
-                        },
                     },
                 }
             ),
@@ -1415,6 +1410,74 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "session-universe-master-current",
             room["binding"]["universe_session_id"],
         )
+
+    def test_provider_chat_catalog_projects_supervisor_session_without_source_file(
+        self,
+    ) -> None:
+        self.server.store.register_project(self.registration())
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-gcs-codex-app-server",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:current",
+                "anchor_ref": "MASTER-CURRENT-GCS-APP",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+                "activity_state": "IDLE",
+                "last_seen_at": "2026-08-13T00:00:00Z",
+                "alias": "GCS MASTER",
+            }
+        )
+        self.server.session_supervisor.set_default(
+            session["session_id"],
+            expected_pointer_version=session["default_pointer_version"],
+        )
+
+        with (
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                return_value=[],
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_observations",
+                return_value=[],
+            ),
+        ):
+            catalog = self.server.provider_chat_catalog()
+            self.assertEqual(1, len(catalog["rooms"]))
+            room = catalog["rooms"][0]
+            descriptor = self.server.resolve_provider_chat_session(
+                room["chat_key"]
+            )
+
+        self.assertEqual("CODEX", room["provider"])
+        self.assertIsNone(room["source_id"])
+        self.assertEqual("CHAT", room["session_kind"])
+        self.assertEqual("SUPERVISOR_OBSERVED", room["identity_state"])
+        self.assertEqual("BOUND", room["binding"]["state"])
+        self.assertEqual("GCS", room["binding"]["current_project_id"])
+        self.assertEqual("CURRENT", room["binding"]["observer_currentness"])
+        self.assertEqual(
+            "MASTER-CURRENT-GCS-APP",
+            room["binding"]["current_anchor_ref"],
+        )
+        self.assertEqual(
+            "session-gcs-codex-app-server",
+            room["binding"]["universe_session_id"],
+        )
+        self.assertEqual(
+            "codex-app-server:current",
+            descriptor["provider_session_ref"],
+        )
+        self.assertEqual(str(self.project_root), descriptor["repository_root"])
+        rendered = json.dumps(catalog)
+        self.assertNotIn("codex-app-server:current", rendered)
+        self.assertNotIn("provider_session_ref", rendered)
 
     def test_provider_chat_catalog_deduplicates_rotated_chat_files_but_keeps_workers(
         self,
@@ -8102,7 +8165,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(UniverseError, "absolute path"):
             safe_transport.request_json(method="GET", path="https://example.com")
 
-    def test_universe_mode_contract_and_aliases(self) -> None:
+    def test_universe_mode_contract_accepts_only_master_and_conductor(self) -> None:
         registry_path = Path(self.temp.name) / "universe-mode-registry.json"
         registry_path.write_text(
             json.dumps(
@@ -8122,17 +8185,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
                             "scope": "project-network/navigation/distribution",
                             "mode_profile": "GOVERNANCE_ONLY",
                         },
-                        "UNIVERSE": {
-                            "role": "CONDUCTOR",
-                            "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
-                        },
                     },
                 }
             ),
             encoding="utf-8",
         )
         registry = load_universe_mode_registry(registry_path)
+        self.assertEqual(["CONDUCTOR", "MASTER"], sorted(registry["modes"]))
         self.assertEqual("CONDUCTOR", registry["modes"]["CONDUCTOR"]["role"])
         self.assertEqual(
             {
@@ -8147,22 +8206,39 @@ class UniverseLocalServiceTests(unittest.TestCase):
             universe_mode_contract(registry),
         )
         for intent in (
-            "UNIVERSE",
-            "Universe mode",
             "CONDUCTOR",
             "Conductor mode",
-            "\uc720\ub2c8\ubc84\uc2a4",
-            "\uc720\ub2c8\ubc84\uc2a4\ubaa8\ub4dc",
             "\ucee8\ub355\ud130",
             "\ucee8\ub355\ud130\ubaa8\ub4dc",
         ):
             with self.subTest(intent=intent):
                 self.assertEqual("CONDUCTOR", resolve_universe_mode_intent(intent))
+        for intent in (
+            "UNIVERSE",
+            "Universe mode",
+            "\uc720\ub2c8\ubc84\uc2a4",
+            "\uc720\ub2c8\ubc84\uc2a4\ubaa8\ub4dc",
+        ):
+            with self.subTest(intent=intent):
+                with self.assertRaisesRegex(
+                    UniverseError, "only Conductor Mode intent"
+                ):
+                    resolve_universe_mode_intent(intent)
 
         require_release_lifecycle_mode("MASTER")
         with self.assertRaisesRegex(UniverseError, "require MASTER Mode"):
             require_release_lifecycle_mode("UNIVERSE")
 
+        registry["modes"]["UNIVERSE"] = {
+            "role": "CONDUCTOR",
+            "scope": "project-network/navigation/distribution",
+            "mode_profile": "GOVERNANCE_ONLY",
+        }
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        with self.assertRaisesRegex(UniverseError, "UNIVERSE"):
+            load_universe_mode_registry(registry_path)
+
+        del registry["modes"]["UNIVERSE"]
         registry["modes"]["CONDUCTOR"]["role"] = "NAVIGATOR"
         registry_path.write_text(json.dumps(registry), encoding="utf-8")
         with self.assertRaisesRegex(UniverseError, "CONDUCTOR"):
@@ -8672,6 +8748,46 @@ class RuntimeLeaseStoreTests(unittest.TestCase):
                 membership="MANAGED",
             )
         self.assertEqual("RUNTIME_LEASE_REQUIRED", context.exception.code)
+
+
+class UniverseDefaultServerBootTests(unittest.TestCase):
+    def test_default_server_does_not_prepare_conductor_from_stale_session(
+        self,
+    ) -> None:
+        temp = tempfile.TemporaryDirectory()
+        try:
+            root = Path(temp.name)
+            stale_session = root / "conductor-mode-session.sqlite"
+            stale_session.write_bytes(b"not a sqlite database")
+            with (
+                patch("universe_server.ResidentModeSessionHost") as session_host,
+                patch("universe_server.UniverseConductorRuntime") as runtime_cls,
+            ):
+                server = create_server(
+                    database_path=root / "universe.sqlite3",
+                    token="boot-token",
+                    auto_start_project_masters=False,
+                    host_profile=HostProfileStore(root / "host.json"),
+                    service_state_path=root / "server.json",
+                    remote_gateway_state_path=root / "remote-gateway.json",
+                    remote_connector_state_path=root / "remote-connector.json",
+                    remote_connector_config_path=root / "remote-connector-config.json",
+                )
+            try:
+                session_host.assert_not_called()
+                runtime_cls.assert_not_called()
+                self.assertIsNone(server.conductor_session_host)
+                self.assertIsNone(server.conductor_runtime)
+                self.assertIsNone(server._planning_binding)
+                self.assertEqual(
+                    "UNBOUND",
+                    server.planning_binding_status()["status"],
+                )
+                self.assertEqual(b"not a sqlite database", stale_session.read_bytes())
+            finally:
+                server.server_close()
+        finally:
+            temp.cleanup()
 
 
 if __name__ == "__main__":

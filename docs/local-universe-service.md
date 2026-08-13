@@ -6,9 +6,13 @@ assignments.
 
 ## Operating Mode contract
 
-The application entry intent is `Mode=CONDUCTOR, Role=CONDUCTOR`.
-`UNIVERSE` remains a project-local operational alias, but application startup
-requests `CONDUCTOR` through the installed Mode Registry.
+`UNIVERSE` is the app and observatory name. It is not a Mode, Role, or Mode
+alias. Only `MASTER` and `CONDUCTOR` are Mode coordinates.
+
+The application observes `Mode=CONDUCTOR, Role=CONDUCTOR` through the installed
+Mode Registry. A separate Mode Host owns Conductor BOOT, Current Anchor,
+provider session, and lifecycle. The Universe app server must not BOOT,
+prepare, bind, own, or start a Conductor Mode session or runtime.
 
 `MASTER` remains separate and is required for Release DB installation, update,
 Mode Registry mutation, and Universe policy lifecycle changes. Neither Mode
@@ -33,16 +37,16 @@ grants authority or permission to mutate an attached project. See
 
 Universe Runtime Host provider processes remain outside the installed project Runtime. They can return a bounded read-only Worker result, but cannot create project authority, write scope, or mutation permission. See `docs/universe-runtime-host.md`.
 
-The Universe Conductor Room persists each user message before execution. The
-local service prepares the `CONDUCTOR / CONDUCTOR` Mode, starts one owned
-internal Skill Router Session Runtime, and binds its loopback endpoint in
-process memory before it accepts Conductor work. Service startup also opens or
-resumes the last Conductor Provider Session coordinate without sending a model
-prompt. The prepared `CONDUCTOR` Registry snapshot, Current Anchor, and Mode
-Boot Binding are recorded atomically in the Project Runtime database. The
-executable Runtime consumes that one-use binding; it does not reselect Mode from
-the Distribution Manifest default. A single service-owned queue then
-delivers ordinary conversation to one resident Provider Session:
+The Universe Conductor Room persists each user message before execution. A
+separate Mode Host owns Conductor BOOT, the `CONDUCTOR / CONDUCTOR` Current
+Anchor, provider session, and lifecycle. The Universe app server observes that
+Host; normal CLI `serve` does not prepare, bind, own, or start a Conductor Mode
+session or runtime. The Mode Host records the prepared `CONDUCTOR` Registry
+snapshot, Current Anchor, and Mode Boot Binding atomically in the Project
+Runtime database. The executable Runtime consumes that one-use binding; it
+does not reselect Mode from the Distribution Manifest default. When a Mode
+Host is present, a Host-owned queue then delivers ordinary conversation to
+one resident Provider Session:
 
 ```text
 Universe UI
@@ -61,11 +65,12 @@ Universe-owned durable Provider chat.
 The HTTP request does not wait for the provider. The UI polls the durable room
 for `PROCESSING`, `ANSWERED`, or `FAILED`. Restart recovery returns interrupted
 `PROCESSING` messages to `QUEUED` and the service creates a new process-local
-binding before replay. `WAITING_FOR_RUNTIME_BINDING` remains a compatibility
-state for manually constructed or test servers that explicitly disable owned
-Runtime startup. A failed owned Runtime startup is reported as `START_FAILED`;
-messages must not wait indefinitely. Raw CLI transcripts, tokens, endpoint
-credentials, and repository contents are not Conductor Room records.
+binding before replay. `WAITING_FOR_RUNTIME_BINDING` is the observation-only
+state when no separate Mode Host has bound a Conductor Runtime. Explicit
+`auto_start_conductor_runtime=True` remains a legacy constructor seam. A
+failed owned Runtime startup is reported as `START_FAILED`; messages must
+not wait indefinitely. Raw CLI transcripts, tokens, endpoint credentials,
+and repository contents are not Conductor Room records.
 
 The Conductor Worker returns a bounded structured reply with no UI action, one
 `TODO_DRAFT`, or one `FRESH_PROJECT_DRAFT`. A Todo draft is validated against

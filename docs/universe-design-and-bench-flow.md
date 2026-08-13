@@ -48,15 +48,19 @@ a room message, Skill Plan, or Bench result as execution permission.
 ## Provider Session Boundary
 
 Universe retains one last Provider/Session coordinate per connection target.
-The application target requests `CONDUCTOR`; each Project Master target
-requests `MASTER`. A matching Provider Session is resumed without another Mode
-greeting. A new or replaced coordinate receives that greeting once.
+`UNIVERSE` is the app and observatory name, not a Mode or alias; only
+`MASTER` and `CONDUCTOR` are Mode coordinates. The application target
+observes `CONDUCTOR`; each Project Master target requests `MASTER`. A matching
+Provider Session is resumed without another Mode greeting. A new or replaced
+coordinate receives that greeting once.
 
 The coordinate is routing state only. The opened Session owns its Mode
 preparation and currentness evaluation. Task Frame Boss and Worker executions
-are ephemeral and never replace a target's last connection coordinate. The
-application prepares the Conductor coordinate at service startup; `Call Project
-Master` prepares the selected Project coordinate before entering its room.
+are ephemeral and never replace a target's last connection coordinate. A
+separate Mode Host owns Conductor BOOT, Current Anchor, provider session, and
+lifecycle. The Universe app observes that Host and does not prepare the
+Conductor coordinate at service startup. `Call Project Master` still prepares
+the selected Project coordinate before entering its room.
 
 Provider Session UI state is limited to Provider, connection state, and Mode
 intent. It is not a Current Anchor, authority, Assignment, or execution
