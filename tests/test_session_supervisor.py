@@ -323,6 +323,31 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertEqual("MASTER-CURRENT-GCS-NEXT", anchored["anchor_ref"])
         self.assertEqual("CURRENT", anchored["currentness"])
 
+    def test_provider_rebind_does_not_demote_exact_owned_process(self) -> None:
+        first, _ = self.store.register_session(self.session())
+        acquired = self.store.acquire_lease(first["session_id"], self.process())
+
+        replacement = self.session()
+        replacement.update(
+            {
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-thread-live",
+                "state": "DISCONNECTED",
+            }
+        )
+        rebound, created = self.store.register_session(replacement)
+
+        self.assertFalse(created)
+        self.assertEqual("LIVE", rebound["state"])
+        self.assertEqual("OWNED", rebound["process_lease"]["lease_state"])
+        self.assertEqual(
+            "LIVE",
+            self.store.list_events(session_id=first["session_id"], limit=1)[0][
+                "state"
+            ],
+        )
+        self.assertNotEqual(acquired["lease_token"], "")
+
     def test_initialize_migrates_only_legacy_provider_aliases(self) -> None:
         legacy, _ = self.store.register_session(self.session("legacy-alias"))
         replacement = self.session("legacy-alias")

@@ -23,7 +23,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from session_supervisor import SessionSupervisorError, SessionSupervisorStore
+from session_supervisor import (
+    PROCESS_IDENTITY_FIELDS,
+    SessionSupervisorError,
+    SessionSupervisorStore,
+)
 from uuid import uuid4
 
 from agent_session_gateway import (
@@ -3510,15 +3514,30 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         raise ProjectMasterHostError("CLAUDE_SESSION_RECOVERY_FAILED")
 
     def prepare_session(self) -> str:
-        try:
-            gateway = self._acp_gateway()
-            start_or_resume = getattr(gateway.session, "start_or_resume", None)
-            if not callable(start_or_resume):
-                raise ProjectMasterHostError("CLAUDE_PROCESS_START_UNAVAILABLE")
-            start_or_resume()
-        except ClaudeResidentError as error:
-            raise ProjectMasterHostError(str(error)) from error
-        return self.session_ref
+        for attempt in range(2):
+            try:
+                gateway = self._acp_gateway()
+                start_or_resume = getattr(gateway.session, "start_or_resume", None)
+                if not callable(start_or_resume):
+                    raise ProjectMasterHostError("CLAUDE_PROCESS_START_UNAVAILABLE")
+                start_or_resume()
+                return self.session_ref
+            except ClaudeResidentError as error:
+                if (
+                    attempt == 0
+                    and str(error) == "CLAUDE_SESSION_RESUME_NOT_FOUND"
+                    and self.session_id is not None
+                ):
+                    # Provider-side history may be pruned independently of the
+                    # local coordinate. Start a fresh resident and let its
+                    # first turn establish the new provider session ref.
+                    self.close()
+                    self.session_id = None
+                    self.connection_state = "UNKNOWN"
+                    self._greeting_pending = False
+                    continue
+                raise ProjectMasterHostError(str(error)) from error
+        raise ProjectMasterHostError("CLAUDE_SESSION_RECOVERY_FAILED")
 
     def _acp_gateway(self) -> UniverseAcpGateway:
         if self._gateway is not None:
@@ -3604,6 +3623,7 @@ class ResidentModeSessionHost:
         *,
         actor_label: str,
         session_supervisor: SessionSupervisorStore | None = None,
+        supervisor_endpoint: str = "http://127.0.0.1:1",
         continuity_coordinator: ContinuitySaver | None = None,
         coordinate_resolver: Callable[[], Mapping[str, Any] | None] | None = None,
         permission_requester: Callable[[Mapping[str, Any]], str | None]
@@ -3618,6 +3638,11 @@ class ResidentModeSessionHost:
         self.target_id = _text(target_id, "target_id")
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = _text(actor_label, "actor_label")
+        self.session_supervisor = session_supervisor
+        self._supervisor_endpoint = _normalize_supervisor_endpoint(
+            supervisor_endpoint
+        )
+        self._supervisor_capability = secrets.token_urlsafe(32)
         self.continuity_coordinator = continuity_coordinator
         self.coordinate_resolver = coordinate_resolver
         self.permission_requester = permission_requester or (lambda _request: None)
@@ -3637,6 +3662,10 @@ class ResidentModeSessionHost:
         self._provider_session_ref: str | None = None
         self._provider_model = ""
         self._provider_effort = "AUTO"
+        self._supervisor_session_id: str | None = None
+        self._supervisor_lease_token: str | None = None
+        self._supervisor_lease_version: int | None = None
+        self._supervisor_process_identity: dict[str, Any] | None = None
         self._last_interaction: dict[str, str] | None = None
         self._last_interaction_at = 0.0
         self._lock = threading.RLock()
@@ -3778,6 +3807,7 @@ class ResidentModeSessionHost:
         with self._lock:
             provider = self._provider
             provider_name = self._provider_name
+            self._mark_supervisor_process_lease_stale()
             self._provider = None
             self._provider_name = None
             self._provider_session_ref = None
@@ -3788,6 +3818,106 @@ class ResidentModeSessionHost:
             close = getattr(provider, "close", None)
             if callable(close):
                 close()
+
+    def _mark_supervisor_process_lease_stale(self) -> None:
+        if (
+            self.session_supervisor is None
+            or not self._supervisor_session_id
+            or not self._supervisor_lease_token
+            or self._supervisor_lease_version is None
+            or self._supervisor_process_identity is None
+        ):
+            return
+        try:
+            self.session_supervisor.mark_lease_stale(
+                self._supervisor_session_id,
+                self._supervisor_process_identity,
+                lease_token=self._supervisor_lease_token,
+                expected_lease_version=self._supervisor_lease_version,
+                reason="RESIDENT_MODE_SESSION_CLOSED",
+            )
+        except SessionSupervisorError:
+            # A concurrent supervisor transition already owns the lifecycle
+            # result. Do not hide the provider close behind stale cleanup.
+            pass
+        finally:
+            self._supervisor_session_id = None
+            self._supervisor_lease_token = None
+            self._supervisor_lease_version = None
+            self._supervisor_process_identity = None
+
+    def _ensure_supervisor_process_lease(self, provider: MasterProvider) -> None:
+        if self.session_supervisor is None:
+            return
+        resolver = getattr(provider, "supervisor_process_identity", None)
+        if not callable(resolver):
+            # Test/custom providers may not expose a native process identity.
+            # They remain usable, but cannot participate in Supervisor leases.
+            return
+        try:
+            self.session_supervisor.sweep_stale_live_sessions()
+            selected = self.store.ensure_supervisor_session(
+                self._provider_name or self._profile_provider or "UNKNOWN"
+            )
+            if not isinstance(selected, Mapping):
+                raise ProjectMasterHostError(
+                    "MODE_SESSION_SUPERVISOR_SESSION_UNAVAILABLE"
+                )
+            supervisor_session_id = _text(
+                selected.get("session_id"), "supervisor_session_id"
+            )
+            identity = resolver(
+                self._supervisor_endpoint,
+                self._supervisor_capability,
+            )
+            if not isinstance(identity, Mapping):
+                raise ProjectMasterHostError(
+                    "MODE_SESSION_PROCESS_IDENTITY_INVALID"
+                )
+            observed_identity = dict(identity)
+            current = self.session_supervisor.get_session(supervisor_session_id)
+            current_lease = current.get("process_lease")
+            if (
+                isinstance(current_lease, Mapping)
+                and current_lease.get("lease_state") == "OWNED"
+                and _same_process_identity(
+                    current_lease.get("process_identity"), observed_identity
+                )
+                and self._supervisor_session_id == supervisor_session_id
+                and self._supervisor_lease_token
+                and self._supervisor_lease_version
+                == int(current_lease.get("lease_version", -1))
+            ):
+                return
+            expected_version = (
+                int(current_lease.get("lease_version", 0))
+                if isinstance(current_lease, Mapping)
+                else 0
+            )
+            acquired = self.session_supervisor.acquire_lease(
+                supervisor_session_id,
+                observed_identity,
+                expected_lease_version=expected_version,
+                stop_capability=self._supervisor_capability,
+            )
+        except SessionSupervisorError as error:
+            raise ProjectMasterHostError(str(error)) from error
+        acquired_lease = acquired.get("lease")
+        if not isinstance(acquired_lease, Mapping):
+            raise ProjectMasterHostError(
+                "MODE_SESSION_PROCESS_LEASE_RESULT_INVALID"
+            )
+        lease_identity = acquired_lease.get("process_identity")
+        if not isinstance(lease_identity, Mapping):
+            raise ProjectMasterHostError(
+                "MODE_SESSION_PROCESS_LEASE_IDENTITY_MISSING"
+            )
+        self._supervisor_session_id = supervisor_session_id
+        self._supervisor_lease_token = _text(
+            acquired.get("lease_token"), "lease_token"
+        )
+        self._supervisor_lease_version = int(acquired_lease["lease_version"])
+        self._supervisor_process_identity = dict(lease_identity)
 
     def _ensure(
         self,
@@ -3818,6 +3948,7 @@ class ResidentModeSessionHost:
                 and selected_model == self._provider_model
                 and selected_effort == self._provider_effort
             ):
+                self._ensure_supervisor_process_lease(self._provider)
                 setattr(self._provider, "connection_state", "REUSED")
                 return self._provider
             replacement_trigger = (
@@ -3831,6 +3962,7 @@ class ResidentModeSessionHost:
             previous = self._provider
             previous_name = self._provider_name
             self._save_continuity(replacement_trigger, previous, previous_name)
+            self._mark_supervisor_process_lease_stale()
             self._provider = None
             self._provider_name = None
             self._provider_session_ref = None
@@ -3865,15 +3997,28 @@ class ResidentModeSessionHost:
         prepare = getattr(active, "prepare_session", None)
         if callable(prepare):
             prepare()
-        self._provider = active
         self._provider_name = provider
+        self._provider = active
+        try:
+            self._ensure_supervisor_process_lease(active)
+        except Exception:
+            self._mark_supervisor_process_lease_stale()
+            close = getattr(active, "close", None)
+            if callable(close):
+                close()
+            self._provider = None
+            self._provider_name = None
+            raise
         self._provider_model = selected_model
         self._provider_effort = selected_effort
-        self._provider_session_ref = self.store.session_ref_for(provider)
-        if self._provider_session_ref is None:
-            raw_session_id = getattr(active, "session_id", None)
-            if isinstance(raw_session_id, str) and raw_session_id.strip():
-                self._provider_session_ref = raw_session_id.strip()
+        raw_session_id = getattr(active, "session_id", None)
+        if isinstance(raw_session_id, str) and raw_session_id.strip():
+            # A stale stored coordinate may be replaced during provider
+            # preparation.  Reuse the live adapter coordinate for the
+            # manager's next activation comparison.
+            self._provider_session_ref = raw_session_id.strip()
+        else:
+            self._provider_session_ref = self.store.session_ref_for(provider)
         return active
 
     def save_idle(self, idle_seconds: float) -> Mapping[str, Any] | None:
@@ -5215,14 +5360,33 @@ class ResidentProjectMasterHostManager:
                 )
                 and handle.governance_context_key == governance_context_key
             ):
-                setattr(handle.worker.provider, "connection_state", "REUSED")
-                return {
-                    "status": "RESIDENT",
-                    "project_id": project_id,
-                    "provider": selected_provider,
-                    "endpoint": handle.endpoint,
-                    "session_connection": self._handle_connection(handle),
-                }
+                try:
+                    provider_available = self._refresh_provider_process_lease(handle)
+                except ProjectMasterHostError as error:
+                    if not _is_provider_process_unavailable(error):
+                        raise
+                    provider_available = False
+                except BaseException as error:
+                    if not _is_provider_process_unavailable(error):
+                        raise
+                    if self.session_supervisor is not None:
+                        self.session_supervisor.sweep_stale_live_sessions()
+                    provider_available = False
+                if provider_available:
+                    setattr(handle.worker.provider, "connection_state", "REUSED")
+                    return {
+                        "status": "RESIDENT",
+                        "project_id": project_id,
+                        "provider": selected_provider,
+                        "endpoint": handle.endpoint,
+                        "session_connection": self._handle_connection(handle),
+                    }
+                self._save_handle_continuity(handle, "PROVIDER_PROCESS_RESTART")
+                if self.session_supervisor is not None:
+                    self.session_supervisor.sweep_stale_live_sessions()
+                handle.close()
+                self._handles.pop(project_id, None)
+                handle = None
             if handle is not None:
                 self._save_handle_continuity(handle, "PROVIDER_SWITCH")
                 handle.close()
@@ -5377,6 +5541,81 @@ class ResidentProjectMasterHostManager:
                 "session_connection": self._handle_connection(handle),
             }
 
+    def _refresh_provider_process_lease(
+        self, handle: ResidentProjectMasterHandle
+    ) -> bool:
+        """Reconcile a resident handle after maintenance marked its lease stale."""
+
+        if self.session_supervisor is None:
+            return True
+        if not _provider_runtime_process_available(handle.worker.provider):
+            return False
+        resolver = getattr(handle.worker.provider, "supervisor_process_identity", None)
+        if not callable(resolver):
+            if self.provider_factory is not None:
+                return True
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_PROCESS_IDENTITY_UNAVAILABLE"
+            )
+        handshake_token = os.environ.get(handle.credential_env)
+        if not handshake_token:
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_PROCESS_HANDSHAKE_UNAVAILABLE"
+            )
+        try:
+            identity = resolver(handle.endpoint, handshake_token)
+            current = (
+                self.session_supervisor.get_session(handle.supervisor_session_id)
+                if handle.supervisor_session_id
+                else None
+            )
+        except ProjectMasterHostError as error:
+            if _is_provider_process_unavailable(error):
+                return False
+            raise
+        except ClaudeResidentError as error:
+            if _is_provider_process_unavailable(error):
+                return False
+            raise ProjectMasterHostError(str(error)) from error
+        except SessionSupervisorError as error:
+            raise ProjectMasterHostError(str(error)) from error
+        except BaseException as error:  # provider adapters may wrap liveness errors
+            if _is_provider_process_unavailable(error):
+                return False
+            raise
+        if not isinstance(identity, Mapping):
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_PROCESS_IDENTITY_INVALID"
+            )
+        current_lease = current.get("process_lease") if isinstance(current, Mapping) else None
+        if (
+            isinstance(current_lease, Mapping)
+            and current_lease.get("lease_state") == "OWNED"
+            and _same_process_identity(
+                current_lease.get("process_identity"), identity
+            )
+            and handle.supervisor_lease_token
+            and handle.supervisor_lease_version
+            == int(current_lease.get("lease_version", -1))
+            and _same_process_identity(
+                handle.supervisor_process_identity, identity
+            )
+        ):
+            return True
+        lease = self._register_provider_process_lease(
+            project_id=handle.project_id,
+            provider=handle.worker.provider,
+            endpoint=handle.endpoint,
+            handshake_token=handshake_token,
+        )
+        if lease is None:
+            return True
+        handle.supervisor_session_id = lease["supervisor_session_id"]
+        handle.supervisor_lease_token = lease["lease_token"]
+        handle.supervisor_lease_version = lease["lease_version"]
+        handle.supervisor_process_identity = lease["process_identity"]
+        return True
+
     def submit_room_event(
         self,
         project_id: str,
@@ -5414,6 +5653,8 @@ class ResidentProjectMasterHostManager:
     ) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
+        if not _provider_runtime_process_available(provider):
+            raise ProjectMasterHostError("PROJECT_MASTER_PROCESS_UNAVAILABLE")
         resolver = getattr(provider, "supervisor_process_identity", None)
         if not callable(resolver):
             if self.provider_factory is not None:
@@ -6125,6 +6366,56 @@ def _provider(value: Any) -> str:
     if normalized not in SUPPORTED_PROVIDERS:
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
     return normalized
+
+
+def _normalize_supervisor_endpoint(value: Any) -> str:
+    raw = _text(value, "supervisor_endpoint")
+    parsed = urlsplit(raw)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ProjectMasterHostError("MODE_SESSION_SUPERVISOR_ENDPOINT_INVALID") from error
+    if (
+        parsed.scheme.lower() != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or port is None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ProjectMasterHostError("MODE_SESSION_SUPERVISOR_ENDPOINT_INVALID")
+    return f"http://127.0.0.1:{port}"
+
+
+def _same_process_identity(stored: Any, observed: Any) -> bool:
+    if not isinstance(stored, Mapping) or not isinstance(observed, Mapping):
+        return False
+    return all(stored.get(field) == observed.get(field) for field in PROCESS_IDENTITY_FIELDS)
+
+
+def _is_provider_process_unavailable(error: BaseException) -> bool:
+    message = str(error).upper()
+    return any(
+        marker in message
+        for marker in (
+            "PROCESS_NOT_ALIVE",
+            "PROCESS_IDENTITY_UNAVAILABLE",
+        )
+    )
+
+
+def _provider_runtime_process_available(provider: Any) -> bool:
+    observer = getattr(provider, "runtime_observation", None)
+    if not callable(observer):
+        return True
+    try:
+        observation = observer()
+    except Exception:
+        return True
+    if not isinstance(observation, Mapping):
+        return True
+    state = str(observation.get("state") or "").strip().upper()
+    return state not in {"STOPPED", "FAILED", "PROCESS_NOT_ALIVE"}
 
 
 def _same_provider_session_ref(provider: str, left: Any, right: Any) -> bool:

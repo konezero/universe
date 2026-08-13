@@ -17,6 +17,7 @@ import json
 import queue
 import subprocess  # nosec B404
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
@@ -92,6 +93,7 @@ RATE_LIMIT_EXHAUSTED_STATUSES = frozenset({"rejected", "blocked", "exhausted"})
 # not be mistaken for QUOTA_EXHAUSTED. The turn continues and the ``result``
 # event decides the outcome.
 RATE_LIMIT_STATUS_UNKNOWN = "RATE_LIMIT_STATUS_UNKNOWN"
+STARTUP_PROBE_SECONDS = 2.0
 
 
 class ClaudeResidentError(RuntimeError):
@@ -293,8 +295,12 @@ class ClaudeResidentSession:
         self.effort = str(effort or "AUTO").strip().upper()
         if self.effort not in PROVIDER_EFFORTS:
             raise ClaudeResidentError("CLAUDE_EFFORT_INVALID")
-        self.session_id = session_id or None
-        # A session id supplied by the store means this is a restore.
+        # Always give a fresh resident an explicit provider session id.  Claude
+        # can terminate an input-stream process that has no initial
+        # ``--session-id`` before the first user turn, which would publish a
+        # dead resident as READY.  A stored id remains a resume coordinate;
+        # a generated id starts a new provider conversation.
+        self.session_id = session_id or str(uuid4())
         self._resume = bool(session_id)
         self.session_observer = session_observer
         self.extra_arguments = tuple(extra_arguments)
@@ -343,7 +349,15 @@ class ClaudeResidentSession:
 
     def session_status(self) -> str:
         with self._state_lock:
-            return self._state
+            state = self._state
+        process = self._process
+        if (
+            state in {SESSION_READY, SESSION_BUSY}
+            and process is not None
+            and not process.alive
+        ):
+            return SESSION_FAILED
+        return state
 
     def stream_events(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._events)
@@ -408,6 +422,7 @@ class ClaudeResidentSession:
         if self.session_status() == SESSION_QUOTA_EXHAUSTED:
             # Never spin a retry loop against a spent quota.
             raise ClaudeResidentError("CLAUDE_QUOTA_EXHAUSTED")
+        self._turn_error = None
         self._set_state(SESSION_CONNECTING)
         try:
             self._process = self._process_factory(
@@ -423,6 +438,29 @@ class ClaudeResidentSession:
             raise
         self._launch_count += 1
         self._set_state(SESSION_READY)
+        # ``claude --resume`` can reject a deleted provider-side session after
+        # emitting its result event. Wait long enough to observe that event
+        # before publishing a resident as READY; a valid stream stays open
+        # without requiring a first user turn.
+        deadline = time.monotonic() + STARTUP_PROBE_SECONDS
+        while self._process is not None and self._process.alive:
+            if self._turn_error == "CLAUDE_SESSION_RESUME_NOT_FOUND":
+                self._set_state(SESSION_FAILED)
+                process, self._process = self._process, None
+                if process is not None:
+                    process.close()
+                raise ClaudeResidentError("CLAUDE_SESSION_RESUME_NOT_FOUND")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if self._process is not None and not self._process.alive:
+            if self._turn_error == "CLAUDE_SESSION_RESUME_NOT_FOUND":
+                self._set_state(SESSION_FAILED)
+                raise ClaudeResidentError("CLAUDE_SESSION_RESUME_NOT_FOUND")
+            self._set_state(SESSION_FAILED)
+            raise ClaudeResidentError(
+                "CLAUDE_PROCESS_NOT_ALIVE" + self._process.stderr_detail()
+            )
         return self.session_status()
 
     def send_message(self, text: str, on_delta: Callable[[str], None]) -> str:

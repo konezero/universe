@@ -716,6 +716,58 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("COMMANDER_MESSAGE_OBSERVED", events)
         self.assertIn("PROVIDER_REPLY_OBSERVED", events)
 
+    def test_resident_mode_session_tracks_provider_process_lease_lifecycle(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "conductor-provider-lease.sqlite3")
+
+        class LeasePreparedProvider(PreparedFakeProvider):
+            def supervisor_process_identity(
+                self, endpoint: str, handshake_token: str
+            ) -> dict[str, Any]:
+                return {
+                    "pid": 4322,
+                    "process_created_at": "2026-08-14T00:00:00Z",
+                    "executable": "C:\\fake\\provider.exe",
+                    "command": ["C:\\fake\\provider.exe", "stdio"],
+                    "endpoint": endpoint,
+                    "handshake_fingerprint": hashlib.sha256(
+                        handshake_token.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+        provider = LeasePreparedProvider()
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-provider-lease.sqlite",
+            actor_label="Universe Conductor",
+            session_supervisor=supervisor,
+            supervisor_endpoint="http://127.0.0.1:52973",
+            provider_factory=lambda *_args: provider,
+        )
+        try:
+            host.prepare("CODEX")
+            live = next(
+                item
+                for item in supervisor.list_sessions(
+                    node="CONDUCTOR", mode="CONDUCTOR"
+                )
+                if item["is_default"]
+            )
+            self.assertEqual("LIVE", live["state"])
+            self.assertEqual("OWNED", live["process_lease"]["lease_state"])
+            self.assertEqual(
+                4322,
+                live["process_lease"]["process_identity"]["pid"],
+            )
+        finally:
+            host.close()
+
+        closed = supervisor.get_session(live["session_id"])
+        self.assertEqual("DISCONNECTED", closed["state"])
+        self.assertEqual("STALE", closed["process_lease"]["lease_state"])
+        self.assertTrue(provider.closed)
+
     def test_resident_mode_session_streams_current_turn_through_native_provider(
         self,
     ) -> None:
@@ -2770,6 +2822,25 @@ class ProjectMasterHostTests(unittest.TestCase):
                 self.assertEqual("LIVE", live["state"])
                 self.assertEqual("OWNED", live["process_lease"]["lease_state"])
                 self.assertEqual(4321, live["process_lease"]["process_identity"]["pid"])
+                handle = manager._handles["GCS"]
+                supervisor.mark_lease_stale(
+                    handle.supervisor_session_id,
+                    handle.supervisor_process_identity,
+                    lease_token=handle.supervisor_lease_token,
+                    expected_lease_version=handle.supervisor_lease_version,
+                    reason="TEST_MAINTENANCE_STALE",
+                )
+                reused = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                recovered = next(
+                    item
+                    for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+                    if item["is_default"]
+                )
+                self.assertEqual("RESIDENT", reused["status"])
+                self.assertEqual("LIVE", recovered["state"])
+                self.assertEqual("OWNED", recovered["process_lease"]["lease_state"])
             finally:
                 manager.close()
 
@@ -2810,6 +2881,85 @@ class ProjectMasterHostTests(unittest.TestCase):
             registrations[0]["master_session_ref"],
         )
         self.assertTrue(provider.closed)
+
+    def test_resident_manager_restarts_dead_reused_provider_process(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "provider-restart.sqlite3")
+        providers: list[Any] = []
+
+        class RestartableProvider(PreparedFakeProvider):
+            def __init__(self, pid: int) -> None:
+                super().__init__()
+                self.pid = pid
+                self.alive = True
+
+            def supervisor_process_identity(
+                self, endpoint: str, handshake_token: str
+            ) -> dict[str, Any]:
+                if not self.alive:
+                    raise ClaudeResidentError("CLAUDE_PROCESS_NOT_ALIVE")
+                return {
+                    "pid": self.pid,
+                    "process_created_at": "2026-08-14T00:00:00Z",
+                    "executable": "C:\\fake\\provider.exe",
+                    "command": ["C:\\fake\\provider.exe", "stdio"],
+                    "endpoint": endpoint,
+                    "handshake_fingerprint": hashlib.sha256(
+                        handshake_token.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        def provider_factory(_root, _project_id, _store):
+            provider = RestartableProvider(4400 + len(providers))
+            providers.append(provider)
+            return provider
+
+        class AnchorObserver(FakeSurfaceObserver):
+            def prepare(self) -> Mapping[str, Any]:
+                self.prepare_count += 1
+                return {
+                    "status": "SESSION_PREPARED",
+                    "mode_current_anchor": {
+                        "snapshot": {
+                            "snapshot": {"anchor_id": "MASTER-CURRENT-RESTART"}
+                        }
+                    },
+                }
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                session_supervisor=supervisor,
+                provider_factory=provider_factory,
+                provider_resolver=lambda _project_id: "CLAUDE",
+                coordinator_factory=lambda _root, _project_id, _session: AnchorObserver(),
+            )
+            try:
+                first = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                providers[0].alive = False
+                second = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                live = next(
+                    item
+                    for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+                    if item["is_default"]
+                )
+                self.assertEqual("STARTED", first["status"])
+                self.assertEqual("STARTED", second["status"])
+                self.assertEqual(2, len(providers))
+                self.assertEqual("LIVE", live["state"])
+                self.assertEqual(4401, live["process_lease"]["process_identity"]["pid"])
+            finally:
+                manager.close()
+
+        self.assertTrue(providers[0].closed)
+        self.assertTrue(providers[1].closed)
 
     def test_resident_manager_rebinds_master_to_project_with_stable_session(self) -> None:
         source_root = self.root / "source"

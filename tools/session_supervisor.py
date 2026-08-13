@@ -327,6 +327,26 @@ class SessionSupervisorStore:
             }
         return dict(observation)
 
+    def _owned_process_is_exact(
+        self, connection: sqlite3.Connection, session_id: str
+    ) -> bool:
+        """Return whether the session still owns the exact recorded process.
+
+        Provider rebind/register calls carry metadata state from their caller;
+        they must not demote a live persistent session based on that payload.
+        Liveness is restored only from the Supervisor-owned process lease and a
+        fresh PID/creation-time observation.
+        """
+
+        lease = connection.execute(
+            "SELECT * FROM process_lease WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if lease is None or str(lease["lease_state"]) != "OWNED":
+            return False
+        observation = self._observe_process_instance(self._lease_identity(lease))
+        return observation.get("status") == "PROCESS_PRESENT_EXACT"
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
@@ -916,6 +936,14 @@ class SessionSupervisorStore:
                         or "observation://session-register",
                         now=now,
                     )
+                effective_state = session["state"]
+                if (
+                    material["state"] != "STOPPED"
+                    and self._owned_process_is_exact(
+                        connection, session["session_id"]
+                    )
+                ):
+                    effective_state = "LIVE"
                 connection.execute(
                     """
                     UPDATE session_record
@@ -951,7 +979,7 @@ class SessionSupervisorStore:
                         session["last_seen_at"],
                         now,
                         alias,
-                        session["state"],
+                        effective_state,
                         session["currentness"],
                         session["currentness"],
                         now,
@@ -970,11 +998,14 @@ class SessionSupervisorStore:
                         else "SESSION_REOBSERVED"
                     ),
                     prior_state=material.get("state"),
-                    state=session["state"],
+                    state=effective_state,
                     details={
                         "source": "register_session_idempotent",
                         "provider_changed": provider_changed,
                         "location_changed": location_changed,
+                        "requested_state": session["state"],
+                        "owned_process_exact": effective_state == "LIVE"
+                        and material["state"] != "STOPPED",
                         "requested_session_id": requested_session_id,
                         "identity_reused": requested_session_id
                         != session["session_id"],
@@ -1164,17 +1195,25 @@ class SessionSupervisorStore:
                 mode=str(row["mode"]),
                 now=now,
             )
+            effective_state = str(row["state"])
+            if (
+                effective_state != "STOPPED"
+                and self._owned_process_is_exact(connection, normalized_id)
+            ):
+                effective_state = "LIVE"
             connection.execute(
                 """
                 UPDATE session_record
                 SET provider = ?, provider_session_ref = ?,
-                    current_provider_binding_id = ?, row_version = ?, updated_at = ?
+                    current_provider_binding_id = ?, state = ?,
+                    row_version = ?, updated_at = ?
                 WHERE session_id = ? AND row_version = ?
                 """,
                 (
                     normalized_provider,
                     normalized_ref,
                     binding_ref,
+                    effective_state,
                     next_version,
                     now,
                     normalized_id,
@@ -1185,8 +1224,12 @@ class SessionSupervisorStore:
                 connection,
                 session_id=normalized_id,
                 event_type="PROVIDER_SESSION_BOUND",
-                state=row["state"],
-                details={"provider": normalized_provider},
+                state=effective_state,
+                details={
+                    "provider": normalized_provider,
+                    "owned_process_exact": effective_state == "LIVE"
+                    and str(row["state"]) != "STOPPED",
+                },
             )
             return self._session_material(
                 connection, self._require_session(connection, normalized_id)

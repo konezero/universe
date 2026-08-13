@@ -178,12 +178,16 @@ class ClaudeResidentSessionTests(unittest.TestCase):
 
     def test_new_session_uses_session_id_flag(self) -> None:
         session = self._session(session_id=None)
-        session.session_id = "fresh-id"
+        generated_session_id = session.session_id
         session.send_message("one", lambda _d: None)
         arguments = FakeClaudeProcess.instances[0].arguments
 
         self.assertIn("--session-id", arguments)
         self.assertNotIn("--resume", arguments)
+        self.assertEqual(
+            generated_session_id,
+            arguments[arguments.index("--session-id") + 1],
+        )
 
     def test_rebind_restarts_same_session_in_target_directory(self) -> None:
         target = self.root / "target"
@@ -342,6 +346,37 @@ class ClaudeResidentSessionTests(unittest.TestCase):
         session.close()
         self.assertTrue(FakeClaudeProcess.instances[0].closed)
         self.assertEqual(SESSION_STOPPED, session.session_status())
+
+    def test_dead_process_is_not_reported_ready(self) -> None:
+        session = self._session()
+        session.send_message("one", lambda _d: None)
+        FakeClaudeProcess.instances[0].alive = False
+        self.assertEqual("FAILED", session.session_status())
+        self.assertEqual("FAILED", session.runtime_observation()["state"])
+
+    def test_missing_resume_session_fails_during_startup(self) -> None:
+        def factory(**kwargs):
+            process = FakeClaudeProcess(**kwargs)
+            process.alive = False
+            process.event_handler(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "errors": [
+                        "No conversation found with session ID: old-session"
+                    ],
+                }
+            )
+            return process
+
+        session = self._session(
+            session_id="old-session",
+            process_factory=factory,
+        )
+        with self.assertRaisesRegex(
+            ClaudeResidentError, "CLAUDE_SESSION_RESUME_NOT_FOUND"
+        ):
+            session.start_or_resume()
 
     def test_concurrent_turns_are_serialized(self) -> None:
         release = threading.Event()

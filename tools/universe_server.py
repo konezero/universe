@@ -16446,6 +16446,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     / "conductor-mode-session.sqlite",
                     actor_label="Universe Conductor",
                     session_supervisor=self.session_supervisor,
+                    supervisor_endpoint=(
+                        f"http://127.0.0.1:{self.server_address[1]}"
+                    ),
                     continuity_coordinator=self.continuity_coordinator,
                     coordinate_resolver=self._conductor_continuity_coordinate,
                     permission_requester=self.conductor_permissions.request,
