@@ -27,7 +27,7 @@ from universe_memory import (  # noqa: E402
     resolve_memory_batch_config,
     synthesize_memory_candidates,
 )
-from universe_server import create_server  # noqa: E402
+from universe_server import UniverseError, create_server  # noqa: E402
 
 
 def available_catalog() -> dict:
@@ -182,6 +182,8 @@ class ConductorDelegationMigrationTests(unittest.TestCase):
                         "project_id": "TEST",
                         "summary": "Exercise migrated cancellation state",
                         "idempotency_key": "legacy-cancellation-state",
+                        "origin_session_anchor_ref": "session_anchor_origin",
+                        "target_session_anchor_ref": "session_anchor_target",
                     }
                 )
                 self.assertTrue(created)
@@ -402,6 +404,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "project_id": "TEST",
                 "summary": "Run the approved bounded work",
                 "idempotency_key": "delegation-test-1",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
                 "task_frame_ref": "task-frame-1",
                 "worker_role": "PROJECT_MASTER",
             },
@@ -440,6 +444,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "project_id": "TEST",
                 "summary": "Recover this bounded operation",
                 "idempotency_key": "delegation-recovery-1",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             }
         )
         self.assertTrue(created)
@@ -464,6 +470,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "project_id": "TEST",
                 "summary": "Cancel before coordinator dispatch",
                 "idempotency_key": "delegation-cancel-queued-1",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             }
         )
         self.assertTrue(created)
@@ -485,6 +493,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "project_id": "TEST",
                 "summary": "Cancel after provider handoff",
                 "idempotency_key": "delegation-cancel-running-1",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             }
         )
         self.assertTrue(created)
@@ -515,6 +525,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "project_id": "TEST",
                 "summary": "Cancel a completed result before review",
                 "idempotency_key": "delegation-cancel-review-1",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             }
         )
         self.assertTrue(created)
@@ -546,6 +558,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "summary": "Use a different model than the resident Master.",
                 "idempotency_key": "delegation-model-override-rejected-1",
                 "model_ref": "other-model",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             },
         )
         self.assertEqual(HTTPStatus.CONFLICT, status)
@@ -577,6 +591,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "summary": "Route this through a different provider.",
                 "idempotency_key": "delegation-provider-mismatch-rejected-1",
                 "provider": "CLAUDE",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             },
         )
         self.assertEqual(HTTPStatus.CONFLICT, status)
@@ -592,73 +608,32 @@ class MemoryCandidateApiTests(unittest.TestCase):
             ),
         )
 
-    def test_project_master_delegation_waits_for_conductor_after_result(self) -> None:
+    def test_project_master_delegation_never_falls_back_to_project_room(self) -> None:
         self.server._conductor_delegation_executor = (
             self.server._dispatch_project_master_delegation
         )
-        queued = {
-            "schema": "universe.project-room-message.v1",
-            "message_id": "room_delegated001",
-            "project_id": "TEST",
-            "delivery_state": "QUEUED_FOR_MASTER",
-        }
-        self.server.send_project_room_message = lambda _project, _value: (
-            queued,
-            True,
+        self.server.send_project_room_message = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("cross-session delegation must not enter Project Room")
         )
         delegation, created = self.server.store.create_conductor_delegation(
             {
                 "project_id": "TEST",
                 "summary": "Run bounded Project work",
                 "idempotency_key": "delegation-project-master-1",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
             }
         )
         self.assertTrue(created)
-        self.server._process_conductor_delegation(delegation["delegation_id"])
+        with self.assertRaises(UniverseError) as raised:
+            self.server._process_conductor_delegation(delegation["delegation_id"])
+        self.assertEqual(
+            "TARGET_SESSION_DELEGATION_TRANSPORT_UNAVAILABLE", raised.exception.code
+        )
         running = self.server.store.get_conductor_delegation(
             delegation["delegation_id"]
         )
         self.assertEqual("RUNNING", running["state"])
-        self.assertEqual(
-            "WAITING_FOR_MASTER_ACCEPTANCE",
-            running["progress"]["step"],
-        )
-        self.assertEqual(
-            "room_delegated001",
-            running["progress"]["project_room_message_id"],
-        )
-
-        self.server.store.create_room_message(
-            "TEST",
-            {
-                "kind": "RESULT",
-                "sender": "PROJECT_MASTER",
-                "body": "bounded result body remains in the Project Room",
-                "idempotency_key": "delegation-project-master-result-1",
-                "in_reply_to": "room_delegated001",
-            },
-            delivery_state="RECORDED",
-        )
-        self.server._observe_project_master_completion(
-            {
-                "project_id": "TEST",
-                "message_id": "room_delegated001",
-                "status": "COMPLETED",
-            }
-        )
-        waiting = self.server.store.get_conductor_delegation(
-            delegation["delegation_id"]
-        )
-        self.assertEqual("RUNNING", waiting["state"])
-        self.assertEqual(
-            "WAITING_FOR_CONDUCTOR_REVIEW",
-            waiting["progress"]["step"],
-        )
-        self.assertEqual({}, waiting["result"])
-        wakeups = self.server.store.list_conductor_room_messages()
-        self.assertEqual(1, len(wakeups))
-        self.assertIn(delegation["delegation_id"], wakeups[0]["body"])
-        self.assertNotIn("bounded result body", json.dumps(waiting))
 
 
 if __name__ == "__main__":

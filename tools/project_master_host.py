@@ -84,6 +84,9 @@ TASK_PROPOSAL_DATABASE_RELATIVE_PATH = Path(
 TASK_FRAME_PROFILE_RELATIVE_PATH = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
 )
+TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH = Path(
+    ".ai/runtime/reference_runtime/profiles/task-frame-instruction-v2.json"
+)
 
 
 class ProjectMasterHostError(RuntimeError):
@@ -533,6 +536,7 @@ class ProjectModeCoordinator:
         binding = self._ensure_runtime()
         if active_anchor is not None and binding["anchor_id"] != active_anchor["anchor_ref"]:
             raise ProjectMasterHostError("PRIMARY_TASK_ACTIVE_WORK_ANCHOR_MISMATCH")
+        origin_session_anchor_ref = self._origin_session_anchor_ref(binding)
         work_result = self._invoke(
             (
                 "execution-binding",
@@ -664,6 +668,13 @@ class ProjectModeCoordinator:
         )
         if created.get("status") != "TASK_FRAME_HOST_ACTIVE":
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_CREATE_FAILED")
+        self._record_task_frame_session_lineage(
+            task_frame_id=normalized_frame["frame_id"],
+            origin_anchor_ref=binding["anchor_id"],
+            origin_session_anchor_ref=origin_session_anchor_ref,
+            origin_session_id=binding["session_id"],
+            origin_frame_id=binding["frame_id"],
+        )
         declaration_turns = self._sequential_declared_turns(normalized_frame["turns"])
         declared = self._post_runtime(
             binding["endpoint"],
@@ -699,10 +710,174 @@ class ProjectModeCoordinator:
             "task_frame_id": normalized_frame["frame_id"],
             "task_frame_proposal_id": execution_approval["proposal_id"],
             "task_frame_plan_digest": execution_approval["plan_digest"],
+            "origin_session_anchor_ref": origin_session_anchor_ref,
             "turns": [
                 {"turn_id": turn["turn_id"], "role": turn["role"]}
                 for turn in normalized_frame["turns"]
             ],
+            "repository_write": False,
+        }
+
+    def create_instruction_authorized_task_frame(
+        self,
+        *,
+        proposal_reference: Mapping[str, Any],
+        task_frame: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Create the v2 Task Frame from a direct Parent instruction.
+
+        The proposal is an immutable planning reference only.  This seam does
+        not read or create a governance approval artifact; the installed v2
+        runtime profile remains responsible for its own instruction-scoped
+        Guard when that profile is released.
+        """
+
+        if set(proposal_reference) != {
+            "proposal_id",
+            "proposal_digest",
+            "request_ref",
+        }:
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_REFERENCE_INVALID")
+        proposal_id = _text(proposal_reference.get("proposal_id"), "proposal_reference.proposal_id")
+        proposal_digest = _text(
+            proposal_reference.get("proposal_digest"),
+            "proposal_reference.proposal_digest",
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", proposal_digest.lower()):
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_REFERENCE_INVALID")
+        instruction_ref = _text(
+            proposal_reference.get("request_ref"), "proposal_reference.request_ref"
+        )
+        normalized_frame = self._approved_task_frame_request(
+            task_frame=task_frame,
+            source_work={
+                "write_roots": [str(self.project_root)],
+                "write_operations": ["CREATE", "MODIFY"],
+            },
+        )
+        binding = self._ensure_runtime()
+        origin_session_anchor_ref = self._origin_session_anchor_ref(binding)
+        instruction_assignment_ref = "instruction:" + normalized_frame["instruction_id"]
+        execution_plan = {
+            "profile_id": "task-frame-instruction-v2",
+            # The Runtime worker topology remains Boss/Sub debate-shaped; v2
+            # changes the Parent authority basis, not that execution shape.
+            "requested_shape": "DEBATE",
+            "resolved_shape": "DEBATE",
+            "model_mode": "EXPLICIT",
+            "frame_id": normalized_frame["frame_id"],
+            # Runtime v1 keeps this legacy field; Session Anchor lineage is
+            # persisted by the Host sidecar until v2 Runtime owns the field.
+            "origin_anchor_ref": binding["anchor_id"],
+            "origin_session_id": binding["session_id"],
+            "origin_frame_id": binding["frame_id"],
+            "task_summary_ref": instruction_ref,
+            "source_ref": "NONE",
+            "candidate_source_ref": normalized_frame["candidate_source_ref"],
+            "source_review_result": normalized_frame["source_review_result"],
+            "parent_actor_ref": normalized_frame["parent_actor_ref"],
+            "commander_surface": "UNIVERSE_UI",
+            "execution_assignment_ref": instruction_assignment_ref,
+            "host_worker_capability": "AVAILABLE",
+            "repository_write_scope": "BOUNDED",
+            "mutation_scope": normalized_frame["mutation_scope"],
+            "fallback_reason": "NONE",
+            "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
+            "turns": normalized_frame["turns"],
+        }
+        proposal_result = self._invoke(
+            (
+                "task-frame",
+                "propose",
+                "--repo-root",
+                str(self.project_root),
+                "--profile",
+                str(TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH),
+            ),
+            {"execution_plan": execution_plan},
+        )
+        execution_proposal = proposal_result.get("execution_proposal")
+        if not isinstance(execution_proposal, Mapping):
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_PROPOSAL_INVALID")
+        created = self._post_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/create",
+            {
+                "session_id": binding["session_id"],
+                "profile": str(TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH),
+                "frame": {
+                    "frame_id": normalized_frame["frame_id"],
+                    "origin_anchor_ref": binding["anchor_id"],
+                    "origin_session_id": binding["session_id"],
+                    "origin_frame_id": binding["frame_id"],
+                    "origin_governance_session_ref": "UNKNOWN",
+                    "task_summary_ref": instruction_ref,
+                    "source_ref": "NONE",
+                    "execution_assignment_ref": instruction_assignment_ref,
+                    "task_frame_execution_proposal": dict(execution_proposal),
+                    # No approval artifact: task-frame-instruction-v2 derives
+                    # authority from the Parent instruction_ref and Guard.
+                    "task_frame_execution_approval": None,
+                    "parent_instruction": {
+                        "instruction_id": normalized_frame["instruction_id"],
+                        "instruction_ref": instruction_ref,
+                        "user_instruction_raw": normalized_frame["instruction_text"],
+                        "constraints": normalized_frame["constraints"],
+                        "expected_output": normalized_frame["expected_output"],
+                        "repository_write_scope": "BOUNDED",
+                        "mutation_scope": normalized_frame["mutation_scope"],
+                    },
+                    "parent_observation": {
+                        "status": "MATCHED",
+                        "evidence_ref": instruction_ref,
+                    },
+                    "observed_at": utc_now(),
+                },
+            },
+        )
+        if created.get("status") != "TASK_FRAME_HOST_ACTIVE":
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_CREATE_FAILED")
+        declared = self._post_runtime(
+            binding["endpoint"],
+            binding["token"],
+            "/v1/task-frame/operation",
+            {
+                "session_id": binding["session_id"],
+                "frame_id": normalized_frame["frame_id"],
+                "operation": {
+                    "operation": "declare_turns",
+                    "turns": self._sequential_declared_turns(normalized_frame["turns"]),
+                    "observed_at": utc_now(),
+                },
+            },
+        )
+        output = declared.get("output")
+        if (
+            declared.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+            or not isinstance(output, Mapping)
+            or output.get("status")
+            not in {"TASK_TURNS_DECLARED", "TASK_TURNS_ALREADY_DECLARED"}
+        ):
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_TURN_DECLARATION_FAILED")
+        self._record_task_frame_session_lineage(
+            task_frame_id=normalized_frame["frame_id"],
+            origin_anchor_ref=binding["anchor_id"],
+            origin_session_anchor_ref=origin_session_anchor_ref,
+            origin_session_id=binding["session_id"],
+            origin_frame_id=binding["frame_id"],
+        )
+        return {
+            "status": "INSTRUCTION_TASK_FRAME_READY",
+            "project_id": self.project_id,
+            "proposal_reference": {
+                "proposal_id": proposal_id,
+                "proposal_digest": proposal_digest,
+                "request_ref": instruction_ref,
+            },
+            "task_frame_id": normalized_frame["frame_id"],
+            "profile": str(TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH),
+            "origin_session_anchor_ref": origin_session_anchor_ref,
             "repository_write": False,
         }
 
@@ -725,6 +900,10 @@ class ProjectModeCoordinator:
         _text(primary_proposal_digest, "primary_proposal_digest")
         approval_ref = _text(approval_evidence_ref, "approval_evidence_ref")
         binding = self._ensure_runtime(recover_task_frame_id=frame_id)
+        self._validate_task_frame_session_lineage(
+            task_frame_id=frame_id,
+            binding=binding,
+        )
         self._reopen_task_frame_from_runtime_store(
             binding=binding,
             task_frame_id=frame_id,
@@ -1957,6 +2136,148 @@ class ProjectModeCoordinator:
             + self.requested_mode.lower()
         )
 
+    @property
+    def _task_frame_session_lineage_path(self) -> Path:
+        return (
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "task_frames"
+            / "task-frame-session-lineage.sqlite3"
+        )
+
+    def _origin_session_anchor_ref(self, binding: Mapping[str, str]) -> str:
+        """Resolve the durable Session Anchor without changing Runtime v1 fields."""
+
+        if self.session_supervisor is None:
+            return "UNKNOWN"
+        session_id = self._supervisor_session_id
+        session: Mapping[str, Any] | None = None
+        if session_id:
+            try:
+                session = self.session_supervisor.get_session(session_id)
+            except SessionSupervisorError:
+                session = None
+        if session is None:
+            candidates = [
+                item
+                for item in self.session_supervisor.list_sessions(
+                    node=self.session_node,
+                    mode=self.requested_mode,
+                    include_hidden=True,
+                )
+                if str(item.get("provider_session_ref") or "")
+                == str(binding.get("session_id") or "")
+            ]
+            if len(candidates) == 1:
+                session = candidates[0]
+        if session is None:
+            return "UNKNOWN"
+        return str(session.get("session_anchor_ref") or "UNKNOWN")
+
+    def _task_frame_session_lineage(self, task_frame_id: str) -> dict[str, str] | None:
+        path = self._task_frame_session_lineage_path
+        if not path.is_file():
+            return None
+        try:
+            connection = sqlite3.connect(
+                f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                row = connection.execute(
+                    """
+                    SELECT task_frame_id, origin_anchor_ref, origin_session_anchor_ref,
+                           origin_session_id, origin_frame_id
+                    FROM task_frame_session_lineage WHERE task_frame_id = ?
+                    """,
+                    (task_frame_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            raise ProjectMasterHostError("TASK_FRAME_SESSION_LINEAGE_UNAVAILABLE") from error
+        return None if row is None else {key: str(row[key]) for key in row.keys()}
+
+    def _record_task_frame_session_lineage(
+        self,
+        *,
+        task_frame_id: str,
+        origin_anchor_ref: str,
+        origin_session_anchor_ref: str,
+        origin_session_id: str,
+        origin_frame_id: str,
+    ) -> None:
+        path = self._task_frame_session_lineage_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            connection = sqlite3.connect(path, timeout=30)
+            try:
+                with connection:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS task_frame_session_lineage (
+                            task_frame_id TEXT PRIMARY KEY,
+                            origin_anchor_ref TEXT NOT NULL,
+                            origin_session_anchor_ref TEXT NOT NULL,
+                            origin_session_id TEXT NOT NULL,
+                            origin_frame_id TEXT NOT NULL,
+                            recorded_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT origin_anchor_ref, origin_session_anchor_ref,
+                               origin_session_id, origin_frame_id
+                        FROM task_frame_session_lineage WHERE task_frame_id = ?
+                        """,
+                        (task_frame_id,),
+                    ).fetchone()
+                    expected = (
+                        origin_anchor_ref,
+                        origin_session_anchor_ref,
+                        origin_session_id,
+                        origin_frame_id,
+                    )
+                    if existing is not None:
+                        if tuple(str(item) for item in existing) != expected:
+                            raise ProjectMasterHostError(
+                                "TASK_FRAME_SESSION_LINEAGE_CONFLICT"
+                            )
+                        return
+                    connection.execute(
+                        """
+                        INSERT INTO task_frame_session_lineage(
+                            task_frame_id, origin_anchor_ref,
+                            origin_session_anchor_ref, origin_session_id,
+                            origin_frame_id, recorded_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (task_frame_id, *expected, utc_now()),
+                    )
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            raise ProjectMasterHostError("TASK_FRAME_SESSION_LINEAGE_PERSIST_FAILED") from error
+
+    def _validate_task_frame_session_lineage(
+        self, *, task_frame_id: str, binding: Mapping[str, str]
+    ) -> None:
+        lineage = self._task_frame_session_lineage(task_frame_id)
+        if lineage is None:
+            # Legacy Frames carry only origin_anchor_ref in Runtime storage.
+            return
+        if (
+            lineage["origin_anchor_ref"] != str(binding["anchor_id"])
+            or lineage["origin_frame_id"] != str(binding["frame_id"])
+        ):
+            raise ProjectMasterHostError("TASK_FRAME_SESSION_LINEAGE_MISMATCH")
+        current = self._origin_session_anchor_ref(binding)
+        recorded = lineage["origin_session_anchor_ref"]
+        if recorded != "UNKNOWN" and current != recorded:
+            raise ProjectMasterHostError("TASK_FRAME_SESSION_ANCHOR_MISMATCH")
+
     def _recover_task_frame_session_id(
         self,
         *,
@@ -2025,6 +2346,10 @@ class ProjectModeCoordinator:
     ) -> None:
         """Register one exact persisted Frame with a replacement Host process."""
 
+        self._validate_task_frame_session_lineage(
+            task_frame_id=task_frame_id,
+            binding=binding,
+        )
         frames_root = self.project_root / ".ai" / "runtime" / "task_frames"
         if not frames_root.is_dir():
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_RECOVERY_NOT_FOUND")
@@ -5744,6 +6069,29 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
                     primary_proposal=request["primary_proposal"],
                     governance_approval=request["governance_approval"],
                     source_work=request["source_work"],
+                    task_frame=request["task_frame"],
+                )
+            )
+        except ProjectMasterHostError as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
+    def create_instruction_authorized_task_frame(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "proposal_reference",
+            "task_frame",
+        }:
+            raise ProjectMasterBridgeError(
+                "INSTRUCTION_TASK_FRAME_REQUEST_INVALID"
+            )
+        create = getattr(self._coordinator, "create_instruction_authorized_task_frame", None)
+        if not callable(create):
+            raise ProjectMasterBridgeError(
+                "INSTRUCTION_TASK_FRAME_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return dict(
+                create(
+                    proposal_reference=request["proposal_reference"],
                     task_frame=request["task_frame"],
                 )
             )

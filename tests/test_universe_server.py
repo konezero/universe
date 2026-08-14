@@ -50,6 +50,7 @@ from universe_server import (  # noqa: E402
     local_connection_profile,
     normalize_conductor_ui_action,
     normalize_conductor_room_message,
+    normalize_conductor_delegation,
     normalize_room_message,
     normalize_planning_runtime_binding,
     normalize_project_attachment,
@@ -160,6 +161,35 @@ class UniverseWorkPreflightTests(unittest.TestCase):
         args = parser().parse_args(["work", str(self.root), "--project-id", "GCS"])
         self.assertEqual("work", args.command)
         self.assertEqual("GCS", args.project_id)
+
+    def test_shared_work_queue_is_labeled_only_for_cross_session_delegation(self) -> None:
+        delegated = normalize_conductor_delegation(
+            {
+                "project_id": "GCS",
+                "summary": "Ask the other session to review the bounded diff.",
+                "idempotency_key": "cross-session-test",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
+            }
+        )
+        self.assertEqual("CROSS_SESSION_DELEGATION", delegated["queue_scope"])
+        with self.assertRaisesRegex(UniverseError, "both origin and target"):
+            normalize_conductor_delegation(
+                {
+                    "project_id": "GCS",
+                    "summary": "Invalid unscoped delegation.",
+                    "idempotency_key": "cross-session-missing",
+                }
+            )
+        with self.assertRaisesRegex(UniverseError, "both origin and target"):
+            normalize_conductor_delegation(
+                {
+                    "project_id": "GCS",
+                    "summary": "Invalid partial delegation.",
+                    "idempotency_key": "cross-session-partial",
+                    "origin_session_anchor_ref": "session_anchor_origin",
+                }
+            )
 
 
 class UniverseLocalServiceTests(unittest.TestCase):
@@ -1541,7 +1571,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(workers))
         self.assertNotEqual(chats[0]["chat_key"], workers[0]["chat_key"])
 
-    def test_provider_chat_catalog_binds_only_boot_anchors_and_merges_provider_history(
+    def test_provider_chat_catalog_keeps_each_bound_session_chat_distinct(
         self,
     ) -> None:
         def discovered(provider: str) -> list[dict[str, Any]]:
@@ -1653,11 +1683,21 @@ class UniverseLocalServiceTests(unittest.TestCase):
         bound = [
             room for room in catalog["rooms"] if room["binding"]["state"] == "BOUND"
         ]
-        self.assertEqual(1, len(bound))
-        self.assertEqual("CLAUDE", bound[0]["provider"])
-        self.assertEqual(2, bound[0]["provider_history_count"])
+        self.assertEqual(3, len(bound))
+        self.assertEqual(
+            {"CODEX", "CLAUDE", "GROK"}, {room["provider"] for room in bound}
+        )
+        self.assertTrue(
+            all(
+                room["binding"]["selection_scope"] == "UI_NAVIGATION_ONLY"
+                for room in bound
+            )
+        )
+        self.assertTrue(
+            all(room["binding"]["session_anchor_ref"] for room in bound)
+        )
         grok = next(room for room in catalog["rooms"] if room["provider"] == "GROK")
-        self.assertEqual("UNBOUND", grok["binding"]["state"])
+        self.assertEqual("BOUND", grok["binding"]["state"])
 
     def test_session_observatory_card_uses_anchor_observer_identity(self) -> None:
         session = {
@@ -1707,6 +1747,112 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "CONDUCTOR-CURRENT-NEW",
             card["anchor_session"]["current_anchor_ref"],
         )
+
+    def test_project_mode_anchor_endpoint_returns_append_only_session_lineage(self) -> None:
+        first, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "anchor-endpoint-one",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-anchor-endpoint-one",
+            }
+        )
+        second, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "anchor-endpoint-two",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-anchor-endpoint-two",
+            }
+        )
+
+        status, response = self.request(
+            "GET", "/v1/supervisor/project-mode-anchors/GCS/MASTER", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROJECT_MODE_ANCHOR_COLLECTED", response["status"])
+        self.assertEqual(
+            [first["session_anchor_ref"], second["session_anchor_ref"]],
+            [
+                item["session_anchor_ref"]
+                for item in response["anchor"]["session_anchor_refs"]
+            ],
+        )
+
+    def test_cross_session_delegation_fails_closed_without_project_room_delivery(
+        self,
+    ) -> None:
+        record = {
+            "delegation_id": "delegation-session-transport-001",
+            "project_id": "GCS",
+            "request": {
+                "worker_role": "PROJECT_MASTER",
+                "provider": "AUTO",
+                "model_ref": None,
+                "summary": "Ask the target session to review the diff.",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
+            },
+        }
+        with patch.object(self.server, "send_project_room_message") as room_send:
+            with self.assertRaises(UniverseError) as raised:
+                self.server._dispatch_project_master_delegation(record)
+        self.assertEqual(
+            "TARGET_SESSION_DELEGATION_TRANSPORT_UNAVAILABLE", raised.exception.code
+        )
+        room_send.assert_not_called()
+
+    def test_delegation_dispatch_rejects_legacy_record_without_session_lineage(
+        self,
+    ) -> None:
+        record = {
+            "delegation_id": "delegation-missing-lineage-001",
+            "project_id": "GCS",
+            "request": {
+                "worker_role": "PROJECT_MASTER",
+                "provider": "AUTO",
+                "model_ref": None,
+                "summary": "Legacy unscoped queue record.",
+            },
+        }
+        with patch.object(self.server, "send_project_room_message") as room_send:
+            with self.assertRaises(UniverseError) as raised:
+                self.server._dispatch_project_master_delegation(record)
+        self.assertEqual(
+            "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID", raised.exception.code
+        )
+        room_send.assert_not_called()
+
+    def test_runtime_audit_retains_hidden_session_anchor_history(self) -> None:
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "hidden-anchor-history",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-hidden-anchor-history",
+            }
+        )
+        self.server.session_supervisor.set_visibility(
+            session["session_id"],
+            visibility="HIDDEN",
+            expected_version=session["row_version"],
+        )
+
+        status, audit = self.request("GET", "/v1/runtime/audit", None, self.token)
+        self.assertEqual(HTTPStatus.OK, status)
+        card = next(
+            item
+            for item in audit["sessions"]
+            if item["session_id"] == "hidden-anchor-history"
+        )
+        self.assertEqual(session["session_anchor_ref"], card["session_anchor_ref"])
+        self.assertEqual("HIDDEN", card["visibility"])
 
     def test_project_anchor_store_is_source_for_supervisor_projection(self) -> None:
         status, _ = self.request(
@@ -5467,6 +5613,63 @@ class UniverseLocalServiceTests(unittest.TestCase):
             request["task_frame"]["source_review_result"],
             forwarded["task_frame"]["source_review_result"],
         )
+
+    def test_instruction_task_frame_http_route_uses_proposal_reference_only(
+        self,
+    ) -> None:
+        proposal = self.create_task_proposal_fixture()
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        request = {
+            "proposal_digest": proposal["proposal_digest"],
+            "task_frame": {"frame_id": "instruction-frame-001"},
+        }
+        bridge = {
+            "project_id": "GCS",
+            "endpoint": "http://127.0.0.1:50123",
+            "credential_env": "TEST_MASTER_BRIDGE_TOKEN",
+        }
+        host_result = {
+            "status": "INSTRUCTION_TASK_FRAME_READY",
+            "project_id": "GCS",
+            "proposal_reference": {
+                "proposal_id": proposal["proposal_id"],
+                "proposal_digest": proposal["proposal_digest"],
+                "request_ref": proposal["request_ref"],
+            },
+            "task_frame_id": "instruction-frame-001",
+            "repository_write": False,
+        }
+        client = Mock()
+        client.create_instruction_authorized_task_frame.return_value = {
+            "host_response": host_result
+        }
+        with (
+            patch.object(self.server, "ensure_project_master", return_value={}),
+            patch.object(self.server.store, "get_master_bridge", return_value=bridge),
+            patch("universe_server.HttpProjectMasterBridge", return_value=client),
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/governance-proposals/"
+                "task_proposal_test_001/instruction-task-frame",
+                request,
+                self.token,
+            )
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("INSTRUCTION_TASK_FRAME_CREATED", result["status"])
+        self.assertEqual(proposal["request_ref"], result["parent_instruction_ref"])
+        forwarded = client.create_instruction_authorized_task_frame.call_args.kwargs
+        self.assertEqual(
+            {
+                "proposal_id": proposal["proposal_id"],
+                "proposal_digest": proposal["proposal_digest"],
+                "request_ref": proposal["request_ref"],
+            },
+            forwarded["proposal_reference"],
+        )
+        self.assertEqual(request["task_frame"], forwarded["task_frame"])
+        self.assertNotIn("approval", forwarded)
 
     def test_conductor_approval_uses_durable_governance_decision(self) -> None:
         proposal = self.create_task_proposal_fixture()

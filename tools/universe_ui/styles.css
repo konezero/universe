@@ -6005,6 +6005,65 @@ body:not(.graph-mode) .conductor-panel {
 .node-mode-item[data-active="false"] .node-mode-copy small {
   color: var(--amber);
 }
+.node-mode-session-cards {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 5px 14px;
+  padding: 5px;
+  border-left: 1px solid rgba(61, 224, 255, 0.2);
+}
+.node-mode-session-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 34px;
+  padding: 5px 6px;
+  border: 1px solid rgba(90, 150, 210, 0.16);
+  border-radius: 6px;
+  background: rgba(7, 21, 38, 0.4);
+  color: var(--text-2);
+  text-align: left;
+}
+.node-mode-session-card:hover,
+.node-mode-session-card:focus-visible,
+.node-mode-session-card[data-selected="true"] {
+  border-color: rgba(61, 224, 255, 0.48);
+  background: rgba(61, 224, 255, 0.11);
+  color: var(--text-1);
+}
+.node-mode-session-card[data-attached="false"] {
+  border-style: dashed;
+  color: var(--text-3);
+}
+.node-mode-session-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.node-mode-session-copy strong,
+.node-mode-session-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-mode-session-copy strong { font-size: 10px; }
+.node-mode-session-copy small { color: var(--text-3); font-size: 8px; }
+.node-mode-session-status {
+  padding: 2px 4px;
+  border: 1px solid rgba(61, 224, 255, 0.24);
+  border-radius: 999px;
+  color: var(--cyan);
+  font-size: 8px;
+  font-weight: 700;
+}
+.node-mode-session-status[data-state="LIVE"] { color: var(--green); }
+.node-mode-session-empty {
+  margin: 2px 0;
+  color: var(--text-3);
+  font-size: 9px;
+}
 
 /* Fixed right chat dock and sliding inspector drawer. */
 .app-shell.mockup-shell {

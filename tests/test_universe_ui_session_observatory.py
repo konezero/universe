@@ -62,10 +62,26 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('const modes = isUniverseHome ? ["MASTER", "CONDUCTOR"] : ["MASTER"];', APP)
         self.assertIn("function nodeModeSessionIsActive(session)", APP)
         self.assertIn('if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;', APP)
-        self.assertIn("if (coordinate.room)", APP)
+        self.assertIn("coordinate.sessions.push(source.session)", APP)
         self.assertIn("node-mode-item", CSS)
         self.assertIn(".node-mode-node", CSS)
         self.assertIn('data-active="false"', CSS)
+
+    def test_mode_click_expands_persistent_session_cards_without_auto_routing(self) -> None:
+        self.assertIn("selectedModeCoordinateKey: null", APP)
+        self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
+        self.assertIn("node-mode-session-card", APP)
+        self.assertIn("if (modeSelected)", APP)
+        self.assertIn("list.append(renderNodeModeSessionCards(coordinate));", APP)
+        open_slice = APP[
+            APP.index("function openNodeModeCoordinate") : APP.index(
+                "function renderNodeModes"
+            )
+        ]
+        self.assertIn("state.selectedModeCoordinateKey = coordinate.key", open_slice)
+        self.assertNotIn("openProviderChatSummary", open_slice)
+        self.assertIn("node-mode-session-cards", CSS)
+        self.assertIn("node-mode-session-card", CSS)
 
     def test_right_chat_dock_and_sliding_inspector_contract(self) -> None:
         self.assertIn('class="conductor-panel glass-panel"', HTML)
@@ -90,8 +106,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             CSS,
         )
         self.assertIn('id="chat-resize-handle"', HTML)
-        self.assertIn("if (coordinate.room)", APP)
-        self.assertIn("openProviderChatSummary(coordinate.room)", APP)
+        self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
+        self.assertIn("await openProviderChatSession(room, { session });", APP)
         self.assertIn("initChatPanelResize()", APP)
         self.assertIn("--chat-panel-width: 380px", CSS)
         self.assertIn("chat-resize-handle", CSS)

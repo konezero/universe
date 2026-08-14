@@ -3148,6 +3148,150 @@ class ProjectMasterHostTests(unittest.TestCase):
             ),
         )
 
+    def test_task_frame_session_lineage_preserves_and_validates_exact_session_anchor(
+        self,
+    ) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        supervisor = SessionSupervisorStore(self.root / ".universe" / "sessions.sqlite3")
+        session, _ = supervisor.register_session(
+            {
+                "session_id": "runtime-supervisor-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "RUNTIME",
+                "provider_session_ref": "project-master-session-001",
+                "anchor_ref": "MASTER-CURRENT-001",
+            }
+        )
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            session_supervisor=supervisor,
+        )
+        coordinator._supervisor_session_id = session["session_id"]
+        binding = {
+            "session_id": "project-master-session-001",
+            "anchor_id": "MASTER-CURRENT-001",
+            "frame_id": "current",
+        }
+        coordinator._record_task_frame_session_lineage(
+            task_frame_id="frame-session-lineage-001",
+            origin_anchor_ref=binding["anchor_id"],
+            origin_session_anchor_ref=session["session_anchor_ref"],
+            origin_session_id=binding["session_id"],
+            origin_frame_id=binding["frame_id"],
+        )
+        coordinator._validate_task_frame_session_lineage(
+            task_frame_id="frame-session-lineage-001", binding=binding
+        )
+        stored = coordinator._task_frame_session_lineage("frame-session-lineage-001")
+        self.assertEqual(session["session_anchor_ref"], stored["origin_session_anchor_ref"])
+
+        moved = supervisor.bind_current_location(
+            session["session_id"],
+            project_id="GCS",
+            node="GCS",
+            mode="CONDUCTOR",
+            evidence_ref="test://session-anchor-move",
+            expected_version=session["row_version"],
+        )
+        self.assertNotEqual(session["session_anchor_ref"], moved["session_anchor_ref"])
+        with self.assertRaisesRegex(ProjectMasterHostError, "SESSION_ANCHOR_MISMATCH"):
+            coordinator._validate_task_frame_session_lineage(
+                task_frame_id="frame-session-lineage-001", binding=binding
+            )
+
+    def test_instruction_authorized_task_frame_uses_v2_profile_without_approval_artifact(
+        self,
+    ) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        coordinator = ProjectModeCoordinator(self.root, "GCS", "codex:session-001")
+        binding = {
+            "endpoint": "http://127.0.0.1:41992",
+            "token": "test-token",
+            "session_id": "project-master-session-001",
+            "frame_id": "current",
+            "anchor_id": "MASTER-CURRENT-001",
+        }
+        posts: list[dict[str, Any]] = []
+
+        def post(_endpoint, _token, path, payload):
+            posts.append({"path": path, "payload": payload})
+            if path == "/v1/task-frame/create":
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TASK_TURNS_DECLARED"},
+            }
+
+        def invoke(_args, payload):
+            self.assertEqual("task-frame-instruction-v2", payload["execution_plan"]["profile_id"])
+            self.assertEqual("DEBATE", payload["execution_plan"]["requested_shape"])
+            return {
+                "execution_proposal": {
+                    "proposal_id": "task_frame_proposal_instruction_001",
+                    "plan_digest": "b" * 64,
+                }
+            }
+
+        with patch.object(coordinator, "_ensure_runtime", return_value=binding), patch.object(
+            coordinator, "_post_runtime", side_effect=post
+        ), patch.object(
+            coordinator, "_invoke", side_effect=invoke
+        ):
+            result = coordinator.create_instruction_authorized_task_frame(
+                proposal_reference={
+                    "proposal_id": "task_proposal_reference_only",
+                    "proposal_digest": "a" * 64,
+                    "request_ref": "universe://project-room/messages/instruction-001",
+                },
+                task_frame={
+                    "frame_id": "instruction-frame-001",
+                    "parent_actor_ref": "project-master:GCS",
+                    "mutation_scope": {
+                        "operations": ["MODIFY"],
+                        "targets": [str(self.root / "tools" / "app.py")],
+                    },
+                    "turns": [
+                        {
+                            "turn_id": "boss",
+                            "role": "BOSS",
+                            "worker_slot_ref": "boss-worker",
+                            "provider": "CODEX",
+                            "model": "gpt-5.6",
+                            "reasoning_effort": "high",
+                        }
+                    ],
+                    "instruction_id": "instruction-001",
+                    "instruction_text": "Implement the bounded local change.",
+                    "constraints": ["NO_PUSH"],
+                    "expected_output": {"result": "focused tests"},
+                },
+            )
+
+        self.assertEqual("INSTRUCTION_TASK_FRAME_READY", result["status"])
+        self.assertIn("task-frame-instruction-v2.json", result["profile"])
+        self.assertEqual("UNKNOWN", result["origin_session_anchor_ref"])
+        self.assertEqual(2, len(posts))
+        frame = posts[0]["payload"]["frame"]
+        self.assertEqual("MATCHED", frame["parent_observation"]["status"])
+        self.assertEqual("instruction:instruction-001", frame["execution_assignment_ref"])
+        self.assertEqual(
+            "universe://project-room/messages/instruction-001",
+            frame["parent_instruction"]["instruction_ref"],
+        )
+        self.assertEqual(
+            "task_frame_proposal_instruction_001",
+            frame["task_frame_execution_proposal"]["proposal_id"],
+        )
+        self.assertIsNone(frame["task_frame_execution_approval"])
+
     def test_approved_descendant_runs_boss_then_declared_child_turns(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)

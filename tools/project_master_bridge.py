@@ -104,6 +104,11 @@ class ProjectMasterBridgeHost:
             "APPROVED_DESCENDANT_TASK_FRAME_GATEWAY_UNAVAILABLE"
         )
 
+    def create_instruction_authorized_task_frame(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError(
+            "INSTRUCTION_TASK_FRAME_GATEWAY_UNAVAILABLE"
+        )
+
     def run_approved_descendant_task_frame(self, _request: Any) -> dict[str, Any]:
         raise ProjectMasterBridgeError(
             "APPROVED_DESCENDANT_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
@@ -165,6 +170,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
                 "/v1/project-master/task-frames/approved"
             ): self.server.bridge_host.create_approved_descendant_task_frame,
             (
+                "/v1/project-master/task-frames/instruction"
+            ): self.server.bridge_host.create_instruction_authorized_task_frame,
+            (
                 "/v1/project-master/task-frames/run"
             ): self.server.bridge_host.run_approved_descendant_task_frame,
         }
@@ -197,6 +205,7 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             "PROJECT_SEED_ASSETS_APPLIED",
             "PROJECT_SKILL_PLAN_BOUND_TO_MASTER_CONTEXT",
             "APPROVED_DESCENDANT_TASK_FRAME_READY",
+            "INSTRUCTION_TASK_FRAME_READY",
         } and not receipt.get("idempotent_replay", False)
         status = HTTPStatus.CREATED if created else HTTPStatus.OK
         self._send_json(status, receipt)

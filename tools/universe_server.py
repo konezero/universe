@@ -3269,6 +3269,8 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         "source_message_id",
         "provider",
         "model_ref",
+        "origin_session_anchor_ref",
+        "target_session_anchor_ref",
     }
     forbidden = {
         "body",
@@ -3341,6 +3343,27 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
             "CONDUCTOR_DELEGATION_MODEL_INVALID",
             "model_ref is invalid",
         )
+    origin_session_anchor_ref = str(
+        value.get("origin_session_anchor_ref") or ""
+    ).strip()
+    target_session_anchor_ref = str(
+        value.get("target_session_anchor_ref") or ""
+    ).strip()
+    if not origin_session_anchor_ref or not target_session_anchor_ref:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
+            "cross-session delegation requires both origin and target Session Anchors",
+        )
+    if any(
+        len(anchor_ref) > 256
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", anchor_ref)
+        for anchor_ref in (origin_session_anchor_ref, target_session_anchor_ref)
+        if anchor_ref
+    ):
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
+            "Session Anchor reference is invalid",
+        )
     return {
         "schema": CONDUCTOR_DELEGATION_SCHEMA,
         "project_id": project_id,
@@ -3351,6 +3374,11 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         "source_message_id": source_message_id or None,
         "provider": provider,
         "model_ref": model_ref,
+        # Only this bounded delegation route may use the shared work queue.
+        # User chat stays attached to its selected vendor Session Anchor.
+        "queue_scope": "CROSS_SESSION_DELEGATION",
+        "origin_session_anchor_ref": origin_session_anchor_ref,
+        "target_session_anchor_ref": target_session_anchor_ref,
     }
 
 
@@ -15985,6 +16013,104 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "task_frame": dict(host_result),
         }
 
+    def create_instruction_authorized_task_frame(
+        self,
+        project_id: str,
+        proposal_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        """Create a v2 Task Frame from a submitted proposal and parent instruction.
+
+        The proposal identifies scope and its request reference becomes the
+        parent instruction reference.  It is not an approval artifact.
+        """
+
+        request = _exact_object_fields(
+            value,
+            field="instruction_authorized_task_frame_request",
+            required=frozenset({"proposal_digest", "task_frame"}),
+        )
+        project = self.store.get_project(project_id)
+        primary_id = _required_text(proposal_id, "proposal_id")
+        primary_digest = _sha256(
+            request["proposal_digest"],
+            "instruction_authorized_task_frame_request.proposal_digest",
+        )
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == primary_id
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        if proposal.get("proposal_digest") != primary_digest:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH",
+                "proposal digest does not match the submitted proposal",
+                HTTPStatus.CONFLICT,
+            )
+        instruction_ref = _required_text(proposal.get("request_ref"), "proposal.request_ref")
+        proposal_reference = {
+            "proposal_id": primary_id,
+            "proposal_digest": primary_digest,
+            "request_ref": instruction_ref,
+        }
+        try:
+            self.ensure_project_master(project["project_id"])
+            bridge = self.store.get_master_bridge(project["project_id"])
+            receipt = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+            ).create_instruction_authorized_task_frame(
+                bridge=bridge,
+                proposal_reference=proposal_reference,
+                task_frame=request["task_frame"],
+            )
+        except (DispatchError, OSError, ProjectMasterHostError) as error:
+            raise UniverseError(
+                "INSTRUCTION_TASK_FRAME_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        host_result = receipt.get("host_response")
+        host_proposal_reference = (
+            host_result.get("proposal_reference")
+            if isinstance(host_result, Mapping)
+            else None
+        )
+        if (
+            not isinstance(host_result, Mapping)
+            or host_result.get("status") != "INSTRUCTION_TASK_FRAME_READY"
+            or not isinstance(host_proposal_reference, Mapping)
+            or host_proposal_reference.get("proposal_id") != primary_id
+            or host_proposal_reference.get("proposal_digest") != primary_digest
+            or host_proposal_reference.get("request_ref") != instruction_ref
+        ):
+            raise UniverseError(
+                "INSTRUCTION_TASK_FRAME_RECEIPT_INVALID",
+                "Project Master did not return a matching instruction Task Frame receipt",
+                HTTPStatus.CONFLICT,
+            )
+        self.publish_project_room_changed(project["project_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "INSTRUCTION_TASK_FRAME_CREATED",
+            "project_id": project["project_id"],
+            "proposal_id": primary_id,
+            "proposal_digest": primary_digest,
+            "parent_instruction_ref": instruction_ref,
+            "task_frame": dict(host_result),
+        }
+
     def run_approved_descendant_task_frame(
         self,
         project_id: str,
@@ -16805,7 +16931,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             room_bindings = self.multi_rooms.list_active_session_bindings(limit=100)
         except MultiRoomError:
             room_bindings = []
-        sessions = self.session_supervisor.list_sessions()[:200]
+        # Anchor Graph lineage is append-only.  Visibility is a panel-level
+        # filter, not a reason to omit a historical Session Anchor from the
+        # audit source.
+        sessions = self.session_supervisor.list_sessions(include_hidden=True)[:200]
         anchor_identity_sources: list[dict[str, Any]] = []
         for provider in ("CODEX", "CLAUDE", "GROK"):
             anchor_identity_sources.extend(
@@ -16992,41 +17121,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         last_message_at = multi_preview.get("last_message_at")
         room_id = multi_preview.get("room_id")
 
-        # Classic Project Room turns only for the *default* session on that node
-        # (otherwise every DISCONNECTED twin shows the same last chat).
-        if not preview_lines and node and bool(session.get("is_default")):
-            try:
-                project_messages = self.store.list_room_messages(node, limit=500)
-            except UniverseError:
-                project_messages = []
-            if project_messages:
-                recent = project_messages[-2:]
-                for message in recent:
-                    text = str(
-                        message.get("body")
-                        or message.get("body_text")
-                        or message.get("text")
-                        or ""
-                    ).strip()
-                    if not text:
-                        continue
-                    preview_lines.append(
-                        {
-                            "author_role": message.get("role")
-                            or message.get("author_role")
-                            or message.get("speaker")
-                            or "?",
-                            "text": text[:240],
-                            "created_at": message.get("created_at")
-                            or message.get("updated_at"),
-                        }
-                    )
-                if preview_lines:
-                    preview_source = "PROJECT_ROOM_DEFAULT"
-                    preview_match = "DEFAULT_NODE"
-                    last_message_at = preview_lines[-1].get("created_at")
-                    room_id = f"project_room:{node}"
-
         # Do NOT promote shared bounded_summary into fake chat lines — many
         # inject rows use the same summary string and look identical.
 
@@ -17092,6 +17186,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         card["last_message_at"] = last_message_at
         card["last_anchor_at"] = anchor_at
         current_anchor_ref = current_anchor_ref or "UNKNOWN"
+        session_anchor_ref = str(
+            session.get("session_anchor_ref") or current_anchor_ref
+        )
+        project_mode_anchor = session.get("project_mode_anchor")
         anchor_identity = {
             "project_id": card.get("current_project_id") or (node if node else None),
             "node": node or "UNKNOWN",
@@ -17099,10 +17197,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "current_anchor_ref": current_anchor_ref,
             "observer_currentness": card.get("currentness") or "UNKNOWN",
             "currentness_source": card.get("anchor_currentness_source") or "UNKNOWN",
+            "session_anchor_ref": session_anchor_ref,
+            "project_mode_anchor_ref": (
+                project_mode_anchor.get("anchor_ref")
+                if isinstance(project_mode_anchor, Mapping)
+                else None
+            ),
+            "selection_scope": "UI_NAVIGATION_ONLY",
         }
-        anchor_identity["anchor_key"] = (
-            "anchor_session_" + _json_sha256(anchor_identity)[:24]
-        )
+        anchor_identity["anchor_key"] = session_anchor_ref
         anchor_alias = str(session.get("alias") or "").strip()
         anchor_alias = re.sub(
             r"\s+\|\s+(?:AUTO|CODEX|CLAUDE|GROK)\s*$",
@@ -17129,6 +17232,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "node": anchor_identity["node"],
             "mode": anchor_identity["mode"],
             "current_anchor_ref": current_anchor_ref,
+            "session_anchor_ref": session_anchor_ref,
+            "project_mode_anchor_ref": anchor_identity["project_mode_anchor_ref"],
         }
         card["preview"] = {
             "source": preview_source,
@@ -17458,14 +17563,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for item in supervisor_sessions
                 if str(item.get("provider") or "").upper() == provider
                 and str(item.get("provider_session_ref") or "") in legacy_refs
-                and (
-                    anchor_observation is not None
-                    or (
-                        bool(item.get("is_default"))
-                        and str(item.get("currentness") or "").upper()
-                        == "CURRENT"
-                    )
-                )
             ]
             matches.sort(
                 key=lambda item: (
@@ -17477,7 +17574,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             bound = matches[0] if matches else None
             binding: dict[str, Any] = {"state": "UNBOUND"}
-            binding_observation = anchor_observation
+            # A persistent Supervisor session already owns its exact vendor
+            # chat key.  Historical Project Anchor observations may enrich an
+            # unbound source, but must not replace that session identity.
+            binding_observation = None if bound is not None else anchor_observation
             if binding_observation is None and bound is not None:
                 bound_node = str(bound.get("node") or "UNKNOWN")
                 bound_project_id = str(
@@ -17511,6 +17611,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "mode": mode,
                     "current_anchor_ref": anchor_ref,
                 }
+                session_anchor_ref = str(
+                    (bound or {}).get("session_anchor_ref") or anchor_ref
+                )
+                project_mode_anchor = (
+                    (bound or {}).get("project_mode_anchor")
+                    if isinstance((bound or {}).get("project_mode_anchor"), Mapping)
+                    else None
+                )
                 observer_currentness = str(
                     binding_observation.get("anchor_session_currentness") or ""
                 ).upper()
@@ -17529,11 +17637,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     else:
                         observer_currentness = "UNKNOWN"
                         currentness_source = "UNKNOWN"
-                effective_default = (
-                    observer_currentness == "CURRENT"
-                    if anchor_observation is not None
-                    else bool(bound is not None and bound.get("is_default"))
-                )
                 binding = {
                     "state": "BOUND" if bound is not None else "ANCHOR_OBSERVED",
                     "current_project_id": anchor_identity["project_id"],
@@ -17544,6 +17647,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         bound.get("alias") if bound is not None else None
                     ),
                     "current_anchor_ref": anchor_ref,
+                    "session_anchor_ref": session_anchor_ref,
+                    "project_mode_anchor_ref": (
+                        project_mode_anchor.get("anchor_ref")
+                        if project_mode_anchor is not None
+                        else None
+                    ),
+                    "vendor_session_chat_key": chat_key,
+                    "selection_scope": "UI_NAVIGATION_ONLY",
                     "origin_anchor_ref": binding_observation.get(
                         "observed_anchor_ref"
                     )
@@ -17553,8 +17664,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     ],
                     "observer_currentness": observer_currentness,
                     "currentness_source": currentness_source,
-                    "anchor_key": "anchor_session_"
-                    + _json_sha256(anchor_identity)[:24],
+                    "anchor_key": session_anchor_ref,
                     "universe_session_id": (
                         bound.get("universe_session_id") or bound.get("session_id")
                         if bound is not None
@@ -17568,7 +17678,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "row_version": (
                         bound.get("row_version") if bound is not None else None
                     ),
-                    "is_default": effective_default,
+                    # Session selection belongs to the UI navigation state;
+                    # no catalog row is the authoritative default chat.
+                    "is_default": False,
                     "supervisor_is_default": bool(
                         bound is not None and bound.get("is_default")
                     ),
@@ -17683,6 +17795,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "mode": mode,
                 "current_anchor_ref": anchor_ref,
             }
+            session_anchor_ref = str(
+                supervisor.get("session_anchor_ref") or anchor_ref
+            )
+            project_mode_anchor = supervisor.get("project_mode_anchor")
             origin = supervisor.get("origin") or {}
             workspace_key = (
                 str(origin.get("workspace_key") or "").strip()
@@ -17715,7 +17831,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if anchor_observation is not None
                 else "UNKNOWN"
             )
-            effective_default = observer_currentness == "CURRENT"
             rows_by_key[chat_key] = {
                 "schema": "universe.provider-chat-room.v1",
                 "chat_key": chat_key,
@@ -17743,6 +17858,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "alias": supervisor.get("alias") or f"{project_id} {mode}",
                     "transport_alias": supervisor.get("alias"),
                     "current_anchor_ref": anchor_ref,
+                    "session_anchor_ref": session_anchor_ref,
+                    "project_mode_anchor_ref": (
+                        project_mode_anchor.get("anchor_ref")
+                        if isinstance(project_mode_anchor, Mapping)
+                        else None
+                    ),
+                    "vendor_session_chat_key": chat_key,
+                    "selection_scope": "UI_NAVIGATION_ONLY",
                     "origin_anchor_ref": anchor_ref,
                     "origin_anchor_temporality": (
                         "SUPERVISOR_CURRENT"
@@ -17752,83 +17875,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     ),
                     "observer_currentness": observer_currentness,
                     "currentness_source": currentness_source,
-                    "anchor_key": "anchor_session_"
-                    + _json_sha256(anchor_identity)[:24],
+                    "anchor_key": session_anchor_ref,
                     "universe_session_id": (
                         supervisor.get("universe_session_id")
                         or supervisor.get("session_id")
                     ),
                     "visibility": supervisor.get("visibility") or "VISIBLE",
                     "row_version": supervisor.get("row_version"),
-                    "is_default": effective_default,
+                    "is_default": False,
                     "supervisor_is_default": bool(supervisor.get("is_default")),
                 },
                 "transcript_content": "EXCLUDED",
             }
 
-        anchor_groups: dict[str, list[dict[str, Any]]] = {}
-        for row in rows_by_key.values():
-            binding = row.get("binding") or {}
-            anchor_key = str(binding.get("anchor_key") or "")
-            if anchor_key and binding.get("state") in {
-                "BOUND",
-                "ANCHOR_OBSERVED",
-            }:
-                anchor_groups.setdefault(anchor_key, []).append(row)
-        for grouped_rooms in anchor_groups.values():
-            has_anchor_db_observation = any(
-                (row.get("binding") or {}).get("currentness_source")
-                == "PROJECT_ANCHOR_DB"
-                for row in grouped_rooms
-            )
-            if has_anchor_db_observation:
-                # The project Anchor DB already selected the one current
-                # observer session. Supervisor default/history must not
-                # overwrite that selection.
-                continue
-            for row in grouped_rooms:
-                binding = row.get("binding") or {}
-                binding["observer_currentness"] = "UNKNOWN"
-                binding["currentness_source"] = "UNKNOWN"
-                binding["is_default"] = False
-
-        rooms_by_anchor: dict[str, dict[str, Any]] = {}
-        unmerged_rooms: list[dict[str, Any]] = []
-        for row in sorted(
-            rows_by_key.values(),
-            key=lambda item: (
-                str(
-                    (item.get("binding") or {}).get("observer_currentness")
-                    or "UNKNOWN"
-                )
-                == "CURRENT",
-                (item.get("binding") or {}).get("state") == "BOUND",
-                bool((item.get("binding") or {}).get("is_default")),
-                str(item.get("last_activity_at") or ""),
-                str(item.get("chat_key") or ""),
-            ),
-            reverse=True,
-        ):
-            binding = row.get("binding") or {}
-            anchor_key = (
-                str(binding.get("anchor_key") or "")
-                if binding.get("state") in {"BOUND", "ANCHOR_OBSERVED"}
-                else ""
-            )
-            if not anchor_key:
-                unmerged_rooms.append(row)
-                continue
-            primary = rooms_by_anchor.get(anchor_key)
-            if primary is None:
-                row["provider_history_count"] = 1
-                rooms_by_anchor[anchor_key] = row
-                continue
-            primary["provider_history_count"] = int(
-                primary.get("provider_history_count") or 1
-            ) + 1
-
+        # A catalog row represents one exact vendor chat owned by one Session
+        # Anchor.  Do not collapse rows under a Mode Anchor: the left-panel
+        # selection is navigation state, not a replacement for session lineage.
         rooms = sorted(
-            [*rooms_by_anchor.values(), *unmerged_rooms],
+            rows_by_key.values(),
             key=lambda item: (
                 str(item.get("last_activity_at") or ""),
                 str(item.get("chat_key") or ""),
@@ -17929,6 +17993,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "current_anchor_ref": str(
                         binding.get("current_anchor_ref") or "UNKNOWN"
                     ),
+                    "origin_session_anchor_ref": str(
+                        binding.get("session_anchor_ref")
+                        or binding.get("current_anchor_ref")
+                        or "UNKNOWN"
+                    ),
+                    "project_mode_anchor_ref": binding.get("project_mode_anchor_ref"),
                     "alias": binding.get("alias") or room.get("display_name"),
                     "model_ref": setting.get("model_ref") or "UNKNOWN",
                     "session_kind": room.get("session_kind") or "CHAT",
@@ -17982,6 +18052,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "current_anchor_ref": str(
                 binding.get("current_anchor_ref") or "UNKNOWN"
             ),
+            "origin_session_anchor_ref": str(
+                binding.get("session_anchor_ref")
+                or binding.get("current_anchor_ref")
+                or "UNKNOWN"
+            ),
+            "project_mode_anchor_ref": binding.get("project_mode_anchor_ref"),
             "alias": binding.get("alias") or room.get("display_name"),
             "model_ref": setting.get("model_ref") or "UNKNOWN",
             "session_kind": room.get("session_kind") or "CHAT",
@@ -20143,6 +20219,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master delegation uses the Project's resident model setting",
                 HTTPStatus.CONFLICT,
             )
+        origin_session_anchor_ref = str(
+            request.get("origin_session_anchor_ref") or ""
+        ).strip()
+        target_session_anchor_ref = str(
+            request.get("target_session_anchor_ref") or ""
+        ).strip()
+        if not origin_session_anchor_ref or not target_session_anchor_ref:
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
+                "cross-session delegation requires both origin and target Session Anchors",
+                HTTPStatus.CONFLICT,
+            )
         project_id = _project_id(record.get("project_id"))
         requested_provider = str(request.get("provider") or "AUTO").upper()
         if requested_provider != "AUTO":
@@ -20153,33 +20241,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "delegation provider does not match the resident Project Master",
                     HTTPStatus.CONFLICT,
                 )
-        message, _created = self.send_project_room_message(
-            project_id,
-            {
-                "kind": "TASK_DRAFT",
-                "sender": "UNIVERSE_CONDUCTOR",
-                "body": _required_text(request.get("summary"), "summary"),
-                "idempotency_key": (
-                    f"conductor-delegation:{record['delegation_id']}"
-                ),
-            },
+        # Project Rooms are meeting/chat surfaces, not the cross-session work
+        # queue.  Until a target Session Anchor transport is installed, retain
+        # the durable delegation record and fail closed without room delivery.
+        raise UniverseError(
+            "TARGET_SESSION_DELEGATION_TRANSPORT_UNAVAILABLE",
+            "no internal transport can rejoin the requested target Session Anchor",
+            HTTPStatus.CONFLICT,
         )
-        if message.get("delivery_state") not in {
-            "QUEUED_FOR_MASTER",
-            "ACCEPTED_BY_MASTER",
-        }:
-            raise UniverseError(
-                "CONDUCTOR_DELEGATION_MASTER_UNAVAILABLE",
-                "Project Master bridge did not retain the delegated message",
-                HTTPStatus.CONFLICT,
-            )
-        return {
-            "progress": {
-                "summary": "Delegation is queued for Project Master acceptance.",
-                "step": "WAITING_FOR_MASTER_ACCEPTANCE",
-                "project_room_message_id": message["message_id"],
-            }
-        }
 
     def _conductor_worker_loop(self) -> None:
         while not self._conductor_stop.is_set():
@@ -21180,6 +21249,45 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             in {"1", "true", "yes"}
                         ),
                     ),
+                },
+            )
+            return
+        if path == "/v1/supervisor/project-mode-anchors":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                anchors = self.server.session_supervisor.list_project_mode_anchors(
+                    project_id=query.get("project_id", [None])[0]
+                )
+            except SessionSupervisorError as error:
+                self._send_supervisor_error(error)
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "PROJECT_MODE_ANCHORS_COLLECTED",
+                    "anchors": anchors,
+                },
+            )
+            return
+        project_mode_anchor_match = re.fullmatch(
+            r"/v1/supervisor/project-mode-anchors/([^/]+)/([^/]+)", path
+        )
+        if project_mode_anchor_match is not None:
+            try:
+                anchor = self.server.session_supervisor.get_project_mode_anchor(
+                    unquote(project_mode_anchor_match.group(1)),
+                    unquote(project_mode_anchor_match.group(2)),
+                )
+            except SessionSupervisorError as error:
+                self._send_supervisor_error(error)
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "PROJECT_MODE_ANCHOR_COLLECTED",
+                    "anchor": anchor,
                 },
             )
             return
@@ -23654,6 +23762,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             approved_task_frame_parts = self._approved_descendant_task_frame_path(path)
+            instruction_task_frame_parts = self._instruction_authorized_task_frame_path(
+                path
+            )
             approved_task_frame_run_parts = self._approved_descendant_task_frame_run_path(path)
             if approved_task_frame_run_parts is not None:
                 self._send(
@@ -23671,6 +23782,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.create_approved_descendant_task_frame(
                         approved_task_frame_parts[0],
                         approved_task_frame_parts[1],
+                        body,
+                    ),
+                )
+                return
+            if instruction_task_frame_parts is not None:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.create_instruction_authorized_task_frame(
+                        instruction_task_frame_parts[0],
+                        instruction_task_frame_parts[1],
                         body,
                     ),
                 )
@@ -24643,6 +24764,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         prefix = "/v1/projects/"
         marker = "/governance-proposals/"
         suffix = "/task-frame"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, proposal_path = remainder.split(marker, 1)
+        proposal_id = proposal_path[: -len(suffix)]
+        if not project_id or "/" in project_id or not proposal_id or "/" in proposal_id:
+            return None
+        return unquote(project_id), unquote(proposal_id)
+
+    @staticmethod
+    def _instruction_authorized_task_frame_path(
+        path: str,
+    ) -> tuple[str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/governance-proposals/"
+        suffix = "/instruction-task-frame"
         if (
             not path.startswith(prefix)
             or marker not in path

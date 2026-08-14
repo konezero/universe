@@ -12,7 +12,7 @@ CSS = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8"
 class ProviderSessionUiContractTests(unittest.TestCase):
     def test_selected_session_uses_native_provider_endpoint_not_room_queue(self) -> None:
         self.assertIn('kind: "PROVIDER_SESSION"', APP)
-        self.assertIn("async function openProviderChatSession(room)", APP)
+        self.assertIn("async function openProviderChatSession(room, options = {})", APP)
         submit_slice = APP[
             APP.index("async function submitDispatch") : APP.index(
                 "async function prepareProjectSeed"
@@ -29,6 +29,26 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertNotIn("/v1/projects/", provider_branch)
         self.assertIn("Sent directly to the selected Provider Session", provider_branch)
 
+    def test_mode_session_selection_keeps_the_exact_provider_coordinate(self) -> None:
+        self.assertIn("selectedSupervisorAnchorKeysByMode: {}", APP)
+        self.assertIn("async function selectNodeModeSession(coordinate, session)", APP)
+        selection_slice = APP[
+            APP.index("async function selectNodeModeSession") : APP.index(
+                "function renderNodeModeSessionCards"
+            )
+        ]
+        self.assertIn("[coordinate.key]: anchorSessionKey(session)", selection_slice)
+        self.assertIn("await openProviderChatSession(room, { session });", selection_slice)
+        open_slice = APP[
+            APP.index("async function openProviderChatSession") : APP.index(
+                "function closeProjectRoomStream"
+            )
+        ]
+        self.assertIn("session_anchor_ref:", open_slice)
+        self.assertIn("vendor_session_id:", open_slice)
+        self.assertIn("chat_key: chatKey", open_slice)
+        self.assertIn("function providerSessionRoomIsOpenable(room)", APP)
+
     def test_provider_session_stream_is_incremental_and_opaque(self) -> None:
         self.assertIn("function openProviderSessionStream(chatKey)", APP)
         self.assertIn("PROVIDER_SESSION_DELTA", APP)
@@ -36,7 +56,7 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("function closeProviderSessionStream(chatKey)", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(
-                "function closeProjectRoomStream"
+                "async function openProviderChatSession"
             )
         ]
         self.assertIn("state.providerSessionStreams[key]", stream_slice)

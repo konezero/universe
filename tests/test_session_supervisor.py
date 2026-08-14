@@ -323,6 +323,45 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertEqual("MASTER-CURRENT-GCS-NEXT", anchored["anchor_ref"])
         self.assertEqual("CURRENT", anchored["currentness"])
 
+    def test_project_mode_anchor_appends_session_anchors_without_selecting_chat(self) -> None:
+        first, _ = self.store.register_session(self.session("session-one"))
+        second, _ = self.store.register_session(self.session("session-two"))
+
+        anchor = self.store.get_project_mode_anchor("GCS", "MASTER")
+        self.assertEqual("universe.project-mode-anchor.v2", anchor["schema"])
+        self.assertEqual(2, anchor["revision"])
+        self.assertEqual(
+            [first["session_anchor_ref"], second["session_anchor_ref"]],
+            [item["session_anchor_ref"] for item in anchor["session_anchor_refs"]],
+        )
+        self.assertNotIn("selected", anchor)
+
+        rebound = self.session("session-one")
+        rebound["provider"] = "CLAUDE"
+        rebound["provider_session_ref"] = "claude-session-one"
+        updated, created = self.store.register_session(rebound)
+        self.assertFalse(created)
+        self.assertEqual(first["session_anchor_ref"], updated["session_anchor_ref"])
+        self.assertEqual(2, self.store.get_project_mode_anchor("GCS", "MASTER")["revision"])
+
+    def test_project_mode_move_creates_new_session_anchor_and_preserves_prior_lineage(self) -> None:
+        session, _ = self.store.register_session(self.session())
+        moved = self.store.bind_current_location(
+            session["session_id"],
+            project_id="GCS",
+            node="GCS",
+            mode="CONDUCTOR",
+            evidence_ref="test://mode-move",
+            expected_version=session["row_version"],
+        )
+
+        self.assertNotEqual(session["session_anchor_ref"], moved["session_anchor_ref"])
+        self.assertEqual(1, self.store.get_project_mode_anchor("GCS", "MASTER")["revision"])
+        conductor = self.store.get_project_mode_anchor("GCS", "CONDUCTOR")
+        self.assertEqual([moved["session_anchor_ref"]], [
+            item["session_anchor_ref"] for item in conductor["session_anchor_refs"]
+        ])
+
     def test_provider_rebind_does_not_demote_exact_owned_process(self) -> None:
         first, _ = self.store.register_session(self.session())
         acquired = self.store.acquire_lease(first["session_id"], self.process())

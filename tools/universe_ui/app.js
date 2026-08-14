@@ -62,6 +62,10 @@ const state = {
   supervisorSessions: [],
   roomSessionBindings: [],
   selectedSupervisorAnchorKey: null,
+  /** A mode can expose many persistent sessions; this is its one chat selection. */
+  selectedSupervisorAnchorKeysByMode: {},
+  /** Expanded left-rail mode whose persistent session cards are visible. */
+  selectedModeCoordinateKey: null,
   observatoryShowAll: false,
   /** Expanded (node|mode) groups so operators can pick an alternate 1:1 session. */
   observatoryExpandedCoords: {},
@@ -433,6 +437,9 @@ function sessionDisplayName(session) {
 }
 
 function anchorSessionKey(session) {
+  if (session?.session_anchor_ref) {
+    return String(session.session_anchor_ref).trim();
+  }
   if (session?.anchor_session?.anchor_key) {
     return session.anchor_session.anchor_key;
   }
@@ -446,7 +453,8 @@ function anchorSessionKey(session) {
 
 function currentAnchorLabel(session) {
   const ref = String(
-    session?.anchor_session?.current_anchor_ref ||
+    session?.session_anchor_ref ||
+      session?.anchor_session?.current_anchor_ref ||
       session?.anchor_ref ||
       "UNKNOWN"
   );
@@ -663,7 +671,33 @@ function uniqueTimeRows(session) {
 
 function selectSupervisorSession(session) {
   state.selectedSupervisorAnchorKey = session ? anchorSessionKey(session) : null;
+  if (session) {
+    const coordinateKey = nodeModeCoordinateKey(session.node, session.mode);
+    state.selectedSupervisorAnchorKeysByMode = {
+      ...state.selectedSupervisorAnchorKeysByMode,
+      [coordinateKey]: anchorSessionKey(session),
+    };
+    state.selectedModeCoordinateKey = coordinateKey;
+  }
   renderSessionObservatory();
+  renderNodeModes();
+}
+
+function sessionAnchorRef(session) {
+  return String(
+    session?.session_anchor_ref ||
+      session?.anchor_session?.current_anchor_ref ||
+      session?.anchor_ref ||
+      ""
+  ).trim();
+}
+
+function nodeModeCoordinateKey(nodeId, mode) {
+  return `${normalizeNodeModeNode(nodeId).toLowerCase()}::${String(
+    mode || ""
+  )
+    .trim()
+    .toUpperCase()}`;
 }
 
 function markdownBody(text) {
@@ -1252,8 +1286,14 @@ async function injectSessionFromObservatory() {
 
 async function activateAnchorSession(session, room = null) {
   if (session) {
-    state.selectedSupervisorAnchorKey = anchorSessionKey(session);
+    selectSupervisorSession(session);
     renderSessionRail();
+    const exactRoom = room || providerChatRoomForSupervisorSession(session);
+    if (exactRoom) {
+      await openProviderChatSession(exactRoom, { session });
+      expandConversationLayer();
+      return;
+    }
     if (session.mode === "MASTER") {
       await attachSelectedMasterSession(session);
       await refreshSupervisorSessions();
@@ -1305,11 +1345,25 @@ function supervisorSessionForRoom(room) {
 function providerChatRoomForSupervisorSession(session) {
   if (!session) return null;
   const sessionKey = anchorSessionKey(session);
+  const anchorRef = sessionAnchorRef(session);
+  const matches = (state.providerChatRooms || []).filter((room) => {
+    const binding = room.binding || {};
+    const boundSession = supervisorSessionForRoom(room);
+    return (
+      (boundSession && anchorSessionKey(boundSession) === sessionKey) ||
+      (anchorRef &&
+        String(binding.session_anchor_ref || binding.current_anchor_ref || "").trim() ===
+          anchorRef)
+    );
+  });
   return (
-    (state.providerChatRooms || []).find((room) => {
-      const boundSession = supervisorSessionForRoom(room);
-      return boundSession && anchorSessionKey(boundSession) === sessionKey;
-    }) || null
+    matches.find(
+      (room) =>
+        anchorRef &&
+        String(
+          room.binding?.session_anchor_ref || room.binding?.current_anchor_ref || ""
+        ).trim() === anchorRef
+    ) || matches[0] || null
   );
 }
 
@@ -1656,7 +1710,7 @@ function nodeModeCoordinates() {
     const normalizedMode = String(mode || "").trim().toUpperCase();
     const project = projectsById.get(normalizedNode.toLowerCase());
     if (!project || !normalizedMode) return;
-    const key = `${normalizedNode.toLowerCase()}::${normalizedMode}`;
+    const key = nodeModeCoordinateKey(normalizedNode, normalizedMode);
     const coordinate = coordinates.get(key) || {
       key,
       nodeId: project.project_id,
@@ -1667,6 +1721,8 @@ function nodeModeCoordinates() {
       hasSession: false,
       room: null,
       session: null,
+      rooms: [],
+      sessions: [],
     };
     coordinate.active = coordinate.active || source.active === true;
     coordinate.current = coordinate.current || source.current === true;
@@ -1676,6 +1732,22 @@ function nodeModeCoordinates() {
     }
     if (source.session && (!coordinate.session || source.active || source.current)) {
       coordinate.session = source.session;
+    }
+    if (
+      source.room &&
+      !coordinate.rooms.some(
+        (room) => String(room.chat_key || "") === String(source.room.chat_key || "")
+      )
+    ) {
+      coordinate.rooms.push(source.room);
+    }
+    if (
+      source.session &&
+      !coordinate.sessions.some(
+        (session) => anchorSessionKey(session) === anchorSessionKey(source.session)
+      )
+    ) {
+      coordinate.sessions.push(source.session);
     }
     coordinates.set(key, coordinate);
   };
@@ -1710,8 +1782,8 @@ function nodeModeCoordinates() {
   const groups = projects.map((project) => {
     const nodeId = project.project_id;
     const modes = nodeModeCatalog(project).map((mode) =>
-      coordinates.get(`${String(nodeId).toLowerCase()}::${mode}`) || {
-        key: `${String(nodeId).toLowerCase()}::${mode}`,
+      coordinates.get(nodeModeCoordinateKey(nodeId, mode)) || {
+        key: nodeModeCoordinateKey(nodeId, mode),
         nodeId,
         project,
         mode,
@@ -1720,6 +1792,8 @@ function nodeModeCoordinates() {
         hasSession: false,
         room: null,
         session: null,
+        rooms: [],
+        sessions: [],
       }
     );
     return { nodeId, project, modes };
@@ -1732,6 +1806,91 @@ function nodeModeStatusLabel(coordinate) {
   return coordinate.hasSession ? "INACTIVE" : "NO SESSION";
 }
 
+function nodeModeSelectedSession(coordinate) {
+  const sessions = coordinate?.sessions || [];
+  const selectedKey = state.selectedSupervisorAnchorKeysByMode[coordinate?.key];
+  return (
+    sessions.find((session) => anchorSessionKey(session) === selectedKey) ||
+    sessions.find((session) => session.is_default) ||
+    sessions[0] ||
+    null
+  );
+}
+
+async function selectNodeModeSession(coordinate, session) {
+  if (!coordinate || !session) return;
+  state.selectedModeCoordinateKey = coordinate.key;
+  state.selectedSupervisorAnchorKey = anchorSessionKey(session);
+  state.selectedSupervisorAnchorKeysByMode = {
+    ...state.selectedSupervisorAnchorKeysByMode,
+    [coordinate.key]: anchorSessionKey(session),
+  };
+  renderNodeModes();
+  renderSessionRail();
+  renderSessionObservatory();
+
+  const room = providerChatRoomForSupervisorSession(session);
+  if (!room) {
+    toast("This persistent session has no attached provider chat", true);
+    return;
+  }
+  await openProviderChatSession(room, { session });
+  expandConversationLayer();
+}
+
+function renderNodeModeSessionCards(coordinate) {
+  const cards = node("div", "node-mode-session-cards");
+  cards.dataset.coordinateKey = coordinate.key;
+  const sessions = coordinate.sessions || [];
+  if (!sessions.length) {
+    cards.append(
+      node("p", "node-mode-session-empty", "No persistent sessions in this mode")
+    );
+    return cards;
+  }
+  const selected = nodeModeSelectedSession(coordinate);
+  for (const session of sessions) {
+    const room = providerChatRoomForSupervisorSession(session);
+    const card = node("button", "node-mode-session-card");
+    card.type = "button";
+    card.dataset.anchorKey = anchorSessionKey(session);
+    card.dataset.selected = String(
+      Boolean(selected && anchorSessionKey(selected) === anchorSessionKey(session))
+    );
+    card.dataset.attached = String(Boolean(room));
+    card.setAttribute(
+      "aria-pressed",
+      String(Boolean(selected && anchorSessionKey(selected) === anchorSessionKey(session)))
+    );
+    const label = node("span", "node-mode-session-copy");
+    label.append(
+      node("strong", "", sessionDisplayName(session)),
+      node(
+        "small",
+        "",
+        `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`
+      )
+    );
+    const status = node(
+      "span",
+      "node-mode-session-status",
+      room ? "CHAT" : String(session.state || "UNKNOWN")
+    );
+    status.dataset.state = String(session.state || "UNKNOWN").toUpperCase();
+    card.append(label, status);
+    card.title = room
+      ? "Open this exact persistent session chat"
+      : "This persistent session has no attached provider chat";
+    card.addEventListener("click", () => {
+      selectNodeModeSession(coordinate, session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+    cards.append(card);
+  }
+  return cards;
+}
+
 function selectNodeModeNode(nodeId) {
   selectProject(nodeId, {
     revealInspector: false,
@@ -1741,13 +1900,10 @@ function selectNodeModeNode(nodeId) {
 }
 
 function openNodeModeCoordinate(coordinate) {
-  // A mode with a registered room always opens the session switch summary,
-  // even when the observed provider is currently inactive or disconnected.
-  if (coordinate.room) {
-    openProviderChatSummary(coordinate.room);
-    return;
-  }
+  // ACTIVE/attached is observed state. It must not select or route a chat.
+  state.selectedModeCoordinateKey = coordinate.key;
   selectNodeModeNode(coordinate.nodeId);
+  renderNodeModes();
 }
 
 function renderNodeModes() {
@@ -1796,9 +1952,8 @@ function renderNodeModes() {
       item.dataset.mode = coordinate.mode;
       item.dataset.active = String(coordinate.active);
       item.dataset.current = String(coordinate.current);
-      item.ariaSelected = String(
-        coordinate.room?.chat_key === state.selectedProviderChatKey
-      );
+      const modeSelected = state.selectedModeCoordinateKey === coordinate.key;
+      item.ariaSelected = String(modeSelected);
       item.title = `${projectDisplayName(group.project)} / ${coordinate.mode} · ${nodeModeStatusLabel(coordinate)}`;
       const copy = node("span", "node-mode-copy");
       copy.append(
@@ -1808,6 +1963,9 @@ function renderNodeModes() {
       item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
+      if (modeSelected) {
+        list.append(renderNodeModeSessionCards(coordinate));
+      }
     }
     section.append(list);
     elements.nodeModeList.append(section);
@@ -1871,7 +2029,6 @@ function renderSessionRail() {
   const appendRoom = (target, room) => {
     const binding = room.binding || { state: "UNBOUND" };
     const isAnchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
-    const boundSession = supervisorSessionForRoom(room);
     const row = node("div", "session-rail-row");
     const item = node("button", "session-rail-item provider-chat-item");
     item.type = "button";
@@ -1879,11 +2036,7 @@ function renderSessionRail() {
     item.dataset.kind = room.session_kind || "CHAT";
     item.classList.toggle(
       "selected",
-      Boolean(
-        room.chat_key === state.selectedProviderChatKey ||
-          (boundSession &&
-            anchorSessionKey(boundSession) === state.selectedSupervisorAnchorKey)
-      )
+      providerSessionRoomIsSelected(room.chat_key)
     );
     const activityState = providerSessionActivityState(room);
     item.dataset.state = activityState;
@@ -1963,11 +2116,7 @@ function renderSessionRail() {
   for (const group of groups) {
     const total = group.current.length + group.past.length + group.unbound.length;
     const hasSelected = [...group.current, ...group.past, ...group.unbound].some(
-      (room) =>
-        room.chat_key === state.selectedProviderChatKey ||
-        supervisorSessionForRoom(room) &&
-          anchorSessionKey(supervisorSessionForRoom(room)) ===
-            state.selectedSupervisorAnchorKey
+      (room) => providerSessionRoomIsSelected(room.chat_key)
     );
     const hasExplicitState = Object.hasOwn(
       state.providerChatExpandedProjects,
@@ -5874,6 +6023,22 @@ function providerSessionActivityState(room) {
   ).toUpperCase();
 }
 
+function providerSessionRoomIsOpenable(room) {
+  const binding = room?.binding || {};
+  const chatKey = String(room?.chat_key || "").trim();
+  const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
+  const bindingState = String(binding.state || "").toUpperCase();
+  const projectId = String(
+    binding.current_project_id || binding.node || ""
+  ).trim();
+  return Boolean(
+    chatKey &&
+      projectId &&
+      sessionKind !== "WORKER" &&
+      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState)
+  );
+}
+
 function providerSessionUnreadCount(room) {
   const key = String(room?.chat_key || "").trim();
   const cache = key ? state.providerSessionRoomCaches[key] : null;
@@ -6002,8 +6167,8 @@ function reconcileProviderSessionStreams() {
 
 async function refreshProviderSession(chatKey) {
   const key = String(chatKey || "").trim();
-  if (!providerSessionRoomIsEligible(providerSessionRoomForChatKey(key))) {
-    throw new Error("This Provider Session is not a current attached session");
+  if (!providerSessionRoomIsOpenable(providerSessionRoomForChatKey(key))) {
+    throw new Error("This Provider Session is not an attached persistent session");
   }
   const snapshot = await api(
     "/v1/provider-sessions/" + encodeURIComponent(key)
@@ -6071,20 +6236,37 @@ function openProviderSessionStream(chatKey) {
   return source;
 }
 
-async function openProviderChatSession(room) {
+async function openProviderChatSession(room, options = {}) {
   const binding = room?.binding || {};
   const projectId = String(
     binding.current_project_id || binding.node || ""
   ).trim();
   const chatKey = String(room?.chat_key || "").trim();
-  if (!projectId || !providerSessionRoomIsEligible(room)) {
-    throw new Error("This Provider Session is not a current attached session");
+  if (!projectId || !providerSessionRoomIsOpenable(room)) {
+    throw new Error("This Provider Session is not an attached persistent session");
   }
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
   closeProjectRoomStream();
   state.selectedProviderChatKey = chatKey;
+  const selectedSession = options.session || supervisorSessionForRoom(room);
+  const selectedSessionAnchorRef = sessionAnchorRef(selectedSession);
+  if (selectedSession && !selectedSessionAnchorRef) {
+    throw new Error("This persistent session has no Session Anchor coordinate");
+  }
+  if (selectedSession) {
+    const coordinateKey = nodeModeCoordinateKey(
+      selectedSession.node,
+      selectedSession.mode
+    );
+    state.selectedSupervisorAnchorKey = anchorSessionKey(selectedSession);
+    state.selectedSupervisorAnchorKeysByMode = {
+      ...state.selectedSupervisorAnchorKeysByMode,
+      [coordinateKey]: anchorSessionKey(selectedSession),
+    };
+    state.selectedModeCoordinateKey = coordinateKey;
+  }
   const setting =
     binding.mode === "CONDUCTOR"
       ? state.providerSettings?.universe_conductor
@@ -6092,6 +6274,15 @@ async function openProviderChatSession(room) {
   state.conversationTarget = {
     kind: "PROVIDER_SESSION",
     chat_key: chatKey,
+    session_anchor_ref:
+      selectedSessionAnchorRef || String(binding.session_anchor_ref || "").trim(),
+    vendor_session_id: String(
+      binding.vendor_session_id ||
+        binding.provider_session_id ||
+        room.provider_session_id ||
+        room.provider_session_ref ||
+        chatKey
+    ).trim(),
     projectId,
     node: binding.node || projectId,
     mode: binding.mode || "MASTER",

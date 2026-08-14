@@ -385,6 +385,7 @@ class SessionSupervisorStore:
                     provider TEXT NOT NULL,
                     provider_session_ref TEXT,
                     anchor_ref TEXT,
+                    session_anchor_ref TEXT,
                     alias TEXT,
                     session_kind TEXT NOT NULL,
                     state TEXT NOT NULL,
@@ -408,6 +409,34 @@ class SessionSupervisorStore:
 
                 CREATE INDEX IF NOT EXISTS session_record_target
                 ON session_record(node, mode, updated_at DESC);
+
+                -- One durable lineage container per Project/Mode. It never
+                -- selects a resident chat; Session Anchors do that.
+                CREATE TABLE IF NOT EXISTS project_mode_anchor (
+                    project_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    anchor_ref TEXT NOT NULL UNIQUE,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, mode)
+                );
+
+                -- Append-only membership: UI selection and provider rebinding
+                -- cannot remove a Session Anchor from the lineage.
+                CREATE TABLE IF NOT EXISTS project_mode_anchor_session (
+                    project_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES session_record(session_id),
+                    attached_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, mode, session_anchor_ref),
+                    UNIQUE(project_id, mode, revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_mode_anchor_session_lookup
+                ON project_mode_anchor_session(project_id, mode, revision);
 
                 CREATE TABLE IF NOT EXISTS session_binding_history (
                     binding_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -501,6 +530,10 @@ class SessionSupervisorStore:
             if "anchor_ref" not in columns:
                 connection.execute(
                     "ALTER TABLE session_record ADD COLUMN anchor_ref TEXT"
+                )
+            if "session_anchor_ref" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_record ADD COLUMN session_anchor_ref TEXT"
                 )
             lease_columns = {
                 str(row[1])
@@ -657,10 +690,19 @@ class SessionSupervisorStore:
                         ),
                         origin_observed_at = COALESCE(origin_observed_at, created_at),
                         current_project_id = COALESCE(current_project_id, node),
-                        last_seen_at = COALESCE(last_seen_at, updated_at)
+                        last_seen_at = COALESCE(last_seen_at, updated_at),
+                        session_anchor_ref = COALESCE(session_anchor_ref, ?)
                     WHERE session_id = ?
                     """,
-                    (provider_ref_hash, session_id),
+                    (
+                        provider_ref_hash,
+                        self._session_anchor_ref(
+                            session_id,
+                            str(record["current_project_id"] or record["node"]),
+                            str(record["mode"]),
+                        ),
+                        session_id,
+                    ),
                 )
                 connection.execute(
                     """
@@ -697,6 +739,21 @@ class SessionSupervisorStore:
                             "migration://session-supervisor/v1",
                             record["created_at"],
                         ),
+                    )
+                refreshed = connection.execute(
+                    "SELECT * FROM session_record WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if refreshed is not None:
+                    self._append_project_mode_anchor(
+                        connection,
+                        project_id=str(
+                            refreshed["current_project_id"] or refreshed["node"]
+                        ),
+                        mode=str(refreshed["mode"]),
+                        session_id=session_id,
+                        session_anchor_ref=str(refreshed["session_anchor_ref"]),
+                        now=now,
                     )
             connection.executescript(
                 """
@@ -749,6 +806,96 @@ class SessionSupervisorStore:
     def _history_ref(prefix: str, *parts: Any) -> str:
         material = "\0".join(str(part or "") for part in parts)
         return f"{prefix}_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _session_anchor_ref(
+        cls, session_id: str, project_id: str, mode: str
+    ) -> str:
+        """Stable Session Anchor identity for one Project/Mode membership."""
+
+        return cls._history_ref(
+            "session_anchor", session_id, project_id, mode.upper()
+        )
+
+    @classmethod
+    def _project_mode_anchor_ref(cls, project_id: str, mode: str) -> str:
+        return cls._history_ref("project_mode_anchor", project_id, mode.upper())
+
+    @classmethod
+    def _append_project_mode_anchor(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        mode: str,
+        session_id: str,
+        session_anchor_ref: str,
+        now: str,
+    ) -> None:
+        """Append a Session Anchor once to its Project/Mode lineage."""
+
+        normalized_project = _required_text(project_id, "project_id")
+        normalized_mode = _required_text(mode, "mode").upper()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO project_mode_anchor(
+                project_id, mode, anchor_ref, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, 0, ?, ?)
+            """,
+            (
+                normalized_project,
+                normalized_mode,
+                cls._project_mode_anchor_ref(normalized_project, normalized_mode),
+                now,
+                now,
+            ),
+        )
+        attached = connection.execute(
+            """
+            SELECT 1 FROM project_mode_anchor_session
+            WHERE project_id = ? AND mode = ? AND session_anchor_ref = ?
+            """,
+            (normalized_project, normalized_mode, session_anchor_ref),
+        ).fetchone()
+        if attached is not None:
+            return
+        anchor = connection.execute(
+            """
+            SELECT revision FROM project_mode_anchor
+            WHERE project_id = ? AND mode = ?
+            """,
+            (normalized_project, normalized_mode),
+        ).fetchone()
+        if anchor is None:
+            raise SessionSupervisorError(
+                "PROJECT_MODE_ANCHOR_INVARIANT_FAILED",
+                "Project/Mode Anchor disappeared during attachment",
+                status=500,
+            )
+        revision = int(anchor["revision"]) + 1
+        connection.execute(
+            """
+            UPDATE project_mode_anchor
+            SET revision = ?, updated_at = ?
+            WHERE project_id = ? AND mode = ?
+            """,
+            (revision, now, normalized_project, normalized_mode),
+        )
+        connection.execute(
+            """
+            INSERT INTO project_mode_anchor_session(
+                project_id, mode, revision, session_anchor_ref, session_id, attached_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_project,
+                normalized_mode,
+                revision,
+                session_anchor_ref,
+                session_id,
+                now,
+            ),
+        )
 
     @classmethod
     def _append_provider_binding(
@@ -908,6 +1055,21 @@ class SessionSupervisorStore:
                         and material.get("anchor_ref") != session["anchor_ref"],
                     )
                 )
+                project_mode_changed = any(
+                    (
+                        material.get("current_project_id") != session["project_id"],
+                        material["mode"] != session["mode"],
+                    )
+                )
+                session_anchor_ref = (
+                    self._session_anchor_ref(
+                        session["session_id"],
+                        str(session["project_id"] or session["node"]),
+                        session["mode"],
+                    )
+                    if project_mode_changed
+                    else str(material["session_anchor_ref"])
+                )
                 summary = session.get("bounded_summary")
                 alias = material.get("alias")
                 if session.get("alias"):
@@ -950,6 +1112,7 @@ class SessionSupervisorStore:
                     SET node = ?, mode = ?, current_project_id = ?,
                         provider = ?, provider_session_ref = ?,
                         anchor_ref = COALESCE(?, anchor_ref),
+                        session_anchor_ref = ?,
                         current_provider_binding_id = COALESCE(?, current_provider_binding_id),
                         current_activity_state = COALESCE(?, current_activity_state),
                         last_seen_at = COALESCE(?, last_seen_at, ?),
@@ -974,6 +1137,7 @@ class SessionSupervisorStore:
                         session["provider"],
                         session["provider_session_ref"],
                         session["anchor_ref"],
+                        session_anchor_ref,
                         binding_ref,
                         session["activity_state"],
                         session["last_seen_at"],
@@ -1030,14 +1194,14 @@ class SessionSupervisorStore:
                 """
                 INSERT INTO session_record(
                     session_id, node, mode, provider, provider_session_ref,
-                    anchor_ref, alias,
+                    anchor_ref, session_anchor_ref, alias,
                     session_kind, state, currentness, bounded_summary,
                     origin_provider, origin_provider_session_ref_hash,
                     origin_workspace_key, origin_observed_at,
                     current_project_id, current_activity_state, last_seen_at,
                     current_provider_binding_id,
                     row_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     session["session_id"],
@@ -1046,6 +1210,11 @@ class SessionSupervisorStore:
                     session["provider"],
                     session["provider_session_ref"],
                     session["anchor_ref"],
+                    self._session_anchor_ref(
+                        session["session_id"],
+                        str(session["project_id"] or session["node"]),
+                        session["mode"],
+                    ),
                     alias,
                     session["session_kind"],
                     session["state"],
@@ -1080,6 +1249,18 @@ class SessionSupervisorStore:
                 anchor_ref=session["anchor_ref"],
                 evidence_ref=session["location_evidence_ref"]
                 or "observation://session-register",
+                now=now,
+            )
+            self._append_project_mode_anchor(
+                connection,
+                project_id=str(session["project_id"] or session["node"]),
+                mode=session["mode"],
+                session_id=session["session_id"],
+                session_anchor_ref=self._session_anchor_ref(
+                    session["session_id"],
+                    str(session["project_id"] or session["node"]),
+                    session["mode"],
+                ),
                 now=now,
             )
             connection.execute(
@@ -1400,6 +1581,20 @@ class SessionSupervisorStore:
                 and prior_default["session_id"] == normalized_id
                 and (row["node"] != normalized_node or row["mode"] != normalized_mode)
             )
+            project_mode_changed = (
+                str(row["current_project_id"] or row["node"])
+                != str(normalized_project or normalized_node)
+                or str(row["mode"]) != normalized_mode
+            )
+            session_anchor_ref = (
+                self._session_anchor_ref(
+                    normalized_id,
+                    str(normalized_project or normalized_node),
+                    normalized_mode,
+                )
+                if project_mode_changed
+                else str(row["session_anchor_ref"])
+            )
             self._append_location(
                 connection,
                 session_id=normalized_id,
@@ -1414,7 +1609,8 @@ class SessionSupervisorStore:
                 """
                 UPDATE session_record
                 SET current_project_id = ?, node = ?, mode = ?,
-                    anchor_ref = COALESCE(?, anchor_ref), currentness = 'CURRENT',
+                    anchor_ref = COALESCE(?, anchor_ref), session_anchor_ref = ?,
+                    currentness = 'CURRENT',
                     row_version = ?, updated_at = ?
                 WHERE session_id = ? AND row_version = ?
                 """,
@@ -1423,11 +1619,20 @@ class SessionSupervisorStore:
                     normalized_node,
                     normalized_mode,
                     normalized_anchor,
+                    session_anchor_ref,
                     version + 1,
                     now,
                     normalized_id,
                     version,
                 ),
+            )
+            self._append_project_mode_anchor(
+                connection,
+                project_id=str(normalized_project or normalized_node),
+                mode=normalized_mode,
+                session_id=normalized_id,
+                session_anchor_ref=session_anchor_ref,
+                now=now,
             )
             if moving_default:
                 connection.execute(
@@ -2431,6 +2636,73 @@ class SessionSupervisorStore:
                 return materials
             return [item for item in materials if item["visibility"] == "VISIBLE"]
 
+    def get_project_mode_anchor(self, project_id: str, mode: str) -> dict[str, Any]:
+        """Return the append-only Session Anchor lineage for one Project/Mode."""
+
+        normalized_project = _required_text(project_id, "project_id")
+        normalized_mode = _required_text(mode, "mode").upper()
+        with self._connection() as connection:
+            anchor = connection.execute(
+                """
+                SELECT anchor_ref, revision, created_at, updated_at
+                FROM project_mode_anchor WHERE project_id = ? AND mode = ?
+                """,
+                (normalized_project, normalized_mode),
+            ).fetchone()
+            if anchor is None:
+                raise SessionSupervisorError(
+                    "PROJECT_MODE_ANCHOR_NOT_FOUND",
+                    "Project/Mode Anchor does not exist",
+                    status=404,
+                )
+            attachments = connection.execute(
+                """
+                SELECT revision, session_anchor_ref, session_id, attached_at
+                FROM project_mode_anchor_session
+                WHERE project_id = ? AND mode = ? ORDER BY revision
+                """,
+                (normalized_project, normalized_mode),
+            ).fetchall()
+        return {
+            "schema": "universe.project-mode-anchor.v2",
+            "project_id": normalized_project,
+            "mode": normalized_mode,
+            "anchor_ref": anchor["anchor_ref"],
+            "revision": int(anchor["revision"]),
+            "session_anchor_refs": [
+                {
+                    "revision": int(item["revision"]),
+                    "session_anchor_ref": item["session_anchor_ref"],
+                    "session_id": item["session_id"],
+                    "attached_at": item["attached_at"],
+                }
+                for item in attachments
+            ],
+            "created_at": anchor["created_at"],
+            "updated_at": anchor["updated_at"],
+        }
+
+    def list_project_mode_anchors(
+        self, *, project_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        normalized_project = (
+            None if project_id is None else _required_text(project_id, "project_id")
+        )
+        with self._connection() as connection:
+            if normalized_project is None:
+                rows = connection.execute(
+                    "SELECT project_id, mode FROM project_mode_anchor ORDER BY project_id, mode"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT project_id, mode FROM project_mode_anchor WHERE project_id = ? ORDER BY mode",
+                    (normalized_project,),
+                ).fetchall()
+        return [
+            self.get_project_mode_anchor(str(row["project_id"]), str(row["mode"]))
+            for row in rows
+        ]
+
     def get_public_session(self, session_id: str) -> dict[str, Any]:
         return self._public_session(self.get_session(session_id))
 
@@ -2747,6 +3019,14 @@ class SessionSupervisorStore:
             "SELECT visibility, updated_at FROM session_visibility WHERE session_id = ?",
             (row["session_id"],),
         ).fetchone()
+        project_id = str(row["current_project_id"] or row["node"])
+        project_mode_anchor = connection.execute(
+            """
+            SELECT anchor_ref, revision, created_at, updated_at
+            FROM project_mode_anchor WHERE project_id = ? AND mode = ?
+            """,
+            (project_id, row["mode"]),
+        ).fetchone()
         return {
             "session_id": row["session_id"],
             "universe_session_id": row["session_id"],
@@ -2755,6 +3035,17 @@ class SessionSupervisorStore:
             "provider": row["provider"],
             "provider_session_ref": row["provider_session_ref"],
             "anchor_ref": row["anchor_ref"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "project_mode_anchor": (
+                {
+                    "anchor_ref": project_mode_anchor["anchor_ref"],
+                    "project_id": project_id,
+                    "mode": row["mode"],
+                    "revision": int(project_mode_anchor["revision"]),
+                }
+                if project_mode_anchor is not None
+                else None
+            ),
             "alias": row["alias"],
             "session_kind": row["session_kind"],
             "state": row["state"],
@@ -2799,6 +3090,8 @@ class SessionSupervisorStore:
         return {
             "schema": "universe.session.v1",
             "universe_session_id": session["universe_session_id"],
+            "session_anchor_ref": session.get("session_anchor_ref"),
+            "project_mode_anchor": session.get("project_mode_anchor"),
             "alias": session.get("alias"),
             "session_kind": session.get("session_kind"),
             "origin": {
