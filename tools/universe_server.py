@@ -16453,6 +16453,85 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         settings["status"] = "CLI_PROVIDER_SETTINGS_COLLECTED"
         return settings
 
+    def _validate_provider_model_pair(
+        self,
+        provider: str,
+        model_ref: str,
+    ) -> None:
+        """Reject a model that is explicitly known to belong to another provider."""
+
+        normalized_provider = str(provider or "").strip().upper()
+        normalized_model = str(model_ref or "").strip()
+        if normalized_provider in {"", "AUTO"} or not normalized_model:
+            return
+
+        explicit_provider = provider_ref_from_model_ref(normalized_model)
+        if explicit_provider != "UNKNOWN" and explicit_provider != normalized_provider:
+            raise UniverseError(
+                "PROVIDER_MODEL_PROVIDER_MISMATCH",
+                f"model_ref belongs to {explicit_provider}, not {normalized_provider}",
+                HTTPStatus.BAD_REQUEST,
+            )
+
+        known_models: dict[str, set[str]] = {
+            provider_name: set()
+            for provider_name in ("GROK", "CODEX", "CLAUDE")
+        }
+        try:
+            capabilities = self.runtime_host.provider_capabilities()
+        except Exception:  # noqa: BLE001 - validation must not break settings reads
+            capabilities = []
+        for capability in capabilities:
+            if not isinstance(capability, Mapping):
+                continue
+            owner = str(capability.get("provider") or "").strip().upper()
+            if owner not in known_models:
+                continue
+            for key in ("model", "model_ref"):
+                value = str(capability.get(key) or "").strip()
+                if value:
+                    known_models[owner].add(value)
+
+        try:
+            catalog = self.provider_model_catalog.snapshot()
+        except Exception:  # noqa: BLE001 - catalog is an optional validation source
+            catalog = {}
+        catalog_providers = (
+            catalog.get("providers") if isinstance(catalog, Mapping) else None
+        )
+        if isinstance(catalog_providers, Mapping):
+            for owner, entry in catalog_providers.items():
+                normalized_owner = str(owner or "").strip().upper()
+                if normalized_owner not in known_models or not isinstance(entry, Mapping):
+                    continue
+                for key in (
+                    "default",
+                    "model",
+                    "models",
+                    "cli_models",
+                    "user_models",
+                ):
+                    value = entry.get(key)
+                    values = value if isinstance(value, list) else [value]
+                    known_models[normalized_owner].update(
+                        str(item).strip()
+                        for item in values
+                        if str(item or "").strip()
+                    )
+
+        owners = {
+            owner
+            for owner, models in known_models.items()
+            if normalized_model in models
+        }
+        if owners and normalized_provider not in owners:
+            owner_text = ", ".join(sorted(owners))
+            raise UniverseError(
+                "PROVIDER_MODEL_PROVIDER_MISMATCH",
+                f"model_ref is registered for {owner_text}, not {normalized_provider}",
+                HTTPStatus.BAD_REQUEST,
+            )
+
     def _ensure_conductor_session_host(self) -> ResidentModeSessionHost:
         with self._conductor_session_host_lock:
             if self.conductor_session_host is None:
@@ -18240,6 +18319,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return profile
 
     def set_universe_provider_setting(self, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        current = self.store.provider_setting("UNIVERSE_CONDUCTOR", "CONDUCTOR")
+        provider = str(request.get("provider") or "").strip().upper()
+        model_ref = str(
+            request.get("model_ref", current.get("model_ref", "")) or ""
+        ).strip()
+        if provider != str(current.get("provider") or "AUTO") and "model_ref" not in request:
+            model_ref = (
+                str(DEFAULT_PRESETS[provider]["default"])
+                if provider in DEFAULT_PRESETS
+                else ""
+            )
+        self._validate_provider_model_pair(provider, model_ref)
         setting = self.store.set_provider_setting(
             "UNIVERSE_CONDUCTOR",
             "CONDUCTOR",
@@ -18265,6 +18357,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         value: Any,
     ) -> dict[str, Any]:
         previous = self.store.provider_setting("PROJECT_MASTER", project_id)
+        request = value if isinstance(value, Mapping) else {}
+        provider = str(request.get("provider") or "").strip().upper()
+        model_ref = str(
+            request.get("model_ref", previous.get("model_ref", "")) or ""
+        ).strip()
+        if provider != str(previous.get("provider") or "AUTO") and "model_ref" not in request:
+            model_ref = (
+                str(DEFAULT_PRESETS[provider]["default"])
+                if provider in DEFAULT_PRESETS
+                else ""
+            )
+        self._validate_provider_model_pair(provider, model_ref)
         setting = self.store.set_provider_setting(
             "PROJECT_MASTER",
             project_id,

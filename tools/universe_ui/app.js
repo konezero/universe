@@ -1401,7 +1401,7 @@ function fillSessionSummaryModelSelect(provider, selectedValue) {
     ),
   ];
   const selected = String(selectedValue || "");
-  if (selected && !models.includes(selected)) models.unshift(selected);
+  const validSelected = selected && models.includes(selected) ? selected : "";
   elements.sessionSummaryModel.replaceChildren();
   for (const modelId of models) {
     const option = node("option", "", modelId);
@@ -1413,7 +1413,8 @@ function fillSessionSummaryModelSelect(provider, selectedValue) {
     option.value = "";
     elements.sessionSummaryModel.append(option);
   }
-  elements.sessionSummaryModel.value = selected || models[0] || "";
+  elements.sessionSummaryModel.value = validSelected || models[0] || "";
+  return elements.sessionSummaryModel.value;
 }
 
 function renderSessionSummaryConnection(room, project, boundSession) {
@@ -1436,7 +1437,7 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   const currentProvider = String(
     room.provider || setting.resolved_provider || setting.provider || "AUTO"
   ).toUpperCase();
-  const currentModel =
+  const configuredModel =
     setting.model_ref ||
     setting.resolved_model ||
     providerCapability(currentProvider)?.model ||
@@ -1470,9 +1471,9 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   if (elements.sessionSummaryProvider.value !== currentProvider) {
     elements.sessionSummaryProvider.selectedIndex = 0;
   }
-  fillSessionSummaryModelSelect(
+  const currentModel = fillSessionSummaryModelSelect(
     elements.sessionSummaryProvider.value,
-    currentModel
+    configuredModel
   );
   elements.sessionSummaryProvider.onchange = () => {
     fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, "");

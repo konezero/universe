@@ -209,6 +209,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('sessionAction = "RESUME"', APP)
         self.assertIn('connectSessionSummaryProviderModel("NEW")', APP)
         self.assertIn("prepareBody.session_action = options.sessionAction", APP)
+        self.assertIn(
+            'const validSelected = selected && models.includes(selected) ? selected : ""',
+            APP,
+        )
 
     def test_conductor_session_uses_the_same_lazy_prepare_attach_route(self) -> None:
         self.assertIn('async function callUniverseConductor(options = {})', APP)

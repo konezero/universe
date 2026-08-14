@@ -2296,7 +2296,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             def provider_capabilities() -> list[dict[str, str]]:
                 return [
                     {"provider": "GROK", "status": "AVAILABLE"},
-                    {"provider": "CODEX", "status": "AVAILABLE"},
+                    {
+                        "provider": "CODEX",
+                        "status": "AVAILABLE",
+                        "model": "gpt-5.6-luna",
+                    },
                 ]
 
             @staticmethod
@@ -2393,6 +2397,27 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("custom-claude-model", explicit["setting"]["model_ref"])
+
+        status, bare_mismatch = self.request(
+            "POST",
+            "/v1/projects/GCS/provider-setting",
+            {"provider": "CLAUDE", "model_ref": "gpt-5.6-luna"},
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual(
+            "PROVIDER_MODEL_PROVIDER_MISMATCH", bare_mismatch["error_code"]
+        )
+
+        status, mismatch = self.request(
+            "POST",
+            "/v1/projects/GCS/provider-setting",
+            {
+                "provider": "CLAUDE",
+                "model_ref": "provider://CODEX/model/gpt-test",
+            },
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("PROVIDER_MODEL_PROVIDER_MISMATCH", mismatch["error_code"])
 
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(
