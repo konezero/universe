@@ -286,6 +286,183 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertTrue(result["worker_id"].startswith("universe-runtime-worker:"))
         self.assertEqual("provider-worker-1", result["provider_worker_ref"])
 
+    def test_dispatch_forwards_validated_bounded_mutation_scope(self) -> None:
+        observed_scope: dict[str, object] = {}
+        target = str(self.root / "tools" / "app.py")
+
+        def post(_endpoint, _token, path, payload):
+            if path == "/v1/task-frame/worker-result":
+                return {"status": "TASK_FRAME_RESULT_RECORDED"}
+            operation = payload["operation"]
+            if operation["operation"] == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {
+                    "status": "TURN_CLAIMED",
+                    "turn": {
+                        "turn_id": operation["turn_id"],
+                        "state": "CLAIMED",
+                        "claimed_by": operation["worker_id"],
+                    },
+                },
+            }
+
+        class Dispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, request):
+                observed_scope.update(
+                    repository_write_scope=request["repository_write_scope"],
+                    mutation_scope=request["mutation_scope"],
+                )
+                return {
+                    "status": "COMPLETED",
+                    "worker_id": "provider-worker-1",
+                    "worker_run_ref": request["worker_run_ref"],
+                    "result_receipt_ref": "result://worker-1",
+                    "result": {
+                        "text": (
+                            '{"outcome":"SUCCEEDED","summary":"done",'
+                            '"evidence_refs":["result://worker-1"],'
+                            '"validation":[{"plane":"focused-tests","state":"PASS",'
+                            '"evidence_refs":["test://focused"]}],'
+                            '"mutation_evidence_refs":["mutation://receipt-1"]}'
+                        )
+                    },
+                    "session_persistence": "EPHEMERAL",
+                    "persistent_session_ref": "UNKNOWN",
+                    "universe_coordinate_persisted": False,
+                }
+
+        request = {
+            **self._dispatch_request(),
+            "repository_write_scope": "BOUNDED",
+            "mutation_scope": {"operations": ["MODIFY"], "targets": [target]},
+            "result_mode": "STRUCTURED_JSON",
+            "output_contract": {
+                "schema": "universe.task-frame-child-result.v1",
+                "mutation_evidence_required": True,
+            },
+        }
+        result = Dispatcher(self.root, post=post).dispatch(request)
+
+        self.assertEqual("BOUNDED", observed_scope["repository_write_scope"])
+        self.assertEqual(
+            {"operations": ["MODIFY"], "targets": [target]},
+            observed_scope["mutation_scope"],
+        )
+        self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
+
+    def test_structured_refusal_recovers_claim_before_result_submission(self) -> None:
+        events: list[str] = []
+
+        def post(_endpoint, _token, path, payload):
+            if path == "/v1/task-frame/worker-result":
+                self.fail("refused child result must not be submitted")
+            operation = payload["operation"]
+            events.append(operation["operation"])
+            if operation["operation"] == "worker_invocation_plan":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "WORKER_INVOCATION_READY",
+                        "worker_invocation": {
+                            "provider": "CODEX",
+                            "model": "test-model",
+                            "input_bundle": {},
+                        },
+                    },
+                }
+            if operation["operation"] == "claim_turn":
+                return {
+                    "status": "TASK_FRAME_OPERATION_APPLIED",
+                    "output": {
+                        "status": "TURN_CLAIMED",
+                        "turn": {
+                            "turn_id": operation["turn_id"],
+                            "state": "CLAIMED",
+                            "claimed_by": operation["worker_id"],
+                        },
+                    },
+                }
+            self.assertEqual("worker_initialization_failed", operation["operation"])
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "WORKER_INITIALIZATION_FAILURE_RECORDED"},
+            }
+
+        class Dispatcher(RuntimeWorkerDispatcher):
+            def provider_capability(self, _provider):
+                return {
+                    "status": "AVAILABLE",
+                    "provider": "CODEX",
+                    "model": "test-model",
+                    "capability_evidence_ref": "host://codex/test",
+                }
+
+            def _invoke_provider(self, _provider, request):
+                return {
+                    "status": "COMPLETED",
+                    "worker_id": "provider-worker-1",
+                    "worker_run_ref": request["worker_run_ref"],
+                    "result_receipt_ref": "result://worker-1",
+                    "result": {
+                        "text": (
+                            '{"outcome":"REFUSED","summary":"no",'
+                            '"evidence_refs":["result://worker-1"],'
+                            '"validation":[{"plane":"focused-tests","state":"NOT_RUN",'
+                            '"evidence_refs":["test://not-run"]}]}'
+                        )
+                    },
+                    "session_persistence": "EPHEMERAL",
+                    "persistent_session_ref": "UNKNOWN",
+                    "universe_coordinate_persisted": False,
+                }
+
+        request = {
+            **self._dispatch_request(),
+            "result_mode": "STRUCTURED_JSON",
+            "output_contract": {
+                "schema": "universe.task-frame-child-result.v1",
+                "mutation_evidence_required": False,
+            },
+        }
+        store = WorkerFailureEvidenceStore(self.root / "worker-failures.sqlite3")
+        with self.assertRaises(WorkerDispatchError) as captured:
+            Dispatcher(
+                self.root,
+                post=post,
+                failure_evidence_store=store,
+            ).dispatch(request)
+
+        self.assertEqual("WORKER_STRUCTURED_RESULT_INVALID", captured.exception.code)
+        self.assertEqual("WORKER_OUTCOME_NOT_SUCCEEDED", captured.exception.reason)
+        self.assertEqual(
+            "WORKER_INITIALIZATION_FAILURE_RECORDED",
+            captured.exception.recovery_status,
+        )
+        self.assertEqual(
+            ["worker_invocation_plan", "claim_turn", "worker_initialization_failed"],
+            events,
+        )
+
     def test_root_boss_can_defer_terminal_result_until_children_finish(self) -> None:
         events: list[str] = []
 

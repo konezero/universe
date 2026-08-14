@@ -554,10 +554,13 @@ class ProjectModeCoordinator:
             raise ProjectMasterHostError("APPROVED_SOURCE_WORK_RECEIPT_INVALID")
         work_receipt_id = _text(work_receipt.get("work_receipt_id"), "work_receipt_id")
 
-        source_ref = _text(
-            primary_proposal.get("source_ref") or primary_proposal.get("request_ref"),
-            "primary.source_ref",
-        )
+        source_ref = normalized_frame["source_ref"]
+        if source_ref == "NONE":
+            source_ref = _text(
+                primary_proposal.get("source_ref")
+                or primary_proposal.get("request_ref"),
+                "primary.source_ref",
+            )
         task_summary_ref = _text(
             (
                 active_work["active_work_ref"]
@@ -577,8 +580,8 @@ class ProjectModeCoordinator:
             "origin_frame_id": binding["frame_id"],
             "task_summary_ref": task_summary_ref,
             "source_ref": source_ref,
-            "candidate_source_ref": "NONE",
-            "source_review_result": None,
+            "candidate_source_ref": normalized_frame["candidate_source_ref"],
+            "source_review_result": normalized_frame["source_review_result"],
             "parent_actor_ref": normalized_frame["parent_actor_ref"],
             "commander_surface": "UNIVERSE_UI",
             "execution_assignment_ref": work_receipt_id,
@@ -713,14 +716,13 @@ class ProjectModeCoordinator:
     ) -> Mapping[str, Any]:
         """Run one approved Frame through the Host-owned worker dispatcher.
 
-        The Runtime owns turn state.  This coordinator only supplies the
-        Parent-facing transport and forwards the exact Runtime-selected
-        provider/model for each declared turn.
+        The Runtime owns turn state. This coordinator supplies the Parent-facing
+        transport and forwards only the exact Runtime-approved mutation scope.
         """
 
         frame_id = _text(task_frame_id, "task_frame_id")
         primary_id = _text(primary_proposal_id, "primary_proposal_id")
-        primary_digest = _text(primary_proposal_digest, "primary_proposal_digest")
+        _text(primary_proposal_digest, "primary_proposal_digest")
         approval_ref = _text(approval_evidence_ref, "approval_evidence_ref")
         binding = self._ensure_runtime(recover_task_frame_id=frame_id)
         self._reopen_task_frame_from_runtime_store(
@@ -754,6 +756,9 @@ class ProjectModeCoordinator:
         turns = plan.get("turns")
         if not isinstance(turns, list) or not all(isinstance(turn, Mapping) for turn in turns):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_TURNS_INVALID")
+        parent_mutation_scope = plan.get("mutation_scope")
+        if not isinstance(parent_mutation_scope, Mapping):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
         boss = next(
             (
                 dict(turn)
@@ -827,7 +832,7 @@ class ProjectModeCoordinator:
             allocations = self._canonical_boss_allocations(
                 structured_result.get("worker_allocations"),
                 turns=turns,
-                summary=str(structured_result.get("summary") or "").strip(),
+                parent_mutation_scope=parent_mutation_scope,
             )
             allocation_result = self._task_frame_operation(
                 binding,
@@ -858,50 +863,75 @@ class ProjectModeCoordinator:
 
         child_results: list[dict[str, str]] = []
         boss_actor_ref = _text(boss_result.get("worker_id"), "boss.worker_id")
-        for turn in turns:
-            if str(turn.get("role") or "").upper() != "SUB_REVIEWER":
-                continue
-            turn_id = _text(turn.get("turn_id"), "execution_plan.turn.turn_id")
-            input_bundle = self._task_frame_operation(
-                binding,
-                frame_id,
-                {"operation": "input_bundle", "turn_id": turn_id},
-            )
-            request = {
-                "schema": "universe.task-frame-worker-dispatch-request.v1",
-                "provider": _text(turn.get("provider"), "execution_plan.turn.provider"),
-                "endpoint": binding["endpoint"],
-                "token": binding["token"],
-                "session_id": binding["session_id"],
-                "frame_id": frame_id,
-                "turn_id": turn_id,
-                "invoker_actor_ref": boss_actor_ref,
-                "repository_write_scope": "NONE",
-                "mutation_scope": {"operations": [], "targets": []},
-                "context_pack": {
-                    "schema": "universe.task-frame-sub-worker-context.v1",
+        allocation_by_turn = {allocation["turn_id"]: allocation for allocation in allocations}
+        try:
+            for turn in turns:
+                role = str(turn.get("role") or "").strip().upper()
+                if role == "BOSS":
+                    continue
+                turn_id = _text(turn.get("turn_id"), "execution_plan.turn.turn_id")
+                allocation = allocation_by_turn.get(turn_id)
+                if allocation is None:
+                    raise ProjectMasterHostError(
+                        "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INCOMPLETE"
+                    )
+                input_bundle = self._task_frame_operation(
+                    binding,
+                    frame_id,
+                    {"operation": "input_bundle", "turn_id": turn_id},
+                )
+                mutation_scope = dict(allocation["mutation_scope"])
+                write_enabled = bool(mutation_scope["operations"])
+                request = {
+                    "schema": "universe.task-frame-worker-dispatch-request.v1",
+                    "provider": _text(turn.get("provider"), "execution_plan.turn.provider"),
+                    "endpoint": binding["endpoint"],
+                    "token": binding["token"],
+                    "session_id": binding["session_id"],
                     "frame_id": frame_id,
-                    "input_bundle": input_bundle,
-                },
-                "output_contract": {
-                    "schema": "universe.task-frame-sub-worker-result.v1",
-                    "instruction": "Return a concise, evidence-backed review result for the supplied allocation.",
-                },
-                "max_turns": 1,
-                "result_mode": "REDACTED",
-            }
-            try:
-                child_result = self.worker_dispatcher.dispatch(request)
-            except WorkerDispatchError as error:
-                raise ProjectMasterHostError(error.code) from error
-            terminal_status = _text(child_result.get("status"), "child.status")
-            if terminal_status not in {
-                "TASK_COMPLETED",
-                "TASK_FRAME_RESULT_RECORDED",
-                "TURN_COMPLETED",
-            }:
-                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_CHILD_RESULT_FAILED")
-            child_results.append({"turn_id": turn_id, "status": terminal_status})
+                    "turn_id": turn_id,
+                    "invoker_actor_ref": boss_actor_ref,
+                    "repository_write_scope": "BOUNDED" if write_enabled else "NONE",
+                    "mutation_scope": mutation_scope,
+                    "context_pack": {
+                        "schema": "universe.task-frame-sub-worker-context.v1",
+                        "frame_id": frame_id,
+                        "semantic_role": role,
+                        "allocation": allocation,
+                        "input_bundle": input_bundle,
+                    },
+                    "output_contract": self._child_result_output_contract(
+                        mutation_evidence_required=write_enabled
+                    ),
+                    "max_turns": 1,
+                    "result_mode": "STRUCTURED_JSON",
+                }
+                try:
+                    child_result = self.worker_dispatcher.dispatch(request)
+                except WorkerDispatchError as error:
+                    raise ProjectMasterHostError(error.code) from error
+                terminal_status = _text(child_result.get("status"), "child.status")
+                if terminal_status not in {
+                    "TASK_COMPLETED",
+                    "TASK_FRAME_RESULT_RECORDED",
+                    "TURN_COMPLETED",
+                } and not terminal_status.startswith("TURN_COMPLETED"):
+                    raise ProjectMasterHostError(
+                        "DESCENDANT_TASK_FRAME_CHILD_RESULT_FAILED"
+                    )
+                child_payload = child_result.get("result")
+                if not isinstance(child_payload, Mapping) or child_payload.get("outcome") != "SUCCEEDED":
+                    raise ProjectMasterHostError(
+                        "DESCENDANT_TASK_FRAME_CHILD_RESULT_INVALID"
+                    )
+                child_results.append({"turn_id": turn_id, "status": terminal_status})
+        except ProjectMasterHostError as error:
+            self._recover_captured_boss_claim(
+                boss_request=boss_request,
+                boss_result=boss_result,
+                reason=str(error),
+            )
+            raise
 
         try:
             boss_completion = self.worker_dispatcher.record_captured_result(
@@ -920,80 +950,180 @@ class ProjectModeCoordinator:
             "child_results": child_results,
             "repository_write": False,
         }
-
     @staticmethod
     def _canonical_boss_allocations(
         raw_allocations: Any,
         *,
         turns: Sequence[Mapping[str, Any]],
-        summary: str,
+        parent_mutation_scope: Mapping[str, Any],
     ) -> list[dict[str, Any]]:
-        declared = {
-            _text(turn.get("turn_id"), "execution_plan.turn.turn_id"): turn
-            for turn in turns
-            if str(turn.get("role") or "").upper() == "SUB_REVIEWER"
+        supported_roles = {
+            "IMPLEMENTER",
+            "SECURITY_REVIEWER",
+            "QA_REVIEWER",
+            "SUB_REVIEWER",
         }
+        declared: dict[str, Mapping[str, Any]] = {}
+        for turn in turns:
+            role = str(turn.get("role") or "").strip().upper()
+            if role == "BOSS":
+                continue
+            if role not in supported_roles:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_WORKER_ROLE_INVALID"
+                )
+            turn_id = _text(turn.get("turn_id"), "execution_plan.turn.turn_id")
+            if turn_id in declared:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
+                )
+            declared[turn_id] = turn
+        if not declared:
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INCOMPLETE"
+            )
+        if set(parent_mutation_scope) != {"operations", "targets"}:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+        parent_operations = parent_mutation_scope.get("operations")
+        parent_targets = parent_mutation_scope.get("targets")
+        if not isinstance(parent_operations, list) or not isinstance(parent_targets, list):
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+        normalized_parent_operations = {
+            _text(value, "execution_plan.mutation_scope.operations").upper()
+            for value in parent_operations
+        }
+        normalized_parent_targets = {
+            _text(value, "execution_plan.mutation_scope.targets")
+            for value in parent_targets
+        }
+        if not normalized_parent_operations or not normalized_parent_targets:
+            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
+
+        if not isinstance(raw_allocations, list):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INVALID"
+            )
+        if len(raw_allocations) != len(declared):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INCOMPLETE"
+            )
         proposals: dict[str, Mapping[str, Any]] = {}
-        unassigned: list[Mapping[str, Any]] = []
-        if isinstance(raw_allocations, list):
-            for item in raw_allocations:
-                if not isinstance(item, Mapping):
-                    continue
-                turn_id = item.get("turn_id")
-                if (
-                    isinstance(turn_id, str)
-                    and turn_id.strip() in declared
-                    and turn_id.strip() not in proposals
-                ):
-                    proposals[turn_id.strip()] = item
-                else:
-                    unassigned.append(item)
-        summary_hint = summary[:1_000] if summary else "No Boss allocation summary was returned."
+        required_fields = {
+            "turn_id",
+            "worker_slot_ref",
+            "worker_path",
+            "task",
+            "expected_output",
+            "mutation_scope",
+            "skill_bindings",
+        }
+        for item in raw_allocations:
+            if not isinstance(item, Mapping) or set(item) != required_fields:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INVALID"
+                )
+            turn_id = _text(item.get("turn_id"), "boss_allocation.turn_id")
+            if turn_id not in declared:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_UNDECLARED"
+                )
+            if turn_id in proposals:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_DUPLICATE"
+                )
+            proposals[turn_id] = item
+        if set(proposals) != set(declared):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INCOMPLETE"
+            )
+
         canonical: list[dict[str, Any]] = []
-        unassigned_iter = iter(unassigned)
         for turn_id, turn in declared.items():
+            proposal = proposals[turn_id]
+            role = str(turn.get("role") or "").strip().upper()
             leaf = turn_id.rsplit("/", 1)[-1]
             if not re.fullmatch(r"[a-zA-Z0-9._-]+", leaf):
-                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
-            proposal = proposals.get(turn_id)
-            if proposal is None:
-                proposal = next(unassigned_iter, None)
-            task = (
-                str(proposal.get("task") or "").strip()
-                if isinstance(proposal, Mapping)
-                else ""
-            )
-            if not task:
-                task = (
-                    "Review the approved parent instruction and prior turn evidence. "
-                    f"Boss context: {summary_hint}"
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
                 )
-            expected_output = (
-                proposal.get("expected_output")
-                if isinstance(proposal, Mapping)
-                else None
+            worker_slot_ref = _text(
+                turn.get("worker_slot_ref"),
+                "execution_plan.turn.worker_slot_ref",
             )
-            if not isinstance(expected_output, Mapping):
-                expected_output = {
-                    "kind": "bounded_sub_review",
-                    "turn_id": turn_id,
-                }
+            worker_path = f"/root/boss/{leaf}"
+            if (
+                _text(proposal.get("worker_slot_ref"), "boss_allocation.worker_slot_ref")
+                != worker_slot_ref
+                or _text(proposal.get("worker_path"), "boss_allocation.worker_path")
+                != worker_path
+            ):
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_IDENTITY_MISMATCH"
+                )
+            task = _text(proposal.get("task"), "boss_allocation.task")
+            expected_output = proposal.get("expected_output")
+            if not isinstance(expected_output, Mapping) or not expected_output:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INVALID"
+                )
+            mutation_scope = proposal.get("mutation_scope")
+            if not isinstance(mutation_scope, Mapping) or set(mutation_scope) != {
+                "operations",
+                "targets",
+            }:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_MUTATION_SCOPE_INVALID"
+                )
+            operations_value = mutation_scope.get("operations")
+            targets_value = mutation_scope.get("targets")
+            if not isinstance(operations_value, list) or not isinstance(targets_value, list):
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_MUTATION_SCOPE_INVALID"
+                )
+            operations = [
+                _text(value, "boss_allocation.mutation_scope.operations").upper()
+                for value in operations_value
+            ]
+            targets = [
+                _text(value, "boss_allocation.mutation_scope.targets")
+                for value in targets_value
+            ]
+            if (
+                len(set(operations)) != len(operations)
+                or len(set(targets)) != len(targets)
+                or bool(operations) != bool(targets)
+                or not set(operations).issubset(normalized_parent_operations)
+                or not set(targets).issubset(normalized_parent_targets)
+            ):
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_MUTATION_SCOPE_INVALID"
+                )
+            if role != "IMPLEMENTER" and (operations or targets):
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_REVIEWER_MUTATION_SCOPE_FORBIDDEN"
+                )
+            skill_bindings = proposal.get("skill_bindings")
+            if not isinstance(skill_bindings, list) or not all(
+                isinstance(binding, Mapping) for binding in skill_bindings
+            ):
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_SKILL_BINDINGS_INVALID"
+                )
             canonical.append(
                 {
                     "turn_id": turn_id,
-                    "worker_slot_ref": _text(
-                        turn.get("worker_slot_ref"),
-                        "execution_plan.turn.worker_slot_ref",
-                    ),
-                    "worker_path": f"/root/boss/{leaf}",
+                    "worker_slot_ref": worker_slot_ref,
+                    "worker_path": worker_path,
                     "task": task,
                     "expected_output": dict(expected_output),
-                    "mutation_scope": {"operations": [], "targets": []},
-                    "skill_bindings": [],
+                    "mutation_scope": {
+                        "operations": operations,
+                        "targets": targets,
+                    },
+                    "skill_bindings": [dict(binding) for binding in skill_bindings],
                 }
             )
         return canonical
-
     def _recover_captured_boss_claim(
         self,
         *,
@@ -1016,18 +1146,38 @@ class ProjectModeCoordinator:
 
     @staticmethod
     def _boss_allocation_output_contract() -> dict[str, Any]:
+        mutation_scope = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["operations", "targets"],
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["CREATE", "MODIFY", "DELETE"]},
+                },
+                "targets": {"type": "array", "items": {"type": "string"}},
+            },
+        }
         allocation = {
             "type": "object",
             "additionalProperties": False,
             "required": [
                 "turn_id",
+                "worker_slot_ref",
+                "worker_path",
                 "task",
                 "expected_output",
+                "mutation_scope",
+                "skill_bindings",
             ],
             "properties": {
                 "turn_id": {"type": "string"},
+                "worker_slot_ref": {"type": "string"},
+                "worker_path": {"type": "string"},
                 "task": {"type": "string"},
                 "expected_output": {"type": "object"},
+                "mutation_scope": mutation_scope,
+                "skill_bindings": {"type": "array", "items": {"type": "object"}},
             },
         }
         return {
@@ -1035,7 +1185,7 @@ class ProjectModeCoordinator:
             "json_schema": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["summary"],
+                "required": ["summary", "worker_allocations"],
                 "properties": {
                     "summary": {"type": "string"},
                     "worker_allocations": {"type": "array", "items": allocation},
@@ -1043,6 +1193,56 @@ class ProjectModeCoordinator:
             },
         }
 
+    @staticmethod
+    def _child_result_output_contract(
+        *, mutation_evidence_required: bool
+    ) -> dict[str, Any]:
+        evidence_refs = {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1},
+        }
+        validation_entry = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["plane", "state", "evidence_refs"],
+            "properties": {
+                "plane": {"type": "string", "minLength": 1},
+                "state": {
+                    "type": "string",
+                    "enum": ["PASS", "FAIL", "NOT_RUN", "NOT_APPLICABLE"],
+                },
+                "evidence_refs": evidence_refs,
+            },
+        }
+        required = ["outcome", "summary", "evidence_refs", "validation"]
+        properties: dict[str, Any] = {
+            "outcome": {"type": "string", "enum": ["SUCCEEDED"]},
+            "summary": {"type": "string", "minLength": 1},
+            "evidence_refs": evidence_refs,
+            "validation": {
+                "type": "array",
+                "minItems": 1,
+                "items": validation_entry,
+            },
+            "mutation_evidence_refs": evidence_refs,
+        }
+        if mutation_evidence_required:
+            required.append("mutation_evidence_refs")
+        return {
+            "schema": "universe.task-frame-child-result.v1",
+            "mutation_evidence_required": mutation_evidence_required,
+            "instruction": (
+                "Return only the structured result. outcome must be SUCCEEDED, "
+                "include evidence references and at least one PASS validation."
+            ),
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": required,
+                "properties": properties,
+            },
+        }
     def _task_frame_operation(
         self,
         binding: Mapping[str, str],
@@ -1068,13 +1268,14 @@ class ProjectModeCoordinator:
 
     @staticmethod
     def _sequential_declared_turns(turns: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        """Project the approved Boss/Worker order into Runtime dependencies.
+        """Project semantic Host roles into the Runtime's Boss/Sub topology."""
 
-        The approved execution plan carries Worker metadata, while the Runtime
-        declaration needs explicit input edges.  Without those edges every
-        turn becomes a root and the Runtime correctly rejects the frame.
-        """
-
+        worker_roles = {
+            "IMPLEMENTER",
+            "SECURITY_REVIEWER",
+            "QA_REVIEWER",
+            "SUB_REVIEWER",
+        }
         declared: list[dict[str, Any]] = []
         previous_turn_id = ""
         root_seen = False
@@ -1083,25 +1284,32 @@ class ProjectModeCoordinator:
             role = _text(turn.get("role"), f"task_frame.turns[{index}].role").upper()
             if role == "BOSS":
                 if root_seen or index != 0:
-                    raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+                    raise ProjectMasterHostError(
+                        "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
+                    )
                 root_seen = True
+                runtime_role = "BOSS"
                 inputs: list[str] = []
             else:
-                if not root_seen:
-                    raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+                if not root_seen or role not in worker_roles:
+                    raise ProjectMasterHostError(
+                        "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
+                    )
+                runtime_role = "SUB_REVIEWER"
                 inputs = [previous_turn_id]
             declared.append(
                 {
                     "turn_id": turn_id,
-                    "role": role,
+                    "role": runtime_role,
                     "input_turn_ids": inputs,
                 }
             )
             previous_turn_id = turn_id
         if not root_seen:
-            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID")
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
+            )
         return declared
-
     def _approved_source_work(
         self,
         *,
@@ -1179,7 +1387,22 @@ class ProjectModeCoordinator:
             "constraints",
             "expected_output",
         }
-        if set(task_frame) != required:
+        candidate_fields = {"candidate_source_ref", "source_review_result"}
+        actual_fields = set(task_frame)
+        if actual_fields == required:
+            source_ref = "NONE"
+            candidate_source_ref = "NONE"
+            source_review_result = None
+        elif actual_fields == required | candidate_fields:
+            (
+                source_ref,
+                candidate_source_ref,
+                source_review_result,
+            ) = self._approved_source_review(
+                candidate_source_ref=task_frame.get("candidate_source_ref"),
+                source_review_result=task_frame.get("source_review_result"),
+            )
+        else:
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_REQUEST_INVALID")
         mutation_scope = task_frame.get("mutation_scope")
         if not isinstance(mutation_scope, Mapping) or set(mutation_scope) != {
@@ -1248,7 +1471,79 @@ class ProjectModeCoordinator:
             ),
             "constraints": list(constraints),
             "expected_output": dict(expected_output),
+            "source_ref": source_ref,
+            "candidate_source_ref": candidate_source_ref,
+            "source_review_result": source_review_result,
         }
+
+    @staticmethod
+    def _approved_source_review(
+        *, candidate_source_ref: Any, source_review_result: Any
+    ) -> tuple[str, str, dict[str, Any]]:
+        candidate_ref = _text(
+            candidate_source_ref, "task_frame.candidate_source_ref"
+        )
+        if candidate_ref.upper() in {"NONE", "UNKNOWN"}:
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_CANDIDATE_SOURCE_REQUIRED"
+            )
+        if not isinstance(source_review_result, Mapping):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_SOURCE_REVIEW_REQUIRED"
+            )
+        result = dict(source_review_result)
+        if (
+            result.get("schema") != "ai-career.source-review-result.v1"
+            or result.get("status") != "SOURCE_REVIEW_PERMITTED"
+            or result.get("review_mode") != "STATIC_REVIEW"
+            or result.get("candidate_execution") != "FORBIDDEN"
+            or result.get("repository_write") is not False
+            or result.get("authority_created") is not False
+            or result.get("execution_assignment_created") is not False
+        ):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_SOURCE_REVIEW_INVALID"
+            )
+        policy = result.get("policy_source")
+        candidate = result.get("candidate_source")
+        if not isinstance(policy, Mapping) or not isinstance(candidate, Mapping):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_SOURCE_REVIEW_INVALID"
+            )
+        policy_ref = _text(policy.get("ref"), "source_review.policy_source.ref")
+        policy_commit = _text(
+            policy.get("commit"), "source_review.policy_source.commit"
+        ).lower()
+        candidate_commit = _text(
+            candidate.get("commit"), "source_review.candidate_source.commit"
+        ).lower()
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", policy_commit)
+            or not re.fullmatch(r"[0-9a-f]{40}", candidate_commit)
+            or policy_commit == candidate_commit
+            or policy_ref == candidate_ref
+            or not candidate_ref.endswith("@" + candidate_commit)
+            or candidate.get("ref") != candidate_ref
+            or candidate.get("classification") != "DATA_ONLY"
+            or candidate.get("policy_activation") != "FORBIDDEN"
+            or str(policy.get("kind") or "").upper()
+            not in {"TRUSTED_BASE", "INSTALLED_DISTRIBUTION"}
+            or policy.get("use") != "REVIEWER_POLICY"
+            or str(policy.get("evidence_ref") or "").strip().upper()
+            in {"", "UNKNOWN"}
+        ):
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_SOURCE_REVIEW_MISMATCH"
+            )
+        try:
+            normalized_result = json.loads(
+                json.dumps(result, ensure_ascii=False, sort_keys=True)
+            )
+        except (TypeError, ValueError) as error:
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_SOURCE_REVIEW_INVALID"
+            ) from error
+        return policy_ref, candidate_ref, normalized_result
 
     @staticmethod
     def _post_runtime(
@@ -1568,6 +1863,8 @@ class ProjectModeCoordinator:
                     command=command,
                     endpoint=endpoint,
                     token=token,
+                    runtime_session_id=session_id,
+                    anchor_id=anchor_id,
                 )
             except Exception:
                 with self._runtime_lock:
@@ -1881,15 +2178,58 @@ class ProjectModeCoordinator:
         command: list[str],
         endpoint: str,
         token: str,
+        runtime_session_id: str,
+        anchor_id: str,
     ) -> None:
         if self.session_supervisor is None:
             return
-        sessions = self.session_supervisor.list_sessions(
-            node=self.session_node, mode=self.requested_mode
+        normalized_runtime_session_id = _text(
+            runtime_session_id, "runtime_session_id"
         )
-        session = next((item for item in sessions if item["is_default"]), None)
-        if session is None:
-            raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
+        normalized_anchor_id = _text(anchor_id, "anchor_id")
+        self.session_supervisor.sweep_stale_live_sessions()
+        session_material = json.dumps(
+            {
+                "node": self.session_node,
+                "mode": self.requested_mode,
+                "provider": "RUNTIME",
+                "runtime_session_id": normalized_runtime_session_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        requested_supervisor_session_id = (
+            "session_"
+            + hashlib.sha256(session_material.encode("utf-8")).hexdigest()[:24]
+        )
+        session, _created = self.session_supervisor.register_session(
+            {
+                "session_id": requested_supervisor_session_id,
+                "node": self.session_node,
+                "project_id": self.project_id,
+                "mode": self.requested_mode,
+                "provider": "RUNTIME",
+                "provider_session_ref": normalized_runtime_session_id,
+                "anchor_ref": normalized_anchor_id,
+                "state": "REGISTERED",
+                "currentness": "CURRENT",
+                "activity_state": "BOOTSTRAPPING",
+                "location_evidence_ref": (
+                    "project-master://"
+                    + self.project_id
+                    + "/task-frame-runtime/"
+                    + normalized_runtime_session_id
+                ),
+                "alias": (
+                    f"{self.project_id} {self.requested_mode} "
+                    "Task Frame Runtime"
+                ),
+                "bounded_summary": (
+                    "Project Master Task Frame Session Boot executor"
+                ),
+            }
+        )
+        supervisor_session_id = str(session["session_id"])
         identity = launched_process_identity(
             process,
             executable=Path(command[0]),
@@ -1902,12 +2242,12 @@ class ProjectModeCoordinator:
             0 if existing is None else int(existing.get("lease_version", 0))
         )
         acquired = self.session_supervisor.acquire_lease(
-            session["session_id"],
+            supervisor_session_id,
             identity,
             expected_lease_version=expected_version,
             stop_capability=token,
         )
-        self._supervisor_session_id = str(session["session_id"])
+        self._supervisor_session_id = supervisor_session_id
         self._lease_token = str(acquired["lease_token"])
         self._lease_version = int(acquired["lease"]["lease_version"])
         self._process_identity = identity
@@ -5780,9 +6120,6 @@ class ResidentProjectMasterHostManager:
         if (
             isinstance(current_lease, Mapping)
             and current_lease.get("lease_state") == "OWNED"
-            and _same_process_identity(
-                current_lease.get("process_identity"), identity
-            )
             and handle.supervisor_lease_token
             and handle.supervisor_lease_version
             == int(current_lease.get("lease_version", -1))
@@ -5902,7 +6239,7 @@ class ResidentProjectMasterHostManager:
             "supervisor_session_id": supervisor_session_id,
             "lease_token": _text(acquired.get("lease_token"), "lease_token"),
             "lease_version": int(acquired_lease["lease_version"]),
-            "process_identity": dict(lease_identity),
+            "process_identity": dict(identity),
         }
 
     def is_resident(self, project_id: str) -> bool:

@@ -5390,6 +5390,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "task_frame": {
                 "frame_id": "gcs-bootstrap-frame-001",
                 "parent_actor_ref": "project-master/GCS",
+                "candidate_source_ref": "git:GCS@" + "2" * 40,
+                "source_review_result": {
+                    "schema": "ai-career.source-review-result.v1",
+                    "status": "SOURCE_REVIEW_PERMITTED",
+                    "policy_source": {
+                        "ref": "installed-runtime://policy@" + "1" * 40,
+                        "commit": "1" * 40,
+                        "kind": "INSTALLED_DISTRIBUTION",
+                        "evidence_ref": "installed-runtime://manifest/verified",
+                        "use": "REVIEWER_POLICY",
+                    },
+                    "candidate_source": {
+                        "ref": "git:GCS@" + "2" * 40,
+                        "commit": "2" * 40,
+                        "policy_activation": "FORBIDDEN",
+                        "classification": "DATA_ONLY",
+                    },
+                    "review_mode": "STATIC_REVIEW",
+                    "repository_write": False,
+                    "authority_created": False,
+                    "execution_assignment_created": False,
+                    "candidate_execution": "FORBIDDEN",
+                },
                 "mutation_scope": {
                     "operations": ["CREATE", "MODIFY"],
                     "targets": [str(self.project_root / "tools" / "bootstrap.py")],
@@ -5440,6 +5463,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("UNIVERSE_UI", forwarded["governance_approval"]["commander_surface"])
         self.assertEqual(evidence_ref, forwarded["governance_approval"]["evidence_ref"])
         self.assertEqual(request["task_frame"], forwarded["task_frame"])
+        self.assertEqual(
+            request["task_frame"]["source_review_result"],
+            forwarded["task_frame"]["source_review_result"],
+        )
 
     def test_conductor_approval_uses_durable_governance_decision(self) -> None:
         proposal = self.create_task_proposal_fixture()
@@ -6159,6 +6186,166 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(409, stale_status)
         self.assertEqual("PROJECT_RELEASE_APPROVAL_STALE", stale["error_code"])
+
+    def test_rboot_prepares_release_db_bound_governance_only_resident(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        selection = {
+            "status": "SELECTED",
+            "project_id": "GCS",
+            "release_id": "core-test",
+            "source_repository": "fixture/universe-private",
+            "source_commit": "b" * 40,
+            "database_sha256": "c" * 64,
+        }
+        context = {
+            "status": "SELECTED",
+            "release_id": "core-test",
+            "source_commit": "b" * 40,
+            "catalog_digest": "d" * 64,
+            "selector_digest": "e" * 64,
+        }
+        planning = {
+            "session_id": "conductor-session",
+            "origin_anchor_ref": "CONDUCTOR-CURRENT-001",
+            "origin_frame_id": "conductor",
+            "binding_evidence_ref": "session-boot://conductor-session/binding",
+            "runtime_currentness_observation": "CURRENT",
+            "source_ref": f"universe-release-db://core-test@{'c' * 64}",
+            "source_commit": "b" * 40,
+            "source_repository": "fixture/universe-private",
+        }
+        connection = {
+            "resident": True,
+            "requested_mode": "MASTER",
+            "session_ref": "provider-session-001",
+            "runtime_observation": {"state": "READY"},
+            "governance_context": context,
+        }
+        prepared = {
+            "status": "PROJECT_MASTER_SESSION_PREPARED",
+            "session_connection": connection,
+        }
+
+        with (
+            patch.object(
+                self.server.store,
+                "selected_project_release_binding",
+                return_value=selection,
+            ),
+            patch.object(
+                self.server,
+                "_project_master_governance_context",
+                return_value=context,
+            ),
+            patch.object(
+                self.server,
+                "_ensure_conductor_planning_runtime",
+                return_value=planning,
+            ) as ensure_conductor,
+            patch.object(
+                self.server,
+                "prepare_project_master_session",
+                return_value=prepared,
+            ) as prepare_master,
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "QUESTION",
+                    "body": "/rboot",
+                    "idempotency_key": "room-rboot-001",
+                },
+                self.token,
+            )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "PROJECT_RELEASE_DB_RESIDENT_BOOT_PREPARED", result["status"]
+        )
+        self.assertEqual("GOVERNANCE_ONLY", result["boot"]["governance_state"])
+        self.assertEqual("INACTIVE", result["boot"]["executor_state"])
+        self.assertEqual("UNASSIGNED", result["boot"]["authority"])
+        self.assertEqual("core-test", result["boot"]["release_id"])
+        self.assertEqual(
+            "ROUTED_TO_RELEASE_DB_RESIDENT_BOOT",
+            result["message"]["delivery_state"],
+        )
+        ensure_conductor.assert_called_once_with()
+        prepare_master.assert_called_once_with("GCS")
+
+    def test_rboot_fails_closed_when_release_context_mismatches(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        selection = {
+            "status": "SELECTED",
+            "project_id": "GCS",
+            "release_id": "core-test",
+            "source_repository": "fixture/universe-private",
+            "source_commit": "b" * 40,
+            "database_sha256": "c" * 64,
+        }
+        mismatched = {
+            "status": "SELECTED",
+            "release_id": "core-other",
+            "source_commit": "b" * 40,
+            "catalog_digest": "d" * 64,
+            "selector_digest": "e" * 64,
+        }
+
+        with (
+            patch.object(
+                self.server.store,
+                "selected_project_release_binding",
+                return_value=selection,
+            ),
+            patch.object(
+                self.server,
+                "_project_master_governance_context",
+                return_value=mismatched,
+            ),
+            patch.object(
+                self.server, "_ensure_conductor_planning_runtime"
+            ) as ensure_conductor,
+            patch.object(self.server, "prepare_project_master_session") as prepare_master,
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "QUESTION",
+                    "body": "/rboot",
+                    "idempotency_key": "room-rboot-mismatch-001",
+                },
+                self.token,
+            )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("RBOOT_RELEASE_CONTEXT_MISMATCH", result["error_code"])
+        ensure_conductor.assert_not_called()
+        prepare_master.assert_not_called()
+
+    def test_untrusted_rboot_text_remains_an_ordinary_room_message(self) -> None:
+        ordinary = ({"message_id": "message-001"}, True)
+        with (
+            patch.object(
+                self.server, "send_project_room_message", return_value=ordinary
+            ) as send_message,
+            patch.object(
+                self.server, "prepare_release_db_resident_boot"
+            ) as prepare_rboot,
+        ):
+            result = self.server.handle_project_room_input(
+                "GCS",
+                {
+                    "kind": "QUESTION",
+                    "body": "/rboot",
+                    "idempotency_key": "room-rboot-untrusted-001",
+                },
+            )
+
+        self.assertEqual("PROJECT_ROOM_MESSAGE_RECORDED", result["status"])
+        send_message.assert_called_once()
+        prepare_rboot.assert_not_called()
 
     def test_os_update_room_command_routes_to_release_lifecycle_not_master(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

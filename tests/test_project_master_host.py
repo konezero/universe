@@ -2491,6 +2491,102 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("current", command[command.index("--frame-id") + 1])
         coordinator.close()
 
+    def test_task_frame_runtime_lease_does_not_replace_master_lease(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        supervisor = SessionSupervisorStore(
+            self.root / "isolated-runtime-lease.sqlite3",
+            process_observer=lambda pid, created_at: {
+                "status": "PROCESS_PRESENT_EXACT",
+                "pid": pid,
+                "process_created_at": created_at,
+            },
+        )
+        master, _created = supervisor.register_session(
+            {
+                "session_id": "session-master-provider",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-code:master-session",
+                "anchor_ref": "MASTER-CURRENT-001",
+                "state": "REGISTERED",
+                "currentness": "CURRENT",
+            }
+        )
+        supervisor.set_default(
+            master["session_id"],
+            expected_pointer_version=master["default_pointer_version"],
+        )
+        master_identity = {
+            "pid": 4101,
+            "process_created_at": "2026-08-14T00:00:00.000000Z",
+            "executable": "C:\\fake\\claude.exe",
+            "command": ["C:\\fake\\claude.exe", "--resume", "master-session"],
+            "endpoint": "http://127.0.0.1:54101",
+            "handshake_fingerprint": "a" * 64,
+        }
+        supervisor.acquire_lease(
+            master["session_id"],
+            master_identity,
+            expected_lease_version=0,
+            stop_capability="master-stop-capability",
+        )
+        master_before = supervisor.get_session(master["session_id"])
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "claude-code:master-session",
+            session_supervisor=supervisor,
+            source_binding_resolver=lambda _root: self._selected_release(),
+        )
+        runtime_identity = {
+            "pid": 4202,
+            "process_created_at": "2026-08-14T00:01:00.000000Z",
+            "executable": "C:\\fake\\python.exe",
+            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "endpoint": "http://127.0.0.1:54202",
+            "handshake_fingerprint": "b" * 64,
+        }
+        with patch(
+            "project_master_host.launched_process_identity",
+            return_value=runtime_identity,
+        ):
+            coordinator._register_process_lease(
+                process=object(),
+                command=["C:\\fake\\python.exe", "session-boot", "serve"],
+                endpoint=runtime_identity["endpoint"],
+                token="runtime-stop-capability",
+                runtime_session_id="project-master-gcs-master",
+                anchor_id="MASTER-CURRENT-001",
+            )
+
+        master_after_acquire = supervisor.get_session(master["session_id"])
+        runtime = next(
+            item
+            for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+            if item["provider"] == "RUNTIME"
+        )
+        default = next(
+            item
+            for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+            if item["is_default"]
+        )
+        self.assertEqual(master["session_id"], default["session_id"])
+        self.assertEqual(master_before["process_lease"], master_after_acquire["process_lease"])
+        self.assertNotEqual(master["session_id"], runtime["session_id"])
+        self.assertEqual("OWNED", runtime["process_lease"]["lease_state"])
+        self.assertEqual(4202, runtime["process_lease"]["process_identity"]["pid"])
+
+        coordinator._mark_stale_if_owned("TEST_RUNTIME_COMPLETE")
+        master_after_cleanup = supervisor.get_session(master["session_id"])
+        runtime_after_cleanup = supervisor.get_session(runtime["session_id"])
+        self.assertEqual(master_before["process_lease"], master_after_cleanup["process_lease"])
+        self.assertEqual("STALE", runtime_after_cleanup["process_lease"]["lease_state"])
+
     def test_project_mode_coordinator_preserves_runtime_error_code(self) -> None:
         runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
@@ -2628,8 +2724,38 @@ class ProjectMasterHostTests(unittest.TestCase):
             "task_summary": primary["task_summary"],
             "instruction_ref": approval["evidence_ref"],
         }
+        candidate_commit = "2" * 40
+        policy_commit = "1" * 40
+        candidate_source_ref = f"git:{self.root.as_posix()}@{candidate_commit}"
+        source_review_result = {
+            "schema": "ai-career.source-review-result.v1",
+            "status": "SOURCE_REVIEW_PERMITTED",
+            "policy_source": {
+                "ref": f"installed-runtime://policy@{policy_commit}",
+                "commit": policy_commit,
+                "kind": "INSTALLED_DISTRIBUTION",
+                "evidence_ref": "installed-runtime://manifest/verified",
+                "use": "REVIEWER_POLICY",
+            },
+            "candidate_source": {
+                "ref": candidate_source_ref,
+                "commit": candidate_commit,
+                "policy_activation": "FORBIDDEN",
+                "classification": "DATA_ONLY",
+            },
+            "review_mode": "STATIC_REVIEW",
+            "repository_write": False,
+            "authority_created": False,
+            "execution_assignment_created": False,
+            "candidate_execution": "FORBIDDEN",
+            "execution_environment": "NOT_APPLICABLE",
+            "test_status": "NOT_RUN_UNTRUSTED",
+            "reasons": [],
+        }
         task_frame = {
             "frame_id": "gcs-primary-001",
+            "candidate_source_ref": candidate_source_ref,
+            "source_review_result": source_review_result,
             "parent_actor_ref": "project-master:GCS",
             "mutation_scope": {
                 "operations": ["CREATE", "MODIFY"],
@@ -2702,6 +2828,9 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("work-receipt-001", plan["execution_assignment_ref"])
         self.assertEqual("UNIVERSE_UI", plan["commander_surface"])
         self.assertEqual(task_frame["mutation_scope"], plan["mutation_scope"])
+        self.assertEqual(candidate_source_ref, plan["candidate_source_ref"])
+        self.assertEqual(source_review_result, plan["source_review_result"])
+        self.assertEqual(source_review_result["policy_source"]["ref"], plan["source_ref"])
         self.assertEqual(
             approval["active_work"]["active_work_ref"], plan["task_summary_ref"]
         )
@@ -2737,6 +2866,51 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertNotIn("token", result)
         self.assertNotIn("endpoint", result)
+
+    def test_approved_source_review_rejects_none_candidate_ref(self) -> None:
+        with self.assertRaisesRegex(
+            ProjectMasterHostError,
+            "DESCENDANT_TASK_FRAME_CANDIDATE_SOURCE_REQUIRED",
+        ):
+            ProjectModeCoordinator._approved_source_review(
+                candidate_source_ref="NONE",
+                source_review_result={},
+            )
+
+    def test_approved_source_review_rejects_candidate_ref_mismatch(self) -> None:
+        candidate_commit = "2" * 40
+        policy_commit = "1" * 40
+        candidate_ref = f"git:{self.root.as_posix()}@{candidate_commit}"
+        result = {
+            "schema": "ai-career.source-review-result.v1",
+            "status": "SOURCE_REVIEW_PERMITTED",
+            "policy_source": {
+                "ref": f"installed-runtime://policy@{policy_commit}",
+                "commit": policy_commit,
+                "kind": "INSTALLED_DISTRIBUTION",
+                "evidence_ref": "installed-runtime://manifest/verified",
+                "use": "REVIEWER_POLICY",
+            },
+            "candidate_source": {
+                "ref": "git:C:/wrong@" + candidate_commit,
+                "commit": candidate_commit,
+                "policy_activation": "FORBIDDEN",
+                "classification": "DATA_ONLY",
+            },
+            "review_mode": "STATIC_REVIEW",
+            "repository_write": False,
+            "authority_created": False,
+            "execution_assignment_created": False,
+            "candidate_execution": "FORBIDDEN",
+        }
+        with self.assertRaisesRegex(
+            ProjectMasterHostError,
+            "DESCENDANT_TASK_FRAME_SOURCE_REVIEW_MISMATCH",
+        ):
+            ProjectModeCoordinator._approved_source_review(
+                candidate_source_ref=candidate_ref,
+                source_review_result=result,
+            )
 
     def test_runtime_session_id_recovers_exact_unfinished_task_frame(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
@@ -2806,6 +2980,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        target = str(self.root / "tools" / "app.py")
         dispatches: list[dict[str, Any]] = []
 
         class Dispatcher:
@@ -2827,17 +3002,17 @@ class ProjectMasterHostTests(unittest.TestCase):
                             "review_decision": "",
                         },
                         "structured_result": {
-                            "summary": "Delegate the focused verification.",
+                            "summary": "Delegate the bounded implementation.",
                             "worker_allocations": [
                                 {
-                                    "turn_id": "review",
-                                    "worker_slot_ref": "review-worker",
-                                    "worker_path": "/root/boss/review",
-                                    "task": "Review the approved work.",
-                                    "expected_output": {"result": "review"},
+                                    "turn_id": "implement",
+                                    "worker_slot_ref": "implementation-worker",
+                                    "worker_path": "/root/boss/implement",
+                                    "task": "Implement the approved work.",
+                                    "expected_output": {"result": "implementation"},
                                     "mutation_scope": {
-                                        "operations": [],
-                                        "targets": [],
+                                        "operations": ["MODIFY"],
+                                        "targets": [target],
                                     },
                                     "skill_bindings": [],
                                 }
@@ -2846,7 +3021,20 @@ class ProjectMasterHostTests(unittest.TestCase):
                     }
                 return {
                     "status": "TURN_COMPLETED",
-                    "worker_id": "review-worker-001",
+                    "worker_id": "implementation-worker-001",
+                    "result": {
+                        "outcome": "SUCCEEDED",
+                        "summary": "Implemented and verified.",
+                        "evidence_refs": ["result://implementation"],
+                        "validation": [
+                            {
+                                "plane": "focused-tests",
+                                "state": "PASS",
+                                "evidence_refs": ["test://focused"],
+                            }
+                        ],
+                        "mutation_evidence_refs": ["mutation://receipt-1"],
+                    },
                 }
 
             def record_captured_result(self, request, envelope):
@@ -2870,6 +3058,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         plan = {
             "frame_id": "gcs-primary-001",
             "parent_actor_ref": "project-master:GCS",
+            "mutation_scope": {"operations": ["MODIFY"], "targets": [target]},
             "turns": [
                 {
                     "turn_id": "boss",
@@ -2880,9 +3069,9 @@ class ProjectMasterHostTests(unittest.TestCase):
                     "reasoning_effort": "max",
                 },
                 {
-                    "turn_id": "review",
-                    "role": "SUB_REVIEWER",
-                    "worker_slot_ref": "review-worker",
+                    "turn_id": "implement",
+                    "role": "IMPLEMENTER",
+                    "worker_slot_ref": "implementation-worker",
                     "provider": "GROK",
                     "model": "grok-4.5",
                     "reasoning_effort": "high",
@@ -2897,9 +3086,7 @@ class ProjectMasterHostTests(unittest.TestCase):
                 return {
                     "status": "TURN_INPUTS_READY",
                     "parent_instruction_bundle": {
-                        "instructions": [
-                            {"instruction_digest": "a" * 64}
-                        ]
+                        "instructions": [{"instruction_digest": "a" * 64}]
                     },
                 }
             if operation["operation"] == "submit_boss_allocations":
@@ -2936,11 +3123,78 @@ class ProjectMasterHostTests(unittest.TestCase):
             binding=binding,
             task_frame_id="gcs-primary-001",
         )
-        self.assertEqual(["boss", "review"], [call["turn_id"] for call in dispatches])
+        self.assertEqual(["boss", "implement"], [call["turn_id"] for call in dispatches])
         self.assertTrue(dispatches[0]["defer_terminal_result"])
         self.assertEqual("boss-worker-001", dispatches[1]["invoker_actor_ref"])
+        self.assertEqual("BOUNDED", dispatches[1]["repository_write_scope"])
+        self.assertEqual(
+            {"operations": ["MODIFY"], "targets": [target]},
+            dispatches[1]["mutation_scope"],
+        )
+        self.assertEqual(
+            "universe.task-frame-child-result.v1",
+            dispatches[1]["output_contract"]["schema"],
+        )
         self.assertEqual("submit_boss_allocations", operations[1]["operation"])
 
+    def test_boss_allocations_fail_closed_on_missing_or_reviewer_mutation(self) -> None:
+        target = str(self.root / "tools" / "app.py")
+        turns = [
+            {"turn_id": "boss", "role": "BOSS", "worker_slot_ref": "boss-worker"},
+            {
+                "turn_id": "security",
+                "role": "SECURITY_REVIEWER",
+                "worker_slot_ref": "security-worker",
+            },
+        ]
+        parent_scope = {"operations": ["MODIFY"], "targets": [target]}
+
+        with self.assertRaises(ProjectMasterHostError) as missing:
+            ProjectModeCoordinator._canonical_boss_allocations(
+                [], turns=turns, parent_mutation_scope=parent_scope
+            )
+        self.assertEqual(
+            "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INCOMPLETE", str(missing.exception)
+        )
+
+        reviewer_allocation = {
+            "turn_id": "security",
+            "worker_slot_ref": "security-worker",
+            "worker_path": "/root/boss/security",
+            "task": "Review security.",
+            "expected_output": {"result": "security-review"},
+            "mutation_scope": {"operations": ["MODIFY"], "targets": [target]},
+            "skill_bindings": [],
+        }
+        with self.assertRaises(ProjectMasterHostError) as reviewer:
+            ProjectModeCoordinator._canonical_boss_allocations(
+                [reviewer_allocation],
+                turns=turns,
+                parent_mutation_scope=parent_scope,
+            )
+        self.assertEqual(
+            "DESCENDANT_TASK_FRAME_REVIEWER_MUTATION_SCOPE_FORBIDDEN",
+            str(reviewer.exception),
+        )
+
+    def test_semantic_worker_roles_project_to_runtime_sub_reviewer(self) -> None:
+        declared = ProjectModeCoordinator._sequential_declared_turns(
+            [
+                {"turn_id": "boss", "role": "BOSS"},
+                {"turn_id": "implement", "role": "IMPLEMENTER"},
+                {"turn_id": "security", "role": "SECURITY_REVIEWER"},
+                {"turn_id": "qa", "role": "QA_REVIEWER"},
+            ]
+        )
+
+        self.assertEqual(
+            ["BOSS", "SUB_REVIEWER", "SUB_REVIEWER", "SUB_REVIEWER"],
+            [turn["role"] for turn in declared],
+        )
+        self.assertEqual(
+            [[], ["boss"], ["implement"], ["security"]],
+            [turn["input_turn_ids"] for turn in declared],
+        )
     def test_approved_descendant_rejects_target_outside_primary_roots(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
@@ -3180,6 +3434,17 @@ class ProjectMasterHostTests(unittest.TestCase):
                 self.assertEqual("OWNED", live["process_lease"]["lease_state"])
                 self.assertEqual(4321, live["process_lease"]["process_identity"]["pid"])
                 handle = manager._handles["GCS"]
+                owned_before_reuse = supervisor.get_session(
+                    handle.supervisor_session_id
+                )["process_lease"]
+                reused_owned = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                owned_after_reuse = supervisor.get_session(
+                    handle.supervisor_session_id
+                )["process_lease"]
+                self.assertEqual("RESIDENT", reused_owned["status"])
+                self.assertEqual(owned_before_reuse, owned_after_reuse)
                 supervisor.mark_lease_stale(
                     handle.supervisor_session_id,
                     handle.supervisor_process_identity,

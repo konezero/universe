@@ -286,6 +286,7 @@ PROJECT_RELEASE_ROOM_COMMAND_PATTERN = re.compile(
     r"(?<![A-Z0-9])OS[_ -]?UPDATE(?![A-Z0-9])",
     re.IGNORECASE,
 )
+RBOOT_ROOM_COMMAND_PATTERN = re.compile(r"^/rboot$", re.IGNORECASE)
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
 ACTIVE_WORK_REFERENCE_SCHEMA = "universe.active-work-reference.v1"
 DIRECT_COMMANDER_ACCESS_SURFACES = frozenset(
@@ -18880,6 +18881,159 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.publish_project_room_changed(project_id)
         return message, created
 
+    def prepare_release_db_resident_boot(
+        self,
+        project_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        """Prepare the Release DB-bound Conductor and resident Project Master."""
+
+        selection = self.store.selected_project_release_binding(project_id)
+        if selection.get("status") != "SELECTED":
+            raise UniverseError(
+                "RBOOT_RELEASE_SELECTION_REQUIRED",
+                f"Project {project_id} has no selected immutable Release DB",
+                HTTPStatus.CONFLICT,
+            )
+        release_id = _required_text(selection.get("release_id"), "release_id")
+        source_commit = _source_commit(selection.get("source_commit"))
+        database_sha256 = _sha256(
+            selection.get("database_sha256"), "database_sha256"
+        )
+        source_repository = _required_text(
+            selection.get("source_repository"), "source_repository"
+        )
+        source_ref = f"universe-release-db://{release_id}@{database_sha256}"
+
+        context = self._project_master_governance_context(project_id)
+        if not isinstance(context, Mapping) or context.get("status") != "SELECTED":
+            raise UniverseError(
+                "RBOOT_GOVERNANCE_CONTEXT_UNAVAILABLE",
+                "The selected Release DB did not return a governance context",
+                HTTPStatus.CONFLICT,
+            )
+        context_release_id = _required_text(
+            context.get("release_id"), "governance_context.release_id"
+        )
+        context_source_commit = _source_commit(context.get("source_commit"))
+        catalog_digest = _sha256(
+            context.get("catalog_digest"), "governance_context.catalog_digest"
+        )
+        selector_digest = _sha256(
+            context.get("selector_digest"), "governance_context.selector_digest"
+        )
+        if (
+            context_release_id != release_id
+            or context_source_commit != source_commit
+        ):
+            raise UniverseError(
+                "RBOOT_RELEASE_CONTEXT_MISMATCH",
+                (
+                    "Release selection and governance context do not share one "
+                    "immutable source"
+                ),
+                HTTPStatus.CONFLICT,
+            )
+
+        planning = self._ensure_conductor_planning_runtime()
+        if not isinstance(planning, Mapping):
+            status = self.planning_binding_status()
+            raise UniverseError(
+                "RBOOT_CONDUCTOR_PREPARATION_FAILED",
+                str(
+                    status.get("reason")
+                    or status.get("error_code")
+                    or status["status"]
+                ),
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if (
+            planning.get("runtime_currentness_observation") != "CURRENT"
+            or planning.get("source_ref") != source_ref
+            or planning.get("source_commit") != source_commit
+            or planning.get("source_repository") != source_repository
+            or any(
+                str(planning.get(field) or "UNKNOWN").upper() == "UNKNOWN"
+                for field in (
+                    "session_id",
+                    "origin_anchor_ref",
+                    "origin_frame_id",
+                    "binding_evidence_ref",
+                )
+            )
+        ):
+            raise UniverseError(
+                "RBOOT_CONDUCTOR_EVIDENCE_NOT_CURRENT",
+                "Conductor Session Boot evidence is missing, stale, or bound to another source",
+                HTTPStatus.CONFLICT,
+            )
+
+        resident = self.prepare_project_master_session(project_id)
+        connection = resident.get("session_connection")
+        resident_context = (
+            connection.get("governance_context")
+            if isinstance(connection, Mapping)
+            else None
+        )
+        runtime_observation = (
+            connection.get("runtime_observation")
+            if isinstance(connection, Mapping)
+            else None
+        )
+        if (
+            resident.get("status") != "PROJECT_MASTER_SESSION_PREPARED"
+            or not isinstance(connection, Mapping)
+            or connection.get("resident") is not True
+            or connection.get("requested_mode") != "MASTER"
+            or str(connection.get("session_ref") or "UNKNOWN").upper() == "UNKNOWN"
+            or not isinstance(runtime_observation, Mapping)
+            or str(runtime_observation.get("state") or "UNKNOWN").upper()
+            == "UNKNOWN"
+            or not isinstance(resident_context, Mapping)
+            or resident_context.get("status") != "SELECTED"
+            or resident_context.get("release_id") != release_id
+            or resident_context.get("source_commit") != source_commit
+            or resident_context.get("catalog_digest") != catalog_digest
+            or resident_context.get("selector_digest") != selector_digest
+        ):
+            raise UniverseError(
+                "RBOOT_RESIDENT_MASTER_EVIDENCE_INVALID",
+                "Resident Project Master evidence is missing or does not match the Release DB context",
+                HTTPStatus.CONFLICT,
+            )
+
+        delivery = {
+            "status": "RELEASE_DB_RESIDENT_BOOT_PREPARED",
+            "governance_state": "GOVERNANCE_ONLY",
+            "executor_state": "INACTIVE",
+            "mode": "CONDUCTOR",
+            "authority": "UNASSIGNED",
+            "execution_assignment": "UNASSIGNED",
+            "release_id": release_id,
+            "database_sha256": database_sha256,
+            "source_commit": source_commit,
+            "catalog_digest": catalog_digest,
+            "selector_digest": selector_digest,
+            "session_id": planning["session_id"],
+            "origin_anchor_ref": planning["origin_anchor_ref"],
+            "origin_frame_id": planning["origin_frame_id"],
+            "binding_evidence_ref": planning["binding_evidence_ref"],
+            "resident_master_session_ref": connection["session_ref"],
+        }
+        message, created = self.store.create_room_message(
+            project_id,
+            value,
+            delivery_state="ROUTED_TO_RELEASE_DB_RESIDENT_BOOT",
+            delivery=delivery,
+        )
+        self.publish_project_room_changed(project_id)
+        return {
+            "status": "PROJECT_RELEASE_DB_RESIDENT_BOOT_PREPARED",
+            "created": created,
+            "message": message,
+            "boot": delivery,
+        }
+
     def handle_project_room_input(
         self,
         project_id: str,
@@ -18892,6 +19046,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         trusted_commander = bool(
             commander_context and commander_context.get("authenticated") is True
         )
+        if trusted_commander and RBOOT_ROOM_COMMAND_PATTERN.fullmatch(body):
+            return self.prepare_release_db_resident_boot(project_id, value)
         is_commander_approval = (
             trusted_commander
             and is_governance_approval_command(body)

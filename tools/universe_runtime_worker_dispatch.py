@@ -351,8 +351,8 @@ class RuntimeWorkerDispatcher:
             "turn_id": request["turn_id"],
             "worker_id": worker_id,
             "worker_run_ref": worker_run_ref,
-            "repository_write_scope": "NONE",
-            "mutation_scope": {"operations": [], "targets": []},
+            "repository_write_scope": request["repository_write_scope"],
+            "mutation_scope": request["mutation_scope"],
             "context_pack": request["context_pack"],
             "output_contract": request["output_contract"],
             "max_turns": request["max_turns"],
@@ -454,6 +454,10 @@ class RuntimeWorkerDispatcher:
                         "WORKER_RESULT_OBJECT_REQUIRED",
                     )
                 structured_result = parsed
+                self._validate_structured_result(
+                    structured_result,
+                    request["output_contract"],
+                )
                 recorded_result = structured_result
 
             model = planned_model
@@ -788,17 +792,80 @@ class RuntimeWorkerDispatcher:
                 "REQUEST_LOAD",
                 "RESULT_MODE_INVALID",
             )
-        mutation_scope = _mapping(raw.get("mutation_scope"), "mutation_scope")
-        if (
-            raw.get("repository_write_scope") != "NONE"
-            or mutation_scope.get("operations") != []
-            or mutation_scope.get("targets") != []
-        ):
+
+        repository_write_scope = str(raw.get("repository_write_scope") or "").strip().upper()
+        if repository_write_scope not in {"NONE", "BOUNDED"}:
             raise WorkerDispatchError(
-                "READ_ONLY_SCOPE_REQUIRED",
+                "WORKER_MUTATION_SCOPE_INVALID",
+                "REQUEST_LOAD",
+                "REPOSITORY_WRITE_SCOPE_INVALID",
+            )
+        mutation_scope = _mapping(raw.get("mutation_scope"), "mutation_scope")
+        if set(mutation_scope) != {"operations", "targets"}:
+            raise WorkerDispatchError(
+                "WORKER_MUTATION_SCOPE_INVALID",
+                "REQUEST_LOAD",
+                "MUTATION_SCOPE_SHAPE_INVALID",
+            )
+        operations_value = mutation_scope.get("operations")
+        targets_value = mutation_scope.get("targets")
+        if not isinstance(operations_value, list) or not isinstance(targets_value, list):
+            raise WorkerDispatchError(
+                "WORKER_MUTATION_SCOPE_INVALID",
+                "REQUEST_LOAD",
+                "MUTATION_SCOPE_LISTS_REQUIRED",
+            )
+        operations: list[str] = []
+        for value in operations_value:
+            if not isinstance(value, str) or not value.strip():
+                raise WorkerDispatchError(
+                    "WORKER_MUTATION_SCOPE_INVALID",
+                    "REQUEST_LOAD",
+                    "MUTATION_OPERATION_INVALID",
+                )
+            operation = value.strip().upper()
+            if operation not in {"CREATE", "MODIFY", "DELETE"} or operation in operations:
+                raise WorkerDispatchError(
+                    "WORKER_MUTATION_SCOPE_INVALID",
+                    "REQUEST_LOAD",
+                    "MUTATION_OPERATION_INVALID",
+                )
+            operations.append(operation)
+        targets: list[str] = []
+        for value in targets_value:
+            if not isinstance(value, str) or not value.strip():
+                raise WorkerDispatchError(
+                    "WORKER_MUTATION_SCOPE_INVALID",
+                    "REQUEST_LOAD",
+                    "MUTATION_TARGET_INVALID",
+                )
+            target = value.strip()
+            if not Path(target).is_absolute() or target in targets:
+                raise WorkerDispatchError(
+                    "WORKER_MUTATION_SCOPE_INVALID",
+                    "REQUEST_LOAD",
+                    "MUTATION_TARGET_INVALID",
+                )
+            targets.append(target)
+        if bool(operations) != bool(targets):
+            raise WorkerDispatchError(
+                "WORKER_MUTATION_SCOPE_INVALID",
+                "REQUEST_LOAD",
+                "MUTATION_SCOPE_INCOMPLETE",
+            )
+        if repository_write_scope == "NONE" and (operations or targets):
+            raise WorkerDispatchError(
+                "WORKER_MUTATION_SCOPE_INVALID",
                 "REQUEST_LOAD",
                 "READ_ONLY_SCOPE_REQUIRED",
             )
+        if repository_write_scope == "BOUNDED" and not operations:
+            raise WorkerDispatchError(
+                "WORKER_MUTATION_SCOPE_INVALID",
+                "REQUEST_LOAD",
+                "BOUNDED_MUTATION_SCOPE_REQUIRED",
+            )
+
         max_turns = raw.get("max_turns", 1)
         if (
             not isinstance(max_turns, int)
@@ -815,7 +882,7 @@ class RuntimeWorkerDispatcher:
             raise WorkerDispatchError(
                 "WORKER_TRANSPORT_FAILED",
                 "REQUEST_LOAD",
-                "DEFER_TERMINAL_RESULT_INVALID",
+                "DEFERRED_RESULT_INVALID",
             )
         return {
             "provider": provider,
@@ -827,6 +894,8 @@ class RuntimeWorkerDispatcher:
             "invoker_actor_ref": _required_text(
                 raw.get("invoker_actor_ref"), "invoker_actor_ref"
             ),
+            "repository_write_scope": repository_write_scope,
+            "mutation_scope": {"operations": operations, "targets": targets},
             "context_pack": _mapping(raw.get("context_pack"), "context_pack"),
             "output_contract": _mapping(raw.get("output_contract"), "output_contract"),
             "max_turns": max_turns,
@@ -834,6 +903,60 @@ class RuntimeWorkerDispatcher:
             "defer_terminal_result": defer_terminal_result,
         }
 
+    @staticmethod
+    def _validate_structured_result(
+        result: Mapping[str, Any], output_contract: Mapping[str, Any]
+    ) -> None:
+        if output_contract.get("schema") != "universe.task-frame-child-result.v1":
+            return
+
+        def invalid(reason: str) -> None:
+            raise WorkerDispatchError(
+                "WORKER_STRUCTURED_RESULT_INVALID",
+                "WORKER_ADAPTER",
+                reason,
+            )
+
+        def evidence_refs(value: Any, reason: str) -> list[str]:
+            if (
+                not isinstance(value, list)
+                or not value
+                or not all(isinstance(item, str) and item.strip() for item in value)
+            ):
+                invalid(reason)
+            return [item.strip() for item in value]
+
+        if result.get("outcome") != "SUCCEEDED":
+            invalid("WORKER_OUTCOME_NOT_SUCCEEDED")
+        if not isinstance(result.get("summary"), str) or not result["summary"].strip():
+            invalid("WORKER_SUMMARY_REQUIRED")
+        evidence_refs(result.get("evidence_refs"), "WORKER_EVIDENCE_REQUIRED")
+        validation = result.get("validation")
+        if not isinstance(validation, list) or not validation:
+            invalid("WORKER_VALIDATION_REQUIRED")
+        pass_seen = False
+        for item in validation:
+            if not isinstance(item, Mapping):
+                invalid("WORKER_VALIDATION_ENTRY_INVALID")
+            if not isinstance(item.get("plane"), str) or not item["plane"].strip():
+                invalid("WORKER_VALIDATION_PLANE_REQUIRED")
+            state = item.get("state")
+            if state not in {"PASS", "FAIL", "NOT_RUN", "NOT_APPLICABLE"}:
+                invalid("WORKER_VALIDATION_STATE_INVALID")
+            evidence_refs(
+                item.get("evidence_refs"),
+                "WORKER_VALIDATION_EVIDENCE_REQUIRED",
+            )
+            if state == "FAIL":
+                invalid("WORKER_VALIDATION_FAILED")
+            pass_seen = pass_seen or state == "PASS"
+        if not pass_seen:
+            invalid("WORKER_VALIDATION_PASS_REQUIRED")
+        if output_contract.get("mutation_evidence_required") is True:
+            evidence_refs(
+                result.get("mutation_evidence_refs"),
+                "WORKER_MUTATION_EVIDENCE_REQUIRED",
+            )
     @staticmethod
     def _skill_bindings(
         planned_invocation: Mapping[str, Any],
