@@ -806,7 +806,7 @@ class ProjectModeCoordinator:
                 "execution_plan": dict(plan),
                 "input_bundle": boss_input,
             },
-            "output_contract": self._boss_allocation_output_contract(),
+            "output_contract": self._boss_allocation_output_contract(turns),
             "max_turns": 1,
             "result_mode": "STRUCTURED_JSON",
             "defer_terminal_result": True,
@@ -1145,7 +1145,9 @@ class ProjectModeCoordinator:
             raise ProjectMasterHostError(error.code) from error
 
     @staticmethod
-    def _boss_allocation_output_contract() -> dict[str, Any]:
+    def _boss_allocation_output_contract(
+        turns: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
         mutation_scope = {
             "type": "object",
             "additionalProperties": False,
@@ -1158,28 +1160,70 @@ class ProjectModeCoordinator:
                 "targets": {"type": "array", "items": {"type": "string"}},
             },
         }
-        allocation = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "turn_id",
-                "worker_slot_ref",
-                "worker_path",
-                "task",
-                "expected_output",
-                "mutation_scope",
-                "skill_bindings",
-            ],
-            "properties": {
-                "turn_id": {"type": "string"},
-                "worker_slot_ref": {"type": "string"},
-                "worker_path": {"type": "string"},
-                "task": {"type": "string"},
-                "expected_output": {"type": "object"},
-                "mutation_scope": mutation_scope,
-                "skill_bindings": {"type": "array", "items": {"type": "object"}},
-            },
+        supported_roles = {
+            "IMPLEMENTER",
+            "SECURITY_REVIEWER",
+            "QA_REVIEWER",
+            "SUB_REVIEWER",
         }
+        allocation_variants: list[dict[str, Any]] = []
+        declared_turn_ids: set[str] = set()
+        for turn in turns:
+            role = str(turn.get("role") or "").strip().upper()
+            if role == "BOSS":
+                continue
+            if role not in supported_roles:
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_WORKER_ROLE_INVALID"
+                )
+            turn_id = _text(turn.get("turn_id"), "execution_plan.turn.turn_id")
+            leaf = turn_id.rsplit("/", 1)[-1]
+            if turn_id in declared_turn_ids or not re.fullmatch(
+                r"[a-zA-Z0-9._-]+", leaf
+            ):
+                raise ProjectMasterHostError(
+                    "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
+                )
+            declared_turn_ids.add(turn_id)
+            worker_slot_ref = _text(
+                turn.get("worker_slot_ref"),
+                "execution_plan.turn.worker_slot_ref",
+            )
+            worker_path = f"/root/boss/{leaf}"
+            allocation_variants.append(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "turn_id",
+                        "worker_slot_ref",
+                        "worker_path",
+                        "task",
+                        "expected_output",
+                        "mutation_scope",
+                        "skill_bindings",
+                    ],
+                    "properties": {
+                        "turn_id": {"type": "string", "enum": [turn_id]},
+                        "worker_slot_ref": {
+                            "type": "string",
+                            "enum": [worker_slot_ref],
+                        },
+                        "worker_path": {"type": "string", "enum": [worker_path]},
+                        "task": {"type": "string"},
+                        "expected_output": {"type": "object"},
+                        "mutation_scope": mutation_scope,
+                        "skill_bindings": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                        },
+                    },
+                }
+            )
+        if not allocation_variants:
+            raise ProjectMasterHostError(
+                "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_INCOMPLETE"
+            )
         return {
             "schema": "universe.task-frame-boss-allocation.v1",
             "json_schema": {
@@ -1188,7 +1232,12 @@ class ProjectModeCoordinator:
                 "required": ["summary", "worker_allocations"],
                 "properties": {
                     "summary": {"type": "string"},
-                    "worker_allocations": {"type": "array", "items": allocation},
+                    "worker_allocations": {
+                        "type": "array",
+                        "minItems": len(allocation_variants),
+                        "maxItems": len(allocation_variants),
+                        "items": {"anyOf": allocation_variants},
+                    },
                 },
             },
         }

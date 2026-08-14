@@ -3177,6 +3177,87 @@ class ProjectMasterHostTests(unittest.TestCase):
             str(reviewer.exception),
         )
 
+    def test_boss_allocation_contract_binds_exact_declared_identities(self) -> None:
+        turns = [
+            {"turn_id": "boss", "role": "BOSS", "worker_slot_ref": "boss-worker"},
+            {
+                "turn_id": "implementation",
+                "role": "SUB_REVIEWER",
+                "worker_slot_ref": "read-only-implementation-reviewer",
+            },
+            {
+                "turn_id": "security_review",
+                "role": "SUB_REVIEWER",
+                "worker_slot_ref": "independent-security-reviewer",
+            },
+            {
+                "turn_id": "qa",
+                "role": "SUB_REVIEWER",
+                "worker_slot_ref": "independent-qa-reviewer",
+            },
+        ]
+
+        contract = ProjectModeCoordinator._boss_allocation_output_contract(turns)
+        allocations = contract["json_schema"]["properties"]["worker_allocations"]
+
+        self.assertEqual(3, allocations["minItems"])
+        self.assertEqual(3, allocations["maxItems"])
+        identities = {
+            (
+                variant["properties"]["turn_id"]["enum"][0],
+                variant["properties"]["worker_slot_ref"]["enum"][0],
+                variant["properties"]["worker_path"]["enum"][0],
+            )
+            for variant in allocations["items"]["anyOf"]
+        }
+        self.assertEqual(
+            {
+                (
+                    "implementation",
+                    "read-only-implementation-reviewer",
+                    "/root/boss/implementation",
+                ),
+                (
+                    "security_review",
+                    "independent-security-reviewer",
+                    "/root/boss/security_review",
+                ),
+                ("qa", "independent-qa-reviewer", "/root/boss/qa"),
+            },
+            identities,
+        )
+
+    def test_boss_allocations_reject_identity_mismatch(self) -> None:
+        target = str(self.root / "tools" / "app.py")
+        turns = [
+            {"turn_id": "boss", "role": "BOSS", "worker_slot_ref": "boss-worker"},
+            {
+                "turn_id": "security",
+                "role": "SECURITY_REVIEWER",
+                "worker_slot_ref": "security-worker",
+            },
+        ]
+        allocation = {
+            "turn_id": "security",
+            "worker_slot_ref": "security-worker",
+            "worker_path": "/root/boss/security-worker",
+            "task": "Review security.",
+            "expected_output": {"result": "security-review"},
+            "mutation_scope": {"operations": [], "targets": []},
+            "skill_bindings": [],
+        }
+
+        with self.assertRaises(ProjectMasterHostError) as mismatch:
+            ProjectModeCoordinator._canonical_boss_allocations(
+                [allocation],
+                turns=turns,
+                parent_mutation_scope={"operations": ["MODIFY"], "targets": [target]},
+            )
+        self.assertEqual(
+            "DESCENDANT_TASK_FRAME_BOSS_ALLOCATION_IDENTITY_MISMATCH",
+            str(mismatch.exception),
+        )
+
     def test_semantic_worker_roles_project_to_runtime_sub_reviewer(self) -> None:
         declared = ProjectModeCoordinator._sequential_declared_turns(
             [
