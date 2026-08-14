@@ -3092,6 +3092,7 @@ class GrokProjectMasterRuntime:
         max_turns: int = 8,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
+        new_session: bool = False,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
@@ -3106,7 +3107,7 @@ class GrokProjectMasterRuntime:
             if actor_label is not None
             else f"Project Master for {self.project_id}"
         )
-        self.session_id = store.session_ref_for("GROK")
+        self.session_id = None if new_session else store.session_ref_for("GROK")
         self.connection_state = "UNKNOWN"
         self._greeting_pending = False
         self._permission_requester: Callable[[Mapping[str, Any]], str | None] | None = (
@@ -3279,6 +3280,7 @@ class CodexProjectMasterRuntime:
         effort: str = "AUTO",
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
+        new_session: bool = False,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
@@ -3292,7 +3294,7 @@ class CodexProjectMasterRuntime:
             if actor_label is not None
             else f"Project Master for {self.project_id}"
         )
-        self.session_id = store.session_ref_for("CODEX")
+        self.session_id = None if new_session else store.session_ref_for("CODEX")
         self.connection_state = "UNKNOWN"
         self._greeting_pending = False
         self._permission_requester: Callable[[Mapping[str, Any]], str | None] | None = (
@@ -3491,6 +3493,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         max_turns: int = 8,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
+        new_session: bool = False,
     ) -> None:
         super().__init__(
             project_root,
@@ -3501,8 +3504,9 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             effort=effort,
             requested_mode=requested_mode,
             actor_label=actor_label,
+            new_session=new_session,
         )
-        self.session_id = store.session_ref_for("CLAUDE")
+        self.session_id = None if new_session else store.session_ref_for("CLAUDE")
         self.max_turns = max(1, int(max_turns))
         self._permission_broker: ClaudePermissionBroker | None = None
         self._mcp_config_root: Path | None = None
@@ -3719,13 +3723,16 @@ class ResidentModeSessionHost:
         *,
         model: str = "",
         effort: str = "AUTO",
+        session_action: str = "RESUME",
     ) -> dict[str, Any]:
         normalized_provider = _provider(provider)
+        normalized_action = normalize_session_action(session_action)
         with self._lock:
             active = self._ensure(
                 normalized_provider,
                 model=model,
                 effort=effort,
+                session_action=normalized_action,
             )
             return self._connection_status(active=active)
 
@@ -3968,7 +3975,10 @@ class ResidentModeSessionHost:
         *,
         model: str | None = None,
         effort: str | None = None,
+        session_action: str = "RESUME",
     ) -> MasterProvider:
+        normalized_action = normalize_session_action(session_action)
+        force_new_session = normalized_action == "NEW"
         if model is not None or effort is not None:
             self._profile_provider = provider
             if model is not None:
@@ -3981,10 +3991,15 @@ class ResidentModeSessionHost:
             self._desired_effort = "AUTO"
         selected_model = self._desired_model
         selected_effort = self._desired_effort
-        selected_session_ref = self.store.session_ref_for(provider)
+        selected_session_ref = (
+            None
+            if force_new_session
+            else self.store.session_ref_for(provider)
+        )
         if self._provider is not None and self._provider_name == provider:
             if (
-                (
+                not force_new_session
+                and (
                     selected_session_ref is None
                     or selected_session_ref == self._provider_session_ref
                 )
@@ -3995,12 +4010,14 @@ class ResidentModeSessionHost:
                 setattr(self._provider, "connection_state", "REUSED")
                 return self._provider
             replacement_trigger = (
-                "SESSION_SELECTION_CHANGED"
+                "NEW_SESSION"
+                if force_new_session
+                else "SESSION_SELECTION_CHANGED"
                 if selected_session_ref != self._provider_session_ref
                 else "PROVIDER_PROFILE_CHANGED"
             )
         else:
-            replacement_trigger = "PROVIDER_SWITCH"
+            replacement_trigger = "NEW_SESSION" if force_new_session else "PROVIDER_SWITCH"
         if self._provider is not None:
             previous = self._provider
             previous_name = self._provider_name
@@ -4024,6 +4041,7 @@ class ResidentModeSessionHost:
                 self.actor_label,
                 selected_model,
                 selected_effort,
+                force_new_session,
             )
         else:
             active = self.provider_factory(
@@ -4213,6 +4231,7 @@ class ResidentModeSessionHost:
         actor_label: str,
         model: str = "",
         effort: str = "AUTO",
+        new_session: bool = False,
     ) -> MasterProvider:
         if provider == "GROK":
             return GrokProjectMasterRuntime(
@@ -4223,6 +4242,7 @@ class ResidentModeSessionHost:
                 effort=effort,
                 requested_mode=requested_mode,
                 actor_label=actor_label,
+                new_session=new_session,
             )
         if provider == "CODEX":
             return CodexProjectMasterRuntime(
@@ -4233,6 +4253,7 @@ class ResidentModeSessionHost:
                 effort=effort,
                 requested_mode=requested_mode,
                 actor_label=actor_label,
+                new_session=new_session,
             )
         if provider == "CLAUDE":
             return ClaudeProjectMasterRuntime(
@@ -4243,6 +4264,7 @@ class ResidentModeSessionHost:
                 effort=effort,
                 requested_mode=requested_mode,
                 actor_label=actor_label,
+                new_session=new_session,
             )
         raise ProjectMasterHostError("MODE_SESSION_PROVIDER_UNSUPPORTED")
 
@@ -5336,8 +5358,15 @@ class ResidentProjectMasterHostManager:
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
         self._lock = threading.RLock()
 
-    def ensure(self, project: Mapping[str, Any]) -> dict[str, Any]:
+    def ensure(
+        self,
+        project: Mapping[str, Any],
+        *,
+        session_action: str = "RESUME",
+    ) -> dict[str, Any]:
         project_id = _text(project.get("project_id"), "project.project_id")
+        normalized_action = normalize_session_action(session_action)
+        force_new_session = normalized_action == "NEW"
         project_root = (
             Path(_text(project.get("project_root"), "project.project_root"))
             .expanduser()
@@ -5363,7 +5392,11 @@ class ResidentProjectMasterHostManager:
             session_supervisor=self.session_supervisor,
             requested_mode="MASTER",
         )
-        selected_session_ref = store.session_ref_for(selected_provider)
+        selected_session_ref = (
+            None
+            if force_new_session
+            else store.session_ref_for(selected_provider)
+        )
         governance_context: dict[str, Any] | None = None
         governance_context_key = "ABSENT"
         if self.governance_context_resolver is not None:
@@ -5392,6 +5425,7 @@ class ResidentProjectMasterHostManager:
             if (
                 handle is not None
                 and handle.thread.is_alive()
+                and not force_new_session
                 and handle.provider == selected_provider
                 and handle.model == selected_model
                 and handle.effort == selected_effort
@@ -5433,7 +5467,10 @@ class ResidentProjectMasterHostManager:
                 self._handles.pop(project_id, None)
                 handle = None
             if handle is not None:
-                self._save_handle_continuity(handle, "PROVIDER_SWITCH")
+                self._save_handle_continuity(
+                    handle,
+                    "NEW_SESSION" if force_new_session else "PROVIDER_SWITCH",
+                )
                 handle.close()
                 self._handles.pop(project_id, None)
 
@@ -5449,6 +5486,7 @@ class ResidentProjectMasterHostManager:
                     store,
                     model=selected_model,
                     effort=selected_effort,
+                    new_session=force_new_session,
                 )
             )
             try:
@@ -6204,18 +6242,34 @@ class ResidentProjectMasterHostManager:
         store: ProjectMasterSessionStore,
         model: str = "",
         effort: str = "AUTO",
+        new_session: bool = False,
     ) -> MasterProvider:
         if provider == "GROK":
             return GrokProjectMasterRuntime(
-                project_root, project_id, store, model=model, effort=effort
+                project_root,
+                project_id,
+                store,
+                model=model,
+                effort=effort,
+                new_session=new_session,
             )
         if provider == "CODEX":
             return CodexProjectMasterRuntime(
-                project_root, project_id, store, model=model, effort=effort
+                project_root,
+                project_id,
+                store,
+                model=model,
+                effort=effort,
+                new_session=new_session,
             )
         if provider == "CLAUDE":
             return ClaudeProjectMasterRuntime(
-                project_root, project_id, store, model=model, effort=effort
+                project_root,
+                project_id,
+                store,
+                model=model,
+                effort=effort,
+                new_session=new_session,
             )
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 
@@ -6410,6 +6464,15 @@ def _provider(value: Any) -> str:
     normalized = _text(value, "provider").upper()
     if normalized not in SUPPORTED_PROVIDERS:
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
+    return normalized
+
+
+def normalize_session_action(value: Any) -> str:
+    """Normalize the explicit resume/new boundary used by session preparation."""
+
+    normalized = str(value or "RESUME").strip().upper()
+    if normalized not in {"RESUME", "NEW"}:
+        raise ProjectMasterHostError("MODE_SESSION_ACTION_INVALID")
     return normalized
 
 

@@ -150,6 +150,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('id="session-summary-model"', HTML)
         self.assertIn('id="session-summary-effort"', HTML)
         self.assertIn('id="session-summary-connect"', HTML)
+        self.assertIn('id="session-summary-new"', HTML)
         self.assertIn('id="session-summary-open"', HTML)
         self.assertIn("openProviderChatSummary(room)", APP)
         self.assertIn("renderProviderChatSummary", APP)
@@ -195,6 +196,19 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             connect_slice.index("elements.sessionSummaryDialog.close()"),
         )
         self.assertIn("session-summary-connection", CSS)
+
+    def test_session_popup_separates_resume_and_new_provider_session(self) -> None:
+        connection_slice = APP[
+            APP.index("function renderSessionSummaryConnection") : APP.index(
+                "function renderProviderChatSummary"
+            )
+        ]
+        self.assertIn('["MASTER", "CONDUCTOR"].includes(mode)', connection_slice)
+        self.assertIn('"Continue with profile"', connection_slice)
+        self.assertIn('"Start new session"', connection_slice)
+        self.assertIn('sessionAction = "RESUME"', APP)
+        self.assertIn('connectSessionSummaryProviderModel("NEW")', APP)
+        self.assertIn("prepareBody.session_action = options.sessionAction", APP)
 
     def test_conductor_session_uses_the_same_lazy_prepare_attach_route(self) -> None:
         self.assertIn('async function callUniverseConductor(options = {})', APP)

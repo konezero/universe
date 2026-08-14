@@ -2496,6 +2496,44 @@ class UniverseLocalServiceTests(unittest.TestCase):
             fake_host.close.assert_called_once()
             self.assertIsNone(self.server.conductor_session_host)
 
+    def test_conductor_new_session_action_reaches_resident_host(self) -> None:
+        fake_host = Mock()
+        fake_host.prepare.return_value = {
+            "schema": "universe.provider-session-connection.v1",
+            "target_kind": "UNIVERSE_CONDUCTOR",
+            "target_id": "CONDUCTOR",
+            "requested_mode": "CONDUCTOR",
+            "last_provider": "CODEX",
+            "last_session_ref": "codex:new-conductor-session",
+            "model_ref": "",
+            "effort": "AUTO",
+            "connection_state": "NEW",
+            "session_persistence": "LAST_COORDINATE",
+            "resident": True,
+        }
+        with (
+            patch(
+                "universe_server.ResidentModeSessionHost",
+                return_value=fake_host,
+            ),
+            patch.object(
+                self.server,
+                "_resolve_conductor_provider",
+                return_value="CODEX",
+            ),
+        ):
+            prepared = self.server.prepare_conductor_session(
+                {"session_action": "NEW"}
+            )
+
+        self.assertEqual("NEW", prepared["connection_state"])
+        fake_host.prepare.assert_called_once_with(
+            "CODEX",
+            model="",
+            effort="AUTO",
+            session_action="NEW",
+        )
+
     def test_conductor_prepare_route_uses_lazy_host_boundary(self) -> None:
         connection = {
             "target_kind": "UNIVERSE_CONDUCTOR",

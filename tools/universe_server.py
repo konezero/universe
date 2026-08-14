@@ -96,6 +96,7 @@ from project_master_host import (
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
     ResidentRoomParticipantHostManager,
+    normalize_session_action,
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
@@ -15741,9 +15742,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._conductor_delegation_queued_ids.add(normalized_id)
         self._conductor_delegation_queue.put(normalized_id)
 
-    def ensure_project_master(self, project_id: str) -> dict[str, Any]:
+    def ensure_project_master(
+        self,
+        project_id: str,
+        *,
+        session_action: str = "RESUME",
+    ) -> dict[str, Any]:
         if self.project_master_hosts is None:
             return {"status": "AUTO_START_DISABLED", "project_id": project_id}
+        normalized_action = normalize_session_action(session_action)
         project = self.store.get_project(project_id)
         try:
             bridge = self.store.get_master_bridge(project_id)
@@ -15758,6 +15765,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if bridge.get("status") in {"REGISTERED", "AVAILABLE"} and (
                 not managed and _loopback_endpoint_reachable(str(bridge["endpoint"]))
             ):
+                if normalized_action == "NEW":
+                    raise ProjectMasterHostError(
+                        "PROJECT_MASTER_NEW_SESSION_UNAVAILABLE"
+                    )
                 return {
                     "status": "EXISTING_BRIDGE",
                     "project_id": project_id,
@@ -15766,6 +15777,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # A managed resident must pass through the Host manager on every
             # prepare. Observatory attach can change the provider session while
             # the bridge itself remains registered.
+        if normalized_action == "NEW":
+            return self.project_master_hosts.ensure(
+                project,
+                session_action=normalized_action,
+            )
         return self.project_master_hosts.ensure(project)
 
     def create_approved_descendant_task_frame(
@@ -16489,6 +16505,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     ) -> dict[str, Any]:
         request = options if isinstance(options, Mapping) else {}
         try:
+            session_action = normalize_session_action(
+                request.get("session_action", "RESUME")
+            )
             if any(key in request for key in ("provider", "model_ref", "effort")):
                 current = self.store.provider_setting(
                     "UNIVERSE_CONDUCTOR", "CONDUCTOR"
@@ -16511,11 +16530,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
             host = self._ensure_conductor_session_host()
-            status = host.prepare(
-                provider,
-                model=str(setting.get("model_ref") or "").strip(),
-                effort=str(setting.get("effort") or "AUTO").strip().upper(),
-            )
+            prepare_options = {
+                "model": str(setting.get("model_ref") or "").strip(),
+                "effort": str(setting.get("effort") or "AUTO").strip().upper(),
+            }
+            if session_action == "NEW":
+                prepare_options["session_action"] = session_action
+            status = host.prepare(provider, **prepare_options)
             self._conductor_session_error = None
             return status
         except (
@@ -18271,6 +18292,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         request = options if isinstance(options, Mapping) else {}
+        session_action = normalize_session_action(
+            request.get("session_action", "RESUME")
+        )
         if any(key in request for key in ("provider", "model_ref", "effort")):
             current = self.store.provider_setting("PROJECT_MASTER", project_id)
             self.set_project_provider_setting(
@@ -18286,7 +18310,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 },
             )
         try:
-            host = self.ensure_project_master(project_id)
+            if session_action == "NEW":
+                host = self.ensure_project_master(
+                    project_id,
+                    session_action=session_action,
+                )
+            else:
+                host = self.ensure_project_master(project_id)
         except ProjectMasterHostError as error:
             error_code = str(error).strip() or "PROJECT_MASTER_SESSION_PREPARATION_FAILED"
             if error_code == "PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE":

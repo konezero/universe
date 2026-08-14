@@ -183,6 +183,7 @@ const elements = {
     "#session-summary-connection-status"
   ),
   sessionSummaryConnect: document.querySelector("#session-summary-connect"),
+  sessionSummaryNew: document.querySelector("#session-summary-new"),
   sessionSummaryOpen: document.querySelector("#session-summary-open"),
   sessionSummaryManage: document.querySelector("#session-summary-manage"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
@@ -1419,13 +1420,19 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   const section = elements.sessionSummaryConnection;
   if (!section) return;
   const binding = room?.binding || {};
+  const mode = String(binding.mode || "").toUpperCase();
   const canChoose = Boolean(
-    boundSession && binding.mode === "MASTER" && project.projectId
+    boundSession &&
+      ["MASTER", "CONDUCTOR"].includes(mode) &&
+      (mode === "CONDUCTOR" || project.projectId)
   );
   section.hidden = !canChoose;
   if (!canChoose) return;
 
-  const setting = projectProviderSetting(project.projectId) || {};
+  const setting =
+    mode === "CONDUCTOR"
+      ? state.providerSettings?.universe_conductor || {}
+      : projectProviderSetting(project.projectId) || {};
   const currentProvider = String(
     room.provider || setting.resolved_provider || setting.provider || "AUTO"
   ).toUpperCase();
@@ -1476,6 +1483,12 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   if (elements.sessionSummaryConnectionStatus) {
     elements.sessionSummaryConnectionStatus.textContent =
       `Current: ${currentProvider} / ${currentModel || "host default"} / ${currentEffort}`;
+  }
+  if (elements.sessionSummaryConnect) {
+    elements.sessionSummaryConnect.textContent = "Continue with profile";
+  }
+  if (elements.sessionSummaryNew) {
+    elements.sessionSummaryNew.textContent = "Start new session";
   }
 }
 
@@ -2483,6 +2496,9 @@ async function callUniverseConductor(options = {}) {
   if (Object.prototype.hasOwnProperty.call(options, "effort")) {
     prepareBody.effort = options.effort || "AUTO";
   }
+  if (options.sessionAction) {
+    prepareBody.session_action = options.sessionAction;
+  }
   const prepared = await api("/v1/conductor-session/prepare", {
     method: "POST",
     body: prepareBody,
@@ -2537,6 +2553,9 @@ async function callProjectMaster(projectId, options = {}) {
   }
   if (Object.prototype.hasOwnProperty.call(options, "effort")) {
     prepareBody.effort = options.effort || "AUTO";
+  }
+  if (options.sessionAction) {
+    prepareBody.session_action = options.sessionAction;
   }
   const prepared = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
@@ -2618,14 +2637,20 @@ async function attachSelectedConductorSession(session) {
   return session;
 }
 
-async function connectSessionSummaryProviderModel() {
+async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
   const room = (state.providerChatRooms || []).find(
     (item) => item.chat_key === state.selectedProviderChatKey
   );
   const session = supervisorSessionForRoom(room);
   const project = sessionRailProjectIdentity(room);
-  if (!room || !session || room.binding?.mode !== "MASTER" || !project.projectId) {
-    throw new Error("Only a bound Project Master can choose a provider and model");
+  const mode = String(room?.binding?.mode || "").toUpperCase();
+  if (
+    !room ||
+    !session ||
+    !["MASTER", "CONDUCTOR"].includes(mode) ||
+    (mode === "MASTER" && !project.projectId)
+  ) {
+    throw new Error("Only a bound Master or Conductor session can choose a provider and model");
   }
   const provider = String(elements.sessionSummaryProvider?.value || "").toUpperCase();
   const modelRef = String(elements.sessionSummaryModel?.value || "").trim();
@@ -2639,17 +2664,25 @@ async function connectSessionSummaryProviderModel() {
       `Connecting ${provider} / ${modelRef || "host default"} / ${effort}...`;
   }
   try {
-    await callProjectMaster(project.projectId, {
+    const options = {
       provider,
       modelRef,
       effort,
+      sessionAction,
       expectedProvider: provider,
       expectedModel: modelRef,
       expectedEffort: effort,
-    });
+    };
+    if (mode === "CONDUCTOR") {
+      await callUniverseConductor(options);
+    } else {
+      await callProjectMaster(project.projectId, options);
+    }
     elements.sessionSummaryDialog.close();
+    const targetLabel = mode === "CONDUCTOR" ? "Conductor" : "Project Master";
+    const actionLabel = sessionAction === "NEW" ? "new session started" : "connected";
     toast(
-      `Project Master connected: ${provider} / ${modelRef || "host default"} / ${effort}`
+      `${targetLabel} ${actionLabel}: ${provider} / ${modelRef || "host default"} / ${effort}`
     );
   } finally {
     if (elements.sessionSummaryConnect) {
@@ -10829,6 +10862,16 @@ function bindEvents() {
       rebindSelectedSessionWorkingDirectory().catch((error) => {
         if (elements.sessionWorkingDirectoryStatus) {
           elements.sessionWorkingDirectoryStatus.textContent = error.message;
+        }
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.sessionSummaryNew) {
+    elements.sessionSummaryNew.addEventListener("click", () => {
+      connectSessionSummaryProviderModel("NEW").catch((error) => {
+        if (elements.sessionSummaryConnectionStatus) {
+          elements.sessionSummaryConnectionStatus.textContent = error.message;
         }
         toast(error.message, true);
       });

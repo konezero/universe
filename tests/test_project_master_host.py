@@ -687,6 +687,55 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("gpt-b", second["model_ref"])
         self.assertEqual("MAX", second["effort"])
 
+    def test_resident_mode_session_can_start_new_thread_for_same_provider(self) -> None:
+        created: list[PreparedFakeProvider] = []
+
+        def factory(*_args):
+            instance = PreparedFakeProvider()
+            created.append(instance)
+            return instance
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-new-session.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=factory,
+        )
+        try:
+            host.prepare("CODEX", model="gpt-a", effort="HIGH")
+            host.prepare(
+                "CODEX",
+                model="gpt-a",
+                effort="HIGH",
+                session_action="NEW",
+            )
+        finally:
+            host.close()
+
+        self.assertEqual(2, len(created))
+        self.assertTrue(created[0].closed)
+        self.assertTrue(created[1].closed)
+
+    def test_invalid_session_action_is_rejected(self) -> None:
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-invalid-session-action.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=lambda *_args: PreparedFakeProvider(),
+        )
+        try:
+            with self.assertRaisesRegex(
+                ProjectMasterHostError,
+                "MODE_SESSION_ACTION_INVALID",
+            ):
+                host.prepare("CODEX", session_action="FORK")
+        finally:
+            host.close()
+
     def test_resident_mode_session_records_commander_and_provider_observations(
         self,
     ) -> None:
