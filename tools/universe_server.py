@@ -15005,6 +15005,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_delegation_stop = threading.Event()
         self._conductor_session_error: dict[str, str] | None = None
         self._conductor_session_provider_factory = conductor_session_provider_factory
+        self._conductor_runtime_factory = conductor_runtime_factory
         self._conductor_session_host_lock = threading.RLock()
         self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
@@ -15051,27 +15052,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         # The legacy constructor flag may still opt into the old eager path for
         # compatibility, but the normal service path starts detached.
         self.conductor_session_host: ResidentModeSessionHost | None = None
+        self.conductor_runtime: UniverseConductorRuntime | None = None
         if auto_start_conductor_runtime:
             self._ensure_conductor_session_host()
             self.prepare_conductor_session()
-        self.conductor_runtime: UniverseConductorRuntime | None = None
         if auto_start_conductor_runtime:
             try:
-                self.conductor_runtime = (
-                    conductor_runtime_factory(Path(__file__).resolve().parents[1])
-                    if conductor_runtime_factory is not None
-                    else UniverseConductorRuntime(
-                        Path(__file__).resolve().parents[1],
-                        session_node="universe",
-                        requested_mode="CONDUCTOR",
-                        source_binding_resolver=(
-                            lambda _root: self.store.selected_project_release_binding(
-                                "universe"
-                            )
-                        ),
-                        session_supervisor=self.session_supervisor,
-                    )
-                )
+                self.conductor_runtime = self._new_conductor_runtime()
                 self._planning_binding = normalize_planning_runtime_binding(
                     self.conductor_runtime.start()
                 )
@@ -15669,6 +15656,63 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for message_id in self.store.recover_conductor_room_messages():
             self.enqueue_conductor_message(message_id)
         return self.planning_binding_status()
+
+    def _new_conductor_runtime(self) -> UniverseConductorRuntime:
+        if self._conductor_runtime_factory is not None:
+            return self._conductor_runtime_factory(
+                Path(__file__).resolve().parents[1]
+            )
+        return UniverseConductorRuntime(
+            Path(__file__).resolve().parents[1],
+            session_node="universe",
+            requested_mode="CONDUCTOR",
+            source_binding_resolver=(
+                lambda _root: self.store.selected_project_release_binding(
+                    "universe"
+                )
+            ),
+            session_supervisor=self.session_supervisor,
+        )
+
+    def _ensure_conductor_planning_runtime(self) -> dict[str, Any] | None:
+        """Lazily attach the runtime required by the Conductor room worker."""
+
+        with self._planning_binding_lock:
+            if self._planning_binding is not None:
+                return dict(self._planning_binding)
+            runtime = self.conductor_runtime
+            if runtime is None:
+                runtime = self._new_conductor_runtime()
+                self.conductor_runtime = runtime
+            try:
+                binding = normalize_planning_runtime_binding(runtime.start())
+                binding["bound_at"] = utc_now()
+                self._planning_binding = binding
+                self._planning_binding_error = None
+                return dict(binding)
+            except (
+                OSError,
+                SessionSupervisorError,
+                UniverseConductorRuntimeError,
+                UniverseError,
+            ) as error:
+                cleanup_error = None
+                try:
+                    runtime.stop()
+                except Exception as stop_error:  # noqa: BLE001 - preserve failure
+                    cleanup_error = (
+                        f"; cleanup={type(stop_error).__name__}: {stop_error}"
+                    )
+                self.conductor_runtime = None
+                self._planning_binding_error = {
+                    "error_code": getattr(
+                        error,
+                        "code",
+                        str(error) or type(error).__name__,
+                    ),
+                    "reason": f"{type(error).__name__}: {error}{cleanup_error or ''}",
+                }
+                return None
 
     def planning_binding_status(self) -> dict[str, Any]:
         with self._planning_binding_lock:
@@ -16570,11 +16614,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }
             if self._conductor_session_error is not None:
                 status["connection_state"] = "UNAVAILABLE"
+                status["error_code"] = self._conductor_session_error["error_code"]
                 status["reason"] = self._conductor_session_error["reason"]
             return status
         status = self.conductor_session_host.status()
         if self._conductor_session_error is not None and not status["resident"]:
             status["connection_state"] = "UNAVAILABLE"
+            status["error_code"] = self._conductor_session_error["error_code"]
             status["reason"] = self._conductor_session_error["reason"]
         return status
 
@@ -16591,9 +16637,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 current = self.store.provider_setting(
                     "UNIVERSE_CONDUCTOR", "CONDUCTOR"
                 )
-                self.store.set_provider_setting(
-                    "UNIVERSE_CONDUCTOR",
-                    "CONDUCTOR",
+                self.set_universe_provider_setting(
                     {
                         "provider": request.get("provider") or current["provider"],
                         "model_ref": request.get(
@@ -16608,6 +16652,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "UNIVERSE_CONDUCTOR", "CONDUCTOR"
             )
             provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
+            self._validate_provider_model_pair(
+                provider,
+                str(setting.get("model_ref") or "").strip(),
+            )
             host = self._ensure_conductor_session_host()
             prepare_options = {
                 "model": str(setting.get("model_ref") or "").strip(),
@@ -19956,28 +20004,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _process_conductor_message(self, message_id: str) -> None:
         if self._try_apply_conductor_governance_approval(message_id) is not None:
             return
+        message = self.store.get_conductor_room_message(message_id)
+        provider = self._resolve_conductor_provider(message)
+        claimed = self.store.claim_conductor_room_message(message_id, provider=provider)
+        if claimed is None:
+            return
         with self._planning_binding_lock:
             binding = (
                 dict(self._planning_binding)
                 if self._planning_binding is not None
                 else None
             )
-        if binding is None:
-            if self._planning_binding_error is not None:
-                self.store.fail_conductor_room_message(
-                    message_id,
-                    code=self._planning_binding_error["error_code"],
-                    reason=self._planning_binding_error["reason"],
-                )
-                return
-            self.store.wait_conductor_room_message(message_id)
-            return
-        message = self.store.get_conductor_room_message(message_id)
-        provider = self._resolve_conductor_provider(message)
-        claimed = self.store.claim_conductor_room_message(message_id, provider=provider)
-        if claimed is None:
-            return
-        if self.conductor_runtime is not None:
+        if self.conductor_runtime is not None and binding is not None:
             self.conductor_runtime.observe(message_id)
             binding["parent_evidence_ref"] = (
                 f"universe://conductor-room/messages/{message_id}"
@@ -20002,20 +20040,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ]
             with self._conductor_session_host_lock:
                 host = self.conductor_session_host
-            if host is None:
+            if host is None and binding is None:
                 # A direct Conductor message is also an attach request. Keep
                 # the normal service detached at startup, but do not fall back
                 # to the planning runtime merely because the UI did not open
                 # the session first.
                 self.prepare_conductor_session()
-                with self._conductor_session_host_lock:
-                    host = self.conductor_session_host
+            with self._conductor_session_host_lock:
+                host = self.conductor_session_host
+            if host is None and self._conductor_session_error is not None:
+                self.store.fail_conductor_room_message(
+                    message_id,
+                    code=self._conductor_session_error["error_code"],
+                    reason=self._conductor_session_error["reason"],
+                )
+                return
             if host is not None:
+                with self._planning_binding_lock:
+                    runtime_binding = dict(self._planning_binding or {})
                 worker_message["runtime_context"] = {
                     "requested_mode": "CONDUCTOR",
-                    "session_id": binding.get("session_id", "UNKNOWN"),
-                    "origin_anchor_ref": binding.get("origin_anchor_ref", "UNKNOWN"),
-                    "origin_frame_id": binding.get("origin_frame_id", "UNKNOWN"),
+                    "session_id": runtime_binding.get("session_id", "UNKNOWN"),
+                    "origin_anchor_ref": runtime_binding.get(
+                        "origin_anchor_ref", "UNKNOWN"
+                    ),
+                    "origin_frame_id": runtime_binding.get(
+                        "origin_frame_id", "UNKNOWN"
+                    ),
                     "commander_surface": "UNIVERSE_UI",
                 }
                 sequence = 0
@@ -20058,6 +20109,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     ui_action=normalize_conductor_ui_action({"kind": "NONE"}),
                 )
                 emit("COMPLETED")
+                return
+            if binding is None and self._planning_binding_error is None:
+                self._ensure_conductor_planning_runtime()
+                with self._planning_binding_lock:
+                    binding = (
+                        dict(self._planning_binding)
+                        if self._planning_binding is not None
+                        else None
+                    )
+            if binding is None:
+                if self._planning_binding_error is not None:
+                    self.store.fail_conductor_room_message(
+                        message_id,
+                        code=self._planning_binding_error["error_code"],
+                        reason=self._planning_binding_error["reason"],
+                    )
+                    return
+                self.store.wait_conductor_room_message(message_id)
                 return
             history = [
                 item

@@ -472,6 +472,162 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
 
+    def test_provider_rebind_uses_identity_owner_after_stale_default_pointer(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "stale-pointer.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="CONDUCTOR",
+        )
+        session, _ = supervisor.register_session(
+            {
+                "session_id": "session-conductor-actual",
+                "node": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-thread",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+        supervisor.set_default(
+            session["session_id"],
+            expected_pointer_version=session["default_pointer_version"],
+        )
+        connection = sqlite3.connect(self.root / "stale-pointer.sqlite3")
+        try:
+            connection.execute(
+                """
+                UPDATE target_default_session
+                SET node = 'CONDUCTOR'
+                WHERE node = 'universe' AND mode = 'CONDUCTOR'
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        state.observe_provider_session("CODEX", "codex-thread")
+
+        current = next(
+            item
+            for item in supervisor.list_sessions(node="universe", mode="CONDUCTOR")
+            if item["is_default"]
+        )
+        self.assertEqual("session-conductor-actual", current["session_id"])
+        self.assertEqual("codex-thread", current["provider_session_ref"])
+
+    def test_provider_activity_uses_provider_binding_not_deterministic_session_id(
+        self,
+    ) -> None:
+        supervisor = SessionSupervisorStore(self.root / "activity-pointer.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="CONDUCTOR",
+        )
+        session, _ = supervisor.register_session(
+            {
+                "session_id": "session-conductor-activity",
+                "node": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-thread",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+        supervisor.set_default(
+            session["session_id"],
+            expected_pointer_version=session["default_pointer_version"],
+        )
+        connection = sqlite3.connect(self.root / "activity-pointer.sqlite3")
+        try:
+            connection.execute(
+                """
+                UPDATE target_default_session
+                SET node = 'CONDUCTOR'
+                WHERE node = 'universe' AND mode = 'CONDUCTOR'
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        observed = state.observe_session_activity(
+            "CODEX",
+            "codex-app-server:codex-thread",
+            event_type="COMMANDER_MESSAGE_OBSERVED",
+            activity_state="ACTIVE",
+            evidence_ref="universe://test/activity",
+        )
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(
+            "SESSION_ACTIVITY_OBSERVED",
+            observed["observation"]["status"],
+        )
+        self.assertEqual("session-conductor-activity", observed["session_id"])
+
+    def test_legacy_binding_migration_uses_identity_owner_session(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "migration-pointer.sqlite3")
+        session, _ = supervisor.register_session(
+            {
+                "session_id": "session-conductor-migration",
+                "node": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-thread",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+        supervisor.set_default(
+            session["session_id"],
+            expected_pointer_version=session["default_pointer_version"],
+        )
+        connection = sqlite3.connect(self.root / "migration-pointer.sqlite3")
+        try:
+            connection.execute(
+                """
+                UPDATE target_default_session
+                SET node = 'CONDUCTOR'
+                WHERE node = 'universe' AND mode = 'CONDUCTOR'
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        state_database = self.root / "migration-state.sqlite"
+        legacy = ProjectMasterSessionStore(state_database, "universe")
+        with legacy._connection() as legacy_connection:
+            legacy_connection.execute(
+                "INSERT OR REPLACE INTO host_metadata(key, value) VALUES(?, ?)",
+                ("last_provider", "CODEX"),
+            )
+            legacy_connection.execute(
+                "INSERT OR REPLACE INTO host_metadata(key, value) VALUES(?, ?)",
+                ("last_session_ref", "codex-thread"),
+            )
+
+        ProjectMasterSessionStore(
+            state_database,
+            "universe",
+            session_node="universe",
+            session_supervisor=supervisor,
+            requested_mode="CONDUCTOR",
+        )
+
+        current = next(
+            item
+            for item in supervisor.list_sessions(node="universe", mode="CONDUCTOR")
+            if item["is_default"]
+        )
+        self.assertEqual("session-conductor-migration", current["session_id"])
+
     def test_project_master_prompt_inherits_primary_approval_for_task_frame(self) -> None:
         prompt = _project_master_system_prompt("Project Master")
         self.assertIn("not a second Commander decision", prompt)
@@ -816,6 +972,61 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("DISCONNECTED", closed["state"])
         self.assertEqual("STALE", closed["process_lease"]["lease_state"])
         self.assertTrue(provider.closed)
+
+    def test_resident_mode_session_rebinds_lease_after_provider_process_replacement(
+        self,
+    ) -> None:
+        supervisor = SessionSupervisorStore(self.root / "provider-replacement-lease.sqlite3")
+
+        class ReplacingLeaseProvider(PreparedFakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pid = 4322
+
+            def supervisor_process_identity(
+                self, endpoint: str, handshake_token: str
+            ) -> dict[str, Any]:
+                return {
+                    "pid": self.pid,
+                    "process_created_at": f"2026-08-14T00:00:{self.pid - 4322:02d}Z",
+                    "executable": "C:\\fake\\provider.exe",
+                    "command": ["C:\\fake\\provider.exe", "stdio"],
+                    "endpoint": endpoint,
+                    "handshake_fingerprint": hashlib.sha256(
+                        handshake_token.encode("utf-8")
+                    ).hexdigest(),
+                }
+
+        provider = ReplacingLeaseProvider()
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-provider-replacement.sqlite",
+            actor_label="Universe Conductor",
+            session_supervisor=supervisor,
+            supervisor_endpoint="http://127.0.0.1:52974",
+            provider_factory=lambda *_args: provider,
+        )
+        try:
+            with patch.object(supervisor, "sweep_stale_live_sessions", return_value={}):
+                host.prepare("CODEX")
+                provider.pid = 4323
+                host.prepare("CODEX")
+            live = next(
+                item
+                for item in supervisor.list_sessions(
+                    node="CONDUCTOR", mode="CONDUCTOR"
+                )
+                if item["is_default"]
+            )
+            self.assertEqual("OWNED", live["process_lease"]["lease_state"])
+            self.assertEqual(4323, live["process_lease"]["process_identity"]["pid"])
+            events = [item["event_type"] for item in supervisor.list_events(limit=20)]
+            self.assertIn("PROCESS_LEASE_STALE", events)
+            self.assertIn("PROCESS_LEASE_ACQUIRED", events)
+        finally:
+            host.close()
 
     def test_resident_mode_session_streams_current_turn_through_native_provider(
         self,

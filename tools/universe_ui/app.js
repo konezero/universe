@@ -2505,6 +2505,9 @@ async function callUniverseConductor(options = {}) {
     body: prepareBody,
   });
   const connection = prepared.session_connection || {};
+  if (connection.error_code) {
+    throw new Error(connection.reason || connection.error_code);
+  }
   if (
     options.expectedProvider &&
     String(connection.last_provider || "").toUpperCase() !==
@@ -2747,10 +2750,24 @@ function renderComposerState() {
       providerCapability(provider)?.cli_auto_approve || "UNKNOWN";
     const session = setting?.session_connection || null;
     const usage = sessionUsageLabel(session);
+    const residentSessionReady = Boolean(
+      session?.resident === true &&
+        !["NOT_OPENED", "UNAVAILABLE"].includes(
+          String(session?.connection_state || "").toUpperCase()
+        )
+    );
+    const sessionUnavailable =
+      String(session?.connection_state || "").toUpperCase() === "UNAVAILABLE";
+    const sessionError = String(
+      session?.reason || session?.error_code || ""
+    ).trim();
+    const conductorChatReady =
+      state.conductorRuntimeBinding?.status === "BOUND" || residentSessionReady;
     elements.roomContext.textContent =
       `Universe Conductor / ${sessionConnectionText(session, "CONDUCTOR")}`;
-    elements.roomHint.textContent =
-      state.conductorRuntimeBinding?.status === "BOUND"
+    elements.roomHint.textContent = sessionUnavailable
+      ? "Provider setup required" + (sessionError ? ": " + sessionError : "")
+      : conductorChatReady
         ? "LLM connected / Auto-approve " + autoApprove + (usage ? " / " + usage : "")
         : "Waiting for Runtime binding" + (usage ? " / " + usage : "");
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";

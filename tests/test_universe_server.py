@@ -2521,6 +2521,42 @@ class UniverseLocalServiceTests(unittest.TestCase):
             fake_host.close.assert_called_once()
             self.assertIsNone(self.server.conductor_session_host)
 
+    def test_detached_conductor_can_lazily_bind_planning_runtime(self) -> None:
+        class FakeRuntime:
+            def __init__(self, _root: Path) -> None:
+                self.start_count = 0
+                self.stop_count = 0
+
+            def start(self) -> dict[str, str]:
+                self.start_count += 1
+                return {
+                    "schema": "universe.planning-runtime-binding.v1",
+                    "endpoint": "http://127.0.0.1:41991",
+                    "token": "runtime-token",
+                    "session_id": "conductor-runtime-session",
+                    "origin_anchor_ref": "conductor-anchor",
+                    "origin_frame_id": "conductor-frame",
+                    "parent_actor_ref": "universe-conductor",
+                    "parent_evidence_ref": "host://conductor/current",
+                    "binding_evidence_ref": "host://conductor/runtime",
+                    "runtime_currentness_observation": "CURRENT",
+                }
+
+            def stop(self) -> None:
+                self.stop_count += 1
+
+        runtime = FakeRuntime(self.project_root)
+        self.server._conductor_runtime_factory = lambda _root: runtime
+
+        self.assertEqual("UNBOUND", self.server.planning_binding_status()["status"])
+        first = self.server._ensure_conductor_planning_runtime()
+        second = self.server._ensure_conductor_planning_runtime()
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual(1, runtime.start_count)
+        self.assertEqual("BOUND", self.server.planning_binding_status()["status"])
+
     def test_conductor_new_session_action_reaches_resident_host(self) -> None:
         fake_host = Mock()
         fake_host.prepare.return_value = {
@@ -2558,6 +2594,39 @@ class UniverseLocalServiceTests(unittest.TestCase):
             effort="AUTO",
             session_action="NEW",
         )
+
+    def test_conductor_prepare_rejects_model_from_another_provider(self) -> None:
+        prepared = self.server.prepare_conductor_session(
+            {
+                "provider": "CODEX",
+                "model_ref": "provider://CLAUDE/model/opus",
+            }
+        )
+        self.assertEqual("UNAVAILABLE", prepared["connection_state"])
+        self.assertEqual(
+            "PROVIDER_MODEL_PROVIDER_MISMATCH", prepared["error_code"]
+        )
+        self.assertIn(
+            "CLAUDE",
+            prepared["reason"],
+        )
+        self.assertIn("CODEX", prepared["reason"])
+
+    def test_conductor_prepare_rejects_legacy_bare_model_from_another_provider(
+        self,
+    ) -> None:
+        self.server.store.set_provider_setting(
+            "UNIVERSE_CONDUCTOR",
+            "CONDUCTOR",
+            {"provider": "CODEX", "model_ref": "opus", "effort": "AUTO"},
+        )
+        prepared = self.server.prepare_conductor_session()
+        self.assertEqual("UNAVAILABLE", prepared["connection_state"])
+        self.assertEqual(
+            "PROVIDER_MODEL_PROVIDER_MISMATCH", prepared["error_code"]
+        )
+        self.assertIn("CLAUDE", prepared["reason"])
+        self.assertIsNone(self.server.conductor_session_host)
 
     def test_conductor_prepare_route_uses_lazy_host_boundary(self) -> None:
         connection = {
@@ -3719,24 +3788,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.runtime_host = CapabilityHost()
         session_host = SessionHost()
         self.server.conductor_session_host = session_host
-        status, _bound = self.request(
-            "POST",
-            "/v1/runtime/planning-binding",
-            {
-                "schema": "universe.planning-runtime-binding.v1",
-                "endpoint": "http://127.0.0.1:41991",
-                "token": "runtime-token",
-                "session_id": "universe-conductor-session",
-                "origin_anchor_ref": "universe-anchor",
-                "origin_frame_id": "current",
-                "parent_actor_ref": "universe-conductor",
-                "parent_evidence_ref": "host://parent/current",
-                "binding_evidence_ref": "host://runtime/binding",
-                "runtime_currentness_observation": "CURRENT",
-            },
-            self.token,
-        )
-        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("UNBOUND", self.server.planning_binding_status()["status"])
         status, queued = self.request(
             "POST",
             "/v1/conductor-room/messages",

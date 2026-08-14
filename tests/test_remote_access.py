@@ -95,6 +95,8 @@ class RemoteAccessStoreTests(unittest.TestCase):
 
 class _UpstreamHandler(BaseHTTPRequestHandler):
     observed_headers: dict[str, str] = {}
+    live_first_sent = threading.Event()
+    live_release_second = threading.Event()
 
     def do_GET(self) -> None:
         type(self).observed_headers = {key: value for key, value in self.headers.items()}
@@ -106,6 +108,19 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"id: 1\ndata: first\n\n")
             self.wfile.flush()
+            self.wfile.write(b"id: 2\ndata: second\n\n")
+            self.wfile.flush()
+            return
+        if self.path == "/events-live":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"id: 1\ndata: first\n\n")
+            self.wfile.flush()
+            type(self).live_first_sent.set()
+            type(self).live_release_second.wait(3)
             self.wfile.write(b"id: 2\ndata: second\n\n")
             self.wfile.flush()
             return
@@ -162,6 +177,8 @@ class RemoteGatewayTests(unittest.TestCase):
         self.cookie_jar = CookieJar()
         self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
         self.user_agent = "UniverseMobileTest/1"
+        _UpstreamHandler.live_first_sent.clear()
+        _UpstreamHandler.live_release_second.clear()
 
     def tearDown(self) -> None:
         self.gateway.shutdown()
@@ -234,6 +251,45 @@ class RemoteGatewayTests(unittest.TestCase):
             events,
         )
         self.assertEqual("0", _UpstreamHandler.observed_headers["Last-Event-ID"])
+
+    def test_gateway_flushes_sse_event_before_upstream_stream_finishes(self) -> None:
+        invitation = self.store.create_pairing(
+            public_base_url=self.endpoint, ttl_seconds=600
+        )
+        form = urlencode(
+            {"code": invitation["code"], "device_name": "Live test mobile"}
+        ).encode("utf-8")
+        with self._open(
+            Request(
+                self.endpoint + "/pair/request",
+                data=form,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        ):
+            pass
+        pending = self.store.snapshot()["pairings"][0]
+        self.store.decide_pairing(pending["pairing_id"], approve=True)
+        with self._open(
+            Request(
+                self.endpoint + f"/pair/status?id={pending['pairing_id']}",
+                method="GET",
+            )
+        ):
+            pass
+
+        try:
+            with self._open(
+                Request(
+                    self.endpoint + "/events-live",
+                    method="GET",
+                    headers={"Accept": "text/event-stream"},
+                )
+            ) as response:
+                self.assertTrue(_UpstreamHandler.live_first_sent.wait(1))
+                self.assertEqual(b"id: 1\n", response.readline())
+        finally:
+            _UpstreamHandler.live_release_second.set()
 
         device = self.store.snapshot()["devices"][0]
         self.store.revoke_device(device["device_id"])

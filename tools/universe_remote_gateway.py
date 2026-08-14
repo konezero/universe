@@ -584,8 +584,15 @@ universes</strong>, use the public list.</p>
             self.send_header("X-Universe-Access-Surface", "REMOTE_BROWSER")
             self.send_header("X-Universe-Remote-Device", str(device["device_id"]))
             self.end_headers()
+            content_type = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+            stream_reader = getattr(response, "read1", None) if content_type == "text/event-stream" else None
             while True:
-                chunk = response.read(64 * 1024)
+                # read1 keeps SSE deltas live instead of waiting for a large buffer.
+                chunk = (
+                    stream_reader(64 * 1024)
+                    if callable(stream_reader)
+                    else response.read(64 * 1024)
+                )
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -842,6 +849,7 @@ def parser() -> argparse.ArgumentParser:
         "--upstream-state", type=Path, default=default_upstream_state_path()
     )
     start.add_argument("--state-file", type=Path, default=default_gateway_state_path())
+    start.add_argument("--listen-host", default="")
     start.add_argument("--port", type=int, default=0)
     start.add_argument("--public-base-url", default="")
     stop = commands.add_parser("stop")
@@ -865,6 +873,7 @@ def main() -> int:
                 upstream_state=args.upstream_state,
                 database_path=database_path,
                 state_path=args.state_file,
+                listen_host=args.listen_host,
                 port=args.port,
                 public_base_url=args.public_base_url,
             )

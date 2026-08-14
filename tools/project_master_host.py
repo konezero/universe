@@ -2406,6 +2406,26 @@ class ProjectMasterSessionStore:
             (session for session in sessions if session["is_default"]),
             None,
         )
+        if selected is None and sessions:
+            # A legacy pointer can retain the old node spelling after the
+            # session itself has been moved. Prefer the observed current row
+            # and repair the pointer before the provider process is leased.
+            selected = next(
+                (session for session in sessions if session["currentness"] == "CURRENT"),
+                sessions[0],
+            )
+            self.session_supervisor.set_default(
+                selected["session_id"],
+                expected_pointer_version=selected["default_pointer_version"],
+            )
+            selected = next(
+                item
+                for item in self.session_supervisor.list_sessions(
+                    node=self.session_node,
+                    mode=self.requested_mode,
+                )
+                if item["session_id"] == selected["session_id"]
+            )
         if selected is not None:
             return selected
         normalized_provider = _provider(provider)
@@ -2491,6 +2511,7 @@ class ProjectMasterSessionStore:
                         "currentness": "UNKNOWN",
                     }
                 )
+            supervisor_session_id = str(candidate["session_id"])
             if not candidate["is_default"]:
                 self.session_supervisor.set_default(
                     supervisor_session_id,
@@ -2531,24 +2552,60 @@ class ProjectMasterSessionStore:
     ) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
-        supervisor_session_id = self._supervisor_session_id(provider, session_ref)
-        try:
-            return self.session_supervisor.observe_session_activity(
-                supervisor_session_id,
-                event_type=event_type,
-                activity_state=activity_state,
-                evidence_ref=evidence_ref,
+        normalized_provider = _provider(provider)
+        normalized_session = _provider_session_identity(
+            normalized_provider,
+            _text(session_ref, "session_ref"),
+        )
+        candidate = self._find_supervisor_session(
+            normalized_provider,
+            normalized_session,
+        )
+        if candidate is None:
+            self.observe_provider_session(normalized_provider, normalized_session)
+            candidate = self._find_supervisor_session(
+                normalized_provider,
+                normalized_session,
             )
-        except SessionSupervisorError as error:
-            if error.code != "SESSION_NOT_FOUND":
-                raise
-            self.observe_provider_session(provider, session_ref)
-            return self.session_supervisor.observe_session_activity(
+        if candidate is None:
+            raise ProjectMasterHostError("MODE_SESSION_SUPERVISOR_SESSION_UNAVAILABLE")
+        supervisor_session_id = str(candidate["session_id"])
+        if not candidate["is_default"]:
+            self.session_supervisor.set_default(
                 supervisor_session_id,
-                event_type=event_type,
-                activity_state=activity_state,
-                evidence_ref=evidence_ref,
+                expected_pointer_version=candidate["default_pointer_version"],
             )
+        return self.session_supervisor.observe_session_activity(
+            supervisor_session_id,
+            event_type=event_type,
+            activity_state=activity_state,
+            evidence_ref=evidence_ref,
+        )
+
+    def _find_supervisor_session(
+        self,
+        provider: str,
+        session_ref: str,
+    ) -> dict[str, Any] | None:
+        if self.session_supervisor is None:
+            return None
+        normalized_provider = _provider(provider)
+        return next(
+            (
+                session
+                for session in self.session_supervisor.list_sessions(
+                    node=self.session_node,
+                    mode=self.requested_mode,
+                )
+                if str(session.get("provider") or "").upper() == normalized_provider
+                and _same_provider_session_ref(
+                    normalized_provider,
+                    session.get("provider_session_ref"),
+                    session_ref,
+                )
+            ),
+            None,
+        )
 
     def observe_current_anchor(self, anchor_ref: str) -> dict[str, Any] | None:
         if self.session_supervisor is None:
@@ -2630,6 +2687,7 @@ class ProjectMasterSessionStore:
                 "currentness": "UNKNOWN",
             }
         )
+        supervisor_session_id = str(session["session_id"])
         if not session["is_default"]:
             self.session_supervisor.set_default(
                 supervisor_session_id,
@@ -3927,23 +3985,64 @@ class ResidentModeSessionHost:
             observed_identity = dict(identity)
             current = self.session_supervisor.get_session(supervisor_session_id)
             current_lease = current.get("process_lease")
+            local_lease_matches = (
+                isinstance(current_lease, Mapping)
+                and current_lease.get("lease_state") == "OWNED"
+                and self._supervisor_session_id == supervisor_session_id
+                and bool(self._supervisor_lease_token)
+                and self._supervisor_lease_version
+                == int(current_lease.get("lease_version", -1))
+                and self._supervisor_process_identity is not None
+                and _same_process_identity(
+                    current_lease.get("process_identity"),
+                    self._supervisor_process_identity,
+                )
+            )
             if (
                 isinstance(current_lease, Mapping)
                 and current_lease.get("lease_state") == "OWNED"
                 and _same_process_identity(
                     current_lease.get("process_identity"), observed_identity
                 )
-                and self._supervisor_session_id == supervisor_session_id
-                and self._supervisor_lease_token
-                and self._supervisor_lease_version
-                == int(current_lease.get("lease_version", -1))
+                and local_lease_matches
             ):
                 return
-            expected_version = (
-                int(current_lease.get("lease_version", 0))
-                if isinstance(current_lease, Mapping)
-                else 0
-            )
+            if local_lease_matches:
+                # A native provider may replace its underlying process while
+                # keeping the same resident session object (for example,
+                # Codex recovering a failed turn). The old lease is still
+                # ours, so retire it with the exact capability and identity
+                # before acquiring a lease for the replacement process.
+                try:
+                    retired = self.session_supervisor.mark_lease_stale(
+                        supervisor_session_id,
+                        self._supervisor_process_identity,
+                        lease_token=self._supervisor_lease_token,
+                        expected_lease_version=self._supervisor_lease_version,
+                        reason="RESIDENT_PROVIDER_PROCESS_REPLACED",
+                    )
+                except SessionSupervisorError as error:
+                    raise ProjectMasterHostError(str(error)) from error
+                retired_lease = (
+                    retired.get("process_lease")
+                    if isinstance(retired, Mapping)
+                    else None
+                )
+                expected_version = (
+                    int(retired_lease["lease_version"])
+                    if isinstance(retired_lease, Mapping)
+                    else self._supervisor_lease_version + 1
+                )
+                self._supervisor_session_id = None
+                self._supervisor_lease_token = None
+                self._supervisor_lease_version = None
+                self._supervisor_process_identity = None
+            else:
+                expected_version = (
+                    int(current_lease.get("lease_version", 0))
+                    if isinstance(current_lease, Mapping)
+                    else 0
+                )
             acquired = self.session_supervisor.acquire_lease(
                 supervisor_session_id,
                 observed_identity,

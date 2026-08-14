@@ -235,6 +235,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             APP,
         )
 
+    def test_conductor_room_uses_resident_session_before_planning_binding(self) -> None:
+        self.assertIn("const residentSessionReady = Boolean(", APP)
+        self.assertIn('session?.resident === true', APP)
+        self.assertIn(
+            'state.conductorRuntimeBinding?.status === "BOUND" || residentSessionReady',
+            APP,
+        )
+        self.assertIn('"Provider setup required"', APP)
+        self.assertIn('"LLM connected / Auto-approve " + autoApprove', APP)
+
     def test_provider_profiles_use_one_provider_model_effort_dialog(self) -> None:
         self.assertIn('id="provider-profile-dialog"', HTML)
         self.assertIn('id="provider-profile-provider"', HTML)
