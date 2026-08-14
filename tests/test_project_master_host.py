@@ -2587,6 +2587,178 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(master_before["process_lease"], master_after_cleanup["process_lease"])
         self.assertEqual("STALE", runtime_after_cleanup["process_lease"]["lease_state"])
 
+    def test_task_frame_runtime_recovers_absent_stop_authorized_lease(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        live_pids = {4202}
+
+        def observe(pid, created_at):
+            if pid in live_pids:
+                return {
+                    "status": "PROCESS_PRESENT_EXACT",
+                    "pid": pid,
+                    "process_created_at": created_at,
+                }
+            return {
+                "status": "ORIGINAL_PROCESS_ABSENT",
+                "reason": "TEST_PROCESS_EXITED",
+                "pid": pid,
+                "expected_process_created_at": created_at,
+            }
+
+        supervisor = SessionSupervisorStore(
+            self.root / "recover-runtime-lease.sqlite3",
+            process_observer=observe,
+        )
+        original = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "claude-code:master-session",
+            session_supervisor=supervisor,
+            source_binding_resolver=lambda _root: self._selected_release(),
+        )
+        original_identity = {
+            "pid": 4202,
+            "process_created_at": "2026-08-14T00:01:00.000000Z",
+            "executable": "C:\\fake\\python.exe",
+            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "endpoint": "http://127.0.0.1:54202",
+            "handshake_fingerprint": "b" * 64,
+        }
+        with patch(
+            "project_master_host.launched_process_identity",
+            return_value=original_identity,
+        ):
+            original._register_process_lease(
+                process=object(),
+                command=original_identity["command"],
+                endpoint=original_identity["endpoint"],
+                token="original-runtime-stop-capability",
+                runtime_session_id="project-master-gcs-master",
+                anchor_id="MASTER-CURRENT-001",
+            )
+        runtime_session_id = original._supervisor_session_id
+        original_token = original._lease_token
+        authorization = supervisor.authorize_managed_stop(
+            runtime_session_id,
+            expected_lease_version=original._lease_version,
+        )
+        self.assertEqual("MANAGED_STOP_AUTHORIZED", authorization["status"])
+        live_pids.clear()
+
+        replacement = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "claude-code:master-session",
+            session_supervisor=supervisor,
+            source_binding_resolver=lambda _root: self._selected_release(),
+        )
+        replacement_identity = {
+            **original_identity,
+            "pid": 4303,
+            "process_created_at": "2026-08-14T00:02:00.000000Z",
+            "endpoint": "http://127.0.0.1:54303",
+            "handshake_fingerprint": "c" * 64,
+        }
+        with patch(
+            "project_master_host.launched_process_identity",
+            return_value=replacement_identity,
+        ):
+            replacement._register_process_lease(
+                process=object(),
+                command=replacement_identity["command"],
+                endpoint=replacement_identity["endpoint"],
+                token="replacement-runtime-stop-capability",
+                runtime_session_id="project-master-gcs-master",
+                anchor_id="MASTER-CURRENT-001",
+            )
+
+        recovered = supervisor.get_session(runtime_session_id)
+        self.assertEqual("LIVE", recovered["state"])
+        self.assertEqual("OWNED", recovered["process_lease"]["lease_state"])
+        self.assertEqual(4303, recovered["process_lease"]["process_identity"]["pid"])
+        self.assertEqual(4, recovered["process_lease"]["lease_version"])
+        self.assertNotEqual(original_token, replacement._lease_token)
+
+    def test_task_frame_runtime_keeps_present_stop_authorized_lease_blocked(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        supervisor = SessionSupervisorStore(
+            self.root / "block-present-runtime-lease.sqlite3",
+            process_observer=lambda pid, created_at: {
+                "status": "PROCESS_PRESENT_EXACT",
+                "pid": pid,
+                "process_created_at": created_at,
+            },
+        )
+        original = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "claude-code:master-session",
+            session_supervisor=supervisor,
+            source_binding_resolver=lambda _root: self._selected_release(),
+        )
+        original_identity = {
+            "pid": 4202,
+            "process_created_at": "2026-08-14T00:01:00.000000Z",
+            "executable": "C:\\fake\\python.exe",
+            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "endpoint": "http://127.0.0.1:54202",
+            "handshake_fingerprint": "b" * 64,
+        }
+        with patch(
+            "project_master_host.launched_process_identity",
+            return_value=original_identity,
+        ):
+            original._register_process_lease(
+                process=object(),
+                command=original_identity["command"],
+                endpoint=original_identity["endpoint"],
+                token="original-runtime-stop-capability",
+                runtime_session_id="project-master-gcs-master",
+                anchor_id="MASTER-CURRENT-001",
+            )
+        runtime_session_id = original._supervisor_session_id
+        supervisor.authorize_managed_stop(
+            runtime_session_id,
+            expected_lease_version=original._lease_version,
+        )
+
+        replacement = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "claude-code:master-session",
+            session_supervisor=supervisor,
+            source_binding_resolver=lambda _root: self._selected_release(),
+        )
+        replacement_identity = {
+            **original_identity,
+            "pid": 4303,
+            "process_created_at": "2026-08-14T00:02:00.000000Z",
+            "endpoint": "http://127.0.0.1:54303",
+            "handshake_fingerprint": "c" * 64,
+        }
+        with patch(
+            "project_master_host.launched_process_identity",
+            return_value=replacement_identity,
+        ), self.assertRaises(ProjectMasterHostError) as blocked:
+            replacement._register_process_lease(
+                process=object(),
+                command=replacement_identity["command"],
+                endpoint=replacement_identity["endpoint"],
+                token="replacement-runtime-stop-capability",
+                runtime_session_id="project-master-gcs-master",
+                anchor_id="MASTER-CURRENT-001",
+            )
+
+        self.assertEqual("PROCESS_ABSENCE_NOT_PROVEN", str(blocked.exception))
+        unchanged = supervisor.get_session(runtime_session_id)
+        self.assertEqual("STOP_AUTHORIZED", unchanged["process_lease"]["lease_state"])
+        self.assertEqual(4202, unchanged["process_lease"]["process_identity"]["pid"])
+        self.assertIsNone(replacement._supervisor_session_id)
+
     def test_project_mode_coordinator_preserves_runtime_error_code(self) -> None:
         runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)

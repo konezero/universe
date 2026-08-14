@@ -2287,6 +2287,26 @@ class ProjectModeCoordinator:
             handshake_token=token,
         )
         existing = session.get("process_lease")
+        if (
+            isinstance(existing, Mapping)
+            and existing.get("lease_state") == "STOP_AUTHORIZED"
+        ):
+            try:
+                recovered = self.session_supervisor.complete_managed_stop(
+                    supervisor_session_id,
+                    expected_lease_version=int(existing.get("lease_version", 0)),
+                )
+            except SessionSupervisorError as error:
+                raise ProjectMasterHostError(error.code) from error
+            recovered_lease = recovered.get("process_lease")
+            if (
+                not isinstance(recovered_lease, Mapping)
+                or recovered_lease.get("lease_state") != "RELEASED"
+            ):
+                raise ProjectMasterHostError(
+                    "RUNTIME_EXECUTOR_STOP_RECOVERY_RESULT_INVALID"
+                )
+            existing = recovered_lease
         expected_version = (
             0 if existing is None else int(existing.get("lease_version", 0))
         )
