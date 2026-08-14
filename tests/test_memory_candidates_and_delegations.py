@@ -184,6 +184,7 @@ class ConductorDelegationMigrationTests(unittest.TestCase):
                         "idempotency_key": "legacy-cancellation-state",
                         "origin_session_anchor_ref": "session_anchor_origin",
                         "target_session_anchor_ref": "session_anchor_target",
+                        "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
                     }
                 )
                 self.assertTrue(created)
@@ -406,6 +407,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "idempotency_key": "delegation-test-1",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
                 "task_frame_ref": "task-frame-1",
                 "worker_role": "PROJECT_MASTER",
             },
@@ -446,6 +448,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "idempotency_key": "delegation-recovery-1",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
         self.assertTrue(created)
@@ -472,6 +475,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "idempotency_key": "delegation-cancel-queued-1",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
         self.assertTrue(created)
@@ -495,6 +499,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "idempotency_key": "delegation-cancel-running-1",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
         self.assertTrue(created)
@@ -527,6 +532,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "idempotency_key": "delegation-cancel-review-1",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
         self.assertTrue(created)
@@ -560,6 +566,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "model_ref": "other-model",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             },
         )
         self.assertEqual(HTTPStatus.CONFLICT, status)
@@ -593,6 +600,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "provider": "CLAUDE",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             },
         )
         self.assertEqual(HTTPStatus.CONFLICT, status)
@@ -622,6 +630,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "idempotency_key": "delegation-project-master-1",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
         self.assertTrue(created)

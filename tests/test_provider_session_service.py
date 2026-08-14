@@ -210,6 +210,27 @@ class ProviderSessionServiceTests(unittest.TestCase):
         )
         self.assertFalse(snapshot["room_queue_used"])
 
+    def test_internal_callbacks_bind_reply_before_terminal_event(self) -> None:
+        observed: list[tuple[str, str]] = []
+        accepted = self.service.submit(
+            CHAT_KEY,
+            {"body": "hello", "idempotency_key": "turn-callback-001"},
+            on_accepted=lambda reply: observed.append(
+                ("accepted", str(reply["message_id"]))
+            ),
+            on_terminal=lambda reply: observed.append(
+                (str(reply["state"]).lower(), str(reply["message_id"]))
+            ),
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+        self.assertEqual(
+            [
+                ("accepted", accepted["reply"]["message_id"]),
+                ("completed", accepted["reply"]["message_id"]),
+            ],
+            observed,
+        )
+
     def test_permission_round_trip_is_scoped_to_opaque_chat_key(self) -> None:
         self.service.submit(
             CHAT_KEY,

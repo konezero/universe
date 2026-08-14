@@ -81,6 +81,52 @@ class UniverseWorkPreflightTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_result_claim_serializes_origin_delivery_against_cancellation(self) -> None:
+        (self.root / "REPOSITORY_MANIFEST.md").write_text("# GCS\n", encoding="utf-8")
+        store = UniverseStore(self.root / "universe.sqlite3")
+        store.register_project(
+            {"project_id": "GCS", "project_root": str(self.root)}
+        )
+
+        def create(key: str) -> dict[str, Any]:
+            delegation, _ = store.create_conductor_delegation(
+                {
+                    "project_id": "GCS",
+                    "summary": "Review the bounded result",
+                    "idempotency_key": key,
+                    "origin_session_anchor_ref": "session_anchor_origin",
+                    "target_session_anchor_ref": "session_anchor_target",
+                    "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            )
+            return store.start_conductor_delegation(delegation["delegation_id"])
+
+        running = create("result-claim-wins")
+        claimed, permitted = store.claim_conductor_delegation_result(
+            running["delegation_id"]
+        )
+        self.assertTrue(permitted)
+        self.assertEqual("RESULT_ROUTING", claimed["state"])
+        self.assertEqual(
+            "RESULT_ROUTING",
+            store.cancel_conductor_delegation(running["delegation_id"], {})["state"],
+        )
+        self.assertEqual(
+            "COMPLETED",
+            store.complete_conductor_delegation(
+                running["delegation_id"], {"result_summary": "bounded result"}
+            )["state"],
+        )
+
+        cancelled = create("cancellation-wins")
+        store.cancel_conductor_delegation(cancelled["delegation_id"], {})
+        ignored, permitted = store.claim_conductor_delegation_result(
+            cancelled["delegation_id"]
+        )
+        self.assertFalse(permitted)
+        self.assertEqual("CANCELLED", ignored["state"])
+        self.assertEqual("PROVIDER_RESULT_IGNORED", ignored["result"]["cancellation_scope"])
+
     def _responses(self) -> list[tuple[int, dict[str, Any]]]:
         return [
             (200, {"status": "READY", "universe": {"universe_id": "test"}}),
@@ -170,6 +216,7 @@ class UniverseWorkPreflightTests(unittest.TestCase):
                 "idempotency_key": "cross-session-test",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
         self.assertEqual("CROSS_SESSION_DELEGATION", delegated["queue_scope"])
@@ -1794,16 +1841,74 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "provider": "AUTO",
                 "model_ref": None,
                 "summary": "Ask the target session to review the diff.",
+                "idempotency_key": "delegation-session-transport-001",
                 "origin_session_anchor_ref": "session_anchor_origin",
                 "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
             },
         }
         with patch.object(self.server, "send_project_room_message") as room_send:
             with self.assertRaises(UniverseError) as raised:
                 self.server._dispatch_project_master_delegation(record)
         self.assertEqual(
-            "TARGET_SESSION_DELEGATION_TRANSPORT_UNAVAILABLE", raised.exception.code
+            "ORIGIN_SESSION_ANCHOR_NOT_FOUND", raised.exception.code
         )
+        room_send.assert_not_called()
+
+    def test_cross_session_delegation_requires_local_operator_token(self) -> None:
+        status, response = self.request(
+            "POST",
+            "/v1/conductor/delegations",
+            {
+                "project_id": "GCS",
+                "summary": "Do not accept an unauthenticated origin claim",
+                "idempotency_key": "delegation-unauthenticated-001",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        )
+        self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+        self.assertEqual("CONDUCTOR_DELEGATION_TOKEN_REQUIRED", response["error_code"])
+        connection = sqlite3.connect(self.server.store.database_path)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM conductor_delegation WHERE idempotency_key = ?",
+                ("delegation-unauthenticated-001",),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(0, count)
+
+    def test_cross_session_delegation_uses_internal_session_anchor_transport(self) -> None:
+        record = {
+            "delegation_id": "delegation-session-transport-success-001",
+            "project_id": "GCS",
+            "request": {
+                "worker_role": "PROJECT_MASTER",
+                "provider": "AUTO",
+                "model_ref": None,
+                "summary": "Ask the exact target session to review the diff.",
+                "idempotency_key": "delegation-session-transport-success-001",
+                "origin_session_anchor_ref": "session_anchor_origin",
+                "target_session_anchor_ref": "session_anchor_target",
+                "origin_session_chat_key": "provider_chat_aaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        }
+        transport = Mock()
+        transport.deliver.return_value = {
+            "progress": {
+                "step": "WAITING_FOR_TARGET_SESSION_RESULT",
+                "room_queue_used": False,
+            }
+        }
+        self.server.session_anchor_transport = transport
+        with patch.object(self.server, "send_project_room_message") as room_send:
+            result = self.server._dispatch_project_master_delegation(record)
+        self.assertEqual(
+            "WAITING_FOR_TARGET_SESSION_RESULT", result["progress"]["step"]
+        )
+        transport.deliver.assert_called_once_with(record)
         room_send.assert_not_called()
 
     def test_delegation_dispatch_rejects_legacy_record_without_session_lineage(

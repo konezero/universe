@@ -1,5 +1,8 @@
 "use strict";
 
+const localControlToken =
+  new URLSearchParams(window.location.search).get("token") || "";
+
 const state = {
   projects: [],
   todos: [],
@@ -64,6 +67,9 @@ const state = {
   selectedSupervisorAnchorKey: null,
   /** A mode can expose many persistent sessions; this is its one chat selection. */
   selectedSupervisorAnchorKeysByMode: {},
+  /** Cross-session work is a routed handoff, never a second direct-chat target. */
+  sessionDelegationDraft: null,
+  sessionDelegations: [],
   /** Expanded left-rail mode whose persistent session cards are visible. */
   selectedModeCoordinateKey: null,
   observatoryShowAll: false,
@@ -692,6 +698,124 @@ function sessionAnchorRef(session) {
   ).trim();
 }
 
+function supervisorSessionForAnchorRef(anchorRef) {
+  const wanted = String(anchorRef || "").trim();
+  if (!wanted) return null;
+  return (
+    (state.supervisorSessions || []).find(
+      (session) => sessionAnchorRef(session) === wanted
+    ) || null
+  );
+}
+
+function isCompletedSessionDelegation(delegation) {
+  return ["COMPLETED", "SUCCEEDED", "RESULT_READY"].includes(
+    String(delegation?.state || delegation?.status || "").toUpperCase()
+  );
+}
+
+function rememberSessionDelegation(delegation) {
+  if (!delegation?.delegation_id) return delegation;
+  state.sessionDelegations = [
+    delegation,
+    ...(state.sessionDelegations || []).filter(
+      (item) => item.delegation_id !== delegation.delegation_id
+    ),
+  ].slice(0, 100);
+  return delegation;
+}
+
+function normalizeSessionDelegation(delegation, fallback = {}) {
+  const request = delegation?.request || {};
+  return {
+    ...(delegation || {}),
+    project_id: delegation?.project_id || request.project_id || fallback.project_id || null,
+    origin_anchor_ref:
+      request.origin_session_anchor_ref || fallback.origin_anchor_ref || "",
+    target_anchor_ref:
+      request.target_session_anchor_ref || fallback.target_anchor_ref || "",
+  };
+}
+
+function watchSessionDelegation(delegationId, fallback, attempt = 0) {
+  if (!delegationId || attempt >= 120) return;
+  window.setTimeout(async () => {
+    try {
+      const result = await api(
+        `/v1/conductor/delegations/${encodeURIComponent(delegationId)}`
+      );
+      const delegation = rememberSessionDelegation(
+        normalizeSessionDelegation(result, fallback)
+      );
+      renderRoomMessages();
+      if (isCompletedSessionDelegation(delegation)) {
+        await rejoinDelegationOrigin(delegation);
+        return;
+      }
+      if (["FAILED", "CANCELLED"].includes(String(delegation.state || "").toUpperCase())) {
+        toast(`Delegation ended with ${delegation.state}`, true);
+        return;
+      }
+      watchSessionDelegation(delegationId, fallback, attempt + 1);
+    } catch (error) {
+      if (attempt < 119) watchSessionDelegation(delegationId, fallback, attempt + 1);
+    }
+  }, 1500);
+}
+
+async function rejoinDelegationOrigin(delegation) {
+  const originAnchorRef = String(delegation?.origin_anchor_ref || "").trim();
+  const originSession = supervisorSessionForAnchorRef(originAnchorRef);
+  const originRoom = providerChatRoomForSupervisorSession(originSession);
+  if (!originSession || !originRoom) {
+    toast("Delegation result is ready, but its origin session chat is unavailable", true);
+    return false;
+  }
+  await openProviderChatSession(originRoom, { session: originSession });
+  expandConversationLayer();
+  toast("Delegation result rejoined the origin session");
+  return true;
+}
+
+function beginCrossSessionDelegation(targetSession) {
+  const origin = state.conversationTarget;
+  const originAnchorRef = String(origin?.session_anchor_ref || "").trim();
+  const targetAnchorRef = sessionAnchorRef(targetSession);
+  if (origin?.kind !== "PROVIDER_SESSION" || !originAnchorRef) {
+    toast("Open the origin persistent session before delegating", true);
+    return;
+  }
+  if (!targetAnchorRef || targetAnchorRef === originAnchorRef) {
+    toast("Choose a different persistent session as the delegation target", true);
+    return;
+  }
+  state.sessionDelegationDraft = {
+    project_id:
+      origin.projectId ||
+      targetSession.current_project_id ||
+      targetSession.project_id ||
+      null,
+    origin_session_chat_key: origin.chat_key,
+    origin_anchor_ref: originAnchorRef,
+    target_anchor_ref: targetAnchorRef,
+    origin_label: origin.alias || origin.projectId || "Origin session",
+    target_label: sessionDisplayName(targetSession),
+    state: "DRAFT",
+  };
+  state.conversationTarget = {
+    kind: "SESSION_DELEGATION",
+    projectId: origin.projectId || targetSession.node || null,
+    origin_anchor_ref: originAnchorRef,
+    target_anchor_ref: targetAnchorRef,
+  };
+  renderNodeModes();
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  expandConversationLayer();
+  elements.dispatchInstruction.focus();
+}
+
 function nodeModeCoordinateKey(nodeId, mode) {
   return `${normalizeNodeModeNode(nodeId).toLowerCase()}::${String(
     mode || ""
@@ -918,6 +1042,10 @@ async function rebindSelectedSessionWorkingDirectory() {
 
 async function api(path, options = {}) {
   const headers = options.body ? { "Content-Type": "application/json" } : {};
+  if (options.controlToken) {
+    if (!localControlToken) throw new Error("Local operator token is unavailable");
+    headers.Authorization = `Bearer ${localControlToken}`;
+  }
   const response = await fetch(path, {
     method: options.method || "GET",
     headers,
@@ -1809,12 +1937,8 @@ function nodeModeStatusLabel(coordinate) {
 function nodeModeSelectedSession(coordinate) {
   const sessions = coordinate?.sessions || [];
   const selectedKey = state.selectedSupervisorAnchorKeysByMode[coordinate?.key];
-  return (
-    sessions.find((session) => anchorSessionKey(session) === selectedKey) ||
-    sessions.find((session) => session.is_default) ||
-    sessions[0] ||
-    null
-  );
+  // A default/current/active observation may be shown, but never chooses chat.
+  return sessions.find((session) => anchorSessionKey(session) === selectedKey) || null;
 }
 
 async function selectNodeModeSession(coordinate, session) {
@@ -1851,6 +1975,7 @@ function renderNodeModeSessionCards(coordinate) {
   const selected = nodeModeSelectedSession(coordinate);
   for (const session of sessions) {
     const room = providerChatRoomForSupervisorSession(session);
+    const row = node("div", "node-mode-session-row");
     const card = node("button", "node-mode-session-card");
     card.type = "button";
     card.dataset.anchorKey = anchorSessionKey(session);
@@ -1886,7 +2011,19 @@ function renderNodeModeSessionCards(coordinate) {
         toast(error.message, true)
       );
     });
-    cards.append(card);
+    row.append(card);
+    if (room && state.conversationTarget.kind === "PROVIDER_SESSION") {
+      const delegate = node("button", "node-mode-session-delegate", "Delegate here");
+      delegate.type = "button";
+      delegate.dataset.targetAnchorRef = sessionAnchorRef(session);
+      delegate.title = "Delegate bounded work from the selected direct session";
+      delegate.disabled =
+        String(state.conversationTarget.session_anchor_ref || "").trim() ===
+        sessionAnchorRef(session);
+      delegate.addEventListener("click", () => beginCrossSessionDelegation(session));
+      row.append(delegate);
+    }
+    cards.append(row);
   }
   return cards;
 }
@@ -2568,6 +2705,11 @@ async function cancelProviderSessionTurn() {
 
 function renderComposerActions() {
   elements.projectMasterActions.replaceChildren();
+  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
+    // Delegation has its own explicit target anchors; do not offer room routing here.
+    elements.returnToConductor.classList.toggle("selected", false);
+    return;
+  }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     const activeReply = activeProviderSessionReply();
     if (activeReply) {
@@ -2877,6 +3019,23 @@ function sessionUsageLabel(connection) {
 }
 
 function renderComposerState() {
+  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
+    const draft = state.sessionDelegationDraft || state.conversationTarget;
+    const originAnchorRef = String(draft.origin_anchor_ref || "UNKNOWN");
+    const targetAnchorRef = String(draft.target_anchor_ref || "UNKNOWN");
+    elements.roomContext.textContent = `Delegation / ${originAnchorRef} → ${targetAnchorRef}`;
+    elements.roomHint.textContent =
+      "Cross-session delegation / origin and target anchors are explicit / not direct chat";
+    elements.dispatchInstruction.placeholder = "Instruction for the target session";
+    if (elements.conversationTitle) {
+      elements.conversationTitle.textContent = "Delegation";
+    }
+    if (elements.conversationTargetLabel) {
+      elements.conversationTargetLabel.textContent =
+        `Origin ${originAnchorRef} → Target ${targetAnchorRef}`;
+    }
+    return;
+  }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     const target = state.conversationTarget;
     const provider = target.provider || "UNKNOWN";
@@ -3575,6 +3734,9 @@ function mergeGovernanceProposalInbox(projectId, proposals) {
 
 
 function conversationMessageCount() {
+  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
+    return state.sessionDelegationDraft ? 1 : 0;
+  }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     return (state.providerSessionMessages || []).length;
   }
@@ -3702,6 +3864,9 @@ function initChatPanelResize() {
 }
 
 function pendingActionItems() {
+  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
+    return { proposals: [], permissions: [], delegations: [] };
+  }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     return {
       proposals: [],
@@ -3805,6 +3970,8 @@ function renderActionInbox() {
   elements.actionInboxList.replaceChildren();
   const title = state.conversationTarget.kind === "UNIVERSE_CONDUCTOR"
     ? "Universe actions"
+    : state.conversationTarget.kind === "SESSION_DELEGATION"
+      ? "Delegation actions"
     : state.conversationTarget.kind === "PROVIDER_SESSION"
       ? `${state.conversationTarget.alias || state.conversationTarget.projectId} actions`
       : `${state.conversationTarget.projectId} actions`;
@@ -3842,6 +4009,33 @@ function renderRoomMessages() {
       elements.conversationExpand?.checked
   );
   elements.roomMessageList.replaceChildren();
+  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
+    const draft = state.sessionDelegationDraft || state.conversationTarget;
+    const delegation = (state.sessionDelegations || []).find(
+      (item) =>
+        String(item.origin_anchor_ref || "") === String(draft.origin_anchor_ref || "") &&
+        String(item.target_anchor_ref || "") === String(draft.target_anchor_ref || "")
+    );
+    const item = node("article", "room-message session-delegation-message");
+    item.append(
+      node("strong", "", "CROSS-SESSION DELEGATION / NOT DIRECT CHAT"),
+      node("p", "", `${draft.origin_label || "Origin"} → ${draft.target_label || "Target"}`),
+      node("small", "", `origin_anchor_ref: ${draft.origin_anchor_ref || "UNKNOWN"}`),
+      node("small", "", `target_anchor_ref: ${draft.target_anchor_ref || "UNKNOWN"}`),
+      node("small", "", `status: ${delegation?.state || draft.state || "DRAFT"}`)
+    );
+    if (delegation && isCompletedSessionDelegation(delegation)) {
+      const rejoin = node("button", "secondary-button", "Open origin session");
+      rejoin.type = "button";
+      rejoin.addEventListener("click", () => {
+        rejoinDelegationOrigin(delegation).catch((error) => toast(error.message, true));
+      });
+      item.append(rejoin);
+    }
+    elements.roomMessageList.append(item);
+    finishRoomMessageRender(previousScrollTop, stickToBottom);
+    return;
+  }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     if (!state.providerSessionMessages.length) {
       elements.roomMessageList.append(
@@ -8205,6 +8399,62 @@ function renderEmpty() {
 async function submitDispatch(event) {
   event.preventDefault();
   const form = new FormData(elements.dispatchForm);
+  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
+    const instruction = String(form.get("instruction") || "").trim();
+    const draft = state.sessionDelegationDraft || state.conversationTarget;
+    const originAnchorRef = String(draft.origin_anchor_ref || "").trim();
+    const targetAnchorRef = String(draft.target_anchor_ref || "").trim();
+    if (!instruction || !originAnchorRef || !targetAnchorRef) {
+      toast("Delegation needs an instruction plus exact origin and target anchor refs", true);
+      return;
+    }
+    elements.dispatchSubmit.disabled = true;
+    try {
+      const projectId = String(draft.project_id || draft.projectId || "").trim();
+      if (!projectId) {
+        throw new Error("Delegation needs an exact project id");
+      }
+      // Internal delegation uses exact Session Anchors, never a Project/Meeting Room queue.
+      const result = await api("/v1/conductor/delegations", {
+        method: "POST",
+        controlToken: true,
+        body: {
+          project_id: projectId,
+          summary: instruction,
+          idempotency_key: crypto.randomUUID(),
+          origin_session_anchor_ref: originAnchorRef,
+          target_session_anchor_ref: targetAnchorRef,
+          origin_session_chat_key: String(draft.origin_session_chat_key || "").trim(),
+          provider: "AUTO",
+        },
+      });
+      const delegation = normalizeSessionDelegation(result.delegation, {
+        project_id: projectId,
+        origin_anchor_ref: originAnchorRef,
+        target_anchor_ref: targetAnchorRef,
+      });
+      rememberSessionDelegation(delegation);
+      state.sessionDelegationDraft = { ...draft, state: delegation.state || "QUEUED" };
+      elements.dispatchForm.reset();
+      renderComposerState();
+      renderRoomMessages();
+      if (isCompletedSessionDelegation(delegation)) {
+        await rejoinDelegationOrigin(delegation);
+      } else {
+        toast("Delegation queued with explicit origin and target anchors");
+        watchSessionDelegation(delegation.delegation_id, {
+          project_id: projectId,
+          origin_anchor_ref: originAnchorRef,
+          target_anchor_ref: targetAnchorRef,
+        });
+      }
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      elements.dispatchSubmit.disabled = false;
+    }
+    return;
+  }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     const instruction = String(form.get("instruction") || "").trim();
     if (!instruction) return;

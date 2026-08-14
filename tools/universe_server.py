@@ -56,6 +56,11 @@ from legacy_executor_classifier import (
 )
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore
+from session_anchor_transport import (
+    SessionAnchorTransport,
+    SessionAnchorTransportError,
+)
+from task_frame_lineage import TaskFrameLineageStore
 from universe_dispatch import (
     DispatchError,
     HttpProjectMasterBridge,
@@ -336,6 +341,7 @@ CONDUCTOR_DELEGATION_STATES = frozenset(
     {
         "QUEUED",
         "RUNNING",
+        "RESULT_ROUTING",
         "CANCELLATION_REQUESTED",
         "COMPLETED",
         "FAILED",
@@ -3271,6 +3277,7 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         "model_ref",
         "origin_session_anchor_ref",
         "target_session_anchor_ref",
+        "origin_session_chat_key",
     }
     forbidden = {
         "body",
@@ -3354,6 +3361,17 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
             "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
             "cross-session delegation requires both origin and target Session Anchors",
         )
+    if origin_session_anchor_ref == target_session_anchor_ref:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
+            "origin and target Session Anchors must be different",
+        )
+    origin_session_chat_key = str(value.get("origin_session_chat_key") or "").strip()
+    if re.fullmatch(r"provider_chat_[0-9a-f]{24}", origin_session_chat_key) is None:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_ORIGIN_CHAT_INVALID",
+            "cross-session delegation requires the exact selected origin chat key",
+        )
     if any(
         len(anchor_ref) > 256
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", anchor_ref)
@@ -3379,6 +3397,7 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         "queue_scope": "CROSS_SESSION_DELEGATION",
         "origin_session_anchor_ref": origin_session_anchor_ref,
         "target_session_anchor_ref": target_session_anchor_ref,
+        "origin_session_chat_key": origin_session_chat_key,
     }
 
 
@@ -4775,7 +4794,7 @@ class UniverseStore:
                     request_json TEXT NOT NULL,
                     state TEXT NOT NULL
                         CHECK(state IN (
-                            'QUEUED', 'RUNNING', 'CANCELLATION_REQUESTED',
+                            'QUEUED', 'RUNNING', 'RESULT_ROUTING', 'CANCELLATION_REQUESTED',
                             'COMPLETED', 'FAILED', 'CANCELLED'
                         )),
                     progress_json TEXT NOT NULL DEFAULT '{}',
@@ -5262,7 +5281,10 @@ class UniverseStore:
             ).fetchone()
             if (
                 delegation_table is not None
-                and "CANCELLATION_REQUESTED" not in str(delegation_table["sql"]).upper()
+                and (
+                    "CANCELLATION_REQUESTED" not in str(delegation_table["sql"]).upper()
+                    or "RESULT_ROUTING" not in str(delegation_table["sql"]).upper()
+                )
             ):
                 connection.execute(
                     "ALTER TABLE conductor_delegation "
@@ -5279,7 +5301,7 @@ class UniverseStore:
                         request_json TEXT NOT NULL,
                         state TEXT NOT NULL
                             CHECK(state IN (
-                                'QUEUED', 'RUNNING', 'CANCELLATION_REQUESTED',
+                                'QUEUED', 'RUNNING', 'RESULT_ROUTING', 'CANCELLATION_REQUESTED',
                                 'COMPLETED', 'FAILED', 'CANCELLED'
                             )),
                         progress_json TEXT NOT NULL DEFAULT '{}',
@@ -11706,7 +11728,11 @@ class UniverseStore:
                     HTTPStatus.NOT_FOUND,
                 )
             cancelled = current["state"] == "CANCELLATION_REQUESTED"
-            if current["state"] not in {"RUNNING", "CANCELLATION_REQUESTED"}:
+            if current["state"] not in {
+                "RUNNING",
+                "RESULT_ROUTING",
+                "CANCELLATION_REQUESTED",
+            }:
                 raise UniverseError(
                     "CONDUCTOR_DELEGATION_STATE_CONFLICT",
                     "only running delegations can be completed",
@@ -11754,6 +11780,65 @@ class UniverseStore:
             )
         return self._conductor_delegation_row(updated)
 
+    def claim_conductor_delegation_result(
+        self, delegation_id: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically close cancellation before a result enters the origin chat."""
+
+        normalized = _required_text(delegation_id, "delegation_id")
+        now = utc_now()
+        with self._connection() as connection:
+            current = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+            if current is None:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_NOT_FOUND",
+                    "conductor delegation does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            state = str(current["state"])
+            if state == "CANCELLATION_REQUESTED":
+                cancellation = json.loads(current["result_json"])
+                cancellation.update(
+                    {
+                        "cancellation_scope": "PROVIDER_RESULT_IGNORED",
+                        "provider_terminal_state": "COMPLETED",
+                        "provider_completed_at": now,
+                    }
+                )
+                connection.execute(
+                    """
+                    UPDATE conductor_delegation
+                    SET state = 'CANCELLED', result_json = ?, updated_at = ?, completed_at = ?
+                    WHERE delegation_id = ? AND state = 'CANCELLATION_REQUESTED'
+                    """,
+                    (_canonical_json(cancellation), now, now, normalized),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                    (normalized,),
+                ).fetchone()
+                return self._conductor_delegation_row(updated), False
+            if state == "RESULT_ROUTING":
+                return self._conductor_delegation_row(current), True
+            if state != "RUNNING":
+                return self._conductor_delegation_row(current), False
+            updated_count = connection.execute(
+                """
+                UPDATE conductor_delegation
+                SET state = 'RESULT_ROUTING', updated_at = ?
+                WHERE delegation_id = ? AND state = 'RUNNING'
+                """,
+                (now, normalized),
+            ).rowcount
+            updated = connection.execute(
+                "SELECT * FROM conductor_delegation WHERE delegation_id = ?",
+                (normalized,),
+            ).fetchone()
+        return self._conductor_delegation_row(updated), updated_count == 1
+
     def fail_conductor_delegation(
         self, delegation_id: str, *, code: str, reason: str
     ) -> dict[str, Any]:
@@ -11780,6 +11865,7 @@ class UniverseStore:
             if current["state"] not in {
                 "QUEUED",
                 "RUNNING",
+                "RESULT_ROUTING",
                 "CANCELLATION_REQUESTED",
             }:
                 return self._conductor_delegation_row(current)
@@ -15057,6 +15143,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 provider_session_host_factory
                 or self._create_provider_session_host
             ),
+        )
+        self.task_frame_lineage = TaskFrameLineageStore(store.database_path)
+        self.session_anchor_transport = SessionAnchorTransport(
+            database_path=store.database_path,
+            session_supervisor=self.session_supervisor,
+            provider_sessions=self.provider_sessions,
+            provider_chat_catalog=self.provider_chat_catalog,
+            task_frame_lineage=self.task_frame_lineage,
+            terminal_claim_callback=self._claim_session_anchor_transport_terminal,
+            terminal_callback=self._observe_session_anchor_transport_terminal,
         )
         self.multi_room_delivery = MultiRoomDeliveryCoordinator(
             self.multi_rooms,
@@ -20241,14 +20337,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "delegation provider does not match the resident Project Master",
                     HTTPStatus.CONFLICT,
                 )
-        # Project Rooms are meeting/chat surfaces, not the cross-session work
-        # queue.  Until a target Session Anchor transport is installed, retain
-        # the durable delegation record and fail closed without room delivery.
-        raise UniverseError(
-            "TARGET_SESSION_DELEGATION_TRANSPORT_UNAVAILABLE",
-            "no internal transport can rejoin the requested target Session Anchor",
-            HTTPStatus.CONFLICT,
-        )
+        try:
+            return self.session_anchor_transport.deliver(record)
+        except SessionAnchorTransportError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def _observe_session_anchor_transport_terminal(
+        self, event: Mapping[str, Any]
+    ) -> None:
+        """Persist the terminal target result without entering any Room queue."""
+
+        delegation_id = _required_text(event.get("delegation_id"), "delegation_id")
+        if event.get("failure_code"):
+            delegation = self.store.fail_conductor_delegation(
+                delegation_id,
+                code=str(event["failure_code"]),
+                reason="exact Session Anchor transport did not return a routable result",
+            )
+        else:
+            delegation = self.store.complete_conductor_delegation(
+                delegation_id,
+                {
+                    "result_summary": _required_text(
+                        event.get("result_summary"), "result_summary"
+                    )[:2000],
+                    "result_ref": _required_text(event.get("result_ref"), "result_ref"),
+                    "result_digest": hashlib.sha256(
+                        _required_text(event.get("result_summary"), "result_summary")
+                        .encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+        self._publish_conductor_delegation(delegation)
+
+    def _claim_session_anchor_transport_terminal(self, delegation_id: str) -> bool:
+        """Serialize cancellation against origin-chat result delivery."""
+
+        delegation, claimed = self.store.claim_conductor_delegation_result(delegation_id)
+        self._publish_conductor_delegation(delegation)
+        return claimed
 
     def _conductor_worker_loop(self) -> None:
         while not self._conductor_stop.is_set():
@@ -22300,6 +22427,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if not self._authorize_local_operator():
                 return
         if path == "/v1/service/shutdown" and not self._authorize_service_control():
+            return
+        if path in {
+            "/v1/conductor/delegations",
+            "/v1/conductor-room/delegations",
+        } and not self._authorize_control_token("CONDUCTOR_DELEGATION_TOKEN_REQUIRED"):
             return
         privileged_supervisor_match = re.fullmatch(
             r"/v1/supervisor/sessions/[^/]+/"

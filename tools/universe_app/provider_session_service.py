@@ -231,7 +231,14 @@ class ProviderSessionService:
             "room_queue_used": False,
         }
 
-    def submit(self, chat_key: str, value: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(
+        self,
+        chat_key: str,
+        value: Mapping[str, Any],
+        *,
+        on_accepted: Callable[[Mapping[str, Any]], None] | None = None,
+        on_terminal: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         if self._closed.is_set():
             raise ProviderSessionError(
                 "PROVIDER_SESSION_SERVICE_CLOSED",
@@ -273,7 +280,14 @@ class ProviderSessionService:
             self._active_message_ids[key] = reply_message["message_id"]
             worker = threading.Thread(
                 target=self._run_turn,
-                args=(key, descriptor, handle, user_message, reply_message),
+                args=(
+                    key,
+                    descriptor,
+                    handle,
+                    user_message,
+                    reply_message,
+                    on_terminal,
+                ),
                 name=f"provider-session-{key[-8:]}",
                 daemon=True,
             )
@@ -289,6 +303,21 @@ class ProviderSessionService:
             self._idempotency[(key, idempotency_key)] = result
             self._idempotency.move_to_end((key, idempotency_key))
             self._prune_idempotency_locked()
+        if on_accepted is not None:
+            try:
+                on_accepted(_json_copy(reply_message))
+            except Exception as error:  # internal transport boundary
+                with self._lock:
+                    self._active_message_ids.pop(key, None)
+                    self._active_threads.pop(key, None)
+                    reply_message["state"] = "FAILED"
+                    reply_message["error_code"] = "PROVIDER_SESSION_ACCEPTED_CALLBACK_FAILED"
+                    reply_message["updated_at"] = _utc_now()
+                raise ProviderSessionError(
+                    "PROVIDER_SESSION_ACCEPTED_CALLBACK_FAILED",
+                    "Provider Session accepted callback failed",
+                    503,
+                ) from error
         self.events.publish(key, {"type": "PROVIDER_SESSION_MESSAGE", "message": user_message})
         self.events.publish(key, {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message})
         try:
@@ -304,6 +333,11 @@ class ProviderSessionService:
                 key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
             )
+            if on_terminal is not None:
+                try:
+                    on_terminal(_json_copy(reply_message))
+                except Exception:
+                    pass
             raise ProviderSessionError(
                 "PROVIDER_SESSION_THREAD_START_FAILED",
                 "Provider Session turn could not start",
@@ -640,6 +674,7 @@ class ProviderSessionService:
         handle: _HostHandle,
         user_message: Mapping[str, Any],
         reply_message: dict[str, Any],
+        on_terminal: Callable[[Mapping[str, Any]], None] | None,
     ) -> None:
         try:
             prepared = handle.host.prepare(str(descriptor["provider"]))
@@ -699,6 +734,12 @@ class ProviderSessionService:
                 self._active_message_ids.pop(chat_key, None)
                 self._cancelled_message_ids.discard(reply_message["message_id"])
                 self._active_threads.pop(chat_key, None)
+            if on_terminal is not None:
+                try:
+                    on_terminal(_json_copy(reply_message))
+                except Exception:
+                    # A transport observer cannot corrupt the provider-native turn.
+                    pass
 
     def _append_delta(
         self, chat_key: str, reply_message: dict[str, Any], value: Any

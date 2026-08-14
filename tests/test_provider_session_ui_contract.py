@@ -49,6 +49,43 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("chat_key: chatKey", open_slice)
         self.assertIn("function providerSessionRoomIsOpenable(room)", APP)
 
+    def test_mode_selection_never_infers_chat_from_default_or_activity(self) -> None:
+        selected_slice = APP[
+            APP.index("function nodeModeSelectedSession") : APP.index(
+                "async function selectNodeModeSession"
+            )
+        ]
+        self.assertIn("selectedSupervisorAnchorKeysByMode", selected_slice)
+        self.assertNotIn("session.is_default", selected_slice)
+        self.assertNotIn("sessions[0]", selected_slice)
+
+    def test_cross_session_delegation_has_explicit_anchor_contract_and_rejoins_origin(self) -> None:
+        self.assertIn("function beginCrossSessionDelegation(targetSession)", APP)
+        self.assertIn("async function rejoinDelegationOrigin(delegation)", APP)
+        delegation_slice = APP[
+            APP.index("async function submitDispatch") : APP.index(
+                "async function prepareProjectSeed"
+            )
+        ]
+        branch = delegation_slice[
+            delegation_slice.index('kind === "SESSION_DELEGATION"') : delegation_slice.index(
+                'kind === "PROVIDER_SESSION"'
+            )
+        ]
+        self.assertIn('api("/v1/conductor/delegations"', branch)
+        self.assertIn("controlToken: true", branch)
+        self.assertIn("origin_session_anchor_ref: originAnchorRef", branch)
+        self.assertIn("target_session_anchor_ref: targetAnchorRef", branch)
+        self.assertIn("origin_session_chat_key:", branch)
+        self.assertIn("project_id: projectId", branch)
+        self.assertIn('provider: "AUTO"', branch)
+        self.assertIn("watchSessionDelegation(delegation.delegation_id", branch)
+        self.assertNotIn("/v1/projects/", branch)
+        self.assertNotIn("/v1/rooms/", branch)
+        self.assertIn("await rejoinDelegationOrigin(delegation)", branch)
+        self.assertIn("CROSS-SESSION DELEGATION / NOT DIRECT CHAT", APP)
+        self.assertIn("session-delegation-message", CSS)
+
     def test_provider_session_stream_is_incremental_and_opaque(self) -> None:
         self.assertIn("function openProviderSessionStream(chatKey)", APP)
         self.assertIn("PROVIDER_SESSION_DELTA", APP)

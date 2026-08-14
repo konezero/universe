@@ -6012,6 +6012,12 @@ body:not(.graph-mode) .conductor-panel {
   padding: 5px;
   border-left: 1px solid rgba(61, 224, 255, 0.2);
 }
+.node-mode-session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px;
+  align-items: stretch;
+}
 .node-mode-session-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -6025,6 +6031,26 @@ body:not(.graph-mode) .conductor-panel {
   background: rgba(7, 21, 38, 0.4);
   color: var(--text-2);
   text-align: left;
+}
+.node-mode-session-delegate {
+  min-width: 58px;
+  padding: 4px 6px;
+  border: 1px dashed rgba(247, 182, 78, 0.55);
+  border-radius: 6px;
+  background: rgba(247, 182, 78, 0.07);
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.node-mode-session-delegate:hover:not(:disabled),
+.node-mode-session-delegate:focus-visible:not(:disabled) {
+  border-style: solid;
+  background: rgba(247, 182, 78, 0.15);
+}
+.node-mode-session-delegate:disabled {
+  opacity: .42;
+  cursor: not-allowed;
 }
 .node-mode-session-card:hover,
 .node-mode-session-card:focus-visible,
@@ -6063,6 +6089,22 @@ body:not(.graph-mode) .conductor-panel {
   margin: 2px 0;
   color: var(--text-3);
   font-size: 9px;
+}
+
+/* A delegation is a routed handoff, deliberately distinct from the direct provider transcript. */
+.room-message.session-delegation-message {
+  display: grid;
+  gap: 6px;
+  border: 1px dashed rgba(247, 182, 78, .7);
+  border-left: 3px solid var(--amber);
+  background: rgba(83, 56, 13, .22);
+}
+.room-message.session-delegation-message strong {
+  color: var(--amber);
+}
+.room-message.session-delegation-message small {
+  color: var(--text-3);
+  overflow-wrap: anywhere;
 }
 
 /* Fixed right chat dock and sliding inspector drawer. */
