@@ -1422,8 +1422,9 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   if (!section) return;
   const binding = room?.binding || {};
   const mode = String(binding.mode || "").toUpperCase();
+  const isAnchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
   const canChoose = Boolean(
-    boundSession &&
+    isAnchored &&
       ["MASTER", "CONDUCTOR"].includes(mode) &&
       (mode === "CONDUCTOR" || project.projectId)
   );
@@ -1505,6 +1506,8 @@ function renderProviderChatSummary() {
   const binding = room.binding || { state: "UNBOUND" };
   const project = sessionRailProjectIdentity(room);
   const boundSession = supervisorSessionForRoom(room);
+  const mode = String(binding.mode || "").toUpperCase();
+  const isAnchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
   const temporality = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)
     ? binding.is_default === true && binding.observer_currentness === "CURRENT"
       ? "Current"
@@ -1567,7 +1570,9 @@ function renderProviderChatSummary() {
     : "Not attached";
   elements.sessionSummaryManage.textContent = boundSession
     ? "View in Observatory"
-    : "Register session";
+    : isAnchored && ["MASTER", "CONDUCTOR"].includes(mode)
+      ? "View activity"
+      : "Register session";
 }
 
 function openProviderChatSummary(room) {
@@ -2650,11 +2655,11 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
   const mode = String(room?.binding?.mode || "").toUpperCase();
   if (
     !room ||
-    !session ||
     !["MASTER", "CONDUCTOR"].includes(mode) ||
+    (sessionAction !== "NEW" && !session) ||
     (mode === "MASTER" && !project.projectId)
   ) {
-    throw new Error("Only a bound Master or Conductor session can choose a provider and model");
+    throw new Error("Only an anchored Master or Conductor room can choose a provider and model");
   }
   const provider = String(elements.sessionSummaryProvider?.value || "").toUpperCase();
   const modelRef = String(elements.sessionSummaryModel?.value || "").trim();
