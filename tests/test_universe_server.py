@@ -1399,8 +1399,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         room = catalog["rooms"][0]
         self.assertEqual("CODEX", room["provider"])
         self.assertEqual("BOUND", room["binding"]["state"])
-        self.assertTrue(room["binding"]["is_default"])
-        self.assertEqual("CURRENT", room["binding"]["observer_currentness"])
+        self.assertFalse(room["binding"]["is_default"])
+        self.assertEqual("UNKNOWN", room["binding"]["observer_currentness"])
+        self.assertEqual("UNKNOWN", room["binding"]["currentness_source"])
         self.assertEqual("universe", room["binding"]["current_project_id"])
         self.assertEqual("MASTER", room["binding"]["mode"])
         self.assertEqual(
@@ -1461,7 +1462,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("SUPERVISOR_OBSERVED", room["identity_state"])
         self.assertEqual("BOUND", room["binding"]["state"])
         self.assertEqual("GCS", room["binding"]["current_project_id"])
-        self.assertEqual("CURRENT", room["binding"]["observer_currentness"])
+        self.assertEqual("UNKNOWN", room["binding"]["observer_currentness"])
+        self.assertEqual("UNKNOWN", room["binding"]["currentness_source"])
         self.assertEqual(
             "MASTER-CURRENT-GCS-APP",
             room["binding"]["current_anchor_ref"],
@@ -1614,6 +1616,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "provider": provider,
                 "provider_session_ref": session_ref,
                 "evidence_ref": "universe://projects/universe/anchor-store/MASTER-CURRENT-SAME",
+                "anchor_session_currentness": (
+                    "CURRENT" if provider == "CLAUDE" else "PAST"
+                ),
+                "anchor_currentness_source": "PROJECT_ANCHOR_DB",
             }
             for provider, session_ref in (
                 ("CODEX", "codex-same-anchor"),
@@ -1652,6 +1658,55 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(2, bound[0]["provider_history_count"])
         grok = next(room for room in catalog["rooms"] if room["provider"] == "GROK")
         self.assertEqual("UNBOUND", grok["binding"]["state"])
+
+    def test_session_observatory_card_uses_anchor_observer_identity(self) -> None:
+        session = {
+            "session_id": "supervisor-claude",
+            "node": "universe",
+            "mode": "MASTER",
+            "current_project_id": "universe",
+            "provider": "CLAUDE",
+            "provider_session_ref": "claude-current",
+            "anchor_ref": "MASTER-STALE",
+            "state": "LIVE",
+            "currentness": "CURRENT",
+            "updated_at": "2026-08-14T01:00:00Z",
+        }
+        observations = [
+            {
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "CONDUCTOR",
+                "anchor_ref": "CONDUCTOR-CURRENT-NEW",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-current",
+                "current_anchor_observed_at": "2026-08-14T02:00:00Z",
+                "anchor_session_currentness": "CURRENT",
+                "anchor_currentness_source": "PROJECT_ANCHOR_DB",
+            }
+        ]
+        with patch.object(
+            self.server.multi_rooms,
+            "preview_for_session",
+            return_value={"lines": [], "source": "NONE", "match": "NONE"},
+        ):
+            card = self.server._session_observatory_card(
+                session,
+                continuity_by_project={},
+                projects_by_id={},
+                anchor_observations=observations,
+            )
+
+        self.assertEqual("GCS", card["node"])
+        self.assertEqual("CONDUCTOR", card["mode"])
+        self.assertEqual("CONDUCTOR-CURRENT-NEW", card["anchor_ref"])
+        self.assertEqual("CURRENT", card["currentness"])
+        self.assertEqual("PROJECT_ANCHOR_DB", card["anchor_currentness_source"])
+        self.assertTrue(card["is_anchor_current"])
+        self.assertEqual(
+            "CONDUCTOR-CURRENT-NEW",
+            card["anchor_session"]["current_anchor_ref"],
+        )
 
     def test_project_anchor_store_is_source_for_supervisor_projection(self) -> None:
         status, _ = self.request(
@@ -1738,7 +1793,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(2, len(observations))
         by_provider = {item["provider"]: item for item in observations}
         self.assertEqual("CURRENT", by_provider["CLAUDE"]["temporality"])
+        self.assertEqual("CURRENT", by_provider["CLAUDE"]["anchor_session_currentness"])
         self.assertEqual("BEYOND", by_provider["CODEX"]["temporality"])
+        self.assertEqual("PAST", by_provider["CODEX"]["anchor_session_currentness"])
         self.assertEqual(
             "MASTER-CURRENT-GCS", by_provider["CLAUDE"]["anchor_ref"]
         )

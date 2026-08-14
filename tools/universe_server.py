@@ -16805,6 +16805,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except MultiRoomError:
             room_bindings = []
         sessions = self.session_supervisor.list_sessions()[:200]
+        anchor_identity_sources: list[dict[str, Any]] = []
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            anchor_identity_sources.extend(
+                self.store.discover_provider_session_sources(provider)
+            )
+        for session in sessions:
+            provider = str(session.get("provider") or "").upper()
+            provider_session_ref = str(
+                session.get("provider_session_ref") or ""
+            ).strip()
+            if provider in {"CODEX", "CLAUDE", "GROK"} and provider_session_ref:
+                anchor_identity_sources.append(
+                    {
+                        "provider": provider,
+                        "provider_session_id": provider_session_ref,
+                        "session_kind": session.get("session_kind") or "CHAT",
+                        "identity_state": "VERIFIED",
+                    }
+                )
+        anchor_observations = self._project_anchor_observations(
+            anchor_identity_sources
+        )
         # Prefer LIVE, then default, then newest (stable multi-pass).
         sessions = sorted(
             sessions,
@@ -16830,6 +16852,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     session,
                     continuity_by_project=continuity_by_project,
                     projects_by_id=projects_by_id,
+                    anchor_observations=anchor_observations,
                 )
             )
         return {
@@ -16860,6 +16883,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         *,
         continuity_by_project: Mapping[str, Mapping[str, Any]],
         projects_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+        anchor_observations: list[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Add last-activity + short chat preview for Observatory disambiguation."""
         card = dict(session)
@@ -16876,7 +16900,43 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for item in history
                 if isinstance(item, Mapping)
             ]
-        node = str(session.get("node") or "")
+        provider = str(session.get("provider") or "").upper()
+        provider_session_ref = str(
+            session.get("provider_session_ref") or ""
+        ).strip()
+        anchor_observation = next(
+            (
+                item
+                for item in (anchor_observations or [])
+                if str(item.get("provider") or "").upper() == provider
+                and str(item.get("provider_session_ref") or "").strip()
+                == provider_session_ref
+            ),
+            None,
+        )
+        if anchor_observation is not None:
+            card["node"] = anchor_observation.get("node") or session.get("node")
+            card["mode"] = anchor_observation.get("mode") or session.get("mode")
+            card["current_project_id"] = (
+                anchor_observation.get("project_id")
+                or session.get("current_project_id")
+            )
+            card["anchor_ref"] = anchor_observation.get("anchor_ref")
+            card["currentness"] = (
+                anchor_observation.get("anchor_session_currentness")
+                or "UNKNOWN"
+            )
+            card["anchor_currentness_source"] = (
+                anchor_observation.get("anchor_currentness_source")
+                or "UNKNOWN"
+            )
+            card["is_anchor_current"] = (
+                card["currentness"] == "CURRENT"
+            )
+        else:
+            card["anchor_currentness_source"] = "UNKNOWN"
+            card["is_anchor_current"] = False
+        node = str(card.get("node") or "")
         lease = (
             session.get("process_lease")
             if isinstance(session.get("process_lease"), Mapping)
@@ -17011,6 +17071,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             anchor_at = value.strip()
                             break
 
+        if anchor_observation is not None:
+            current_anchor_ref = str(
+                anchor_observation.get("anchor_ref") or "UNKNOWN"
+            )
+            anchor_at = str(
+                anchor_observation.get("current_anchor_observed_at")
+                or anchor_observation.get("observed_at")
+                or ""
+            ) or None
         candidates = [
             value
             for value in (last_message_at, lease_at, last_seen_at, created_at)
@@ -17023,10 +17092,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         card["last_anchor_at"] = anchor_at
         current_anchor_ref = current_anchor_ref or "UNKNOWN"
         anchor_identity = {
-            "project_id": node if node else None,
+            "project_id": card.get("current_project_id") or (node if node else None),
             "node": node or "UNKNOWN",
-            "mode": str(session.get("mode") or "UNKNOWN"),
+            "mode": str(card.get("mode") or "UNKNOWN"),
             "current_anchor_ref": current_anchor_ref,
+            "observer_currentness": card.get("currentness") or "UNKNOWN",
+            "currentness_source": card.get("anchor_currentness_source") or "UNKNOWN",
         }
         anchor_identity["anchor_key"] = (
             "anchor_session_" + _json_sha256(anchor_identity)[:24]
@@ -17107,7 +17178,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return exact[0] if len(exact) == 1 else None
 
         candidates: list[dict[str, Any]] = []
-        current_anchors: dict[tuple[str, str], dict[str, str]] = {}
+        current_anchors: dict[tuple[str, str], dict[str, Any]] = {}
         for project in self.store.list_projects()[:100]:
             project_id = str(project.get("project_id") or "").strip()
             project_root = Path(str(project.get("project_root") or "")).resolve(
@@ -17183,9 +17254,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             mode = anchor_prefix.upper() or "UNKNOWN"
                         if temporality == "CURRENT":
                             coordinate = (project_id, mode)
+                            observer_session_ref = str(
+                                snapshot.get("observer_session_ref") or ""
+                            ).strip()
                             current = {
                                 "anchor_ref": str(row["anchor_id"]),
                                 "observed_at": str(row["observed_at"]),
+                                "observer_session_ref": (
+                                    observer_session_ref or "UNKNOWN"
+                                ),
+                                "observer_identity": resolve_observer(
+                                    observer_session_ref
+                                ),
                             }
                             previous_current = current_anchors.get(coordinate)
                             if previous_current is None or (
@@ -17239,6 +17319,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if current_anchor is not None
                 else candidate["observed_at"]
             )
+            candidate_identity = (
+                str(candidate["provider"]),
+                str(candidate["provider_session_ref"]),
+            )
+            current_identity = (
+                current_anchor.get("observer_identity")
+                if current_anchor is not None
+                else None
+            )
+            candidate["anchor_session_currentness"] = (
+                "CURRENT"
+                if current_identity is not None
+                and current_identity == candidate_identity
+                else (
+                    "PAST"
+                    if current_anchor is not None and current_identity is not None
+                    else "UNKNOWN"
+                )
+            )
+            candidate["anchor_currentness_source"] = (
+                "PROJECT_ANCHOR_DB" if current_anchor is not None else "UNKNOWN"
+            )
             identity = (
                 str(candidate["provider"]),
                 str(candidate["provider_session_ref"]),
@@ -17283,7 +17385,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for provider in ("CODEX", "CLAUDE", "GROK"):
             discovered.extend(self.store.discover_provider_session_sources(provider))
 
-        anchor_observations = self._project_anchor_observations(discovered)
+        supervisor_sessions = self.session_supervisor.list_sessions(include_hidden=True)
+        anchor_identity_sources = list(discovered)
+        for supervisor in supervisor_sessions:
+            provider = str(supervisor.get("provider") or "").upper()
+            provider_session_ref = str(
+                supervisor.get("provider_session_ref") or ""
+            ).strip()
+            if provider in {"CODEX", "CLAUDE", "GROK"} and provider_session_ref:
+                anchor_identity_sources.append(
+                    {
+                        "provider": provider,
+                        "provider_session_id": provider_session_ref,
+                        "session_kind": supervisor.get("session_kind") or "CHAT",
+                        "identity_state": "VERIFIED",
+                    }
+                )
+        anchor_observations = self._project_anchor_observations(
+            anchor_identity_sources
+        )
         anchors_by_identity = {
             (
                 str(item["provider"]),
@@ -17301,7 +17421,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ): source
             for source in registered_sources
         }
-        supervisor_sessions = self.session_supervisor.list_sessions(include_hidden=True)
         rows_by_key: dict[str, dict[str, Any]] = {}
         for source in discovered:
             provider = str(source.get("provider") or "UNKNOWN").upper()
@@ -17391,6 +17510,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "mode": mode,
                     "current_anchor_ref": anchor_ref,
                 }
+                observer_currentness = str(
+                    binding_observation.get("anchor_session_currentness") or ""
+                ).upper()
+                currentness_source = str(
+                    binding_observation.get("anchor_currentness_source") or ""
+                ).upper()
+                if not observer_currentness:
+                    if anchor_observation is not None:
+                        observer_currentness = (
+                            "CURRENT"
+                            if str(binding_observation.get("temporality") or "").upper()
+                            == "CURRENT"
+                            else "PAST"
+                        )
+                        currentness_source = "PROJECT_ANCHOR_DB"
+                    else:
+                        observer_currentness = "UNKNOWN"
+                        currentness_source = "UNKNOWN"
+                effective_default = (
+                    observer_currentness == "CURRENT"
+                    if anchor_observation is not None
+                    else bool(bound is not None and bound.get("is_default"))
+                )
                 binding = {
                     "state": "BOUND" if bound is not None else "ANCHOR_OBSERVED",
                     "current_project_id": anchor_identity["project_id"],
@@ -17408,11 +17550,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "origin_anchor_temporality": binding_observation[
                         "temporality"
                     ],
-                    "observer_currentness": (
-                        bound.get("currentness")
-                        if bound is not None
-                        else "UNKNOWN"
-                    ),
+                    "observer_currentness": observer_currentness,
+                    "currentness_source": currentness_source,
                     "anchor_key": "anchor_session_"
                     + _json_sha256(anchor_identity)[:24],
                     "universe_session_id": (
@@ -17428,7 +17567,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "row_version": (
                         bound.get("row_version") if bound is not None else None
                     ),
-                    "is_default": bool(
+                    "is_default": effective_default,
+                    "supervisor_is_default": bool(
                         bound is not None and bound.get("is_default")
                     ),
                 }
@@ -17523,7 +17663,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if chat_key in rows_by_key:
                 continue
 
-            anchor_ref = str(supervisor.get("anchor_ref") or "UNKNOWN")
+            anchor_observation = anchors_by_identity.get(
+                (provider, provider_session_ref)
+            )
+            if anchor_observation is not None:
+                project_id = str(
+                    anchor_observation.get("project_id") or project_id
+                ).strip()
+                mode = str(anchor_observation.get("mode") or mode).upper()
+            anchor_ref = str(
+                (anchor_observation or {}).get("anchor_ref")
+                or supervisor.get("anchor_ref")
+                or "UNKNOWN"
+            )
             anchor_identity = {
                 "project_id": project_id,
                 "node": str(supervisor.get("node") or project_id),
@@ -17542,6 +17694,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 or ""
             )
             session_state = str(supervisor.get("state") or "UNKNOWN").upper()
+            observer_currentness = (
+                str(
+                    (anchor_observation or {}).get("anchor_session_currentness")
+                    or ""
+                ).upper()
+                if anchor_observation is not None
+                else "UNKNOWN"
+            )
+            if anchor_observation is not None and not observer_currentness:
+                observer_currentness = (
+                    "CURRENT"
+                    if str(anchor_observation.get("temporality") or "").upper()
+                    == "CURRENT"
+                    else "PAST"
+                )
+            currentness_source = (
+                "PROJECT_ANCHOR_DB"
+                if anchor_observation is not None
+                else "UNKNOWN"
+            )
+            effective_default = observer_currentness == "CURRENT"
             rows_by_key[chat_key] = {
                 "schema": "universe.provider-chat-room.v1",
                 "chat_key": chat_key,
@@ -17576,9 +17749,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         == "CURRENT"
                         else "SUPERVISOR_OBSERVED"
                     ),
-                    "observer_currentness": (
-                        supervisor.get("currentness") or "UNKNOWN"
-                    ),
+                    "observer_currentness": observer_currentness,
+                    "currentness_source": currentness_source,
                     "anchor_key": "anchor_session_"
                     + _json_sha256(anchor_identity)[:24],
                     "universe_session_id": (
@@ -17587,7 +17759,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     ),
                     "visibility": supervisor.get("visibility") or "VISIBLE",
                     "row_version": supervisor.get("row_version"),
-                    "is_default": bool(supervisor.get("is_default")),
+                    "is_default": effective_default,
+                    "supervisor_is_default": bool(supervisor.get("is_default")),
                 },
                 "transcript_content": "EXCLUDED",
             }
@@ -17602,20 +17775,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }:
                 anchor_groups.setdefault(anchor_key, []).append(row)
         for grouped_rooms in anchor_groups.values():
-            default_rooms = [
-                row
+            has_anchor_db_observation = any(
+                (row.get("binding") or {}).get("currentness_source")
+                == "PROJECT_ANCHOR_DB"
                 for row in grouped_rooms
-                if (row.get("binding") or {}).get("state") == "BOUND"
-                and (row.get("binding") or {}).get("is_default") is True
-            ]
-            current_room = default_rooms[0] if len(default_rooms) == 1 else None
+            )
+            if has_anchor_db_observation:
+                # The project Anchor DB already selected the one current
+                # observer session. Supervisor default/history must not
+                # overwrite that selection.
+                continue
             for row in grouped_rooms:
                 binding = row.get("binding") or {}
-                binding["observer_currentness"] = (
-                    "CURRENT"
-                    if row is current_room
-                    else "PAST"
-                )
+                binding["observer_currentness"] = "UNKNOWN"
+                binding["currentness_source"] = "UNKNOWN"
+                binding["is_default"] = False
 
         rooms_by_anchor: dict[str, dict[str, Any]] = {}
         unmerged_rooms: list[dict[str, Any]] = []
