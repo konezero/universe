@@ -3621,6 +3621,13 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
                 if not callable(start_or_resume):
                     raise ProjectMasterHostError("CLAUDE_PROCESS_START_UNAVAILABLE")
                 start_or_resume()
+                # A fresh Claude resident receives its explicit session id before
+                # the first turn. Persist that coordinate now so the connection
+                # status cannot expose the previous provider's session.
+                if self.session_id:
+                    self.connection_state = self.store.observe_provider_session(
+                        "CLAUDE", self.session_id
+                    )
                 return self.session_ref
             except ClaudeResidentError as error:
                 if (

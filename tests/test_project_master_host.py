@@ -1705,6 +1705,32 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("Universe Project Room message", gateway.prompts[0])
         self.assertTrue(runtime.session_ref.startswith("claude-code:"))
 
+    def test_claude_prepare_persists_new_session_before_first_turn(self) -> None:
+        class PreparedSession:
+            def start_or_resume(self) -> str:
+                return "READY"
+
+        class PreparedGateway:
+            session = PreparedSession()
+
+        runtime = ClaudeProjectMasterRuntime(
+            self.root,
+            "GCS",
+            self.state,
+            new_session=True,
+        )
+        runtime._gateway = PreparedGateway()
+        runtime.session_id = "fresh-claude-session"
+
+        runtime.prepare_session()
+
+        coordinate = self.state.last_provider_session()
+        self.assertEqual(
+            {"provider": "CLAUDE", "session_ref": "fresh-claude-session"},
+            coordinate,
+        )
+        self.assertEqual("NEW", runtime.connection_state)
+
     def test_claude_runtime_replaces_missing_resumed_session_once(self) -> None:
         class MissingResumeGateway(FakeAgentGateway):
             def reply_stream(self, prompt: str, on_delta) -> str:
