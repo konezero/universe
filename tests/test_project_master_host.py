@@ -2445,7 +2445,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             session_id = command[command.index("--session-id") + 1]
             process = FakeRuntimeProcess(
                 {
-                    "status": "SESSION_BOOT_IMAGE_CREATED",
+                    "status": "PERSISTENT_SESSION_ATTACHED",
                     "host_adapter": {
                         "endpoint": "http://127.0.0.1:41992",
                         "token": token,
@@ -2480,6 +2480,8 @@ class ProjectMasterHostTests(unittest.TestCase):
             binding = coordinator._ensure_runtime()
 
         command = process_holder[0].command
+        self.assertIn("project-runtime", command)
+        self.assertNotIn("session-boot", command)
         self.assertEqual("current", binding["frame_id"])
         self.assertEqual(
             "mode-boot-master-001", binding["mode_boot_binding_id"]
@@ -2547,7 +2549,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "pid": 4202,
             "process_created_at": "2026-08-14T00:01:00.000000Z",
             "executable": "C:\\fake\\python.exe",
-            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "command": ["C:\\fake\\python.exe", "project-runtime", "serve"],
             "endpoint": "http://127.0.0.1:54202",
             "handshake_fingerprint": "b" * 64,
         }
@@ -2557,7 +2559,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         ):
             coordinator._register_process_lease(
                 process=object(),
-                command=["C:\\fake\\python.exe", "session-boot", "serve"],
+                command=["C:\\fake\\python.exe", "project-runtime", "serve"],
                 endpoint=runtime_identity["endpoint"],
                 token="runtime-stop-capability",
                 runtime_session_id="project-master-gcs-master",
@@ -2622,7 +2624,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "pid": 4202,
             "process_created_at": "2026-08-14T00:01:00.000000Z",
             "executable": "C:\\fake\\python.exe",
-            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "command": ["C:\\fake\\python.exe", "project-runtime", "serve"],
             "endpoint": "http://127.0.0.1:54202",
             "handshake_fingerprint": "b" * 64,
         }
@@ -2704,7 +2706,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "pid": 4202,
             "process_created_at": "2026-08-14T00:01:00.000000Z",
             "executable": "C:\\fake\\python.exe",
-            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "command": ["C:\\fake\\python.exe", "project-runtime", "serve"],
             "endpoint": "http://127.0.0.1:54202",
             "handshake_fingerprint": "b" * 64,
         }

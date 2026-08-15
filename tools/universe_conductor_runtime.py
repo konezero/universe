@@ -136,7 +136,7 @@ class UniverseConductorRuntime:
         command = [
             str(_required_host_executable("python")),
             str(self.runtime_cli),
-            "session-boot",
+            "project-runtime",
             "serve",
             "--repo-root",
             str(self.repository_root),
@@ -149,7 +149,7 @@ class UniverseConductorRuntime:
             "--boot-binding-id",
             mode_boot_binding["binding_id"],
             "--host-action",
-            "UNIVERSE_LOCAL_SERVICE",
+            "PERSISTENT_SESSION_ATTACH",
             "--session-location",
             "UNIVERSE_LOCAL_SERVICE",
             "--commander-surface",
@@ -189,7 +189,7 @@ class UniverseConductorRuntime:
             host_adapter = startup.get("host_adapter")
             runtime_state = startup.get("runtime_state")
             if (
-                startup.get("status") != "SESSION_BOOT_IMAGE_CREATED"
+                startup.get("status") != "PERSISTENT_SESSION_ATTACHED"
                 or not isinstance(host_adapter, Mapping)
                 or not isinstance(runtime_state, Mapping)
                 or runtime_state.get("anchor_id") != anchor_id

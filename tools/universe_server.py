@@ -21197,7 +21197,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     break
 
     def adopt_runtime_executor(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Adopt one official Session Boot executor into the resident Supervisor."""
+        """Adopt one official persistent project runtime host into the resident Supervisor."""
 
         if not isinstance(body, Mapping):
             raise SessionSupervisorError(

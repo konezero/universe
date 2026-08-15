@@ -1999,7 +1999,7 @@ class ProjectModeCoordinator:
             command = [
                 str(python),
                 str(self.runtime_cli),
-                "session-boot",
+                "project-runtime",
                 "serve",
                 "--repo-root",
                 str(self.project_root),
@@ -2012,7 +2012,7 @@ class ProjectModeCoordinator:
                 "--boot-binding-id",
                 mode_boot_binding["binding_id"],
                 "--host-action",
-                "PROJECT_MASTER_SEED_APPLY",
+                "PERSISTENT_SESSION_ATTACH",
                 "--session-location",
                 "PROJECT_MASTER_HOST",
                 "--commander-surface",
@@ -2045,7 +2045,7 @@ class ProjectModeCoordinator:
                 host_adapter = startup.get("host_adapter")
                 runtime_state = startup.get("runtime_state")
                 if (
-                    startup.get("status") != "SESSION_BOOT_IMAGE_CREATED"
+                    startup.get("status") != "PERSISTENT_SESSION_ATTACHED"
                     or not isinstance(host_adapter, Mapping)
                     or not isinstance(runtime_state, Mapping)
                     or runtime_state.get("anchor_id") != anchor_id
@@ -2599,7 +2599,7 @@ class ProjectModeCoordinator:
                     "Task Frame Runtime"
                 ),
                 "bounded_summary": (
-                    "Project Master Task Frame Session Boot executor"
+                    "Project Master persistent Task Frame runtime host"
                 ),
             }
         )
@@ -3859,7 +3859,7 @@ def _project_master_system_prompt(actor_label: str) -> str:
         "the Commander again. If scope or boundary changes, stop and create a new primary "
         "Task Proposal instead of inheriting approval. "
         "When both Task and Evidence require executable proof, "
-        "request or attach the Session Boot executor with "
+        "request or attach the persistent project runtime host with "
         "EXECUTABLE_PROOF_REQUIRED before execution. Invoke subordinate agents only as "
         "declared Task Frame Workers. Route every mutation through Execution Guard and "
         "a receipt-aware write path. Never substitute a raw write, raw subordinate "

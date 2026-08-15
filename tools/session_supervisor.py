@@ -1820,7 +1820,7 @@ class SessionSupervisorStore:
         *,
         stop_capability: Any,
     ) -> dict[str, Any]:
-        """Register one already-started Session Boot executor as owned.
+        """Register one already-started persistent project runtime host as owned.
 
         The caller must provide the exact process identity and the short-lived
         capability returned by the executor. The Supervisor probes the process

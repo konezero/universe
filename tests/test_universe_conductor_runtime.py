@@ -152,7 +152,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 session_id = command[command.index("--session-id") + 1]
                 process = FakeProcess(
                     {
-                        "status": "SESSION_BOOT_IMAGE_CREATED",
+                        "status": "PERSISTENT_SESSION_ATTACHED",
                         "host_adapter": {
                             "endpoint": "http://127.0.0.1:41991",
                             "token": token,
@@ -248,7 +248,8 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             )
             self.assertEqual("b" * 40, requests[0]["source_commit"])
             self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
-            self.assertIn("session-boot", process.command)
+            self.assertIn("project-runtime", process.command)
+            self.assertNotIn("session-boot", process.command)
             self.assertEqual(
                 "mode-boot-conductor-001",
                 process.command[process.command.index("--boot-binding-id") + 1],
