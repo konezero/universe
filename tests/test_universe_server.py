@@ -1499,8 +1499,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("CODEX", room["provider"])
         self.assertEqual("BOUND", room["binding"]["state"])
         self.assertFalse(room["binding"]["is_default"])
-        self.assertEqual("UNKNOWN", room["binding"]["observer_currentness"])
-        self.assertEqual("UNKNOWN", room["binding"]["currentness_source"])
+        self.assertEqual("CURRENT", room["binding"]["observer_currentness"])
+        self.assertEqual("SESSION_SUPERVISOR", room["binding"]["currentness_source"])
         self.assertEqual("universe", room["binding"]["current_project_id"])
         self.assertEqual("MASTER", room["binding"]["mode"])
         self.assertEqual(

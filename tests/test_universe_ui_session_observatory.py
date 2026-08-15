@@ -83,6 +83,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("openProviderChatSummary", open_slice)
         self.assertIn("node-mode-session-cards", CSS)
         self.assertIn("node-mode-session-card", CSS)
+        self.assertIn("const selectedAnchorKey = anchorSessionKey(session)", APP)
+        self.assertIn("typeof options.isCurrent === \"function\"", APP)
+        self.assertIn("if (!isCurrent()) return false", APP)
 
     def test_chat_toggle_has_no_message_count_badge(self) -> None:
         self.assertNotIn('id="conversation-badge"', HTML)
@@ -146,7 +149,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         )
         self.assertIn('id="chat-resize-handle"', HTML)
         self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
-        self.assertIn("await openProviderChatSession(room, { session });", APP)
+        self.assertIn("const opened = await openProviderChatSession(room, {", APP)
         self.assertIn("initChatPanelResize()", APP)
         self.assertIn("--chat-panel-width: 380px", CSS)
         self.assertIn("chat-resize-handle", CSS)

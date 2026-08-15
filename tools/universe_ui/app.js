@@ -1962,8 +1962,14 @@ async function selectNodeModeSession(coordinate, session) {
     toast("This persistent session has no attached provider chat", true);
     return;
   }
-  await openProviderChatSession(room, { session });
-  expandConversationLayer();
+  const selectedAnchorKey = anchorSessionKey(session);
+  const opened = await openProviderChatSession(room, {
+    session,
+    isCurrent: () =>
+      state.selectedModeCoordinateKey === coordinate.key &&
+      state.selectedSupervisorAnchorKeysByMode[coordinate.key] === selectedAnchorKey,
+  });
+  if (opened) expandConversationLayer();
 }
 
 function renderNodeModeSessionCards(coordinate) {
@@ -6460,6 +6466,9 @@ function openProviderSessionStream(chatKey) {
 }
 
 async function openProviderChatSession(room, options = {}) {
+  const isCurrent =
+    typeof options.isCurrent === "function" ? options.isCurrent : () => true;
+  if (!isCurrent()) return false;
   const binding = room?.binding || {};
   const projectId = String(
     binding.current_project_id || binding.node || ""
@@ -6471,6 +6480,7 @@ async function openProviderChatSession(room, options = {}) {
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
+  if (!isCurrent()) return false;
   closeProjectRoomStream();
   state.selectedProviderChatKey = chatKey;
   const selectedSession = options.session || supervisorSessionForRoom(room);
@@ -6522,6 +6532,7 @@ async function openProviderChatSession(room, options = {}) {
   renderComposerState();
   renderRoomMessages();
   elements.dispatchInstruction.focus();
+  return true;
 }
 
 function closeProjectRoomStream() {

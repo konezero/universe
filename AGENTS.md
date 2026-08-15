@@ -117,18 +117,17 @@ state exception in execution-guard. Follow
 create Authority or Execution Assignment.
 
 After completed, validated work, ordinary local Git staging, commit, and
-push remain outside the Runtime. The immutable Git commit SHA may be
-appended to the approved Task Proposal's Result Receipt as work evidence.
-It does not create Runtime authority, Binding, or an execution receipt.
+push remain outside the Runtime. Emit commit and push notifications with
+the immutable Git SHA; they do not create Runtime authority, Binding,
+approval evidence, or an execution receipt.
 
 ## Normal Runtime Route
 
-For a requested mutation, execute
-`.ai/skills/common/task-assignment/SKILL.md`, display the resulting
-candidate, obtain exact approval, and execute
-`.ai/skills/common/execution-binding/SKILL.md`. Binding carries verified
-approval and authority context into process-local state; it does not
-create canonical authority or final execution permission.
+For a direct user mutation instruction, execute
+`.ai/skills/common/task-assignment/SKILL.md` and activate its bounded
+instruction Work Receipt without a second approval prompt. Use the strict
+Proposal / Binding route only for agent-initiated work, unresolved material
+choices, ambiguous destructive targets, or scope outside the instruction.
 
 Use `.ai/skills/common/task-frame-debate/SKILL.md` for the default
 bounded Boss/reviewer route. A Result Packet remains a Parent candidate.
