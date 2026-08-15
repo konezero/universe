@@ -63,10 +63,15 @@ are notification-only milestones such as `COMMIT_COMPLETED`, `COMMIT_FAILED`,
 Destructive effects remain outside an instruction unless explicitly named.
 
 Provider processes inherit a session-scoped Git Trace2 event target. Universe
-parses only terminal `commit` and `push` command names plus exit codes after a
-turn, emits notification-only milestones, and removes the trace file when the
-provider session closes. Trace argv and repository paths are never projected
-into Provider Session events.
+parses terminal `commit` and `push` command names plus exit codes after a turn,
+then enriches successful milestones with a bounded Git snapshot: commit SHA,
+subject, branch, configured remote name, and changed-file count. The selected
+Session exposes these notification-only records in its Action inbox until the
+user deletes them. Deleting an Action removes only that informational record;
+it does not mutate Git history, approval evidence, or Task Proposal history.
+Trace argv, repository paths, remote URLs, and credentials are never projected
+into Provider Session events, and the trace file is removed when the session
+closes.
 
 ## Selection and delivery
 

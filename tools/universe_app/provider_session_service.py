@@ -24,7 +24,9 @@ PROVIDER_SESSION_STREAM_SCHEMA = "universe.provider-session-stream.v1"
 PROVIDER_SESSION_MESSAGE_SCHEMA = "universe.provider-session-message.v1"
 PROVIDER_SESSION_SNAPSHOT_SCHEMA = "universe.provider-session-snapshot.v1"
 WORK_STATUS_SCHEMA = "universe.work-status-notification.v1"
+PROVIDER_ACTION_SCHEMA = "universe.provider-session-action.v1"
 CHAT_KEY_PATTERN = re.compile(r"^provider_chat_[0-9a-f]{24}$")
+ACTION_ID_PATTERN = re.compile(r"^provider_action_[0-9a-f]{24}$")
 
 
 def _utc_now() -> str:
@@ -52,6 +54,17 @@ def _chat_key(value: Any) -> str:
             400,
         )
     return key
+
+
+def _action_id(value: Any) -> str:
+    action_id = _text(value, "action_id")
+    if not ACTION_ID_PATTERN.fullmatch(action_id):
+        raise ProviderSessionError(
+            "PROVIDER_SESSION_ACTION_ID_INVALID",
+            "action_id is not a valid Provider Session Action identifier",
+            400,
+        )
+    return action_id
 
 
 def _json_copy(value: Any) -> Any:
@@ -85,6 +98,20 @@ class ProviderSessionHost(Protocol):
     ) -> None: ...
 
     def close(self) -> None: ...
+
+
+class ProviderActionStore(Protocol):
+    def record_provider_session_action(
+        self, chat_key: str, action: Mapping[str, Any], *, retain: int
+    ) -> Mapping[str, Any]: ...
+
+    def list_provider_session_actions(
+        self, chat_key: str, *, limit: int
+    ) -> list[dict[str, Any]]: ...
+
+    def delete_provider_session_action(
+        self, chat_key: str, action_id: str
+    ) -> Mapping[str, Any] | None: ...
 
 
 class ProviderSessionEventHub:
@@ -163,9 +190,11 @@ class ProviderSessionService:
         retained_idempotency: int | None = None,
         retained_permissions: int | None = None,
         permission_timeout_seconds: float = 600.0,
+        action_store: ProviderActionStore | None = None,
     ) -> None:
         self.resolver = resolver
         self.host_factory = host_factory
+        self.action_store = action_store
         self.events = ProviderSessionEventHub()
         self.retained_messages = max(16, int(retained_messages))
         self.retained_idempotency = max(
@@ -191,6 +220,7 @@ class ProviderSessionService:
         self._permissions: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._permission_waiters: dict[str, dict[str, Any]] = {}
         self._work_statuses: dict[str, dict[str, Any]] = {}
+        self._actions: dict[str, deque[dict[str, Any]]] = {}
         self._active_threads: dict[str, threading.Thread] = {}
         self._active_message_ids: dict[str, str] = {}
         self._cancelled_message_ids: set[str] = set()
@@ -217,6 +247,13 @@ class ProviderSessionService:
             ]
             active_message_id = self._active_message_ids.get(key)
             work_status = _json_copy(self._work_statuses.get(key))
+            actions = _json_copy(
+                self.action_store.list_provider_session_actions(
+                    key, limit=self.retained_messages
+                )
+                if self.action_store is not None
+                else list(self._actions.get(key, ()))
+            )
             state = (
                 "CANCELLATION_REQUESTED"
                 if active_message_id in self._cancelled_message_ids
@@ -230,6 +267,7 @@ class ProviderSessionService:
             "messages": _json_copy(messages),
             "permissions": _json_copy(permissions),
             "work_status": work_status,
+            "actions": actions,
             "connection": connection,
             "transcript_owner": "PROVIDER",
             "room_queue_used": False,
@@ -659,6 +697,53 @@ class ProviderSessionService:
             )
         )
 
+    def delete_action(self, chat_key: str, action_id: str) -> dict[str, Any]:
+        key = _chat_key(chat_key)
+        normalized_action_id = _action_id(action_id)
+        if self.action_store is not None:
+            removed = self.action_store.delete_provider_session_action(
+                key, normalized_action_id
+            )
+        else:
+            self._resolve(key)
+            with self._lock:
+                actions = self._actions.get(key)
+                removed = next(
+                    (
+                        action
+                        for action in actions or ()
+                        if action["action_id"] == normalized_action_id
+                    ),
+                    None,
+                )
+                if removed is not None:
+                    self._actions[key] = deque(
+                        (
+                            action
+                            for action in actions or ()
+                            if action["action_id"] != normalized_action_id
+                        ),
+                        maxlen=self.retained_messages,
+                    )
+        if removed is None:
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_ACTION_NOT_FOUND",
+                "Provider Session Action does not exist",
+                404,
+            )
+        self.events.publish(
+            key,
+            {
+                "type": "PROVIDER_SESSION_ACTION_DELETED",
+                "action_id": normalized_action_id,
+            },
+        )
+        return {
+            "schema": PROVIDER_ACTION_SCHEMA,
+            "status": "PROVIDER_SESSION_ACTION_DELETED",
+            "action": _json_copy(removed),
+        }
+
     def _prune_idempotency_locked(self) -> None:
         while len(self._idempotency) > self.retained_idempotency:
             self._idempotency.popitem(last=False)
@@ -688,26 +773,85 @@ class ProviderSessionService:
         error_code: str | None = None,
         details: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        updated_at = _utc_now()
+        safe_details = {
+            key: details[key]
+            for key in (
+                "source",
+                "exit_code",
+                "commit_sha",
+                "short_sha",
+                "commit_message",
+                "branch",
+                "remote",
+                "changed_files",
+            )
+            if details is not None and key in details
+        }
         status = {
             "schema": WORK_STATUS_SCHEMA,
             "operation": operation,
             "state": state,
             "message_id": message_id,
             "error_code": error_code,
-            "updated_at": _utc_now(),
+            "updated_at": updated_at,
         }
-        if details:
-            status["details"] = {
-                key: details[key]
-                for key in ("source", "exit_code")
-                if key in details
+        if safe_details:
+            status["details"] = safe_details
+        action = None
+        if operation in {"COMMIT", "PUSH"} and state in {"COMPLETED", "FAILED"}:
+            short_sha = str(safe_details.get("short_sha") or "").strip()
+            commit_message = str(safe_details.get("commit_message") or "").strip()
+            branch = str(safe_details.get("branch") or "").strip()
+            remote = str(safe_details.get("remote") or "").strip()
+            changed_files = safe_details.get("changed_files")
+            if operation == "COMMIT" and state == "COMPLETED":
+                summary_parts = [part for part in (short_sha, commit_message) if part]
+                if isinstance(changed_files, int):
+                    summary_parts.append(f"{changed_files} files")
+            elif operation == "PUSH" and state == "COMPLETED":
+                destination = f"{branch} -> {remote}" if branch and remote else branch
+                summary_parts = [part for part in (destination, short_sha) if part]
+            else:
+                exit_code = safe_details.get("exit_code")
+                summary_parts = [
+                    f"Git exit {exit_code}" if isinstance(exit_code, int) else "Git operation failed"
+                ]
+            action = {
+                "schema": PROVIDER_ACTION_SCHEMA,
+                "action_id": "provider_action_" + uuid.uuid4().hex[:24],
+                "kind": "INFORMATIONAL",
+                "category": "GIT",
+                "operation": operation,
+                "state": state,
+                "title": f"{operation.title()} {state.lower()}",
+                "summary": " · ".join(summary_parts),
+                "details": safe_details,
+                "message_id": message_id,
+                "created_at": updated_at,
             }
+        if action is not None and self.action_store is not None:
+            action = dict(
+                self.action_store.record_provider_session_action(
+                    chat_key, action, retain=self.retained_messages
+                )
+            )
         with self._lock:
             self._work_statuses[chat_key] = status
+            if action is not None and self.action_store is None:
+                actions = self._actions.setdefault(
+                    chat_key, deque(maxlen=self.retained_messages)
+                )
+                actions.append(action)
         self.events.publish(
             chat_key,
             {"type": "PROVIDER_SESSION_WORK_STATUS", "work_status": status},
         )
+        if action is not None:
+            self.events.publish(
+                chat_key,
+                {"type": "PROVIDER_SESSION_ACTION", "action": action},
+            )
         return _json_copy(status)
 
     def _run_turn(

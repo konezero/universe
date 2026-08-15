@@ -91,7 +91,21 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("PROVIDER_SESSION_DELTA", APP)
         self.assertIn("PROVIDER_SESSION_PERMISSION", APP)
         self.assertIn("PROVIDER_SESSION_WORK_STATUS", APP)
+        self.assertIn("PROVIDER_SESSION_ACTION", APP)
+        self.assertIn("PROVIDER_SESSION_ACTION_DELETED", APP)
         self.assertIn("function workStatusNotificationText(workStatus)", APP)
+        self.assertIn("function renderGitActionCard(chatKey, action)", APP)
+        self.assertIn("function deleteProviderSessionAction(chatKey, action)", APP)
+        self.assertIn('/actions/${encodeURIComponent(action.action_id)}`', APP)
+        self.assertIn('{ method: "DELETE" }', APP)
+        action_slice = APP[
+            APP.index("function pendingActionItems") : APP.index(
+                "function finishRoomMessageRender"
+            )
+        ]
+        self.assertNotIn("governanceProposal", action_slice)
+        self.assertNotIn("renderGovernanceProposalCard", APP)
+        self.assertIn("state.providerSessionPermissions", action_slice)
         self.assertIn("function closeProviderSessionStream(chatKey)", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(

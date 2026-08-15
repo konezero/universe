@@ -3906,44 +3906,45 @@ function initChatPanelResize() {
 
 function pendingActionItems() {
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
-    return { proposals: [], permissions: [], delegations: [] };
+    return { permissions: [], delegations: [], activities: [] };
   }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    const cache = providerSessionRoomCacheFor(state.conversationTarget.chat_key);
     return {
-      proposals: [],
       permissions: (state.providerSessionPermissions || []).filter(
         (item) => item.state === "PENDING"
       ),
       delegations: [],
+      activities: [...(cache?.actions || [])].reverse(),
     };
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     return {
-      proposals: (state.governanceProposalInbox || []).filter(
-        (item) => item.state === "PROPOSED"
-      ),
       permissions: (state.conductorPermissions || []).filter(
         (item) => item.state === "PENDING"
       ),
       delegations: (state.conductorDelegations || []).filter((item) =>
         ["QUEUED", "RUNNING", "CANCELLATION_REQUESTED"].includes(item.state)
       ),
+      activities: [],
     };
   }
   return {
-    proposals: (state.governanceProposals || []).filter(
-      (item) => item.state === "PROPOSED"
-    ),
     permissions: (state.projectPermissions || []).filter(
       (item) => item.state === "PENDING"
     ),
     delegations: [],
+    activities: [],
   };
 }
 
 function actionInboxCount() {
   const items = pendingActionItems();
-  return items.proposals.length + items.permissions.length + items.delegations.length;
+  return (
+    items.permissions.length +
+    items.delegations.length +
+    items.activities.length
+  );
 }
 
 function updateActionInboxBadge() {
@@ -3951,6 +3952,59 @@ function updateActionInboxBadge() {
   const count = actionInboxCount();
   elements.actionInboxBadge.textContent = count > 99 ? "99+" : String(count);
   elements.actionInboxBadge.classList.toggle("hidden", count === 0);
+}
+
+function renderGitActionCard(chatKey, action) {
+  const item = node("article", "action-inbox-card git-action-card");
+  item.append(
+    node("strong", "", `${action.operation || "GIT"} / ${action.state || "UNKNOWN"}`),
+    node("p", "git-action-summary", action.summary || action.title || "Git activity")
+  );
+  const details = action.details || {};
+  const detailRows = [
+    ["Commit", details.commit_sha],
+    ["Message", details.commit_message],
+    ["Branch", details.branch],
+    ["Remote", details.remote],
+    ["Changed files", Number.isInteger(details.changed_files) ? String(details.changed_files) : ""],
+    ["Observed", action.created_at],
+  ].filter(([, value]) => String(value || "").trim());
+  if (detailRows.length) {
+    const disclosure = node("details", "git-action-details");
+    disclosure.append(node("summary", "", "Details"));
+    for (const [label, value] of detailRows) {
+      const row = node("div", "git-action-detail-row");
+      row.append(node("span", "", label), node("code", "", String(value)));
+      disclosure.append(row);
+    }
+    item.append(disclosure);
+  }
+  const actions = node("div", "proposal-actions");
+  const remove = node("button", "secondary-button", "Delete");
+  remove.type = "button";
+  remove.addEventListener("click", () => deleteProviderSessionAction(chatKey, action));
+  actions.append(remove);
+  item.append(actions);
+  return item;
+}
+
+async function deleteProviderSessionAction(chatKey, action) {
+  try {
+    await api(
+      `/v1/provider-sessions/${encodeURIComponent(chatKey)}/actions/${encodeURIComponent(action.action_id)}`,
+      { method: "DELETE" }
+    );
+    const cache = providerSessionRoomCacheFor(chatKey);
+    if (cache) {
+      cache.actions = (cache.actions || []).filter(
+        (item) => item.action_id !== action.action_id
+      );
+    }
+    renderActionInbox();
+    toast("Action deleted");
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function renderDelegationActionCard(delegation) {
@@ -4017,17 +4071,18 @@ function renderActionInbox() {
       ? `${state.conversationTarget.alias || state.conversationTarget.projectId} actions`
       : `${state.conversationTarget.projectId} actions`;
   if (elements.actionInboxTitle) elements.actionInboxTitle.textContent = title;
-  for (const proposal of items.proposals) {
-    elements.actionInboxList.append(renderGovernanceProposalCard(proposal));
-  }
   for (const permission of items.permissions) {
     elements.actionInboxList.append(renderPermissionCard(permission));
   }
   for (const delegation of items.delegations) {
     elements.actionInboxList.append(renderDelegationActionCard(delegation));
   }
+  const chatKey = String(state.conversationTarget.chat_key || "").trim();
+  for (const activity of items.activities) {
+    elements.actionInboxList.append(renderGitActionCard(chatKey, activity));
+  }
   if (!elements.actionInboxList.childElementCount) {
-    elements.actionInboxList.append(node("p", "empty-copy", "No pending actions"));
+    elements.actionInboxList.append(node("p", "empty-copy", "No actions"));
   }
 }
 
@@ -4204,102 +4259,6 @@ function renderRoomMessages() {
     elements.roomMessageList.append(item);
   }
   finishRoomMessageRender(previousScrollTop, stickToBottom);
-}
-
-function renderGovernanceProposalCard(proposal) {
-  const item = node("article", "room-message governance-proposal-request");
-  const summary = proposal.task_summary || "Project task proposal";
-  const digest = String(proposal.proposal_digest || "UNKNOWN");
-  const scope = proposal.scope && Object.keys(proposal.scope).length
-    ? JSON.stringify(proposal.scope)
-    : proposal.boundary || "Project scope";
-  item.append(
-    node(
-      "strong",
-      "",
-      `GOVERNANCE / ${proposal.project_id} / APPROVAL REQUIRED`
-    ),
-    node("p", "proposal-title", summary),
-    node("small", "proposal-boundary", proposal.boundary || "Scope recorded"),
-    node("small", "proposal-coordinate", `ID ${proposal.proposal_id}`),
-    node("small", "proposal-coordinate", `Digest ${digest.slice(0, 16)}...`),
-    node("small", "proposal-scope", scope)
-  );
-  const actions = node("div", "proposal-actions");
-  const approve = node("button", "proposal-approve", "Approve");
-  approve.type = "button";
-  approve.title = `Approve ${proposal.proposal_id}`;
-  approve.addEventListener("click", () =>
-    decideGovernanceProposal(proposal, "APPROVE")
-  );
-  const cancel = node("button", "proposal-cancel", "Cancel");
-  cancel.type = "button";
-  cancel.title = `Cancel ${proposal.proposal_id}`;
-  cancel.addEventListener("click", () =>
-    decideGovernanceProposal(proposal, "CANCEL")
-  );
-  actions.append(cancel, approve);
-  item.append(actions);
-  return item;
-}
-
-async function decideGovernanceProposal(proposal, decision) {
-  if (!state.projects.some((project) => project.project_id === proposal.project_id)) {
-    toast("Proposal project is no longer attached", true);
-    return false;
-  }
-  try {
-    const result = await api(
-      `/v1/governance/proposals/${encodeURIComponent(
-        proposal.proposal_id
-      )}/decision`,
-      {
-        method: "POST",
-        body: {
-          decision,
-          proposal_digest: proposal.proposal_digest,
-        },
-      }
-    );
-    state.governanceProposals = [
-      ...(state.selectedProject?.project_id === result.proposal.project_id
-        ? [result.proposal]
-        : []),
-      ...state.governanceProposals.filter(
-        (item) => item.proposal_id !== result.proposal.proposal_id
-      ),
-    ];
-    mergeGovernanceProposalInbox(result.proposal.project_id, [
-      result.proposal,
-      ...state.governanceProposalInbox.filter(
-        (item) =>
-          item.project_id === result.proposal.project_id &&
-          item.proposal_id !== result.proposal.proposal_id
-      ),
-    ]);
-    if (
-      result.message &&
-      state.selectedProject?.project_id === result.proposal.project_id
-    ) {
-      state.roomMessages = dedupeRoomMessages([
-        ...state.roomMessages.filter(
-          (message) => message.message_id !== result.message.message_id
-        ),
-        result.message,
-      ]);
-    }
-    renderProjects();
-    renderRoomMessages();
-    toast(
-      decision === "CANCEL"
-        ? "Governance Proposal cancelled"
-        : "Governance Proposal approved and delivered to Project Master"
-    );
-    return true;
-  } catch (error) {
-    toast(error.message, true);
-    return false;
-  }
 }
 
 function requestedPermissionSummary(value) {
@@ -6164,6 +6123,7 @@ function providerSessionRoomCacheFor(chatKey) {
       messages: [],
       permissions: [],
       workStatus: null,
+      actions: [],
       connection: null,
       target: null,
       streamState: "IDLE",
@@ -6298,6 +6258,9 @@ function applyProviderSessionSnapshot(snapshot, chatKey = null) {
     .filter(Boolean);
   cache.connection = redactProviderSessionObject(snapshot.connection || null);
   cache.workStatus = redactProviderSessionObject(snapshot.work_status || null);
+  cache.actions = (Array.isArray(snapshot.actions) ? snapshot.actions : [])
+    .map((action) => redactProviderSessionObject(action))
+    .filter(Boolean);
   cache.target = redactProviderSessionTarget(snapshot.target) || cache.target;
   if (providerSessionRoomIsSelected(key) && cache.target) {
     state.conversationTarget = {
@@ -6314,7 +6277,10 @@ function workStatusNotificationText(workStatus) {
   const stateValue = String(workStatus?.state || "UNKNOWN").toUpperCase();
   const operation = String(workStatus?.operation || "WORK").replaceAll("_", " ");
   if (stateValue === "STARTED") return `${operation} started`;
-  if (stateValue === "COMPLETED") return `${operation} completed`;
+  if (stateValue === "COMPLETED") {
+    const shortSha = String(workStatus?.details?.short_sha || "").trim();
+    return `${operation} completed${shortSha ? ` · ${shortSha}` : ""}`;
+  }
   if (stateValue === "CANCELLED") return `${operation} cancelled`;
   if (stateValue === "FAILED") {
     const code = String(workStatus?.error_code || "UNKNOWN");
@@ -6357,6 +6323,21 @@ function applyProviderSessionPayload(chatKey, payload, envelope) {
         String(cache.workStatus.state || "").toUpperCase() === "FAILED"
       );
     }
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_ACTION") {
+    const action = redactProviderSessionObject(payload.action || null);
+    if (action) {
+      cache.actions = [
+        ...(cache.actions || []).filter((item) => item.action_id !== action.action_id),
+        action,
+      ];
+    }
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_ACTION_DELETED") {
+    const actionId = String(payload.action_id || "").trim();
+    cache.actions = (cache.actions || []).filter(
+      (item) => item.action_id !== actionId
+    );
     handled = true;
   } else if (
     type === "PROVIDER_SESSION_PERMISSION" ||

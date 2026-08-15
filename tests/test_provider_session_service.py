@@ -130,6 +130,11 @@ class FakeProviderHost:
                     "state": "COMPLETED",
                     "exit_code": 0,
                     "source": "GIT_TRACE2",
+                    "commit_sha": "d" * 40,
+                    "short_sha": "ddddddd",
+                    "commit_message": "Describe Git action",
+                    "branch": "codex/action-history",
+                    "changed_files": 3,
                 },
                 {
                     "operation": "PUSH",
@@ -263,6 +268,14 @@ class ProviderSessionServiceTests(unittest.TestCase):
         self.assertEqual(
             {"source": "GIT_TRACE2", "exit_code": 1}, statuses[-1]["details"]
         )
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual(["COMMIT", "PUSH"], [item["operation"] for item in snapshot["actions"]])
+        commit_action = snapshot["actions"][0]
+        self.assertEqual("INFORMATIONAL", commit_action["kind"])
+        self.assertEqual("ddddddd · Describe Git action · 3 files", commit_action["summary"])
+        deleted = self.service.delete_action(CHAT_KEY, commit_action["action_id"])
+        self.assertEqual("PROVIDER_SESSION_ACTION_DELETED", deleted["status"])
+        self.assertEqual(["PUSH"], [item["operation"] for item in self.service.snapshot(CHAT_KEY)["actions"]])
         public = json.dumps(statuses)
         self.assertNotIn("argv", public)
         self.assertNotIn("repository_root", public)

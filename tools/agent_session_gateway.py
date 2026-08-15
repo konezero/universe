@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 import queue
+import shutil
 import subprocess  # nosec B404
 import tempfile
 import threading
@@ -190,8 +191,14 @@ class GitTrace2Observer:
     schema = "universe.git-trace2-work-status.v1"
     _operations = {"commit": "COMMIT", "push": "PUSH"}
 
-    def __init__(self, cwd: Path) -> None:
-        runtime_root = cwd / ".ai" / "runtime" / "tmp" / "git-trace2"
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        metadata_reader: Callable[[str], Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.cwd = cwd.resolve()
+        runtime_root = self.cwd / ".ai" / "runtime" / "tmp" / "git-trace2"
         try:
             runtime_root.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -203,6 +210,7 @@ class GitTrace2Observer:
         self._commands: dict[str, str] = {}
         self._emitted: set[str] = set()
         self._lock = threading.Lock()
+        self._metadata_reader = metadata_reader or self._read_git_metadata
 
     def environment(self, base: Mapping[str, str]) -> dict[str, str]:
         environment = dict(base)
@@ -234,16 +242,92 @@ class GitTrace2Observer:
                 if operation is None or not isinstance(code, int):
                     continue
                 self._emitted.add(sid)
-                milestones.append(
-                    {
-                        "schema": self.schema,
-                        "operation": operation,
-                        "state": "COMPLETED" if code == 0 else "FAILED",
-                        "exit_code": code,
-                        "source": "GIT_TRACE2",
-                    }
-                )
+                milestone = {
+                    "schema": self.schema,
+                    "operation": operation,
+                    "state": "COMPLETED" if code == 0 else "FAILED",
+                    "exit_code": code,
+                    "source": "GIT_TRACE2",
+                }
+                if code == 0:
+                    try:
+                        metadata = self._metadata_reader(operation)
+                    except Exception:
+                        metadata = {}
+                    if isinstance(metadata, Mapping):
+                        milestone.update(
+                            {
+                                key: metadata[key]
+                                for key in (
+                                    "commit_sha",
+                                    "short_sha",
+                                    "commit_message",
+                                    "branch",
+                                    "remote",
+                                    "changed_files",
+                                )
+                                if key in metadata
+                            }
+                        )
+                milestones.append(milestone)
             return milestones
+
+    def _read_git_metadata(self, operation: str) -> dict[str, Any]:
+        executable = shutil.which("git.exe") or shutil.which("git")
+        if not executable:
+            return {}
+        environment = {
+            "GIT_TRACE2_EVENT": "0",
+            "GIT_TRACE2_EVENT_NESTING": "0",
+            "GIT_TRACE_REDACT": "1",
+        }
+
+        def read(*arguments: str, maximum: int = 4096) -> str:
+            result = run_native_cli(
+                NativeCliRequest(
+                    executable=Path(executable),
+                    arguments=tuple(arguments),
+                    cwd=self.cwd,
+                    timeout_seconds=5,
+                    output_encoding="utf-8",
+                    max_output_chars=maximum,
+                    environment=environment,
+                )
+            )
+            if result.status != "COMPLETED" or result.return_code != 0:
+                return ""
+            return result.stdout
+
+        identity = read("show", "-s", "--format=%H%x00%s", "HEAD")
+        commit_sha, separator, message = identity.strip().partition("\x00")
+        if not separator or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha):
+            return {}
+        metadata: dict[str, Any] = {
+            "commit_sha": commit_sha.lower(),
+            "short_sha": commit_sha[:7].lower(),
+            "commit_message": self._safe_git_label(message, 240) or "Commit",
+        }
+        changed = read(
+            "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD",
+            maximum=200_000,
+        )
+        metadata["changed_files"] = len(
+            [line for line in changed.splitlines() if line.strip()]
+        )
+        branch = self._safe_git_label(read("branch", "--show-current"), 160)
+        metadata["branch"] = branch or "DETACHED"
+        if operation == "PUSH" and branch:
+            remote = self._safe_git_label(
+                read("config", "--get", f"branch.{branch}.remote"), 80
+            )
+            if remote and not any(marker in remote for marker in ("/", chr(92), "://")):
+                metadata["remote"] = remote
+        return metadata
+
+    @staticmethod
+    def _safe_git_label(value: Any, maximum: int) -> str:
+        text = " ".join(str(value or "").split())
+        return "".join(character for character in text if character.isprintable())[:maximum]
 
     def close(self) -> None:
         with self._lock:

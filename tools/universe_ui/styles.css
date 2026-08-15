@@ -3831,6 +3831,31 @@ body {
   color: var(--muted);
   font-size: 10px;
 }
+
+.git-action-summary {
+  margin: 7px 0;
+  overflow-wrap: anywhere;
+}
+
+.git-action-details summary {
+  color: var(--teal);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.git-action-detail-row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.git-action-detail-row code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
 @media (max-width: 420px) {
   .session-rail-filters {
     grid-template-columns: minmax(0, 1fr) auto;

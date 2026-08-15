@@ -5379,6 +5379,27 @@ class UniverseLocalServiceTests(unittest.TestCase):
             envelope["payload"]["messages"][0]["body"],
         )
 
+    def test_provider_session_action_can_be_deleted_by_one_api(self) -> None:
+        action = {
+            "schema": "universe.provider-session-action.v1",
+            "action_id": "provider_action_0123456789abcdef01234567",
+            "kind": "INFORMATIONAL",
+            "operation": "COMMIT",
+            "state": "COMPLETED",
+        }
+        chat_key = "provider_chat_0123456789abcdef01234567"
+        action["created_at"] = "2026-08-15T00:00:00Z"
+        self.server.store.record_provider_session_action(chat_key, action, retain=200)
+        status, result = self.request(
+            "DELETE",
+            f"/v1/provider-sessions/{chat_key}/actions/{action['action_id']}",
+            token=self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROVIDER_SESSION_ACTION_DELETED", result["status"])
+        self.assertEqual(action["action_id"], result["action"]["action_id"])
+        self.assertEqual([], self.server.store.list_provider_session_actions(chat_key, limit=200))
+
     def test_governance_proposal_is_durable_visible_and_approved_by_one_api(
         self,
     ) -> None:

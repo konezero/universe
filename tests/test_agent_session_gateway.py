@@ -127,7 +127,17 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_git_trace2_observer_emits_terminal_commit_and_push_once(self) -> None:
-        observer = GitTrace2Observer(self.root)
+        observer = GitTrace2Observer(
+            self.root,
+            metadata_reader=lambda operation: {
+                "commit_sha": "d" * 40,
+                "short_sha": "ddddddd",
+                "commit_message": "Describe Git action",
+                "branch": "codex/action-history",
+                "remote": "origin" if operation == "PUSH" else "ignored",
+                "changed_files": 3,
+            },
+        )
         environment = observer.environment({"EXISTING": "value"})
         self.assertEqual("value", environment["EXISTING"])
         self.assertEqual(str(observer.path), environment["GIT_TRACE2_EVENT"])
@@ -150,6 +160,10 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         self.assertEqual(["COMMIT", "PUSH"], [item["operation"] for item in milestones])
         self.assertEqual(["COMPLETED", "FAILED"], [item["state"] for item in milestones])
+        self.assertEqual("ddddddd", milestones[0]["short_sha"])
+        self.assertEqual("Describe Git action", milestones[0]["commit_message"])
+        self.assertEqual(3, milestones[0]["changed_files"])
+        self.assertNotIn("commit_sha", milestones[1])
         self.assertEqual([], observer.drain_work_statuses())
         self.assertNotIn("argv", json.dumps(milestones))
         observer.close()

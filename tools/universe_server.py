@@ -4774,6 +4774,16 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS governance_proposal_decision_project_time
                 ON governance_proposal_decision(project_id, created_at, decision_id);
 
+                CREATE TABLE IF NOT EXISTS provider_session_action (
+                    action_id TEXT PRIMARY KEY,
+                    chat_key TEXT NOT NULL,
+                    action_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS provider_session_action_chat_time
+                ON provider_session_action(chat_key, created_at, action_id);
+
                 CREATE TABLE IF NOT EXISTS conductor_room_message (
                     message_id TEXT PRIMARY KEY,
                     idempotency_key TEXT NOT NULL UNIQUE,
@@ -12662,6 +12672,92 @@ class UniverseStore:
             "resolved_at": row["resolved_at"],
         }
 
+    def record_provider_session_action(
+        self,
+        chat_key: str,
+        action: Mapping[str, Any],
+        *,
+        retain: int,
+    ) -> dict[str, Any]:
+        normalized_chat_key = _required_text(chat_key, "chat_key")
+        payload = dict(action)
+        action_id = _identifier(payload.get("action_id"), "action_id")
+        created_at = _required_text(payload.get("created_at"), "action.created_at")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_session_action(
+                    action_id, chat_key, action_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(action_id) DO UPDATE SET
+                    action_json = excluded.action_json
+                WHERE provider_session_action.chat_key = excluded.chat_key
+                """,
+                (
+                    action_id,
+                    normalized_chat_key,
+                    _canonical_json(payload),
+                    created_at,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM provider_session_action
+                WHERE chat_key = ? AND action_id NOT IN (
+                    SELECT action_id FROM provider_session_action
+                    WHERE chat_key = ?
+                    ORDER BY created_at DESC, action_id DESC
+                    LIMIT ?
+                )
+                """,
+                (normalized_chat_key, normalized_chat_key, max(1, int(retain))),
+            )
+        return payload
+
+    def list_provider_session_actions(
+        self, chat_key: str, *, limit: int
+    ) -> list[dict[str, Any]]:
+        normalized_chat_key = _required_text(chat_key, "chat_key")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT action_json FROM (
+                    SELECT action_json, created_at, action_id
+                    FROM provider_session_action
+                    WHERE chat_key = ?
+                    ORDER BY created_at DESC, action_id DESC
+                    LIMIT ?
+                )
+                ORDER BY created_at ASC, action_id ASC
+                """,
+                (normalized_chat_key, max(1, int(limit))),
+            ).fetchall()
+        return [json.loads(str(row["action_json"])) for row in rows]
+
+    def delete_provider_session_action(
+        self, chat_key: str, action_id: str
+    ) -> dict[str, Any] | None:
+        normalized_chat_key = _required_text(chat_key, "chat_key")
+        normalized_action_id = _identifier(action_id, "action_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT action_json FROM provider_session_action
+                WHERE chat_key = ? AND action_id = ?
+                """,
+                (normalized_chat_key, normalized_action_id),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                DELETE FROM provider_session_action
+                WHERE chat_key = ? AND action_id = ?
+                """,
+                (normalized_chat_key, normalized_action_id),
+            )
+        return json.loads(str(row["action_json"]))
+
     def record_governance_proposal_decision(
         self,
         project_id: str,
@@ -15155,6 +15251,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 provider_session_host_factory
                 or self._create_provider_session_host
             ),
+            action_store=self.store,
         )
         self.task_frame_lineage = TaskFrameLineageStore(store.database_path)
         self.session_anchor_transport = SessionAnchorTransport(
@@ -24624,6 +24721,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        provider_session_action = re.fullmatch(
+            r"/v1/provider-sessions/([^/]+)/actions/([^/]+)", path
+        )
+        if provider_session_action is not None:
+            try:
+                result = self.server.provider_sessions.delete_action(
+                    unquote(provider_session_action.group(1)),
+                    unquote(provider_session_action.group(2)),
+                )
+                self._send(HTTPStatus.OK, result)
+            except ProviderSessionError as error:
+                self._send_provider_session_error(error)
+            return
         todo_id = self._todo_path(path)
         if todo_id is not None:
             try:
