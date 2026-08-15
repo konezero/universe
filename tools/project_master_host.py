@@ -3953,6 +3953,11 @@ class GrokProjectMasterRuntime:
         self.project_root = Path(rebound)
         return rebound
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        if self._gateway is None:
+            return []
+        return self._gateway.drain_work_statuses()
+
     def runtime_observation(self) -> dict[str, Any]:
         if self._gateway is not None:
             return self._gateway.runtime_observation()
@@ -4104,6 +4109,11 @@ class CodexProjectMasterRuntime:
 
     def reply(self, message: Mapping[str, Any]) -> str:
         return self.reply_stream(message, lambda _delta: None)
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        if self._gateway is None:
+            return []
+        return self._gateway.drain_work_statuses()
 
     def runtime_observation(self) -> dict[str, Any]:
         if self._gateway is not None:
@@ -4651,6 +4661,14 @@ class ResidentModeSessionHost:
             }
             result["runtime_observation"] = self._runtime_observation(active)
             return result
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        with self._lock:
+            provider = self._provider
+            reader = getattr(provider, "drain_work_statuses", None)
+            if not callable(reader):
+                return []
+            return [dict(item) for item in reader() if isinstance(item, Mapping)]
 
     def close(self) -> None:
         with self._lock:

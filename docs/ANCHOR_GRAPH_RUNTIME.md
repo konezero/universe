@@ -55,10 +55,18 @@ work described by that instruction. The execution guard verifies the current
 instruction coordinate, roots, operations, concrete target, payload digest, and
 Task Frame lineage without creating or requiring a separate approval event.
 
-Local edits, tests, Task Frames, staging, and commits do not require another
-approval prompt. Publishing with `git push` requires a fresh user confirmation
-immediately before the push. Destructive or external effects remain outside an
-instruction unless they are explicitly named.
+Local edits, tests, Task Frames, staging, commits, and pushes do not require
+another approval prompt. The selected Session Anchor receives bounded work-status
+notifications (`STARTED`, `COMPLETED`, `FAILED`, or `CANCELLED`). Commit and push
+are notification-only milestones such as `COMMIT_COMPLETED`, `COMMIT_FAILED`,
+`PUSH_COMPLETED`, and `PUSH_FAILED`; they never create approval evidence.
+Destructive effects remain outside an instruction unless explicitly named.
+
+Provider processes inherit a session-scoped Git Trace2 event target. Universe
+parses only terminal `commit` and `push` command names plus exit codes after a
+turn, emits notification-only milestones, and removes the trace file when the
+provider session closes. Trace argv and repository paths are never projected
+into Provider Session events.
 
 ## Selection and delivery
 

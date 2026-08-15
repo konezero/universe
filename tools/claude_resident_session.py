@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from agent_session_gateway import GitTrace2Observer
 from process_identity import launched_process_identity
 from windows_native_cli import NativeCliRequest, open_native_cli
 
@@ -285,7 +286,8 @@ class ClaudeResidentSession:
         self.permission_failure = permission_failure
         self.executable = executable
         self.cwd = cwd
-        self.environment = dict(environment)
+        self._git_trace2 = GitTrace2Observer(cwd)
+        self.environment = self._git_trace2.environment(environment)
         leaked = CLAUDE_FORBIDDEN_ENVIRONMENT.intersection(self.environment)
         if leaked:
             # Claude must not be able to read its own approval capability.
@@ -519,12 +521,16 @@ class ClaudeResidentSession:
         self._turn_error = "CLAUDE_TURN_CANCELLED"
         self._turn_done.set()
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
     def close(self) -> None:
         process, self._process = self._process, None
         if process is not None:
             process.close()
         self.cancel_turn()
         self._set_state(SESSION_STOPPED)
+        self._git_trace2.close()
 
     def rebind_working_directory(self, cwd: Path) -> str:
         target = cwd.expanduser().resolve(strict=True)

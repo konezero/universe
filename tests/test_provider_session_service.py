@@ -43,6 +43,7 @@ class FakeProviderHost:
         self.status_calls = 0
         self.block_started = threading.Event()
         self.block_release = threading.Event()
+        self.work_statuses: list[dict[str, Any]] = []
 
     def set_permission_requester(
         self, requester: Callable[[Mapping[str, Any]], str | None]
@@ -122,9 +123,28 @@ class FakeProviderHost:
             text = f"selected:{selected or 'none'}"
             on_delta(text)
             return {"text": text, "session_ref": "provider-secret-session-ref"}
+        if message["body"] == "git milestones":
+            self.work_statuses = [
+                {
+                    "operation": "COMMIT",
+                    "state": "COMPLETED",
+                    "exit_code": 0,
+                    "source": "GIT_TRACE2",
+                },
+                {
+                    "operation": "PUSH",
+                    "state": "FAILED",
+                    "exit_code": 1,
+                    "source": "GIT_TRACE2",
+                },
+            ]
         on_delta("hello ")
         on_delta("world")
         return {"text": "hello world", "session_ref": "provider-secret-session-ref"}
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        statuses, self.work_statuses = self.work_statuses, []
+        return statuses
 
     def close(self) -> None:
         self.closed = True
@@ -194,6 +214,16 @@ class ProviderSessionServiceTests(unittest.TestCase):
         self.assertEqual(["USER", "ASSISTANT"], [m["role"] for m in snapshot["messages"]])
         self.assertEqual("hello world", snapshot["messages"][-1]["body"])
         self.assertEqual("COMPLETED", snapshot["messages"][-1]["state"])
+        self.assertEqual("COMPLETED", snapshot["work_status"]["state"])
+        self.assertEqual("PROVIDER_TURN", snapshot["work_status"]["operation"])
+        event_states = [
+            event["payload"]["work_status"]["state"]
+            for event in self.service.events.wait(
+                CHAT_KEY, after_event_id=0, timeout_seconds=0.1
+            )
+            if event["payload"].get("type") == "PROVIDER_SESSION_WORK_STATUS"
+        ]
+        self.assertEqual(["STARTED", "COMPLETED"], event_states)
         self.assertEqual(
             [("CODEX", "provider-secret-session-ref")],
             self.hosts[0].store.observed,
@@ -209,6 +239,33 @@ class ProviderSessionServiceTests(unittest.TestCase):
             snapshot["connection"]["runtime_observation"]["usage"],
         )
         self.assertFalse(snapshot["room_queue_used"])
+
+    def test_git_trace2_milestones_publish_without_command_arguments(self) -> None:
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "git milestones", "idempotency_key": "turn-git-001"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+
+        events = self.service.events.wait(
+            CHAT_KEY, after_event_id=0, timeout_seconds=0.1
+        )
+        statuses = [
+            event["payload"]["work_status"]
+            for event in events
+            if event["payload"].get("type") == "PROVIDER_SESSION_WORK_STATUS"
+        ]
+        self.assertEqual(
+            ["PROVIDER_TURN", "PROVIDER_TURN", "COMMIT", "PUSH"],
+            [status["operation"] for status in statuses],
+        )
+        self.assertEqual("GIT_EXIT_1", statuses[-1]["error_code"])
+        self.assertEqual(
+            {"source": "GIT_TRACE2", "exit_code": 1}, statuses[-1]["details"]
+        )
+        public = json.dumps(statuses)
+        self.assertNotIn("argv", public)
+        self.assertNotIn("repository_root", public)
 
     def test_internal_callbacks_bind_reply_before_terminal_event(self) -> None:
         observed: list[tuple[str, str]] = []

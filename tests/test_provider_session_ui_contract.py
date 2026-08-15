@@ -90,6 +90,8 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("function openProviderSessionStream(chatKey)", APP)
         self.assertIn("PROVIDER_SESSION_DELTA", APP)
         self.assertIn("PROVIDER_SESSION_PERMISSION", APP)
+        self.assertIn("PROVIDER_SESSION_WORK_STATUS", APP)
+        self.assertIn("function workStatusNotificationText(workStatus)", APP)
         self.assertIn("function closeProviderSessionStream(chatKey)", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(

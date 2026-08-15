@@ -6163,6 +6163,7 @@ function providerSessionRoomCacheFor(chatKey) {
       chat_key: key,
       messages: [],
       permissions: [],
+      workStatus: null,
       connection: null,
       target: null,
       streamState: "IDLE",
@@ -6296,6 +6297,7 @@ function applyProviderSessionSnapshot(snapshot, chatKey = null) {
     .map((permission) => redactProviderSessionPermission(permission))
     .filter(Boolean);
   cache.connection = redactProviderSessionObject(snapshot.connection || null);
+  cache.workStatus = redactProviderSessionObject(snapshot.work_status || null);
   cache.target = redactProviderSessionTarget(snapshot.target) || cache.target;
   if (providerSessionRoomIsSelected(key) && cache.target) {
     state.conversationTarget = {
@@ -6306,6 +6308,19 @@ function applyProviderSessionSnapshot(snapshot, chatKey = null) {
   }
   syncSelectedProviderSessionState(key);
   return true;
+}
+
+function workStatusNotificationText(workStatus) {
+  const stateValue = String(workStatus?.state || "UNKNOWN").toUpperCase();
+  const operation = String(workStatus?.operation || "WORK").replaceAll("_", " ");
+  if (stateValue === "STARTED") return `${operation} started`;
+  if (stateValue === "COMPLETED") return `${operation} completed`;
+  if (stateValue === "CANCELLED") return `${operation} cancelled`;
+  if (stateValue === "FAILED") {
+    const code = String(workStatus?.error_code || "UNKNOWN");
+    return `${operation} failed (${code})`;
+  }
+  return `${operation} ${stateValue.toLowerCase()}`;
 }
 
 function applyProviderSessionPayload(chatKey, payload, envelope) {
@@ -6333,6 +6348,15 @@ function applyProviderSessionPayload(chatKey, payload, envelope) {
         : message
     );
     syncSelectedProviderSessionState(key);
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_WORK_STATUS") {
+    cache.workStatus = redactProviderSessionObject(payload.work_status || null);
+    if (cache.workStatus) {
+      toast(
+        workStatusNotificationText(cache.workStatus),
+        String(cache.workStatus.state || "").toUpperCase() === "FAILED"
+      );
+    }
     handled = true;
   } else if (
     type === "PROVIDER_SESSION_PERMISSION" ||

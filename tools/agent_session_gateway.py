@@ -155,6 +155,8 @@ class AgentSession(Protocol):
 
     def set_permission_requester(self, requester: PermissionRequester) -> None: ...
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]: ...
+
     def close(self) -> None: ...
 
 
@@ -175,6 +177,103 @@ class BoundedSession(Protocol):
     def prompt(self, text: str, on_delta: Callable[[str], None]) -> str: ...
 
     def close(self) -> None: ...
+
+
+class GitTrace2Observer:
+    """Collect terminal commit/push milestones from one provider process tree.
+
+    Git writes JSONL to a session-scoped runtime file. Only the command name and
+    exit code leave this observer; argv and repository paths stay out of UI
+    events and the trace file is removed when the provider session closes.
+    """
+
+    schema = "universe.git-trace2-work-status.v1"
+    _operations = {"commit": "COMMIT", "push": "PUSH"}
+
+    def __init__(self, cwd: Path) -> None:
+        runtime_root = cwd / ".ai" / "runtime" / "tmp" / "git-trace2"
+        try:
+            runtime_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            runtime_root = Path(tempfile.gettempdir()) / "universe-git-trace2"
+            runtime_root.mkdir(parents=True, exist_ok=True)
+        self.path = runtime_root / f"provider-{uuid4().hex}.jsonl"
+        self._offset = 0
+        self._remainder = b""
+        self._commands: dict[str, str] = {}
+        self._emitted: set[str] = set()
+        self._lock = threading.Lock()
+
+    def environment(self, base: Mapping[str, str]) -> dict[str, str]:
+        environment = dict(base)
+        environment["GIT_TRACE2_EVENT"] = str(self.path)
+        environment["GIT_TRACE2_EVENT_NESTING"] = "20"
+        environment["GIT_TRACE_REDACT"] = "1"
+        return environment
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        with self._lock:
+            records = self._read_records()
+            milestones: list[dict[str, Any]] = []
+            for record in records:
+                sid = str(record.get("sid") or "").strip()
+                if not sid:
+                    continue
+                event = str(record.get("event") or "").casefold()
+                if event == "cmd_name":
+                    operation = self._operations.get(
+                        str(record.get("name") or "").casefold()
+                    )
+                    if operation is not None:
+                        self._commands[sid] = operation
+                    continue
+                if event not in {"exit", "atexit"} or sid in self._emitted:
+                    continue
+                operation = self._commands.get(sid)
+                code = record.get("code")
+                if operation is None or not isinstance(code, int):
+                    continue
+                self._emitted.add(sid)
+                milestones.append(
+                    {
+                        "schema": self.schema,
+                        "operation": operation,
+                        "state": "COMPLETED" if code == 0 else "FAILED",
+                        "exit_code": code,
+                        "source": "GIT_TRACE2",
+                    }
+                )
+            return milestones
+
+    def close(self) -> None:
+        with self._lock:
+            self.path.unlink(missing_ok=True)
+
+    def _read_records(self) -> list[dict[str, Any]]:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size < self._offset:
+            self._offset = 0
+            self._remainder = b""
+        with self.path.open("rb") as stream:
+            stream.seek(self._offset)
+            chunk = stream.read()
+        self._offset += len(chunk)
+        if not chunk:
+            return []
+        lines = (self._remainder + chunk).split(b"\n")
+        self._remainder = lines.pop()
+        records: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                record = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(record, Mapping):
+                records.append(dict(record))
+        return records
 
 
 def worker_session_contract(session: Any) -> dict[str, Any]:
@@ -515,6 +614,12 @@ class UniverseAcpGateway:
     def set_permission_requester(self, requester: PermissionRequester) -> None:
         self.session.set_permission_requester(requester)
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        reader = getattr(self.session, "drain_work_statuses", None)
+        if not callable(reader):
+            return []
+        return [dict(item) for item in reader() if isinstance(item, Mapping)]
+
     def runtime_observation(self) -> dict[str, Any]:
         observer = getattr(self.session, "runtime_observation", None)
         if callable(observer):
@@ -586,6 +691,8 @@ class GrokAcpSession:
         self.last_platform_approval_evidence: dict[str, Any] | None = None
         self._active_delta: Callable[[str], None] | None = None
         self._bootstrap_pending = True
+        self._git_trace2 = GitTrace2Observer(cwd)
+        environment = self._git_trace2.environment(environment)
         transport_arguments = [
             "--no-auto-update",
             "--permission-mode",
@@ -656,8 +763,12 @@ class GrokAcpSession:
             raise AgentSessionError("GROK_ACP_RESPONSE_MISSING")
         return output
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
     def close(self) -> None:
         self._transport.close()
+        self._git_trace2.close()
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
@@ -821,6 +932,8 @@ class CodexAppServerSession:
         self._completed_turns: set[str] = set()
         self._turn_statuses: dict[str, str] = {}
         self._bootstrap_pending = False
+        self._git_trace2 = GitTrace2Observer(cwd)
+        environment = self._git_trace2.environment(environment)
         transport_arguments = ["app-server"]
         if self.model.casefold() not in {"auto", "default"}:
             transport_arguments.extend(("-c", f"model={json.dumps(self.model)}"))
@@ -912,8 +1025,12 @@ class CodexAppServerSession:
             raise AgentSessionError("CODEX_RESPONSE_MISSING")
         return output
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
     def close(self) -> None:
         self._transport.close()
+        self._git_trace2.close()
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
@@ -1180,7 +1297,8 @@ class ClaudeCodeSession:
     ) -> None:
         self.executable = executable
         self.cwd = cwd
-        self.environment = dict(environment)
+        self._git_trace2 = GitTrace2Observer(cwd)
+        self.environment = self._git_trace2.environment(environment)
         self.system_prompt = system_prompt
         self.model = _text(model, "model")
         self._resume_session = bool(session_id) and not ephemeral
@@ -1291,8 +1409,11 @@ class ClaudeCodeSession:
         on_delta(output)
         return output.strip()
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
     def close(self) -> None:
-        return None
+        self._git_trace2.close()
 
     @staticmethod
     def _argument_value(arguments: list[str], flag: str, error_code: str) -> str:

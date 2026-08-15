@@ -23,6 +23,7 @@ from agent_session_gateway import AgentSessionError, normalize_permission_reques
 PROVIDER_SESSION_STREAM_SCHEMA = "universe.provider-session-stream.v1"
 PROVIDER_SESSION_MESSAGE_SCHEMA = "universe.provider-session-message.v1"
 PROVIDER_SESSION_SNAPSHOT_SCHEMA = "universe.provider-session-snapshot.v1"
+WORK_STATUS_SCHEMA = "universe.work-status-notification.v1"
 CHAT_KEY_PATTERN = re.compile(r"^provider_chat_[0-9a-f]{24}$")
 
 
@@ -189,6 +190,7 @@ class ProviderSessionService:
         self._messages: dict[str, deque[dict[str, Any]]] = {}
         self._permissions: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._permission_waiters: dict[str, dict[str, Any]] = {}
+        self._work_statuses: dict[str, dict[str, Any]] = {}
         self._active_threads: dict[str, threading.Thread] = {}
         self._active_message_ids: dict[str, str] = {}
         self._cancelled_message_ids: set[str] = set()
@@ -214,6 +216,7 @@ class ProviderSessionService:
                 if item["chat_key"] == key
             ]
             active_message_id = self._active_message_ids.get(key)
+            work_status = _json_copy(self._work_statuses.get(key))
             state = (
                 "CANCELLATION_REQUESTED"
                 if active_message_id in self._cancelled_message_ids
@@ -226,6 +229,7 @@ class ProviderSessionService:
             "target": self._public_target(descriptor),
             "messages": _json_copy(messages),
             "permissions": _json_copy(permissions),
+            "work_status": work_status,
             "connection": connection,
             "transcript_owner": "PROVIDER",
             "room_queue_used": False,
@@ -320,6 +324,7 @@ class ProviderSessionService:
                 ) from error
         self.events.publish(key, {"type": "PROVIDER_SESSION_MESSAGE", "message": user_message})
         self.events.publish(key, {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message})
+        self._publish_work_status(key, reply_message["message_id"], "STARTED")
         try:
             worker.start()
         except RuntimeError as error:
@@ -332,6 +337,12 @@ class ProviderSessionService:
             self.events.publish(
                 key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
+            )
+            self._publish_work_status(
+                key,
+                reply_message["message_id"],
+                "FAILED",
+                error_code="PROVIDER_SESSION_THREAD_START_FAILED",
             )
             if on_terminal is not None:
                 try:
@@ -667,6 +678,38 @@ class ProviderSessionService:
                 return
             self._permissions.pop(removable, None)
 
+    def _publish_work_status(
+        self,
+        chat_key: str,
+        message_id: str,
+        state: str,
+        *,
+        operation: str = "PROVIDER_TURN",
+        error_code: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        status = {
+            "schema": WORK_STATUS_SCHEMA,
+            "operation": operation,
+            "state": state,
+            "message_id": message_id,
+            "error_code": error_code,
+            "updated_at": _utc_now(),
+        }
+        if details:
+            status["details"] = {
+                key: details[key]
+                for key in ("source", "exit_code")
+                if key in details
+            }
+        with self._lock:
+            self._work_statuses[chat_key] = status
+        self.events.publish(
+            chat_key,
+            {"type": "PROVIDER_SESSION_WORK_STATUS", "work_status": status},
+        )
+        return _json_copy(status)
+
     def _run_turn(
         self,
         chat_key: str,
@@ -710,6 +753,11 @@ class ProviderSessionService:
                 chat_key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
             )
+            self._publish_work_status(
+                chat_key,
+                reply_message["message_id"],
+                "CANCELLED" if cancelled else "COMPLETED",
+            )
         except Exception as error:  # noqa: BLE001 - provider boundary is normalized
             code = str(getattr(error, "code", type(error).__name__)).upper()
             with self._lock:
@@ -722,7 +770,39 @@ class ProviderSessionService:
                 chat_key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
             )
+            self._publish_work_status(
+                chat_key,
+                reply_message["message_id"],
+                "CANCELLED" if cancelled else "FAILED",
+                error_code=None if cancelled else code[:120],
+            )
         finally:
+            try:
+                reader = getattr(handle.host, "drain_work_statuses", None)
+                milestones = reader() if callable(reader) else []
+                for milestone in milestones:
+                    operation = str(milestone.get("operation") or "").upper()
+                    state = str(milestone.get("state") or "").upper()
+                    if operation not in {"COMMIT", "PUSH"} or state not in {
+                        "COMPLETED",
+                        "FAILED",
+                    }:
+                        continue
+                    exit_code = milestone.get("exit_code")
+                    self._publish_work_status(
+                        chat_key,
+                        reply_message["message_id"],
+                        state,
+                        operation=operation,
+                        error_code=(
+                            f"GIT_EXIT_{exit_code}"
+                            if state == "FAILED" and isinstance(exit_code, int)
+                            else None
+                        ),
+                        details=milestone,
+                    )
+            except Exception:
+                pass
             try:
                 refreshed_connection = self._public_connection(handle.host.status())
             except Exception:  # noqa: BLE001 - retain the last safe snapshot

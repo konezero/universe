@@ -17,6 +17,7 @@ from agent_session_gateway import (  # noqa: E402
     ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
+    GitTrace2Observer,
     build_platform_approval_evidence,
     cli_auto_approve_status,
     normalize_permission_request,
@@ -124,6 +125,35 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_git_trace2_observer_emits_terminal_commit_and_push_once(self) -> None:
+        observer = GitTrace2Observer(self.root)
+        environment = observer.environment({"EXISTING": "value"})
+        self.assertEqual("value", environment["EXISTING"])
+        self.assertEqual(str(observer.path), environment["GIT_TRACE2_EVENT"])
+        observer.path.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {"event": "cmd_name", "sid": "commit-1", "name": "commit"},
+                    {"event": "exit", "sid": "commit-1", "code": 0},
+                    {"event": "atexit", "sid": "commit-1", "code": 0},
+                    {"event": "cmd_name", "sid": "push-1", "name": "push"},
+                    {"event": "exit", "sid": "push-1", "code": 1},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        milestones = observer.drain_work_statuses()
+
+        self.assertEqual(["COMMIT", "PUSH"], [item["operation"] for item in milestones])
+        self.assertEqual(["COMPLETED", "FAILED"], [item["state"] for item in milestones])
+        self.assertEqual([], observer.drain_work_statuses())
+        self.assertNotIn("argv", json.dumps(milestones))
+        observer.close()
+        self.assertFalse(observer.path.exists())
 
     def test_permission_request_uses_acp_option_contract(self) -> None:
         request = normalize_permission_request(
