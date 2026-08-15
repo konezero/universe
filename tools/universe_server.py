@@ -215,6 +215,14 @@ from universe_app.bench_service import (
 from universe_app.bench_repository import BenchObservationRepository
 from universe_app.memory_batch_service import MemoryBatchConfigurationService
 from universe_app.memory_execution_service import MemoryBatchExecutionService
+from universe_app.memory_scheduler import (
+    MemoryBatchScheduler,
+    format_utc as format_scheduler_utc,
+    next_cadence_due,
+    parse_utc as parse_scheduler_utc,
+    quota_window,
+    retry_delay_seconds,
+)
 from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
@@ -4740,6 +4748,27 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS work_loop_result_fanout_project_time
                 ON work_loop_result_fanout(project_id, created_at, fanout_id);
 
+                CREATE TABLE IF NOT EXISTS work_loop_review_candidate (
+                    candidate_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    fanout_id TEXT NOT NULL
+                        REFERENCES work_loop_result_fanout(fanout_id)
+                        ON DELETE CASCADE,
+                    sink_kind TEXT NOT NULL
+                        CHECK(sink_kind IN ('GOAL_PLAN', 'EXPERIENCE', 'MEMORY', 'BENCH', 'DOCUMENT_AUTOMATION')),
+                    review_state TEXT NOT NULL
+                        CHECK(review_state IN ('PENDING_REVIEW', 'KEPT', 'REJECTED')),
+                    candidate_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    UNIQUE(fanout_id, sink_kind)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_loop_review_candidate_project_time
+                ON work_loop_review_candidate(project_id, created_at, candidate_id);
+
                 CREATE TABLE IF NOT EXISTS project_dispatch (
                     dispatch_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -4911,6 +4940,64 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS memory_batch_run_project_time
                 ON memory_batch_run(project_id, started_at, run_id);
+
+                CREATE TABLE IF NOT EXISTS memory_batch_schedule_state (
+                    schedule_id TEXT PRIMARY KEY
+                        REFERENCES memory_batch_config(config_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    config_revision INTEGER NOT NULL,
+                    schedule_kind TEXT NOT NULL,
+                    interval_minutes INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('DISABLED', 'READY', 'CLAIMED', 'RETRY_WAIT', 'QUOTA_DEFERRED')),
+                    next_due_at TEXT,
+                    due_slot_key TEXT,
+                    lease_owner TEXT,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    last_error_code TEXT,
+                    last_outcome TEXT,
+                    last_started_at TEXT,
+                    last_terminal_at TEXT,
+                    last_success_at TEXT,
+                    last_run_id TEXT,
+                    quota_limit INTEGER,
+                    quota_window_hours INTEGER,
+                    quota_window_start TEXT,
+                    quota_window_end TEXT,
+                    quota_consumed INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, stage)
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_batch_schedule_due
+                ON memory_batch_schedule_state(state, next_due_at, schedule_id);
+
+                CREATE TABLE IF NOT EXISTS memory_batch_schedule_attempt (
+                    attempt_id TEXT PRIMARY KEY,
+                    schedule_id TEXT NOT NULL
+                        REFERENCES memory_batch_schedule_state(schedule_id)
+                        ON DELETE CASCADE,
+                    due_slot_key TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('STARTED', 'SUCCEEDED', 'FAILED', 'ABANDONED')),
+                    run_id TEXT,
+                    error_code TEXT,
+                    started_at TEXT NOT NULL,
+                    terminal_at TEXT,
+                    UNIQUE(schedule_id, due_slot_key, lease_generation)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS memory_batch_schedule_one_success
+                ON memory_batch_schedule_attempt(schedule_id, due_slot_key)
+                WHERE state = 'SUCCEEDED';
 
                 CREATE TABLE IF NOT EXISTS memory_candidate (
                     candidate_id TEXT PRIMARY KEY,
@@ -5852,6 +5939,137 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _memory_batch_schedule_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": "universe.memory-batch-schedule-state.v1",
+            "schedule_id": str(row["schedule_id"]),
+            "project_id": str(row["project_id"]),
+            "stage": str(row["stage"]),
+            "config_revision": int(row["config_revision"]),
+            "schedule": {
+                "kind": str(row["schedule_kind"]),
+                "interval_minutes": int(row["interval_minutes"]),
+            },
+            "state": str(row["state"]),
+            "next_due_at": row["next_due_at"],
+            "due_slot_key": row["due_slot_key"],
+            "lease_owner": row["lease_owner"],
+            "lease_generation": int(row["lease_generation"]),
+            "lease_expires_at": row["lease_expires_at"],
+            "attempt_count": int(row["attempt_count"]),
+            "max_attempts": int(row["max_attempts"]),
+            "last_error_code": row["last_error_code"],
+            "last_outcome": row["last_outcome"],
+            "last_started_at": row["last_started_at"],
+            "last_terminal_at": row["last_terminal_at"],
+            "last_success_at": row["last_success_at"],
+            "last_run_id": row["last_run_id"],
+            "quota": {
+                "limit": row["quota_limit"],
+                "window_hours": row["quota_window_hours"],
+                "window_start": row["quota_window_start"],
+                "window_end": row["quota_window_end"],
+                "consumed": int(row["quota_consumed"]),
+            },
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def _reconcile_memory_batch_schedule(
+        self,
+        connection: sqlite3.Connection,
+        config: Mapping[str, Any],
+        *,
+        now: str,
+    ) -> None:
+        schedule = config["schedule"]
+        kind = str(schedule["kind"])
+        interval = int(schedule["interval_minutes"])
+        enabled = bool(config["enabled"]) and kind != "MANUAL"
+        existing = connection.execute(
+            "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+            (config["config_id"],),
+        ).fetchone()
+        preserve_due = (
+            existing is not None
+            and str(existing["schedule_kind"]) == kind
+            and int(existing["interval_minutes"]) == interval
+            and existing["next_due_at"]
+            and str(existing["state"]) != "DISABLED"
+        )
+        next_due_at = None
+        if enabled:
+            next_due_at = (
+                str(existing["next_due_at"])
+                if preserve_due
+                else format_scheduler_utc(
+                    parse_scheduler_utc(now) + timedelta(minutes=interval)
+                )
+            )
+        budget = config.get("quota_or_budget")
+        quota_limit = budget.get("max_runs") if isinstance(budget, Mapping) else None
+        window_hours = (
+            budget.get("window_hours") if isinstance(budget, Mapping) else None
+        )
+        window_start = window_end = None
+        quota_consumed = 0
+        if quota_limit is not None and window_hours is not None:
+            window_start, window_end = quota_window(now, int(window_hours))
+            if (
+                existing is not None
+                and existing["quota_window_start"] == window_start
+                and existing["quota_limit"] == quota_limit
+            ):
+                quota_consumed = int(existing["quota_consumed"])
+        connection.execute(
+            """
+            INSERT INTO memory_batch_schedule_state(
+                schedule_id, project_id, stage, config_revision, schedule_kind,
+                interval_minutes, state, next_due_at, due_slot_key, lease_owner,
+                lease_generation, lease_expires_at, attempt_count, max_attempts,
+                last_error_code, last_outcome, last_started_at, last_terminal_at,
+                last_success_at, last_run_id, quota_limit, quota_window_hours,
+                quota_window_start, quota_window_end, quota_consumed, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, 0, 3,
+                      NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(schedule_id) DO UPDATE SET
+                config_revision = excluded.config_revision,
+                schedule_kind = excluded.schedule_kind,
+                interval_minutes = excluded.interval_minutes,
+                state = CASE
+                    WHEN excluded.state = 'DISABLED' THEN 'DISABLED'
+                    WHEN memory_batch_schedule_state.state = 'DISABLED' THEN 'READY'
+                    ELSE memory_batch_schedule_state.state
+                END,
+                next_due_at = excluded.next_due_at,
+                due_slot_key = CASE WHEN excluded.state = 'DISABLED' THEN NULL ELSE memory_batch_schedule_state.due_slot_key END,
+                lease_owner = CASE WHEN excluded.state = 'DISABLED' THEN NULL ELSE memory_batch_schedule_state.lease_owner END,
+                lease_expires_at = CASE WHEN excluded.state = 'DISABLED' THEN NULL ELSE memory_batch_schedule_state.lease_expires_at END,
+                quota_limit = excluded.quota_limit,
+                quota_window_hours = excluded.quota_window_hours,
+                quota_window_start = excluded.quota_window_start,
+                quota_window_end = excluded.quota_window_end,
+                quota_consumed = excluded.quota_consumed,
+                updated_at = excluded.updated_at
+            """,
+            (
+                config["config_id"],
+                config["project_id"],
+                config["stage"],
+                config["revision"],
+                kind,
+                interval,
+                "READY" if enabled else "DISABLED",
+                next_due_at,
+                quota_limit,
+                window_hours,
+                window_start,
+                window_end,
+                quota_consumed,
+                now,
+            ),
+        )
+
+    @staticmethod
     def _memory_batch_config_row(row: sqlite3.Row) -> dict[str, Any]:
         value = json.loads(row["config_json"])
         value["schema"] = MEMORY_BATCH_CONFIG_SCHEMA
@@ -5950,13 +6168,15 @@ class UniverseStore:
                 "SELECT * FROM memory_batch_config WHERE config_id = ?",
                 (config_id,),
             ).fetchone()
-        if row is None:
-            raise UniverseError(
-                "MEMORY_BATCH_CONFIG_UNAVAILABLE",
-                "memory batch config was not persisted",
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-        return self._memory_batch_config_row(row)
+            if row is None:
+                raise UniverseError(
+                    "MEMORY_BATCH_CONFIG_UNAVAILABLE",
+                    "memory batch config was not persisted",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            stored = self._memory_batch_config_row(row)
+            self._reconcile_memory_batch_schedule(connection, stored, now=now)
+        return stored
 
     def get_memory_batch_configs(self, project_id: str) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
@@ -6012,6 +6232,322 @@ class UniverseStore:
             if item["stage"] == normalized_stage
         )
 
+    def list_memory_batch_schedule_states(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_batch_schedule_state
+                WHERE project_id = ?
+                ORDER BY stage, schedule_id
+                """,
+                (project["project_id"],),
+            ).fetchall()
+        return [self._memory_batch_schedule_row(row) for row in rows]
+
+    def recover_expired_memory_batch_schedules(self, now: str) -> list[str]:
+        recovered: list[str] = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_batch_schedule_state
+                WHERE state = 'CLAIMED' AND lease_expires_at <= ?
+                ORDER BY lease_expires_at, schedule_id
+                """,
+                (now,),
+            ).fetchall()
+            for row in rows:
+                schedule_id = str(row["schedule_id"])
+                generation = int(row["lease_generation"])
+                connection.execute(
+                    """
+                    UPDATE memory_batch_schedule_attempt
+                    SET state = 'ABANDONED', error_code = 'LEASE_EXPIRED', terminal_at = ?
+                    WHERE schedule_id = ? AND lease_generation = ? AND state = 'STARTED'
+                    """,
+                    (now, schedule_id, generation),
+                )
+                attempts = int(row["attempt_count"])
+                exhausted = attempts >= int(row["max_attempts"])
+                if exhausted:
+                    next_due = next_cadence_due(
+                        str(row["next_due_at"]), int(row["interval_minutes"]), now
+                    )
+                    state = "READY"
+                    due_slot_key = None
+                    attempt_count = 0
+                    outcome = "FAILED_EXHAUSTED"
+                else:
+                    next_due = format_scheduler_utc(
+                        parse_scheduler_utc(now)
+                        + timedelta(seconds=retry_delay_seconds(attempts))
+                    )
+                    state = "RETRY_WAIT"
+                    due_slot_key = row["due_slot_key"]
+                    attempt_count = attempts
+                    outcome = "ABANDONED"
+                updated = connection.execute(
+                    """
+                    UPDATE memory_batch_schedule_state
+                    SET state = ?, next_due_at = ?, due_slot_key = ?, lease_owner = NULL,
+                        lease_expires_at = NULL, attempt_count = ?,
+                        last_error_code = 'LEASE_EXPIRED', last_outcome = ?,
+                        last_terminal_at = ?, updated_at = ?
+                    WHERE schedule_id = ? AND state = 'CLAIMED'
+                      AND lease_generation = ? AND lease_expires_at <= ?
+                    """,
+                    (
+                        state,
+                        next_due,
+                        due_slot_key,
+                        attempt_count,
+                        outcome,
+                        now,
+                        now,
+                        schedule_id,
+                        generation,
+                        now,
+                    ),
+                ).rowcount
+                if updated == 1:
+                    recovered.append(schedule_id)
+        return recovered
+
+    def claim_due_memory_batch_schedule(
+        self,
+        *,
+        now: str,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> dict[str, Any] | None:
+        owner = _required_text(lease_owner, "lease_owner")
+        expires_at = format_scheduler_utc(
+            parse_scheduler_utc(now) + timedelta(seconds=max(60, int(lease_seconds)))
+        )
+        with self._connection() as connection:
+            candidates = connection.execute(
+                """
+                SELECT * FROM memory_batch_schedule_state
+                WHERE state IN ('READY', 'RETRY_WAIT', 'QUOTA_DEFERRED')
+                  AND next_due_at IS NOT NULL AND next_due_at <= ?
+                ORDER BY next_due_at, schedule_id
+                LIMIT 32
+                """,
+                (now,),
+            ).fetchall()
+            for row in candidates:
+                schedule_id = str(row["schedule_id"])
+                quota_limit = row["quota_limit"]
+                window_hours = row["quota_window_hours"]
+                quota_consumed = int(row["quota_consumed"])
+                window_start = row["quota_window_start"]
+                window_end = row["quota_window_end"]
+                if quota_limit is not None and window_hours is not None:
+                    current_start, current_end = quota_window(now, int(window_hours))
+                    if window_start != current_start:
+                        window_start, window_end = current_start, current_end
+                        quota_consumed = 0
+                    if quota_consumed >= int(quota_limit):
+                        connection.execute(
+                            """
+                            UPDATE memory_batch_schedule_state
+                            SET state = 'QUOTA_DEFERRED', next_due_at = ?,
+                                quota_window_start = ?, quota_window_end = ?,
+                                quota_consumed = ?, last_error_code = 'MEMORY_BATCH_QUOTA_EXCEEDED',
+                                last_outcome = 'DEFERRED_QUOTA', updated_at = ?
+                            WHERE schedule_id = ? AND state IN ('READY', 'RETRY_WAIT', 'QUOTA_DEFERRED')
+                            """,
+                            (
+                                current_end,
+                                current_start,
+                                current_end,
+                                quota_consumed,
+                                now,
+                                schedule_id,
+                            ),
+                        )
+                        continue
+                planned_due = str(row["next_due_at"])
+                due_slot_key = row["due_slot_key"] or (
+                    "memory-slot-"
+                    + _json_sha256(
+                        {"schedule_id": schedule_id, "planned_due_at": planned_due}
+                    )[:24]
+                )
+                generation = int(row["lease_generation"]) + 1
+                attempts = int(row["attempt_count"]) + 1
+                updated = connection.execute(
+                    """
+                    UPDATE memory_batch_schedule_state
+                    SET state = 'CLAIMED', due_slot_key = ?, lease_owner = ?,
+                        lease_generation = ?, lease_expires_at = ?, attempt_count = ?,
+                        last_started_at = ?, quota_window_start = ?, quota_window_end = ?,
+                        quota_consumed = ?, updated_at = ?
+                    WHERE schedule_id = ?
+                      AND state IN ('READY', 'RETRY_WAIT', 'QUOTA_DEFERRED')
+                      AND next_due_at = ? AND next_due_at <= ?
+                    """,
+                    (
+                        due_slot_key,
+                        owner,
+                        generation,
+                        expires_at,
+                        attempts,
+                        now,
+                        window_start,
+                        window_end,
+                        quota_consumed + (1 if quota_limit is not None and window_hours is not None else 0),
+                        now,
+                        schedule_id,
+                        planned_due,
+                        now,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    continue
+                attempt_id = "memory-attempt-" + _json_sha256(
+                    {
+                        "schedule_id": schedule_id,
+                        "due_slot_key": due_slot_key,
+                        "lease_generation": generation,
+                    }
+                )[:24]
+                connection.execute(
+                    """
+                    INSERT INTO memory_batch_schedule_attempt(
+                        attempt_id, schedule_id, due_slot_key, lease_generation,
+                        state, started_at
+                    ) VALUES (?, ?, ?, ?, 'STARTED', ?)
+                    """,
+                    (attempt_id, schedule_id, due_slot_key, generation, now),
+                )
+                claimed = connection.execute(
+                    "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+                    (schedule_id,),
+                ).fetchone()
+                return self._memory_batch_schedule_row(claimed)
+        return None
+
+    def finish_memory_batch_schedule(
+        self,
+        claim: Mapping[str, Any],
+        *,
+        now: str,
+        outcome: str,
+        run_id: str | None = None,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        schedule_id = _required_text(claim.get("schedule_id"), "schedule_id")
+        owner = _required_text(claim.get("lease_owner"), "lease_owner")
+        generation = int(claim.get("lease_generation", 0))
+        normalized_outcome = str(outcome or "").strip().upper()
+        if normalized_outcome not in {"SUCCEEDED", "FAILED"}:
+            raise UniverseError(
+                "MEMORY_BATCH_SCHEDULE_OUTCOME_INVALID",
+                "schedule outcome must be SUCCEEDED or FAILED",
+            )
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "CLAIMED"
+                or row["lease_owner"] != owner
+                or int(row["lease_generation"]) != generation
+            ):
+                raise UniverseError(
+                    "MEMORY_BATCH_SCHEDULE_LEASE_STALE",
+                    "only the current schedule lease may record a terminal result",
+                    HTTPStatus.CONFLICT,
+                )
+            due_slot_key = str(row["due_slot_key"])
+            attempt_state = "SUCCEEDED" if normalized_outcome == "SUCCEEDED" else "FAILED"
+            connection.execute(
+                """
+                UPDATE memory_batch_schedule_attempt
+                SET state = ?, run_id = ?, error_code = ?, terminal_at = ?
+                WHERE schedule_id = ? AND due_slot_key = ?
+                  AND lease_generation = ? AND state = 'STARTED'
+                """,
+                (
+                    attempt_state,
+                    run_id,
+                    error_code,
+                    now,
+                    schedule_id,
+                    due_slot_key,
+                    generation,
+                ),
+            )
+            attempts = int(row["attempt_count"])
+            exhausted = attempts >= int(row["max_attempts"])
+            if normalized_outcome == "SUCCEEDED" or exhausted:
+                state = "READY"
+                next_due = next_cadence_due(
+                    str(row["next_due_at"]), int(row["interval_minutes"]), now
+                )
+                next_slot = None
+                next_attempt_count = 0
+                terminal_outcome = (
+                    "SUCCEEDED" if normalized_outcome == "SUCCEEDED" else "FAILED_EXHAUSTED"
+                )
+            elif error_code == "MEMORY_BATCH_QUOTA_EXCEEDED" and row["quota_window_end"]:
+                state = "QUOTA_DEFERRED"
+                next_due = str(row["quota_window_end"])
+                next_slot = due_slot_key
+                next_attempt_count = attempts
+                terminal_outcome = "DEFERRED_QUOTA"
+            else:
+                state = "RETRY_WAIT"
+                next_due = format_scheduler_utc(
+                    parse_scheduler_utc(now)
+                    + timedelta(seconds=retry_delay_seconds(attempts))
+                )
+                next_slot = due_slot_key
+                next_attempt_count = attempts
+                terminal_outcome = "FAILED_RETRYABLE"
+            updated = connection.execute(
+                """
+                UPDATE memory_batch_schedule_state
+                SET state = ?, next_due_at = ?, due_slot_key = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, attempt_count = ?, last_error_code = ?,
+                    last_outcome = ?, last_terminal_at = ?,
+                    last_success_at = CASE WHEN ? = 'SUCCEEDED' THEN ? ELSE last_success_at END,
+                    last_run_id = COALESCE(?, last_run_id), updated_at = ?
+                WHERE schedule_id = ? AND state = 'CLAIMED'
+                  AND lease_owner = ? AND lease_generation = ?
+                """,
+                (
+                    state,
+                    next_due,
+                    next_slot,
+                    next_attempt_count,
+                    error_code,
+                    terminal_outcome,
+                    now,
+                    normalized_outcome,
+                    now,
+                    run_id,
+                    now,
+                    schedule_id,
+                    owner,
+                    generation,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise UniverseError(
+                    "MEMORY_BATCH_SCHEDULE_LEASE_STALE",
+                    "schedule lease changed before completion",
+                    HTTPStatus.CONFLICT,
+                )
+            terminal = connection.execute(
+                "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return self._memory_batch_schedule_row(terminal)
+
     def list_memory_batch_runs(
         self, project_id: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -6047,13 +6583,24 @@ class UniverseStore:
             for row in rows
         ]
 
-    def count_memory_batch_runs(self, project_id: str, stage: str) -> int:
+    def count_memory_batch_runs(
+        self, project_id: str, stage: str, *, since: str | None = None
+    ) -> int:
         project = self.get_project(project_id)
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
-                (project["project_id"], stage),
-            ).fetchone()
+            if since is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
+                    (project["project_id"], stage),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM memory_batch_run
+                    WHERE project_id = ? AND stage = ? AND started_at >= ?
+                    """,
+                    (project["project_id"], stage, since),
+                ).fetchone()
         return int(row["count"] or 0)
 
     def get_memory_batch_run(self, run_id: str) -> dict[str, Any] | None:
@@ -12422,6 +12969,14 @@ class UniverseStore:
             outcome=outcome,
             state=state,
         )
+        sink_kinds = (
+            "GOAL_PLAN",
+            "EXPERIENCE",
+            "MEMORY",
+            "BENCH",
+            "DOCUMENT_AUTOMATION",
+        )
+        material["review_candidate_count"] = len(sink_kinds)
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
@@ -12455,6 +13010,51 @@ class UniverseStore:
                     now,
                 ),
             )
+            for sink_kind in sink_kinds:
+                candidate_id = "work-review-" + _json_sha256(
+                    {"fanout_id": material["fanout_id"], "sink_kind": sink_kind}
+                )[:24]
+                candidate = {
+                    "schema": "universe.work-loop-review-candidate.v1",
+                    "candidate_id": candidate_id,
+                    "project_id": project["project_id"],
+                    "fanout_id": material["fanout_id"],
+                    "source": {
+                        "kind": "TODO_RESULT",
+                        "todo_id": todo_id,
+                        "outcome": outcome,
+                        "state": state,
+                    },
+                    "sink_kind": sink_kind,
+                    "review_state": "PENDING_REVIEW",
+                    "auto_adopt": False,
+                    "effects": {
+                        "goal_plan": "NONE",
+                        "experience": "NONE",
+                        "memory": "NONE",
+                        "bench": "NONE",
+                        "document": "NONE",
+                        "authority": "NONE",
+                        "execution_assignment": "NONE",
+                    },
+                }
+                connection.execute(
+                    """
+                    INSERT INTO work_loop_review_candidate(
+                        candidate_id, project_id, fanout_id, sink_kind,
+                        review_state, candidate_json, created_at
+                    ) VALUES (?, ?, ?, ?, 'PENDING_REVIEW', ?, ?)
+                    ON CONFLICT(fanout_id, sink_kind) DO NOTHING
+                    """,
+                    (
+                        candidate_id,
+                        project["project_id"],
+                        material["fanout_id"],
+                        sink_kind,
+                        _canonical_json(candidate),
+                        now,
+                    ),
+                )
         material["created_at"] = now
         material["status"] = "WORK_LOOP_RESULT_FANOUT_RECORDED"
         return material
@@ -12480,6 +13080,91 @@ class UniverseStore:
             item["created_at"] = row["created_at"]
             items.append(item)
         return items
+
+    def list_work_loop_review_candidates(
+        self, project_id: str, *, limit: int = 250
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT candidate_json, review_state, created_at, reviewed_at
+                FROM work_loop_review_candidate
+                WHERE project_id = ?
+                ORDER BY created_at DESC, candidate_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 1000))),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = json.loads(row["candidate_json"])
+            item["review_state"] = row["review_state"]
+            item["created_at"] = row["created_at"]
+            item["reviewed_at"] = row["reviewed_at"]
+            items.append(item)
+        return items
+
+    def review_work_loop_candidate(
+        self,
+        project_id: str,
+        candidate_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_id = _required_text(candidate_id, "candidate_id")
+        normalized_decision = str(decision or "").strip().upper()
+        next_state = {"KEEP": "KEPT", "REJECT": "REJECTED"}.get(
+            normalized_decision
+        )
+        if next_state is None:
+            raise UniverseError(
+                "WORK_LOOP_REVIEW_DECISION_INVALID",
+                "decision must be KEEP or REJECT",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM work_loop_review_candidate
+                WHERE project_id = ? AND candidate_id = ?
+                """,
+                (project["project_id"], normalized_id),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "WORK_LOOP_REVIEW_CANDIDATE_NOT_FOUND",
+                    "review candidate does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["review_state"] == next_state:
+                reviewed = json.loads(row["candidate_json"])
+                reviewed["review_state"] = next_state
+                reviewed["created_at"] = row["created_at"]
+                reviewed["reviewed_at"] = row["reviewed_at"]
+                reviewed["status"] = "WORK_LOOP_REVIEW_ALREADY_RECORDED"
+                return reviewed
+            if row["review_state"] != "PENDING_REVIEW":
+                raise UniverseError(
+                    "WORK_LOOP_REVIEW_CONFLICT",
+                    "candidate already has another review decision",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                UPDATE work_loop_review_candidate
+                SET review_state = ?, reviewed_at = ?
+                WHERE candidate_id = ? AND review_state = 'PENDING_REVIEW'
+                """,
+                (next_state, now, normalized_id),
+            )
+            reviewed = json.loads(row["candidate_json"])
+        reviewed["review_state"] = next_state
+        reviewed["created_at"] = row["created_at"]
+        reviewed["reviewed_at"] = now
+        reviewed["status"] = "WORK_LOOP_REVIEW_RECORDED"
+        reviewed["auto_adopt"] = False
+        return reviewed
 
     def recover_interrupted_work_loop_todos(self, project_id: str) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -12716,14 +13401,30 @@ class UniverseStore:
                 """,
                 (project["project_id"],),
             ).fetchone()["count"]
+            document_review_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM work_loop_review_candidate
+                WHERE project_id = ? AND sink_kind = 'DOCUMENT_AUTOMATION'
+                  AND review_state = 'PENDING_REVIEW'
+                """,
+                (project["project_id"],),
+            ).fetchone()["count"]
         return {
             "schema": "universe.work-loop-snapshot.v1",
             "status": "WORK_LOOP_COLLECTED",
             "project_id": project["project_id"],
             "predictions": predictions,
             "result_fanouts": self.list_work_loop_result_fanouts(project["project_id"]),
+            "review_candidates": self.list_work_loop_review_candidates(
+                project["project_id"]
+            ),
+            "memory_schedules": self.list_memory_batch_schedule_states(
+                project["project_id"]
+            ),
             "document_automation": {
                 "proposal_count": int(document_count),
+                "pending_result_reviews": int(document_review_count),
                 "auto_applied": False,
             },
             "adoption_policy": {
@@ -15610,6 +16311,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         remote_connector_config_path: Path | None = None,
         directory_selector: Callable[[], str | None] | None = None,
         file_selector: Callable[[str], str | None] | None = None,
+        memory_scheduler_clock: Any = None,
+        memory_scheduler_poll_seconds: float = 30.0,
+        auto_start_memory_scheduler: bool = True,
     ):
         self.store = store
         self.project_task_proposals = ProjectTaskProposalAdapter()
@@ -15648,6 +16352,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.provider_model_catalog,
             api_schema=API_SCHEMA,
         )
+        self._memory_scheduler_stop = threading.Event()
+        self._memory_scheduler_wake = threading.Event()
+        self._memory_scheduler_poll_seconds = max(
+            0.05, min(float(memory_scheduler_poll_seconds), 300.0)
+        )
+        self._memory_scheduler_last_tick: dict[str, Any] | None = None
+        self.memory_batch_scheduler = MemoryBatchScheduler(
+            self.store,
+            self._run_scheduled_memory_batch,
+            clock=memory_scheduler_clock,
+        )
+        self._auto_start_memory_scheduler = bool(auto_start_memory_scheduler)
         python_tool = self.host_profile.resolve("python")
         self.continuity_coordinator = (
             ProjectContinuityCoordinator(
@@ -15821,6 +16537,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._maintain_worker.start()
+        self._memory_scheduler_worker = threading.Thread(
+            target=self._memory_batch_scheduler_loop,
+            name="universe-memory-batch-scheduler",
+            daemon=True,
+        )
+        if self._auto_start_memory_scheduler:
+            self._memory_scheduler_worker.start()
         self._supervisor_maintenance_stop = threading.Event()
         self._supervisor_maintenance_last_run: dict[str, Any] | None = None
         self._supervisor_maintenance_worker = threading.Thread(
@@ -19124,12 +19847,44 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return self.memory_batch_config_service.resolve(project_id, value)
 
     def memory_batch_configs(self, project_id: str) -> dict[str, Any]:
-        return self.memory_batch_config_service.list_configs(project_id)
+        result = self.memory_batch_config_service.list_configs(project_id)
+        result["schedules"] = self.store.list_memory_batch_schedule_states(project_id)
+        result["scheduler"] = {
+            "status": (
+                "RUNNING"
+                if self._auto_start_memory_scheduler
+                and self._memory_scheduler_worker.is_alive()
+                else "STOPPED"
+            ),
+            "last_tick": self._memory_scheduler_last_tick,
+        }
+        return result
 
     def set_memory_batch_config(
         self, project_id: str, value: Any
     ) -> dict[str, Any]:
-        return self.memory_batch_config_service.save_config(project_id, value)
+        result = self.memory_batch_config_service.save_config(project_id, value)
+        self._memory_scheduler_wake.set()
+        result["schedule"] = next(
+            (
+                item
+                for item in self.store.list_memory_batch_schedule_states(project_id)
+                if item["stage"] == result["config"]["stage"]
+            ),
+            None,
+        )
+        return result
+
+    def _run_scheduled_memory_batch(
+        self, project_id: str, stage: str
+    ) -> Mapping[str, Any]:
+        request: dict[str, Any] = {"stage": stage, "trigger": "SCHEDULED"}
+        if stage == "FAST_EXTRACT":
+            request["source_ids"] = [
+                item["source_id"]
+                for item in self.store.list_provider_session_sources()
+            ]
+        return self.run_memory_batch(project_id, request)
 
     def run_memory_batch(self, project_id: str, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
@@ -19156,10 +19911,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
         budget = resolved.get("quota_or_budget")
-        if isinstance(budget, Mapping) and set(budget) - {"max_runs"}:
+        if isinstance(budget, Mapping) and set(budget) - {"max_runs", "window_hours"}:
             raise UniverseError(
                 "MEMORY_BATCH_BUDGET_ENFORCEMENT_UNAVAILABLE",
-                "this slice enforces max_runs only; token, cost, and window budgets require Provider usage telemetry",
+                "this slice enforces max_runs and UTC run windows only; token and cost budgets require Provider usage telemetry",
                 HTTPStatus.CONFLICT,
             )
         request = {
@@ -21532,6 +22287,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "last_run": self._maintain_last_run,
         }
 
+    def _memory_batch_scheduler_loop(self) -> None:
+        while not self._memory_scheduler_stop.is_set():
+            try:
+                self._memory_scheduler_last_tick = self.memory_batch_scheduler.tick()
+            except Exception as error:  # noqa: BLE001 - scheduler remains observable
+                self._memory_scheduler_last_tick = {
+                    "schema": "universe.memory-batch-scheduler.v1",
+                    "status": "MEMORY_BATCH_SCHEDULER_TICK_FAILED",
+                    "observed_at": utc_now(),
+                    "error_code": str(
+                        getattr(error, "code", "") or type(error).__name__
+                    ),
+                }
+            self._memory_scheduler_wake.wait(
+                timeout=self._memory_scheduler_poll_seconds
+            )
+            self._memory_scheduler_wake.clear()
+
     def _memory_maintain_worker_loop(self) -> None:
         """In-process maintain batch. interval_hours 0 => idle recheck only."""
 
@@ -21804,6 +22577,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             close_step(
                 "supervisor_maintenance_worker",
                 lambda: self._supervisor_maintenance_worker.join(timeout=5),
+            )
+        self.memory_batch_scheduler.stop_accepting()
+        self._memory_scheduler_stop.set()
+        self._memory_scheduler_wake.set()
+        if self._memory_scheduler_worker.is_alive():
+            close_step(
+                "memory_batch_scheduler",
+                lambda: self._memory_scheduler_worker.join(timeout=5),
             )
         self._maintain_stop.set()
         self._maintain_wake.set()
@@ -25067,6 +25848,25 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/work-loop/review-candidates/review":
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "WORK_LOOP_REVIEW_INVALID", "review body must be an object"
+                    )
+                candidate = self.server.store.review_work_loop_candidate(
+                    parts[0],
+                    str(body.get("candidate_id") or ""),
+                    str(body.get("decision") or ""),
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": candidate.pop("status"),
+                        "candidate": candidate,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/work-loop/recover":
                 self._send(
                     HTTPStatus.OK,
@@ -25647,6 +26447,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/experience-cases/from-observations",
             "/experience-cases",
             "/work-loop/predictions/review",
+            "/work-loop/review-candidates/review",
             "/work-loop/predictions",
             "/work-loop/recover",
             "/work-loop",

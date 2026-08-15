@@ -12,6 +12,7 @@ import time
 import unittest
 import uuid
 from dataclasses import replace
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -8159,6 +8160,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "idempotency_key": "fanout-todo-001",
             },
         )
+        room_message_count = len(self.server.store.list_room_messages("GCS"))
         transition = self.server.store.apply_master_message_todo_transition(
             "GCS",
             message["message_id"],
@@ -8188,7 +8190,194 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("WORK_LOOP_COLLECTED", snapshot["status"])
         self.assertTrue(snapshot["result_fanouts"])
         self.assertEqual(1, len(snapshot["result_fanouts"]))
+        self.assertEqual(5, len(snapshot["review_candidates"]))
+        self.assertEqual(
+            {
+                "GOAL_PLAN",
+                "EXPERIENCE",
+                "MEMORY",
+                "BENCH",
+                "DOCUMENT_AUTOMATION",
+            },
+            {item["sink_kind"] for item in snapshot["review_candidates"]},
+        )
+        self.assertTrue(
+            all(not item["auto_adopt"] for item in snapshot["review_candidates"])
+        )
+        self.assertEqual(
+            room_message_count, len(self.server.store.list_room_messages("GCS"))
+        )
+        review_target = snapshot["review_candidates"][0]
+        status, reviewed = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/review-candidates/review",
+            {"candidate_id": review_target["candidate_id"], "decision": "KEEP"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("KEPT", reviewed["candidate"]["review_state"])
+        self.assertFalse(reviewed["candidate"]["auto_adopt"])
         self.assertFalse(snapshot["adoption_policy"]["auto_adopt"])
+
+    def test_memory_batch_schedule_claim_retry_recovery_and_stale_lease(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        config = self.server.store.upsert_memory_batch_config(
+            "GCS",
+            {
+                "stage": "CONSOLIDATE",
+                "provider": "CODEX",
+                "model_ref": "gpt-5.6-luna",
+                "effort": "MAX",
+                "schedule": {"kind": "HOURLY"},
+                "quota_or_budget": {"max_runs": 2, "window_hours": 6},
+                "fallback": "DETERMINISTIC",
+                "enabled": True,
+                "dry_run": True,
+            },
+        )
+        schedule = self.server.store.list_memory_batch_schedule_states("GCS")[0]
+        self.assertEqual(config["config_id"], schedule["schedule_id"])
+        self.assertEqual("READY", schedule["state"])
+
+        due = schedule["next_due_at"]
+        claim = self.server.store.claim_due_memory_batch_schedule(
+            now=due,
+            lease_owner="host-a",
+            lease_seconds=60,
+        )
+        self.assertIsNotNone(claim)
+        self.assertEqual("CLAIMED", claim["state"])
+        self.assertIsNone(
+            self.server.store.claim_due_memory_batch_schedule(
+                now=due,
+                lease_owner="host-b",
+                lease_seconds=60,
+            )
+        )
+        with self.assertRaises(UniverseError) as stale:
+            self.server.store.finish_memory_batch_schedule(
+                {**claim, "lease_generation": claim["lease_generation"] + 1},
+                now=due,
+                outcome="SUCCEEDED",
+                run_id="run-stale",
+            )
+        self.assertEqual("MEMORY_BATCH_SCHEDULE_LEASE_STALE", stale.exception.code)
+
+        lease_expired_at = (
+            datetime.fromisoformat(claim["lease_expires_at"].replace("Z", "+00:00"))
+            + timedelta(seconds=1)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        recovered = self.server.store.recover_expired_memory_batch_schedules(
+            lease_expired_at
+        )
+        self.assertEqual([schedule["schedule_id"]], recovered)
+        self.assertEqual(
+            [], self.server.store.recover_expired_memory_batch_schedules(lease_expired_at)
+        )
+        retry = self.server.store.list_memory_batch_schedule_states("GCS")[0]
+        self.assertEqual("RETRY_WAIT", retry["state"])
+        self.assertEqual(1, retry["attempt_count"])
+
+        second = self.server.store.claim_due_memory_batch_schedule(
+            now=retry["next_due_at"],
+            lease_owner="host-b",
+            lease_seconds=60,
+        )
+        failed = self.server.store.finish_memory_batch_schedule(
+            second,
+            now=retry["next_due_at"],
+            outcome="FAILED",
+            error_code="EXPECTED_FAILURE",
+        )
+        self.assertEqual("RETRY_WAIT", failed["state"])
+        self.assertEqual(2, failed["attempt_count"])
+
+    def test_memory_batch_schedule_recovers_claim_after_store_restart(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.upsert_memory_batch_config(
+            "GCS",
+            {
+                "stage": "SYNTHESIZE",
+                "provider": "CODEX",
+                "model_ref": "gpt-5.6-luna",
+                "effort": "MAX",
+                "schedule": {"kind": "HOURLY"},
+                "quota_or_budget": None,
+                "fallback": "DETERMINISTIC",
+                "enabled": True,
+                "dry_run": True,
+            },
+        )
+        schedule = next(
+            item
+            for item in self.server.store.list_memory_batch_schedule_states("GCS")
+            if item["stage"] == "SYNTHESIZE"
+        )
+        claim = self.server.store.claim_due_memory_batch_schedule(
+            now=schedule["next_due_at"],
+            lease_owner="host-before-restart",
+            lease_seconds=60,
+        )
+        self.assertIsNotNone(claim)
+
+        restarted_store = UniverseStore(self.server.store.database_path)
+        expired_at = (
+            datetime.fromisoformat(claim["lease_expires_at"].replace("Z", "+00:00"))
+            + timedelta(seconds=1)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        self.assertEqual(
+            [schedule["schedule_id"]],
+            restarted_store.recover_expired_memory_batch_schedules(expired_at),
+        )
+        recovered = next(
+            item
+            for item in restarted_store.list_memory_batch_schedule_states("GCS")
+            if item["stage"] == "SYNTHESIZE"
+        )
+        self.assertEqual("RETRY_WAIT", recovered["state"])
+        self.assertEqual(claim["due_slot_key"], recovered["due_slot_key"])
+        self.assertEqual(1, recovered["attempt_count"])
+        self.assertEqual(
+            [], restarted_store.recover_expired_memory_batch_schedules(expired_at)
+        )
+
+    def test_memory_batch_scheduler_tick_executes_due_stage_once(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.upsert_memory_batch_config(
+            "GCS",
+            {
+                "stage": "CONSOLIDATE",
+                "provider": "CODEX",
+                "model_ref": "gpt-5.6-luna",
+                "effort": "MAX",
+                "schedule": {"kind": "HOURLY"},
+                "quota_or_budget": None,
+                "fallback": "DETERMINISTIC",
+                "enabled": True,
+                "dry_run": True,
+            },
+        )
+        schedule = self.server.store.list_memory_batch_schedule_states("GCS")[0]
+        due = datetime.fromisoformat(schedule["next_due_at"].replace("Z", "+00:00"))
+        clock = Mock()
+        clock.now.return_value = due
+        calls: list[tuple[str, str]] = []
+        self.server.memory_batch_scheduler.clock = clock
+        self.server.memory_batch_scheduler.execute = lambda project_id, stage: (
+            calls.append((project_id, stage)) or {"run_id": "scheduled-run-1"}
+        )
+
+        tick = self.server.memory_batch_scheduler.tick()
+        self.assertEqual([("GCS", "CONSOLIDATE")], calls)
+        self.assertEqual("SUCCEEDED", tick["executions"][0]["outcome"])
+        terminal = self.server.store.list_memory_batch_schedule_states("GCS")[0]
+        self.assertEqual("SUCCEEDED", terminal["last_outcome"])
+        self.assertEqual("scheduled-run-1", terminal["last_run_id"])
+        self.assertEqual(0, terminal["attempt_count"])
+
+        repeated = self.server.memory_batch_scheduler.tick()
+        self.assertEqual([], repeated["executions"])
+        self.assertEqual([("GCS", "CONSOLIDATE")], calls)
 
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

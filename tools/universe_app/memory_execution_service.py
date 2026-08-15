@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from http import HTTPStatus
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from universe_memory import (
     MEMORY_BATCH_RUN_SCHEMA,
@@ -19,6 +19,8 @@ from universe_memory import (
     normalize_memory_candidate,
     synthesize_memory_candidates,
 )
+
+from .memory_scheduler import quota_window
 
 from .connection import UniverseError
 
@@ -40,7 +42,9 @@ def _utc_now() -> str:
 class MemoryBatchExecutionStore(Protocol):
     def get_project(self, project_id: str) -> dict[str, Any]: ...
 
-    def count_memory_batch_runs(self, project_id: str, stage: str) -> int: ...
+    def count_memory_batch_runs(
+        self, project_id: str, stage: str, *, since: str | None = None
+    ) -> int: ...
 
     def list_provider_session_sources(self) -> list[dict[str, Any]]: ...
 
@@ -78,8 +82,14 @@ class MemoryBatchExecutionStore(Protocol):
 class MemoryBatchExecutionService:
     """Run deterministic Memory stages and persist one durable result envelope."""
 
-    def __init__(self, store: MemoryBatchExecutionStore) -> None:
+    def __init__(
+        self,
+        store: MemoryBatchExecutionStore,
+        *,
+        now: Callable[[], str] = _utc_now,
+    ) -> None:
         self.store = store
+        self.now = now
 
     def execute(
         self,
@@ -102,7 +112,18 @@ class MemoryBatchExecutionService:
         dry_run = bool(config.get("dry_run", False))
         budget = config.get("quota_or_budget")
         if isinstance(budget, Mapping) and budget.get("max_runs") is not None:
-            count = self.store.count_memory_batch_runs(project["project_id"], stage)
+            since = None
+            if budget.get("window_hours") is not None:
+                since, _window_end = quota_window(
+                    self.now(), int(budget["window_hours"])
+                )
+            count = (
+                self.store.count_memory_batch_runs(
+                    project["project_id"], stage, since=since
+                )
+                if since is not None
+                else self.store.count_memory_batch_runs(project["project_id"], stage)
+            )
             if int(count) >= int(budget["max_runs"]):
                 raise UniverseError(
                     "MEMORY_BATCH_QUOTA_EXCEEDED",
@@ -215,7 +236,7 @@ class MemoryBatchExecutionService:
             run_id, _config_digest, _input_digest = self.store.memory_batch_run_id(
                 project["project_id"], stage, config, input_material
             )
-        now = _utc_now()
+        now = self.now()
         result: dict[str, Any] = {
             "schema": MEMORY_BATCH_RUN_SCHEMA,
             "status": "DRY_RUN_COMPLETED" if dry_run else "COMPLETED",

@@ -3797,7 +3797,13 @@ async function selectProject(
       `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`
     ).catch(() => ({ candidates: [] })),
     api(`/v1/projects/${encodeURIComponent(projectId)}/work-loop`).catch(
-      () => ({ predictions: [], result_fanouts: [], document_automation: null })
+      () => ({
+        predictions: [],
+        result_fanouts: [],
+        review_candidates: [],
+        memory_schedules: [],
+        document_automation: null,
+      })
     ),
   ]);
   state.projection = projectionResult?.projection || null;
@@ -8230,6 +8236,17 @@ async function reviewWorkLoopPrediction(proposalId, decision) {
   toast(`Prediction ${decision === "KEEP" ? "kept" : "rejected"}`);
 }
 
+async function reviewWorkLoopCandidate(candidateId, decision) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/review-candidates/review`,
+    { method: "POST", body: { candidate_id: candidateId, decision } }
+  );
+  await refreshSelectedWorkLoop();
+  toast(`Result candidate ${decision === "KEEP" ? "kept" : "rejected"}`);
+}
+
 async function recoverWorkLoopTodos() {
   const projectId = state.selectedProject?.project_id;
   if (!projectId) return;
@@ -8328,13 +8345,67 @@ function renderWorkLoopDetails() {
     }
     group.append(card);
   }
+  const reviewCandidates = workLoop.review_candidates || [];
+  if (reviewCandidates.length) {
+    group.append(node("h4", "", `Result Review (${reviewCandidates.length})`));
+  }
+  for (const candidate of reviewCandidates.slice(0, 10)) {
+    const card = node("div", "context-card");
+    card.append(
+      node(
+        "strong",
+        "",
+        `${candidate.sink_kind} · ${candidate.review_state || "PENDING_REVIEW"}`
+      ),
+      node(
+        "p",
+        "empty-copy",
+        `${candidate.outcome || "UNKNOWN"} · Todo ${candidate.todo_id || "unknown"}`
+      )
+    );
+    if ((candidate.review_state || "PENDING_REVIEW") === "PENDING_REVIEW") {
+      const reviewActions = node("div", "detail-heading-actions");
+      for (const decision of ["KEEP", "REJECT"]) {
+        const button = node(
+          "button",
+          "secondary-button compact-action",
+          decision === "KEEP" ? "Keep" : "Reject"
+        );
+        button.type = "button";
+        button.addEventListener("click", () =>
+          reviewWorkLoopCandidate(candidate.candidate_id, decision).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        reviewActions.append(button);
+      }
+      card.append(reviewActions);
+    }
+    group.append(card);
+  }
+  const memorySchedules = workLoop.memory_schedules || [];
+  if (memorySchedules.length) {
+    group.append(node("h4", "", `Memory Scheduler (${memorySchedules.length})`));
+  }
+  for (const schedule of memorySchedules.slice(0, 8)) {
+    group.append(
+      node(
+        "p",
+        "empty-copy",
+        `${schedule.stage || "MEMORY"} · ${schedule.state || "UNKNOWN"} · last ${schedule.last_outcome || "NONE"} · next ${schedule.next_due_at || "not scheduled"} · attempts ${Number(schedule.attempt_count || 0)}/${Number(schedule.max_attempts || 0)}`
+      )
+    );
+  }
   const fanoutCount = (workLoop.result_fanouts || []).length;
+  const pendingReviewCount = reviewCandidates.filter(
+    (candidate) => (candidate.review_state || "PENDING_REVIEW") === "PENDING_REVIEW"
+  ).length;
   const documentCount = Number(workLoop.document_automation?.proposal_count || 0);
   group.append(
     node(
       "p",
       "empty-copy",
-      `Result fan-out ${fanoutCount} · Document proposals ${documentCount} · auto-apply off`
+      `Result fan-out ${fanoutCount} · Pending reviews ${pendingReviewCount} · Memory schedules ${memorySchedules.length} · Document proposals ${documentCount} · auto-apply off`
     )
   );
   return group;

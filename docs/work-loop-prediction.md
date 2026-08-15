@@ -1,6 +1,6 @@
 # Goal-centered Work Loop
 
-Universe exposes one project-scoped work-loop view that connects Goal/Plan evidence, Todo outcomes, Experience, Memory/RAG, Bench observations, curated Seeds, prediction proposals, and document-automation counts.
+Universe exposes one project-scoped work-loop view that connects Goal/Plan evidence, Todo outcomes, Experience, Memory/RAG, Bench observations, curated Seeds, prediction proposals, durable Memory schedules, and document automation.
 
 ## Operator flow
 
@@ -9,15 +9,17 @@ Universe exposes one project-scoped work-loop view that connects Goal/Plan evide
 3. Inspect every suggestion's kind, confidence, and provenance. Unsupported and low-confidence candidates remain visible as rejected inputs.
 4. Choose **Keep** or **Reject** for the proposal. Keeping is curation only: it does not create a Goal, Plan, Milestone, Todo, authority, or execution assignment.
 5. Choose **Recover** after an interrupted run to return only recovery-eligible `IN_PROGRESS` Todos to `READY`.
+6. Review each terminal Todo Result candidate independently for Goal/Plan, Experience, Memory, Bench, and Document Automation.
 
 Predictions never auto-adopt Goals or Todos. Document proposals also remain review-only and are never auto-applied.
 
 ## API
 
-- `GET /v1/projects/{project_id}/work-loop` returns prediction proposals, deterministic Result fan-outs, and document-automation proposal counts.
+- `GET /v1/projects/{project_id}/work-loop` returns predictions, deterministic Result fan-outs, five-sink review candidates, Memory scheduler state, and document-automation counts.
 - `POST /v1/projects/{project_id}/work-loop/predictions` builds or reuses the content-addressed current proposal.
 - `POST /v1/projects/{project_id}/work-loop/predictions/review` accepts `{ "proposal_id": "...", "decision": "KEEP|REJECT" }`.
 - `POST /v1/projects/{project_id}/work-loop/recover` performs bounded Todo restart recovery.
+- `POST /v1/projects/{project_id}/work-loop/review-candidates/review` accepts `{ "candidate_id": "...", "decision": "KEEP|REJECT" }`.
 
 Prediction review states are `PROPOSAL_ONLY`, `KEPT`, and `REJECTED`. A reviewed proposal cannot be switched to the opposite decision; the API fails closed with a conflict.
 
@@ -38,6 +40,6 @@ Rejected candidates retain `reason` (`UNSUPPORTED` or `LOW_CONFIDENCE`), confide
 
 ## Result fan-out and recovery
 
-A terminal Todo transition records one idempotent Result fan-out descriptor for Goal/Plan observation, Experience candidacy, and Memory review. The descriptor does not itself create those entities; downstream incorporation remains independently reviewable.
+A terminal Todo transition records one idempotent Result fan-out descriptor and five independently reviewable candidates: `GOAL_PLAN`, `EXPERIENCE`, `MEMORY`, `BENCH`, and `DOCUMENT_AUTOMATION`. Repeating the same terminal transition reuses the same fan-out and candidates. No candidate is placed in public chat, auto-adopted, or treated as a Goal, Todo, Memory, Bench result, or document until it is reviewed and a later domain-specific action incorporates it.
 
 Recovery only changes an `IN_PROGRESS` Todo when a linked room message has explicit `FAILED` delivery evidence, then emits a recovery event. An unlinked Todo remains untouched because absence is not failure evidence. Recovery creates no Task Frame or execution assignment. Operators should inspect the returned `recovered` list before resuming work.
