@@ -20,22 +20,27 @@ lifecycle entry. It accepts only matching `PASS`, `VERIFIED`, and
 `READY_FOR_BOOT` evidence, then records one idempotent application receipt.
 Fresh install therefore does not require a resident Master to exist first.
 
-The Host can invoke a declared read-only Task Frame turn only after the Task
-Frame Runtime returns `WORKER_INVOCATION_READY`. Provider configuration never
-creates a Task Frame, authority, assignment, write scope, or source-mutation
-permission.
+The Host can invoke a declared Task Frame turn only after the Task Frame Runtime
+returns `WORKER_INVOCATION_READY`. The Project Master owns the instruction,
+authority, bounded mutation scope, and Task Frame lineage. A Worker attaches to
+that lineage; it does not obtain a separate approval or Work Receipt. Provider
+configuration never creates a Task Frame, authority, assignment, write scope,
+or source-mutation permission.
 
 Current providers are `GROK`, `CODEX`, and `CLAUDE`. Provider capability is
 Host-dependent. An unavailable CLI remains `UNAVAILABLE`; it is not replaced
 by a simulated Worker result.
 
-Every provider request requires `repository_write_scope: NONE` and an empty
-mutation scope. Source mutation stays on the attached Project's Execution
-Guard and receipt-aware mutation gateway path.
+Read-only provider requests require `repository_write_scope: NONE` and an empty
+mutation scope. A write-enabled turn receives only the exact `BOUNDED` scope
+already declared by the Master-owned Task Frame. Any one-time file permit is an
+internal Host gateway capability and is never handed to the Worker as authority
+or as a Worker receipt.
 
 `worker_run_ref` is a transient Host correlation key, not a receipt. A
-completed Worker envelope carries exactly one `result_receipt_ref`; the same
-reference may also appear in `evidence_refs`, but it is not a second receipt.
+completed Worker envelope carries exactly one `result_receipt_ref`; this is a
+result reference, not mutation authority or a Work Receipt. The same reference
+may also appear in `evidence_refs`, but it is not a second receipt.
 
 All product-owned external executables resolve through the local Host Profile.
 The active Profile path is selected by `AI_CAREER_HOST_PROFILE` and defaults to
@@ -75,8 +80,9 @@ the persistent native process opener for Grok ACP and Codex app-server JSON-RPC
 stdio sessions. Claude uses bounded print-mode JSON calls, resumes only the one
 target-scoped `session_id`, and transports prompt text through a temporary stdin
 file. Claude resident sessions expose only `Read`, `Glob`, and `Grep` under
-`--permission-mode plan` and no MCP configuration. Task Frame Claude calls also
-use `--tools ""` and `--no-session-persistence`. Exact argv boundaries,
+`--permission-mode plan` and no MCP configuration. Read-only Task Frame Claude
+calls expose the same three tools and use `--no-session-persistence`; they do
+not receive write tools or a Work Receipt. Exact argv boundaries,
 non-ASCII protocol text, structured results, and provider permission boundaries
 are covered by Runtime Host regression tests.
 

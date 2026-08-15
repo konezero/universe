@@ -37,6 +37,7 @@ PROVIDER_ALIASES = {
 }
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS = 90
+READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS = 240
 
 
 @dataclass(frozen=True)
@@ -356,7 +357,14 @@ class RuntimeWorkerDispatcher:
             "context_pack": request["context_pack"],
             "output_contract": request["output_contract"],
             "max_turns": request["max_turns"],
-            "response_timeout_seconds": self.worker_response_timeout_seconds,
+            "response_timeout_seconds": (
+                max(
+                    self.worker_response_timeout_seconds,
+                    READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS,
+                )
+                if request["repository_write_scope"] == "NONE"
+                else self.worker_response_timeout_seconds
+            ),
             "result_mode": request["result_mode"],
         }
 
@@ -867,10 +875,11 @@ class RuntimeWorkerDispatcher:
             )
 
         max_turns = raw.get("max_turns", 1)
+        max_turn_limit = 16 if repository_write_scope == "NONE" else 8
         if (
             not isinstance(max_turns, int)
             or isinstance(max_turns, bool)
-            or not 1 <= max_turns <= 8
+            or not 1 <= max_turns <= max_turn_limit
         ):
             raise WorkerDispatchError(
                 "WORKER_TRANSPORT_FAILED",
@@ -935,6 +944,10 @@ class RuntimeWorkerDispatcher:
         if not isinstance(validation, list) or not validation:
             invalid("WORKER_VALIDATION_REQUIRED")
         pass_seen = False
+        fail_seen = False
+        mutation_evidence_required = (
+            output_contract.get("mutation_evidence_required") is True
+        )
         for item in validation:
             if not isinstance(item, Mapping):
                 invalid("WORKER_VALIDATION_ENTRY_INVALID")
@@ -947,12 +960,15 @@ class RuntimeWorkerDispatcher:
                 item.get("evidence_refs"),
                 "WORKER_VALIDATION_EVIDENCE_REQUIRED",
             )
-            if state == "FAIL":
+            if state == "FAIL" and mutation_evidence_required:
                 invalid("WORKER_VALIDATION_FAILED")
             pass_seen = pass_seen or state == "PASS"
-        if not pass_seen:
+            fail_seen = fail_seen or state == "FAIL"
+        if mutation_evidence_required and not pass_seen:
             invalid("WORKER_VALIDATION_PASS_REQUIRED")
-        if output_contract.get("mutation_evidence_required") is True:
+        if not mutation_evidence_required and not (pass_seen or fail_seen):
+            invalid("WORKER_REVIEW_CONCLUSION_REQUIRED")
+        if mutation_evidence_required:
             evidence_refs(
                 result.get("mutation_evidence_refs"),
                 "WORKER_MUTATION_EVIDENCE_REQUIRED",
@@ -1155,6 +1171,7 @@ class RuntimeWorkerDispatcher:
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
                     ephemeral=True,
+                    allow_read_only_tools=True,
                     max_turns=int(request.get("max_turns", 8)),
                     response_timeout_seconds=float(
                         request["response_timeout_seconds"]

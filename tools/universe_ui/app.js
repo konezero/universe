@@ -31,6 +31,7 @@ const state = {
   memoryBatchRuns: [],
   memoryCandidates: [],
   memoryCandidateFilters: { stage: "", kind: "", state: "REVIEW_REQUIRED" },
+  workLoop: null,
   selectedNode: null,
   focusedNodeId: null,
   view: "universe",
@@ -3741,6 +3742,7 @@ async function selectProject(
     memoryBatchConfigResult,
     memoryBatchRunResult,
     memoryCandidateResult,
+    workLoopResult,
   ] = await Promise.all([
     project.projection_available === false
       ? Promise.resolve(null)
@@ -3794,6 +3796,9 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`
     ).catch(() => ({ candidates: [] })),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/work-loop`).catch(
+      () => ({ predictions: [], result_fanouts: [], document_automation: null })
+    ),
   ]);
   state.projection = projectionResult?.projection || null;
   if (state.projection) {
@@ -3828,6 +3833,7 @@ async function selectProject(
   state.memoryBatchConfigs = memoryBatchConfigResult.configs || [];
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
   state.memoryCandidates = memoryCandidateResult.candidates || [];
+  state.workLoop = workLoopResult || null;
   const goalPlanResult = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
   ).catch(() => ({ goals: [], unassigned_todos: [] }));
@@ -8189,6 +8195,151 @@ function selectGraphNode(event) {
   showInspectorTab("details");
 }
 
+async function refreshSelectedWorkLoop() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  state.workLoop = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop`
+  );
+  renderDetails();
+}
+
+async function generateWorkLoopPrediction() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/predictions`,
+    { method: "POST", body: {} }
+  );
+  await refreshSelectedWorkLoop();
+  toast(
+    result.status === "WORK_LOOP_PREDICTION_RECORDED"
+      ? "Prediction proposal recorded"
+      : "Prediction proposal already current"
+  );
+}
+
+async function reviewWorkLoopPrediction(proposalId, decision) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/predictions/review`,
+    { method: "POST", body: { proposal_id: proposalId, decision } }
+  );
+  await refreshSelectedWorkLoop();
+  toast(`Prediction ${decision === "KEEP" ? "kept" : "rejected"}`);
+}
+
+async function recoverWorkLoopTodos() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/recover`,
+    { method: "POST", body: {} }
+  );
+  await refresh();
+  if (state.selectedProject?.project_id === projectId) {
+    await selectProject(projectId, { revealInspector: true });
+  }
+  toast(`Recovered ${(result.recovered || []).length} interrupted Todo`);
+}
+
+function renderWorkLoopDetails() {
+  const workLoop = state.workLoop || {};
+  const predictions = workLoop.predictions || [];
+  const group = node("div", "detail-group");
+  const heading = node("div", "detail-heading-row");
+  heading.append(node("h3", "", `Work Loop (${predictions.length})`));
+  const actions = node("div", "detail-heading-actions");
+  const generate = node("button", "secondary-button compact-action", "Predict");
+  generate.type = "button";
+  generate.title = "Generate a review-only Goal / Plan / Milestone / risk proposal";
+  generate.addEventListener("click", () =>
+    generateWorkLoopPrediction().catch((error) => toast(error.message, true))
+  );
+  const recover = node("button", "secondary-button compact-action", "Recover");
+  recover.type = "button";
+  recover.title = "Return interrupted Todo work to READY when recovery evidence matches";
+  recover.addEventListener("click", () =>
+    recoverWorkLoopTodos().catch((error) => toast(error.message, true))
+  );
+  actions.append(generate, recover);
+  heading.append(actions);
+  group.append(heading);
+  group.append(
+    node(
+      "p",
+      "empty-copy",
+      "Predictions are evidence-backed proposals only. They never auto-adopt Goals or Todos."
+    )
+  );
+  if (!predictions.length) {
+    group.append(node("p", "empty-copy", "No prediction proposal yet."));
+  }
+  for (const prediction of predictions.slice(0, 5)) {
+    const card = node("div", "context-card");
+    card.append(
+      node(
+        "strong",
+        "",
+        `${prediction.review_state || "PROPOSAL_ONLY"} · ${prediction.proposal_id}`
+      )
+    );
+    const list = node("ul", "context-list");
+    for (const suggestion of (prediction.suggestions || []).slice(0, 8)) {
+      const provenance = (suggestion.provenance || [])
+        .map((item) => `${item.kind}:${item.ref}`)
+        .join(", ");
+      list.append(
+        node(
+          "li",
+          "",
+          `${suggestion.kind} · ${Math.round(Number(suggestion.confidence || 0) * 100)}% · ${suggestion.title}${provenance ? ` · ${provenance}` : ""}`
+        )
+      );
+    }
+    for (const rejected of (prediction.rejected || []).slice(0, 5)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `REJECTED · ${rejected.reason} · ${rejected.title || "No supported candidate"}`
+        )
+      );
+    }
+    card.append(list);
+    if ((prediction.review_state || "PROPOSAL_ONLY") === "PROPOSAL_ONLY") {
+      const reviewActions = node("div", "detail-heading-actions");
+      for (const decision of ["KEEP", "REJECT"]) {
+        const button = node(
+          "button",
+          "secondary-button compact-action",
+          decision === "KEEP" ? "Keep" : "Reject"
+        );
+        button.type = "button";
+        button.addEventListener("click", () =>
+          reviewWorkLoopPrediction(prediction.proposal_id, decision).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        reviewActions.append(button);
+      }
+      card.append(reviewActions);
+    }
+    group.append(card);
+  }
+  const fanoutCount = (workLoop.result_fanouts || []).length;
+  const documentCount = Number(workLoop.document_automation?.proposal_count || 0);
+  group.append(
+    node(
+      "p",
+      "empty-copy",
+      `Result fan-out ${fanoutCount} · Document proposals ${documentCount} · auto-apply off`
+    )
+  );
+  return group;
+}
+
 function renderDetails() {
   elements.details.replaceChildren();
   const selected = state.selectedNode;
@@ -8302,6 +8453,10 @@ function renderDetails() {
     todoGroup.append(list);
   }
   elements.details.append(todoGroup);
+
+  if (state.selectedProject) {
+    elements.details.append(renderWorkLoopDetails());
+  }
 
   if (state.selectedProject) {
     const handoffGroup = node("div", "detail-group");

@@ -43,6 +43,7 @@ from project_master_host import (  # noqa: E402
     ResidentRoomParticipantHostManager,
     _default_state_db,
     _project_master_system_prompt,
+    _task_frame_child_max_turns,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
@@ -3294,6 +3295,74 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertIsNone(frame["task_frame_execution_approval"])
 
+    def test_instruction_authorized_read_only_worker_inherits_master_frame(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        coordinator = ProjectModeCoordinator(self.root, "GCS", "codex:session-001")
+        binding = {
+            "endpoint": "http://127.0.0.1:41992",
+            "token": "test-token",
+            "session_id": "project-master-session-001",
+            "frame_id": "current",
+            "anchor_id": "MASTER-CURRENT-001",
+        }
+        posts: list[dict[str, Any]] = []
+
+        def post(_endpoint, _token, path, payload):
+            posts.append({"path": path, "payload": payload})
+            if path == "/v1/task-frame/create":
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TASK_TURNS_DECLARED"},
+            }
+
+        with patch.object(coordinator, "_ensure_runtime", return_value=binding), patch.object(
+            coordinator, "_post_runtime", side_effect=post
+        ), patch.object(
+            coordinator,
+            "_invoke",
+            return_value={
+                "execution_proposal": {
+                    "proposal_id": "task_frame_proposal_read_only_001",
+                    "plan_digest": "b" * 64,
+                }
+            },
+        ):
+            result = coordinator.create_instruction_authorized_task_frame(
+                proposal_reference={
+                    "proposal_id": "task_proposal_reference_only",
+                    "proposal_digest": "a" * 64,
+                    "request_ref": "universe://project-room/messages/review-001",
+                },
+                task_frame={
+                    "frame_id": "instruction-review-frame-001",
+                    "parent_actor_ref": "project-master:GCS",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "turns": [
+                        {
+                            "turn_id": "review",
+                            "role": "BOSS",
+                            "worker_slot_ref": "review-worker",
+                            "provider": "CLAUDE",
+                            "model": "opus",
+                            "reasoning_effort": "high",
+                        }
+                    ],
+                    "instruction_id": "review-001",
+                    "instruction_text": "Review the Master Task Frame read-only.",
+                    "constraints": ["NO_MUTATION"],
+                    "expected_output": {"result": "findings"},
+                },
+            )
+
+        self.assertEqual("INSTRUCTION_TASK_FRAME_READY", result["status"])
+        frame = posts[0]["payload"]["frame"]
+        self.assertEqual("NONE", frame["parent_instruction"]["repository_write_scope"])
+        self.assertEqual({"operations": [], "targets": []}, frame["parent_instruction"]["mutation_scope"])
+        self.assertNotIn("work_receipt", frame)
+
     def test_approved_descendant_runs_boss_then_declared_child_turns(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
@@ -3494,6 +3563,39 @@ class ProjectMasterHostTests(unittest.TestCase):
             "DESCENDANT_TASK_FRAME_REVIEWER_MUTATION_SCOPE_FORBIDDEN",
             str(reviewer.exception),
         )
+
+    def test_read_only_reviewer_inherits_master_frame_without_work_receipt(self) -> None:
+        turns = [
+            {"turn_id": "boss", "role": "BOSS", "worker_slot_ref": "boss-worker"},
+            {
+                "turn_id": "review",
+                "role": "SUB_REVIEWER",
+                "worker_slot_ref": "independent-reviewer",
+            },
+        ]
+        allocation = {
+            "turn_id": "review",
+            "worker_slot_ref": "independent-reviewer",
+            "worker_path": "/root/boss/review",
+            "task": "Review without mutation.",
+            "expected_output": {"result": "review"},
+            "mutation_scope": {"operations": [], "targets": []},
+            "skill_bindings": [],
+        }
+
+        canonical = ProjectModeCoordinator._canonical_boss_allocations(
+            [allocation],
+            turns=turns,
+            parent_mutation_scope={"operations": [], "targets": []},
+        )
+
+        self.assertEqual([allocation], canonical)
+        self.assertNotIn("work_receipt", canonical[0])
+        self.assertEqual([], canonical[0]["mutation_scope"]["operations"])
+
+    def test_read_only_worker_gets_review_budget_without_write_authority(self) -> None:
+        self.assertEqual(16, _task_frame_child_max_turns(write_enabled=False))
+        self.assertEqual(1, _task_frame_child_max_turns(write_enabled=True))
 
     def test_boss_allocation_contract_binds_exact_declared_identities(self) -> None:
         turns = [

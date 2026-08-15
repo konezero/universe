@@ -134,7 +134,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertEqual("UNKNOWN", result["provider_durable_chat_state"])
 
     def test_claude_task_frame_disables_session_persistence(self) -> None:
-        observed: list[tuple[bool, int, float, str, object]] = []
+        observed: list[tuple[bool, bool, int, float, str, object]] = []
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -144,10 +144,17 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
 
         class FakeClaudeSession:
             def __init__(
-                self, *, ephemeral, max_turns, response_timeout_seconds, model, json_schema, **_kwargs
+                self, *, ephemeral, allow_read_only_tools, max_turns, response_timeout_seconds, model, json_schema, **_kwargs
             ) -> None:
                 observed.append(
-                    (ephemeral, max_turns, response_timeout_seconds, model, json_schema)
+                    (
+                        ephemeral,
+                        allow_read_only_tools,
+                        max_turns,
+                        response_timeout_seconds,
+                        model,
+                        json_schema,
+                    )
                 )
                 self.session_ref = "claude-code:ephemeral-1"
 
@@ -175,7 +182,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual([(True, 5, 90.0, "test-model", schema)], observed)
+        self.assertEqual([(True, True, 5, 90.0, "test-model", schema)], observed)
         self.assertEqual("CLAUDE_CODE_CLI_ADAPTER", result["runtime_provider"])
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
@@ -218,6 +225,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
 
     def test_dispatch_claims_before_starting_provider(self) -> None:
         events: list[str] = []
+        observed_timeouts: list[float] = []
 
         def post(_endpoint, _token, path, payload):
             if path == "/v1/task-frame/worker-result":
@@ -262,6 +270,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             def _invoke_provider(self, _provider, request):
                 self.assert_claimed(request)
                 events.append("provider")
+                observed_timeouts.append(request["response_timeout_seconds"])
                 return {
                     "status": "COMPLETED",
                     "worker_id": "provider-worker-1",
@@ -285,6 +294,62 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         )
         self.assertTrue(result["worker_id"].startswith("universe-runtime-worker:"))
         self.assertEqual("provider-worker-1", result["provider_worker_ref"])
+        self.assertEqual([240], observed_timeouts)
+
+    def test_read_only_worker_allows_extended_review_turn_budget(self) -> None:
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        normalized = dispatcher._normalize_request(
+            {**self._dispatch_request(), "max_turns": 16}
+        )
+        self.assertEqual(16, normalized["max_turns"])
+
+        target = str(self.root / "tools" / "app.py")
+        with self.assertRaises(WorkerDispatchError) as captured:
+            dispatcher._normalize_request(
+                {
+                    **self._dispatch_request(),
+                    "repository_write_scope": "BOUNDED",
+                    "mutation_scope": {
+                        "operations": ["MODIFY"],
+                        "targets": [target],
+                    },
+                    "max_turns": 16,
+                }
+            )
+        self.assertEqual("WORKER_TRANSPORT_FAILED", captured.exception.code)
+        self.assertEqual("MAX_TURNS_INVALID", captured.exception.reason)
+
+    def test_read_only_review_records_fail_conclusion_without_mutation_receipt(self) -> None:
+        result = {
+            "outcome": "SUCCEEDED",
+            "summary": "A correctness defect was found.",
+            "evidence_refs": ["source://reviewed-file"],
+            "validation": [
+                {
+                    "plane": "independent-review",
+                    "state": "FAIL",
+                    "evidence_refs": ["source://reviewed-file:42"],
+                }
+            ],
+        }
+        RuntimeWorkerDispatcher._validate_structured_result(
+            result,
+            {
+                "schema": "universe.task-frame-child-result.v1",
+                "mutation_evidence_required": False,
+            },
+        )
+
+        with self.assertRaises(WorkerDispatchError) as captured:
+            RuntimeWorkerDispatcher._validate_structured_result(
+                {**result, "mutation_evidence_refs": ["mutation://receipt"]},
+                {
+                    "schema": "universe.task-frame-child-result.v1",
+                    "mutation_evidence_required": True,
+                },
+            )
+        self.assertEqual("WORKER_STRUCTURED_RESULT_INVALID", captured.exception.code)
+        self.assertEqual("WORKER_VALIDATION_FAILED", captured.exception.reason)
 
     def test_dispatch_forwards_validated_bounded_mutation_scope(self) -> None:
         observed_scope: dict[str, object] = {}
@@ -331,6 +396,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
                 observed_scope.update(
                     repository_write_scope=request["repository_write_scope"],
                     mutation_scope=request["mutation_scope"],
+                    response_timeout_seconds=request["response_timeout_seconds"],
                 )
                 return {
                     "status": "COMPLETED",
@@ -368,6 +434,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             {"operations": ["MODIFY"], "targets": [target]},
             observed_scope["mutation_scope"],
         )
+        self.assertEqual(90, observed_scope["response_timeout_seconds"])
         self.assertEqual("TASK_FRAME_RESULT_RECORDED", result["status"])
 
     def test_structured_refusal_recovers_claim_before_result_submission(self) -> None:

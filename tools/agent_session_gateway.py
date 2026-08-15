@@ -1503,6 +1503,7 @@ class ClaudeCodeSession:
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
+        allow_read_only_tools: bool = False,
         max_turns: int = 8,
         response_timeout_seconds: float = 300,
         json_schema: Mapping[str, Any] | None = None,
@@ -1523,6 +1524,7 @@ class ClaudeCodeSession:
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
+        self.allow_read_only_tools = bool(allow_read_only_tools)
         self.max_turns = max(1, int(max_turns))
         self.response_timeout_seconds = _positive_timeout_seconds(
             response_timeout_seconds, "CLAUDE_RESPONSE_TIMEOUT_INVALID"
@@ -1554,7 +1556,11 @@ class ClaudeCodeSession:
             str(self.max_turns),
             "--strict-mcp-config",
             "--tools",
-            "" if self.ephemeral else ",".join(CLAUDE_READ_ONLY_TOOLS),
+            (
+                ",".join(CLAUDE_READ_ONLY_TOOLS)
+                if self.allow_read_only_tools or not self.ephemeral
+                else ""
+            ),
         ]
         if self.ephemeral:
             arguments.append("--no-session-persistence")

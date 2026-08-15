@@ -7935,6 +7935,261 @@ class UniverseLocalServiceTests(unittest.TestCase):
             [item["queue_id"]], [entry["queue_id"] for entry in queue["items"]]
         )
 
+    def test_work_loop_predictions_are_reviewable_and_never_auto_adopted(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, empty = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/predictions",
+            {},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual([], empty["prediction"]["suggestions"])
+        self.assertEqual("UNSUPPORTED", empty["prediction"]["rejected"][0]["reason"])
+
+        self.request(
+            "POST",
+            "/v1/projects/GCS/goals",
+            {
+                "title": "Ship the operator spine",
+                "description": "",
+                "owner": "Project Master",
+                "state": "DESIGNING",
+                "sort_order": 0,
+            },
+            self.token,
+        )
+        self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Ship the operator spine",
+                "detail": "",
+                "priority": "P1",
+                "state": "DONE",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+            self.token,
+        )
+        self.request(
+            "POST",
+            "/v1/projects/GCS/memories",
+            {
+                "title": "Ship the operator spine",
+                "body": "Keep the operator spine reviewable.",
+                "state": "OBSERVED",
+            },
+            self.token,
+        )
+        first = self.skill_observation_candidate()
+        self.request(
+            "POST", "/v1/projects/GCS/skill-observations", first, self.token
+        )
+        observation = self.server.store.list_skill_observations("GCS")[0]
+        self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {
+                "title": "Ship the operator spine",
+                "observation_ids": [observation["observation_id"]],
+            },
+            self.token,
+        )
+
+        status, predicted = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/predictions",
+            {},
+            self.token,
+        )
+        self.assertIn(status, {200, 201})
+        prediction = predicted["prediction"]
+        self.assertTrue(prediction["suggestions"])
+        self.assertFalse(prediction["adoption_policy"]["auto_adopt"])
+        self.assertEqual("PROPOSAL_ONLY", prediction["review_state"])
+        goals_before = self.request("GET", "/v1/projects/GCS/goals", token=self.token)[1]
+
+        status, reviewed = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/predictions/review",
+            {"proposal_id": prediction["proposal_id"], "decision": "KEEP"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("KEPT", reviewed["prediction"]["review_state"])
+        self.assertFalse(reviewed["prediction"]["goal_created"])
+        self.assertFalse(reviewed["prediction"]["todo_created"])
+        goals_after = self.request("GET", "/v1/projects/GCS/goals", token=self.token)[1]
+        self.assertEqual(
+            [item["goal_id"] for item in goals_before["goals"]],
+            [item["goal_id"] for item in goals_after["goals"]],
+        )
+        status, conflict = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/predictions/review",
+            {"proposal_id": prediction["proposal_id"], "decision": "REJECT"},
+            self.token,
+        )
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "WORK_LOOP_PREDICTION_REVIEW_CONFLICT", conflict["error_code"]
+        )
+
+        failed = json.loads(json.dumps(self.skill_observation_candidate()))
+        failed["candidate_id"] = "skill-observation-gcs-fail"
+        failed["candidate"]["observations"][0]["observation_digest"] = "e" * 64
+        failed["candidate"]["observations"][0]["outcome"] = "FAILED"
+        failed["candidate"]["observations"][0]["validation_state"] = "FAIL"
+        failed["candidate"]["observations"][0]["evidence_refs"] = [
+            "receipt://gcs/fail-001"
+        ]
+        status, failed_obs = self.request(
+            "POST", "/v1/projects/GCS/skill-observations", failed, self.token
+        )
+        self.assertEqual(201, status)
+        fail_id = failed_obs["observations"][0]["observation_id"]
+        self.request(
+            "POST",
+            "/v1/projects/GCS/experience-cases",
+            {
+                "title": "source review operator spine",
+                "observation_ids": [fail_id],
+            },
+            self.token,
+        )
+        status, risked = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/predictions",
+            {},
+            self.token,
+        )
+        self.assertIn(status, {200, 201})
+        risk_titles = [
+            item["title"]
+            for item in risked["prediction"]["suggestions"]
+            if item["kind"] == "RISK"
+        ]
+        self.assertTrue(risk_titles)
+
+    def test_work_loop_recovers_interrupted_todos_and_fans_out_results(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        _, unlinked = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Legitimate in-flight work",
+                "detail": "",
+                "priority": "P1",
+                "state": "IN_PROGRESS",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+            self.token,
+        )
+        _, todo_result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Recover interrupted work",
+                "detail": "",
+                "priority": "P1",
+                "state": "IN_PROGRESS",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+            self.token,
+        )
+        todo_id = todo_result["todo"]["todo_id"]
+        self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "QUESTION",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "do the work",
+                "todo_id": todo_id,
+                "idempotency_key": "recover-todo-001",
+            },
+            delivery_state="FAILED",
+        )
+        status, recovered = self.request(
+            "POST",
+            "/v1/projects/GCS/work-loop/recover",
+            {},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("WORK_LOOP_TODOS_RECOVERED", recovered["status"])
+        self.assertEqual([todo_id], [item["todo_id"] for item in recovered["recovered"]])
+        refreshed = self.server.store.get_todo(todo_id)
+        self.assertEqual("READY", refreshed["state"])
+        self.assertEqual(
+            "IN_PROGRESS", self.server.store.get_todo(unlinked["todo"]["todo_id"])["state"]
+        )
+
+        _, done = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Completed fan-out",
+                "detail": "",
+                "priority": "P2",
+                "state": "IN_PROGRESS",
+                "source_kind": "USER",
+                "sort_order": 1,
+            },
+            self.token,
+        )
+        done_id = done["todo"]["todo_id"]
+        message, _ = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "QUESTION",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "finish it",
+                "todo_id": done_id,
+                "idempotency_key": "fanout-todo-001",
+            },
+        )
+        transition = self.server.store.apply_master_message_todo_transition(
+            "GCS",
+            message["message_id"],
+            outcome="COMPLETED",
+        )
+        self.assertEqual("TODO_TRANSITION_APPLIED", transition["status"])
+        self.assertEqual("DONE", transition["state"])
+        self.assertFalse(transition["result_fanout"]["auto_adopted"])
+        repeated_transition = self.server.store.apply_master_message_todo_transition(
+            "GCS",
+            message["message_id"],
+            outcome="COMPLETED",
+        )
+        self.assertEqual("TODO_TRANSITION_NOT_REQUIRED", repeated_transition["status"])
+        repeated_fanout = self.server.store.record_todo_result_fanout(
+            "GCS", done_id, "COMPLETED", "DONE"
+        )
+        self.assertEqual(
+            "WORK_LOOP_RESULT_FANOUT_ALREADY_RECORDED", repeated_fanout["status"]
+        )
+        self.assertEqual(
+            transition["result_fanout"]["fanout_id"], repeated_fanout["fanout_id"]
+        )
+        snapshot = self.request(
+            "GET", "/v1/projects/GCS/work-loop", token=self.token
+        )[1]
+        self.assertEqual("WORK_LOOP_COLLECTED", snapshot["status"])
+        self.assertTrue(snapshot["result_fanouts"])
+        self.assertEqual(1, len(snapshot["result_fanouts"]))
+        self.assertFalse(snapshot["adoption_policy"]["auto_adopt"])
+
     def test_context_pack_skill_plan_and_adoption_remain_non_executing(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         before = {

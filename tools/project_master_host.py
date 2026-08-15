@@ -87,10 +87,20 @@ TASK_FRAME_PROFILE_RELATIVE_PATH = Path(
 TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-instruction-v2.json"
 )
+WRITE_ENABLED_WORKER_MAX_TURNS = 1
+READ_ONLY_WORKER_MAX_TURNS = 16
 
 
 class ProjectMasterHostError(RuntimeError):
     pass
+
+
+def _task_frame_child_max_turns(*, write_enabled: bool) -> int:
+    return (
+        WRITE_ENABLED_WORKER_MAX_TURNS
+        if write_enabled
+        else READ_ONLY_WORKER_MAX_TURNS
+    )
 
 
 _WindowsKillOnCloseJob = WindowsKillOnCloseJob
@@ -755,6 +765,9 @@ class ProjectModeCoordinator:
                 "write_operations": ["CREATE", "MODIFY"],
             },
         )
+        repository_write_scope = (
+            "BOUNDED" if normalized_frame["mutation_scope"]["operations"] else "NONE"
+        )
         binding = self._ensure_runtime()
         origin_session_anchor_ref = self._origin_session_anchor_ref(binding)
         instruction_assignment_ref = "instruction:" + normalized_frame["instruction_id"]
@@ -779,7 +792,7 @@ class ProjectModeCoordinator:
             "commander_surface": "UNIVERSE_UI",
             "execution_assignment_ref": instruction_assignment_ref,
             "host_worker_capability": "AVAILABLE",
-            "repository_write_scope": "BOUNDED",
+            "repository_write_scope": repository_write_scope,
             "mutation_scope": normalized_frame["mutation_scope"],
             "fallback_reason": "NONE",
             "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
@@ -825,7 +838,7 @@ class ProjectModeCoordinator:
                         "user_instruction_raw": normalized_frame["instruction_text"],
                         "constraints": normalized_frame["constraints"],
                         "expected_output": normalized_frame["expected_output"],
-                        "repository_write_scope": "BOUNDED",
+                        "repository_write_scope": repository_write_scope,
                         "mutation_scope": normalized_frame["mutation_scope"],
                     },
                     "parent_observation": {
@@ -1082,7 +1095,9 @@ class ProjectModeCoordinator:
                     "output_contract": self._child_result_output_contract(
                         mutation_evidence_required=write_enabled
                     ),
-                    "max_turns": 1,
+                    "max_turns": _task_frame_child_max_turns(
+                        write_enabled=write_enabled
+                    ),
                     "result_mode": "STRUCTURED_JSON",
                 }
                 try:
@@ -1175,7 +1190,7 @@ class ProjectModeCoordinator:
             _text(value, "execution_plan.mutation_scope.targets")
             for value in parent_targets
         }
-        if not normalized_parent_operations or not normalized_parent_targets:
+        if bool(normalized_parent_operations) != bool(normalized_parent_targets):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
 
         if not isinstance(raw_allocations, list):
@@ -1647,8 +1662,7 @@ class ProjectModeCoordinator:
             for item in operations_value
         ]
         if (
-            not operations
-            or len(set(operations)) != len(operations)
+            len(set(operations)) != len(operations)
             or not set(operations).issubset(set(source_work["write_operations"]))
         ):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
@@ -1664,7 +1678,7 @@ class ProjectModeCoordinator:
             if target_text in normalized_targets:
                 raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
             normalized_targets.append(target_text)
-        if not normalized_targets:
+        if bool(operations) != bool(normalized_targets):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
         turns = task_frame.get("turns")
         if (

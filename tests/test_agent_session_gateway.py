@@ -369,6 +369,40 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("", arguments[arguments.index("--tools") + 1])
         self.assertEqual([], sessions)
 
+    def test_claude_ephemeral_review_can_enable_read_only_tools(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            return NativeCliResult(
+                contract="test",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps({"result": "Reviewed", "is_error": False}),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="Review",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            allow_read_only_tools=True,
+            native_runner=runner,
+        )
+        session.prompt("Review", lambda _delta: None)
+
+        arguments = requests[0].arguments
+        self.assertIn("--no-session-persistence", arguments)
+        self.assertEqual("Read,Glob,Grep", arguments[arguments.index("--tools") + 1])
+
     def test_claude_structured_session_binds_schema_and_uses_structured_output(
         self,
     ) -> None:

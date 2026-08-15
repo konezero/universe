@@ -224,6 +224,12 @@ from universe_app.provider_session_service import (
     ProviderSessionError,
     ProviderSessionService,
 )
+from universe_app.work_loop_prediction import (
+    WORK_LOOP_PREDICTION_SCHEMA,
+    WORK_LOOP_RESULT_FANOUT_SCHEMA,
+    build_result_fanout,
+    build_work_loop_predictions,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 _AMBIENT_BROWSER_CONTEXT_RE = re.compile(
@@ -295,6 +301,7 @@ PROJECT_RELEASE_ROOM_COMMAND_PATTERN = re.compile(
 )
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
 ACTIVE_WORK_REFERENCE_SCHEMA = "universe.active-work-reference.v1"
+WORK_LOOP_PREDICTION_REVIEW_STATES = frozenset({"PROPOSAL_ONLY", "KEPT", "REJECTED"})
 DIRECT_COMMANDER_ACCESS_SURFACES = frozenset(
     {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}
 )
@@ -4698,6 +4705,40 @@ class UniverseStore:
                     proposal_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS work_loop_prediction (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    proposal_json TEXT NOT NULL,
+                    review_state TEXT NOT NULL
+                        CHECK(review_state IN ('PROPOSAL_ONLY', 'KEPT', 'REJECTED')),
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    UNIQUE(project_id, proposal_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_loop_prediction_project_time
+                ON work_loop_prediction(project_id, created_at, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS work_loop_result_fanout (
+                    fanout_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    fanout_digest TEXT NOT NULL UNIQUE,
+                    fanout_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_kind, source_id, outcome)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_loop_result_fanout_project_time
+                ON work_loop_result_fanout(project_id, created_at, fanout_id);
 
                 CREATE TABLE IF NOT EXISTS project_dispatch (
                     dispatch_id TEXT PRIMARY KEY,
@@ -12349,6 +12390,12 @@ class UniverseStore:
                 },
             },
         )
+        fanout = self.record_todo_result_fanout(
+            normalized_project,
+            todo_id,
+            normalized_outcome,
+            desired_state,
+        )
         return {
             "status": "TODO_TRANSITION_APPLIED",
             "project_id": normalized_project,
@@ -12357,6 +12404,335 @@ class UniverseStore:
             "state": desired_state,
             "outcome": normalized_outcome,
             "event_id": event["event_id"],
+            "result_fanout": fanout,
+        }
+
+    def record_todo_result_fanout(
+        self,
+        project_id: str,
+        todo_id: str,
+        outcome: str,
+        state: str,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        material = build_result_fanout(
+            project_id=project["project_id"],
+            source_kind="TODO",
+            source_id=todo_id,
+            outcome=outcome,
+            state=state,
+        )
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT fanout_json, created_at
+                FROM work_loop_result_fanout
+                WHERE project_id = ? AND source_kind = 'TODO'
+                  AND source_id = ? AND outcome = ?
+                """,
+                (project["project_id"], todo_id, outcome),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["fanout_json"])
+                stored["created_at"] = existing["created_at"]
+                stored["status"] = "WORK_LOOP_RESULT_FANOUT_ALREADY_RECORDED"
+                return stored
+            connection.execute(
+                """
+                INSERT INTO work_loop_result_fanout(
+                    fanout_id, project_id, source_kind, source_id, outcome,
+                    fanout_digest, fanout_json, created_at
+                ) VALUES (?, ?, 'TODO', ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["fanout_id"],
+                    project["project_id"],
+                    todo_id,
+                    outcome,
+                    material["fanout_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["created_at"] = now
+        material["status"] = "WORK_LOOP_RESULT_FANOUT_RECORDED"
+        return material
+
+    def list_work_loop_result_fanouts(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT fanout_json, created_at
+                FROM work_loop_result_fanout
+                WHERE project_id = ?
+                ORDER BY created_at DESC, fanout_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = json.loads(row["fanout_json"])
+            item["created_at"] = row["created_at"]
+            items.append(item)
+        return items
+
+    def recover_interrupted_work_loop_todos(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        recovered: list[dict[str, Any]] = []
+        with self._connection() as connection:
+            todos = connection.execute(
+                """
+                SELECT todo_id, state, revision
+                FROM project_todo
+                WHERE project_id = ? AND state = 'IN_PROGRESS'
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            messages = connection.execute(
+                """
+                SELECT message_id, message_json, delivery_state
+                FROM project_room_message
+                WHERE project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            linked: dict[str, list[sqlite3.Row]] = {}
+            for message in messages:
+                payload = json.loads(message["message_json"])
+                todo_id = payload.get("todo_id")
+                if isinstance(todo_id, str) and todo_id:
+                    linked.setdefault(todo_id, []).append(message)
+            now = utc_now()
+            for todo in todos:
+                rows = linked.get(todo["todo_id"], [])
+                failed = any(
+                    str(row["delivery_state"] or "").upper() == "FAILED" for row in rows
+                )
+                if not failed:
+                    continue
+                cursor = connection.execute(
+                    """
+                    UPDATE project_todo
+                    SET state = 'READY', revision = revision + 1, updated_at = ?
+                    WHERE todo_id = ? AND revision = ? AND state = 'IN_PROGRESS'
+                    """,
+                    (now, todo["todo_id"], todo["revision"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                recovered.append(
+                    {
+                        "todo_id": todo["todo_id"],
+                        "previous_state": "IN_PROGRESS",
+                        "state": "READY",
+                        "reason": "LINKED_MESSAGE_FAILED",
+                    }
+                )
+        if recovered:
+            self.append_event(
+                project["project_id"],
+                {
+                    "event_id": "todo-recover-"
+                    + _json_sha256(
+                        {
+                            "project_id": project["project_id"],
+                            "todo_ids": [item["todo_id"] for item in recovered],
+                        }
+                    )[:24],
+                    "event_type": "TODO_RESTART_RECOVERED",
+                    "payload": {"recovered": recovered},
+                },
+            )
+        return {
+            "status": "WORK_LOOP_TODOS_RECOVERED",
+            "project_id": project["project_id"],
+            "recovered": recovered,
+            "task_frame_created": False,
+            "execution_assignment_created": False,
+        }
+
+    def propose_work_loop_predictions(self, project_id: str) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            seed = self.get_project_seed(project["project_id"])
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            seed = None
+        bundle = {
+            "project_id": project["project_id"],
+            "seed": seed,
+            "experience_cases": self.list_experience_cases(project["project_id"], limit=200),
+            "bench_observations": self.list_skill_observations(
+                project["project_id"], limit=200
+            ),
+            "todos": [
+                todo
+                for todo in self.list_todos()
+                if todo.get("project_id") == project["project_id"]
+            ],
+            "memories": self.list_project_memories(project["project_id"], limit=200),
+        }
+        material = build_work_loop_predictions(bundle)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT proposal_json, review_state, created_at, reviewed_at
+                FROM work_loop_prediction
+                WHERE project_id = ? AND proposal_digest = ?
+                """,
+                (project["project_id"], material["proposal_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["proposal_json"])
+                stored["review_state"] = existing["review_state"]
+                stored["created_at"] = existing["created_at"]
+                stored["reviewed_at"] = existing["reviewed_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO work_loop_prediction(
+                    proposal_id, project_id, proposal_digest, proposal_json,
+                    review_state, created_at, reviewed_at
+                ) VALUES (?, ?, ?, ?, 'PROPOSAL_ONLY', ?, NULL)
+                """,
+                (
+                    material["proposal_id"],
+                    project["project_id"],
+                    material["proposal_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["review_state"] = "PROPOSAL_ONLY"
+        material["created_at"] = now
+        material["reviewed_at"] = None
+        return material, True
+
+    def list_work_loop_predictions(
+        self, project_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, review_state, created_at, reviewed_at
+                FROM work_loop_prediction
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 200))),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = json.loads(row["proposal_json"])
+            item["review_state"] = row["review_state"]
+            item["created_at"] = row["created_at"]
+            item["reviewed_at"] = row["reviewed_at"]
+            items.append(item)
+        return items
+
+    def review_work_loop_prediction(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = _exact_object_fields(
+            value,
+            field="work_loop_prediction_review",
+            required=frozenset({"proposal_id", "decision"}),
+        )
+        proposal_id = _identifier(request["proposal_id"], "proposal_id")
+        decision = _identifier(request["decision"], "decision").upper()
+        if decision not in {"KEEP", "REJECT"}:
+            raise UniverseError(
+                "WORK_LOOP_PREDICTION_DECISION_INVALID",
+                "decision must be KEEP or REJECT",
+                HTTPStatus.CONFLICT,
+            )
+        next_state = "KEPT" if decision == "KEEP" else "REJECTED"
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json, review_state, created_at, reviewed_at
+                FROM work_loop_prediction
+                WHERE project_id = ? AND proposal_id = ?
+                """,
+                (project["project_id"], proposal_id),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "WORK_LOOP_PREDICTION_NOT_FOUND",
+                    "work-loop prediction does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["review_state"] == next_state:
+                stored = json.loads(row["proposal_json"])
+                stored["review_state"] = row["review_state"]
+                stored["created_at"] = row["created_at"]
+                stored["reviewed_at"] = row["reviewed_at"]
+                stored["goal_created"] = False
+                stored["todo_created"] = False
+                return stored, False
+            if row["review_state"] != "PROPOSAL_ONLY":
+                raise UniverseError(
+                    "WORK_LOOP_PREDICTION_REVIEW_CONFLICT",
+                    "prediction already has another review decision",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                UPDATE work_loop_prediction
+                SET review_state = ?, reviewed_at = ?
+                WHERE project_id = ? AND proposal_id = ? AND review_state = 'PROPOSAL_ONLY'
+                """,
+                (next_state, now, project["project_id"], proposal_id),
+            )
+        stored = json.loads(row["proposal_json"])
+        stored["review_state"] = next_state
+        stored["created_at"] = row["created_at"]
+        stored["reviewed_at"] = now
+        stored["goal_created"] = False
+        stored["todo_created"] = False
+        stored["schema"] = WORK_LOOP_PREDICTION_SCHEMA
+        return stored, True
+
+    def work_loop_snapshot(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        predictions = self.list_work_loop_predictions(project["project_id"])
+        with self._connection() as connection:
+            document_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM document_incorporation_proposal
+                WHERE project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchone()["count"]
+        return {
+            "schema": "universe.work-loop-snapshot.v1",
+            "status": "WORK_LOOP_COLLECTED",
+            "project_id": project["project_id"],
+            "predictions": predictions,
+            "result_fanouts": self.list_work_loop_result_fanouts(project["project_id"]),
+            "document_automation": {
+                "proposal_count": int(document_count),
+                "auto_applied": False,
+            },
+            "adoption_policy": {
+                "auto_adopt": False,
+                "creates_goal": False,
+                "creates_todo": False,
+            },
+            "task_frame_created": False,
+            "execution_assignment_created": False,
         }
 
     def append_master_bridge_reply(
@@ -22525,6 +22901,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/work-loop":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **self.server.store.work_loop_snapshot(project_id),
+                    },
+                )
+                return
+            if suffix == "/work-loop/predictions":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "WORK_LOOP_PREDICTIONS_COLLECTED",
+                        "project_id": project_id,
+                        "predictions": self.server.store.list_work_loop_predictions(
+                            project_id
+                        ),
+                    },
+                )
+                return
             if suffix == "/experience-pattern-proposals":
                 self._send(
                     HTTPStatus.OK,
@@ -24635,6 +25033,51 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/work-loop/predictions":
+                proposal, created = self.server.store.propose_work_loop_predictions(
+                    parts[0]
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "WORK_LOOP_PREDICTION_RECORDED"
+                            if created
+                            else "WORK_LOOP_PREDICTION_ALREADY_RECORDED"
+                        ),
+                        "prediction": proposal,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/work-loop/predictions/review":
+                prediction, changed = self.server.store.review_work_loop_prediction(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "WORK_LOOP_PREDICTION_REVIEW_RECORDED"
+                            if changed
+                            else "WORK_LOOP_PREDICTION_REVIEW_ALREADY_RECORDED"
+                        ),
+                        "prediction": prediction,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/work-loop/recover":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **self.server.store.recover_interrupted_work_loop_todos(
+                            parts[0]
+                        ),
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/memories":
                 memory = self.server.store.create_project_memory(parts[0], body)
                 self._send(
@@ -25203,6 +25646,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-handoffs",
             "/experience-cases/from-observations",
             "/experience-cases",
+            "/work-loop/predictions/review",
+            "/work-loop/predictions",
+            "/work-loop/recover",
+            "/work-loop",
             "/experience-matches",
             "/experience-patterns/auto",
             "/experience-pattern-proposals",
