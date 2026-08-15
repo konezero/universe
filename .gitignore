@@ -11,3 +11,7 @@ projects/*/.universe/
 
 dist/portable/
 
+# Generated Release DB import artifacts.
+dist/releases/*.sqlite3
+dist/releases/*.manifest.json
+
