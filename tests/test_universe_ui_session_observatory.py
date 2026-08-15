@@ -66,6 +66,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("node-mode-item", CSS)
         self.assertIn(".node-mode-node", CSS)
         self.assertIn('data-active="false"', CSS)
+        self.assertNotIn(
+            ".filter((project) => !isProjectContainer(project))",
+            APP[APP.index("function nodeModeCoordinates") : APP.index("function nodeModeStatusLabel")],
+        )
+        self.assertIn("function renderNodeModeGroup", APP)
+        self.assertIn("node-mode-group-nested", APP)
+        self.assertIn("childrenByParent.get(group.nodeId)", APP)
+        self.assertIn(".node-mode-group-nested", CSS)
 
     def test_mode_click_expands_persistent_session_cards_without_auto_routing(self) -> None:
         self.assertIn("selectedModeCoordinateKey: null", APP)
@@ -124,6 +132,46 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn(
             'project_root: String(form.get("project_root") || "").trim()', APP
         )
+
+    def test_release_import_uses_native_file_pickers(self) -> None:
+        release_dialog = HTML[HTML.index('id="release-dialog"') :]
+        self.assertIn('id="release-database-browse"', release_dialog)
+        self.assertIn('id="release-manifest-browse"', release_dialog)
+        self.assertIn('class="host-path-picker"', release_dialog)
+        self.assertIn('api("/v1/host/select-file"', APP)
+        self.assertIn('"RELEASE_DATABASE"', APP)
+        self.assertIn('"RELEASE_MANIFEST"', APP)
+        self.assertIn(".host-path-picker", CSS)
+
+    def test_release_proposal_renders_current_lifecycle_plan_shape(self) -> None:
+        start = APP.index("function showReleaseProposal(proposal)")
+        end = APP.index("async function proposeProjectRelease", start)
+        renderer = APP[start:end]
+        self.assertIn("Array.isArray(plan.actions)", renderer)
+        self.assertIn("Array.isArray(plan.collisions)", renderer)
+        self.assertIn("plan.installed_runtime?.state", renderer)
+        self.assertIn("plan.project_host_preflight", renderer)
+        self.assertNotIn("for (const action of proposal.plan.actions)", renderer)
+
+    def test_release_catalog_selects_target_and_exposes_apply(self) -> None:
+        release_dialog = HTML[HTML.index('id="release-dialog"') :]
+        self.assertIn('id="release-target-project"', release_dialog)
+        catalog_start = APP.index("function renderReleaseCatalog()")
+        catalog_end = APP.index("function showReleaseProposal", catalog_start)
+        catalog = APP[catalog_start:catalog_end]
+        self.assertIn("state.selectedReleaseTargetProjectId", catalog)
+        self.assertIn("visibleProjects()", catalog)
+        self.assertIn("project.project_root", catalog)
+        self.assertNotIn("action.disabled = !state.selectedProject", catalog)
+        self.assertNotIn("state.selectedProject?.project_id", catalog)
+        proposal_start = APP.index("function showReleaseProposal(proposal)")
+        proposal_end = APP.index("async function proposeProjectRelease", proposal_start)
+        proposal_renderer = APP[proposal_start:proposal_end]
+        self.assertIn("applyProjectRelease(proposal, applyButton)", proposal_renderer)
+        self.assertIn("async function applyProjectRelease", APP)
+        self.assertIn("/release-proposals/apply`,", APP)
+        self.assertIn('approval: "APPROVED"', APP)
+        self.assertIn("proposal.release_database_sha256", APP)
 
     def test_right_chat_dock_and_sliding_inspector_contract(self) -> None:
         self.assertIn('class="conductor-panel glass-panel"', HTML)

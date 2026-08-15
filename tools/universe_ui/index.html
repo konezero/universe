@@ -1157,17 +1157,29 @@
       <div class="release-layout">
         <section>
           <h3>Imported releases</h3>
+          <label class="release-target-field">
+            Target project
+            <select id="release-target-project">
+              <option value="">Select a project</option>
+            </select>
+          </label>
           <div id="release-list" class="release-list"></div>
         </section>
         <section class="release-import">
           <h3>Import immutable Release DB</h3>
           <label>
             Database path
-            <input name="database_path" autocomplete="off" required>
+            <span class="host-path-picker">
+              <input name="database_path" autocomplete="off" required>
+              <button id="release-database-browse" type="button" class="secondary-button">Browse&hellip;</button>
+            </span>
           </label>
           <label>
             Manifest path
-            <input name="manifest_path" autocomplete="off" required>
+            <span class="host-path-picker">
+              <input name="manifest_path" autocomplete="off" required>
+              <button id="release-manifest-browse" type="button" class="secondary-button">Browse&hellip;</button>
+            </span>
           </label>
           <label>
             Mode
@@ -1187,6 +1199,6 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=work-spine-9" defer></script>
+  <script src="/app.js?v=work-spine-12" defer></script>
 </body>
 </html>

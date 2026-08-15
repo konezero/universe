@@ -1004,6 +1004,7 @@ def _node_candidate_from_manifest(
         "display_name": display_name,
         "label": _required_text(manifest.get("label", node_kind.title()), "label"),
         "legacy_project_ids": legacy_project_ids,
+        "runtime_ownership": "OWNED",
     }
     if parent_project_id is not None:
         metadata["parent_project_id"] = parent_project_id
@@ -15167,6 +15168,45 @@ def select_directory_with_native_dialog() -> str | None:
     return str(selected).strip() or None
 
 
+def select_file_with_native_dialog(kind: str) -> str | None:
+    """Open a constrained Host file chooser without importing the selection."""
+
+    choices = {
+        "RELEASE_DATABASE": (
+            "Select Release DB",
+            [("SQLite database", "*.sqlite3"), ("All files", "*.*")],
+        ),
+        "RELEASE_MANIFEST": (
+            "Select Release manifest",
+            [("JSON manifest", "*.json"), ("All files", "*.*")],
+        ),
+    }
+    if kind not in choices:
+        raise UniverseError("HOST_FILE_SELECTION_KIND_INVALID", "file selection kind is invalid")
+    title, filetypes = choices[kind]
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            selected = filedialog.askopenfilename(
+                parent=root,
+                title=title,
+                filetypes=filetypes,
+            )
+        finally:
+            root.destroy()
+    except Exception as error:
+        raise UniverseError(
+            "HOST_FILE_PICKER_UNAVAILABLE",
+            f"native file picker is unavailable: {error}",
+        ) from error
+    return str(selected).strip() or None
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -15193,6 +15233,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         remote_connector_state_path: Path | None = None,
         remote_connector_config_path: Path | None = None,
         directory_selector: Callable[[], str | None] | None = None,
+        file_selector: Callable[[str], str | None] | None = None,
     ):
         self.store = store
         self.project_task_proposals = ProjectTaskProposalAdapter()
@@ -15211,6 +15252,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.directory_selector = (
             directory_selector or select_directory_with_native_dialog
         )
+        self.file_selector = file_selector or select_file_with_native_dialog
         self.host_profile = host_profile or HostProfileStore()
         try:
             self.host_profile.ensure_initialized()
@@ -23629,6 +23671,55 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         )
                     )
                 return
+            if path == "/v1/host/select-file":
+                try:
+                    kind = _required_text(body.get("kind"), "kind")
+                    selected = self.server.file_selector(kind)
+                    file_path = None
+                    if selected:
+                        selected_path = Path(selected).expanduser().resolve(strict=True)
+                        if not selected_path.is_file():
+                            raise UniverseError(
+                                "HOST_FILE_SELECTION_INVALID",
+                                "selected path must be an existing file",
+                            )
+                        allowed_suffix = {
+                            "RELEASE_DATABASE": ".sqlite3",
+                            "RELEASE_MANIFEST": ".json",
+                        }.get(kind)
+                        if allowed_suffix is None:
+                            raise UniverseError(
+                                "HOST_FILE_SELECTION_KIND_INVALID",
+                                "file selection kind is invalid",
+                            )
+                        if selected_path.suffix.lower() != allowed_suffix:
+                            raise UniverseError(
+                                "HOST_FILE_SELECTION_INVALID",
+                                f"selected file must use the {allowed_suffix} extension",
+                            )
+                        file_path = str(selected_path)
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": (
+                                "FILE_SELECTED"
+                                if file_path is not None
+                                else "FILE_SELECTION_CANCELLED"
+                            ),
+                            "file": file_path,
+                        },
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except Exception as error:
+                    self._send_error(
+                        UniverseError(
+                            "HOST_FILE_PICKER_UNAVAILABLE",
+                            f"native file picker is unavailable: {error}",
+                        )
+                    )
+                return
             if path == "/v1/project-connections/prepare":
                 self._send(HTTPStatus.OK, self.server.prepare_project_connection(body))
                 return
@@ -25648,6 +25739,7 @@ def create_server(
     remote_connector_state_path: Path | None = None,
     remote_connector_config_path: Path | None = None,
     directory_selector: Callable[[], str | None] | None = None,
+    file_selector: Callable[[str], str | None] | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -25681,6 +25773,7 @@ def create_server(
         remote_connector_state_path=remote_connector_state_path,
         remote_connector_config_path=remote_connector_config_path,
         directory_selector=directory_selector,
+        file_selector=file_selector,
     )
 
 

@@ -16,6 +16,7 @@ const state = {
   dispatches: [],
   releases: [],
   releaseProposals: [],
+  selectedReleaseTargetProjectId: null,
   masterHandoffs: [],
   skillPlanAdoptions: [],
   skillObservations: [],
@@ -371,6 +372,9 @@ const elements = {
   adoptCompositionButton: document.querySelector("#adopt-composition-button"),
   releaseDialog: document.querySelector("#release-dialog"),
   releaseForm: document.querySelector("#release-form"),
+  releaseDatabaseBrowse: document.querySelector("#release-database-browse"),
+  releaseManifestBrowse: document.querySelector("#release-manifest-browse"),
+  releaseTargetProject: document.querySelector("#release-target-project"),
   releaseList: document.querySelector("#release-list"),
   releaseFormError: document.querySelector("#release-form-error"),
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
@@ -1829,7 +1833,6 @@ function nodeModeRoomIsActive(room) {
 
 function nodeModeCoordinates() {
   const projects = visibleProjects()
-    .filter((project) => !isProjectContainer(project))
     .sort((left, right) =>
       projectSortKey(left).localeCompare(projectSortKey(right))
     );
@@ -1928,7 +1931,12 @@ function nodeModeCoordinates() {
         sessions: [],
       }
     );
-    return { nodeId, project, modes };
+    return {
+      nodeId,
+      project,
+      modes,
+      parentProjectId: String(project.metadata?.parent_project_id || ""),
+    };
   });
   return groups;
 }
@@ -2058,29 +2066,13 @@ function openNodeModeCoordinate(coordinate) {
   renderNodeModes();
 }
 
-function renderNodeModes() {
-  if (!elements.nodeModeList) return;
-  const groups = nodeModeCoordinates();
-  const modeCount = groups.reduce((total, group) => total + group.modes.length, 0);
-  const activeModeCount = groups.reduce(
-    (total, group) => total + group.modes.filter((mode) => mode.active).length,
-    0
-  );
-  elements.nodeModeList.replaceChildren();
-  if (elements.nodeModeCount) {
-    elements.nodeModeCount.textContent = `${activeModeCount}/${modeCount}`;
-    elements.nodeModeCount.title = `${activeModeCount} active sessions / ${modeCount} node modes`;
-  }
-  if (!groups.length) {
-    elements.nodeModeList.append(
-      node("p", "node-mode-empty", "No nodes registered")
+function renderNodeModeGroup(group, { nested = false } = {}) {
+    const section = node(
+      "section",
+      nested ? "node-mode-group node-mode-group-nested" : "node-mode-group"
     );
-    return;
-  }
-
-  for (const group of groups) {
-    const section = node("section", "node-mode-group");
     section.dataset.nodeId = group.nodeId;
+    section.dataset.nodeKind = String(group.project.metadata?.node_kind || "PROJECT");
     const activeCount = group.modes.filter((mode) => mode.active).length;
     const heading = node("button", "node-mode-group-heading node-mode-node");
     heading.type = "button";
@@ -2120,7 +2112,48 @@ function renderNodeModes() {
       }
     }
     section.append(list);
-    elements.nodeModeList.append(section);
+    return section;
+}
+
+function renderNodeModes() {
+  if (!elements.nodeModeList) return;
+  const groups = nodeModeCoordinates();
+  const modeCount = groups.reduce((total, group) => total + group.modes.length, 0);
+  const activeModeCount = groups.reduce(
+    (total, group) => total + group.modes.filter((mode) => mode.active).length,
+    0
+  );
+  elements.nodeModeList.replaceChildren();
+  if (elements.nodeModeCount) {
+    elements.nodeModeCount.textContent = `${activeModeCount}/${modeCount}`;
+    elements.nodeModeCount.title = `${activeModeCount} active sessions / ${modeCount} node modes`;
+  }
+  if (!groups.length) {
+    elements.nodeModeList.append(
+      node("p", "node-mode-empty", "No nodes registered")
+    );
+    return;
+  }
+
+  const groupsById = new Map(groups.map((group) => [group.nodeId, group]));
+  const childrenByParent = new Map();
+  for (const group of groups) {
+    if (!group.parentProjectId || !groupsById.has(group.parentProjectId)) continue;
+    const children = childrenByParent.get(group.parentProjectId) || [];
+    children.push(group);
+    childrenByParent.set(group.parentProjectId, children);
+  }
+  const roots = groups.filter(
+    (group) => !group.parentProjectId || !groupsById.has(group.parentProjectId)
+  );
+  const appendGroup = (group, nested = false) => {
+    elements.nodeModeList.append(renderNodeModeGroup(group, { nested }));
+    for (const child of childrenByParent.get(group.nodeId) || []) {
+      appendGroup(child, true);
+    }
+  };
+  for (const group of roots) {
+    appendGroup(group);
   }
 }
 
@@ -3520,6 +3553,28 @@ function renderProjects() {
 }
 
 function renderReleaseCatalog() {
+  const previousTarget =
+    state.selectedReleaseTargetProjectId ||
+    elements.releaseTargetProject.value ||
+    "";
+  elements.releaseTargetProject.replaceChildren(
+    new Option("Select a project", "")
+  );
+  const targetProjects = visibleProjects();
+  for (const project of targetProjects) {
+    elements.releaseTargetProject.append(
+      new Option(
+        `${projectDisplayName(project)} · ${project.project_root}`,
+        project.project_id
+      )
+    );
+  }
+  const targetExists = targetProjects.some(
+    (project) => project.project_id === previousTarget
+  );
+  elements.releaseTargetProject.value = targetExists ? previousTarget : "";
+  state.selectedReleaseTargetProjectId = elements.releaseTargetProject.value || null;
+
   elements.releaseList.replaceChildren();
   if (!state.releases.length) {
     elements.releaseList.append(
@@ -3547,10 +3602,12 @@ function renderReleaseCatalog() {
     const action = node(
       "button",
       "secondary-button",
-      state.selectedProject ? "Plan project update" : "Select a project first"
+      state.selectedReleaseTargetProjectId
+        ? "Plan project update"
+        : "Select a target project"
     );
     action.type = "button";
-    action.disabled = !state.selectedProject;
+    action.disabled = !state.selectedReleaseTargetProjectId;
     action.addEventListener("click", () =>
       proposeProjectRelease(release.release_id)
     );
@@ -3566,45 +3623,67 @@ function showReleaseProposal(proposal) {
     "blocked",
     proposal.status === "PROJECT_RELEASE_PROPOSAL_BLOCKED"
   );
+  const plan = proposal.plan && typeof proposal.plan === "object"
+    ? proposal.plan
+    : {};
+  const actions = Array.isArray(plan.actions) ? plan.actions : [];
+  const collisions = Array.isArray(plan.collisions) ? plan.collisions : [];
   const actionCounts = {};
-  for (const action of proposal.plan.actions) {
+  for (const action of actions) {
     actionCounts[action.action] = (actionCounts[action.action] || 0) + 1;
   }
+  const legacySummary = actions.length || collisions.length
+    ? `collisions ${collisions.length} / actions ${Object.entries(actionCounts)
+        .map(([name, count]) => `${name}:${count}`)
+        .join(", ") || "none"}`
+    : `installed Runtime ${plan.installed_runtime?.state || "UNKNOWN"} / Host preflight ${
+        plan.project_host_preflight || "UNKNOWN"
+      }`;
   elements.releaseProposalOutput.append(
     node("h3", "", proposal.status),
     node(
       "p",
       "",
       `${proposal.release_id} → ${proposal.project_id} / ${
-        proposal.plan.operation
+        plan.operation || "UNKNOWN"
       }`
     ),
     node(
       "p",
       "",
-      `Plan ${proposal.plan.plan_digest} / collisions ${
-        proposal.plan.collisions.length
-      } / actions ${Object.entries(actionCounts)
-        .map(([name, count]) => `${name}:${count}`)
-        .join(", ")}`
+      `Plan ${plan.plan_digest || "UNKNOWN"} / ${legacySummary}`
     ),
     node(
       "p",
       "",
-      "No project files were changed. Approval and Project Host apply are separate."
+      "No project files were changed. Apply runs the displayed Runtime lifecycle plan."
     )
   );
+  if (proposal.status !== "PROJECT_RELEASE_PROPOSAL_BLOCKED") {
+    const applyButton = node(
+      "button",
+      "primary-button release-apply-button",
+      `Apply ${plan.operation || "project update"}`
+    );
+    applyButton.type = "button";
+    applyButton.addEventListener("click", () =>
+      applyProjectRelease(proposal, applyButton)
+    );
+    elements.releaseProposalOutput.append(applyButton);
+  }
 }
 
 async function proposeProjectRelease(releaseId) {
-  if (!state.selectedProject) {
-    toast("Select a project", true);
+  const projectId = state.selectedReleaseTargetProjectId;
+  if (!projectId) {
+    toast("Select a target project", true);
     return;
   }
+  elements.releaseFormError.textContent = "";
   try {
     const result = await api(
       `/v1/projects/${encodeURIComponent(
-        state.selectedProject.project_id
+        projectId
       )}/release-proposals`,
       {
         method: "POST",
@@ -3839,6 +3918,53 @@ function setChatPanelWidth(width, { persist = false } = {}) {
     } catch (_error) {
       // Local preference storage is optional.
     }
+  }
+}
+
+async function applyProjectRelease(proposal, button) {
+  const projectId = String(proposal.project_id || "");
+  if (!projectId) {
+    toast("Release proposal has no target project", true);
+    return;
+  }
+  button.disabled = true;
+  elements.releaseFormError.textContent = "";
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/release-proposals/apply`,
+      {
+        method: "POST",
+        body: {
+          approval: "APPROVED",
+          proposal_id: proposal.proposal_id,
+          proposal_digest: proposal.proposal_digest,
+        },
+      }
+    );
+    const receipt = result.receipt || {};
+    elements.releaseProposalOutput.replaceChildren(
+      node("h3", "", result.status || "PROJECT_RELEASE_APPLICATION_COMPLETED"),
+      node("p", "", `${proposal.release_id} → ${projectId}`),
+      node(
+        "p",
+        "",
+        `Release ${receipt.release_id || proposal.release_id} / DB ${
+          receipt.release_database_sha256 ||
+          proposal.release_database_sha256 ||
+          "UNKNOWN"
+        }`
+      ),
+      node(
+        "p",
+        "",
+        `Project Host ${result.master_host?.status || "UNKNOWN"}`
+      )
+    );
+    toast(`Runtime update applied to ${projectId}`);
+    await refresh({ syncSelectedProject: false });
+  } catch (error) {
+    elements.releaseFormError.textContent = error.message;
+    button.disabled = false;
   }
 }
 
@@ -10149,6 +10275,44 @@ function selectFreshProjectRoot() {
   );
 }
 
+async function selectHostFile(input, button, kind, errorOutput) {
+  button.disabled = true;
+  errorOutput.textContent = "";
+  try {
+    const result = await api("/v1/host/select-file", {
+      method: "POST",
+      body: { kind },
+    });
+    if (result.status === "FILE_SELECTED" && result.file) {
+      input.value = result.file;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+    }
+  } catch (error) {
+    errorOutput.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectReleaseDatabase() {
+  return selectHostFile(
+    elements.releaseForm.elements.namedItem("database_path"),
+    elements.releaseDatabaseBrowse,
+    "RELEASE_DATABASE",
+    elements.releaseFormError
+  );
+}
+
+function selectReleaseManifest() {
+  return selectHostFile(
+    elements.releaseForm.elements.namedItem("manifest_path"),
+    elements.releaseManifestBrowse,
+    "RELEASE_MANIFEST",
+    elements.releaseFormError
+  );
+}
+
 async function submitRelease(event) {
   event.preventDefault();
   elements.releaseFormError.textContent = "";
@@ -11273,6 +11437,13 @@ function bindEvents() {
       renderReleaseCatalog();
       elements.releaseDialog.showModal();
     });
+  elements.releaseTargetProject.addEventListener("change", () => {
+    state.selectedReleaseTargetProjectId =
+      elements.releaseTargetProject.value || null;
+    elements.releaseProposalOutput.replaceChildren();
+    elements.releaseProposalOutput.classList.add("hidden");
+    renderReleaseCatalog();
+  });
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
@@ -11651,6 +11822,8 @@ function bindEvents() {
   elements.projectForm.addEventListener("submit", submitProject);
   elements.projectRootBrowse.addEventListener("click", selectProjectRoot);
   elements.freshProjectRootBrowse.addEventListener("click", selectFreshProjectRoot);
+  elements.releaseDatabaseBrowse.addEventListener("click", selectReleaseDatabase);
+  elements.releaseManifestBrowse.addEventListener("click", selectReleaseManifest);
   elements.workerBindingScope.addEventListener("change", renderWorkerBindingSettings);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
 

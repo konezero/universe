@@ -134,6 +134,7 @@ class NetworkAnchorProjectTests(unittest.TestCase):
             self.assertEqual({"alpha-id", "beta-id"}, set(by_id))
             self.assertEqual("alpha-host", by_id["alpha-id"]["metadata"]["node_tag"])
             self.assertEqual("beta-host", by_id["beta-id"]["metadata"]["node_tag"])
+            self.assertEqual("OWNED", by_id["alpha-id"]["metadata"]["runtime_ownership"])
 
     def test_ensure_registers_manifest_defined_home(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -179,6 +180,8 @@ class NetworkAnchorProjectTests(unittest.TestCase):
                 self.assertEqual(
                     "private-node-root", career["metadata"]["parent_project_id"]
                 )
+                self.assertEqual("OWNED", career["metadata"]["runtime_ownership"])
+                self.assertNotIn("runtime_owner_project_id", career["metadata"])
                 self.assertEqual("career", career["metadata"]["node_tag"])
                 self.assertIn(
                     "rendezvous", {item["project_id"] for item in candidates}

@@ -2148,13 +2148,15 @@ dialog label {
   font-weight: 620;
 }
 
-.project-root-picker {
+.project-root-picker,
+.host-path-picker {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
 }
 
-.project-root-picker .secondary-button {
+.project-root-picker .secondary-button,
+.host-path-picker .secondary-button {
   white-space: nowrap;
 }
 
@@ -2764,6 +2766,12 @@ dialog label {
   overflow-y: auto;
 }
 
+.release-target-field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
 .release-card {
   display: grid;
   gap: 6px;
@@ -2803,6 +2811,10 @@ dialog label {
 
 .proposal-output.blocked {
   border-left-color: var(--red);
+}
+
+.release-apply-button {
+  margin-top: 10px;
 }
 
 .hidden {
@@ -5917,6 +5929,14 @@ body:not(.graph-mode) .conductor-panel {
 .node-mode-group {
   display: grid;
   gap: 5px;
+}
+.node-mode-group-nested {
+  margin-left: 12px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(126, 151, 184, 0.28);
+}
+.node-mode-group[data-node-kind="CONTAINER"] > .node-mode-group-heading {
+  background: rgba(126, 151, 184, 0.08);
 }
 .node-mode-group-heading {
   display: flex;

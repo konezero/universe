@@ -412,6 +412,38 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("DIRECTORY_SELECTION_CANCELLED", payload["status"])
         self.assertIsNone(payload["directory"])
 
+    def test_native_release_file_picker_returns_selected_host_path(self) -> None:
+        database = self.project_root / "release.sqlite3"
+        database.write_bytes(b"sqlite fixture")
+        self.server.file_selector = lambda kind: (
+            str(database) if kind == "RELEASE_DATABASE" else None
+        )
+
+        status, payload = self.request(
+            "POST",
+            "/v1/host/select-file",
+            {"kind": "RELEASE_DATABASE"},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FILE_SELECTED", payload["status"])
+        self.assertEqual(str(database.resolve()), payload["file"])
+
+    def test_native_release_file_picker_cancel_is_a_noop(self) -> None:
+        self.server.file_selector = lambda kind: None
+
+        status, payload = self.request(
+            "POST",
+            "/v1/host/select-file",
+            {"kind": "RELEASE_MANIFEST"},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FILE_SELECTION_CANCELLED", payload["status"])
+        self.assertIsNone(payload["file"])
+
     def create_task_proposal_fixture(
         self, *, scope: JsonObject | None = None
     ) -> JsonObject:
