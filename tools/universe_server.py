@@ -12758,7 +12758,20 @@ class UniverseStore:
                         "idempotency_key",
                     )
                 }
-                if comparable != material:
+                failed_cancel_retry = (
+                    current["state"] == "FAILED"
+                    and current["decision"] == "CANCEL"
+                    and all(
+                        current[key] == material[key]
+                        for key in (
+                            "project_id",
+                            "proposal_id",
+                            "proposal_digest",
+                            "decision",
+                        )
+                    )
+                )
+                if comparable != material and not failed_cancel_retry:
                     raise UniverseError(
                         "GOVERNANCE_PROPOSAL_DECISION_CONFLICT",
                         "Proposal or idempotency key is already bound to another decision",
@@ -19867,6 +19880,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             reverse=True,
         )
 
+    def list_pending_governance_proposal_inbox(self) -> list[dict[str, Any]]:
+        pending: list[dict[str, Any]] = []
+        for proposal in self.list_governance_proposal_inbox():
+            if proposal.get("state") != "PROPOSED":
+                continue
+            decision = self.store.find_governance_proposal_decision(
+                proposal["project_id"], proposal["proposal_id"]
+            )
+            if (
+                decision is not None
+                and decision["decision"] == "CANCEL"
+                and decision["state"] == "APPLIED"
+            ):
+                continue
+            pending.append(proposal)
+        return pending
+
     def decide_project_governance_proposal(
         self,
         project_id: str,
@@ -19950,12 +19980,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     evidence_ref=decision["evidence_ref"],
                 )
             else:
-                decision_result = self.project_task_proposals.cancel(
-                    Path(project["project_root"]),
-                    proposal_id=proposal["proposal_id"],
-                    proposal_digest=proposal["proposal_digest"],
-                    evidence_ref=decision["evidence_ref"],
-                )
+                decision_result = {
+                    "schema": "universe.governance-proposal-dismissal.v1",
+                    "status": "TASK_PROPOSAL_DISMISSED",
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                    "evidence_ref": decision["evidence_ref"],
+                    "dismissed_at": utc_now(),
+                    "reference_proposal_state": proposal["state"],
+                    "reference_proposal_preserved": True,
+                }
         except ProjectMasterHostError as error:
             failed = self.store.fail_governance_proposal_decision(
                 decision["decision_id"],
@@ -21257,11 +21291,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 {
                     "schema": API_SCHEMA,
                     "status": "GOVERNANCE_PROPOSAL_INBOX_COLLECTED",
-                    "proposals": [
-                        proposal
-                        for proposal in self.server.list_governance_proposal_inbox()
-                        if proposal.get("state") == "PROPOSED"
-                    ],
+                    "proposals": self.server.list_pending_governance_proposal_inbox(),
                 },
             )
             return

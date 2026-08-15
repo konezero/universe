@@ -5520,56 +5520,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
         proposal = self.create_task_proposal_fixture()
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
 
-        class CancellingAdapter(ProjectTaskProposalAdapter):
-            def cancel(
-                inner_self,
-                project_root: Path,
-                *,
-                proposal_id: str,
-                proposal_digest: str,
-                evidence_ref: str,
-            ) -> JsonObject:
-                cancellation = {
-                    "schema": "ai-career.task-proposal-cancellation.v1",
-                    "status": "CANCELLED",
-                    "proposal_id": proposal_id,
-                    "proposal_digest": proposal_digest,
-                    "evidence_ref": evidence_ref,
-                    "cancelled_at": "2026-08-10T00:01:00Z",
-                }
-                database_path = (
-                    project_root
-                    / ".ai"
-                    / "runtime"
-                    / "task_frames"
-                    / "task-proposals.sqlite3"
-                )
-                connection = sqlite3.connect(database_path)
-                try:
-                    connection.execute(
-                        """
-                        UPDATE proposal
-                        SET state = 'CANCELLED', cancellation_json = ?, completed_at = ?
-                        WHERE proposal_id = ? AND proposal_digest = ?
-                        """,
-                        (
-                            json.dumps(
-                                cancellation, sort_keys=True, separators=(",", ":")
-                            ),
-                            cancellation["cancelled_at"],
-                            proposal_id,
-                            proposal_digest,
-                        ),
-                    )
-                    connection.commit()
-                finally:
-                    connection.close()
-                return {
-                    "status": "TASK_PROPOSAL_CANCELLED",
-                    "cancellation": cancellation,
-                }
+        prior, created = self.server.store.record_governance_proposal_decision(
+            "GCS",
+            proposal,
+            {
+                "decision": "CANCEL",
+                "proposal_digest": proposal["proposal_digest"],
+                "source": "NATURAL_LANGUAGE",
+                "commander_surface": "UNIVERSE_UI",
+                "access_surface": "LOCAL_BROWSER",
+                "idempotency_key": "failed-cancel-attempt",
+            },
+        )
+        self.assertTrue(created)
+        failed = self.server.store.fail_governance_proposal_decision(
+            prior["decision_id"], "CLI_USAGE_ERROR"
+        )
+        self.assertEqual("FAILED", failed["state"])
 
-        self.server.project_task_proposals = CancellingAdapter()
+        class CancellationMustStayLocal(ProjectTaskProposalAdapter):
+            def cancel(self, *args: object, **kwargs: object) -> JsonObject:
+                raise AssertionError("Runtime Task Proposal journal must stay unchanged")
+
+        self.server.project_task_proposals = CancellationMustStayLocal()
         status, cancelled = self.request(
             "POST",
             "/v1/governance/proposals/task_proposal_test_001/decision",
@@ -5581,9 +5554,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("GOVERNANCE_PROPOSAL_CANCELLED", cancelled["status"])
-        self.assertEqual("CANCELLED", cancelled["proposal"]["state"])
+        self.assertEqual("PROPOSED", cancelled["proposal"]["state"])
         self.assertEqual("CANCEL", cancelled["decision"]["decision"])
         self.assertEqual("APPLIED", cancelled["decision"]["state"])
+        self.assertEqual(prior["decision_id"], cancelled["decision"]["decision_id"])
+        self.assertEqual(
+            "TASK_PROPOSAL_DISMISSED", cancelled["decision"]["result"]["status"]
+        )
+        self.assertTrue(
+            cancelled["decision"]["result"]["reference_proposal_preserved"]
+        )
         self.assertIsNone(cancelled["message"])
 
         status, pending = self.request(
