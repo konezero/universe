@@ -2783,6 +2783,26 @@ function returnToUniverseConductor() {
   elements.dispatchInstruction.focus();
 }
 
+function applyNewSessionCoordinates(
+  prepareBody,
+  options,
+  fallbackProjectId,
+  fallbackMode
+) {
+  if (options.sessionAction !== "NEW") return;
+  const projectId = String(options.projectId || fallbackProjectId || "").trim();
+  const cwd = String(options.cwd || "").trim();
+  const requestedMode = String(
+    options.requestedMode || fallbackMode || ""
+  ).trim().toUpperCase();
+  if (!projectId || !cwd || !requestedMode) {
+    throw new Error("New sessions require project, cwd, and Mode coordinates");
+  }
+  prepareBody.project_id = projectId;
+  prepareBody.cwd = cwd;
+  prepareBody.requested_mode = requestedMode;
+}
+
 async function callUniverseConductor(options = {}) {
   closeComposerActionMenu();
   const prepareBody = {};
@@ -2796,6 +2816,12 @@ async function callUniverseConductor(options = {}) {
   if (options.sessionAction) {
     prepareBody.session_action = options.sessionAction;
   }
+  applyNewSessionCoordinates(
+    prepareBody,
+    options,
+    options.projectId,
+    "CONDUCTOR"
+  );
   const prepared = await api("/v1/conductor-session/prepare", {
     method: "POST",
     body: prepareBody,
@@ -2857,6 +2883,12 @@ async function callProjectMaster(projectId, options = {}) {
   if (options.sessionAction) {
     prepareBody.session_action = options.sessionAction;
   }
+  applyNewSessionCoordinates(
+    prepareBody,
+    options,
+    projectId,
+    "MASTER"
+  );
   const prepared = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
     {
@@ -2944,11 +2976,17 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
   const session = supervisorSessionForRoom(room);
   const project = sessionRailProjectIdentity(room);
   const mode = String(room?.binding?.mode || "").toUpperCase();
+  const registeredProject = (state.projects || []).find(
+    (item) =>
+      String(item.project_id || "").toLowerCase() ===
+      String(project.projectId || "").toLowerCase()
+  );
   if (
     !room ||
     !["MASTER", "CONDUCTOR"].includes(mode) ||
     (sessionAction !== "NEW" && !session) ||
-    (mode === "MASTER" && !project.projectId)
+    (mode === "MASTER" && !project.projectId) ||
+    (sessionAction === "NEW" && !registeredProject?.project_root)
   ) {
     throw new Error("Only an anchored Master or Conductor room can choose a provider and model");
   }
@@ -2969,6 +3007,9 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       modelRef,
       effort,
       sessionAction,
+      projectId: registeredProject?.project_id,
+      cwd: registeredProject?.project_root,
+      requestedMode: mode,
       expectedProvider: provider,
       expectedModel: modelRef,
       expectedEffort: effort,
