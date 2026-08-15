@@ -89,17 +89,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("conversationBadge:", APP)
         self.assertNotIn("function updateConversationBadge", APP)
 
-    def test_fresh_and_import_projects_are_visible_utility_rail_entries(self) -> None:
-        self.assertIn('id="fresh-project-rail-button"', HTML)
-        self.assertIn('id="import-project-rail-button"', HTML)
-        self.assertIn("<small>Fresh</small>", HTML)
-        self.assertIn("<small>Import</small>", HTML)
-        self.assertIn("freshProjectRailButton:", APP)
-        self.assertIn("importProjectRailButton:", APP)
-        self.assertIn(
-            'elements.freshProjectRailButton.addEventListener("click", openFreshProjectWizard)',
-            APP,
-        )
+    def test_project_entry_is_unified_and_planning_is_project_scoped(self) -> None:
+        self.assertIn('id="add-project-rail-button"', HTML)
+        self.assertNotIn('id="fresh-project-rail-button"', HTML)
+        self.assertNotIn('id="import-project-rail-button"', HTML)
+        self.assertIn('id="plan-project-button"', HTML)
+        self.assertIn("addProjectRailButton:", APP)
+        self.assertIn("planProjectButton:", APP)
+        self.assertIn('/v1/project-connections/prepare', APP)
+        self.assertIn('/v1/project-connections/apply', APP)
         self.assertIn("elements.projectDialog.showModal()", APP)
 
     def test_import_project_root_uses_native_directory_picker(self) -> None:

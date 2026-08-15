@@ -233,8 +233,9 @@ const elements = {
   goalPlanMap: document.querySelector("#goal-plan-map"),
   editSelectedGoal: document.querySelector("#edit-selected-goal"),
   utilityRail: document.querySelector(".utility-rail"),
-  freshProjectRailButton: document.querySelector("#fresh-project-rail-button"),
-  importProjectRailButton: document.querySelector("#import-project-rail-button"),
+  addProjectRailButton: document.querySelector("#add-project-rail-button"),
+  planProjectButton: document.querySelector("#plan-project-button"),
+  projectSubmit: document.querySelector("#project-submit"),
   mobileWorkTabs: document.querySelector(".mobile-work-tabs"),
   mobileDelegateGoal: document.querySelector("#mobile-delegate-goal"),
   mobileEditPlan: document.querySelector("#mobile-edit-plan"),
@@ -10066,15 +10067,33 @@ async function submitProject(event) {
   elements.projectFormError.textContent = "";
   const form = new FormData(elements.projectForm);
   try {
-    await api("/v1/projects/register", {
+    const request = {
+      project_id: form.get("project_id"),
+      project_root: form.get("project_root"),
+      release_id: state.releases[0]?.release_id || null,
+    };
+    if (!state.projectConnectionPlan) {
+      const planned = await api("/v1/project-connections/prepare", {
+        method: "POST",
+        body: request,
+      });
+      state.projectConnectionPlan = planned;
+      elements.projectSubmit.textContent = planned.action_label;
+      elements.projectFormError.textContent = planned.detail;
+      return;
+    }
+    await api("/v1/project-connections/apply", {
       method: "POST",
       body: {
-        project_id: form.get("project_id"),
-        project_root: form.get("project_root"),
+        ...request,
+        plan_digest: state.projectConnectionPlan.plan_digest,
+        command: "CONNECT_PROJECT",
       },
     });
+    state.projectConnectionPlan = null;
     elements.projectDialog.close();
     elements.projectForm.reset();
+    elements.projectSubmit.textContent = "Inspect project";
     toast("Project connected");
     await refresh();
     await selectProject(String(form.get("project_id")));
@@ -11568,10 +11587,15 @@ function bindEvents() {
   document
     .querySelector("#start-project-topbar-button")
     .addEventListener("click", openFreshProjectWizard);
-  elements.freshProjectRailButton.addEventListener("click", openFreshProjectWizard);
-  elements.importProjectRailButton.addEventListener("click", () =>
-    elements.projectDialog.showModal()
-  );
+  elements.addProjectRailButton.addEventListener("click", () => {
+    state.projectConnectionPlan = null;
+    elements.projectSubmit.textContent = "Inspect project";
+    elements.projectDialog.showModal();
+  });
+  elements.planProjectButton.addEventListener("click", () => {
+    if (!state.selectedProject) return toast("Select a project first", true);
+    openFreshProjectWizard();
+  });
   elements.dispatchForm.addEventListener("submit", submitDispatch);
   elements.composerActionButton.addEventListener("click", () =>
     toggleComposerActionMenu()

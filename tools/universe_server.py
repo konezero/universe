@@ -90,7 +90,9 @@ from project_skill_plan_apply import (
     build_project_skill_plan_approval,
 )
 from project_release_apply import (
+    INSTALLATION_MANIFEST_PATH,
     ProjectReleaseApplyError,
+    apply_project_release_plan,
     apply_project_release_proposal,
     build_project_release_approval,
     plan_project_release_lifecycle,
@@ -16680,6 +16682,134 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         with self.project_release_application_lock:
             return self._apply_project_release(project_id, request)
 
+    def prepare_project_connection(self, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="project_connection_prepare",
+            required=frozenset({"project_id", "project_root"}),
+            optional=frozenset({"release_id"}),
+        )
+        project_id = _project_id(request["project_id"])
+        root = _canonical_project_root(request["project_root"])
+        runtime_manifest = root / INSTALLATION_MANIFEST_PATH
+        if runtime_manifest.is_file() and not runtime_manifest.is_symlink():
+            material = {
+                "project_id": project_id,
+                "project_root": str(root),
+                "action": "ATTACH_RUNTIME_PROJECT",
+            }
+            digest = _json_sha256(material)
+            return {
+                "schema": API_SCHEMA,
+                "status": "PROJECT_CONNECTION_PLAN_READY",
+                **material,
+                "plan_digest": digest,
+                "action_label": "Attach to Universe",
+                "detail": "Installed Runtime detected. Universe will attach without reinstalling it.",
+            }
+        releases = self.store.list_releases()
+        release_id = request.get("release_id")
+        if not release_id and len(releases) == 1:
+            release_id = releases[0]["release_id"]
+        if not release_id:
+            raise UniverseError(
+                "PROJECT_RELEASE_SELECTION_REQUIRED",
+                "Import exactly one Release DB or select a release before Runtime installation",
+                HTTPStatus.CONFLICT,
+            )
+        artifact = self.store.get_release_artifact_binding(str(release_id))
+        with ReleaseRuntime(
+            database_path=Path(artifact["database_path"]),
+            manifest_path=Path(artifact["manifest_path"]),
+        ) as runtime:
+            plan = plan_project_release_lifecycle(
+                project_root=root,
+                project_id=project_id,
+                release_id=runtime.release_id,
+                source_commit=runtime.metadata["source_commit"],
+            )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_CONNECTION_PLAN_READY",
+            "project_id": project_id,
+            "project_root": str(root),
+            "action": "INSTALL_RUNTIME_AND_ADD",
+            "release_id": str(release_id),
+            "release_database_sha256": artifact["database_sha256"],
+            "plan": plan,
+            "plan_digest": plan["plan_digest"],
+            "action_label": "Install Runtime & Add",
+            "detail": "Runtime is not installed. Existing source and Git content will be preserved.",
+        }
+
+    def apply_project_connection(self, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="project_connection_apply",
+            required=frozenset(
+                {"project_id", "project_root", "plan_digest", "command"}
+            ),
+            optional=frozenset({"release_id"}),
+        )
+        if request["command"] != "CONNECT_PROJECT":
+            raise UniverseError(
+                "PROJECT_CONNECTION_COMMAND_INVALID",
+                "command must be CONNECT_PROJECT",
+            )
+        prepared = self.prepare_project_connection(
+            {
+                "project_id": request["project_id"],
+                "project_root": request["project_root"],
+                **(
+                    {"release_id": request["release_id"]}
+                    if request.get("release_id")
+                    else {}
+                ),
+            }
+        )
+        if request["plan_digest"] != prepared["plan_digest"]:
+            raise UniverseError("PROJECT_CONNECTION_PLAN_STALE", "project connection plan changed")
+        receipt = None
+        if prepared["action"] == "INSTALL_RUNTIME_AND_ADD":
+            artifact = self.store.get_release_artifact_binding(prepared["release_id"])
+            try:
+                receipt = apply_project_release_plan(
+                    project_root=Path(prepared["project_root"]),
+                    project_id=prepared["project_id"],
+                    plan=prepared["plan"],
+                    release_database_sha256=prepared["release_database_sha256"],
+                    instruction_ref=(
+                        "universe://direct-command/project-connections/"
+                        + prepared["plan_digest"]
+                    ),
+                    database_path=Path(artifact["database_path"]),
+                    manifest_path=Path(artifact["manifest_path"]),
+                )
+            except ProjectReleaseApplyError as error:
+                raise UniverseError(
+                    error.code,
+                    str(error),
+                    HTTPStatus.CONFLICT,
+                ) from error
+        project, created = self.store.register_project(
+            {
+                "project_id": prepared["project_id"],
+                "project_root": prepared["project_root"],
+                "install_mode": (
+                    "UNIVERSE_ATTACHED"
+                    if prepared["action"] == "INSTALL_RUNTIME_AND_ADD"
+                    else "PROJECT_STANDALONE"
+                ),
+            }
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_CONNECTED",
+            "project": project,
+            "created": created,
+            "runtime_receipt": receipt,
+        }
+
     def _apply_project_release(
         self,
         project_id: str,
@@ -17960,7 +18090,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     binding_observation.get("anchor_currentness_source") or ""
                 ).upper()
                 if not observer_currentness:
-                    if anchor_observation is not None:
+                    if bound is not None:
+                        observer_currentness = (
+                            "CURRENT"
+                            if bool(bound.get("is_default"))
+                            or str(bound.get("currentness") or "").upper()
+                            == "CURRENT"
+                            else "PAST"
+                        )
+                        currentness_source = "SESSION_SUPERVISOR"
+                    elif anchor_observation is not None:
                         observer_currentness = (
                             "CURRENT"
                             if str(binding_observation.get("temporality") or "").upper()
@@ -23489,6 +23628,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             f"native directory picker is unavailable: {error}",
                         )
                     )
+                return
+            if path == "/v1/project-connections/prepare":
+                self._send(HTTPStatus.OK, self.server.prepare_project_connection(body))
+                return
+            if path == "/v1/project-connections/apply":
+                self._send(HTTPStatus.OK, self.server.apply_project_connection(body))
                 return
             if path == "/v1/projects/register":
                 project, created = self.server.store.register_project(body)

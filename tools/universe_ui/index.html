@@ -47,8 +47,7 @@
       <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
       <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
       <button type="button" data-primary-view="meeting" title="Meeting Room"><span aria-hidden="true">&#9672;</span><small>Meeting</small></button>
-      <button id="fresh-project-rail-button" type="button" title="Start fresh project"><span aria-hidden="true">&#10022;</span><small>Fresh</small></button>
-      <button id="import-project-rail-button" type="button" title="Import existing project"><span aria-hidden="true">&#43;</span><small>Import</small></button>
+      <button id="add-project-rail-button" type="button" title="Add project"><span aria-hidden="true">&#43;</span><small>Project</small></button>
     </nav>
 
     <aside class="project-rail universe-rail">
@@ -105,6 +104,7 @@
             <p id="goal-plan-subtitle">Goal &rarr; Milestone / Phase &rarr; Todo</p>
           </div>
           <div class="goal-plan-actions">
+            <button id="plan-project-button" class="secondary-button" type="button">Plan project</button>
             <button id="goal-plan-map" class="secondary-button" type="button">Open map</button>
             <button id="add-goal-button" class="primary-button" type="button">Add goal</button>
           </div>
@@ -283,7 +283,7 @@
   <dialog id="project-dialog">
     <form id="project-form" method="dialog">
       <div class="dialog-heading">
-        <h2>Import existing project</h2>
+        <h2>Add project</h2>
         <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
       </div>
       <label>
@@ -299,7 +299,7 @@
       </label>
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
-        <button type="submit" class="primary-button">Import</button>
+        <button id="project-submit" type="submit" class="primary-button">Inspect project</button>
       </div>
       <p id="project-form-error" class="form-error" role="alert"></p>
     </form>

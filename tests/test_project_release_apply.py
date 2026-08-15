@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from core_release import build_release  # noqa: E402
 from project_release_apply import (  # noqa: E402
     ProjectReleaseApplyError,
+    apply_project_release_plan,
     apply_project_release_proposal,
     build_project_release_approval,
     plan_project_release_lifecycle,
@@ -248,6 +249,59 @@ class ProjectReleaseApplyTests(unittest.TestCase):
             "provider-attested",
             receipt["lifecycle_result"]["source"]["binding"],
         )
+
+    def test_direct_plan_application_returns_no_proposal_or_approval_evidence(self) -> None:
+        proposal = self._proposal()
+
+        def runner(request: Any) -> NativeCliResult:
+            lifecycle_request = json.loads(
+                Path(request.arguments[2]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                "universe://direct-command/project-connections/test",
+                lifecycle_request["approval"]["evidence_ref"],
+            )
+            payload = {
+                "result": "PASS",
+                "operation": "FRESH_INSTALL",
+                "user_command": "OS_INSTALL",
+                "repository_runtime": "VERIFIED",
+                "target": str(self.project.resolve()),
+                "source": {
+                    "provider": "universe-release-db",
+                    "binding": "provider-attested",
+                    "commit": self.commit,
+                },
+                "validate": {"validation_id": "validation-fixture"},
+                "boot_handoff": {"status": "READY_FOR_BOOT"},
+                "permit_receipt": {"receipt_id": "permit-fixture"},
+            }
+            return NativeCliResult(
+                contract="windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps(payload),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        receipt = apply_project_release_plan(
+            project_root=self.project,
+            project_id="demo",
+            plan=proposal["plan"],
+            release_database_sha256=proposal["release_database_sha256"],
+            instruction_ref="universe://direct-command/project-connections/test",
+            database_path=self.database,
+            manifest_path=self.manifest,
+            native_runner=runner,
+        )
+
+        self.assertEqual("PROJECT_RUNTIME_LIFECYCLE_APPLIED", receipt["status"])
+        self.assertNotIn("proposal_id", receipt)
+        self.assertNotIn("proposal_digest", receipt)
+        self.assertNotIn("approval_evidence_ref", receipt)
 
     def test_project_state_change_rejects_stale_proposal_before_execution(self) -> None:
         proposal = self._proposal()

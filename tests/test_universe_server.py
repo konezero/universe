@@ -6480,6 +6480,74 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.assertEqual(before, after)
 
+    def test_project_connection_installs_from_direct_command_without_proposal(self) -> None:
+        project_root = self.temp_root / "direct-project"
+        project_root.mkdir()
+        (project_root / "REPOSITORY_MANIFEST.md").write_text(
+            "# DIRECT Repository Manifest\n",
+            encoding="utf-8",
+        )
+        database, manifest = self.build_release_fixture()
+        _, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        release_id = imported["release"]["release_id"]
+
+        status, prepared = self.request(
+            "POST",
+            "/v1/project-connections/prepare",
+            {
+                "project_id": "DIRECT",
+                "project_root": str(project_root),
+                "release_id": release_id,
+            },
+            self.token,
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("INSTALL_RUNTIME_AND_ADD", prepared["action"])
+        self.assertNotIn("proposal", prepared)
+        receipt = {
+            "schema": "universe.project-runtime-lifecycle-receipt.v1",
+            "status": "PROJECT_RUNTIME_LIFECYCLE_APPLIED",
+            "project_id": "DIRECT",
+            "release_id": release_id,
+            "plan_digest": prepared["plan_digest"],
+            "instruction_ref": "universe://direct-command/project-connections/test",
+            "receipt_digest": "a" * 64,
+        }
+        with patch(
+            "universe_server.apply_project_release_plan",
+            return_value=receipt,
+        ) as apply_release:
+            applied_status, applied = self.request(
+                "POST",
+                "/v1/project-connections/apply",
+                {
+                    "project_id": "DIRECT",
+                    "project_root": str(project_root),
+                    "release_id": release_id,
+                    "plan_digest": prepared["plan_digest"],
+                    "command": "CONNECT_PROJECT",
+                },
+                self.token,
+            )
+
+        self.assertEqual(200, applied_status, applied)
+        self.assertEqual("PROJECT_CONNECTED", applied["status"])
+        self.assertEqual(receipt, applied["runtime_receipt"])
+        call = apply_release.call_args.kwargs
+        self.assertEqual(prepared["plan"], call["plan"])
+        self.assertNotIn("proposal", call)
+        self.assertNotIn("approval", call)
+
     def test_project_release_apply_is_approved_durable_and_idempotent(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         database, manifest = self.build_release_fixture()

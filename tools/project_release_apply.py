@@ -13,6 +13,7 @@ from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 RELEASE_APPROVAL_SCHEMA = "universe.project-release-approval.v1"
 RELEASE_APPLY_RECEIPT_SCHEMA = "universe.project-release-apply-receipt.v1"
+DIRECT_LIFECYCLE_RECEIPT_SCHEMA = "universe.project-runtime-lifecycle-receipt.v1"
 LIFECYCLE_PLAN_SCHEMA = "universe.project-runtime-lifecycle-plan.v1"
 INSTALLATION_MANIFEST_PATH = (
     ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
@@ -333,6 +334,98 @@ def apply_project_release_proposal(
         **material,
         "receipt_digest": _digest(material),
         "lifecycle_result": lifecycle_result,
+    }
+
+
+def apply_project_release_plan(
+    *,
+    project_root: Path,
+    project_id: str,
+    plan: Mapping[str, Any],
+    release_database_sha256: str,
+    instruction_ref: str,
+    database_path: Path,
+    manifest_path: Path,
+    native_runner: Any = run_native_cli,
+    timeout_seconds: float = 900,
+) -> dict[str, Any]:
+    """Apply an inspected lifecycle plan from a direct user command.
+
+    The bundled lifecycle host still consumes its legacy approval-shaped input,
+    so this adapter keeps that compatibility detail private. Universe callers
+    exchange only the immutable plan, the selected Release DB digest, and the
+    direct instruction reference; no Proposal or approval evidence is returned
+    or persisted by this route.
+    """
+    normalized_project = _text(project_id, "project_id")
+    normalized_instruction_ref = _text(instruction_ref, "instruction_ref")
+    normalized_database_sha256 = _sha256(
+        release_database_sha256,
+        "release_database_sha256",
+    )
+    if not isinstance(plan, Mapping):
+        raise ProjectReleaseApplyError(
+            "PROJECT_RELEASE_PLAN_INVALID",
+            "lifecycle plan must be an object",
+        )
+    material = {
+        "schema": "universe.project-release-proposal.v1",
+        "project_id": normalized_project,
+        "release_id": _text(plan.get("release_id"), "plan.release_id"),
+        "mode": "MASTER",
+        "release_database_sha256": normalized_database_sha256,
+        "plan": dict(plan),
+        "approval": "REQUIRED",
+        "execution_owner": "PROJECT_HOST",
+        "effects": {"project_write": "NONE", "files_changed": 0},
+        "next_operation": "USER_APPROVAL_AND_PROJECT_HOST_APPLY",
+    }
+    compatibility_digest = _digest(material)
+    compatibility_payload = {
+        **material,
+        "proposal_digest": compatibility_digest,
+        "proposal_id": "release_proposal_" + compatibility_digest[:20],
+        "status": "PROJECT_RELEASE_PROPOSAL_READY",
+    }
+    compatibility_approval = build_project_release_approval(
+        project_id=normalized_project,
+        proposal=compatibility_payload,
+        evidence_ref=normalized_instruction_ref,
+    )
+    legacy_receipt = apply_project_release_proposal(
+        project_root=project_root,
+        project_id=normalized_project,
+        proposal=compatibility_payload,
+        approval=compatibility_approval,
+        database_path=database_path,
+        manifest_path=manifest_path,
+        native_runner=native_runner,
+        timeout_seconds=timeout_seconds,
+    )
+    direct_material = {
+        key: value
+        for key, value in legacy_receipt.items()
+        if key
+        not in {
+            "schema",
+            "status",
+            "receipt_digest",
+            "proposal_id",
+            "proposal_digest",
+            "approval_evidence_ref",
+        }
+    }
+    direct_material["instruction_ref"] = normalized_instruction_ref
+    digest_material = {
+        key: value
+        for key, value in direct_material.items()
+        if key != "lifecycle_result"
+    }
+    return {
+        "schema": DIRECT_LIFECYCLE_RECEIPT_SCHEMA,
+        "status": "PROJECT_RUNTIME_LIFECYCLE_APPLIED",
+        **direct_material,
+        "receipt_digest": _digest(digest_material),
     }
 
 
