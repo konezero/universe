@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import socket
 import sys
 import urllib.error
@@ -99,38 +98,6 @@ def _read_stdin_json() -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
-
-
-def _session_md_fields(repo_root: Path) -> dict[str, str]:
-    path = repo_root / ".ai" / "runtime" / "state" / "session.md"
-    if not path.is_file():
-        return {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    fields: dict[str, str] = {}
-    for line in text.splitlines():
-        if ":" not in line or line.startswith("#"):
-            continue
-        key, _, value = line.partition(":")
-        key = key.strip()
-        value = value.strip()
-        if key and value:
-            fields[key] = value
-    return fields
-
-
-def _parse_session_md_provider(fields: Mapping[str, str]) -> tuple[str | None, str | None]:
-    provider = fields.get("Last Provider", "").strip().upper()
-    ref = fields.get("Last Provider Session Ref", "").strip()
-    if provider in {"", "UNKNOWN", "NONE"}:
-        provider = None
-    if ref in {"", "UNKNOWN", "NONE"}:
-        ref = None
-    if provider is not None and provider not in PROVIDERS:
-        provider = None
-    return provider, ref
 
 
 def _paths_equal(left: str, right: str) -> bool:
@@ -400,10 +367,6 @@ def resolve_provider_and_ref(
         if grok_ref:
             return "GROK", grok_ref, grok_source
 
-    md_provider, md_ref = _parse_session_md_provider(session_fields)
-    if md_provider and md_ref:
-        return md_provider, md_ref, "session.md"
-
     if args.provider:
         return str(args.provider).strip().upper(), None, "CLI.provider_only"
     return None, None, "UNRESOLVED"
@@ -420,8 +383,6 @@ def resolve_project_id(
         args.project_id,
         environment.get("UNIVERSE_PROJECT_ID"),
         environment.get("UNIVERSE_NODE"),
-        session_fields.get("Project"),
-        session_fields.get("Node"),
     ):
         text = str(candidate or "").strip()
         if text and text.upper() not in {"UNKNOWN", "NONE"}:
@@ -443,8 +404,6 @@ def resolve_mode(
         args.mode,
         environment.get("UNIVERSE_MODE"),
         environment.get("REQUESTED_MODE"),
-        session_fields.get("Mode"),
-        session_fields.get("Requested Mode"),
     ):
         text = str(candidate or "").strip().upper()
         if text and text not in {"UNKNOWN", "NONE"}:
@@ -552,72 +511,6 @@ def write_observation(
         return None
 
 
-def patch_session_md_observation(
-    repo_root: Path,
-    *,
-    provider: str,
-    session_ref: str,
-    connection_state: str,
-) -> str:
-    """Best-effort observation-only lines in session.md (not authority).
-
-    Returns status label. Refuses if file missing or fields not found.
-    """
-    path = repo_root / ".ai" / "runtime" / "state" / "session.md"
-    if not path.is_file():
-        return "SESSION_MD_ABSENT"
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return "SESSION_MD_UNREADABLE"
-
-    replacements = {
-        "Last Provider": provider,
-        "Last Provider Session Ref": session_ref,
-        "Provider Session Connection State": connection_state,
-        "Provider Session Target": f"{provider}:{session_ref}",
-    }
-    lines = text.splitlines(keepends=True)
-    if not lines:
-        return "SESSION_MD_EMPTY"
-    changed = 0
-    seen: set[str] = set()
-    out: list[str] = []
-    for line in lines:
-        matched = False
-        for key, value in replacements.items():
-            # Exact markdown field lines: "Key: value"
-            pattern = re.compile(rf"^({re.escape(key)}:\s*)(.*?)(\r?\n)?$")
-            m = pattern.match(line)
-            if m:
-                ending = m.group(3) or "\n"
-                new_line = f"{key}: {value}{ending}"
-                if new_line != line:
-                    changed += 1
-                out.append(new_line)
-                seen.add(key)
-                matched = True
-                break
-        if not matched:
-            out.append(line)
-    # Append missing observation keys (session.md from Host projection may omit them).
-    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
-    missing = [key for key in replacements if key not in seen]
-    if missing:
-        if out and not out[-1].endswith(("\n", "\r\n")):
-            out[-1] = out[-1] + newline
-        for key in missing:
-            out.append(f"{key}: {replacements[key]}{newline}")
-            changed += 1
-    if changed == 0:
-        return "SESSION_MD_UNCHANGED"
-    try:
-        path.write_text("".join(out), encoding="utf-8", newline="")
-    except OSError:
-        return "SESSION_MD_WRITE_FAILED"
-    return "SESSION_MD_OBSERVATION_UPDATED"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -658,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--update-session-md",
         action="store_true",
-        help="Best-effort patch Last Provider* observation lines in session.md",
+        help="Deprecated compatibility flag; returns DEPRECATED_ANCHOR_DB_ONLY",
     )
     parser.add_argument(
         "--strict",
@@ -681,7 +574,9 @@ def run_hook(
 ) -> dict[str, Any]:
     env = os.environ if environment is None else environment
     repo_root = args.repo_root.expanduser().resolve()
-    session_fields = _session_md_fields(repo_root)
+    # Anchor databases own live session coordinates. The Markdown companions
+    # are compatibility notices only and are never read by this hook.
+    session_fields: dict[str, str] = {}
 
     if stdin_payload is None and args.from_stdin:
         stdin_payload = _read_stdin_json()
@@ -758,14 +653,9 @@ def run_hook(
         "execution_assignment": "UNASSIGNED",
     }
     observation_path = write_observation(repo_root, observation)
-    session_md_status = "NOT_REQUESTED"
-    if args.update_session_md:
-        session_md_status = patch_session_md_observation(
-            repo_root,
-            provider=provider,
-            session_ref=session_ref,
-            connection_state="OBSERVED",
-        )
+    session_md_status = (
+        "DEPRECATED_ANCHOR_DB_ONLY" if args.update_session_md else "NOT_REQUESTED"
+    )
 
     inject_body = {
         "project_id": project_id,

@@ -79,9 +79,50 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("state.selectedModeCoordinateKey = coordinate.key", open_slice)
+        self.assertIn("state.selectedModeCoordinateKey = null", open_slice)
         self.assertNotIn("openProviderChatSummary", open_slice)
         self.assertIn("node-mode-session-cards", CSS)
         self.assertIn("node-mode-session-card", CSS)
+
+    def test_chat_toggle_has_no_message_count_badge(self) -> None:
+        self.assertNotIn('id="conversation-badge"', HTML)
+        self.assertNotIn("conversationBadge:", APP)
+        self.assertNotIn("function updateConversationBadge", APP)
+
+    def test_fresh_and_import_projects_are_visible_utility_rail_entries(self) -> None:
+        self.assertIn('id="fresh-project-rail-button"', HTML)
+        self.assertIn('id="import-project-rail-button"', HTML)
+        self.assertIn("<small>Fresh</small>", HTML)
+        self.assertIn("<small>Import</small>", HTML)
+        self.assertIn("freshProjectRailButton:", APP)
+        self.assertIn("importProjectRailButton:", APP)
+        self.assertIn(
+            'elements.freshProjectRailButton.addEventListener("click", openFreshProjectWizard)',
+            APP,
+        )
+        self.assertIn("elements.projectDialog.showModal()", APP)
+
+    def test_import_project_root_uses_native_directory_picker(self) -> None:
+        self.assertIn('id="project-root-browse"', HTML)
+        self.assertIn('class="project-root-picker"', HTML)
+        self.assertIn("projectRootBrowse:", APP)
+        self.assertIn('api("/v1/host/select-directory"', APP)
+        self.assertIn('elements.projectForm.elements.namedItem("project_root")', APP)
+        self.assertIn('result.status === "DIRECTORY_SELECTED"', APP)
+        self.assertIn(".project-root-picker", CSS)
+
+    def test_fresh_project_directory_uses_native_directory_picker(self) -> None:
+        fresh_dialog = HTML[HTML.index('id="fresh-project-dialog"') :]
+        self.assertIn('name="project_root"', fresh_dialog)
+        self.assertIn('id="fresh-project-root-browse"', fresh_dialog)
+        self.assertIn("freshProjectRootBrowse:", APP)
+        self.assertIn("function selectFreshProjectRoot()", APP)
+        self.assertIn(
+            'elements.freshProjectForm.elements.namedItem("project_root")', APP
+        )
+        self.assertIn(
+            'project_root: String(form.get("project_root") || "").trim()', APP
+        )
 
     def test_right_chat_dock_and_sliding_inspector_contract(self) -> None:
         self.assertIn('class="conductor-panel glass-panel"', HTML)
@@ -321,17 +362,12 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("session-working-directory", CSS)
         self.assertIn(".session-working-directory.hidden", CSS)
 
-    def test_approval_uses_server_owned_canonical_route(self) -> None:
-        self.assertIn("/v1/governance/proposals/", APP)
-        decision_slice = APP[
-            APP.index("async function decideGovernanceProposal") :
-            APP.index("function requestedPermissionSummary")
-        ]
-        self.assertNotIn("commander_surface", decision_slice)
-        self.assertNotIn("idempotency_key", decision_slice)
-        self.assertIn('decideGovernanceProposal(proposal, "APPROVE")', APP)
-        self.assertIn('decideGovernanceProposal(proposal, "CANCEL")', APP)
-        self.assertIn('"proposal-cancel", "Cancel"', APP)
+    def test_action_inbox_excludes_governance_approval_controls(self) -> None:
+        self.assertNotIn("/v1/governance/proposals/", APP)
+        self.assertNotIn("async function decideGovernanceProposal", APP)
+        self.assertNotIn('decideGovernanceProposal(proposal, "APPROVE")', APP)
+        self.assertNotIn('decideGovernanceProposal(proposal, "CANCEL")', APP)
+        self.assertNotIn('"proposal-cancel", "Cancel"', APP)
 
     def test_actions_are_separate_from_chat_and_keep_scroll_stable(self) -> None:
         self.assertIn('id="action-inbox-button"', HTML)
@@ -344,7 +380,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("/v1/conductor-room/delegations/", APP)
         message_slice = APP[
             APP.index("function renderRoomMessages") : APP.index(
-                "function renderGovernanceProposalCard"
+                "function renderComposerState"
             )
         ]
         self.assertNotIn("renderGovernanceProposalCard(proposal)", message_slice)

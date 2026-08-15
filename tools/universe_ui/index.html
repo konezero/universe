@@ -47,6 +47,8 @@
       <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
       <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
       <button type="button" data-primary-view="meeting" title="Meeting Room"><span aria-hidden="true">&#9672;</span><small>Meeting</small></button>
+      <button id="fresh-project-rail-button" type="button" title="Start fresh project"><span aria-hidden="true">&#10022;</span><small>Fresh</small></button>
+      <button id="import-project-rail-button" type="button" title="Import existing project"><span aria-hidden="true">&#43;</span><small>Import</small></button>
     </nav>
 
     <aside class="project-rail universe-rail">
@@ -195,7 +197,6 @@
             <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse conversation" aria-label="Collapse conversation" aria-expanded="true">
               <span class="chat-dock-icon" aria-hidden="true">&#128172;</span>
               <span class="chat-dock-label">Chat</span>
-              <span id="conversation-badge" class="chat-badge hidden">0</span>
               <span class="chat-dock-chevron" aria-hidden="true">&#9660;</span>
             </button>
             <div class="conversation-title-wrap">
@@ -282,7 +283,7 @@
   <dialog id="project-dialog">
     <form id="project-form" method="dialog">
       <div class="dialog-heading">
-        <h2>Connect project</h2>
+        <h2>Import existing project</h2>
         <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
       </div>
       <label>
@@ -291,11 +292,14 @@
       </label>
       <label>
         Project root
-        <input name="project_root" autocomplete="off" required>
+        <span class="project-root-picker">
+          <input name="project_root" autocomplete="off" required>
+          <button id="project-root-browse" type="button" class="secondary-button">Browse…</button>
+        </span>
       </label>
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
-        <button type="submit" class="primary-button">Connect</button>
+        <button type="submit" class="primary-button">Import</button>
       </div>
       <p id="project-form-error" class="form-error" role="alert"></p>
     </form>
@@ -903,6 +907,13 @@
             <input name="kind" autocomplete="off" placeholder="desktop-app" required>
           </label>
         </div>
+        <label>
+          Project directory
+          <span class="project-root-picker">
+            <input name="project_root" autocomplete="off" required>
+            <button id="fresh-project-root-browse" type="button" class="secondary-button">Browse…</button>
+          </span>
+        </label>
         <label>
           Goal
           <textarea name="goal" rows="3" required></textarea>

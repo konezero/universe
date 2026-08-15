@@ -239,17 +239,21 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("from-env", ref)
         self.assertEqual("GROK_SESSION_ID", source)
 
-    def test_project_and_mode_from_session_md_fields(self) -> None:
-        fields = {"Project": "universe", "Mode": "MASTER", "Node": "universe"}
+    def test_project_and_mode_ignore_stale_session_md_fields(self) -> None:
+        fields = {"Project": "stale", "Mode": "MASTER", "Node": "stale"}
         project = resolve_project_id(
             args=_args(),
             session_fields=fields,
-            environment={},
+            environment={"UNIVERSE_PROJECT_ID": "universe"},
             repo_root=None,
         )
-        mode = resolve_mode(args=_args(), session_fields=fields, environment={})
+        mode = resolve_mode(
+            args=_args(),
+            session_fields=fields,
+            environment={"UNIVERSE_MODE": "CONDUCTOR"},
+        )
         self.assertEqual("universe", project)
-        self.assertEqual("MASTER", mode)
+        self.assertEqual("CONDUCTOR", mode)
 
     def test_dry_run_skips_http(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

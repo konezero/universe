@@ -11,13 +11,18 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Protocol
 import uuid
 
-from agent_session_gateway import AgentSessionError, normalize_permission_request
+from agent_session_gateway import (
+    AgentSessionError,
+    GitTrace2RepositoryObserver,
+    normalize_permission_request,
+)
 
 
 PROVIDER_SESSION_STREAM_SCHEMA = "universe.provider-session-stream.v1"
@@ -191,6 +196,10 @@ class ProviderSessionService:
         retained_permissions: int | None = None,
         permission_timeout_seconds: float = 600.0,
         action_store: ProviderActionStore | None = None,
+        repository_git_observer_factory: Callable[[Path], Any] | None = (
+            GitTrace2RepositoryObserver
+        ),
+        repository_git_poll_seconds: float = 0.5,
     ) -> None:
         self.resolver = resolver
         self.host_factory = host_factory
@@ -214,6 +223,8 @@ class ProviderSessionService:
             ),
         )
         self.permission_timeout_seconds = max(0.1, float(permission_timeout_seconds))
+        self.repository_git_observer_factory = repository_git_observer_factory
+        self.repository_git_poll_seconds = max(0.05, float(repository_git_poll_seconds))
         self._lock = threading.RLock()
         self._handles: dict[str, _HostHandle] = {}
         self._messages: dict[str, deque[dict[str, Any]]] = {}
@@ -228,6 +239,16 @@ class ProviderSessionService:
             tuple[str, str], dict[str, Any]
         ] = OrderedDict()
         self._closed = threading.Event()
+        self._repository_git_observers: dict[str, Any] = {}
+        self._repository_git_chat_keys: dict[str, set[str]] = {}
+        self._repository_git_thread: threading.Thread | None = None
+        if self.repository_git_observer_factory is not None:
+            self._repository_git_thread = threading.Thread(
+                target=self._poll_repository_git,
+                name="provider-session-repository-git",
+                daemon=True,
+            )
+            self._repository_git_thread.start()
 
     def snapshot(self, chat_key: str) -> dict[str, Any]:
         key = _chat_key(chat_key)
@@ -547,9 +568,19 @@ class ProviderSessionService:
             self._permission_waiters.clear()
             handles = list(self._handles.values())
             workers = list(self._active_threads.values())
+            repository_git_observers = list(self._repository_git_observers.values())
             self._handles.clear()
+            self._repository_git_observers.clear()
+            self._repository_git_chat_keys.clear()
+        if self._repository_git_thread is not None:
+            self._repository_git_thread.join(timeout=5)
         for handle in handles:
             handle.host.close()
+        for observer in repository_git_observers:
+            try:
+                observer.close()
+            except Exception:
+                pass
         for worker in workers:
             worker.join(timeout=5)
 
@@ -599,7 +630,79 @@ class ProviderSessionService:
                 "Provider Session identity is not verified",
                 409,
             )
+        self._register_repository_git(chat_key, descriptor)
         return descriptor
+
+    def _register_repository_git(
+        self, chat_key: str, descriptor: Mapping[str, Any]
+    ) -> None:
+        factory = self.repository_git_observer_factory
+        if factory is None:
+            return
+        root = Path(str(descriptor["repository_root"])).expanduser().resolve()
+        repository_key = str(root).casefold()
+        with self._lock:
+            observer = self._repository_git_observers.get(repository_key)
+            if observer is not None:
+                self._repository_git_chat_keys.setdefault(repository_key, set()).add(
+                    chat_key
+                )
+                return
+        try:
+            candidate = factory(root)
+        except Exception:
+            return
+        with self._lock:
+            observer = self._repository_git_observers.get(repository_key)
+            if observer is None:
+                self._repository_git_observers[repository_key] = candidate
+                observer = candidate
+            self._repository_git_chat_keys.setdefault(repository_key, set()).add(chat_key)
+        if observer is not candidate:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+
+    def _poll_repository_git(self) -> None:
+        while not self._closed.wait(self.repository_git_poll_seconds):
+            with self._lock:
+                entries = [
+                    (
+                        repository_key,
+                        observer,
+                        tuple(self._repository_git_chat_keys.get(repository_key, ())),
+                    )
+                    for repository_key, observer in self._repository_git_observers.items()
+                ]
+            for _repository_key, observer, chat_keys in entries:
+                try:
+                    milestones = observer.drain_work_statuses()
+                except Exception:
+                    continue
+                for milestone in milestones:
+                    operation = str(milestone.get("operation") or "").upper()
+                    state = str(milestone.get("state") or "").upper()
+                    if operation not in {"COMMIT", "PUSH"} or state not in {
+                        "COMPLETED",
+                        "FAILED",
+                    }:
+                        continue
+                    exit_code = milestone.get("exit_code")
+                    message_id = "repository_git_" + uuid.uuid4().hex[:24]
+                    for chat_key in chat_keys:
+                        self._publish_work_status(
+                            chat_key,
+                            message_id,
+                            state,
+                            operation=operation,
+                            error_code=(
+                                f"GIT_EXIT_{exit_code}"
+                                if state == "FAILED" and isinstance(exit_code, int)
+                                else None
+                            ),
+                            details=milestone,
+                        )
 
     def _ensure_handle(
         self, chat_key: str, descriptor: Mapping[str, Any]

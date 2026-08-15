@@ -155,6 +155,19 @@ class FakeProviderHost:
         self.closed = True
 
 
+class FakeRepositoryGitObserver:
+    def __init__(self) -> None:
+        self.milestones: list[dict[str, Any]] = []
+        self.closed = False
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        milestones, self.milestones = self.milestones, []
+        return milestones
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class ProviderSessionServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.hosts: list[FakeProviderHost] = []
@@ -194,6 +207,7 @@ class ProviderSessionServiceTests(unittest.TestCase):
         *,
         retained_idempotency: int | None = None,
         retained_permissions: int | None = None,
+        repository_git_observer_factory: Callable[[Path], Any] | None = None,
     ) -> ProviderSessionService:
         return ProviderSessionService(
             resolver=self.resolver,
@@ -201,6 +215,8 @@ class ProviderSessionServiceTests(unittest.TestCase):
             permission_timeout_seconds=2,
             retained_idempotency=retained_idempotency,
             retained_permissions=retained_permissions,
+            repository_git_observer_factory=repository_git_observer_factory,
+            repository_git_poll_seconds=0.01,
         )
 
     def tearDown(self) -> None:
@@ -279,6 +295,37 @@ class ProviderSessionServiceTests(unittest.TestCase):
         public = json.dumps(statuses)
         self.assertNotIn("argv", public)
         self.assertNotIn("repository_root", public)
+
+    def test_repository_git_milestone_reaches_registered_session_without_turn(self) -> None:
+        observer = FakeRepositoryGitObserver()
+        self.service.close()
+        self.service = self._new_service(
+            repository_git_observer_factory=lambda _root: observer
+        )
+        self.service.snapshot(CHAT_KEY)
+        observer.milestones = [
+            {
+                "operation": "PUSH",
+                "state": "COMPLETED",
+                "exit_code": 0,
+                "source": "GIT_TRACE2",
+                "commit_sha": "e" * 40,
+                "short_sha": "eeeeeee",
+                "commit_message": "External push",
+                "branch": "codex/external",
+                "remote": "origin",
+                "changed_files": 1,
+            }
+        ]
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            actions = self.service.snapshot(CHAT_KEY)["actions"]
+            if actions:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(["PUSH"], [item["operation"] for item in actions])
+        self.assertEqual("codex/external -> origin · eeeeeee", actions[0]["summary"])
 
     def test_internal_callbacks_bind_reply_before_terminal_event(self) -> None:
         observed: list[tuple[str, str]] = []

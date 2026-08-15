@@ -360,6 +360,135 @@ class GitTrace2Observer:
         return records
 
 
+class GitTrace2RepositoryObserver(GitTrace2Observer):
+    """Collect Git milestones from every Git process for one repository.
+
+    Git ignores Trace2 values from repository-local config. Registration uses a
+    global ``includeIf gitdir`` entry whose included file targets only this
+    repository. The collector deletes completed raw traces after extracting the
+    bounded commit/push milestone so argv never enters Universe events.
+    """
+
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        metadata_reader: Callable[[str], Mapping[str, Any]] | None = None,
+        native_runner: Callable[[NativeCliRequest], NativeCliResult] = run_native_cli,
+        register: bool = True,
+    ) -> None:
+        super().__init__(cwd, metadata_reader=metadata_reader)
+        self.path.unlink(missing_ok=True)
+        self.runtime_root = self.path.parent
+        self.event_root = self.runtime_root / "repository-events"
+        self.event_root.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.runtime_root / "repository-trace2.config"
+        self._native_runner = native_runner
+        self.registration_state = "NOT_REQUESTED"
+        if register:
+            self.registration_state = self._register_repository_target()
+
+    def environment(self, base: Mapping[str, str]) -> dict[str, str]:
+        environment = dict(base)
+        environment["GIT_TRACE2_EVENT"] = str(self.event_root)
+        environment["GIT_TRACE2_EVENT_NESTING"] = "20"
+        environment["GIT_TRACE_REDACT"] = "1"
+        return environment
+
+    def close(self) -> None:
+        return None
+
+    def _register_repository_target(self) -> str:
+        executable = shutil.which("git.exe") or shutil.which("git")
+        if not executable:
+            return "GIT_UNAVAILABLE"
+        disabled_trace = {
+            "GIT_TRACE2_EVENT": "0",
+            "GIT_TRACE2_EVENT_NESTING": "0",
+            "GIT_TRACE_REDACT": "1",
+        }
+
+        def run(*arguments: str) -> NativeCliResult:
+            return self._native_runner(
+                NativeCliRequest(
+                    executable=Path(executable),
+                    arguments=tuple(arguments),
+                    cwd=self.cwd,
+                    timeout_seconds=10,
+                    output_encoding="utf-8",
+                    max_output_chars=20_000,
+                    environment=disabled_trace,
+                )
+            )
+
+        git_dir_result = run("rev-parse", "--absolute-git-dir")
+        if git_dir_result.status != "COMPLETED" or git_dir_result.return_code != 0:
+            return "REPOSITORY_UNAVAILABLE"
+        git_dir = str(git_dir_result.stdout or "").strip().replace(chr(92), "/")
+        if not git_dir:
+            return "REPOSITORY_UNAVAILABLE"
+        target = str(self.event_root.resolve()).replace(chr(92), "/")
+        config = "\n".join(
+            (
+                "[trace2]",
+                f"\teventTarget = {target}",
+                "\teventNesting = 20",
+                "\teventBrief = true",
+                "",
+            )
+        )
+        try:
+            self.config_path.write_text(config, encoding="utf-8", newline="\n")
+        except OSError:
+            return "CONFIG_WRITE_FAILED"
+        key = f"includeIf.gitdir/i:{git_dir}.path"
+        current = run("config", "--global", "--get-all", key)
+        configured = {
+            line.strip().casefold()
+            for line in str(current.stdout or "").splitlines()
+            if line.strip()
+        }
+        wanted = str(self.config_path.resolve()).casefold()
+        if wanted in configured:
+            return "REGISTERED"
+        added = run("config", "--global", "--add", key, str(self.config_path.resolve()))
+        if added.status != "COMPLETED" or added.return_code != 0:
+            return "REGISTRATION_FAILED"
+        return "REGISTERED"
+
+    def _read_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        try:
+            paths = sorted(path for path in self.event_root.iterdir() if path.is_file())
+        except OSError:
+            return records
+        for path in paths:
+            try:
+                lines = path.read_bytes().splitlines()
+            except OSError:
+                continue
+            terminal = False
+            for line in lines:
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, Mapping):
+                    continue
+                item = dict(record)
+                records.append(item)
+                if str(item.get("event") or "").casefold() in {"exit", "atexit"}:
+                    terminal = True
+            if terminal:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if len(self._emitted) > 10_000:
+            self._emitted.clear()
+        return records
+
+
 def worker_session_contract(session: Any) -> dict[str, Any]:
     """Describe one session's lifetime for uniform assertions across providers."""
 

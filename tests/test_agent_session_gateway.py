@@ -18,6 +18,7 @@ from agent_session_gateway import (  # noqa: E402
     CodexAppServerSession,
     GrokAcpSession,
     GitTrace2Observer,
+    GitTrace2RepositoryObserver,
     build_platform_approval_evidence,
     cli_auto_approve_status,
     normalize_permission_request,
@@ -168,6 +169,49 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertNotIn("argv", json.dumps(milestones))
         observer.close()
         self.assertFalse(observer.path.exists())
+
+    def test_repository_git_trace2_observer_collects_external_process_file(self) -> None:
+        observer = GitTrace2RepositoryObserver(
+            self.root,
+            metadata_reader=lambda _operation: {
+                "commit_sha": "a" * 40,
+                "short_sha": "aaaaaaa",
+                "commit_message": "External commit",
+                "branch": "codex/external",
+                "changed_files": 2,
+            },
+            register=False,
+        )
+        environment = observer.environment({})
+        self.assertEqual(str(observer.event_root), environment["GIT_TRACE2_EVENT"])
+        trace = observer.event_root / "external-process"
+        trace.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {
+                        "event": "start",
+                        "sid": "external-commit",
+                        "argv": ["git", "commit", "secret message"],
+                    },
+                    {
+                        "event": "cmd_name",
+                        "sid": "external-commit",
+                        "name": "commit",
+                    },
+                    {"event": "exit", "sid": "external-commit", "code": 0},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        milestones = observer.drain_work_statuses()
+
+        self.assertEqual(["COMMIT"], [item["operation"] for item in milestones])
+        self.assertEqual("External commit", milestones[0]["commit_message"])
+        self.assertNotIn("argv", json.dumps(milestones))
+        self.assertFalse(trace.exists())
 
     def test_permission_request_uses_acp_option_contract(self) -> None:
         request = normalize_permission_request(

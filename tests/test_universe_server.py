@@ -390,6 +390,28 @@ class UniverseLocalServiceTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def test_native_directory_picker_returns_selected_host_path(self) -> None:
+        self.server.directory_selector = lambda: str(self.project_root)
+
+        status, payload = self.request(
+            "POST", "/v1/host/select-directory", {}, self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("DIRECTORY_SELECTED", payload["status"])
+        self.assertEqual(str(self.project_root.resolve()), payload["directory"])
+
+    def test_native_directory_picker_cancel_is_a_noop(self) -> None:
+        self.server.directory_selector = lambda: None
+
+        status, payload = self.request(
+            "POST", "/v1/host/select-directory", {}, self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("DIRECTORY_SELECTION_CANCELLED", payload["status"])
+        self.assertIsNone(payload["directory"])
+
     def create_task_proposal_fixture(
         self, *, scope: JsonObject | None = None
     ) -> JsonObject:
@@ -6995,6 +7017,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         request = {
             "intent": {
                 "project": "Local trading workstation",
+                "project_root": str(self.project_root),
                 "kind": "desktop-app",
                 "technologies": ["python", "pyside6", "sqlite"],
                 "goal": "stable unattended operation with recoverable state",
@@ -7009,6 +7032,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(201, status)
         self.assertEqual("FRESH_PROJECT_COMPOSITION_PROPOSAL_READY", result["status"])
         composition = result["composition"]
+        self.assertEqual(str(self.project_root), composition["intent"]["project_root"])
         self.assertEqual("USER_SELECTION_REQUIRED", composition["selection_state"])
         self.assertEqual(
             "durable-desktop-state", composition["selected_route"]["route_id"]

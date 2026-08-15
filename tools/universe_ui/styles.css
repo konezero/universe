@@ -2148,6 +2148,16 @@ dialog label {
   font-weight: 620;
 }
 
+.project-root-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.project-root-picker .secondary-button {
+  white-space: nowrap;
+}
+
 .wizard-dialog {
   width: min(900px, calc(100vw - 28px));
 }

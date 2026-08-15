@@ -1922,7 +1922,7 @@ def normalize_fresh_project_composition_request(value: Any) -> dict[str, Any]:
         request["intent"],
         field="fresh_project_composition_request.intent",
         required=frozenset({"project", "kind", "technologies", "goal"}),
-        optional=frozenset({"constraints", "target_users"}),
+        optional=frozenset({"constraints", "project_root", "target_users"}),
     )
     normalized_intent = normalize_fresh_project_intent(
         {
@@ -1939,6 +1939,10 @@ def normalize_fresh_project_composition_request(value: Any) -> dict[str, Any]:
             "intent.constraints must contain at most 32 entries",
         )
     normalized_intent["constraints"] = constraints
+    if "project_root" in intent:
+        normalized_intent["project_root"] = str(
+            _canonical_project_root(intent["project_root"])
+        )
     if "target_users" in intent:
         normalized_intent["target_users"] = _required_text(
             intent["target_users"], "intent.target_users"
@@ -15135,6 +15139,32 @@ class RoomParticipantPermissionRegistry:
                     record["resolved_at"] = utc_now()
 
 
+def select_directory_with_native_dialog() -> str | None:
+    """Open the Host's native directory chooser without changing project state."""
+
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            selected = filedialog.askdirectory(
+                parent=root,
+                mustexist=True,
+                title="Select project root",
+            )
+        finally:
+            root.destroy()
+    except Exception as error:
+        raise UniverseError(
+            "HOST_DIRECTORY_PICKER_UNAVAILABLE",
+            f"native directory picker is unavailable: {error}",
+        ) from error
+    return str(selected).strip() or None
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -15160,6 +15190,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         remote_gateway_state_path: Path | None = None,
         remote_connector_state_path: Path | None = None,
         remote_connector_config_path: Path | None = None,
+        directory_selector: Callable[[], str | None] | None = None,
     ):
         self.store = store
         self.project_task_proposals = ProjectTaskProposalAdapter()
@@ -15175,6 +15206,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.remote_connector_config_path = (
             remote_connector_config_path or default_connector_config_path()
         ).resolve()
+        self.directory_selector = (
+            directory_selector or select_directory_with_native_dialog
+        )
         self.host_profile = host_profile or HostProfileStore()
         try:
             self.host_profile.ensure_initialized()
@@ -23420,6 +23454,42 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/v1/host/select-directory":
+                try:
+                    selected = self.server.directory_selector()
+                    directory = None
+                    if selected:
+                        selected_path = (
+                            Path(selected).expanduser().resolve(strict=True)
+                        )
+                        if not selected_path.is_dir():
+                            raise UniverseError(
+                                "HOST_DIRECTORY_SELECTION_INVALID",
+                                "selected path must be an existing directory",
+                            )
+                        directory = str(selected_path)
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": (
+                                "DIRECTORY_SELECTED"
+                                if directory is not None
+                                else "DIRECTORY_SELECTION_CANCELLED"
+                            ),
+                            "directory": directory,
+                        },
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except Exception as error:
+                    self._send_error(
+                        UniverseError(
+                            "HOST_DIRECTORY_PICKER_UNAVAILABLE",
+                            f"native directory picker is unavailable: {error}",
+                        )
+                    )
+                return
             if path == "/v1/projects/register":
                 project, created = self.server.store.register_project(body)
                 self._send(
@@ -25432,6 +25502,7 @@ def create_server(
     remote_gateway_state_path: Path | None = None,
     remote_connector_state_path: Path | None = None,
     remote_connector_config_path: Path | None = None,
+    directory_selector: Callable[[], str | None] | None = None,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -25464,6 +25535,7 @@ def create_server(
         remote_gateway_state_path=remote_gateway_state_path,
         remote_connector_state_path=remote_connector_state_path,
         remote_connector_config_path=remote_connector_config_path,
+        directory_selector=directory_selector,
     )
 
 

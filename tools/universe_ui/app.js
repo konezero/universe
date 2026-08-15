@@ -168,6 +168,7 @@ const elements = {
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
+  projectRootBrowse: document.querySelector("#project-root-browse"),
   settingsButton: document.querySelector("#settings-button"),
   sessionObservatoryButton: document.querySelector("#session-observatory-button"),
   sessionObservatoryTopbarButton: document.querySelector(
@@ -232,6 +233,8 @@ const elements = {
   goalPlanMap: document.querySelector("#goal-plan-map"),
   editSelectedGoal: document.querySelector("#edit-selected-goal"),
   utilityRail: document.querySelector(".utility-rail"),
+  freshProjectRailButton: document.querySelector("#fresh-project-rail-button"),
+  importProjectRailButton: document.querySelector("#import-project-rail-button"),
   mobileWorkTabs: document.querySelector(".mobile-work-tabs"),
   mobileDelegateGoal: document.querySelector("#mobile-delegate-goal"),
   mobileEditPlan: document.querySelector("#mobile-edit-plan"),
@@ -338,6 +341,7 @@ const elements = {
   roomSessionBindingList: document.querySelector("#room-session-binding-list"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
+  freshProjectRootBrowse: document.querySelector("#fresh-project-root-browse"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
   freshProjectIntent: document.querySelector("#fresh-project-intent"),
   freshProjectRoutes: document.querySelector("#fresh-project-routes"),
@@ -373,7 +377,6 @@ const elements = {
   chatResizeHandle: document.querySelector("#chat-resize-handle"),
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationExpand: document.querySelector("#conversation-expand"),
-  conversationBadge: document.querySelector("#conversation-badge"),
   actionInboxButton: document.querySelector("#action-inbox-button"),
   actionInboxBadge: document.querySelector("#action-inbox-badge"),
   actionInboxDialog: document.querySelector("#action-inbox-dialog"),
@@ -2038,6 +2041,11 @@ function selectNodeModeNode(nodeId) {
 
 function openNodeModeCoordinate(coordinate) {
   // ACTIVE/attached is observed state. It must not select or route a chat.
+  if (state.selectedModeCoordinateKey === coordinate.key) {
+    state.selectedModeCoordinateKey = null;
+    renderNodeModes();
+    return;
+  }
   state.selectedModeCoordinateKey = coordinate.key;
   selectNodeModeNode(coordinate.nodeId);
   renderNodeModes();
@@ -3774,31 +3782,6 @@ function mergeGovernanceProposalInbox(projectId, proposals) {
 }
 
 
-function conversationMessageCount() {
-  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
-    return state.sessionDelegationDraft ? 1 : 0;
-  }
-  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
-    return (state.providerSessionMessages || []).length;
-  }
-  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    return (state.conductorMessages || []).length;
-  }
-  return (state.roomMessages || []).length;
-}
-
-function updateConversationBadge() {
-  if (!elements.conversationBadge) return;
-  const count = conversationMessageCount();
-  if (count > 0) {
-    elements.conversationBadge.textContent = count > 99 ? "99+" : String(count);
-    elements.conversationBadge.classList.remove("hidden");
-  } else {
-    elements.conversationBadge.textContent = "0";
-    elements.conversationBadge.classList.add("hidden");
-  }
-}
-
 function syncConversationToggle(collapsed) {
   if (!elements.conversationToggle) return;
   const title = collapsed ? "Expand conversation" : "Collapse conversation";
@@ -4090,7 +4073,6 @@ function finishRoomMessageRender(previousScrollTop, stickToBottom = false) {
   elements.roomMessageList.scrollTop = stickToBottom
     ? elements.roomMessageList.scrollHeight
     : previousScrollTop;
-  updateConversationBadge();
   renderActionInbox();
 }
 
@@ -9690,6 +9672,7 @@ async function submitFreshProjectIntent(event) {
   const form = new FormData(elements.freshProjectForm);
   const intent = {
     project: String(form.get("project") || "").trim(),
+    project_root: String(form.get("project_root") || "").trim(),
     kind: String(form.get("kind") || "").trim(),
     technologies: commaList(form.get("technologies")),
     goal: String(form.get("goal") || "").trim(),
@@ -10098,6 +10081,42 @@ async function submitProject(event) {
   } catch (error) {
     elements.projectFormError.textContent = error.message;
   }
+}
+
+async function selectHostDirectory(input, button, errorOutput) {
+  button.disabled = true;
+  errorOutput.textContent = "";
+  try {
+    const result = await api("/v1/host/select-directory", {
+      method: "POST",
+      body: {},
+    });
+    if (result.status === "DIRECTORY_SELECTED" && result.directory) {
+      input.value = result.directory;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+    }
+  } catch (error) {
+    errorOutput.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectProjectRoot() {
+  return selectHostDirectory(
+    elements.projectForm.elements.namedItem("project_root"),
+    elements.projectRootBrowse,
+    elements.projectFormError
+  );
+}
+
+function selectFreshProjectRoot() {
+  return selectHostDirectory(
+    elements.freshProjectForm.elements.namedItem("project_root"),
+    elements.freshProjectRootBrowse,
+    elements.freshProjectError
+  );
 }
 
 async function submitRelease(event) {
@@ -11549,6 +11568,10 @@ function bindEvents() {
   document
     .querySelector("#start-project-topbar-button")
     .addEventListener("click", openFreshProjectWizard);
+  elements.freshProjectRailButton.addEventListener("click", openFreshProjectWizard);
+  elements.importProjectRailButton.addEventListener("click", () =>
+    elements.projectDialog.showModal()
+  );
   elements.dispatchForm.addEventListener("submit", submitDispatch);
   elements.composerActionButton.addEventListener("click", () =>
     toggleComposerActionMenu()
@@ -11591,6 +11614,8 @@ function bindEvents() {
     );
   });
   elements.projectForm.addEventListener("submit", submitProject);
+  elements.projectRootBrowse.addEventListener("click", selectProjectRoot);
+  elements.freshProjectRootBrowse.addEventListener("click", selectFreshProjectRoot);
   elements.workerBindingScope.addEventListener("change", renderWorkerBindingSettings);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
 

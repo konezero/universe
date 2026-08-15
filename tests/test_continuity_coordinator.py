@@ -72,45 +72,29 @@ class ProjectContinuityCoordinatorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "GCS"
-        state = self.root / ".ai" / "runtime" / "state"
-        state.mkdir(parents=True)
-        self.session_path = state / "session.md"
-        self.anchor_path = state / "current_anchor_frame.md"
+        self.root.mkdir(parents=True)
+        self.runtime_coordinate = None
         self.backend = FakeBackend()
         self.coordinator = ProjectContinuityCoordinator(
             Path(self.temp.name) / "universe.sqlite3",
             self.backend,
             clock=lambda: "2026-08-02T12:00:00Z",
+            coordinate_resolver=lambda _root: self.runtime_coordinate,
         )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def write_coordinates(self, *, session_id: str = "session-1") -> None:
-        self.session_path.write_text(
-            "\n".join(
-                (
-                    "Node: GCS",
-                    "Mode: MASTER",
-                    f"Session ID: {session_id}",
-                    "Frame ID: frame-1",
-                    "Executable Runtime Currentness: CURRENT",
-                    "Source Commit: " + "a" * 40,
-                )
-            ),
-            encoding="utf-8",
-        )
-        self.anchor_path.write_text(
-            "\n".join(
-                (
-                    f"Session ID: {session_id}",
-                    "Frame ID: frame-1",
-                    "Anchor ID: anchor-1",
-                    "Executable Runtime Currentness: CURRENT",
-                )
-            ),
-            encoding="utf-8",
-        )
+        self.runtime_coordinate = {
+            "node": "GCS",
+            "mode": "MASTER",
+            "session_id": session_id,
+            "frame_id": "frame-1",
+            "anchor_id": "anchor-1",
+            "currentness": "CURRENT",
+            "source_ref": "git-object-database://GCS@" + "a" * 40,
+        }
 
     def test_save_writes_checkpoint_and_resume_without_git_publication(self) -> None:
         self.write_coordinates()
@@ -142,6 +126,7 @@ class ProjectContinuityCoordinatorTests(unittest.TestCase):
             Path(self.temp.name) / "universe.sqlite3",
             self.backend,
             clock=lambda: "2026-08-02T12:05:00Z",
+            coordinate_resolver=lambda _root: self.runtime_coordinate,
         )
         second = reopened.save(**values)
         self.assertEqual("AUTO_CONTINUITY_SAVED", first["status"])
@@ -168,6 +153,7 @@ class ProjectContinuityCoordinatorTests(unittest.TestCase):
             Path(self.temp.name) / "retry.sqlite3",
             backend,
             clock=lambda: "2026-08-02T12:06:00Z",
+            coordinate_resolver=lambda _root: self.runtime_coordinate,
         )
         values = {
             "project_root": self.root,
@@ -189,8 +175,7 @@ class ProjectContinuityCoordinatorTests(unittest.TestCase):
         self.assertEqual(2, len(backend.calls))
 
     def test_unknown_coordinates_skip_without_writing_project_store(self) -> None:
-        self.session_path.write_text("Node: GCS\nMode: MASTER\nSession ID: UNKNOWN\n")
-        self.anchor_path.write_text("Anchor ID: UNKNOWN\n")
+        self.runtime_coordinate = None
         result = self.coordinator.save(
             project_root=self.root,
             trigger="NORMAL_STOP",
@@ -200,9 +185,8 @@ class ProjectContinuityCoordinatorTests(unittest.TestCase):
         self.assertEqual("SESSION_COORDINATES_UNAVAILABLE", result["reason"])
         self.assertEqual([], self.backend.calls)
 
-    def test_live_runtime_coordinate_overrides_stale_static_state(self) -> None:
-        self.session_path.write_text("Node: universe\nSession ID: UNKNOWN\n")
-        self.anchor_path.write_text("Anchor ID: UNKNOWN\n")
+    def test_live_runtime_coordinate_overrides_resolver_state(self) -> None:
+        self.runtime_coordinate = None
         result = self.coordinator.save(
             project_root=self.root,
             trigger="NORMAL_STOP",
