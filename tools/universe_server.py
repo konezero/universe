@@ -238,6 +238,14 @@ from universe_app.work_loop_prediction import (
     build_result_fanout,
     build_work_loop_predictions,
 )
+from universe_file_index import (
+    FileIndexError,
+    coordinate_from_request,
+    index_status,
+    require_mode_current_anchor,
+    search_index,
+    sync_index,
+)
 
 API_SCHEMA = "universe.local-service.v1"
 _RETRIEVAL_TOKEN_RE = re.compile(r"[\w-]{2,}", flags=re.UNICODE)
@@ -4658,6 +4666,22 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_memory_project_link
                 ON project_memory(project_id, link_state, node_ref, memory_id);
 
+                CREATE TABLE IF NOT EXISTS project_file_index (
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    relative_path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    text_excerpt TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, relative_path)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_file_index_project_time
+                ON project_file_index(project_id, indexed_at, relative_path);
+
                 CREATE TABLE IF NOT EXISTS career_promotion_queue (
                     queue_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -9010,6 +9034,87 @@ class UniverseStore:
         }
         material["retrieval_digest"] = _json_sha256(material)
         return material
+
+    def _require_project_anchor(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, str]:
+        project = self.get_project(project_id)
+        try:
+            mode, anchor_id = coordinate_from_request(payload if isinstance(payload, Mapping) else {})
+            used = require_mode_current_anchor(
+                Path(project["project_root"]), mode=mode, anchor_id=anchor_id
+            )
+        except FileIndexError as error:
+            raise UniverseError(error.error_code, error.detail) from error
+        return {
+            "project_id": project["project_id"],
+            "project_root": project["project_root"],
+            **used,
+        }
+
+    def sync_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        bound = self._require_project_anchor(project_id, payload)
+        with self._connection() as connection:
+            index = sync_index(
+                connection,
+                project_id=bound["project_id"],
+                project_root=Path(bound["project_root"]),
+            )
+        return {
+            "schema": API_SCHEMA,
+            "status": "FILE_INDEX_SYNCED",
+            "project_id": bound["project_id"],
+            "mode": bound["mode"],
+            "anchor_id": bound["anchor_id"],
+            "index": index,
+        }
+
+    def search_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        bound = self._require_project_anchor(project_id, payload)
+        query = str(payload.get("query") or "")
+        try:
+            with self._connection() as connection:
+                search = search_index(
+                    connection,
+                    project_id=bound["project_id"],
+                    query=query,
+                    limit=int(payload.get("limit") or 20),
+                )
+        except FileIndexError as error:
+            raise UniverseError(error.error_code, error.detail) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "FILE_SEARCH_COMPLETED",
+            "project_id": bound["project_id"],
+            "mode": bound["mode"],
+            "anchor_id": bound["anchor_id"],
+            "search": search,
+        }
+
+    def project_file_index_status(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            status = index_status(connection, project_id=project["project_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "FILE_INDEX_COLLECTED",
+            "project_id": project["project_id"],
+            "index": status,
+        }
+
+    def project_retrieval_context(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        bound = self._require_project_anchor(project_id, payload)
+        retrieval = self.build_project_llm_retrieval_context(
+            bound["project_id"],
+            query=str(payload.get("query") or ""),
+            node_ids=list(payload.get("node_ids") or []),
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "RETRIEVAL_CONTEXT_READY",
+            "project_id": bound["project_id"],
+            "mode": bound["mode"],
+            "anchor_id": bound["anchor_id"],
+            "retrieval": retrieval,
+        }
 
     def create_context_pack(
         self, project_id: str, value: Any
@@ -24067,6 +24172,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if suffix == "":
                 self._send(HTTPStatus.OK, self.server.store.get_project(project_id))
                 return
+            if suffix == "/file-index":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.project_file_index_status(project_id),
+                )
+                return
             if suffix == "/integration-template-proposal":
                 self.server.store.get_project(project_id)
                 self._send(
@@ -26310,6 +26421,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/file-index/sync":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.sync_project_file_index(parts[0], body),
+                )
+                return
+            if parts is not None and parts[1] == "/file-index/search":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.search_project_file_index(parts[0], body),
+                )
+                return
+            if parts is not None and parts[1] == "/retrieval-context":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.project_retrieval_context(parts[0], body),
+                )
+                return
             if parts is not None and parts[1] == "/context-packs":
                 pack, created = self.server.store.create_context_pack(parts[0], body)
                 self._send(
@@ -27040,6 +27169,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memories/link",
             "/memories",
             "/career-promotion-queue",
+            "/file-index/sync",
+            "/file-index/search",
+            "/file-index",
+            "/retrieval-context",
             "/context-packs",
             "/release-proposals/apply",
             "/release-proposals",
