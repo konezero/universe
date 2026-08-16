@@ -17,8 +17,13 @@ Read `REPOSITORY_MANIFEST.md`, then `.ai/START_HERE.md`, then
 `.ai/runtime/project_instance/boot_command_entry.md`.
 
 Runtime contracts are indexed by `.ai/core/README.md`.
-Current values come from `.ai/runtime/state/session.md` and
-`.ai/runtime/state/current_anchor_frame.md`.
+`.ai/runtime/state/session.md` and
+`.ai/runtime/state/current_anchor_frame.md` are companion refs only.
+Do not treat their Mode, Role, or Anchor fields as current. Use the Mode Current Anchor in `.ai/runtime/state/project_runtime.sqlite3`
+for the requested Mode. Open the session SQL under
+`.ai/runtime/session_store/` bound to that Current Anchor. Create that
+session SQL only when it is absent; do not start a new session that
+ignores the Current Anchor.
 
 For source-only `OS_STATUS`, those state files and any checkpoint,
 Resume Archive, validation, or Runtime Image documents are observed

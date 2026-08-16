@@ -20,8 +20,10 @@ Runtime Workspace: `.ai/`
 3. `.ai/START_HERE.md`
 4. `.ai/core/README.md`
 5. `.ai/runtime/project_instance/boot_command_entry.md`
-6. `.ai/runtime/state/session.md`
-7. `.ai/runtime/state/current_anchor_frame.md`
+6. `.ai/runtime/state/project_runtime.sqlite3` Mode Current Anchor; use it
+7. `.ai/runtime/session_store/` bound to that Current Anchor; create only if absent
+
+`session.md` and `current_anchor_frame.md` are companion refs only.
 
 ## Installation Evidence
 
