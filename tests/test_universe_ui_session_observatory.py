@@ -95,6 +95,23 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("typeof options.isCurrent === \"function\"", APP)
         self.assertIn("if (!isCurrent()) return false", APP)
 
+    def test_session_graph_is_a_separate_read_only_navigation_surface(self) -> None:
+        self.assertIn('data-primary-view="sessions"', HTML)
+        self.assertIn('api("/v1/session-graph")', APP)
+        self.assertIn("function buildSessionGraph()", APP)
+        self.assertIn('state.view === "sessions"', APP)
+        self.assertIn('item.kind === "session_anchor"', APP)
+        self.assertIn("selectNodeModeSession(coordinate, session)", APP)
+        self.assertIn("MODE_ANCHOR", APP)
+        self.assertIn("SESSION_ANCHOR", APP)
+        self.assertIn("TASK_FRAME", APP)
+        self.assertIn('id="graph-legend"', HTML)
+        self.assertIn('if (view === "sessions") fitGraphView();', APP)
+        self.assertIn('state.view === "sessions" ? 0.12 : 0.5', APP)
+        self.assertIn('state.selectedProject?.project_id', APP)
+        self.assertIn('visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to)', APP)
+        self.assertIn(".node-key.session-anchor", CSS)
+
     def test_chat_toggle_has_no_message_count_badge(self) -> None:
         self.assertNotIn('id="conversation-badge"', HTML)
         self.assertNotIn("conversationBadge:", APP)
@@ -444,6 +461,12 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('deliveryState === "ACCEPTED_BY_MASTER"', APP)
         self.assertNotIn("DELIVERED_TO_MASTER", APP)
 
+    def test_semantic_project_graph_is_separate_from_session_graph(self) -> None:
+        self.assertIn('/semantic-graph', APP)
+        self.assertIn('function buildSemanticProjectGraph', APP)
+        self.assertIn('projection only', APP)
+        self.assertIn('if (state.view === "semantic")', APP)
+
     def test_project_graph_labels_functional_nodes_with_seed_provenance(self) -> None:
         self.assertIn("Project Seed node", HTML)
         self.assertIn('projection_origin: "PROJECT_SEED"', APP)
@@ -470,6 +493,21 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('binding.observer_currentness === "CURRENT"', rail_slice)
         self.assertNotIn("binding.anchor_temporality", rail_slice)
 
+
+    def test_provider_session_stream_requires_verified_identity(self) -> None:
+        eligible_slice = APP[
+            APP.index("function providerSessionRoomIsEligible") : APP.index(
+                "function providerSessionRoomCacheFor"
+            )
+        ]
+        openable_slice = APP[
+            APP.index("function providerSessionRoomIsOpenable") : APP.index(
+                "function providerSessionUnreadCount"
+            )
+        ]
+        self.assertIn('identityState === "VERIFIED"', eligible_slice)
+        self.assertIn('currentness === "CURRENT"', eligible_slice)
+        self.assertIn('identityState === "VERIFIED"', openable_slice)
 
     def test_provider_session_background_events_keep_selected_transcript_focused(self) -> None:
         selection_slice = APP[

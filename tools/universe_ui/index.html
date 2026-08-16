@@ -17,6 +17,7 @@
       <nav id="primary-nav" class="primary-nav" aria-label="Workspace surfaces">
         <button type="button" class="selected" data-primary-view="work" title="Project goal plan">Work Spine</button>
         <button type="button" data-primary-view="timeline" title="Project timeline graph">Timeline</button>
+        <button type="button" data-primary-view="sessions" title="Mode, Session Anchor, and Task Frame lineage">Sessions</button>
         <button type="button" data-primary-view="documents" title="Document graph">Documents</button>
         <button type="button" data-primary-view="memory" title="Project memory (inspector)">Memory</button>
         <button type="button" data-primary-view="future" title="Future paths (inspector)">Future</button>
@@ -43,6 +44,7 @@
     <nav class="utility-rail" aria-label="Universe tools">
       <button class="selected" type="button" data-primary-view="work" title="Home"><span aria-hidden="true">&#8962;</span><small>Home</small></button>
       <button type="button" data-primary-view="map" title="Graph"><span aria-hidden="true">&#9675;</span><small>Graph</small></button>
+      <button type="button" data-primary-view="sessions" title="Session Graph"><span aria-hidden="true">&#8644;</span><small>Sessions</small></button>
       <button type="button" data-primary-view="memory" title="Memory"><span aria-hidden="true">&#9673;</span><small>Memory</small></button>
       <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
       <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
@@ -139,7 +141,7 @@
           </div>
           <button id="prepare-project-button" class="secondary-button" type="button" title="Queue project-map discovery">Request Project Map</button>
         </div>
-        <div class="toolbar-legend graph-legend" aria-hidden="true">
+        <div id="graph-legend" class="toolbar-legend graph-legend" aria-hidden="true">
           <span><i class="node-key project"></i>Project</span>
           <span><i class="node-key system"></i>Project Seed node</span>
           <span><i class="node-key predicted"></i>Predicted</span>

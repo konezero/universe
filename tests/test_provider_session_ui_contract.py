@@ -38,7 +38,9 @@ class ProviderSessionUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("[coordinate.key]: anchorSessionKey(session)", selection_slice)
-        self.assertIn("await openProviderChatSession(room, { session });", selection_slice)
+        self.assertIn("const opened = await openProviderChatSession(room, {", selection_slice)
+        self.assertIn("session,", selection_slice)
+        self.assertIn("isCurrent:", selection_slice)
         open_slice = APP[
             APP.index("async function openProviderChatSession") : APP.index(
                 "function closeProjectRoomStream"

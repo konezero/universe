@@ -672,9 +672,11 @@ class ProjectMasterHostTests(unittest.TestCase):
 
     def test_project_master_greets_only_new_provider_session(self) -> None:
         prompts: list[str] = []
+        session_options: list[dict[str, object]] = []
 
         class FakeSession:
-            def __init__(self, *, session_id, session_observer, **_kwargs) -> None:
+            def __init__(self, *, session_id, session_observer, **kwargs) -> None:
+                session_options.append(dict(kwargs))
                 self.session_id = session_id or "grok-session-new"
                 self.session_ref = f"grok-acp:{self.session_id}"
                 session_observer(self.session_id)
@@ -720,6 +722,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             resumed.reply(message)
             resumed.close()
 
+        self.assertEqual([900.0, 900.0], [item["response_timeout_seconds"] for item in session_options])
         self.assertIn("Enter MASTER Mode", prompts[0])
         self.assertIn("Project Room message is the current work request", prompts[0])
         self.assertIn("status?", prompts[0])

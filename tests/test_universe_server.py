@@ -1061,6 +1061,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
             plan["goals"][0]["milestones"][0]["todos"][0]["todo_id"],
         )
 
+        status, semantic = self.request("GET", "/v1/projects/GCS/semantic-graph")
+        self.assertEqual(200, status)
+        self.assertEqual("SEMANTIC_PROJECT_GRAPH_COLLECTED", semantic["status"])
+        self.assertTrue(semantic["invariants"]["projection_only"])
+        self.assertFalse(semantic["invariants"]["auto_promote"])
+        node_types = {item["entity_type"] for item in semantic["nodes"]}
+        self.assertTrue({"PROJECT", "GOAL", "MILESTONE", "TODO"}.issubset(node_types))
+        edge_types = {item["edge_type"] for item in semantic["edges"]}
+        self.assertTrue({"PROJECT_HAS_GOAL", "GOAL_HAS_MILESTONE", "MILESTONE_HAS_TODO"}.issubset(edge_types))
+
         stale = {
             "title": goal["title"],
             "description": goal["description"],
@@ -1884,6 +1894,51 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 for item in response["anchor"]["session_anchor_refs"]
             ],
         )
+
+    def test_session_graph_projects_mode_session_and_task_frame_lineage(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        first, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-graph-one",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-session-graph-one",
+            }
+        )
+        second, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-graph-two",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-session-graph-two",
+            }
+        )
+        self.server.task_frame_lineage.create_task_frame(
+            frame_ref="task-frame-session-graph",
+            origin_session_anchor_ref=first["session_anchor_ref"],
+            target_session_anchor_ref=second["session_anchor_ref"],
+        )
+
+        status, response = self.request(
+            "GET", "/v1/session-graph?project_id=GCS", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        graph = response["graph"]
+        self.assertEqual("SESSION_GRAPH_PROJECTED", graph["status"])
+        self.assertTrue(graph["projection_policy"]["read_only"])
+        self.assertFalse(graph["projection_policy"]["authority_created"])
+        node_types = [item["entity_type"] for item in graph["nodes"]]
+        self.assertEqual(1, node_types.count("MODE_ANCHOR"))
+        self.assertEqual(2, node_types.count("SESSION_ANCHOR"))
+        self.assertEqual(1, node_types.count("TASK_FRAME"))
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertIn("MODE_ANCHOR_HAS_SESSION_ANCHOR", edge_types)
+        self.assertIn("SESSION_ANCHOR_HAS_TASK_FRAME", edge_types)
+        self.assertIn("TASK_FRAME_TARGETS_SESSION", edge_types)
 
     def test_cross_session_delegation_fails_closed_without_project_room_delivery(
         self,
@@ -4895,6 +4950,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
             os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
         self.assertIsNone(self.server.project_master_stream_snapshot("GCS"))
 
+    def test_master_bridge_failed_stream_persists_terminal_delivery(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, registered = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "opaque-project-master-session",
+                "binding_evidence_ref": "project-host://GCS/master-session/registered",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        bridge = registered["bridge"]
+        receipt = {
+            "status": "DELIVERED",
+            "bridge_id": bridge["bridge_id"],
+            "project_id": "GCS",
+            "message_id": "room-placeholder",
+            "delivered_at": "2026-08-10T07:00:00Z",
+        }
+        with patch("universe_server.HttpProjectMasterBridge.deliver", return_value=receipt):
+            _, delivered = self.request(
+                "POST",
+                "/v1/projects/GCS/room/messages",
+                {
+                    "kind": "TASK_DRAFT",
+                    "body": "Run the bounded Master turn.",
+                    "idempotency_key": "room-master-failed-001",
+                },
+                self.token,
+            )
+        message = delivered["message"]
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/stream",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": message["message_id"],
+                    "event": "STARTED",
+                    "sequence": 0,
+                    "delta": "",
+                    "detail": "",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+            self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/stream",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": message["message_id"],
+                    "event": "FAILED",
+                    "sequence": 1,
+                    "delta": "",
+                    "detail": "ProjectMasterHostError: AGENT_RPC_TIMEOUT:session/prompt",
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+
+        failed = next(
+            item
+            for item in self.server.store.list_room_messages("GCS")
+            if item["message_id"] == message["message_id"]
+        )
+        self.assertEqual("FAILED", failed["delivery_state"])
+        self.assertEqual("FAILED", failed["delivery"]["status"])
+        self.assertEqual(
+            "ProjectMasterHostError: AGENT_RPC_TIMEOUT:session/prompt",
+            failed["delivery"]["detail"],
+        )
+        self.assertIsNone(self.server.project_master_stream_snapshot("GCS"))
+
     def test_master_bridge_stream_event_is_authenticated_and_published(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, registered = self.request(
@@ -5800,6 +5935,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "primary_proposal_digest": proposal["proposal_digest"],
             "approval_evidence_ref": evidence_ref,
             "task_frame_id": "gcs-bootstrap-frame-001",
+            "origin_session_anchor_ref": "session-anchor-approved-001",
             "repository_write": False,
         }
         client = Mock()
@@ -5822,6 +5958,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_CREATED", result["status"])
         self.assertEqual(host_result, result["task_frame"])
+        self.assertEqual(
+            "session-anchor-approved-001",
+            self.server.task_frame_lineage.get_task_frame(
+                "gcs-bootstrap-frame-001"
+            )["origin_session_anchor_ref"],
+        )
         forwarded = client.create_approved_descendant_task_frame.call_args.kwargs
         self.assertEqual(proposal["proposal_id"], forwarded["primary_proposal"]["proposal_id"])
         self.assertEqual("UNIVERSE_UI", forwarded["governance_approval"]["commander_surface"])
@@ -5855,6 +5997,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "request_ref": proposal["request_ref"],
             },
             "task_frame_id": "instruction-frame-001",
+            "origin_session_anchor_ref": "session-anchor-instruction-001",
             "repository_write": False,
         }
         client = Mock()
@@ -5877,6 +6020,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("INSTRUCTION_TASK_FRAME_CREATED", result["status"])
         self.assertEqual(proposal["request_ref"], result["parent_instruction_ref"])
+        self.assertEqual(
+            "session-anchor-instruction-001",
+            self.server.task_frame_lineage.get_task_frame(
+                "instruction-frame-001"
+            )["origin_session_anchor_ref"],
+        )
         forwarded = client.create_instruction_authorized_task_frame.call_args.kwargs
         self.assertEqual(
             {
@@ -6070,6 +6219,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "primary_proposal_digest": proposal["proposal_digest"],
             "approval_evidence_ref": approval["evidence_ref"],
             "task_frame_id": request["task_frame"]["frame_id"],
+            "origin_session_anchor_ref": "session-anchor-legacy-reconcile-001",
             "repository_write": False,
         }
         client = Mock()

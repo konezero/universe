@@ -3897,6 +3897,7 @@ class GrokProjectMasterRuntime:
         model: str = "",
         effort: str = "AUTO",
         max_turns: int = 8,
+        response_timeout_seconds: float = 900.0,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
@@ -3908,6 +3909,7 @@ class GrokProjectMasterRuntime:
         self.model = model.strip()
         self.effort = str(effort or "AUTO").strip().upper()
         self.max_turns = max(1, int(max_turns))
+        self.response_timeout_seconds = float(response_timeout_seconds)
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = (
             _text(actor_label, "actor_label")
@@ -4028,6 +4030,7 @@ class GrokProjectMasterRuntime:
                 effort=self.effort,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
+                response_timeout_seconds=self.response_timeout_seconds,
                 permission_requester=self._permission_requester,
                 session_observer=observe_session,
             )

@@ -11,6 +11,10 @@ const state = {
   expandedGoals: {},
   selectedProject: null,
   projection: null,
+  /** Read-only Mode Anchor → Session Anchor → Task Frame projection. */
+  sessionGraph: null,
+  /** Read-only typed projection from existing project stores. */
+  semanticGraph: null,
   /** project_id -> projection; multiverse always expands from this cache */
   projectionsByProject: {},
   dispatches: [],
@@ -147,6 +151,7 @@ const elements = {
   workspaceSubtitle: document.querySelector("#workspace-subtitle"),
   canvas: document.querySelector("#universe-graph"),
   graphEmpty: document.querySelector("#graph-empty"),
+  graphLegend: document.querySelector("#graph-legend"),
   graphHint: document.querySelector("#graph-hint"),
   graphTooltip: document.querySelector("#graph-node-tooltip"),
   graphZoomIn: document.querySelector("#graph-zoom-in"),
@@ -1069,11 +1074,12 @@ async function api(path, options = {}) {
 }
 
 async function refreshSupervisorSessions() {
-  const [audit, legacy, activity, chatCatalog] = await Promise.all([
+  const [audit, legacy, activity, chatCatalog, sessionGraph] = await Promise.all([
     api("/v1/runtime/audit"),
     api("/v1/supervisor/legacy-executors"),
     api("/v1/session-observer/sources"),
     api("/v1/session-observer/chat-rooms"),
+    api("/v1/session-graph").catch(() => null),
   ]);
   state.runtimeAudit = audit;
   state.runtimePreflight = audit.preflight || null;
@@ -1106,6 +1112,7 @@ async function refreshSupervisorSessions() {
   state.legacyExecutors = legacy.executors || [];
   state.providerActivitySources = activity.sources || [];
   state.providerChatRooms = chatCatalog.rooms || [];
+  state.sessionGraph = sessionGraph?.graph || state.sessionGraph;
   syncProviderSessionSubscriptions();
   prefillsObservatoryInjectForm();
   renderRuntimePreflight();
@@ -1113,6 +1120,7 @@ async function refreshSupervisorSessions() {
   renderSessionRail();
   renderNodeModes();
   renderProviderActivitySources();
+  if (state.view === "sessions") buildSessionGraph();
 }
 
 async function tailProviderSessions() {
@@ -3221,7 +3229,7 @@ function setGraphScale(nextScale) {
 
 /** Graph canvas modes only (not inspector tabs). */
 function showGraphView(view) {
-  const allowed = new Set(["universe", "timeline", "documents", "implementation"]);
+  const allowed = new Set(["universe", "semantic", "sessions", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
   state.view = view;
   document.body.classList.add("graph-mode");
@@ -3229,9 +3237,18 @@ function showGraphView(view) {
   state.focusedNodeId = null;
   elements.nodeBreadcrumb?.classList.add("hidden");
   syncPrimaryNavSelection(
-    view === "universe" ? "map" : view
+    ["universe", "semantic"].includes(view) ? "map" : view
   );
+  if (view !== "sessions") {
+    setGraphLegend([
+      { kind: "project", label: "Project" },
+      { kind: "system", label: "Project Seed node" },
+      { kind: "predicted", label: "Predicted" },
+      { kind: "document", label: "Document" },
+    ]);
+  }
   buildGraph();
+  if (view === "sessions") fitGraphView();
   renderDetails();
 }
 
@@ -3289,7 +3306,11 @@ function fitGraphView() {
   const viewportHeight = height / ratio;
   const spanX = Math.max(180, maxX - minX + 160);
   const spanY = Math.max(140, maxY - minY + 140);
-  const scale = Math.min(1.6, Math.max(0.5, Math.min(viewportWidth / spanX, viewportHeight / spanY)));
+  const minimumScale = state.view === "sessions" ? 0.12 : 0.5;
+  const scale = Math.min(
+    1.6,
+    Math.max(minimumScale, Math.min(viewportWidth / spanX, viewportHeight / spanY))
+  );
   state.graph.scale = scale;
   state.graph.x = -((minX + maxX) / 2) * scale;
   state.graph.y = -((minY + maxY) / 2) * scale;
@@ -3743,6 +3764,7 @@ async function selectProject(
     memoryBatchRunResult,
     memoryCandidateResult,
     workLoopResult,
+    semanticGraphResult,
   ] = await Promise.all([
     project.projection_available === false
       ? Promise.resolve(null)
@@ -3805,6 +3827,9 @@ async function selectProject(
         document_automation: null,
       })
     ),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`).catch(
+      () => ({ nodes: [], edges: [], invariants: { projection_only: true } })
+    ),
   ]);
   state.projection = projectionResult?.projection || null;
   if (state.projection) {
@@ -3840,6 +3865,7 @@ async function selectProject(
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
   state.memoryCandidates = memoryCandidateResult.candidates || [];
   state.workLoop = workLoopResult || null;
+  state.semanticGraph = semanticGraphResult || null;
   const goalPlanResult = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
   ).catch(() => ({ goals: [], unassigned_todos: [] }));
@@ -6228,6 +6254,7 @@ function providerSessionRoomIsEligible(room) {
   const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
   const bindingState = String(binding.state || "").toUpperCase();
   const currentness = String(binding.observer_currentness || "").toUpperCase();
+  const identityState = String(room?.identity_state || "").toUpperCase();
   const projectId = String(
     binding.current_project_id || binding.node || ""
   ).trim();
@@ -6236,7 +6263,8 @@ function providerSessionRoomIsEligible(room) {
       projectId &&
       sessionKind !== "WORKER" &&
       ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
-      currentness === "CURRENT"
+      currentness === "CURRENT" &&
+      identityState === "VERIFIED"
   );
 }
 
@@ -6351,6 +6379,7 @@ function providerSessionRoomIsOpenable(room) {
   const chatKey = String(room?.chat_key || "").trim();
   const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
   const bindingState = String(binding.state || "").toUpperCase();
+  const identityState = String(room?.identity_state || "").toUpperCase();
   const projectId = String(
     binding.current_project_id || binding.node || ""
   ).trim();
@@ -6358,7 +6387,8 @@ function providerSessionRoomIsOpenable(room) {
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
-      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState)
+      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
+      identityState === "VERIFIED"
   );
 }
 
@@ -6816,6 +6846,14 @@ function buildGraph() {
     buildMultiverseGraph();
     return;
   }
+  if (state.view === "sessions") {
+    buildSessionGraph();
+    return;
+  }
+  if (state.view === "semantic") {
+    buildSemanticProjectGraph();
+    return;
+  }
   if (state.view === "implementation") {
     if (state.selectedProject) {
       buildProjectInteriorGraph({ mode: "implementation" });
@@ -6840,6 +6878,159 @@ function buildGraph() {
     return;
   }
   buildProjectInteriorGraph({ mode: state.view });
+}
+
+function setGraphLegend(items) {
+  if (!elements.graphLegend) return;
+  elements.graphLegend.replaceChildren();
+  for (const item of items) {
+    const row = node("span");
+    row.append(node("i", `node-key ${item.kind}`), document.createTextNode(item.label));
+    elements.graphLegend.append(row);
+  }
+}
+
+function buildSemanticProjectGraph() {
+  const projection = state.semanticGraph || {};
+  const sourceNodes = projection.nodes || [];
+  const layerByType = {
+    PROJECT: 0,
+    GOAL: 1,
+    MILESTONE: 2,
+    TODO: 3,
+    PREDICTION: 2,
+    MEMORY: 2,
+    BENCH: 2,
+  };
+  const kindByType = {
+    PROJECT: "project",
+    GOAL: "goal",
+    MILESTONE: "milestone",
+    TODO: "todo",
+    PREDICTION: "predicted",
+    MEMORY: "memory",
+    BENCH: "bench",
+  };
+  setGraphLegend([
+    { kind: "project", label: "Project" },
+    { kind: "goal", label: "Goal" },
+    { kind: "milestone", label: "Milestone" },
+    { kind: "todo", label: "Todo" },
+    { kind: "predicted", label: "Prediction" },
+    { kind: "memory", label: "Memory" },
+    { kind: "bench", label: "Bench candidate" },
+  ]);
+  const graphNodes = sourceNodes.map((item) => ({
+    id: item.id,
+    label: item.label,
+    kind: kindByType[item.entity_type] || "related",
+    depth: layerByType[item.entity_type] ?? 4,
+    data: item,
+    x: 0,
+    y: 0,
+  }));
+  const layers = [...new Set(graphNodes.map((item) => item.depth))].sort((a, b) => a - b);
+  for (const depth of layers) {
+    const layer = graphNodes.filter((item) => item.depth === depth);
+    layer.forEach((item, index) => {
+      item.x = (index - (layer.length - 1) / 2) * 150;
+      item.y = (depth - 1.5) * 130;
+    });
+  }
+  const visible = new Set(graphNodes.map((item) => item.id));
+  state.graph.nodes = graphNodes;
+  state.graph.edges = (projection.edges || [])
+    .filter((edge) => visible.has(edge.from) && visible.has(edge.to))
+    .map((edge) => ({ from: edge.from, to: edge.to, kind: edge.edge_type, data: edge }));
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  if (elements.graphHint) {
+    elements.graphHint.classList.toggle("hidden", !graphNodes.length);
+    elements.graphHint.textContent = `Project Graph · ${state.selectedProject?.project_id || "Unknown"} · ${graphNodes.length} typed node(s) · projection only`;
+  }
+  drawGraph();
+}
+
+function buildSessionGraph() {
+  setGraphLegend([
+    { kind: "mode", label: "Mode" },
+    { kind: "mode-anchor", label: "Mode Anchor" },
+    { kind: "session-anchor", label: "Session Anchor" },
+    { kind: "task-frame", label: "Task Frame" },
+  ]);
+  const projection = state.sessionGraph || { nodes: [], edges: [] };
+  const selectedProjectId = String(state.selectedProject?.project_id || "").trim();
+  const projectedNodes = projection.nodes || [];
+  const sourceNodes = selectedProjectId
+    ? projectedNodes.filter((item) => item.project_id === selectedProjectId)
+    : projectedNodes;
+  const visibleNodeIds = new Set(sourceNodes.map((item) => item.id));
+  const projectIds = [...new Set(sourceNodes.map((item) => item.project_id).filter(Boolean))].sort();
+  const layerByType = {
+    PROJECT: 0,
+    MODE: 1,
+    MODE_ANCHOR: 2,
+    SESSION_ANCHOR: 3,
+    TASK_FRAME: 4,
+  };
+  const graphNodes = sourceNodes.map((item) => ({
+    id: item.id,
+    label: item.label,
+    kind: String(item.entity_type || "UNKNOWN").toLowerCase(),
+    depth: layerByType[item.entity_type] ?? 5,
+    projectId: item.project_id || null,
+    data: item,
+    x: 0,
+    y: 0,
+  }));
+  projectIds.forEach((projectId, projectIndex) => {
+    const group = graphNodes.filter((item) => item.projectId === projectId);
+    const maxLayerCount = Math.max(
+      1,
+      ...Object.values(layerByType).map(
+        (depth) => group.filter((item) => item.depth === depth).length
+      )
+    );
+    const groupWidth = Math.max(360, maxLayerCount * 86);
+    const centerX =
+      (projectIndex - (projectIds.length - 1) / 2) * (groupWidth + 90);
+    for (const depth of Object.values(layerByType)) {
+      const layer = group
+        .filter((item) => item.depth === depth)
+        .sort((left, right) => left.id.localeCompare(right.id));
+      layer.forEach((item, index) => {
+        item.x = centerX + (index - (layer.length - 1) / 2) * 82;
+        item.y = -220 + depth * 105;
+      });
+    }
+  });
+  state.graph.nodes = graphNodes;
+  state.graph.edges = (projection.edges || [])
+    .filter((edge) => visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to))
+    .map((edge) => ({
+      from: edge.from,
+      to: edge.to,
+      kind: String(edge.edge_type || "related").toLowerCase().replaceAll("_", "-"),
+      data: edge,
+    }));
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  if (elements.graphEmpty && !graphNodes.length) {
+    elements.graphEmpty.textContent = "No Mode or Session Anchor lineage is available";
+  }
+  if (elements.graphHint) {
+    const sessions = graphNodes.filter((item) => item.kind === "session_anchor").length;
+    const frames = graphNodes.filter((item) => item.kind === "task_frame").length;
+    elements.graphHint.classList.toggle("hidden", !graphNodes.length);
+    const scopeLabel = selectedProjectId || "All projects";
+    elements.graphHint.textContent =
+      `Session Graph · ${scopeLabel} · ${sessions} Session Anchor(s) · ${frames} Task Frame(s) · click a Session Anchor to bind its exact chat`;
+  }
+  drawGraph();
 }
 
 /** Fetch projections for every attached project so multiverse can stay fully expanded. */
@@ -6883,6 +7074,12 @@ function projectionForProject(projectId) {
  * Selection never hides nodes; drawGraph uses dim alpha for current depth.
  */
 function buildMultiverseGraph() {
+  setGraphLegend([
+    { kind: "project", label: "Project" },
+    { kind: "system", label: "Project Seed node" },
+    { kind: "predicted", label: "Predicted" },
+    { kind: "document", label: "Document" },
+  ]);
   const hub = {
     id: "universe:hub",
     label: "Universe",
@@ -7879,6 +8076,18 @@ function graphAccentColor(item) {
       soft: "rgba(177, 139, 255, 0.28)",
     };
   }
+  if (item.kind === "mode") {
+    return { fill: "rgba(56, 45, 96, 0.94)", stroke: "#b9a3ff", soft: "rgba(185, 163, 255, 0.24)" };
+  }
+  if (item.kind === "mode_anchor") {
+    return { fill: "rgba(24, 63, 105, 0.94)", stroke: "#73b9ff", soft: "rgba(115, 185, 255, 0.24)" };
+  }
+  if (item.kind === "session_anchor") {
+    return { fill: "rgba(18, 82, 72, 0.94)", stroke: "#67ddc3", soft: "rgba(103, 221, 195, 0.24)" };
+  }
+  if (item.kind === "task_frame") {
+    return { fill: "rgba(91, 55, 24, 0.94)", stroke: "#f1ae66", soft: "rgba(241, 174, 102, 0.24)" };
+  }
   if (item.kind === "setup") {
     return {
       fill: "rgba(82, 61, 24, 0.92)",
@@ -7919,6 +8128,9 @@ function graphNodeMetrics(item) {
   }
   if (item.kind === "project") {
     return { shape: "project", radius: 22, hitR: 28 };
+  }
+  if (["mode", "mode_anchor", "session_anchor", "task_frame"].includes(item.kind)) {
+    return { shape: "system", radius: item.kind === "session_anchor" ? 17 : 15, hitR: 22 };
   }
   if (item.kind === "system" || item.kind === "related" || item.kind === "focus") {
     return { shape: "system", radius: 14, hitR: 18 };
@@ -8053,6 +8265,10 @@ function graphNodeKindLabel(item) {
   if (item.kind === "universe") return "Universe";
   if (item.kind === "project") return "Project";
   if (item.kind === "system") return "System";
+  if (item.kind === "mode") return "Mode";
+  if (item.kind === "mode_anchor") return "Mode Anchor";
+  if (item.kind === "session_anchor") return "Session Anchor";
+  if (item.kind === "task_frame") return "Task Frame";
   return item.kind || "Node";
 }
 
@@ -8114,6 +8330,35 @@ function selectGraphNode(event) {
   const selected = hitTestGraphNode(point);
   if (!selected) return;
   state.inspectorDismissed = false;
+  if (state.view === "sessions") {
+    state.selectedNode = selected;
+    drawGraph();
+    renderDetails();
+    showInspectorTab("details");
+    if (selected.kind === "session_anchor") {
+      const anchorRef = String(selected.data?.ref || "");
+      const session = (state.supervisorSessions || []).find(
+        (item) => sessionAnchorRef(item) === anchorRef
+      );
+      if (!session) {
+        toast("This Session Anchor has no observable provider session", true);
+        return;
+      }
+      const coordinate = nodeModeCoordinates()
+        .flatMap((group) => group.modes)
+        .find((item) => item.sessions.some(
+          (candidate) => anchorSessionKey(candidate) === anchorSessionKey(session)
+        ));
+      if (!coordinate) {
+        toast("This Session Anchor has no visible Mode coordinate", true);
+        return;
+      }
+      selectNodeModeSession(coordinate, session).catch((error) =>
+        toast(error.message, true)
+      );
+    }
+    return;
+  }
   if (selected.kind === "universe") {
     // Depth 0 focus — tree stays fully expanded; only dim shifts.
     state.focusedNodeId = null;
@@ -12065,7 +12310,7 @@ function bindEvents() {
       else if (["memory", "future", "bench", "activity", "details"].includes(view)) {
         openInspectorSurface(view);
       } else if (view === "map" || view === "universe") {
-        showGraphView("universe");
+        showGraphView(state.selectedProject ? "semantic" : "universe");
       }
     });
   });
@@ -12098,14 +12343,14 @@ function bindEvents() {
         return;
       }
       if (view === "map" || view === "network" || view === "project" || view === "ecosystem") {
-        showGraphView("universe");
+        showGraphView(state.selectedProject ? "semantic" : "universe");
         if (view === "ecosystem") {
           // Project list lives in the left rail — just focus map + list context.
           elements.projectList?.focus?.();
         }
         return;
       }
-      if (view === "timeline" || view === "documents") {
+      if (view === "sessions" || view === "timeline" || view === "documents") {
         showGraphView(view);
         return;
       }
@@ -12159,7 +12404,7 @@ function bindGoalPlanEvents() {
       renderRoomMessages();
     });
   }
-  elements.goalPlanMap?.addEventListener("click", () => showGraphView("universe"));
+  elements.goalPlanMap?.addEventListener("click", () => showGraphView("semantic"));
   elements.editSelectedGoal?.addEventListener("click", () => {
     const goal = state.goals.find((item) => item.goal_id === state.selectedGoalId);
     if (goal) openGoalEditor(goal);
@@ -12169,8 +12414,9 @@ function bindGoalPlanEvents() {
     if (!button) return;
     const view = button.getAttribute("data-primary-view");
     if (view === "work") showGoalPlanView();
-    else if (view === "map") showGraphView("universe");
+    else if (view === "map") showGraphView(state.selectedProject ? "semantic" : "universe");
     else if (view === "documents") showGraphView("documents");
+    else if (view === "sessions") showGraphView("sessions");
     else if (view === "meeting") {
       state.settingsTab = "rooms";
       openSettings().catch((error) => toast(error.message, true));

@@ -60,7 +60,7 @@ from session_anchor_transport import (
     SessionAnchorTransport,
     SessionAnchorTransportError,
 )
-from task_frame_lineage import TaskFrameLineageStore
+from task_frame_lineage import TaskFrameLineageError, TaskFrameLineageStore
 from universe_dispatch import (
     DispatchError,
     HttpProjectMasterBridge,
@@ -13601,6 +13601,171 @@ class UniverseStore:
             "execution_assignment_created": False,
         }
 
+    def semantic_project_graph(self, project_id: str) -> dict[str, Any]:
+        """Project existing durable records as typed, non-authoritative graph facts."""
+        project = self.get_project(project_id)
+        project_id = project["project_id"]
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        node_ids: set[str] = set()
+        edge_ids: set[str] = set()
+
+        def add_node(
+            entity_type: str,
+            source_id: str,
+            label: str,
+            lifecycle_state: str,
+            source_kind: str,
+            source_ref: str,
+            data: Mapping[str, Any],
+        ) -> str:
+            node_id = f"{entity_type.lower()}:{source_id}"
+            if node_id in node_ids:
+                return node_id
+            node_ids.add(node_id)
+            nodes.append(
+                {
+                    "id": node_id,
+                    "entity_type": entity_type,
+                    "label": label or source_id,
+                    "lifecycle_state": lifecycle_state or "UNKNOWN",
+                    "provenance": {
+                        "source_kind": source_kind,
+                        "source_ref": source_ref,
+                    },
+                    "projection_only": True,
+                    "authority_state": "NONE",
+                    "data": dict(data),
+                }
+            )
+            return node_id
+
+        def add_edge(edge_type: str, source: str, target: str, source_ref: str) -> None:
+            edge_id = f"{edge_type}:{source}->{target}"
+            if edge_id in edge_ids:
+                return
+            edge_ids.add(edge_id)
+            edges.append(
+                {
+                    "id": edge_id,
+                    "edge_type": edge_type,
+                    "from": source,
+                    "to": target,
+                    "provenance": {"source_ref": source_ref},
+                    "projection_only": True,
+                }
+            )
+
+        project_node = add_node(
+            "PROJECT",
+            project_id,
+            str(project.get("display_name") or project_id),
+            str(project.get("state") or "REGISTERED"),
+            "PROJECT_CONNECTION",
+            f"universe://projects/{project_id}",
+            project,
+        )
+        goals = self.list_project_goals(project_id)
+        assigned_todos: set[str] = set()
+        for goal in goals:
+            goal_id = str(goal["goal_id"])
+            goal_node = add_node(
+                "GOAL", goal_id, str(goal.get("title") or goal_id),
+                str(goal.get("state") or "UNKNOWN"), "PROJECT_GOAL",
+                f"universe://goals/{goal_id}", goal,
+            )
+            add_edge("PROJECT_HAS_GOAL", project_node, goal_node, f"universe://goals/{goal_id}")
+            for milestone in goal.get("milestones", []):
+                milestone_id = str(milestone["milestone_id"])
+                milestone_node = add_node(
+                    "MILESTONE", milestone_id, str(milestone.get("title") or milestone_id),
+                    str(milestone.get("state") or "UNKNOWN"), "PROJECT_MILESTONE",
+                    f"universe://milestones/{milestone_id}", milestone,
+                )
+                add_edge("GOAL_HAS_MILESTONE", goal_node, milestone_node, f"universe://milestones/{milestone_id}")
+                for todo in milestone.get("todos", []):
+                    todo_id = str(todo["todo_id"])
+                    assigned_todos.add(todo_id)
+                    todo_node = add_node(
+                        "TODO", todo_id, str(todo.get("title") or todo_id),
+                        str(todo.get("state") or "UNKNOWN"), "PROJECT_TODO",
+                        f"universe://todos/{todo_id}", todo,
+                    )
+                    add_edge("MILESTONE_HAS_TODO", milestone_node, todo_node, f"universe://todos/{todo_id}")
+            for todo in goal.get("todos", []):
+                todo_id = str(todo["todo_id"])
+                assigned_todos.add(todo_id)
+                todo_node = add_node(
+                    "TODO", todo_id, str(todo.get("title") or todo_id),
+                    str(todo.get("state") or "UNKNOWN"), "PROJECT_TODO",
+                    f"universe://todos/{todo_id}", todo,
+                )
+                add_edge("GOAL_HAS_TODO", goal_node, todo_node, f"universe://todos/{todo_id}")
+
+        for todo in self.list_todos():
+            if todo.get("project_id") != project_id or str(todo["todo_id"]) in assigned_todos:
+                continue
+            todo_id = str(todo["todo_id"])
+            todo_node = add_node(
+                "TODO", todo_id, str(todo.get("title") or todo_id),
+                str(todo.get("state") or "UNKNOWN"), "PROJECT_TODO",
+                f"universe://todos/{todo_id}", todo,
+            )
+            add_edge("PROJECT_HAS_TODO", project_node, todo_node, f"universe://todos/{todo_id}")
+
+        for prediction in self.list_work_loop_predictions(project_id):
+            proposal_id = str(prediction.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            suggestions = prediction.get("suggestions") if isinstance(prediction.get("suggestions"), list) else []
+            prediction_node = add_node(
+                "PREDICTION", proposal_id,
+                str(prediction.get("title") or f"Prediction · {len(suggestions)} suggestion(s)"),
+                str(prediction.get("review_state") or "PROPOSAL_ONLY"),
+                "WORK_LOOP_PREDICTION", f"universe://work-loop/predictions/{proposal_id}", prediction,
+            )
+            add_edge("PROJECT_HAS_PREDICTION", project_node, prediction_node, f"universe://work-loop/predictions/{proposal_id}")
+
+        for memory in self.list_project_memories(project_id, limit=200):
+            memory_id = str(memory.get("memory_id") or "")
+            if not memory_id:
+                continue
+            memory_node = add_node(
+                "MEMORY", memory_id, str(memory.get("title") or memory_id),
+                str(memory.get("link_state") or memory.get("state") or "LINKED_ONLY"),
+                "PROJECT_MEMORY", str(memory.get("origin_ref") or f"universe://memories/{memory_id}"), memory,
+            )
+            add_edge("PROJECT_HAS_MEMORY", project_node, memory_node, f"universe://memories/{memory_id}")
+
+        for candidate in self.list_work_loop_review_candidates(project_id):
+            if str(candidate.get("sink_kind") or "").upper() != "BENCH":
+                continue
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                continue
+            bench_node = add_node(
+                "BENCH", candidate_id,
+                str(candidate.get("title") or candidate.get("summary") or "Bench recommendation"),
+                str(candidate.get("review_state") or "PENDING_REVIEW"),
+                "WORK_LOOP_BENCH_CANDIDATE", f"universe://work-loop/review-candidates/{candidate_id}", candidate,
+            )
+            add_edge("PROJECT_HAS_BENCH_CANDIDATE", project_node, bench_node, f"universe://work-loop/review-candidates/{candidate_id}")
+
+        return {
+            "schema": "universe.semantic-project-graph.v1",
+            "status": "SEMANTIC_PROJECT_GRAPH_COLLECTED",
+            "project_id": project_id,
+            "nodes": nodes,
+            "edges": edges,
+            "invariants": {
+                "projection_only": True,
+                "auto_promote": False,
+                "creates_authority": False,
+                "creates_task_frame": False,
+                "source_stores_remain_authoritative": True,
+            },
+        }
+
     def append_master_bridge_reply(
         self,
         project_id: str,
@@ -17556,6 +17721,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching Task Frame receipt",
                 HTTPStatus.CONFLICT,
             )
+        try:
+            self.task_frame_lineage.create_task_frame(
+                frame_ref=host_result.get("task_frame_id"),
+                origin_session_anchor_ref=host_result.get("origin_session_anchor_ref"),
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.CONFLICT,
+            ) from error
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -17653,6 +17829,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching instruction Task Frame receipt",
                 HTTPStatus.CONFLICT,
             )
+        try:
+            self.task_frame_lineage.create_task_frame(
+                frame_ref=host_result.get("task_frame_id"),
+                origin_session_anchor_ref=host_result.get("origin_session_anchor_ref"),
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.CONFLICT,
+            ) from error
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -18674,6 +18861,186 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "provider_ready": provider_ready,
             "providers": providers,
             "suggestions": suggestions,
+        }
+
+    def session_graph_projection(self, project_id: str | None = None) -> dict[str, Any]:
+        """Project the durable Mode/Session Anchor and Task Frame lineage.
+
+        This is a read-only projection over canonical stores. It never changes
+        currentness, chat selection, authority, or Task Frame state.
+        """
+
+        project_filter = str(project_id or "").strip() or None
+        if project_filter is not None:
+            self.store.get_project(project_filter)
+        anchors = self.session_supervisor.list_project_mode_anchors(
+            project_id=project_filter
+        )
+        sessions = self.session_supervisor.list_public_sessions(
+            include_hidden=True,
+        )
+        sessions_by_anchor = {
+            str(item.get("session_anchor_ref") or ""): item
+            for item in sessions
+            if str(item.get("session_anchor_ref") or "")
+        }
+        nodes: dict[str, dict[str, Any]] = {}
+        edges: dict[str, dict[str, Any]] = {}
+
+        def add_node(node_id: str, entity_type: str, label: str, **fields: Any) -> None:
+            nodes.setdefault(
+                node_id,
+                {
+                    "id": node_id,
+                    "entity_type": entity_type,
+                    "label": label,
+                    **fields,
+                },
+            )
+
+        def add_edge(edge_type: str, source: str, target: str, **fields: Any) -> None:
+            edge_id = f"{edge_type}:{source}:{target}"
+            edges.setdefault(
+                edge_id,
+                {
+                    "id": edge_id,
+                    "edge_type": edge_type,
+                    "from": source,
+                    "to": target,
+                    **fields,
+                },
+            )
+
+        included_session_refs: set[str] = set()
+        for anchor in anchors:
+            project_ref = str(anchor.get("project_id") or "UNKNOWN")
+            mode = str(anchor.get("mode") or "UNKNOWN").upper()
+            anchor_ref = str(anchor.get("anchor_ref") or "UNKNOWN")
+            project_node = f"project:{project_ref}"
+            mode_node = f"mode:{project_ref}:{mode}"
+            mode_anchor_node = f"mode_anchor:{anchor_ref}"
+            add_node(
+                project_node,
+                "PROJECT",
+                project_ref,
+                project_id=project_ref,
+                source_ref=f"universe://projects/{project_ref}",
+            )
+            add_node(
+                mode_node,
+                "MODE",
+                mode,
+                project_id=project_ref,
+                mode=mode,
+                source_ref="universe://runtime/mode-registry",
+            )
+            add_node(
+                mode_anchor_node,
+                "MODE_ANCHOR",
+                f"{mode} anchor",
+                ref=anchor_ref,
+                project_id=project_ref,
+                mode=mode,
+                revision=anchor.get("revision"),
+                created_at=anchor.get("created_at"),
+                updated_at=anchor.get("updated_at"),
+                source_ref=f"universe://supervisor/project-mode-anchors/{project_ref}/{mode}",
+            )
+            add_edge("PROJECT_HAS_MODE", project_node, mode_node)
+            add_edge("MODE_HAS_MODE_ANCHOR", mode_node, mode_anchor_node)
+            for lineage in anchor.get("session_anchor_refs") or []:
+                session_anchor_ref = str(
+                    lineage.get("session_anchor_ref") or ""
+                ).strip()
+                if not session_anchor_ref:
+                    continue
+                included_session_refs.add(session_anchor_ref)
+                session = sessions_by_anchor.get(session_anchor_ref) or {}
+                session_node = f"session_anchor:{session_anchor_ref}"
+                add_node(
+                    session_node,
+                    "SESSION_ANCHOR",
+                    str(session.get("alias") or session_anchor_ref),
+                    ref=session_anchor_ref,
+                    project_id=project_ref,
+                    mode=mode,
+                    session_id=(
+                        session.get("universe_session_id")
+                        or lineage.get("session_id")
+                    ),
+                    provider=(
+                        session.get("current_provider")
+                        or session.get("provider")
+                        or "UNKNOWN"
+                    ),
+                    state=session.get("state") or "UNKNOWN",
+                    currentness=session.get("currentness") or "UNKNOWN",
+                    is_default=bool(session.get("is_default")),
+                    attached_at=lineage.get("attached_at"),
+                    lineage_revision=lineage.get("revision"),
+                    source_ref=f"universe://sessions/{session_anchor_ref}",
+                )
+                add_edge(
+                    "MODE_ANCHOR_HAS_SESSION_ANCHOR",
+                    mode_anchor_node,
+                    session_node,
+                    revision=lineage.get("revision"),
+                    attached_at=lineage.get("attached_at"),
+                )
+
+        for frame in self.task_frame_lineage.list_task_frames():
+            origin_ref = str(frame.get("origin_session_anchor_ref") or "")
+            target_ref = str(frame.get("target_session_anchor_ref") or "")
+            if project_filter is not None and origin_ref not in included_session_refs:
+                continue
+            if origin_ref not in included_session_refs:
+                continue
+            frame_ref = str(frame.get("frame_ref") or "")
+            if not frame_ref:
+                continue
+            frame_node = f"task_frame:{frame_ref}"
+            origin_node = f"session_anchor:{origin_ref}"
+            origin = nodes.get(origin_node) or {}
+            add_node(
+                frame_node,
+                "TASK_FRAME",
+                frame_ref,
+                ref=frame_ref,
+                project_id=origin.get("project_id"),
+                mode=origin.get("mode"),
+                revision=frame.get("revision"),
+                result_count=len(frame.get("results") or []),
+                created_at=frame.get("created_at"),
+                source_ref=f"universe://task-frame-lineage/{frame_ref}",
+            )
+            add_edge("SESSION_ANCHOR_HAS_TASK_FRAME", origin_node, frame_node)
+            parent_ref = str(frame.get("parent_task_frame_ref") or "")
+            if parent_ref:
+                add_edge(
+                    "TASK_FRAME_CONTINUES",
+                    f"task_frame:{parent_ref}",
+                    frame_node,
+                )
+            if target_ref and target_ref in included_session_refs:
+                add_edge(
+                    "TASK_FRAME_TARGETS_SESSION",
+                    frame_node,
+                    f"session_anchor:{target_ref}",
+                )
+
+        return {
+            "schema": "universe.session-graph-projection.v1",
+            "status": "SESSION_GRAPH_PROJECTED",
+            "project_id": project_filter,
+            "observed_at": utc_now(),
+            "projection_policy": {
+                "read_only": True,
+                "selection_scope": "UI_NAVIGATION_ONLY",
+                "authority_created": False,
+                "source_write": False,
+            },
+            "nodes": sorted(nodes.values(), key=lambda item: item["id"]),
+            "edges": sorted(edges.values(), key=lambda item: item["id"]),
         }
 
     def runtime_audit(self) -> dict[str, Any]:
@@ -21130,6 +21497,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "ACCEPTED_BY_MASTER",
         }:
             return
+        if stream_event == "FAILED":
+            failed = self.store._update_room_delivery(
+                message,
+                delivery_state="FAILED",
+                delivery={
+                    **dict(message.get("delivery") or {}),
+                    "status": "FAILED",
+                    "failed_at": utc_now(),
+                    "detail": str(event.get("detail") or "PROJECT_MASTER_FAILED"),
+                },
+            )
+            try:
+                self.store.apply_master_message_todo_transition(
+                    project_id,
+                    failed["message_id"],
+                    outcome="FAILED",
+                )
+            except UniverseError:
+                pass
+            self.publish_project_room_changed(project_id)
         with self._project_master_stream_lock:
             if stream_event == "STARTED":
                 self._active_project_master_streams[project_id] = {
@@ -23124,6 +23511,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        if path == "/v1/session-graph":
+            query = parse_qs(urlsplit(self.path).query)
+            graph = self.server.session_graph_projection(
+                project_id=query.get("project_id", [None])[0]
+            )
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": graph["status"],
+                    "graph": graph,
+                },
+            )
+            return
         if path == "/v1/runtime/audit":
             try:
                 self._send(HTTPStatus.OK, self.server.runtime_audit())
@@ -23852,6 +24253,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "cases": self.server.store.list_experience_cases(project_id),
                     },
                 )
+                return
+            if suffix == "/semantic-graph":
+                self._send(HTTPStatus.OK, self.server.store.semantic_project_graph(project_id))
                 return
             if suffix == "/work-loop":
                 self._send(
@@ -26622,6 +27026,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/work-loop/predictions",
             "/work-loop/recover",
             "/work-loop",
+            "/semantic-graph",
             "/experience-matches",
             "/experience-patterns/auto",
             "/experience-pattern-proposals",

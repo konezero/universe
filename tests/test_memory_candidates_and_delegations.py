@@ -28,6 +28,7 @@ from universe_memory import (  # noqa: E402
     synthesize_memory_candidates,
 )
 from universe_server import UniverseError, create_server  # noqa: E402
+from session_anchor_transport import SessionAnchorTransportError  # noqa: E402
 
 
 def available_catalog() -> dict:
@@ -622,6 +623,12 @@ class MemoryCandidateApiTests(unittest.TestCase):
         )
         self.server.send_project_room_message = lambda *_args: (_ for _ in ()).throw(
             AssertionError("cross-session delegation must not enter Project Room")
+        )
+        self.server.session_anchor_transport.deliver = lambda *_args: (_ for _ in ()).throw(
+            SessionAnchorTransportError(
+                "TARGET_SESSION_DELEGATION_TRANSPORT_UNAVAILABLE",
+                "target Session Anchor transport is unavailable",
+            )
         )
         delegation, created = self.server.store.create_conductor_delegation(
             {

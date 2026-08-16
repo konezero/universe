@@ -1548,6 +1548,8 @@ class ClaudeCodeSession:
             "-p",
             "--output-format",
             "json",
+            "--system-prompt",
+            self.system_prompt,
             "--permission-mode",
             CLAUDE_PERMISSION_MODE,
             "--model",
@@ -1655,6 +1657,9 @@ class ClaudeCodeSession:
 
         if CLAUDE_FORBIDDEN_ARGUMENTS.intersection(arguments):
             raise AgentSessionError("CLAUDE_PERMISSION_BYPASS_FORBIDDEN")
+        ClaudeCodeSession._argument_value(
+            arguments, "--system-prompt", "CLAUDE_SYSTEM_PROMPT_REQUIRED"
+        )
         mode = ClaudeCodeSession._argument_value(
             arguments, "--permission-mode", "CLAUDE_PERMISSION_MODE_REQUIRED"
         )
@@ -1678,7 +1683,7 @@ class ClaudeCodeSession:
         )
         path = Path(temporary)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(f"{self.system_prompt}\n\n{text}\n")
+            stream.write(f"{text}\n")
         return path
 
 

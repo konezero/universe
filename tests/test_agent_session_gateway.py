@@ -278,7 +278,7 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         def runner(request):
             requests.append(request)
-            self.assertIn("System\n\nQuestion", request.stdin_path.read_text("utf-8"))
+            self.assertEqual("Question\n", request.stdin_path.read_text("utf-8"))
             return NativeCliResult(
                 contract="test",
                 status="COMPLETED",
@@ -366,6 +366,7 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertNotIn("--bare", arguments)
         self.assertIn("--no-session-persistence", arguments)
         self.assertEqual("default", arguments[arguments.index("--model") + 1])
+        self.assertEqual("System", arguments[arguments.index("--system-prompt") + 1])
         self.assertEqual("", arguments[arguments.index("--tools") + 1])
         self.assertEqual([], sessions)
 

@@ -314,6 +314,7 @@ class ClaudeResidentSession:
         self._state_lock = threading.Lock()
         self._turn_lock = threading.Lock()
         self._turn_done = threading.Event()
+        self._closed = threading.Event()
         self._turn_deltas: list[str] = []
         self._turn_text: list[str] = []
         self._turn_error: str | None = None
@@ -474,8 +475,12 @@ class ClaudeResidentSession:
             # One turn at a time per session.
             raise ClaudeResidentError("CLAUDE_TURN_ALREADY_ACTIVE")
         try:
+            if self._closed.is_set():
+                raise ClaudeResidentError("CLAUDE_TURN_CANCELLED")
             self.start_or_resume()
             process = self._process
+            if self._closed.is_set():
+                raise ClaudeResidentError("CLAUDE_TURN_CANCELLED")
             if process is None or not process.alive:
                 self._set_state(SESSION_FAILED)
                 raise ClaudeResidentError("CLAUDE_PROCESS_UNAVAILABLE")
@@ -525,10 +530,13 @@ class ClaudeResidentSession:
         return self._git_trace2.drain_work_statuses()
 
     def close(self) -> None:
+        # Publish cancellation before process teardown can surface as an
+        # unavailable/closed-stream error in the active turn.
+        self._closed.set()
+        self.cancel_turn()
         process, self._process = self._process, None
         if process is not None:
             process.close()
-        self.cancel_turn()
         self._set_state(SESSION_STOPPED)
         self._git_trace2.close()
 
@@ -644,7 +652,11 @@ class ClaudeResidentSession:
         kind = event.get("type")
         if kind == "__stream_closed__":
             if not self._turn_done.is_set() and self.session_status() == SESSION_BUSY:
-                self._turn_error = "CLAUDE_STREAM_CLOSED"
+                self._turn_error = (
+                    "CLAUDE_TURN_CANCELLED"
+                    if self._closed.is_set()
+                    else "CLAUDE_STREAM_CLOSED"
+                )
                 self._turn_done.set()
             return
         if kind == "system":

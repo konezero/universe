@@ -1019,6 +1019,22 @@ body.inspector-open .graph-hint {
   background: var(--red);
 }
 
+.node-key.mode {
+  background: #b9a3ff;
+}
+
+.node-key.mode-anchor {
+  background: #73b9ff;
+}
+
+.node-key.session-anchor {
+  background: #67ddc3;
+}
+
+.node-key.task-frame {
+  background: #f1ae66;
+}
+
 .command-composer {
   position: absolute;
   z-index: 7;

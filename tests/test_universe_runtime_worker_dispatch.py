@@ -182,7 +182,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual([(True, True, 5, 90.0, "test-model", schema)], observed)
+        self.assertEqual([(True, False, 5, 90.0, "test-model", schema)], observed)
         self.assertEqual("CLAUDE_CODE_CLI_ADAPTER", result["runtime_provider"])
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
@@ -202,6 +202,58 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
 
         self.assertEqual("WORKER_OUTPUT_SCHEMA_REQUIRED", captured.exception.code)
         self.assertEqual("CLAUDE_JSON_SCHEMA_REQUIRED", captured.exception.reason)
+
+    def test_invoke_structured_provider_validates_complete_object(self) -> None:
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        request = {
+            **self.request,
+            "result_mode": "STRUCTURED_JSON",
+            "output_contract": {
+                "json_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["summary"],
+                    "properties": {"summary": {"type": "string"}},
+                }
+            },
+        }
+        worker = {
+            "status": "COMPLETED",
+            "result": {"text": '{"summary":"bounded"}'},
+            "result_receipt_ref": "receipt://structured",
+        }
+        with patch.object(dispatcher, "_invoke_provider", return_value=worker):
+            result = dispatcher.invoke_structured_provider("GROK", request)
+
+        self.assertEqual({"summary": "bounded"}, result["structured_result"])
+
+    def test_invoke_structured_provider_rejects_narration_and_missing_fields(self) -> None:
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        request = {
+            **self.request,
+            "result_mode": "STRUCTURED_JSON",
+            "output_contract": {
+                "json_schema": {
+                    "type": "object",
+                    "required": ["summary"],
+                    "properties": {"summary": {"type": "string"}},
+                }
+            },
+        }
+        for text, reason in (
+            ('I will comply. {"summary":"bounded"}', "WORKER_RESULT_JSON_INVALID"),
+            ('{"other":"value"}', "WORKER_RESULT_SCHEMA_REQUIRED_FIELD_MISSING"),
+        ):
+            with self.subTest(text=text):
+                with patch.object(
+                    dispatcher,
+                    "_invoke_provider",
+                    return_value={"status": "COMPLETED", "result": {"text": text}},
+                ):
+                    with self.assertRaises(WorkerDispatchError) as captured:
+                        dispatcher.invoke_structured_provider("GROK", request)
+                self.assertEqual("WORKER_STRUCTURED_RESULT_INVALID", captured.exception.code)
+                self.assertEqual(reason, captured.exception.reason)
 
     @staticmethod
     def _dispatch_request() -> dict[str, object]:
