@@ -31,6 +31,12 @@ Current providers are `GROK`, `CODEX`, and `CLAUDE`. Provider capability is
 Host-dependent. An unavailable CLI remains `UNAVAILABLE`; it is not replaced
 by a simulated Worker result.
 
+Before each resident Project Master turn, Universe may attach a bounded
+project retrieval context containing linked Memory hits and Bench-derived
+skill recommendations. This context is evidence only. A recommended Skill is
+not a binding, Assignment, approval, Work Receipt, or permission; the Master
+must select it within a later Task Frame before a Worker can use it.
+
 Read-only provider requests require `repository_write_scope: NONE` and an empty
 mutation scope. A write-enabled turn receives only the exact `BOUNDED` scope
 already declared by the Master-owned Task Frame. Any one-time file permit is an

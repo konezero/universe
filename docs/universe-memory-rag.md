@@ -7,6 +7,19 @@ node link/unlink, search, and propose-links
 Not: Candidate auto-adoption, Seed mutation, automatic Bench/Future promotion,
 Career promotion, or raw transcript storage
 
+## LLM retrieval context
+
+Every resident Project Master message receives a bounded, project-local
+`universe.project-llm-retrieval-context.v1` projection. Retrieval includes
+only `LINKED` Memory, ranking Node and token matches first and using a bounded
+recent fallback when no explicit match exists. It also ranks matching
+project-local Bench observations first, then falls back to bounded successful
+project-local Skills. Bench recommendations remain `CANDIDATE_ONLY` with
+`TASK_FRAME_SELECTION_REQUIRED`; they create no skill binding, authority, or
+execution assignment. Explicit Context Packs carry the same retrieval
+projection for downstream planning. Unlinked or merely proposed Memory is not
+injected.
+
 ## Invariant
 
 ```text

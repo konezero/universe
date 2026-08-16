@@ -143,6 +143,7 @@ NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceBindingResolver = Callable[[Path], Mapping[str, Any]]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
+RetrievalContextResolver = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 NativeRoomObserver = Callable[[Mapping[str, Any]], None]
 RoomPermissionObserver = Callable[
     [Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]],
@@ -4067,6 +4068,11 @@ class GrokProjectMasterRuntime:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        retrieval_text = json.dumps(
+            message.get("retrieval_context", {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
@@ -4075,6 +4081,7 @@ class GrokProjectMasterRuntime:
             f"project_runtime_context: {context_text}\n\n"
             f"project_skill_plan_context: {skill_plan_text}\n\n"
             f"project_skill_binding_proposals: {skill_binding_text}\n\n"
+            f"project_retrieval_context: {retrieval_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -4284,6 +4291,11 @@ class CodexProjectMasterRuntime:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        retrieval_text = json.dumps(
+            message.get("retrieval_context", {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
@@ -4292,6 +4304,7 @@ class CodexProjectMasterRuntime:
             f"project_runtime_context: {context_text}\n\n"
             f"project_skill_plan_context: {skill_plan_text}\n\n"
             f"project_skill_binding_proposals: {skill_binding_text}\n\n"
+            f"project_retrieval_context: {retrieval_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -5573,6 +5586,7 @@ class ProjectMasterConversationWorker:
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
         governance_context: Mapping[str, Any] | None = None,
+        retrieval_context_resolver: RetrievalContextResolver | None = None,
         room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
         self.provider = provider
@@ -5589,6 +5603,7 @@ class ProjectMasterConversationWorker:
         self.governance_context = (
             dict(governance_context) if governance_context is not None else None
         )
+        self.retrieval_context_resolver = retrieval_context_resolver
         self.room_event_observer = room_event_observer
         self._last_completion: dict[str, Any] | None = None
         self._last_completion_at = 0.0
@@ -5740,6 +5755,15 @@ class ProjectMasterConversationWorker:
             provider_message["skill_binding_proposals"] = (
                 self.store.skill_binding_proposals()
             )
+            if self.retrieval_context_resolver is not None:
+                retrieval = self.retrieval_context_resolver(
+                    self.project_id, provider_message
+                )
+                if not isinstance(retrieval, Mapping):
+                    raise ProjectMasterHostError(
+                        "PROJECT_RETRIEVAL_CONTEXT_UNAVAILABLE"
+                    )
+                provider_message["retrieval_context"] = dict(retrieval)
             governance_context = self._governance_context_for_message()
             if governance_context is not None:
                 provider_message["governance_context"] = governance_context
@@ -5860,6 +5884,15 @@ class ProjectMasterConversationWorker:
                     "correlation_id": event.get("correlation_id"),
                 },
             }
+            if self.retrieval_context_resolver is not None:
+                retrieval = self.retrieval_context_resolver(
+                    self.project_id, provider_message
+                )
+                if not isinstance(retrieval, Mapping):
+                    raise ProjectMasterHostError(
+                        "PROJECT_RETRIEVAL_CONTEXT_UNAVAILABLE"
+                    )
+                provider_message["retrieval_context"] = dict(retrieval)
             governance_context = self._governance_context_for_message()
             if governance_context is not None:
                 provider_message["governance_context"] = governance_context
@@ -6231,6 +6264,7 @@ class ResidentProjectMasterHostManager:
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
+        retrieval_context_resolver: RetrievalContextResolver | None = None,
         release_source_binding_resolver: GovernanceContextResolver | None = None,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         room_event_observer: NativeRoomObserver | None = None,
@@ -6247,6 +6281,7 @@ class ResidentProjectMasterHostManager:
         )
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
+        self.retrieval_context_resolver = retrieval_context_resolver
         self.release_source_binding_resolver = release_source_binding_resolver
         self.completion_observer = completion_observer
         self.room_event_observer = room_event_observer
@@ -6430,6 +6465,7 @@ class ResidentProjectMasterHostManager:
                 # for every user or room message.
                 governance_context_resolver=None,
                 governance_context=governance_context,
+                retrieval_context_resolver=self.retrieval_context_resolver,
                 room_event_observer=self.room_event_observer,
             )
             host = LiveProjectMasterBridgeHost(

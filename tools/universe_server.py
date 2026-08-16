@@ -240,10 +240,18 @@ from universe_app.work_loop_prediction import (
 )
 
 API_SCHEMA = "universe.local-service.v1"
+_RETRIEVAL_TOKEN_RE = re.compile(r"[\w-]{2,}", flags=re.UNICODE)
 _AMBIENT_BROWSER_CONTEXT_RE = re.compile(
     r"<in-app-browser-context\b[^>]*>.*?(?:</in-app-browser-context>|\Z)",
     flags=re.IGNORECASE | re.DOTALL,
 )
+
+
+def _retrieval_tokens(value: Any) -> frozenset[str]:
+    return frozenset(
+        token.casefold()
+        for token in _RETRIEVAL_TOKEN_RE.findall(str(value or ""))
+    )
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
@@ -8854,6 +8862,155 @@ class UniverseStore:
             limit=bounded_limit,
         )
 
+    def build_project_llm_retrieval_context(
+        self,
+        project_id: str,
+        *,
+        query: str,
+        node_ids: Sequence[str] | None = None,
+        memory_limit: int = 8,
+        skill_limit: int = 8,
+    ) -> dict[str, Any]:
+        """Retrieve trusted Memory and Bench skill evidence for an LLM turn."""
+
+        project = self.get_project(project_id)
+        query_tokens = _retrieval_tokens(query)
+        selected_nodes = {
+            str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()
+        }
+        memory_hits: list[dict[str, Any]] = []
+        for memory in self.list_project_memories(
+            project["project_id"], link_state="LINKED", limit=200
+        ):
+            memory_tokens = _retrieval_tokens(
+                " ".join(
+                    [
+                        str(memory.get("title") or ""),
+                        str(memory.get("body") or ""),
+                        str(memory.get("node_ref") or ""),
+                    ]
+                )
+            )
+            shared = sorted(query_tokens & memory_tokens)
+            node_match = bool(
+                selected_nodes and str(memory.get("node_ref") or "") in selected_nodes
+            )
+            memory_hits.append(
+                {
+                    "memory_id": memory["memory_id"],
+                    "title": memory.get("title"),
+                    "body": str(memory.get("body") or "")[:2000],
+                    "node_ref": memory.get("node_ref"),
+                    "graph": memory.get("graph"),
+                    "origin_ref": memory.get("origin_ref"),
+                    "match": {
+                        "shared_tokens": shared[:20],
+                        "node_match": node_match,
+                    },
+                }
+            )
+        memory_hits.sort(
+            key=lambda item: (
+                -int(item["match"]["node_match"]),
+                -len(item["match"]["shared_tokens"]),
+                str(item["memory_id"]),
+            )
+        )
+
+        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        for observation in self.list_skill_observations(
+            project["project_id"], limit=500
+        ):
+            skill = observation["skill"]
+            execution = observation["execution_context"]
+            candidate_tokens = _retrieval_tokens(
+                " ".join(
+                    [
+                        str(skill.get("skill_id") or ""),
+                        str(skill.get("operation_class") or ""),
+                        str(execution.get("task_kind") or ""),
+                        str(execution.get("node_ref") or ""),
+                    ]
+                )
+            )
+            shared = sorted(query_tokens & candidate_tokens)
+            node_match = bool(
+                selected_nodes and str(execution.get("node_ref") or "") in selected_nodes
+            )
+            provider_ref = str(execution.get("provider_ref") or "UNKNOWN")
+            if provider_ref == "UNKNOWN":
+                provider_ref = provider_ref_from_model_ref(observation["model_ref"])
+            key = (
+                str(skill["skill_id"]),
+                str(skill["skill_version"]),
+                str(skill["operation_class"]),
+                str(observation["model_ref"]),
+                provider_ref,
+            )
+            candidate = grouped.setdefault(
+                key,
+                {
+                    "candidate_id": "benchskill_" + _json_sha256(key)[:24],
+                    "skill": dict(skill),
+                    "model_ref": observation["model_ref"],
+                    "provider_ref": provider_ref,
+                    "recommendation_state": "CANDIDATE_ONLY",
+                    "binding_state": "TASK_FRAME_SELECTION_REQUIRED",
+                    "authority": "NONE",
+                    "observation_count": 0,
+                    "successful_count": 0,
+                    "validated_success_count": 0,
+                    "failed_count": 0,
+                    "match": {"shared_tokens": shared[:20], "node_match": node_match},
+                },
+            )
+            candidate["observation_count"] += 1
+            if observation["outcome"] == "SUCCEEDED":
+                candidate["successful_count"] += 1
+                if observation["validation_state"] == "PASS":
+                    candidate["validated_success_count"] += 1
+            elif observation["outcome"] == "FAILED":
+                candidate["failed_count"] += 1
+        skill_candidates = sorted(
+            (
+                item
+                for item in grouped.values()
+                if item["successful_count"] > 0
+            ),
+            key=lambda item: (
+                -int(item["match"]["node_match"]),
+                -len(item["match"]["shared_tokens"]),
+                -item["validated_success_count"],
+                -item["successful_count"],
+                item["failed_count"],
+                -item["observation_count"],
+                item["candidate_id"],
+            ),
+        )[: max(1, min(int(skill_limit), 20))]
+        material = {
+            "schema": "universe.project-llm-retrieval-context.v1",
+            "project_id": project["project_id"],
+            "query_digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "memory": {
+                "policy": "LINKED_ONLY",
+                "ranking": "NODE_THEN_TOKEN_THEN_RECENT_BOUNDED",
+                "hits": memory_hits[: max(1, min(int(memory_limit), 20))],
+            },
+            "bench": {
+                "policy": "EVIDENCE_ONLY",
+                "ranking": "MATCH_THEN_VALIDATED_SUCCESS_THEN_SUCCESS_BOUNDED",
+                "recommended_skills": skill_candidates,
+            },
+            "effects": {
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "skill_binding": "NONE",
+                "project_source_write": "NONE",
+            },
+        }
+        material["retrieval_digest"] = _json_sha256(material)
+        return material
+
     def create_context_pack(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -8902,6 +9059,11 @@ class UniverseStore:
             if request["bench_limit"]
             else []
         )
+        retrieval = self.build_project_llm_retrieval_context(
+            project["project_id"],
+            query=request["purpose"],
+            node_ids=request["node_ids"],
+        )
         material = {
             "schema": PROJECT_CONTEXT_PACK_SCHEMA,
             "project_id": project["project_id"],
@@ -8923,6 +9085,7 @@ class UniverseStore:
                 "observations": bench_observations,
                 "observation_count": len(bench_observations),
             },
+            "retrieval": retrieval,
             "effects": {
                 "project_source_write": "NONE",
                 "authority": "NONE",
@@ -13261,7 +13424,9 @@ class UniverseStore:
                 for todo in self.list_todos()
                 if todo.get("project_id") == project["project_id"]
             ],
-            "memories": self.list_project_memories(project["project_id"], limit=200),
+            "memories": self.list_project_memories(
+                project["project_id"], link_state="LINKED", limit=200
+            ),
         }
         material = build_work_loop_predictions(bundle)
         now = utc_now()
@@ -16505,6 +16670,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 model_resolver=self._resolve_project_master_model,
                 effort_resolver=self._resolve_project_master_effort,
                 governance_context_resolver=self._project_master_governance_context,
+                retrieval_context_resolver=(
+                    lambda project_id, message: self.store.build_project_llm_retrieval_context(
+                        project_id,
+                        query=str(message.get("body") or ""),
+                    )
+                ),
                 release_source_binding_resolver=(
                     lambda project_id: self.store.selected_project_release_binding(
                         project_id

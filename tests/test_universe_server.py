@@ -8490,6 +8490,88 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("CONTEXT_PACK_NODE_UNKNOWN", rejected["error_code"])
 
+    def test_llm_retrieval_injects_linked_memory_and_bench_skill_candidates(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
+        linked = self.server.store.create_project_memory(
+            "GCS",
+            {
+                "title": "Broker source review",
+                "body": "Reuse the validated source review flow for broker changes.",
+                "state": "OBSERVED",
+            },
+        )
+        unlinked = self.server.store.create_project_memory(
+            "GCS",
+            {
+                "title": "Broker source review draft",
+                "body": "This unreviewed note must not reach an LLM context.",
+                "state": "OBSERVED",
+            },
+        )
+        self.server.store.link_project_memory(
+            "GCS",
+            linked["memory_id"],
+            {
+                "node_ref": "broker-client",
+                "graph": "functional",
+                "link_state": "LINKED",
+            },
+        )
+        observation = self.skill_observation_candidate()
+        observation["candidate"]["observations"][0]["execution_context"] = {
+            "provider_ref": "OPENAI",
+            "worker_role": "SUB_REVIEWER",
+            "task_kind": "SOURCE_REVIEW",
+            "node_ref": "broker-client",
+            "failure_kind": "NONE",
+            "quota_state": "AVAILABLE",
+        }
+        self.request(
+            "POST",
+            "/v1/projects/GCS/skill-observations",
+            observation,
+            self.token,
+        )
+
+        retrieval = self.server.store.build_project_llm_retrieval_context(
+            "GCS",
+            query="Review the broker source changes",
+            node_ids=["broker-client"],
+        )
+        self.assertEqual("LINKED_ONLY", retrieval["memory"]["policy"])
+        self.assertEqual(
+            [linked["memory_id"]],
+            [item["memory_id"] for item in retrieval["memory"]["hits"]],
+        )
+        self.assertNotIn(
+            unlinked["memory_id"],
+            {item["memory_id"] for item in retrieval["memory"]["hits"]},
+        )
+        recommended = retrieval["bench"]["recommended_skills"]
+        self.assertEqual(["source-review"], [item["skill"]["skill_id"] for item in recommended])
+        self.assertEqual("CANDIDATE_ONLY", recommended[0]["recommendation_state"])
+        self.assertEqual("TASK_FRAME_SELECTION_REQUIRED", recommended[0]["binding_state"])
+        self.assertEqual("NONE", recommended[0]["authority"])
+        self.assertEqual("NONE", retrieval["effects"]["skill_binding"])
+
+        pack, _ = self.server.store.create_context_pack(
+            "GCS",
+            {
+                "purpose": "Review the broker source changes",
+                "node_ids": ["broker-client"],
+                "bench_limit": 10,
+            },
+        )
+        self.assertEqual(retrieval["memory"]["hits"], pack["retrieval"]["memory"]["hits"])
+        self.assertEqual(
+            ["source-review"],
+            [
+                item["skill"]["skill_id"]
+                for item in pack["retrieval"]["bench"]["recommended_skills"]
+            ],
+        )
+
     def test_selected_skill_plan_is_bound_to_master_context_once(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)

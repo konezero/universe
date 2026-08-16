@@ -1825,6 +1825,47 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertEqual("Project Master answer", self.replies[0]["body"])
 
+    def test_project_master_message_receives_read_only_retrieval_context(self) -> None:
+        retrieval = {
+            "schema": "universe.project-llm-retrieval-context.v1",
+            "memory": {"policy": "LINKED_ONLY", "hits": [{"memory_id": "memory_1"}]},
+            "bench": {
+                "policy": "EVIDENCE_ONLY",
+                "recommended_skills": [
+                    {
+                        "candidate_id": "benchskill_1",
+                        "recommendation_state": "CANDIDATE_ONLY",
+                        "binding_state": "TASK_FRAME_SELECTION_REQUIRED",
+                        "authority": "NONE",
+                    }
+                ],
+            },
+            "effects": {"authority": "NONE", "skill_binding": "NONE"},
+        }
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            retrieval_context_resolver=lambda project_id, message: (
+                retrieval
+                if project_id == "GCS" and message["body"]
+                else {}
+            ),
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(retrieval, self.provider.messages[0]["retrieval_context"])
+
     def test_native_room_event_sends_only_incremental_input_and_observes_output(
         self,
     ) -> None:
@@ -1840,6 +1881,12 @@ class ProjectMasterHostTests(unittest.TestCase):
             reply_poster=lambda **values: self.replies.append(values) or {},
             stream_poster=lambda **values: self.streams.append(values) or {},
             room_event_observer=lambda event: observed.append(dict(event)),
+            retrieval_context_resolver=lambda project_id, message: {
+                "schema": "universe.project-llm-retrieval-context.v1",
+                "project_id": project_id,
+                "query": message["body"],
+                "effects": {"authority": "NONE", "skill_binding": "NONE"},
+            },
         )
         room_event = {
             "room_id": "room_native",
@@ -1874,6 +1921,13 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertNotIn("history", provider_message)
         self.assertNotIn("messages", provider_message)
         self.assertNotIn("skill_plan_context", provider_message)
+        self.assertEqual(
+            "Review only this new line",
+            provider_message["retrieval_context"]["query"],
+        )
+        self.assertEqual(
+            "NONE", provider_message["retrieval_context"]["effects"]["skill_binding"]
+        )
         self.assertEqual([room_event], self.surface_observer.room_events)
         self.assertEqual(
             [
