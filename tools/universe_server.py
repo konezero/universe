@@ -20160,13 +20160,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def create_cli_terminal(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
+        project_id = str(payload.get("project_id") or "").strip()
+        mode = str(payload.get("mode") or "MASTER").strip().upper()
+        cwd = str(payload.get("cwd") or "").strip()
+        resume_ref = str(payload.get("resume_session_ref") or "").strip()
+        is_new_session = not resume_ref or resume_ref.upper() == "UNKNOWN"
+        if is_new_session and project_id and cwd:
+            self._prepare_cli_mode_binding(project_id, mode, cwd)
         try:
             terminal = self.terminal_host.create(
-                project_id=str(payload.get("project_id") or ""),
-                mode=str(payload.get("mode") or "MASTER"),
-                cwd=str(payload.get("cwd") or ""),
+                project_id=project_id,
+                mode=mode,
+                cwd=cwd,
                 provider=str(payload.get("provider") or "AUTO"),
-                resume_session_ref=str(payload.get("resume_session_ref") or ""),
+                resume_session_ref=resume_ref,
                 cols=int(payload.get("cols") or 120),
                 rows=int(payload.get("rows") or 32),
             )
@@ -20182,6 +20189,133 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "CLI_TERMINAL_CREATED",
             "terminal": terminal,
         }
+
+    def _prepare_cli_mode_binding(
+        self,
+        project_id: str,
+        mode: str,
+        cwd: str,
+    ) -> None:
+        """Run prepare-session via the project runtime CLI before spawning a
+        standalone CLI terminal.  This writes a mode_boot_binding to the
+        project's runtime SQLite so the CLI boots with proper mode coordinates
+        derived from the selected release DB."""
+
+        release = self.store.selected_project_release_binding(project_id)
+        if (
+            not isinstance(release, Mapping)
+            or str(release.get("status") or "").upper() != "SELECTED"
+        ):
+            raise UniverseError(
+                "PROJECT_RELEASE_SELECTION_REQUIRED",
+                (
+                    f"Project {project_id} has no selected Release; "
+                    "select a Release before starting a CLI session"
+                ),
+                HTTPStatus.CONFLICT,
+            )
+        project_root = Path(cwd).expanduser().resolve()
+        registry_path = (
+            project_root / ".ai" / "runtime" / "project_instance" / "mode_registry.json"
+        )
+        if not registry_path.is_file():
+            raise UniverseError(
+                "MODE_REGISTRY_UNAVAILABLE",
+                f"Mode registry not found at {registry_path}",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            definition = registry["modes"][mode]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            raise UniverseError(
+                "MODE_DEFINITION_UNAVAILABLE",
+                f"Mode {mode} is not defined in the project mode registry",
+                HTTPStatus.CONFLICT,
+            ) from error
+        role = str(definition.get("role") or "").strip().upper()
+        scope = str(definition.get("scope") or "").strip()
+        mode_profile = str(definition.get("mode_profile") or "GOVERNANCE_ONLY").strip()
+        if not role or not scope:
+            raise UniverseError(
+                "MODE_DEFINITION_INCOMPLETE",
+                f"Mode {mode} definition is missing role or scope",
+                HTTPStatus.CONFLICT,
+            )
+        runtime_cli = project_root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        if not runtime_cli.is_file():
+            return
+        source_commit = str(release.get("source_commit") or "UNKNOWN")
+        source_repository = str(release.get("source_repository") or "UNKNOWN")
+        database_sha256 = str(release.get("database_sha256") or "UNKNOWN")
+        release_id = str(release.get("release_id") or "UNKNOWN")
+        source_ref = f"universe-release-db://{release_id}@{database_sha256}"
+        host_session_ref = f"cli-terminal:{secrets.token_hex(12)}"
+        request_payload = {
+            "command": "BOOT",
+            "source_state": "SOURCE_READY",
+            "source_ref": source_ref,
+            "source_commit": source_commit,
+            "source_repository": source_repository,
+            "mode": mode,
+            "role": role,
+            "scope": scope,
+            "host_session_ref": host_session_ref,
+            "anchor_snapshot_ref": "UNKNOWN",
+            "host_executable_capability": "AVAILABLE",
+            "mode_profile": mode_profile,
+            "task_requirement": "NONE",
+            "evidence_profile": "NONE",
+            "execution_intent": "NONE",
+            "commander_input": None,
+        }
+        tmp_dir = Path(
+            os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        ) / "Universe" / "runtime-tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        request_path = tmp_dir / f"cli-prepare-{uuid.uuid4().hex}.json"
+        request_path.write_text(
+            json.dumps(request_payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(runtime_cli),
+                    "prepare-session",
+                    "--repo-root",
+                    str(project_root),
+                    "--request",
+                    str(request_path),
+                ],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise UniverseError(
+                "CLI_MODE_BINDING_PREPARATION_FAILED",
+                f"Failed to prepare mode binding: {error}",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from error
+        finally:
+            request_path.unlink(missing_ok=True)
+        if result.returncode != 0:
+            detail = "prepare-session exited with non-zero status"
+            try:
+                failure = json.loads(result.stdout)
+                detail = str(failure.get("error", detail))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            raise UniverseError(
+                "CLI_MODE_BINDING_PREPARATION_FAILED",
+                detail,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
 
     def close_cli_terminal(self, terminal_id: str) -> dict[str, Any]:
         try:
