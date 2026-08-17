@@ -1824,19 +1824,39 @@ function nodeModeCatalog(project) {
     });
 }
 
+function nodeModeSessionIsCurrent(session) {
+  const currentness = String(
+    session?.currentness ||
+      session?.observer_currentness ||
+      session?.anchor_session?.currentness ||
+      ""
+  ).toUpperCase();
+  if (currentness === "CURRENT") return true;
+  return session?.is_default === true && currentness !== "STALE";
+}
+
+function vendorStreamStateForSession(session) {
+  const room = providerChatRoomForSupervisorSession(session);
+  const key = String(room?.chat_key || "").trim();
+  if (!key) return "NO_VENDOR";
+  const cache = providerSessionRoomCacheFor(key);
+  return String(
+    state.providerSessionStreamStates[key] || cache?.streamState || "IDLE"
+  ).toUpperCase();
+}
+
 function nodeModeSessionIsActive(session) {
-  return ["LIVE", "STARTING"].includes(
-    String(session?.state || "").trim().toUpperCase()
-  );
+  return vendorStreamStateForSession(session) === "LIVE";
 }
 
 function nodeModeRoomIsActive(room) {
-  const boundSession = supervisorSessionForRoom(room);
+  const key = String(room?.chat_key || "").trim();
+  if (!key) return false;
+  const cache = providerSessionRoomCacheFor(key);
   return (
-    nodeModeSessionIsActive(boundSession) ||
-    ["LIVE", "STARTING"].includes(
-      String(room?.activity_state || "").trim().toUpperCase()
-    )
+    String(
+      state.providerSessionStreamStates[key] || cache?.streamState || ""
+    ).toUpperCase() === "LIVE"
   );
 }
 
@@ -1905,7 +1925,10 @@ function nodeModeCoordinates() {
       session: boundSession,
       active: nodeModeRoomIsActive(room),
       hasSession: Boolean(binding.universe_session_id || boundSession),
-      current: binding.is_default === true && binding.observer_currentness === "CURRENT",
+      current:
+        nodeModeSessionIsCurrent(boundSession) ||
+        (binding.is_default === true &&
+          String(binding.observer_currentness || "").toUpperCase() === "CURRENT"),
     });
   }
   for (const session of state.supervisorSessions || []) {
@@ -1915,11 +1938,7 @@ function nodeModeCoordinates() {
       session,
       active: nodeModeSessionIsActive(session),
       hasSession: true,
-      current:
-        session.is_default === true &&
-        ["CURRENT"].includes(
-          String(session.observer_currentness || session.currentness || "").toUpperCase()
-        ),
+      current: nodeModeSessionIsCurrent(session),
     });
   }
 
@@ -1951,8 +1970,10 @@ function nodeModeCoordinates() {
 }
 
 function nodeModeStatusLabel(coordinate) {
-  if (coordinate.active) return coordinate.current ? "ACTIVE · CURRENT" : "ACTIVE";
-  return coordinate.hasSession ? "INACTIVE" : "NO SESSION";
+  if (coordinate.current && coordinate.active) return "CURRENT · STREAM";
+  if (coordinate.current) return "CURRENT";
+  if (coordinate.active) return "STREAM";
+  return coordinate.hasSession ? "SAVED" : "NO SESSION";
 }
 
 function nodeModeSelectedSession(coordinate) {
@@ -1960,6 +1981,56 @@ function nodeModeSelectedSession(coordinate) {
   const selectedKey = state.selectedSupervisorAnchorKeysByMode[coordinate?.key];
   // A default/current/active observation may be shown, but never chooses chat.
   return sessions.find((session) => anchorSessionKey(session) === selectedKey) || null;
+}
+
+async function resumeNodeModeSession(coordinate, session) {
+  const room = providerChatRoomForSupervisorSession(session);
+  const selectedAnchorKey = anchorSessionKey(session);
+  const stillSelected = () =>
+    state.selectedModeCoordinateKey === coordinate.key &&
+    state.selectedSupervisorAnchorKeysByMode[coordinate.key] === selectedAnchorKey;
+  if (room && providerSessionRoomIsOpenable(room)) {
+    const opened = await openProviderChatSession(room, {
+      session,
+      isCurrent: stillSelected,
+    });
+    if (opened) expandConversationLayer();
+    return;
+  }
+  if (String(session.mode || "").toUpperCase() === "MASTER") {
+    await attachSelectedMasterSession(session);
+    expandConversationLayer();
+    return;
+  }
+  if (String(session.mode || "").toUpperCase() === "CONDUCTOR") {
+    await attachSelectedConductorSession(session);
+    expandConversationLayer();
+    return;
+  }
+  toast("This persistent session has no vendor session to resume", true);
+}
+
+async function startNewNodeModeSession(coordinate) {
+  const project = coordinate?.project;
+  const mode = String(coordinate?.mode || "").toUpperCase();
+  const projectId = String(project?.project_id || "").trim();
+  const cwd = String(project?.project_root || "").trim();
+  if (!projectId || !cwd || !mode) {
+    throw new Error("New sessions require a registered project and Mode");
+  }
+  const options = {
+    sessionAction: "NEW",
+    projectId,
+    cwd,
+    requestedMode: mode,
+  };
+  if (mode === "CONDUCTOR") {
+    await callUniverseConductor(options);
+  } else {
+    await callProjectMaster(projectId, options);
+  }
+  expandConversationLayer();
+  await refreshSupervisorSessions();
 }
 
 async function selectNodeModeSession(coordinate, session) {
@@ -1973,20 +2044,7 @@ async function selectNodeModeSession(coordinate, session) {
   renderNodeModes();
   renderSessionRail();
   renderSessionObservatory();
-
-  const room = providerChatRoomForSupervisorSession(session);
-  if (!room) {
-    toast("This persistent session has no attached provider chat", true);
-    return;
-  }
-  const selectedAnchorKey = anchorSessionKey(session);
-  const opened = await openProviderChatSession(room, {
-    session,
-    isCurrent: () =>
-      state.selectedModeCoordinateKey === coordinate.key &&
-      state.selectedSupervisorAnchorKeysByMode[coordinate.key] === selectedAnchorKey,
-  });
-  if (opened) expandConversationLayer();
+  await resumeNodeModeSession(coordinate, session);
 }
 
 function renderNodeModeSessionCards(coordinate) {
@@ -2000,7 +2058,22 @@ function renderNodeModeSessionCards(coordinate) {
     return cards;
   }
   const selected = nodeModeSelectedSession(coordinate);
-  for (const session of sessions) {
+  const ordered = [...sessions].sort((left, right) => {
+    const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
+    const rightCurrent = nodeModeSessionIsCurrent(right) ? 0 : 1;
+    if (leftCurrent !== rightCurrent) return leftCurrent - rightCurrent;
+    return String(right.last_seen_at || right.updated_at || "").localeCompare(
+      String(left.last_seen_at || left.updated_at || "")
+    );
+  });
+  const create = node("button", "node-mode-session-new", "New session");
+  create.type = "button";
+  create.title = "Start a new vendor session for this Mode";
+  create.addEventListener("click", () => {
+    startNewNodeModeSession(coordinate).catch((error) => toast(error.message, true));
+  });
+  cards.append(create);
+  for (const session of ordered) {
     const room = providerChatRoomForSupervisorSession(session);
     const row = node("div", "node-mode-session-row");
     const card = node("button", "node-mode-session-card");
@@ -2023,16 +2096,27 @@ function renderNodeModeSessionCards(coordinate) {
         `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`
       )
     );
-    const status = node(
-      "span",
-      "node-mode-session-status",
-      room ? "CHAT" : String(session.state || "UNKNOWN")
-    );
-    status.dataset.state = String(session.state || "UNKNOWN").toUpperCase();
+    const stream = vendorStreamStateForSession(session);
+    const current = nodeModeSessionIsCurrent(session);
+    const statusLabel = current && stream === "LIVE"
+      ? "CURRENT · LIVE"
+      : current
+        ? "CURRENT"
+        : stream === "LIVE"
+          ? "STREAM"
+          : stream === "NO_VENDOR"
+            ? "SAVED"
+            : stream;
+    const status = node("span", "node-mode-session-status", statusLabel);
+    status.dataset.state = stream;
+    status.dataset.current = String(current);
     card.append(label, status);
-    card.title = room
-      ? "Open this exact persistent session chat"
-      : "This persistent session has no attached provider chat";
+    card.title = nodeModeSessionIsCurrent(session)
+      ? "Resume the DB Current session"
+      : room
+        ? "Resume this saved vendor session"
+        : "Saved session with no vendor stream yet";
+    card.dataset.current = String(nodeModeSessionIsCurrent(session));
     card.addEventListener("click", () => {
       selectNodeModeSession(coordinate, session).catch((error) =>
         toast(error.message, true)
@@ -2082,7 +2166,7 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
     );
     section.dataset.nodeId = group.nodeId;
     section.dataset.nodeKind = String(group.project.metadata?.node_kind || "PROJECT");
-    const activeCount = group.modes.filter((mode) => mode.active).length;
+    const currentCount = group.modes.filter((mode) => mode.current).length;
     const heading = node("button", "node-mode-group-heading node-mode-node");
     heading.type = "button";
     heading.dataset.nodeId = group.nodeId;
@@ -2092,7 +2176,7 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
     heading.title = `Select ${projectDisplayName(group.project)} node`;
     heading.append(
       node("strong", "", projectDisplayName(group.project)),
-      node("small", "", `${activeCount}/${group.modes.length} active`)
+      node("small", "", `${currentCount}/${group.modes.length} current`)
     );
     heading.addEventListener("click", () => selectNodeModeNode(group.nodeId));
     section.append(heading);
@@ -2128,14 +2212,14 @@ function renderNodeModes() {
   if (!elements.nodeModeList) return;
   const groups = nodeModeCoordinates();
   const modeCount = groups.reduce((total, group) => total + group.modes.length, 0);
-  const activeModeCount = groups.reduce(
-    (total, group) => total + group.modes.filter((mode) => mode.active).length,
+  const currentModeCount = groups.reduce(
+    (total, group) => total + group.modes.filter((mode) => mode.current).length,
     0
   );
   elements.nodeModeList.replaceChildren();
   if (elements.nodeModeCount) {
-    elements.nodeModeCount.textContent = `${activeModeCount}/${modeCount}`;
-    elements.nodeModeCount.title = `${activeModeCount} active sessions / ${modeCount} node modes`;
+    elements.nodeModeCount.textContent = `${currentModeCount}/${modeCount}`;
+    elements.nodeModeCount.title = `${currentModeCount} DB Current modes / ${modeCount} node modes`;
   }
   if (!groups.length) {
     elements.nodeModeList.append(

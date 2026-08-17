@@ -6002,6 +6002,37 @@ body:not(.graph-mode) .conductor-panel {
 .node-mode-item[data-current="true"] {
   box-shadow: inset 2px 0 0 var(--cyan);
 }
+.node-mode-item[data-current="true"] .node-mode-copy small {
+  color: var(--cyan);
+}
+.node-mode-item[data-active="true"][data-current="false"] .node-mode-copy small {
+  color: var(--green);
+}
+.node-mode-session-new {
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 6px;
+  border: 1px dashed rgba(61, 224, 255, 0.35);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--cyan);
+  font-size: 9px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.node-mode-session-new:hover,
+.node-mode-session-new:focus-visible {
+  border-style: solid;
+  background: rgba(61, 224, 255, 0.1);
+}
+.node-mode-session-card[data-current="true"] {
+  border-color: rgba(61, 224, 255, 0.55);
+}
+.node-mode-session-status[data-current="true"] { color: var(--cyan); }
+.node-mode-session-status[data-state="CONNECTING"],
+.node-mode-session-status[data-state="RECONNECTING"] { color: var(--amber); }
+.node-mode-session-status[data-state="NO_VENDOR"],
+.node-mode-session-status[data-state="IDLE"] { color: var(--text-3); }
 .node-mode-mark {
   display: grid;
   width: 22px;

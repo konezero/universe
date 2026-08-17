@@ -61,6 +61,11 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("function nodeModeCatalog(project)", APP)
         self.assertIn('const modes = isUniverseHome ? ["MASTER", "CONDUCTOR"] : ["MASTER"];', APP)
         self.assertIn("function nodeModeSessionIsActive(session)", APP)
+        self.assertIn("function nodeModeSessionIsCurrent(session)", APP)
+        self.assertIn("function vendorStreamStateForSession(session)", APP)
+        self.assertIn("function startNewNodeModeSession(coordinate)", APP)
+        self.assertIn("function resumeNodeModeSession(coordinate, session)", APP)
+        self.assertIn('currentness === "CURRENT"', APP)
         self.assertIn('if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;', APP)
         self.assertIn("coordinate.sessions.push(source.session)", APP)
         self.assertIn("node-mode-item", CSS)
@@ -94,6 +99,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("const selectedAnchorKey = anchorSessionKey(session)", APP)
         self.assertIn("typeof options.isCurrent === \"function\"", APP)
         self.assertIn("if (!isCurrent()) return false", APP)
+        self.assertIn("await resumeNodeModeSession(coordinate, session)", APP)
+        self.assertIn("New session", APP)
 
     def test_session_graph_is_a_separate_read_only_navigation_surface(self) -> None:
         self.assertIn('data-primary-view="sessions"', HTML)
