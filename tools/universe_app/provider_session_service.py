@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 import uuid
 
 from agent_session_gateway import (
@@ -293,6 +293,58 @@ class ProviderSessionService:
             "transcript_owner": "PROVIDER",
             "room_queue_used": False,
         }
+
+    def observe_excerpts(
+        self,
+        chat_key: str,
+        excerpts: Sequence[Mapping[str, Any]],
+        *,
+        publish: bool = False,
+        replace_observer: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Merge transient observer excerpts into process-local room messages."""
+
+        key = _chat_key(chat_key)
+        now = _utc_now()
+        created: list[dict[str, Any]] = []
+        with self._lock:
+            existing = list(self._messages.get(key, ()))
+            if replace_observer:
+                existing = [
+                    item
+                    for item in existing
+                    if item.get("origin") != "PROVIDER_OBSERVER"
+                ]
+                self._messages[key] = deque(existing, maxlen=self.retained_messages)
+            known = {str(item.get("message_id") or "") for item in existing}
+            for excerpt in excerpts:
+                excerpt_id = str(excerpt.get("excerpt_id") or "").strip()
+                role = str(excerpt.get("role") or "").strip().upper()
+                text = str(excerpt.get("text") or "").strip()
+                if not excerpt_id or role not in {"USER", "ASSISTANT"} or not text:
+                    continue
+                if excerpt_id in known:
+                    continue
+                message = {
+                    "schema": PROVIDER_SESSION_MESSAGE_SCHEMA,
+                    "message_id": excerpt_id,
+                    "chat_key": key,
+                    "role": role,
+                    "body": text,
+                    "state": "COMPLETED",
+                    "created_at": now,
+                    "updated_at": now,
+                    "origin": "PROVIDER_OBSERVER",
+                }
+                self._append_message(key, message)
+                known.add(excerpt_id)
+                created.append(message)
+        if publish:
+            for message in created:
+                self.events.publish(
+                    key, {"type": "PROVIDER_SESSION_MESSAGE", "message": message}
+                )
+        return created
 
     def submit(
         self,

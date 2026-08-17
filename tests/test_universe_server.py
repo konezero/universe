@@ -1457,7 +1457,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {room["provider"] for room in catalog["rooms"]},
         )
         codex = next(room for room in catalog["rooms"] if room["provider"] == "CODEX")
-        self.assertEqual("BOUND", codex["binding"]["state"])
+        self.assertEqual("ANCHOR_OBSERVED", codex["binding"]["state"])
         self.assertEqual("CURRENT", codex["binding"]["observer_currentness"])
         self.assertEqual("2026-08-09T00:00:00Z", codex["last_activity_at"])
         self.assertEqual("GCS MASTER", codex["binding"]["alias"])
@@ -1540,18 +1540,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(catalog["rooms"]))
         room = catalog["rooms"][0]
         self.assertEqual("CODEX", room["provider"])
-        self.assertEqual("BOUND", room["binding"]["state"])
-        self.assertFalse(room["binding"]["is_default"])
-        self.assertEqual("CURRENT", room["binding"]["observer_currentness"])
-        self.assertEqual("SESSION_SUPERVISOR", room["binding"]["currentness_source"])
-        self.assertEqual("universe", room["binding"]["current_project_id"])
-        self.assertEqual("MASTER", room["binding"]["mode"])
+        self.assertEqual("INDEPENDENT", room["binding"]["state"])
+        self.assertEqual("WORKSPACE_OBSERVED", room["binding"].get("currentness_source"))
+        self.assertEqual("universe", room["binding"].get("current_project_id"))
         self.assertEqual(
-            "MASTER-CURRENT-LIVE", room["binding"]["current_anchor_ref"]
+            None, room["binding"].get("current_anchor_ref")
         )
         self.assertEqual(
-            "session-universe-master-current",
-            room["binding"]["universe_session_id"],
+            None,
+            room["binding"].get("universe_session_id"),
         )
 
     def test_provider_chat_catalog_projects_supervisor_session_without_source_file(
@@ -2200,6 +2197,200 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_project_anchor_sessions_list_current_and_beyond_ing_from_store(self) -> None:
+        status, _ = self.request(
+            "POST", "/v1/projects/register", self.registration(), self.token
+        )
+        self.assertIn(status, {HTTPStatus.OK, HTTPStatus.CREATED})
+        runtime_state = self.project_root / ".ai" / "runtime" / "state"
+        session_dir = self.project_root / ".ai" / "runtime" / "session_store"
+        runtime_state.mkdir(parents=True, exist_ok=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        database = runtime_state / "project_runtime.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE mode_current_anchor (
+                    mode TEXT PRIMARY KEY,
+                    frame_id TEXT NOT NULL,
+                    anchor_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    registry_revision INTEGER NOT NULL,
+                    registry_digest TEXT NOT NULL,
+                    mode_definition_digest TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                );
+                CREATE TABLE beyond_anchor (
+                    mode TEXT NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    frame_id TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    retired_at TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    PRIMARY KEY (mode, anchor_id)
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO mode_current_anchor VALUES (
+                    'MASTER', 'current', 'MASTER-CURRENT-NOW', 'CURRENT', 'test',
+                    '2026-08-17T10:00:00Z', 1, 'digest', 'digest', ?
+                )
+                """,
+                (
+                    json.dumps(
+                        {
+                            "observer_session_ref": "grok-acp:current-vendor",
+                            "coordinates": {"mode": "MASTER"},
+                            "state": "CURRENT",
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO beyond_anchor VALUES (
+                    'MASTER', 'MASTER-CURRENT-OLD-ING', 'current', 'test',
+                    '2026-08-16T10:00:00Z', '2026-08-17T10:00:00Z', ?
+                )
+                """,
+                (
+                    json.dumps(
+                        {
+                            "observer_session_ref": "UNIVERSE-MASTER-TEST-001",
+                            "session_id": "UNIVERSE-MASTER-TEST-001",
+                            "coordinates": {"mode": "MASTER"},
+                            "state": "EXECUTING",
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO beyond_anchor VALUES (
+                    'MASTER', 'MASTER-CURRENT-OLD-STOP', 'current', 'test',
+                    '2026-08-15T10:00:00Z', '2026-08-16T10:00:00Z', ?
+                )
+                """,
+                (
+                    json.dumps(
+                        {
+                            "session_id": "UNIVERSE-MASTER-STOPPED-001",
+                            "coordinates": {"mode": "MASTER"},
+                            "state": "STOPPED",
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        def write_session_store(
+            session_id: str, anchor_id: str, state: str, snapshot: dict[str, Any]
+        ) -> None:
+            digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
+            path = session_dir / f"session-{digest}.sqlite3"
+            store = sqlite3.connect(path)
+            try:
+                store.execute(
+                    """
+                    CREATE TABLE anchor_snapshot (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        revision INTEGER NOT NULL,
+                        frame_id TEXT NOT NULL,
+                        anchor_id TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        source_ref TEXT NOT NULL,
+                        snapshot_json TEXT NOT NULL
+                    )
+                    """
+                )
+                store.execute(
+                    """
+                    INSERT INTO anchor_snapshot VALUES (
+                        1, 1, 'current', ?, ?, '2026-08-16T10:00:00Z', 'test', ?
+                    )
+                    """,
+                    (anchor_id, state, json.dumps(snapshot)),
+                )
+                store.commit()
+            finally:
+                store.close()
+
+        write_session_store(
+            "UNIVERSE-MASTER-TEST-001",
+            "MASTER-CURRENT-OLD-ING",
+            "EXECUTING",
+            {
+                "session_id": "UNIVERSE-MASTER-TEST-001",
+                "observer_session_ref": "UNIVERSE-MASTER-TEST-001",
+                "coordinates": {"mode": "MASTER"},
+                "state": "EXECUTING",
+            },
+        )
+        write_session_store(
+            "UNIVERSE-MASTER-READY-001",
+            "MASTER-CURRENT-OLD-ING",
+            "READY",
+            {
+                "session_id": "UNIVERSE-MASTER-READY-001",
+                "coordinates": {"mode": "MASTER"},
+                "state": "READY",
+            },
+        )
+        write_session_store(
+            "UNIVERSE-MASTER-STOPPED-001",
+            "MASTER-CURRENT-OLD-STOP",
+            "STOPPED",
+            {
+                "session_id": "UNIVERSE-MASTER-STOPPED-001",
+                "coordinates": {"mode": "MASTER"},
+                "state": "STOPPED",
+            },
+        )
+
+        status, payload = self.request(
+            "GET", "/v1/projects/GCS/anchor-sessions", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PROJECT_ANCHOR_SESSIONS_COLLECTED", payload["status"])
+        by_id = {item["session_id"]: item for item in payload["sessions"]}
+        current = next(
+            item for item in payload["sessions"] if item["currentness"] == "CURRENT"
+        )
+        self.assertEqual("MASTER-CURRENT-NOW", current["current_anchor_ref"])
+        self.assertEqual("CURRENT", current["temporality"])
+        self.assertEqual("MODE_CURRENT_ANCHOR", current["currentness_source"])
+        self.assertIn("UNIVERSE-MASTER-TEST-001", by_id)
+        self.assertEqual("PAST", by_id["UNIVERSE-MASTER-TEST-001"]["currentness"])
+        self.assertEqual("BEYOND", by_id["UNIVERSE-MASTER-TEST-001"]["temporality"])
+        self.assertEqual(
+            "SESSION_STORE",
+            by_id["UNIVERSE-MASTER-TEST-001"]["currentness_source"],
+        )
+        self.assertTrue(by_id["UNIVERSE-MASTER-TEST-001"]["active_ing"])
+        self.assertEqual("EXECUTING", by_id["UNIVERSE-MASTER-TEST-001"]["state"])
+        self.assertNotIn("UNIVERSE-MASTER-READY-001", by_id)
+        self.assertNotIn("UNIVERSE-MASTER-STOPPED-001", by_id)
+        catalog = self.server.provider_chat_catalog()
+        self.assertTrue(
+            any(
+                item["session_id"] == "UNIVERSE-MASTER-TEST-001"
+                for item in catalog["anchor_sessions"]
+            )
+        )
+        rendered = json.dumps(catalog)
+        self.assertNotIn("provider_session_id", rendered)
+        self.assertNotIn("provider_session_ref", rendered)
+
 
     def test_tail_auto_registers_only_bound_verified_provider_sessions(self) -> None:
         bound_path = self.temp_root / "rollout-bound-tail.jsonl"

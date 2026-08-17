@@ -89,6 +89,10 @@ const state = {
   providerActivitySources: [],
   providerActivityDiscoveries: [],
   providerChatRooms: [],
+  projectAnchorSessions: [],
+  terminals: [],
+  activeTerminalId: null,
+  terminalSurfaces: {},
   providerChatSearch: "",
   providerChatShowWorkers: false,
   providerChatShowHidden: false,
@@ -395,6 +399,10 @@ const elements = {
   actionInboxList: document.querySelector("#action-inbox-list"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
+  terminalTabs: document.querySelector("#terminal-tabs"),
+  terminalStage: document.querySelector("#terminal-stage"),
+  conversationTitle: document.querySelector("#conversation-title"),
+  conversationTargetLabel: document.querySelector("#conversation-target-label"),
   roomContext: document.querySelector("#room-context"),
   roomHint: document.querySelector("#room-hint"),
   closeInspector: document.querySelector("#close-inspector"),
@@ -838,6 +846,35 @@ function nodeModeCoordinateKey(nodeId, mode) {
     .toUpperCase()}`;
 }
 
+function projectForVendorWorkspace(room) {
+  const workspaceName = String(room?.workspace_name || "").trim().toLowerCase();
+  if (!workspaceName) return null;
+  return (
+    visibleProjects().find((project) => {
+      const id = String(project.project_id || "").toLowerCase();
+      const root = String(project.project_root || "").replaceAll("\\", "/").toLowerCase();
+      const rootName = root.split("/").filter(Boolean).pop() || "";
+      return id === workspaceName || rootName === workspaceName;
+    }) || null
+  );
+}
+
+function unboundVendorSessionFromRoom(room, project, mode) {
+  const chatKey = String(room?.chat_key || "").trim();
+  return {
+    provider: String(room?.provider || "UNKNOWN").toUpperCase(),
+    node: project.project_id,
+    mode,
+    currentness: String(room?.binding?.observer_currentness || "UNKNOWN").toUpperCase(),
+    observer_currentness: String(room?.binding?.observer_currentness || "UNKNOWN").toUpperCase(),
+    session_anchor_ref: room?.binding?.session_anchor_ref || `vendor:${chatKey}`,
+    last_seen_at: room?.last_activity_at || null,
+    alias: room?.binding?.alias || `${String(room?.provider || "Vendor").toUpperCase()} ${room?.workspace_name || project.project_id}`,
+    chat_key: chatKey,
+    vendor_unbound: String(room?.binding?.state || "").toUpperCase() === "INDEPENDENT",
+  };
+}
+
 function markdownBody(text) {
   const root = node("div", "markdown-body");
   const lines = String(text || "").replaceAll("\r\n", "\n").split("\n");
@@ -1112,6 +1149,7 @@ async function refreshSupervisorSessions() {
   state.legacyExecutors = legacy.executors || [];
   state.providerActivitySources = activity.sources || [];
   state.providerChatRooms = chatCatalog.rooms || [];
+  state.projectAnchorSessions = chatCatalog.anchor_sessions || [];
   state.sessionGraph = sessionGraph?.graph || state.sessionGraph;
   syncProviderSessionSubscriptions();
   prefillsObservatoryInjectForm();
@@ -1132,6 +1170,9 @@ async function tailProviderSessions() {
       body: {},
     });
     state.providerChatRooms = result.catalog?.rooms || state.providerChatRooms;
+    if (result.catalog?.anchor_sessions) {
+      state.projectAnchorSessions = result.catalog.anchor_sessions;
+    }
     syncProviderSessionSubscriptions();
     for (const delta of result.deltas || []) {
       const sourceId = String(delta.source?.source_id || "");
@@ -1149,12 +1190,17 @@ async function tailProviderSessions() {
       );
       if (fresh.length) {
         state.providerLiveDeltas[room.chat_key] = [...existing, ...fresh].slice(-80);
+        mergeProviderLiveDeltasIntoRoom(room.chat_key);
       }
     }
     renderSessionRail();
     renderNodeModes();
     renderProviderChatSummary();
     renderSelectedSessionDetail();
+    if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+      renderRoomMessages();
+      renderComposerState();
+    }
   } catch (_error) {
     // The next bounded poll retries. UNKNOWN remains visible instead of being
     // promoted to a guessed live state.
@@ -1489,6 +1535,11 @@ function supervisorSessionForRoom(room) {
 
 function providerChatRoomForSupervisorSession(session) {
   if (!session) return null;
+  const chatKey = String(session.chat_key || "").trim();
+  if (chatKey) {
+    const byKey = providerSessionRoomForChatKey(chatKey);
+    if (byKey) return byKey;
+  }
   const sessionKey = anchorSessionKey(session);
   const anchorRef = sessionAnchorRef(session);
   const matches = (state.providerChatRooms || []).filter((room) => {
@@ -1524,7 +1575,9 @@ function providerLiveDeliveryLabel(room) {
 
 function sessionRailProjectIdentity(room) {
   const binding = room?.binding || {};
-  const anchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
+  const anchored = ["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"].includes(
+    binding.state
+  );
   const boundProject = String(
     binding.current_project_id || binding.node || ""
   ).trim();
@@ -1757,7 +1810,7 @@ function renderProviderChatSummary() {
     }
   }
   const canOpenDirect =
-    ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state) &&
+    ["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"].includes(binding.state) &&
     room.session_kind !== "WORKER";
   elements.sessionSummaryOpen.disabled = !canOpenDirect;
   elements.sessionSummaryOpen.textContent = canOpenDirect
@@ -1807,7 +1860,7 @@ function nodeModeCatalog(project) {
       .filter((room) => {
         const binding = room.binding || {};
         return (
-          ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state) &&
+          ["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"].includes(binding.state) &&
           normalizeNodeModeNode(
             binding.current_project_id || binding.node
           ).toLowerCase() === projectId
@@ -1836,8 +1889,10 @@ function nodeModeSessionIsCurrent(session) {
 }
 
 function vendorStreamStateForSession(session) {
-  const room = providerChatRoomForSupervisorSession(session);
-  const key = String(room?.chat_key || "").trim();
+  const room =
+    providerSessionRoomForChatKey(session?.chat_key) ||
+    providerChatRoomForSupervisorSession(session);
+  const key = String(room?.chat_key || session?.chat_key || "").trim();
   if (!key) return "NO_VENDOR";
   const cache = providerSessionRoomCacheFor(key);
   return String(
@@ -1916,32 +1971,21 @@ function nodeModeCoordinates() {
     coordinates.set(key, coordinate);
   };
 
-  for (const room of state.providerChatRooms || []) {
-    const binding = room.binding || {};
-    if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;
-    const boundSession = supervisorSessionForRoom(room);
-    record(binding.current_project_id || binding.node, binding.mode, {
-      room,
-      session: boundSession,
-      active: nodeModeRoomIsActive(room),
-      hasSession: Boolean(binding.universe_session_id || boundSession),
-      current:
-        nodeModeSessionIsCurrent(boundSession) ||
-        (binding.is_default === true &&
-          String(binding.observer_currentness || "").toUpperCase() === "CURRENT"),
-    });
-  }
-  for (const session of state.supervisorSessions || []) {
-    const room = providerChatRoomForSupervisorSession(session);
-    record(session.node, session.mode, {
-      room,
+  for (const session of state.projectAnchorSessions || []) {
+    const projectId = String(session.project_id || session.node || "").trim();
+    const mode = String(session.mode || "").trim().toUpperCase();
+    if (!projectId || !mode) continue;
+    const room =
+      providerSessionRoomForChatKey(session.chat_key) ||
+      providerChatRoomForSupervisorSession(session);
+    record(projectId, mode, {
       session,
-      active: nodeModeSessionIsActive(session),
+      room,
       hasSession: true,
       current: nodeModeSessionIsCurrent(session),
+      active: room ? nodeModeRoomIsActive(room) : false,
     });
   }
-
   const groups = projects.map((project) => {
     const nodeId = project.project_id;
     const modes = nodeModeCatalog(project).map((mode) =>
@@ -1983,31 +2027,35 @@ function nodeModeSelectedSession(coordinate) {
   return sessions.find((session) => anchorSessionKey(session) === selectedKey) || null;
 }
 
+async function attachProviderChatRoom(room, coordinate) {
+  const key = String(room?.chat_key || "").trim();
+  if (!key) throw new Error("This vendor session has no chat key");
+  const result = await api(
+    "/v1/session-observer/chat-rooms/" + encodeURIComponent(key) + "/attach",
+    {
+      method: "POST",
+      body: {
+        project_id: coordinate?.project?.project_id || coordinate?.nodeId,
+        mode: coordinate?.mode || "MASTER",
+        make_default: true,
+      },
+    }
+  );
+  if (result.catalog?.rooms) state.providerChatRooms = result.catalog.rooms;
+  if (result.catalog?.anchor_sessions) {
+    state.projectAnchorSessions = result.catalog.anchor_sessions;
+  }
+  await refreshSupervisorSessions();
+  return providerSessionRoomForChatKey(key);
+}
+
 async function resumeNodeModeSession(coordinate, session) {
-  const room = providerChatRoomForSupervisorSession(session);
-  const selectedAnchorKey = anchorSessionKey(session);
-  const stillSelected = () =>
-    state.selectedModeCoordinateKey === coordinate.key &&
-    state.selectedSupervisorAnchorKeysByMode[coordinate.key] === selectedAnchorKey;
-  if (room && providerSessionRoomIsOpenable(room)) {
-    const opened = await openProviderChatSession(room, {
-      session,
-      isCurrent: stillSelected,
-    });
-    if (opened) expandConversationLayer();
-    return;
-  }
-  if (String(session.mode || "").toUpperCase() === "MASTER") {
-    await attachSelectedMasterSession(session);
+  if (focusTerminalForSession(coordinate, session)) {
     expandConversationLayer();
     return;
   }
-  if (String(session.mode || "").toUpperCase() === "CONDUCTOR") {
-    await attachSelectedConductorSession(session);
-    expandConversationLayer();
-    return;
-  }
-  toast("This persistent session has no vendor session to resume", true);
+  await createTerminalTab(coordinate, session);
+  expandConversationLayer();
 }
 
 async function startNewNodeModeSession(coordinate) {
@@ -2018,19 +2066,8 @@ async function startNewNodeModeSession(coordinate) {
   if (!projectId || !cwd || !mode) {
     throw new Error("New sessions require a registered project and Mode");
   }
-  const options = {
-    sessionAction: "NEW",
-    projectId,
-    cwd,
-    requestedMode: mode,
-  };
-  if (mode === "CONDUCTOR") {
-    await callUniverseConductor(options);
-  } else {
-    await callProjectMaster(projectId, options);
-  }
+  await createTerminalTab(coordinate);
   expandConversationLayer();
-  await refreshSupervisorSessions();
 }
 
 async function selectNodeModeSession(coordinate, session) {
@@ -2098,15 +2135,18 @@ function renderNodeModeSessionCards(coordinate) {
     );
     const stream = vendorStreamStateForSession(session);
     const current = nodeModeSessionIsCurrent(session);
+    const activeIng = session.active_ing === true;
     const statusLabel = current && stream === "LIVE"
       ? "CURRENT · LIVE"
       : current
         ? "CURRENT"
-        : stream === "LIVE"
-          ? "STREAM"
-          : stream === "NO_VENDOR"
-            ? "SAVED"
-            : stream;
+        : activeIng
+          ? String(session.state || "ING")
+          : stream === "LIVE"
+            ? "STREAM"
+            : stream === "NO_VENDOR"
+              ? "SAVED"
+              : stream;
     const status = node("span", "node-mode-session-status", statusLabel);
     status.dataset.state = stream;
     status.dataset.current = String(current);
@@ -3201,6 +3241,13 @@ function sessionUsageLabel(connection) {
 }
 
 function renderComposerState() {
+  const activeTerminal = typeof activeTerminalSession === "function"
+    ? activeTerminalSession()
+    : (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId);
+  if (typeof applyCliDockTitle === "function") {
+    applyCliDockTitle(activeTerminal || null);
+  }
+  if (activeTerminal) return;
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
     const draft = state.sessionDelegationDraft || state.conversationTarget;
     const originAnchorRef = String(draft.origin_anchor_ref || "UNKNOWN");
@@ -3209,13 +3256,6 @@ function renderComposerState() {
     elements.roomHint.textContent =
       "Cross-session delegation / origin and target anchors are explicit / not direct chat";
     elements.dispatchInstruction.placeholder = "Instruction for the target session";
-    if (elements.conversationTitle) {
-      elements.conversationTitle.textContent = "Delegation";
-    }
-    if (elements.conversationTargetLabel) {
-      elements.conversationTargetLabel.textContent =
-        `Origin ${originAnchorRef} → Target ${targetAnchorRef}`;
-    }
     return;
   }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
@@ -3229,13 +3269,6 @@ function renderComposerState() {
       `Direct Provider Session / ${connection.connection_state || state.providerSessionStreamState}`;
     elements.dispatchInstruction.placeholder =
       `Message ${target.alias || target.projectId}`;
-    if (elements.conversationTitle) {
-      elements.conversationTitle.textContent = "Conversation";
-    }
-    if (elements.conversationTargetLabel) {
-      elements.conversationTargetLabel.textContent =
-        `${target.alias || target.projectId} / ${provider} / ${model}`;
-    }
     return;
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
@@ -3266,12 +3299,6 @@ function renderComposerState() {
         ? "LLM connected / Auto-approve " + autoApprove + (usage ? " / " + usage : "")
         : "Waiting for Runtime binding" + (usage ? " / " + usage : "");
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";
-    if (elements.conversationTitle) {
-      elements.conversationTitle.textContent = "Conversation";
-    }
-    if (elements.conversationTargetLabel) {
-      elements.conversationTargetLabel.textContent = "Universe Conductor";
-    }
     return;
   }
   const projectId = state.conversationTarget.projectId;
@@ -3298,12 +3325,6 @@ function renderComposerState() {
       ? "Bridge registered / awaiting first delivery" + (usage ? " / " + usage : "")
       : "Project Room only" + (usage ? " / " + usage : "");
   elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
-  if (elements.conversationTitle) {
-    elements.conversationTitle.textContent = "Conversation";
-  }
-  if (elements.conversationTargetLabel) {
-    elements.conversationTargetLabel.textContent = `${projectId} Master`;
-  }
 }
 
 function setGraphScale(nextScale) {
@@ -6332,23 +6353,29 @@ function providerSessionRoomForChatKey(chatKey) {
   ) || null;
 }
 
-function providerSessionRoomIsEligible(room) {
+function providerSessionObservedProjectId(room) {
   const binding = room?.binding || {};
-  const chatKey = String(room?.chat_key || "").trim();
-  const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
-  const bindingState = String(binding.state || "").toUpperCase();
-  const currentness = String(binding.observer_currentness || "").toUpperCase();
-  const identityState = String(room?.identity_state || "").toUpperCase();
-  const projectId = String(
+  const boundProject = String(
     binding.current_project_id || binding.node || ""
   ).trim();
+  if (boundProject) return boundProject;
+  return String(projectForVendorWorkspace(room)?.project_id || "").trim();
+}
+
+function providerSessionRoomIsEligible(room) {
+  const chatKey = String(room?.chat_key || "").trim();
+  const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
+  const currentness = String(
+    room?.binding?.observer_currentness || ""
+  ).toUpperCase();
+  const identityState = String(room?.identity_state || "").toUpperCase();
+  const projectId = providerSessionObservedProjectId(room);
   return Boolean(
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
-      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
-      currentness === "CURRENT" &&
-      identityState === "VERIFIED"
+      identityState === "VERIFIED" &&
+      (currentness === "CURRENT" || providerSessionRoomIsSelected(chatKey))
   );
 }
 
@@ -6415,6 +6442,21 @@ function mergeProviderSessionMessages(chatKey, messages) {
   syncSelectedProviderSessionState(chatKey);
 }
 
+function mergeProviderLiveDeltasIntoRoom(chatKey) {
+  const key = String(chatKey || "").trim();
+  const deltas = state.providerLiveDeltas[key] || [];
+  if (!key || !deltas.length) return;
+  mergeProviderSessionMessages(
+    key,
+    deltas.map((delta) => ({
+      message_id: delta.excerpt_id,
+      role: delta.role,
+      body: delta.text,
+      state: "COMPLETED",
+    }))
+  );
+}
+
 function mergeProviderSessionPermission(chatKey, permission) {
   const safe = redactProviderSessionPermission(permission);
   const cache = providerSessionRoomCacheFor(chatKey);
@@ -6459,19 +6501,14 @@ function providerSessionActivityState(room) {
 }
 
 function providerSessionRoomIsOpenable(room) {
-  const binding = room?.binding || {};
   const chatKey = String(room?.chat_key || "").trim();
   const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
-  const bindingState = String(binding.state || "").toUpperCase();
   const identityState = String(room?.identity_state || "").toUpperCase();
-  const projectId = String(
-    binding.current_project_id || binding.node || ""
-  ).trim();
+  const projectId = providerSessionObservedProjectId(room);
   return Boolean(
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
-      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
       identityState === "VERIFIED"
   );
 }
@@ -6510,6 +6547,7 @@ function applyProviderSessionSnapshot(snapshot, chatKey = null) {
       kind: "PROVIDER_SESSION",
     };
   }
+  if (!cache.messages.length) mergeProviderLiveDeltasIntoRoom(key);
   syncSelectedProviderSessionState(key);
   return true;
 }
@@ -6778,6 +6816,7 @@ async function openProviderChatSession(room, options = {}) {
   clearProviderSessionUnread(chatKey);
   syncSelectedProviderSessionState(chatKey);
   await refreshProviderSession(chatKey);
+  mergeProviderLiveDeltasIntoRoom(chatKey);
   openProviderSessionStream(chatKey);
   closeComposerActionMenu();
   renderComposerActions();
@@ -12847,6 +12886,7 @@ window.addEventListener("beforeunload", closeAllProviderSessionStreams);
 refresh().finally(() => {
   openConductorRoomStream();
   void tailProviderSessions();
+  void loadTerminalTabs();
 });
 window.setInterval(refreshConductorRoom, 1200);
 state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);

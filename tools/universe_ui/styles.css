@@ -826,6 +826,73 @@ body.inspector-open .graph-hint {
   padding: 10px 12px 12px;
 }
 
+.terminal-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px 0;
+}
+.terminal-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgba(90, 160, 230, 0.28);
+  border-radius: 999px;
+  background: rgba(10, 22, 40, 0.9);
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.terminal-tab[aria-selected="true"] {
+  border-color: rgba(61, 224, 255, 0.7);
+}
+.terminal-tab-close {
+  opacity: 0.7;
+}
+.terminal-empty {
+  margin: 0;
+  padding: 8px 10px 0;
+  color: var(--muted, #8aa0bd);
+  font-size: 12px;
+}
+.terminal-stage {
+  flex: 1 1 auto;
+  min-height: 180px;
+  height: auto;
+  margin: 8px 8px 0;
+}
+.terminal-pane {
+  height: 100%;
+}
+.terminal-input-form {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px 10px;
+}
+.terminal-input-form input {
+  flex: 1 1 auto;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid rgba(90, 160, 230, 0.28);
+  border-radius: 8px;
+  background: #07141f;
+  color: inherit;
+}
+.terminal-input-form button {
+  min-width: 64px;
+  border: 1px solid rgba(61, 224, 255, 0.45);
+  border-radius: 8px;
+  background: rgba(10, 40, 48, 0.95);
+  color: inherit;
+  cursor: pointer;
+}
+.conversation-layer.collapsed .terminal-tabs,
+.conversation-layer.collapsed .terminal-stage,
+.conversation-layer.collapsed .terminal-input-form {
+  display: none;
+}
 .conversation-layer.collapsed .room-message-list {
   display: none;
 }
@@ -6392,6 +6459,22 @@ body.chat-resizing * {
   max-height: none;
   overflow-y: auto;
   padding: 14px 12px;
+}
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .room-message-list.hidden {
+  display: none;
+}
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .terminal-tabs {
+  flex: 0 0 auto;
+}
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .terminal-stage {
+  flex: 1 1 auto;
+  min-height: 220px;
+  height: auto;
+}
+.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .terminal-input-form {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--ws-line);
+  background: #0a1917;
 }
 
 .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer.collapsed {

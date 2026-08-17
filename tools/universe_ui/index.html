@@ -6,6 +6,7 @@
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
   <link rel="stylesheet" href="/styles.css?v=work-spine-9">
+  <link rel="stylesheet" href="/xterm.min.css">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -198,12 +199,12 @@
           <header class="conversation-layer-header">
             <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse conversation" aria-label="Collapse conversation" aria-expanded="true">
               <span class="chat-dock-icon" aria-hidden="true">&#128172;</span>
-              <span class="chat-dock-label">Chat</span>
+              <span class="chat-dock-label">CLI</span>
               <span class="chat-dock-chevron" aria-hidden="true">&#9660;</span>
             </button>
             <div class="conversation-title-wrap">
-              <strong id="conversation-title">Conversation</strong>
-              <small id="conversation-target-label">Universe Conductor</small>
+              <strong id="conversation-title">CLI</strong>
+              <small id="conversation-target-label">No terminal tab</small>
             </div>
             <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>
             <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
@@ -215,10 +216,16 @@
               <input id="conversation-opacity" type="range" min="25" max="100" value="92">
             </label>
           </header>
-          <div id="room-message-list" class="room-message-list"></div>
+          <div id="room-message-list" class="room-message-list hidden"></div>
+          <div id="terminal-tabs" class="terminal-tabs" role="tablist"></div>
+          <div id="terminal-stage" class="terminal-stage"></div>
+          <form id="terminal-input-form" class="terminal-input-form">
+            <input id="terminal-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a command and press Enter">
+            <button type="submit">Send</button>
+          </form>
         </section>
 
-        <form id="dispatch-form" class="command-composer project-room conductor-composer">
+        <form id="dispatch-form" class="command-composer project-room conductor-composer hidden">
           <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
           <div class="composer-action-wrap">
             <button id="composer-action-button" class="composer-action-button" type="button" title="Conversation actions" aria-expanded="false">+</button>
@@ -1201,6 +1208,9 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=work-spine-12" defer></script>
+  <script src="/xterm.min.js"></script>
+  <script src="/xterm-addon-fit.min.js"></script>
+  <script src="/terminals.js?v=term-8" defer></script>
+  <script src="/app.js?v=work-spine-13" defer></script>
 </body>
 </html>

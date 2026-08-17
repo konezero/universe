@@ -601,6 +601,24 @@ class ProviderSessionServiceTests(unittest.TestCase):
             self.assertTrue(self.service.wait_idle(CHAT_KEY))
         self.assertLessEqual(len(self.service._permissions), 2)
 
+    def test_observer_excerpts_fill_empty_snapshot_without_room_queue(self) -> None:
+        created = self.service.observe_excerpts(
+            CHAT_KEY,
+            [
+                {"excerpt_id": "semantic_user", "role": "USER", "text": "from vendor"},
+                {"excerpt_id": "semantic_assistant", "role": "ASSISTANT", "text": "reply"},
+            ],
+            replace_observer=True,
+        )
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual(2, len(created))
+        self.assertEqual(
+            ["from vendor", "reply"],
+            [item["body"] for item in snapshot["messages"]],
+        )
+        self.assertTrue(all(item["origin"] == "PROVIDER_OBSERVER" for item in created))
+        self.assertFalse(snapshot["room_queue_used"])
+
 
 if __name__ == "__main__":
     unittest.main()

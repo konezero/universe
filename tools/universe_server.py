@@ -227,6 +227,8 @@ from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
 )
+from universe_app.terminal_host import TerminalHost, TerminalHostError
+from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
 from universe_app.provider_session_service import (
     PROVIDER_SESSION_STREAM_SCHEMA,
     ProviderSessionError,
@@ -238,6 +240,7 @@ from universe_app.work_loop_prediction import (
     build_result_fanout,
     build_work_loop_predictions,
 )
+from runtime_state_trust_gate import is_active_ing_state
 from universe_file_index import (
     FileIndexError,
     coordinate_from_request,
@@ -814,6 +817,258 @@ def _provider_source_key(value: Mapping[str, Any]) -> str:
         "source_path": _canonical_provider_source_path(value.get("source_path")),
     }
     return "provider_source_" + _json_sha256(identity)[:24]
+
+
+
+
+def _unwrap_anchor_snapshot(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    inner = payload.get("snapshot")
+    if isinstance(inner, Mapping):
+        merged = dict(payload)
+        merged.update(inner)
+        return merged
+    return dict(payload)
+
+
+def _session_store_digest(session_id: str) -> str:
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:24]
+
+
+def _vendor_identity_from_observer(observer_ref: str) -> tuple[str, str] | None:
+    raw = str(observer_ref or "").strip()
+    lowered = raw.lower()
+    prefixed = (
+        ("grok-acp:", "GROK"),
+        ("grok-cli:", "GROK"),
+        ("claude-code:", "CLAUDE"),
+        ("codex-app-server:", "CODEX"),
+        ("codex:", "CODEX"),
+    )
+    for prefix, provider in prefixed:
+        if lowered.startswith(prefix):
+            vendor_id = raw[len(prefix) :].strip()
+            return (provider, vendor_id) if vendor_id else None
+    return None
+
+
+def _vendor_chat_key(provider: str, provider_session_id: str) -> str:
+    identity = {
+        "provider": str(provider or "UNKNOWN").upper(),
+        "provider_session_id": str(provider_session_id or ""),
+        "source_path": "",
+    }
+    return "provider_chat_" + _provider_source_key(identity).removeprefix(
+        "provider_source_"
+    )
+
+
+def _read_project_runtime_anchors(
+    store: Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    current_by_mode: dict[str, dict[str, Any]] = {}
+    beyond_by_anchor: dict[str, dict[str, Any]] = {}
+    if not store.is_file():
+        return current_by_mode, beyond_by_anchor
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{store.resolve().as_posix()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "mode_current_anchor" in tables:
+            for row in connection.execute(
+                """
+                SELECT mode, frame_id, anchor_id, state, observed_at, snapshot_json
+                FROM mode_current_anchor
+                """
+            ):
+                try:
+                    payload = json.loads(str(row["snapshot_json"] or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                inner = _unwrap_anchor_snapshot(payload)
+                mode = str(row["mode"] or "").strip().upper()
+                if not mode:
+                    continue
+                current_by_mode[mode] = {
+                    "mode": mode,
+                    "frame_id": str(row["frame_id"] or "current"),
+                    "anchor_id": str(row["anchor_id"] or ""),
+                    "state": str(
+                        row["state"] or inner.get("state") or "CURRENT"
+                    ).upper(),
+                    "observed_at": str(row["observed_at"] or ""),
+                    "observer_session_ref": str(
+                        inner.get("observer_session_ref") or ""
+                    ).strip(),
+                    "session_id": str(inner.get("session_id") or "").strip(),
+                }
+        if "beyond_anchor" in tables:
+            for row in connection.execute(
+                """
+                SELECT mode, frame_id, anchor_id, observed_at, retired_at,
+                       snapshot_json
+                FROM beyond_anchor
+                """
+            ):
+                try:
+                    payload = json.loads(str(row["snapshot_json"] or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                inner = _unwrap_anchor_snapshot(payload)
+                coordinates = inner.get("coordinates")
+                if not isinstance(coordinates, Mapping):
+                    coordinates = {}
+                mode = str(
+                    row["mode"] or coordinates.get("mode") or ""
+                ).strip().upper()
+                anchor_id = str(row["anchor_id"] or "").strip()
+                if not anchor_id:
+                    continue
+                beyond_by_anchor[anchor_id] = {
+                    "mode": mode,
+                    "frame_id": str(row["frame_id"] or "current"),
+                    "anchor_id": anchor_id,
+                    "observed_at": str(row["observed_at"] or ""),
+                    "retired_at": str(row["retired_at"] or ""),
+                    "observer_session_ref": str(
+                        inner.get("observer_session_ref") or ""
+                    ).strip(),
+                    "session_id": str(inner.get("session_id") or "").strip(),
+                    "state": str(inner.get("state") or "UNKNOWN").upper(),
+                }
+    except (OSError, sqlite3.Error):
+        return current_by_mode, beyond_by_anchor
+    finally:
+        if connection is not None:
+            connection.close()
+    return current_by_mode, beyond_by_anchor
+
+
+def _read_session_store_rows(session_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not session_dir.is_dir():
+        return rows
+    for path in sorted(session_dir.glob("session-*.sqlite3")):
+        if path.name.endswith(("-wal", "-shm")):
+            continue
+        digest = path.stem.removeprefix("session-")
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{path.resolve().as_posix()}?mode=ro",
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "anchor_snapshot" not in tables:
+                rows.append({"digest": digest, "present": True})
+                continue
+            row = connection.execute(
+                "SELECT * FROM anchor_snapshot WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                rows.append({"digest": digest, "present": True})
+                continue
+            try:
+                payload = json.loads(str(row["snapshot_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            inner = _unwrap_anchor_snapshot(payload)
+            coordinates = inner.get("coordinates")
+            if not isinstance(coordinates, Mapping):
+                coordinates = {}
+            rows.append(
+                {
+                    "digest": digest,
+                    "present": True,
+                    "anchor_id": str(row["anchor_id"] or "").strip(),
+                    "state": str(
+                        row["state"] or inner.get("state") or ""
+                    ).upper(),
+                    "observed_at": str(row["observed_at"] or ""),
+                    "session_id": str(inner.get("session_id") or "").strip(),
+                    "observer_session_ref": str(
+                        inner.get("observer_session_ref") or ""
+                    ).strip(),
+                    "mode": str(coordinates.get("mode") or "").strip().upper(),
+                }
+            )
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+    return rows
+
+
+def _chat_key_for_observer(observer_ref: str) -> tuple[str, str | None]:
+    identity = _vendor_identity_from_observer(observer_ref)
+    if identity is None:
+        return "UNKNOWN", None
+    return identity[0], _vendor_chat_key(identity[0], identity[1])
+
+
+def _public_anchor_session(
+    *,
+    project_id: str,
+    mode: str,
+    session_id: str,
+    provider: str,
+    session_anchor_ref: str,
+    current_anchor_ref: str,
+    origin_anchor_ref: str,
+    temporality: str,
+    currentness: str,
+    currentness_source: str,
+    state: str,
+    last_seen_at: str,
+    chat_key: str | None,
+    store_present: bool,
+    observer_session_ref: str = "",
+) -> dict[str, Any]:
+    universe_id = session_id if str(session_id).startswith("UNIVERSE-") else None
+    observer = str(observer_session_ref or "").strip()
+    identity = _vendor_identity_from_observer(observer or session_id)
+    provider_session_id = identity[1] if identity is not None else ""
+    return {
+        "schema": "universe.project-anchor-session.v1",
+        "project_id": project_id,
+        "node": project_id,
+        "mode": mode,
+        "session_id": session_id,
+        "universe_session_id": universe_id,
+        "alias": session_id if universe_id else f"{project_id} {mode}",
+        "provider": provider,
+        "observer_session_ref": observer,
+        "provider_session_id": provider_session_id,
+        "session_anchor_ref": session_anchor_ref,
+        "current_anchor_ref": current_anchor_ref,
+        "origin_anchor_ref": origin_anchor_ref,
+        "temporality": temporality,
+        "currentness": currentness,
+        "observer_currentness": currentness,
+        "currentness_source": currentness_source,
+        "state": state,
+        "active_ing": is_active_ing_state(state),
+        "last_seen_at": last_seen_at or None,
+        "chat_key": chat_key,
+        "store_present": store_present,
+    }
 
 
 def _public_provider_source(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -16769,6 +17024,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.file_selector = file_selector or select_file_with_native_dialog
         self.host_profile = host_profile or HostProfileStore()
+        self.terminal_host = TerminalHost()
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
@@ -19520,6 +19776,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             prefixed = (
                 ("claude-code:", "CLAUDE"),
                 ("grok-acp:", "GROK"),
+                ("grok-cli:", "GROK"),
                 ("codex-app-server:", "CODEX"),
                 ("codex:", "CODEX"),
             )
@@ -19728,6 +19985,215 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "unchanged": len(observations),
         }
 
+    def list_project_anchor_sessions(self, project_id: str) -> dict[str, Any]:
+        """List Current and in-progress Beyond sessions from the project store."""
+
+        project = self.store.get_project(project_id)
+        project_root = Path(str(project.get("project_root") or "")).resolve(
+            strict=False
+        )
+        runtime_store = (
+            project_root / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+        )
+        session_dir = project_root / ".ai" / "runtime" / "session_store"
+        current_by_mode, beyond_by_anchor = _read_project_runtime_anchors(
+            runtime_store
+        )
+        store_rows = _read_session_store_rows(session_dir)
+        sessions: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def remember(mode: str, session_id: str) -> bool:
+            key = (mode, session_id)
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+        def matching_store_row(
+            *,
+            mode: str,
+            anchor_id: str,
+            session_id: str,
+            observer_ref: str,
+        ) -> dict[str, Any] | None:
+            candidates = []
+            if session_id:
+                candidates.append(_session_store_digest(session_id))
+            if observer_ref:
+                candidates.append(_session_store_digest(observer_ref))
+            for row in store_rows:
+                if row.get("digest") in candidates:
+                    return row
+                if anchor_id and row.get("anchor_id") == anchor_id:
+                    return row
+                if session_id and row.get("session_id") == session_id:
+                    return row
+                if observer_ref and row.get("observer_session_ref") == observer_ref:
+                    return row
+            return None
+
+        for mode, current in current_by_mode.items():
+            observer = str(current.get("observer_session_ref") or "").strip()
+            session_id = (
+                str(current.get("session_id") or "").strip()
+                or observer
+                or str(current.get("anchor_id") or "")
+            )
+            if not session_id or not remember(mode, session_id):
+                continue
+            store_row = matching_store_row(
+                mode=mode,
+                anchor_id=str(current.get("anchor_id") or ""),
+                session_id=session_id,
+                observer_ref=observer,
+            )
+            provider, chat_key = _chat_key_for_observer(observer)
+            sessions.append(
+                _public_anchor_session(
+                    project_id=project_id,
+                    mode=mode,
+                    session_id=session_id,
+                    provider=provider,
+                    session_anchor_ref=str(current.get("anchor_id") or ""),
+                    current_anchor_ref=str(current.get("anchor_id") or ""),
+                    origin_anchor_ref=str(current.get("anchor_id") or ""),
+                    temporality="CURRENT",
+                    currentness="CURRENT",
+                    currentness_source="MODE_CURRENT_ANCHOR",
+                    state=str(
+                        (store_row or {}).get("state") or current.get("state") or "CURRENT"
+                    ),
+                    last_seen_at=str(
+                        (store_row or {}).get("observed_at")
+                        or current.get("observed_at")
+                        or ""
+                    ),
+                    chat_key=chat_key,
+                    store_present=store_row is not None,
+                    observer_session_ref=observer,
+                )
+            )
+
+        for row in store_rows:
+            anchor_id = str(row.get("anchor_id") or "").strip()
+            if not anchor_id or anchor_id not in beyond_by_anchor:
+                continue
+            if not is_active_ing_state(row.get("state")):
+                continue
+            beyond = beyond_by_anchor[anchor_id]
+            mode = str(row.get("mode") or beyond.get("mode") or "").upper()
+            session_id = (
+                str(row.get("session_id") or "").strip()
+                or str(row.get("observer_session_ref") or "").strip()
+                or f"session-{row.get('digest')}"
+            )
+            current = current_by_mode.get(mode) or {}
+            if session_id in {
+                str(current.get("session_id") or ""),
+                str(current.get("observer_session_ref") or ""),
+            } or anchor_id == str(current.get("anchor_id") or ""):
+                continue
+            if not mode or not remember(mode, session_id):
+                continue
+            observer = str(
+                row.get("observer_session_ref")
+                or beyond.get("observer_session_ref")
+                or ""
+            )
+            provider, chat_key = _chat_key_for_observer(observer)
+            sessions.append(
+                _public_anchor_session(
+                    project_id=project_id,
+                    mode=mode,
+                    session_id=session_id,
+                    provider=provider,
+                    session_anchor_ref=anchor_id,
+                    current_anchor_ref=str(
+                        current.get("anchor_id") or beyond.get("anchor_id") or ""
+                    ),
+                    origin_anchor_ref=anchor_id,
+                    temporality="BEYOND",
+                    currentness="PAST",
+                    currentness_source="SESSION_STORE",
+                    state=str(row.get("state") or "UNKNOWN"),
+                    last_seen_at=str(row.get("observed_at") or ""),
+                    chat_key=chat_key,
+                    observer_session_ref=observer,
+                    store_present=True,
+                )
+            )
+
+        sessions.sort(
+            key=lambda item: (
+                0 if item.get("currentness") == "CURRENT" else 1,
+                str(item.get("mode") or ""),
+                str(item.get("last_seen_at") or ""),
+            )
+        )
+        return {
+            "schema": "universe.project-anchor-sessions.v1",
+            "status": "PROJECT_ANCHOR_SESSIONS_COLLECTED",
+            "project_id": project_id,
+            "sessions": sessions,
+        }
+
+    def list_all_project_anchor_sessions(self) -> list[dict[str, Any]]:
+        sessions: list[dict[str, Any]] = []
+        for project in self.store.list_projects()[:100]:
+            project_id = str(project.get("project_id") or "").strip()
+            if not project_id:
+                continue
+            try:
+                listed = self.list_project_anchor_sessions(project_id)
+            except UniverseError:
+                continue
+            sessions.extend(listed.get("sessions") or [])
+        return sessions
+
+    def list_cli_terminals(self) -> dict[str, Any]:
+        return {
+            "schema": API_SCHEMA,
+            "status": "CLI_TERMINALS_COLLECTED",
+            "terminals": self.terminal_host.list_sessions(),
+        }
+
+    def create_cli_terminal(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            terminal = self.terminal_host.create(
+                project_id=str(payload.get("project_id") or ""),
+                mode=str(payload.get("mode") or "MASTER"),
+                cwd=str(payload.get("cwd") or ""),
+                provider=str(payload.get("provider") or "AUTO"),
+                resume_session_ref=str(payload.get("resume_session_ref") or ""),
+                cols=int(payload.get("cols") or 120),
+                rows=int(payload.get("rows") or 32),
+            )
+        except TerminalHostError as error:
+            status = (
+                HTTPStatus.NOT_FOUND
+                if error.code == "TERMINAL_NOT_FOUND"
+                else HTTPStatus.CONFLICT
+            )
+            raise UniverseError(error.code, error.detail, status) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "CLI_TERMINAL_CREATED",
+            "terminal": terminal,
+        }
+
+    def close_cli_terminal(self, terminal_id: str) -> dict[str, Any]:
+        try:
+            result = self.terminal_host.close(terminal_id)
+        except TerminalHostError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.NOT_FOUND,
+            ) from error
+        return {"schema": API_SCHEMA, **result}
+
     def provider_chat_catalog(self) -> dict[str, Any]:
         """Join provider-owned chat metadata to optional Universe bindings.
 
@@ -19822,30 +20288,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             bound = matches[0] if matches else None
             binding: dict[str, Any] = {"state": "UNBOUND"}
-            # A persistent Supervisor session already owns its exact vendor
-            # chat key.  Historical Project Anchor observations may enrich an
-            # unbound source, but must not replace that session identity.
-            binding_observation = None if bound is not None else anchor_observation
-            if binding_observation is None and bound is not None:
-                bound_node = str(bound.get("node") or "UNKNOWN")
-                bound_project_id = str(
-                    bound.get("current_project_id")
-                    or (bound_node if bound_node != "UNKNOWN" else "")
-                ).strip()
-                bound_anchor_ref = str(bound.get("anchor_ref") or "UNKNOWN")
-                binding_observation = {
-                    "project_id": bound_project_id or None,
-                    "node": bound_node,
-                    "mode": str(bound.get("mode") or "UNKNOWN"),
-                    "anchor_ref": bound_anchor_ref,
-                    "observed_anchor_ref": bound_anchor_ref,
-                    "temporality": "SUPERVISOR_CURRENT",
-                    "observed_at": (
-                        bound.get("last_seen_at")
-                        or bound.get("updated_at")
-                        or "UNKNOWN"
-                    ),
-                }
+            # Vendor chats stay independent. Mode Current Anchor is observational
+            # currentness, not Session Supervisor ownership.
+            binding_observation = anchor_observation
             if binding_observation is not None:
                 node = str(binding_observation.get("node") or "UNKNOWN")
                 mode = str(binding_observation.get("mode") or "UNKNOWN")
@@ -19874,28 +20319,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     binding_observation.get("anchor_currentness_source") or ""
                 ).upper()
                 if not observer_currentness:
-                    if bound is not None:
-                        observer_currentness = (
-                            "CURRENT"
-                            if bool(bound.get("is_default"))
-                            or str(bound.get("currentness") or "").upper()
-                            == "CURRENT"
-                            else "PAST"
-                        )
-                        currentness_source = "SESSION_SUPERVISOR"
-                    elif anchor_observation is not None:
-                        observer_currentness = (
-                            "CURRENT"
-                            if str(binding_observation.get("temporality") or "").upper()
-                            == "CURRENT"
-                            else "PAST"
-                        )
-                        currentness_source = "PROJECT_ANCHOR_DB"
-                    else:
-                        observer_currentness = "UNKNOWN"
-                        currentness_source = "UNKNOWN"
+                    observer_currentness = (
+                        "CURRENT"
+                        if str(binding_observation.get("temporality") or "").upper()
+                        == "CURRENT"
+                        else "PAST"
+                    )
+                    currentness_source = "MODE_CURRENT_ANCHOR"
                 binding = {
-                    "state": "BOUND" if bound is not None else "ANCHOR_OBSERVED",
+                    "state": "ANCHOR_OBSERVED",
                     "current_project_id": anchor_identity["project_id"],
                     "node": node,
                     "mode": mode,
@@ -19942,6 +20374,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         bound is not None and bound.get("is_default")
                     ),
                 }
+            else:
+                workspace_name = str(source.get("workspace_name") or "").strip()
+                workspace_path = str(source.get("workspace") or "").strip()
+                project_match = None
+                for item in self.store.list_projects():
+                    project_id = str(item.get("project_id") or "").strip()
+                    project_root = str(item.get("project_root") or "").strip()
+                    root_name = Path(project_root).name if project_root else ""
+                    if project_id and project_id.lower() == workspace_name.lower():
+                        project_match = item
+                        break
+                    if root_name and root_name.lower() == workspace_name.lower():
+                        project_match = item
+                        break
+                    if (
+                        workspace_path
+                        and project_root.replace("\\", "/").lower()
+                        == workspace_path.replace("\\", "/").lower()
+                    ):
+                        project_match = item
+                        break
+                if project_match is not None:
+                    project_id = str(project_match.get("project_id") or "")
+                    binding = {
+                        "state": "INDEPENDENT",
+                        "current_project_id": project_id,
+                        "node": project_id,
+                        "mode": "MASTER",
+                        "alias": f"{project_id} observed",
+                        "observer_currentness": "UNKNOWN",
+                        "currentness_source": "WORKSPACE_OBSERVED",
+                        "selection_scope": "UI_NAVIGATION_ONLY",
+                        "is_default": False,
+                    }
 
             registered = registered_by_identity.get(
                 (provider, provider_session_id, source_path)
@@ -20161,6 +20627,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "PROVIDER_CHAT_CATALOG_COLLECTED",
             "observed_at": utc_now(),
             "rooms": rooms,
+            "anchor_sessions": self.list_all_project_anchor_sessions(),
             "providers": ["CODEX", "CLAUDE", "GROK"],
             "transcript_content": "EXCLUDED",
         }
@@ -20425,7 +20892,174 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continue
             if delta["deltas"] or delta["delivery"] == "ACTIVITY_ONLY":
                 deltas.append(delta)
+        self._publish_live_provider_excerpts(deltas)
         return {"scans": scans, "deltas": deltas}
+
+    def _provider_chat_key_for_source_id(self, source_id: str) -> str | None:
+        wanted = str(source_id or "").strip()
+        if not wanted:
+            return None
+        for source in self.store.list_provider_session_sources():
+            if str(source.get("source_id") or "") != wanted:
+                continue
+            identity = {
+                "provider": source.get("provider"),
+                "provider_session_id": source.get("provider_session_id"),
+                "source_path": "",
+            }
+            return "provider_chat_" + _provider_source_key(identity).removeprefix(
+                "provider_source_"
+            )
+        return None
+
+    def _source_id_for_provider_chat_key(self, chat_key: str) -> str | None:
+        wanted = str(chat_key or "").strip()
+        if not wanted:
+            return None
+        for source in self.store.list_provider_session_sources():
+            identity = {
+                "provider": source.get("provider"),
+                "provider_session_id": source.get("provider_session_id"),
+                "source_path": "",
+            }
+            key = "provider_chat_" + _provider_source_key(identity).removeprefix(
+                "provider_source_"
+            )
+            if key == wanted:
+                return str(source.get("source_id") or "") or None
+        return None
+
+    def hydrate_provider_session_transcript(self, chat_key: str) -> None:
+        source_id = self._source_id_for_provider_chat_key(chat_key)
+        if not source_id:
+            return
+        try:
+            excerpts = (
+                self.store.provider_session_observer.build_transient_visible_transcript(
+                    source_id
+                )
+            )
+        except ProviderSessionObserverError:
+            return
+        try:
+            self.provider_sessions.observe_excerpts(
+                chat_key, excerpts, replace_observer=True
+            )
+        except ProviderSessionError:
+            return
+
+    def _publish_live_provider_excerpts(self, deltas: list[dict[str, Any]]) -> None:
+        for delta in deltas:
+            if not isinstance(delta, Mapping):
+                continue
+            excerpts = delta.get("deltas")
+            source = delta.get("source")
+            if not excerpts or not isinstance(source, Mapping):
+                continue
+            chat_key = self._provider_chat_key_for_source_id(
+                str(source.get("source_id") or "")
+            )
+            if not chat_key:
+                continue
+            try:
+                self.provider_sessions.observe_excerpts(
+                    chat_key, excerpts, publish=True
+                )
+            except ProviderSessionError:
+                continue
+
+    def resolve_provider_chat_identity(self, chat_key: str) -> dict[str, Any]:
+        wanted = str(chat_key or "").strip()
+        if not wanted:
+            raise UniverseError("PROVIDER_CHAT_KEY_REQUIRED", "chat_key is required")
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            for source in self.store.discover_provider_session_sources(provider):
+                provider_name = str(source.get("provider") or "UNKNOWN").upper()
+                provider_session_id = str(source.get("provider_session_id") or "")
+                source_path = _canonical_provider_source_path(source.get("source_path"))
+                if not source_path:
+                    continue
+                identity_verified = source.get("identity_state") == "VERIFIED"
+                session_kind = str(source.get("session_kind") or "CHAT").upper()
+                chat_identity = {
+                    "provider": provider_name,
+                    "provider_session_id": provider_session_id,
+                    "source_path": (
+                        ""
+                        if identity_verified and session_kind != "WORKER"
+                        else source_path
+                    ),
+                }
+                key = "provider_chat_" + _provider_source_key(chat_identity).removeprefix(
+                    "provider_source_"
+                )
+                if key != wanted:
+                    continue
+                if not identity_verified or session_kind == "WORKER":
+                    raise UniverseError(
+                        "PROVIDER_SESSION_IDENTITY_UNKNOWN",
+                        "this vendor session cannot be attached",
+                        HTTPStatus.CONFLICT,
+                    )
+                return {
+                    **source,
+                    "chat_key": key,
+                    "provider": provider_name,
+                    "provider_session_id": provider_session_id,
+                }
+        raise UniverseError(
+            "PROVIDER_CHAT_ROOM_NOT_FOUND",
+            "vendor session is no longer observable",
+            HTTPStatus.NOT_FOUND,
+        )
+
+    def attach_provider_chat_room(
+        self, chat_key: str, request: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        payload = request if isinstance(request, Mapping) else {}
+        identity = self.resolve_provider_chat_identity(chat_key)
+        project_id = str(payload.get("project_id") or payload.get("node") or "").strip()
+        if not project_id:
+            workspace = str(identity.get("workspace") or "").strip()
+            workspace_name = str(identity.get("workspace_name") or "").strip()
+            projects = self.store.list_projects()
+            match = next(
+                (
+                    item
+                    for item in projects
+                    if str(item.get("project_id") or "").lower()
+                    in {workspace_name.lower(), Path(workspace).name.lower()}
+                    or (
+                        workspace
+                        and str(item.get("project_root") or "").replace("\\", "/").lower()
+                        == workspace.replace("\\", "/").lower()
+                    )
+                ),
+                None,
+            )
+            if match is None:
+                raise UniverseError(
+                    "INJECT_TARGET_REQUIRED",
+                    "attach requires a matching registered project",
+                    HTTPStatus.CONFLICT,
+                )
+            project_id = str(match.get("project_id") or "")
+        self.store.register_provider_session_source(
+            {
+                "provider": identity["provider"],
+                "provider_session_id": identity["provider_session_id"],
+                "source_path": identity["source_path"],
+                "source_kind": identity["source_kind"],
+                "source_version": identity.get("source_version") or "v1",
+            }
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROVIDER_CHAT_ROOM_OBSERVED",
+            "chat_key": str(identity["chat_key"]),
+            "project_id": project_id,
+            "catalog": self.provider_chat_catalog(),
+        }
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
@@ -23331,8 +23965,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path in {"/", "/app.js", "/styles.css"}:
+        if path in {"/", "/app.js", "/styles.css", "/terminals.js", "/xterm.min.js", "/xterm.min.css", "/xterm-addon-fit.min.js"}:
             self._send_static(path)
+            return
+        if path.startswith("/v1/terminals/") and path.endswith("/stream"):
+            if not self._authorize():
+                return
+            self._upgrade_terminal_stream(unquote(path[len("/v1/terminals/") : -len("/stream")]))
+            return
+        if path == "/v1/terminals":
+            if not self._authorize():
+                return
+            self._send(HTTPStatus.OK, self.server.list_cli_terminals())
             return
         if path == "/health":
             self._send(
@@ -23930,6 +24574,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 if provider_session_get.group(2):
                     self._stream_provider_session(chat_key)
                 else:
+                    self.server.hydrate_provider_session_transcript(chat_key)
                     self._send(
                         HTTPStatus.OK,
                         self.server.provider_sessions.snapshot(chat_key),
@@ -24368,6 +25013,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if suffix == "/semantic-graph":
                 self._send(HTTPStatus.OK, self.server.store.semantic_project_graph(project_id))
                 return
+            if suffix == "/anchor-sessions":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.list_project_anchor_sessions(project_id),
+                )
+                return
             if suffix == "/work-loop":
                 self._send(
                     HTTPStatus.OK,
@@ -24575,6 +25226,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        if path == "/v1/terminals":
+            try:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.create_cli_terminal(self._read_json()),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path.startswith("/v1/settings/remote-access/") and not (
             self._authorize_local_operator()
         ):
@@ -25137,6 +25797,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
+                return
+            provider_chat_attach = re.fullmatch(
+                r"/v1/session-observer/chat-rooms/([^/]+)/attach$", path
+            )
+            if provider_chat_attach is not None:
+                try:
+                    result = self.server.attach_provider_chat_room(
+                        unquote(provider_chat_attach.group(1)),
+                        body or {},
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except UniverseError as error:
+                    self._send_error(error)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                except SessionSupervisorError as error:
+                    self._send_supervisor_error(error)
                 return
             if path == "/v1/sessions/inject":
                 try:
@@ -26974,6 +27651,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        terminal_id = re.fullmatch(r"/v1/terminals/([^/]+)$", path)
+        if terminal_id is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.close_cli_terminal(unquote(terminal_id.group(1))),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         provider_session_action = re.fullmatch(
             r"/v1/provider-sessions/([^/]+)/actions/([^/]+)", path
         )
@@ -27156,6 +27843,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/work-loop/recover",
             "/work-loop",
             "/semantic-graph",
+            "/anchor-sessions",
             "/experience-matches",
             "/experience-patterns/auto",
             "/experience-pattern-proposals",
@@ -27463,6 +28151,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def _stream_provider_session(self, chat_key: str) -> None:
         cursor = self.server.provider_sessions.events.cursor()
+        self.server.hydrate_provider_session_transcript(chat_key)
         snapshot = self.server.provider_sessions.snapshot(chat_key)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -27640,11 +28329,40 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _upgrade_terminal_stream(self, terminal_id: str) -> None:
+        try:
+            self.server.terminal_host.get(terminal_id)
+        except TerminalHostError as error:
+            self._send_error(
+                UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND)
+            )
+            return
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if str(self.headers.get("Upgrade") or "").lower() != "websocket" or not key:
+            self._send_error(
+                UniverseError(
+                    "TERMINAL_STREAM_UPGRADE_REQUIRED",
+                    "terminal stream requires a WebSocket upgrade",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            )
+            return
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
+        self.end_headers()
+        pump_terminal_socket(self, terminal_id, self.server.terminal_host)
+
     def _send_static(self, path: str) -> None:
         filename = {
             "/": "index.html",
             "/app.js": "app.js",
             "/styles.css": "styles.css",
+            "/terminals.js": "terminals.js",
+            "/xterm.min.js": "xterm.min.js",
+            "/xterm.min.css": "xterm.min.css",
+            "/xterm-addon-fit.min.js": "xterm-addon-fit.min.js",
         }[path]
         target = UI_ROOT / filename
         if not target.is_file() or target.is_symlink():
@@ -27662,8 +28380,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; "
             "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         )
         self.end_headers()

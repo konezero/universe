@@ -37,10 +37,16 @@ class ProviderSessionUiContractTests(unittest.TestCase):
                 "function renderNodeModeSessionCards"
             )
         ]
+        resume_slice = APP[
+            APP.index("async function resumeNodeModeSession") : APP.index(
+                "async function startNewNodeModeSession"
+            )
+        ]
         self.assertIn("[coordinate.key]: anchorSessionKey(session)", selection_slice)
-        self.assertIn("const opened = await openProviderChatSession(room, {", selection_slice)
-        self.assertIn("session,", selection_slice)
-        self.assertIn("isCurrent:", selection_slice)
+        self.assertIn("await resumeNodeModeSession(coordinate, session)", selection_slice)
+        self.assertIn("createTerminalTab(coordinate, session)", resume_slice)
+        self.assertIn("focusTerminalForSession(coordinate, session)", resume_slice)
+        self.assertNotIn("attachProviderChatRoom", resume_slice)
         open_slice = APP[
             APP.index("async function openProviderChatSession") : APP.index(
                 "function closeProjectRoomStream"
@@ -149,7 +155,8 @@ class ProviderSessionUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn('sessionKind !== "WORKER"', eligibility)
-        self.assertIn('"BOUND", "ANCHOR_OBSERVED"', eligibility)
+        self.assertIn("function providerSessionObservedProjectId(room)", APP)
+        self.assertIn("providerSessionRoomIsSelected(chatKey)", eligibility)
         self.assertIn('currentness === "CURRENT"', eligibility)
         self.assertIn("providerSessionRoomIsEligible(room)", APP)
         self.assertIn("delete state.providerSessionRoomCaches[key]", APP)
