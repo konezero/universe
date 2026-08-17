@@ -50,17 +50,18 @@ function bindTerminalInput() {
 }
 
 function focusTerminalInput() {
-  const input = document.querySelector("#terminal-input");
   const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
+  const form = document.querySelector("#terminal-input-form");
+  if (surface?.term) {
+    if (form) form.hidden = true;
+    try { surface.term.focus(); } catch (_e) { /* pane not ready */ }
+    return;
+  }
+  if (form) form.hidden = false;
+  const input = document.querySelector("#terminal-input");
   if (input) {
     input.disabled = !surface;
     input.focus();
-    return;
-  }
-  try {
-    surface?.term?.focus();
-  } catch (_error) {
-    /* ignore until the pane exists */
   }
 }
 
@@ -114,12 +115,24 @@ function renderTerminalDock() {
   }
 }
 
+function autoWidenForTerminal() {
+  const shell = document.querySelector(".app-shell");
+  if (!shell) return;
+  const current = parseInt(getComputedStyle(shell).getPropertyValue("--chat-panel-width")) || 380;
+  if (current < 600) {
+    shell.style.setProperty("--chat-panel-width", "680px");
+    const handle = document.querySelector("#chat-resize-handle");
+    if (handle) handle.setAttribute("aria-valuenow", "680");
+  }
+}
+
 function selectTerminalTab(terminalId) {
   const session = (state.terminals || []).find((item) => item.terminal_id === terminalId);
   if (!session) return;
   state.activeTerminalId = terminalId;
   renderTerminalDock();
   ensureTerminalSurface(session);
+  autoWidenForTerminal();
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = id !== terminalId;
@@ -186,8 +199,16 @@ function ensureTerminalSurface(session) {
     socket.send(JSON.stringify({ type: "resize", cols, rows }));
   };
   socket.addEventListener("open", notifySize);
+  socket.addEventListener("close", () => {
+    term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
+  });
   window.addEventListener("resize", notifySize);
-  surface = { element, term, fit, socket, notifySize };
+  const resizeObserver = new ResizeObserver(() => {
+    if (element.hidden) return;
+    notifySize();
+  });
+  resizeObserver.observe(element);
+  surface = { element, term, fit, socket, notifySize, resizeObserver };
   state.terminalSurfaces[session.terminal_id] = surface;
   return surface;
 }
@@ -270,16 +291,9 @@ async function closeTerminalTab(terminalId) {
   await api("/v1/terminals/" + encodeURIComponent(terminalId), { method: "DELETE" });
   const surface = (state.terminalSurfaces || {})[terminalId];
   if (surface) {
-    try {
-      surface.socket.close();
-    } catch (_error) {
-      /* already closed */
-    }
-    try {
-      surface.term.dispose();
-    } catch (_error) {
-      /* ignore */
-    }
+    try { surface.resizeObserver?.disconnect(); } catch (_e) { /* ok */ }
+    try { surface.socket.close(); } catch (_e) { /* already closed */ }
+    try { surface.term.dispose(); } catch (_e) { /* ok */ }
     surface.element.remove();
     delete state.terminalSurfaces[terminalId];
   }

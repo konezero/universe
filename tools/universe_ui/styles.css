@@ -862,9 +862,13 @@ body.inspector-open .graph-hint {
   min-height: 180px;
   height: auto;
   margin: 8px 8px 0;
+  overflow: hidden;
+  position: relative;
 }
 .terminal-pane {
+  width: 100%;
   height: 100%;
+  overflow: hidden;
 }
 .terminal-input-form {
   display: flex;
@@ -6470,6 +6474,8 @@ body.chat-resizing * {
   flex: 1 1 auto;
   min-height: 220px;
   height: auto;
+  overflow: hidden;
+  position: relative;
 }
 .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .terminal-input-form {
   flex: 0 0 auto;

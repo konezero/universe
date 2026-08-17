@@ -4028,7 +4028,7 @@ function expandConversationLayer() {
 }
 
 const CHAT_PANEL_MIN_WIDTH = 300;
-const CHAT_PANEL_MAX_WIDTH = 560;
+const CHAT_PANEL_MAX_WIDTH = 900;
 
 function clampChatPanelWidth(width) {
   const requested = Number(width);
