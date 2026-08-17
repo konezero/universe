@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Query the Mode Current Anchor and the bound session SQL path."""
+"""Query the Mode Current Anchor and Registry snapshot from the Project Runtime store."""
 
 from __future__ import annotations
 
@@ -32,6 +32,45 @@ def _result(status: str, **fields: Any) -> dict[str, Any]:
     return payload
 
 
+def _registry_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
+    try:
+        row = connection.execute(
+            """
+            SELECT revision, registry_digest, registry_json
+            FROM mode_registry_snapshot
+            WHERE singleton = 1
+            """
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {
+            "registry_source": "MISSING",
+            "registry_revision": None,
+            "registry_digest": "",
+            "registered_modes": [],
+        }
+    if row is None:
+        return {
+            "registry_source": "MISSING",
+            "registry_revision": None,
+            "registry_digest": "",
+            "registered_modes": [],
+        }
+    try:
+        payload = json.loads(str(row[2] or ""))
+    except json.JSONDecodeError:
+        payload = {}
+    modes = payload.get("modes") if isinstance(payload, dict) else {}
+    registered = (
+        sorted(str(name) for name in modes) if isinstance(modes, dict) else []
+    )
+    return {
+        "registry_source": "project_runtime.sqlite3:mode_registry_snapshot",
+        "registry_revision": row[0],
+        "registry_digest": str(row[1]),
+        "registered_modes": registered,
+    }
+
+
 def query(repo_root: Path, request: dict[str, Any]) -> dict[str, Any]:
     mode = str(request.get("mode") or "").strip().upper()
     expected = str(request.get("anchor_id") or "").strip()
@@ -47,6 +86,15 @@ def query(repo_root: Path, request: dict[str, Any]) -> dict[str, Any]:
         )
     connection = sqlite3.connect(f"file:{store.resolve().as_posix()}?mode=ro", uri=True)
     try:
+        registry = _registry_snapshot(connection)
+        if registry["registered_modes"] and mode not in registry["registered_modes"]:
+            return _result(
+                "MODE_NOT_REGISTERED",
+                mode=mode,
+                reasons=["MODE_NOT_REGISTERED"],
+                standalone_uses_same_store=True,
+                **registry,
+            )
         row = connection.execute(
             """
             SELECT mode, frame_id, anchor_id, state
@@ -62,6 +110,8 @@ def query(repo_root: Path, request: dict[str, Any]) -> dict[str, Any]:
             "MODE_CURRENT_ANCHOR_MISSING",
             mode=mode,
             reasons=["MODE_CURRENT_ANCHOR_MISSING"],
+            standalone_uses_same_store=True,
+            **registry,
         )
     stored_anchor = str(row[2])
     if expected and expected != stored_anchor:
@@ -71,6 +121,8 @@ def query(repo_root: Path, request: dict[str, Any]) -> dict[str, Any]:
             requested_anchor_id=expected,
             anchor_id=stored_anchor,
             reasons=["MODE_CURRENT_ANCHOR_MISMATCH"],
+            standalone_uses_same_store=True,
+            **registry,
         )
     session_sql = ""
     session_sql_present = False
@@ -89,6 +141,8 @@ def query(repo_root: Path, request: dict[str, Any]) -> dict[str, Any]:
         session_sql_path=session_sql,
         session_sql_present=session_sql_present,
         companions_are_refs=True,
+        standalone_uses_same_store=True,
+        **registry,
     )
 
 

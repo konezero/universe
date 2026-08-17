@@ -20,10 +20,11 @@ Runtime Workspace: `.ai/`
 3. `.ai/START_HERE.md`
 4. `.ai/core/README.md`
 5. `.ai/runtime/project_instance/boot_command_entry.md`
-6. `.ai/runtime/state/project_runtime.sqlite3` Mode Current Anchor; use it
+6. `.ai/runtime/state/project_runtime.sqlite3` Registry snapshot and Mode Current Anchor; use them
 7. `.ai/runtime/session_store/` bound to that Current Anchor; create only if absent
 
-`session.md` and `current_anchor_frame.md` are companion refs only.
+Standalone and Universe-attached Hosts use that same store. Do not walk git
+for live Mode. `session.md` and `current_anchor_frame.md` are companion refs only.
 
 ## Installation Evidence
 

@@ -7,7 +7,9 @@ Not: MCP protocol wrapper, CLI-side index, automatic Skill binding
 ## Rule
 
 A general CLI does not walk the repository or read `session.md` as current
-Mode. It uses the Mode Current Anchor and queries the local Universe service.
+Mode. Standalone and Universe-attached Hosts both query
+`project_runtime.sqlite3` for the Registry snapshot and Mode Current Anchor.
+Universe HTTP is only for search and Memory/Bench.
 
 ```text
 requested Mode Current Anchor

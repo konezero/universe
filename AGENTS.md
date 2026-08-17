@@ -32,10 +32,13 @@ references only. Follow
 evidence, restore is `NOT_PERFORMED`, validation is `NOT_RUN`, and
 Runtime / Mode Current Anchor fields remain `UNKNOWN`.
 
-Mode intent must resolve through
-`.ai/runtime/project_instance/mode_registry.json` before Role, Scope,
-session preparation, or Mode Current Anchor access. The project
-Registry is `MASTER_MANAGED`; MASTER cannot delete itself.
+Mode intent must resolve through the Registry snapshot in
+`.ai/runtime/state/project_runtime.sqlite3` before Role, Scope,
+session preparation, or Mode Current Anchor access. Standalone and
+Universe-attached Hosts use that same store. Do not walk git or Core
+markdown for live Mode. The installed `mode_registry.json` is a Release
+seed only when the snapshot is absent. The project Registry is
+`MASTER_MANAGED`; MASTER cannot delete itself.
 
 ## Common Agent Policy
 
