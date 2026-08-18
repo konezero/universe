@@ -19084,33 +19084,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     expected_mode="CONDUCTOR",
                     mode_registry_path=DEFAULT_MODE_REGISTRY_PATH,
                 )
-            if any(key in request for key in ("provider", "model_ref", "effort")):
-                current = self.store.provider_setting(
-                    "UNIVERSE_CONDUCTOR", "CONDUCTOR"
-                )
-                self.set_universe_provider_setting(
-                    {
-                        "provider": request.get("provider") or current["provider"],
-                        "model_ref": request.get(
-                            "model_ref", current.get("model_ref", "")
-                        ),
-                        "effort": request.get(
-                            "effort", current.get("effort", "AUTO")
-                        ),
-                    },
-                )
             setting = self.store.provider_setting(
                 "UNIVERSE_CONDUCTOR", "CONDUCTOR"
             )
-            provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
-            self._validate_provider_model_pair(
-                provider,
-                str(setting.get("model_ref") or "").strip(),
+            effective_model = str(
+                request.get("model_ref", setting.get("model_ref", "")) or ""
+            ).strip()
+            effective_effort = str(
+                request.get("effort", setting.get("effort", "AUTO")) or "AUTO"
+            ).strip().upper()
+            provider = self._resolve_conductor_provider(
+                {"requested_provider": request.get("provider") or "AUTO"}
             )
+            self._validate_provider_model_pair(provider, effective_model)
             host = self._ensure_conductor_session_host()
             prepare_options = {
-                "model": str(setting.get("model_ref") or "").strip(),
-                "effort": str(setting.get("effort") or "AUTO").strip().upper(),
+                "model": effective_model,
+                "effort": effective_effort,
             }
             if session_action == "NEW":
                 prepare_options["session_action"] = session_action
@@ -21784,20 +21774,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 project_root=project_root,
                 expected_mode="MASTER",
                 mode_registry_path=project_root / project["refs"]["mode_registry"],
-            )
-        if any(key in request for key in ("provider", "model_ref", "effort")):
-            current = self.store.provider_setting("PROJECT_MASTER", project_id)
-            self.set_project_provider_setting(
-                project_id,
-                {
-                    "provider": request.get("provider") or current["provider"],
-                    "model_ref": request.get(
-                        "model_ref", current.get("model_ref", "")
-                    ),
-                    "effort": request.get(
-                        "effort", current.get("effort", "AUTO")
-                    ),
-                },
             )
         try:
             if session_action == "NEW":
