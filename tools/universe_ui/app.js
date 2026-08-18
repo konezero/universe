@@ -2147,6 +2147,7 @@ async function resumeNodeModeSession(coordinate, session) {
     return;
   }
   await createTerminalTab(coordinate, session);
+  await refreshSupervisorSessions();
   expandConversationLayer();
 }
 
@@ -2159,6 +2160,7 @@ async function startNewNodeModeSession(coordinate) {
     throw new Error("New sessions require a registered project and Mode");
   }
   await createTerminalTab(coordinate);
+  await refreshSupervisorSessions();
   expandConversationLayer();
 }
 
