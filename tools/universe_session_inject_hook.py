@@ -852,9 +852,183 @@ def run_hook(
     )
 
 
+def _toml_array(items: list[str]) -> str:
+    return "[" + ", ".join(json.dumps(i) for i in items) + "]"
+
+
+def _codex_hook_block(python_exe: str, script_path: str) -> str:
+    cmd = _toml_array([python_exe, script_path, "--repo-root", ".", "--provider", "CODEX", "--from-stdin", "--trigger", "session_start"])
+    return (
+        "\n[[hooks.SessionStart]]\n"
+        'matcher = "*"\n'
+        "[[hooks.SessionStart.hooks]]\n"
+        'type = "command"\n'
+        f"command = {cmd}\n"
+    )
+
+
+def _grok_hook_payload(python_exe: str, script_path: str) -> dict[str, Any]:
+    cmd = " ".join([
+        python_exe, script_path,
+        "--repo-root", ".",
+        "--provider", "GROK",
+        "--from-stdin",
+        "--trigger", "session_start",
+    ])
+    return {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": cmd}]}
+            ]
+        }
+    }
+
+
+def _claude_settings_hook(script_path: str) -> dict[str, Any]:
+    return {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"python {script_path} --repo-root . --from-stdin --trigger session_start",
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+
+def _merge_claude_settings(path: Path, hook_entry: dict[str, Any]) -> str:
+    """Merge SessionStart hook into .claude/settings.json; return status string."""
+    import json as _json
+    existing: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            existing = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            existing = {}
+    hooks = existing.setdefault("hooks", {})
+    starts = hooks.setdefault("SessionStart", [])
+    new_cmd = hook_entry["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    script_marker = "universe_session_inject_hook.py"
+    if any(
+        script_marker in (h.get("command") or "")
+        for block in starts
+        for h in (block.get("hooks") or [])
+    ):
+        return "ALREADY_PRESENT"
+    starts.append(hook_entry["hooks"]["SessionStart"][0])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return "WRITTEN"
+
+
+def setup_provider_hooks(
+    repo_root: Path,
+    *,
+    global_: bool = False,
+    providers: list[str] | None = None,
+    python_exe: str | None = None,
+    script_path: str | None = None,
+) -> dict[str, Any]:
+    """Write SessionStart hook configs for Codex and/or Grok (and Claude).
+
+    Returns a dict with per-provider status strings.
+    """
+    import sys as _sys
+    py = python_exe or _sys.executable
+    sp = script_path or str(Path(__file__).resolve())
+    targets = [p.upper() for p in (providers or ["CODEX", "GROK"])]
+    results: dict[str, Any] = {}
+
+    home = Path.home()
+
+    if "CODEX" in targets:
+        config_dir = home / ".codex" if global_ else repo_root / ".codex"
+        config_path = config_dir / "config.toml"
+        try:
+            existing = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+            marker = "universe_session_inject_hook.py"
+            if marker in existing:
+                results["CODEX"] = {"status": "ALREADY_PRESENT", "path": str(config_path)}
+            else:
+                config_dir.mkdir(parents=True, exist_ok=True)
+                with config_path.open("a", encoding="utf-8") as f:
+                    f.write(_codex_hook_block(py, sp))
+                results["CODEX"] = {"status": "WRITTEN", "path": str(config_path)}
+        except OSError as e:
+            results["CODEX"] = {"status": "ERROR", "detail": str(e)}
+
+    if "GROK" in targets:
+        hooks_dir = home / ".grok" / "hooks" if global_ else repo_root / ".grok" / "hooks"
+        hook_path = hooks_dir / "session-start.json"
+        try:
+            existing_json: dict[str, Any] = {}
+            if hook_path.is_file():
+                try:
+                    existing_json = json.loads(hook_path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    existing_json = {}
+            marker = "universe_session_inject_hook.py"
+            existing_text = json.dumps(existing_json)
+            if marker in existing_text:
+                results["GROK"] = {"status": "ALREADY_PRESENT", "path": str(hook_path)}
+            else:
+                payload = _grok_hook_payload(py, sp)
+                if existing_json:
+                    # Merge into existing hooks
+                    ex_hooks = existing_json.setdefault("hooks", {})
+                    ex_starts = ex_hooks.setdefault("SessionStart", [])
+                    ex_starts.extend(payload["hooks"]["SessionStart"])
+                    merged = existing_json
+                else:
+                    merged = payload
+                hooks_dir.mkdir(parents=True, exist_ok=True)
+                hook_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+                results["GROK"] = {"status": "WRITTEN", "path": str(hook_path)}
+        except OSError as e:
+            results["GROK"] = {"status": "ERROR", "detail": str(e)}
+
+    if "CLAUDE" in targets:
+        settings_path = (
+            home / ".claude" / "settings.json" if global_
+            else repo_root / ".claude" / "settings.json"
+        )
+        try:
+            status = _merge_claude_settings(settings_path, _claude_settings_hook(sp))
+            results["CLAUDE"] = {"status": status, "path": str(settings_path)}
+        except OSError as e:
+            results["CLAUDE"] = {"status": "ERROR", "detail": str(e)}
+
+    return {"status": "SETUP_HOOKS_DONE", "global": global_, "providers": results}
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Subcommand dispatch: first positional arg "setup-hooks" branches early.
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    if raw and raw[0] == "setup-hooks":
+        sub = argparse.ArgumentParser(description="Write SessionStart hook configs for Codex/Grok/Claude")
+        sub.add_argument("--repo-root", type=Path, default=Path.cwd())
+        sub.add_argument("--global", dest="global_", action="store_true", help="Write to global home config dirs")
+        sub.add_argument("--providers", nargs="+", default=["CODEX", "GROK"], metavar="PROVIDER")
+        sub.add_argument("--python", dest="python_exe", default="")
+        sub.add_argument("--script", dest="script_path", default="")
+        args = sub.parse_args(raw[1:])
+        result = setup_provider_hooks(
+            args.repo_root.expanduser().resolve(),
+            global_=args.global_,
+            providers=args.providers,
+            python_exe=args.python_exe or None,
+            script_path=args.script_path or None,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     result = run_hook(args)
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.strict and result.get("status") not in {"INJECTED", "DRY_RUN"}:

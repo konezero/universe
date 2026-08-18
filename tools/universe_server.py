@@ -21245,6 +21245,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "catalog": catalog,
         }
 
+    def setup_provider_hooks(self, value: Any) -> dict[str, Any]:
+        from universe_session_inject_hook import setup_provider_hooks as _setup
+        body = value if isinstance(value, dict) else {}
+        global_ = bool(body.get("global", False))
+        raw_providers = body.get("providers")
+        providers = (
+            [str(p).upper() for p in raw_providers if str(p).upper() in {"CLAUDE", "CODEX", "GROK"}]
+            if isinstance(raw_providers, list)
+            else ["CODEX", "GROK"]
+        )
+        result = _setup(
+            Path(__file__).resolve().parents[1],
+            global_=global_,
+            providers=providers,
+        )
+        return {"schema": API_SCHEMA, **result}
+
     def memory_batch_catalog_settings(self) -> dict[str, Any]:
         return self.memory_batch_config_service.catalog_settings()
 
@@ -26277,6 +26294,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self._send(
                         HTTPStatus.OK,
                         self.server.save_provider_models(body),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                return
+            if path == "/v1/settings/setup-provider-hooks":
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.setup_provider_hooks(body),
                     )
                 except UniverseError as error:
                     self._send_error(error)

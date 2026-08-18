@@ -314,6 +314,7 @@ const elements = {
   workerBindingSettings: document.querySelector("#worker-binding-settings"),
   providerModelCatalog: document.querySelector("#provider-model-catalog"),
   refreshProviderModels: document.querySelector("#refresh-provider-models-button"),
+  setupProviderHooks: document.querySelector("#setup-provider-hooks-button"),
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
@@ -5263,6 +5264,22 @@ async function refreshProviderModels() {
     renderProviderModelCatalog();
     renderWorkerBindingSettings();
     toast("Provider models refreshed");
+  } catch (error) {
+    elements.settingsError.textContent = error.message;
+  }
+}
+
+async function setupProviderHooks(opts = {}) {
+  elements.settingsError.textContent = "";
+  try {
+    const result = await api("/v1/settings/setup-provider-hooks", {
+      method: "POST",
+      body: { providers: ["CODEX", "GROK"], ...opts },
+    });
+    const lines = Object.entries(result.providers || {})
+      .map(([p, r]) => `${p}: ${r.status}`)
+      .join(", ");
+    toast(`CLI hooks: ${lines || "done"}`);
   } catch (error) {
     elements.settingsError.textContent = error.message;
   }
@@ -12427,6 +12444,11 @@ function bindEvents() {
   if (elements.refreshProviderModels) {
     elements.refreshProviderModels.addEventListener("click", () => {
       refreshProviderModels().catch((error) => toast(error.message, true));
+    });
+  }
+  if (elements.setupProviderHooks) {
+    elements.setupProviderHooks.addEventListener("click", () => {
+      setupProviderHooks().catch((error) => toast(error.message, true));
     });
   }
   elements.remoteAccessTransport.addEventListener("change", () => {
