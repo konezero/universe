@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.client import HTTPConnection
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import html
 import ipaddress
 import json
@@ -14,6 +16,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import struct
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -129,6 +132,28 @@ def _read_http_head(sock: socket.socket) -> tuple[bytes, bytes]:
         buf += chunk
     idx = buf.index(b"\r\n\r\n") + 4
     return buf[:idx], buf[idx:]
+
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept_key(key: str) -> str:
+    digest = hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _ws_frame(payload: bytes, opcode: int = 2) -> bytes:
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header.extend(struct.pack("!H", n))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", n))
+    return bytes(header) + payload
 
 
 def _load_upstream_state(path: Path) -> tuple[str, Path]:
@@ -624,11 +649,35 @@ universes</strong>, use the public list.</p>
             if connection is not None:
                 connection.close()
 
+    def _send_ws_diagnostic(self, key: str, message: str) -> None:
+        """Complete the WebSocket handshake and send an error message as a terminal frame."""
+        if not key:
+            return
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", _ws_accept_key(key))
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except OSError:
+            return
+        text = f"\r\n\x1b[91m[gateway: {message}]\x1b[0m\r\n"
+        try:
+            self.connection.sendall(_ws_frame(text.encode("utf-8"), opcode=2))
+        except OSError:
+            return
+        try:
+            self.connection.sendall(_ws_frame(b"\x03\xf3", opcode=8))
+        except OSError:
+            pass
+
     def _proxy_websocket(self, device: dict[str, Any]) -> None:
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
         try:
             upstream, _ = _load_upstream_state(self.server.upstream_state)
         except GatewayError as error:
-            self._send_error_payload(error.status, error.code, error.detail)
+            self._send_ws_diagnostic(key, f"{error.code}: {error.detail}")
             return
         parsed = urlsplit(upstream)
         try:
@@ -636,7 +685,7 @@ universes</strong>, use the public list.</p>
                 (parsed.hostname, parsed.port), timeout=10
             )
         except OSError as error:
-            self._send_error_payload(503, "HOST_OFFLINE", str(error))
+            self._send_ws_diagnostic(key, f"HOST_OFFLINE: {error}")
             return
         request_parts = [f"{self.command} {self.path} HTTP/1.1\r\n"]
         request_parts.append(f"Host: {parsed.hostname}:{parsed.port}\r\n")
@@ -651,21 +700,21 @@ universes</strong>, use the public list.</p>
             upstream_sock.sendall("".join(request_parts).encode("latin-1"))
         except OSError as error:
             upstream_sock.close()
-            self._send_error_payload(503, "HOST_OFFLINE", str(error))
+            self._send_ws_diagnostic(key, f"HOST_OFFLINE (send): {error}")
             return
         head, leftover = _read_http_head(upstream_sock)
         if not head:
             upstream_sock.close()
             self.log_message("WS-PROXY: empty response from upstream for %s", self.path)
-            self._send_error_payload(502, "UPSTREAM_EMPTY", "no response from upstream")
+            self._send_ws_diagnostic(key, "UPSTREAM_EMPTY: no response from universe server")
             return
         first_line = head.split(b"\r\n", 1)[0]
         self.log_message("WS-PROXY: upstream first line: %r leftover=%d bytes", first_line, len(leftover))
         if b" 101 " not in first_line:
-            self.log_message("WS-PROXY: non-101 from upstream, forwarding to browser")
-            self.wfile.write(head)
-            self.wfile.flush()
             upstream_sock.close()
+            snippet = first_line.decode("latin-1", errors="replace")
+            self.log_message("WS-PROXY: non-101 from upstream: %s", snippet)
+            self._send_ws_diagnostic(key, f"UPSTREAM non-101: {snippet!r}")
             return
         self.wfile.write(head)
         if leftover:
