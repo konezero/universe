@@ -120,6 +120,17 @@ def load_gateway_state(path: Path) -> dict[str, Any]:
     return value
 
 
+def _read_http_head(sock: socket.socket) -> tuple[bytes, bytes]:
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return buf, b""
+        buf += chunk
+    idx = buf.index(b"\r\n\r\n") + 4
+    return buf[:idx], buf[idx:]
+
+
 def _load_upstream_state(path: Path) -> tuple[str, Path]:
     try:
         value = json.loads(path.expanduser().read_text(encoding="utf-8"))
@@ -551,6 +562,9 @@ universes</strong>, use the public list.</p>
                 403, "REMOTE_SERVICE_CONTROL_FORBIDDEN", "desktop control is required"
             )
             return
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            self._proxy_websocket(device)
+            return
         connection: HTTPConnection | None = None
         response_started = False
         try:
@@ -608,6 +622,82 @@ universes</strong>, use the public list.</p>
         finally:
             if connection is not None:
                 connection.close()
+
+    def _proxy_websocket(self, device: dict[str, Any]) -> None:
+        try:
+            upstream, _ = _load_upstream_state(self.server.upstream_state)
+        except GatewayError as error:
+            self._send_error_payload(error.status, error.code, error.detail)
+            return
+        parsed = urlsplit(upstream)
+        try:
+            upstream_sock = socket.create_connection(
+                (parsed.hostname, parsed.port), timeout=10
+            )
+        except OSError as error:
+            self._send_error_payload(503, "HOST_OFFLINE", str(error))
+            return
+        request_parts = [f"{self.command} {self.path} HTTP/1.1\r\n"]
+        request_parts.append(f"Host: {parsed.hostname}:{parsed.port}\r\n")
+        for name, value in self.headers.items():
+            if name.lower() == "host":
+                continue
+            request_parts.append(f"{name}: {value}\r\n")
+        request_parts.append("X-Universe-Access-Surface: REMOTE_BROWSER\r\n")
+        request_parts.append(f"X-Universe-Remote-Device: {device['device_id']}\r\n")
+        request_parts.append("\r\n")
+        try:
+            upstream_sock.sendall("".join(request_parts).encode("latin-1"))
+        except OSError as error:
+            upstream_sock.close()
+            self._send_error_payload(503, "HOST_OFFLINE", str(error))
+            return
+        head, leftover = _read_http_head(upstream_sock)
+        if not head:
+            upstream_sock.close()
+            self._send_error_payload(502, "UPSTREAM_EMPTY", "no response from upstream")
+            return
+        first_line = head.split(b"\r\n", 1)[0]
+        if b" 101 " not in first_line:
+            self.wfile.write(head)
+            self.wfile.flush()
+            upstream_sock.close()
+            return
+        self.wfile.write(head)
+        if leftover:
+            self.wfile.write(leftover)
+        self.wfile.flush()
+        client_sock = self.connection
+        client_sock.settimeout(0.5)
+        upstream_sock.settimeout(0.5)
+        stop = threading.Event()
+
+        def relay(src: socket.socket, dst: socket.socket) -> None:
+            try:
+                while not stop.is_set():
+                    try:
+                        data = src.recv(8192)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                stop.set()
+
+        t_up = threading.Thread(target=relay, args=(client_sock, upstream_sock), daemon=True)
+        t_down = threading.Thread(target=relay, args=(upstream_sock, client_sock), daemon=True)
+        t_up.start()
+        t_down.start()
+        stop.wait()
+        t_up.join(timeout=2)
+        t_down.join(timeout=2)
+        try:
+            upstream_sock.close()
+        except OSError:
+            pass
 
     def _read_body(self, *, optional: bool = False) -> bytes:
         try:
