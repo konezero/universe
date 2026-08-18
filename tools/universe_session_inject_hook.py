@@ -306,6 +306,12 @@ def resolve_provider_and_ref(
                 "STDIN.explicit",
             )
 
+        # Use --provider if supplied, otherwise default to CLAUDE for stdin reads.
+        stdin_provider = (
+            str(args.provider).strip().upper()
+            if args.provider and str(args.provider).strip().upper() in PROVIDERS
+            else "CLAUDE"
+        )
         for key in (
             "session_id",
             "sessionId",
@@ -316,16 +322,14 @@ def resolve_provider_and_ref(
         ):
             raw = stdin_payload.get(key)
             if isinstance(raw, str) and raw.strip():
-                # Claude Code SessionStart typically supplies session_id.
-                # Grok TUI may also pass session_id with provider=GROK (handled above).
-                return "CLAUDE", raw.strip(), f"STDIN.{key}"
+                return stdin_provider, raw.strip(), f"STDIN.{key}"
 
         nested = stdin_payload.get("session")
         if isinstance(nested, Mapping):
             for key in ("id", "session_id", "sessionId"):
                 raw = nested.get(key)
                 if isinstance(raw, str) and raw.strip():
-                    return "CLAUDE", raw.strip(), f"STDIN.session.{key}"
+                    return stdin_provider, raw.strip(), f"STDIN.session.{key}"
 
     # Explicit provider env + matching ref env.
     for key in PROVIDER_HINT_ENV:
