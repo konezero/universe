@@ -28486,6 +28486,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
         self.end_headers()
+        self.wfile.flush()
         pump_terminal_socket(self, terminal_id, self.server.terminal_host)
 
     def _send_static(self, path: str) -> None:
