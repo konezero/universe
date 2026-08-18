@@ -28464,15 +28464,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _upgrade_terminal_stream(self, terminal_id: str) -> None:
+        self.log_message("TERM-WS: upgrade request for terminal_id=%r surface=%r", terminal_id, self.headers.get("X-Universe-Access-Surface"))
         try:
             self.server.terminal_host.get(terminal_id)
         except TerminalHostError as error:
+            self.log_message("TERM-WS: terminal not found: %r", error.code)
             self._send_error(
                 UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND)
             )
             return
         key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
         if str(self.headers.get("Upgrade") or "").lower() != "websocket" or not key:
+            self.log_message("TERM-WS: missing upgrade headers, key=%r", key)
             self._send_error(
                 UniverseError(
                     "TERMINAL_STREAM_UPGRADE_REQUIRED",
@@ -28481,6 +28484,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        self.log_message("TERM-WS: sending 101 for terminal_id=%r", terminal_id)
         self.send_response(101, "Switching Protocols")
         self.send_header("Upgrade", "websocket")
         self.send_header("Connection", "Upgrade")
@@ -28488,6 +28492,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.flush()
         pump_terminal_socket(self, terminal_id, self.server.terminal_host)
+        self.log_message("TERM-WS: pump done for terminal_id=%r", terminal_id)
 
     def _send_static(self, path: str) -> None:
         filename = {

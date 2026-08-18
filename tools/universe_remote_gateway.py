@@ -655,10 +655,13 @@ universes</strong>, use the public list.</p>
         head, leftover = _read_http_head(upstream_sock)
         if not head:
             upstream_sock.close()
+            self.log_message("WS-PROXY: empty response from upstream for %s", self.path)
             self._send_error_payload(502, "UPSTREAM_EMPTY", "no response from upstream")
             return
         first_line = head.split(b"\r\n", 1)[0]
+        self.log_message("WS-PROXY: upstream first line: %r leftover=%d bytes", first_line, len(leftover))
         if b" 101 " not in first_line:
+            self.log_message("WS-PROXY: non-101 from upstream, forwarding to browser")
             self.wfile.write(head)
             self.wfile.flush()
             upstream_sock.close()
