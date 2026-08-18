@@ -912,7 +912,9 @@ def start_gateway(
     public_base_url: str = "",
     python_executable: str = "",
 ) -> dict[str, Any]:
-    stop_gateway(state_path)
+    current = gateway_status(state_path)
+    if current.get("status") in {"READY", "HOST_OFFLINE"}:
+        return current
     bind_host = _validate_listen_host(listen_host or _discover_lan_ipv4())
     python = python_executable or sys.executable
     command = [

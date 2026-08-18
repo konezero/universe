@@ -24081,6 +24081,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         close_step("http_server", super().server_close)
         close_step(
+            "remote_connector",
+            lambda: stop_connector(self.remote_connector_state_path),
+        )
+        close_step(
             "remote_gateway",
             lambda: stop_gateway(self.remote_gateway_state_path),
         )
