@@ -24080,6 +24080,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
             )
         close_step("http_server", super().server_close)
+        close_step(
+            "remote_gateway",
+            lambda: stop_gateway(self.remote_gateway_state_path),
+        )
         print(
             json.dumps(
                 {
