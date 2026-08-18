@@ -5274,7 +5274,7 @@ async function setupProviderHooks(opts = {}) {
   try {
     const result = await api("/v1/settings/setup-provider-hooks", {
       method: "POST",
-      body: { providers: ["CODEX", "GROK"], ...opts },
+      body: { providers: ["CODEX", "GROK"], global: true, ...opts },
     });
     const lines = Object.entries(result.providers || {})
       .map(([p, r]) => `${p}: ${r.status}`)
