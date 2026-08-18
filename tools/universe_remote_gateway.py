@@ -477,18 +477,27 @@ universes</strong>, use the public list.</p>
             HTTPStatus.OK, {"status": "REMOTE_PAIRING_STATUS", "state": result["state"]}
         )
 
+    def _ws_upgrade_key(self) -> str:
+        if (self.headers.get("Upgrade") or "").lower() != "websocket":
+            return ""
+        return str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+
     def _authorize_remote_browser(
         self, *, path: str | None = None
     ) -> dict[str, Any] | None:
+        ws_key = self._ws_upgrade_key()
         token = self._cookies().get(SESSION_COOKIE, "")
         if not token:
             # Browser navigations should re-enter pairing, not a raw JSON error.
-            if self._wants_html_navigation():
+            if not ws_key and self._wants_html_navigation():
                 self._redirect_to_pair(clear_session=True)
                 return None
-            self._send_error_payload(
-                401, "REMOTE_DEVICE_PAIRING_REQUIRED", "pair this browser first"
-            )
+            if ws_key:
+                self._send_ws_diagnostic(ws_key, "REMOTE_DEVICE_PAIRING_REQUIRED: pair this browser first (no session cookie)")
+            else:
+                self._send_error_payload(
+                    401, "REMOTE_DEVICE_PAIRING_REQUIRED", "pair this browser first"
+                )
             return None
         try:
             return self.server.remote_access.authorize_device(
@@ -502,8 +511,11 @@ universes</strong>, use the public list.</p>
                 "REMOTE_DEVICE_SESSION_EXPIRED",
                 "REMOTE_DEVICE_SESSION_MISMATCH",
             }
-            if recoverable and self._wants_html_navigation():
+            if recoverable and not ws_key and self._wants_html_navigation():
                 self._redirect_to_pair(clear_session=True)
+                return None
+            if ws_key:
+                self._send_ws_diagnostic(ws_key, f"{error.code}: {error.detail}")
                 return None
             if recoverable:
                 secure = urlsplit(self.server.public_base_url).scheme == "https"
