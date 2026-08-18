@@ -255,7 +255,7 @@ function terminalResumeRef(coordinate, session) {
       ""
   ).trim();
   const stripped = raw.replace(
-    /^(grok-acp:|grok-cli:|claude-code:|codex-app-server:|codex:)/i,
+    /^(grok-acp:|grok-cli:|claude-code:|codex-app-server:|codex-app:|codex:|cli-terminal:)/i,
     ""
   );
   if (!stripped || /^(UNKNOWN|UNASSIGNED|NONE)$/i.test(stripped)) return "";
