@@ -3777,6 +3777,27 @@ body {
   color: var(--text-3);
   font-size: 10px;
 }
+.new-session-dialog {
+  width: min(400px, calc(100vw - 24px));
+  max-height: min(600px, calc(100vh - 24px));
+  padding: 18px;
+  overflow: auto;
+}
+.new-session-fields {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.new-session-fields label {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.new-session-fields select {
+  width: 100%;
+}
 .session-summary-dialog {
   width: min(440px, calc(100vw - 24px));
   max-height: min(680px, calc(100vh - 24px));

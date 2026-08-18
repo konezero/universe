@@ -251,8 +251,20 @@ const elements = {
   mobileDelegateGoal: document.querySelector("#mobile-delegate-goal"),
   mobileEditPlan: document.querySelector("#mobile-edit-plan"),
   mobileAddMilestone: document.querySelector("#mobile-add-milestone"),
+  quickNewSessionButton: document.querySelector("#quick-new-session-button"),
   quickConductorButton: document.querySelector("#quick-conductor-button"),
   quickTaskButton: document.querySelector("#quick-task-button"),
+  newSessionDialog: document.querySelector("#new-session-dialog"),
+  newSessionForm: document.querySelector("#new-session-form"),
+  newSessionMode: document.querySelector("#new-session-mode"),
+  newSessionProjectRow: document.querySelector("#new-session-project-row"),
+  newSessionProject: document.querySelector("#new-session-project"),
+  newSessionProvider: document.querySelector("#new-session-provider"),
+  newSessionModel: document.querySelector("#new-session-model"),
+  newSessionEffort: document.querySelector("#new-session-effort"),
+  newSessionStatus: document.querySelector("#new-session-status"),
+  newSessionError: document.querySelector("#new-session-error"),
+  newSessionSubmit: document.querySelector("#new-session-submit"),
   goalDialog: document.querySelector("#goal-dialog"),
   goalForm: document.querySelector("#goal-form"),
   goalFormError: document.querySelector("#goal-form-error"),
@@ -4803,6 +4815,122 @@ function openProviderProfileDialog({ scopeKind, scopeId, label }) {
   elements.providerProfileStatus.textContent = providerStatusText(setting);
   elements.providerProfileError.textContent = "";
   elements.providerProfileDialog.showModal();
+}
+
+function openNewSessionDialog() {
+  if (!elements.newSessionDialog) return;
+  const providers = state.providerSettings?.available_providers || [];
+  elements.newSessionProvider.replaceChildren();
+  for (const p of providers) {
+    const key = String(p.provider || "").toUpperCase();
+    if (!key) continue;
+    const option = node("option", "", key === "CODEX" ? "Codex" : key === "CLAUDE" ? "Claude" : "Grok");
+    option.value = key;
+    option.disabled = p.status === "UNAVAILABLE";
+    elements.newSessionProvider.append(option);
+  }
+  if (!elements.newSessionProvider.options.length) {
+    for (const key of ["CODEX", "CLAUDE", "GROK"]) {
+      const option = node("option", "", key);
+      option.value = key;
+      elements.newSessionProvider.append(option);
+    }
+  }
+  const fillNewSessionModelSelect = (provider) => {
+    const key = String(provider || "").toUpperCase();
+    const models = [
+      ...new Set(
+        [
+          ...providerCatalogModels(key),
+          providerCapability(key)?.model,
+          state.providerModels?.providers?.[key]?.default,
+        ].filter(Boolean)
+      ),
+    ];
+    elements.newSessionModel.replaceChildren();
+    for (const modelId of models) {
+      const option = node("option", "", modelId);
+      option.value = modelId;
+      elements.newSessionModel.append(option);
+    }
+    if (!models.length) {
+      const option = node("option", "", "Host default");
+      option.value = "";
+      elements.newSessionModel.append(option);
+    }
+    elements.newSessionModel.value = models[0] || "";
+  };
+  fillNewSessionModelSelect(elements.newSessionProvider.value);
+  elements.newSessionProvider.onchange = () => fillNewSessionModelSelect(elements.newSessionProvider.value);
+
+  const projects = state.projects || [];
+  elements.newSessionProject.replaceChildren();
+  for (const project of projects) {
+    const option = node("option", "", project.project_id);
+    option.value = project.project_id;
+    elements.newSessionProject.append(option);
+  }
+  const currentProjectId = state.selectedProject?.project_id || projects[0]?.project_id || "";
+  elements.newSessionProject.value = currentProjectId;
+
+  const updateProjectRowVisibility = () => {
+    if (elements.newSessionProjectRow) {
+      elements.newSessionProjectRow.hidden = elements.newSessionMode.value === "CONDUCTOR";
+    }
+  };
+  elements.newSessionMode.value = "CONDUCTOR";
+  updateProjectRowVisibility();
+  elements.newSessionMode.onchange = updateProjectRowVisibility;
+
+  if (elements.newSessionStatus) elements.newSessionStatus.textContent = "";
+  if (elements.newSessionError) elements.newSessionError.textContent = "";
+  if (elements.newSessionSubmit) elements.newSessionSubmit.disabled = false;
+  elements.newSessionDialog.showModal();
+}
+
+async function submitNewSession(event) {
+  event.preventDefault();
+  if (!elements.newSessionSubmit) return;
+  const mode = String(elements.newSessionMode?.value || "CONDUCTOR").toUpperCase();
+  const projectId = String(elements.newSessionProject?.value || "").trim();
+  const provider = String(elements.newSessionProvider?.value || "").toUpperCase();
+  const modelRef = String(elements.newSessionModel?.value || "").trim();
+  const effort = String(elements.newSessionEffort?.value || "AUTO").toUpperCase();
+  if (!provider) {
+    if (elements.newSessionError) elements.newSessionError.textContent = "Choose a provider first";
+    return;
+  }
+  if (mode === "MASTER" && !projectId) {
+    if (elements.newSessionError) elements.newSessionError.textContent = "Choose a project first";
+    return;
+  }
+  const project = (state.projects || []).find(
+    (item) => String(item.project_id || "").toLowerCase() === projectId.toLowerCase()
+  );
+  if (mode === "MASTER" && !project?.project_root) {
+    if (elements.newSessionError) elements.newSessionError.textContent = "Project has no registered root path";
+    return;
+  }
+  elements.newSessionSubmit.disabled = true;
+  if (elements.newSessionStatus) {
+    elements.newSessionStatus.textContent = `Starting ${provider} / ${modelRef || "host default"} / ${effort}...`;
+  }
+  if (elements.newSessionError) elements.newSessionError.textContent = "";
+  try {
+    const options = { provider, modelRef, effort, sessionAction: "NEW" };
+    if (mode === "CONDUCTOR") {
+      await callUniverseConductor(options);
+    } else {
+      await callProjectMaster(projectId, { ...options, cwd: project.project_root, requestedMode: "MASTER" });
+    }
+    elements.newSessionDialog.close();
+    toast(`New ${mode === "CONDUCTOR" ? "Conductor" : "Master"} session started: ${provider} / ${modelRef || "host default"} / ${effort}`);
+  } catch (error) {
+    if (elements.newSessionError) elements.newSessionError.textContent = error.message;
+  } finally {
+    if (elements.newSessionSubmit) elements.newSessionSubmit.disabled = false;
+    if (elements.newSessionStatus) elements.newSessionStatus.textContent = "";
+  }
 }
 
 async function submitProviderProfile(event) {
@@ -12547,6 +12675,8 @@ function bindGoalPlanEvents() {
     else if (["memory", "bench", "activity", "details"].includes(view)) openInspectorSurface(view);
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
+  elements.quickNewSessionButton?.addEventListener("click", openNewSessionDialog);
+  elements.newSessionForm?.addEventListener("submit", submitNewSession);
   elements.quickConductorButton?.addEventListener("click", () => elements.dispatchInstruction?.focus());
   elements.quickTaskButton?.addEventListener("click", () => openTodoDialog(true));
   elements.mobileWorkTabs?.addEventListener("click", (event) => {

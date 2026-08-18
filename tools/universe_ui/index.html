@@ -88,6 +88,7 @@
         <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
       <div class="rail-quick-actions legacy-rail-surface">
+        <button id="quick-new-session-button" type="button"><span aria-hidden="true">+</span> New session</button>
         <button id="quick-conductor-button" type="button"><span aria-hidden="true">+</span> New Conductor conversation</button>
         <button id="quick-task-button" type="button"><span aria-hidden="true">&#9745;</span> Create task</button>
       </div>
@@ -700,6 +701,55 @@
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
         <button id="provider-profile-submit" type="submit" class="primary-button">Apply profile</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="new-session-dialog" class="new-session-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Launch</span>
+        <h2>New session</h2>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <form id="new-session-form">
+      <div class="new-session-fields">
+        <label>
+          <span>Mode</span>
+          <select id="new-session-mode">
+            <option value="CONDUCTOR">Conductor</option>
+            <option value="MASTER">Project Master</option>
+          </select>
+        </label>
+        <label id="new-session-project-row">
+          <span>Project</span>
+          <select id="new-session-project"></select>
+        </label>
+        <label>
+          <span>Provider</span>
+          <select id="new-session-provider"></select>
+        </label>
+        <label>
+          <span>Model</span>
+          <select id="new-session-model"></select>
+        </label>
+        <label>
+          <span>Effort</span>
+          <select id="new-session-effort">
+            <option value="AUTO">Auto</option>
+            <option value="LOW">Low</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="HIGH">High</option>
+            <option value="MAX">Max</option>
+          </select>
+        </label>
+      </div>
+      <p id="new-session-status" class="provider-setting-status" role="status"></p>
+      <p id="new-session-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
+        <button id="new-session-submit" type="submit" class="primary-button">Start session</button>
       </div>
     </form>
   </dialog>
