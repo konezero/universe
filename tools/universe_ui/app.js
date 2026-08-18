@@ -1768,6 +1768,10 @@ function renderProviderChatSummary() {
     return;
   }
   const binding = room.binding || { state: "UNBOUND" };
+  if (elements.sessionSummaryOpen) elements.sessionSummaryOpen.hidden = false;
+  if (elements.sessionSummaryManage) elements.sessionSummaryManage.hidden = false;
+  if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = false;
+  if (elements.sessionSummaryLive) elements.sessionSummaryLive.hidden = false;
   const project = sessionRailProjectIdentity(room);
   const boundSession = supervisorSessionForRoom(room);
   const mode = String(binding.mode || "").toUpperCase();
@@ -1841,10 +1845,85 @@ function renderProviderChatSummary() {
 
 function openProviderChatSummary(room) {
   state.selectedProviderChatKey = room.chat_key;
+  state.pendingNewSessionCoordinate = null;
   markProviderSessionRead(room.chat_key);
   renderSessionRail();
   renderNodeModes();
   renderProviderChatSummary();
+  if (!elements.sessionSummaryDialog.open) {
+    elements.sessionSummaryDialog.showModal();
+  }
+}
+
+function openSessionSummaryForNew(coordinate) {
+  const mode = String(coordinate?.mode || "").toUpperCase();
+  const project = coordinate?.project;
+  const projectId = String(project?.project_id || "").trim();
+  if (!["MASTER", "CONDUCTOR"].includes(mode)) return;
+  if (mode === "MASTER" && (!projectId || !project?.project_root)) {
+    toast("Project is not registered", true);
+    return;
+  }
+  state.pendingNewSessionCoordinate = coordinate;
+  state.selectedProviderChatKey = null;
+  elements.sessionSummaryTitle.textContent =
+    mode === "CONDUCTOR" ? "New Conductor session" : `New session · ${projectId}`;
+  elements.sessionSummarySubtitle.textContent =
+    mode === "CONDUCTOR" ? "Universe Conductor" : `${projectId} · Master`;
+  if (elements.sessionSummaryFacts) elements.sessionSummaryFacts.replaceChildren();
+  if (elements.sessionSummaryLive) elements.sessionSummaryLive.hidden = true;
+  if (elements.sessionSummaryOpen) elements.sessionSummaryOpen.hidden = true;
+  if (elements.sessionSummaryManage) elements.sessionSummaryManage.hidden = true;
+  const section = elements.sessionSummaryConnection;
+  if (section) {
+    section.hidden = false;
+    const setting =
+      mode === "CONDUCTOR"
+        ? state.providerSettings?.universe_conductor || {}
+        : projectProviderSetting(projectId) || {};
+    const currentProvider = String(
+      setting.resolved_provider || setting.provider || "AUTO"
+    ).toUpperCase();
+    const configuredModel = setting.model_ref || setting.resolved_model || "";
+    const currentEffort = String(setting.effort || setting.resolved_effort || "AUTO").toUpperCase();
+    const providers = state.providerSettings?.available_providers || [];
+    elements.sessionSummaryProvider.replaceChildren();
+    for (const provider of providers) {
+      const key = String(provider.provider || "").toUpperCase();
+      if (!key) continue;
+      const option = node(
+        "option",
+        "",
+        key === "CODEX" ? "Codex" : key === "CLAUDE" ? "Claude" : "Grok"
+      );
+      option.value = key;
+      option.disabled = provider.status === "UNAVAILABLE";
+      if (provider.reason) option.title = provider.reason;
+      elements.sessionSummaryProvider.append(option);
+    }
+    if (!elements.sessionSummaryProvider.options.length) {
+      for (const key of ["CODEX", "CLAUDE", "GROK"]) {
+        const option = node("option", "", key);
+        option.value = key;
+        elements.sessionSummaryProvider.append(option);
+      }
+    }
+    elements.sessionSummaryProvider.value = currentProvider;
+    if (elements.sessionSummaryProvider.value !== currentProvider) {
+      elements.sessionSummaryProvider.selectedIndex = 0;
+    }
+    fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, configuredModel);
+    elements.sessionSummaryProvider.onchange = () => {
+      fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, "");
+    };
+    if (elements.sessionSummaryEffort) elements.sessionSummaryEffort.value = currentEffort;
+    if (elements.sessionSummaryConnectionStatus) {
+      elements.sessionSummaryConnectionStatus.textContent =
+        "Choose provider settings for the new session";
+    }
+    if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = true;
+    if (elements.sessionSummaryNew) elements.sessionSummaryNew.textContent = "Start new session";
+  }
   if (!elements.sessionSummaryDialog.open) {
     elements.sessionSummaryDialog.showModal();
   }
@@ -2119,7 +2198,7 @@ function renderNodeModeSessionCards(coordinate) {
   create.type = "button";
   create.title = "Start a new vendor session for this Mode";
   create.addEventListener("click", () => {
-    startNewNodeModeSession(coordinate).catch((error) => toast(error.message, true));
+    openSessionSummaryForNew(coordinate);
   });
   cards.append(create);
   for (const session of ordered) {
@@ -3166,16 +3245,23 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
   const room = (state.providerChatRooms || []).find(
     (item) => item.chat_key === state.selectedProviderChatKey
   );
+  const pendingCoord = state.pendingNewSessionCoordinate;
   const session = supervisorSessionForRoom(room);
-  const project = sessionRailProjectIdentity(room);
-  const mode = String(room?.binding?.mode || "").toUpperCase();
-  const registeredProject = (state.projects || []).find(
-    (item) =>
-      String(item.project_id || "").toLowerCase() ===
-      String(project.projectId || "").toLowerCase()
-  );
+  const project = room
+    ? sessionRailProjectIdentity(room)
+    : { projectId: String(pendingCoord?.project?.project_id || ""), label: "" };
+  const mode = String(room?.binding?.mode || pendingCoord?.mode || "").toUpperCase();
+  const registeredProject = room
+    ? (state.projects || []).find(
+        (item) =>
+          String(item.project_id || "").toLowerCase() ===
+          String(project.projectId || "").toLowerCase()
+      )
+    : (pendingCoord?.project?.project_root
+        ? { project_id: pendingCoord.project.project_id, project_root: pendingCoord.project.project_root }
+        : null);
   if (
-    !room ||
+    (!room && !pendingCoord) ||
     !["MASTER", "CONDUCTOR"].includes(mode) ||
     (sessionAction !== "NEW" && !session) ||
     (mode === "MASTER" && !project.projectId) ||
@@ -3213,6 +3299,7 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       await callProjectMaster(project.projectId, options);
     }
     elements.sessionSummaryDialog.close();
+    state.pendingNewSessionCoordinate = null;
     const targetLabel = mode === "CONDUCTOR" ? "Conductor" : "Project Master";
     const actionLabel = sessionAction === "NEW" ? "new session started" : "connected";
     toast(
