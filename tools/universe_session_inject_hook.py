@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import socket
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -26,6 +27,14 @@ from urllib.parse import quote, urlsplit
 
 HOOK_SCHEMA = "universe.session-inject-hook.v1"
 PROVIDERS = frozenset({"CLAUDE", "CODEX", "GROK"})
+
+# Prefix used when writing observer_session_ref into mode_current_anchor snapshot.
+# Must match _vendor_identity_from_observer prefixes in universe_server.py.
+PROVIDER_OBS_PREFIX: dict[str, str] = {
+    "CLAUDE": "claude-code",
+    "CODEX": "codex",
+    "GROK": "grok-cli",
+}
 
 # Env keys scanned in order per provider (first non-empty wins).
 PROVIDER_ENV_REFS: dict[str, tuple[str, ...]] = {
@@ -511,6 +520,77 @@ def write_observation(
         return None
 
 
+def _make_observer_session_ref(provider: str, session_ref: str) -> str:
+    prefix = PROVIDER_OBS_PREFIX.get(provider.upper(), provider.lower())
+    return f"{prefix}:{session_ref}"
+
+
+def patch_mode_current_anchor(
+    repo_root: Path,
+    *,
+    provider: str,
+    session_ref: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Patch observer_session_ref into mode_current_anchor.snapshot_json.
+
+    Operates directly on project_runtime.sqlite3 — no Universe server needed.
+    Best-effort: returns a status dict, never raises.
+    """
+    store = repo_root / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+    if not store.is_file():
+        return {"status": "ANCHOR_STORE_ABSENT"}
+    observer_ref = _make_observer_session_ref(provider, session_ref)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(store.resolve()), timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "mode_current_anchor" not in tables:
+            return {"status": "ANCHOR_TABLE_ABSENT"}
+        row = connection.execute(
+            "SELECT snapshot_json FROM mode_current_anchor WHERE mode = ?",
+            (mode,),
+        ).fetchone()
+        if row is None:
+            return {"status": "ANCHOR_ROW_ABSENT", "mode": mode}
+        try:
+            payload = json.loads(str(row["snapshot_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        inner = payload.get("snapshot")
+        if isinstance(inner, dict):
+            inner["observer_session_ref"] = observer_ref
+            payload["snapshot"] = inner
+        else:
+            payload["observer_session_ref"] = observer_ref
+        connection.execute(
+            "UPDATE mode_current_anchor SET snapshot_json = ? WHERE mode = ?",
+            (json.dumps(payload, separators=(",", ":")), mode),
+        )
+        connection.commit()
+        return {
+            "status": "ANCHOR_PATCHED",
+            "mode": mode,
+            "observer_session_ref": observer_ref,
+        }
+    except (OSError, sqlite3.Error) as error:
+        return {"status": "ANCHOR_PATCH_FAILED", "detail": str(error)}
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -657,6 +737,15 @@ def run_hook(
         "DEPRECATED_ANCHOR_DB_ONLY" if args.update_session_md else "NOT_REQUESTED"
     )
 
+    # Patch mode_current_anchor.snapshot_json with observer_session_ref.
+    # Local SQLite write — runs even when Universe is offline.
+    anchor_patch = patch_mode_current_anchor(
+        repo_root,
+        provider=provider,
+        session_ref=session_ref,
+        mode=mode,
+    )
+
     inject_body = {
         "project_id": project_id,
         "node": node,
@@ -681,6 +770,7 @@ def run_hook(
             detail="resolved inject payload; HTTP not called",
             observation_path=observation_path,
             session_md_status=session_md_status,
+            anchor_patch=anchor_patch,
             inject_body=inject_body,
             **base,
         )
@@ -698,6 +788,7 @@ def run_hook(
             state_file=str(state_path),
             observation_path=observation_path,
             session_md_status=session_md_status,
+            anchor_patch=anchor_patch,
             **base,
         )
     if not endpoint_reachable(endpoint):
@@ -708,6 +799,7 @@ def run_hook(
             state_file=str(state_path),
             observation_path=observation_path,
             session_md_status=session_md_status,
+            anchor_patch=anchor_patch,
             **base,
         )
 
@@ -724,6 +816,7 @@ def run_hook(
             http_status=status_code,
             observation_path=observation_path,
             session_md_status=session_md_status,
+            anchor_patch=anchor_patch,
             inject_response={
                 "status": response.get("status"),
                 "supervisor_session_created": response.get(
@@ -749,6 +842,7 @@ def run_hook(
         http_status=status_code or None,
         observation_path=observation_path,
         session_md_status=session_md_status,
+        anchor_patch=anchor_patch,
         inject_body=inject_body,
         **base,
     )
