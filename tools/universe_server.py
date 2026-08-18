@@ -845,6 +845,7 @@ def _vendor_identity_from_observer(observer_ref: str) -> tuple[str, str] | None:
         ("claude-code:", "CLAUDE"),
         ("codex-app-server:", "CODEX"),
         ("codex:", "CODEX"),
+        ("cli-terminal:", "CODEX"),
     )
     for prefix, provider in prefixed:
         if lowered.startswith(prefix):
