@@ -121,26 +121,41 @@ def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
                         message = json.loads(payload.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         if payload:
-                            host.write(terminal_id, payload)
+                            try:
+                                host.write(terminal_id, payload)
+                            except Exception:
+                                pass
                         continue
                     kind = str(message.get("type") or "").lower()
                     if kind == "resize":
-                        host.resize(
-                            terminal_id,
-                            int(message.get("cols") or 120),
-                            int(message.get("rows") or 32),
-                        )
+                        try:
+                            host.resize(
+                                terminal_id,
+                                int(message.get("cols") or 120),
+                                int(message.get("rows") or 32),
+                            )
+                        except Exception:
+                            pass
                     elif kind == "input":
                         text = str(message.get("data") or "")
                         if text:
                             if not text.endswith(("\n", "\r")):
                                 text += "\r"
-                            host.write(terminal_id, text.encode("utf-8"))
+                            try:
+                                host.write(terminal_id, text.encode("utf-8"))
+                            except Exception:
+                                pass
                     elif payload:
-                        host.write(terminal_id, payload)
+                        try:
+                            host.write(terminal_id, payload)
+                        except Exception:
+                            pass
                     continue
                 if opcode == 2 and payload:
-                    host.write(terminal_id, payload)
+                    try:
+                        host.write(terminal_id, payload)
+                    except Exception:
+                        pass
     finally:
         stop.set()
         reader.join(timeout=1)

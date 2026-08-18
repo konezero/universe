@@ -199,8 +199,9 @@ function ensureTerminalSurface(session) {
     socket.send(JSON.stringify({ type: "resize", cols, rows }));
   };
   socket.addEventListener("open", notifySize);
-  socket.addEventListener("close", () => {
-    term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
+  socket.addEventListener("close", (event) => {
+    const detail = event.reason ? ` ${event.code}: ${event.reason}` : ` code=${event.code}`;
+    term.write(`\r\n\x1b[90m[session closed${detail}]\x1b[0m\r\n`);
   });
   window.addEventListener("resize", notifySize);
   const resizeObserver = new ResizeObserver(() => {

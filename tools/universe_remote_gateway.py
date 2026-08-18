@@ -564,6 +564,7 @@ universes</strong>, use the public list.</p>
             return
         if (self.headers.get("Upgrade") or "").lower() == "websocket":
             self._proxy_websocket(device)
+            self.close_connection = True
             return
         connection: HTTPConnection | None = None
         response_started = False
