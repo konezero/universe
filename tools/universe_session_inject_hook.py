@@ -857,13 +857,14 @@ def _toml_array(items: list[str]) -> str:
 
 
 def _codex_hook_block(python_exe: str, script_path: str) -> str:
-    cmd = _toml_array([python_exe, script_path, "--repo-root", ".", "--provider", "CODEX", "--from-stdin", "--trigger", "session_start"])
+    import subprocess as _sp
+    cmd_str = _sp.list2cmdline([python_exe, script_path, "--repo-root", ".", "--provider", "CODEX", "--from-stdin", "--trigger", "session_start"])
     return (
         "\n[[hooks.SessionStart]]\n"
         'matcher = "*"\n'
         "[[hooks.SessionStart.hooks]]\n"
         'type = "command"\n'
-        f"command = {cmd}\n"
+        f"command = {json.dumps(cmd_str)}\n"
     )
 
 
