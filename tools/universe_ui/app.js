@@ -612,9 +612,13 @@ function sessionActivityMs(session) {
 
 function sessionObservatoryRank(session) {
   const stateName = String(session?.state || "").toUpperCase();
+  const currentness = String(session?.currentness || "").toUpperCase();
   const live = stateName === "LIVE" ? 3 : stateName === "STARTING" ? 2 : 1;
-  const isDefault = session?.is_default ? 1 : 0;
-  return live * 1e15 + isDefault * 1e14 + sessionActivityMs(session);
+  // CURRENT sessions should surface above stale-but-is_default ones.
+  const isCurrent = currentness === "CURRENT" ? 1 : 0;
+  // is_default only counts when the session is not stale.
+  const isDefault = session?.is_default && currentness !== "STALE" ? 1 : 0;
+  return live * 1e15 + isCurrent * 1e14 + isDefault * 1e13 + sessionActivityMs(session);
 }
 
 function observatoryEligibleSessions(sessions) {

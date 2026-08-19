@@ -1765,7 +1765,7 @@ class SessionSupervisorStore:
             )
 
     def set_default(
-        self, session_id: str, *, expected_pointer_version: Any
+        self, session_id: str, *, expected_pointer_version: Any, force: bool = False
     ) -> dict[str, Any]:
         normalized_id = _required_text(session_id, "session_id")
         expected = _non_negative_integer(
@@ -1778,7 +1778,7 @@ class SessionSupervisorStore:
                 (session["node"], session["mode"]),
             ).fetchone()
             current_version = 0 if current is None else int(current["pointer_version"])
-            if current_version != expected:
+            if not force and current_version != expected:
                 raise SessionSupervisorError(
                     "DEFAULT_SESSION_VERSION_CONFLICT",
                     "default session pointer version changed",

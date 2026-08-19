@@ -29189,6 +29189,10 @@ def perform_session_ref_inject(
             ).strip(),
         }
     )
+    # register_session may resolve a different session_id via identity_owner lookup
+    # (when another session already owns this provider_session_ref). Use the
+    # effective session_id from the returned session dict for all subsequent ops.
+    effective_session_id = str(session.get("session_id") or session_id)
     default_selection: Mapping[str, Any] | None = None
     if make_default and not bool(session.get("is_default")):
         # Don't steal the default pointer from a session that is currently LIVE.
@@ -29207,10 +29211,20 @@ def perform_session_ref_inject(
         if live_default_exists:
             make_default = False
     if make_default and not bool(session.get("is_default")):
-        default_selection = session_supervisor.set_default(
-            session_id,
-            expected_pointer_version=session.get("default_pointer_version"),
-        )
+        try:
+            default_selection = session_supervisor.set_default(
+                effective_session_id,
+                expected_pointer_version=session.get("default_pointer_version"),
+            )
+        except SessionSupervisorError as _err:
+            if _err.code != "DEFAULT_SESSION_VERSION_CONFLICT":
+                raise
+            # Stale version — retry unconditionally (no live default guard already passed).
+            default_selection = session_supervisor.set_default(
+                effective_session_id,
+                expected_pointer_version=session.get("default_pointer_version"),
+                force=True,
+            )
         session = dict(session)
         session["is_default"] = True
         session["default_pointer_version"] = (
