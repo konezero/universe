@@ -113,12 +113,15 @@ function sendPtyText(socket, data) {
   socket.send(new TextEncoder().encode(text));
 }
 
+const TERMINAL_COLS = 80;
+const TERMINAL_ROWS = 24;
+
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
-      if (event.isComposing) return false;
+      if (event.isComposing || event.keyCode === 229) return false;
       return true;
     });
   }
@@ -142,6 +145,18 @@ function bindTerminalIme(term, socket) {
   });
 }
 
+function scaleFontToContainer(term, element) {
+  const width = element.clientWidth;
+  const height = element.clientHeight;
+  if (!width || !height) return;
+  const fontFromWidth = width / (TERMINAL_COLS * 0.6);
+  const fontFromHeight = height / (TERMINAL_ROWS * 1.2);
+  const size = Math.max(8, Math.min(32, Math.floor(Math.min(fontFromWidth, fontFromHeight))));
+  if (term.options.fontSize !== size) {
+    term.options.fontSize = size;
+  }
+}
+
 function ensureTerminalSurface(session) {
   if (!elements.terminalStage || typeof Terminal !== "function") return;
   state.terminalSurfaces = state.terminalSurfaces || {};
@@ -151,22 +166,20 @@ function ensureTerminalSurface(session) {
   element.dataset.terminalId = session.terminal_id;
   elements.terminalStage.append(element);
   const term = new Terminal({
+    cols: TERMINAL_COLS,
+    rows: TERMINAL_ROWS,
     cursorBlink: true,
     fontSize: 13,
+    fontFamily: 'D2Coding, "Nanum Gothic Coding", "Cascadia Code", Consolas, monospace',
+    unicodeVersion: "11",
     convertEol: true,
     theme: {
       background: "#07101d",
       foreground: "#d7e6ff",
     },
   });
-  const fit = typeof FitAddon === "function"
-    ? new FitAddon()
-    : window.FitAddon
-      ? new window.FitAddon.FitAddon()
-      : null;
-  if (fit) term.loadAddon(fit);
   term.open(element);
-  if (fit) fit.fit();
+  scaleFontToContainer(term, element);
   try { term.reset(); } catch (_error) { /* xterm not ready */ }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(
@@ -175,39 +188,20 @@ function ensureTerminalSurface(session) {
   socket.binaryType = "arraybuffer";
   socket.addEventListener("message", (event) => writeTerminalBytes(term, event.data));
   bindTerminalIme(term, socket);
-  let lastSent = { cols: 0, rows: 0 };
   let resizeTimer = 0;
-  const sendSize = (cols, rows) => {
+  const sendFixedSize = () => {
     if (socket.readyState !== WebSocket.OPEN) return;
-    lastSent = { cols, rows };
-    socket.send(JSON.stringify({ type: "resize", cols, rows }));
+    socket.send(JSON.stringify({ type: "resize", cols: TERMINAL_COLS, rows: TERMINAL_ROWS }));
   };
-  const notifySize = (force) => {
+  const notifySize = () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
-      if (socket.readyState !== WebSocket.OPEN) return;
-      if (fit) {
-        try {
-          fit.fit();
-        } catch (_error) {
-          /* ignore until the pane has a box */
-        }
-      }
-      const cols = Math.max(80, Number(term.cols) || 80);
-      const rows = Math.max(24, Number(term.rows) || 24);
-      if (force) {
-        const bump = rows > 24 ? rows - 1 : rows + 1;
-        sendSize(cols, bump);
-        window.setTimeout(() => sendSize(cols, rows), 50);
-        return;
-      }
-      if (lastSent.cols === cols && lastSent.rows === rows) return;
-      sendSize(cols, rows);
-    }, force ? 0 : 150);
+      if (element.hidden) return;
+      scaleFontToContainer(term, element);
+    }, 150);
   };
   socket.addEventListener("open", () => {
-    lastSent = { cols: 0, rows: 0 };
-    notifySize(true);
+    sendFixedSize();
   });
   socket.addEventListener("close", (event) => {
     const detail = event.reason ? ` ${event.code}: ${event.reason}` : ` code=${event.code}`;
@@ -219,7 +213,7 @@ function ensureTerminalSurface(session) {
     notifySize();
   });
   resizeObserver.observe(element);
-  surface = { element, term, fit, socket, notifySize, resizeObserver };
+  surface = { element, term, socket, notifySize, resizeObserver };
   state.terminalSurfaces[session.terminal_id] = surface;
   return surface;
 }
@@ -319,8 +313,7 @@ function refitActiveTerminal() {
     if (surface.element?.hidden) return false;
     const box = surface.element.getBoundingClientRect();
     if (box.width < 40 || box.height < 80) return false;
-    try { surface.fit?.fit(); } catch (_e) { /* pane not ready */ }
-    surface.notifySize?.(true);
+    surface.notifySize?.();
     return true;
   };
   run();
