@@ -30060,6 +30060,20 @@ def main() -> int:
             return 0
 
         if args.command == "serve":
+            # Strip AI-session markers from this process so PTY children
+            # don't inherit them and show "transcript saving is off" warnings.
+            for _env_key in (
+                "CLAUDE_CODE_CHILD_SESSION",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_SESSION_ID",
+                "CLAUDE_CONVERSATION_ID",
+                "CODEX_THREAD_ID",
+                "CODEX_SESSION_ID",
+                "GROK_SESSION_ID",
+                "XAI_SESSION_ID",
+                "GROK_CONVERSATION_ID",
+            ):
+                os.environ.pop(_env_key, None)
             mode_registry = load_universe_mode_registry(args.mode_registry)
             mode_contract = universe_mode_contract(mode_registry)
             token = (

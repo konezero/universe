@@ -185,11 +185,16 @@ function ensureTerminalSurface(session) {
     },
   });
   term.open(element);
-  if (!scaleFontToContainer(term, element)) {
+  const refreshAfterLayout = () => {
+    if (!scaleFontToContainer(term, element)) return false;
+    try { term.refresh(0, term.rows - 1); } catch (_e) { /* ok */ }
+    return true;
+  };
+  if (!refreshAfterLayout()) {
     // element not yet laid out — retry after paint
     window.requestAnimationFrame(() => {
-      if (!scaleFontToContainer(term, element)) {
-        window.setTimeout(() => scaleFontToContainer(term, element), 200);
+      if (!refreshAfterLayout()) {
+        window.setTimeout(refreshAfterLayout, 200);
       }
     });
   }
@@ -327,6 +332,8 @@ function refitActiveTerminal() {
     const box = surface.element.getBoundingClientRect();
     if (box.width < 40 || box.height < 80) return false;
     surface.notifySize?.();
+    // Force a full canvas repaint so content is visible without needing user input.
+    try { surface.term?.refresh(0, (surface.term.rows || 24) - 1); } catch (_e) { /* ok */ }
     return true;
   };
   run();
