@@ -119,9 +119,10 @@ const TERMINAL_ROWS = 24;
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
+  let justComposed = false;
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
-      if (event.isComposing || event.keyCode === 229) return false;
+      if (event.isComposing || event.keyCode === 229 || justComposed) return false;
       return true;
     });
   }
@@ -131,16 +132,19 @@ function bindTerminalIme(term, socket) {
     textarea.setAttribute("spellcheck", "false");
     textarea.addEventListener("compositionstart", () => {
       composing = true;
+      justComposed = false;
     }, true);
     textarea.addEventListener("compositionend", () => {
       composing = false;
+      justComposed = true;
       window.setTimeout(() => {
+        justComposed = false;
         try { textarea.value = ""; } catch (_error) { /* ignore */ }
       }, 0);
     }, true);
   }
   term.onData((data) => {
-    if (composing) return;
+    if (composing || justComposed) return;
     sendPtyText(socket, data);
   });
 }
@@ -148,13 +152,14 @@ function bindTerminalIme(term, socket) {
 function scaleFontToContainer(term, element) {
   const width = element.clientWidth;
   const height = element.clientHeight;
-  if (!width || !height) return;
-  const fontFromWidth = width / (TERMINAL_COLS * 0.6);
-  const fontFromHeight = height / (TERMINAL_ROWS * 1.2);
-  const size = Math.max(8, Math.min(32, Math.floor(Math.min(fontFromWidth, fontFromHeight))));
+  if (!width || !height) return false;
+  const fontFromWidth = width / (TERMINAL_COLS * 0.65);
+  const fontFromHeight = height / (TERMINAL_ROWS * 1.35);
+  const size = Math.max(8, Math.min(20, Math.floor(Math.min(fontFromWidth, fontFromHeight))));
   if (term.options.fontSize !== size) {
     term.options.fontSize = size;
   }
+  return true;
 }
 
 function ensureTerminalSurface(session) {
@@ -180,7 +185,14 @@ function ensureTerminalSurface(session) {
     },
   });
   term.open(element);
-  scaleFontToContainer(term, element);
+  if (!scaleFontToContainer(term, element)) {
+    // element not yet laid out — retry after paint
+    window.requestAnimationFrame(() => {
+      if (!scaleFontToContainer(term, element)) {
+        window.setTimeout(() => scaleFontToContainer(term, element), 200);
+      }
+    });
+  }
   try { term.reset(); } catch (_error) { /* xterm not ready */ }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(
