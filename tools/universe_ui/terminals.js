@@ -114,7 +114,7 @@ function sendPtyText(socket, data) {
 }
 
 const TERMINAL_COLS = 80;
-const TERMINAL_ROWS = 80;
+const TERMINAL_ROWS = 50;
 
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
