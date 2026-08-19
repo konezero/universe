@@ -3604,6 +3604,10 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       `Connecting ${provider} / ${modelRef || "host default"} / ${effort}...`;
   }
   try {
+    // For NEW sessions the Claude process hasn't reported its session id yet
+    // when prepare returns, so last_provider is still UNKNOWN. Skip the
+    // provider/model/effort assertions — they only make sense on RESUME.
+    const isNew = String(sessionAction || "").toUpperCase() === "NEW";
     const options = {
       provider,
       modelRef,
@@ -3612,9 +3616,9 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       projectId: registeredProject?.project_id,
       cwd: registeredProject?.project_root,
       requestedMode: mode,
-      expectedProvider: provider,
-      expectedModel: modelRef,
-      expectedEffort: effort,
+      expectedProvider: isNew ? undefined : provider,
+      expectedModel: isNew ? undefined : modelRef,
+      expectedEffort: isNew ? undefined : effort,
     };
     if (mode === "CONDUCTOR") {
       await callUniverseConductor(options);
