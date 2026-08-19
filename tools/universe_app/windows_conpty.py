@@ -43,6 +43,12 @@ class WindowsConPTY:
         )
         self._reader.start()
 
+    @property
+    def pid(self) -> int | None:
+        pty = getattr(self, "_pty", None)
+        pid = getattr(pty, "pid", None)
+        return int(pid) if isinstance(pid, int) and pid > 0 else None
+
     def write(self, data: bytes) -> None:
         if not data or self._closed:
             return

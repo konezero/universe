@@ -118,10 +118,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
 
     def test_mode_click_expands_persistent_session_cards_without_auto_routing(self) -> None:
         self.assertIn("selectedModeCoordinateKey: null", APP)
-        self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
+        self.assertIn("function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {})", APP)
         self.assertIn("node-mode-session-card", APP)
-        self.assertIn("if (modeSelected)", APP)
-        self.assertIn("list.append(renderNodeModeSessionCards(coordinate));", APP)
+        self.assertIn("if (modeSelected || liveCount)", APP)
+        self.assertIn("renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected })", APP)
+        self.assertIn("function ptyLiveTerminalsForCoordinate", APP)
+        self.assertIn("function nodeModePanelSessions", APP)
+        self.assertIn('session_kind: "PTY_LIVE"', APP)
+        self.assertIn('api("/v1/terminals")', APP)
         open_slice = APP[
             APP.index("function openNodeModeCoordinate") : APP.index(
                 "function renderNodeModes"
@@ -255,7 +259,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             CSS,
         )
         self.assertIn('id="chat-resize-handle"', HTML)
-        self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
+        self.assertIn("function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {})", APP)
         self.assertIn("id=\"terminal-tabs\"", HTML)
         self.assertIn("createTerminalTab(coordinate)", APP)
         self.assertIn("initChatPanelResize()", APP)

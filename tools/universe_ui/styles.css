@@ -2908,6 +2908,14 @@ dialog label {
   display: none;
 }
 
+.setup-provider-hooks-status {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .toast-region {
   position: fixed;
   right: 14px;

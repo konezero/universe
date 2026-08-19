@@ -227,6 +227,7 @@ from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
 )
+from universe_app.pty_supervisor import SupervisedTerminalHost
 from universe_app.terminal_host import TerminalHost, TerminalHostError
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
 from universe_app.provider_session_service import (
@@ -17018,6 +17019,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         memory_scheduler_clock: Any = None,
         memory_scheduler_poll_seconds: float = 30.0,
         auto_start_memory_scheduler: bool = True,
+        use_pty_supervisor: bool = False,
     ):
         self.store = store
         self.project_task_proposals = ProjectTaskProposalAdapter()
@@ -17038,7 +17040,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.file_selector = file_selector or select_file_with_native_dialog
         self.host_profile = host_profile or HostProfileStore()
-        self.terminal_host = TerminalHost()
+        if use_pty_supervisor:
+            self.terminal_host = SupervisedTerminalHost()
+        else:
+            self.terminal_host = TerminalHost()
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
@@ -21272,13 +21277,47 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         providers = (
             [str(p).upper() for p in raw_providers if str(p).upper() in {"CLAUDE", "CODEX", "GROK"}]
             if isinstance(raw_providers, list)
-            else ["CODEX", "GROK"]
+            else ["CODEX", "GROK", "CLAUDE"]
         )
+        repo_root = Path(__file__).resolve().parents[1]
         result = _setup(
-            Path(__file__).resolve().parents[1],
+            repo_root,
             global_=global_,
             providers=providers,
         )
+        injects: list[dict[str, Any]] = []
+        for item in result.get("repairs") or []:
+            if item.get("status") != "REPAIRED":
+                continue
+            try:
+                injected = perform_session_ref_inject(
+                    session_supervisor=self.session_supervisor,
+                    multi_rooms=self.multi_rooms,
+                    body={
+                        "project_id": repo_root.name,
+                        "mode": item.get("mode") or "MASTER",
+                        "provider": "GROK",
+                        "provider_session_ref": item.get("session_ref") or "",
+                        "make_default": True,
+                        "bounded_summary": "Setup CLI Hooks repaired Grok compat stamp",
+                    },
+                )
+                injects.append(
+                    {
+                        "status": injected.get("status"),
+                        "mode": item.get("mode"),
+                        "session_ref": item.get("session_ref"),
+                    }
+                )
+            except Exception as error:  # noqa: BLE001 - setup stays best-effort
+                injects.append(
+                    {
+                        "status": "INJECT_FAILED",
+                        "mode": item.get("mode"),
+                        "detail": f"{type(error).__name__}:{error}",
+                    }
+                )
+        result["injects"] = injects
         return {"schema": API_SCHEMA, **result}
 
     def memory_batch_catalog_settings(self) -> dict[str, Any]:
@@ -28599,6 +28638,7 @@ def create_server(
     remote_connector_config_path: Path | None = None,
     directory_selector: Callable[[], str | None] | None = None,
     file_selector: Callable[[str], str | None] | None = None,
+    use_pty_supervisor: bool = False,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -28633,6 +28673,7 @@ def create_server(
         remote_connector_config_path=remote_connector_config_path,
         directory_selector=directory_selector,
         file_selector=file_selector,
+        use_pty_supervisor=use_pty_supervisor,
     )
 
 
@@ -29863,6 +29904,7 @@ def main() -> int:
                 mode_contract=mode_contract,
                 auto_start_conductor_runtime=False,
                 service_state_path=args.state_file,
+                use_pty_supervisor=True,
             )
             host, port = server.server_address[:2]
             host_text = host.decode("ascii") if isinstance(host, bytes) else host

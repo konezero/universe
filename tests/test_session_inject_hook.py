@@ -17,6 +17,7 @@ from universe_session_inject_hook import (  # noqa: E402
     resolve_project_id,
     resolve_provider_and_ref,
     run_hook,
+    setup_provider_hooks,
 )
 
 
@@ -76,6 +77,16 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("CLAUDE", provider)
         self.assertEqual("claude-sess-9", ref)
         self.assertEqual("STDIN.session_id", source)
+
+    def test_grok_hook_env_overrides_claude_compat_command(self) -> None:
+        provider, ref, source = resolve_provider_and_ref(
+            args=_args(provider="CLAUDE"),
+            stdin_payload={"sessionId": "01a0172e-1c8a-7ae0-bd72-42f97ca90b70"},
+            session_fields={},
+            environment={"GROK_HOOK_EVENT": "session_start"},
+        )
+        self.assertEqual("GROK", provider)
+        self.assertEqual("01a0172e-1c8a-7ae0-bd72-42f97ca90b70", ref)
 
     def test_stdin_session_id_without_provider_is_not_claude(self) -> None:
         provider, ref, source = resolve_provider_and_ref(
@@ -401,6 +412,112 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("INJECTED", result["status"])
         self.assertEqual("bind_1", result["inject_response"]["binding_id"])
         self.assertEqual("session_start", result["trigger"])
+
+    def test_setup_writes_project_claude_and_grok_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = setup_provider_hooks(
+                root,
+                global_=False,
+                providers=["GROK", "CLAUDE"],
+                python_exe="python",
+                script_path="tools/universe_session_inject_hook.py",
+            )
+            self.assertEqual("SETUP_HOOKS_DONE", result["status"])
+            grok_hook = root / ".grok" / "hooks" / "session-start.json"
+            claude_hook = root / ".claude" / "settings.json"
+            self.assertEqual("WRITTEN", result["providers"]["GROK_PROJECT"]["status"])
+            self.assertEqual("WRITTEN", result["providers"]["CLAUDE_PROJECT"]["status"])
+            self.assertTrue(grok_hook.is_file())
+            self.assertIn("--provider GROK", grok_hook.read_text(encoding="utf-8"))
+            self.assertIn("--provider CLAUDE", claude_hook.read_text(encoding="utf-8"))
+            again = setup_provider_hooks(
+                root,
+                global_=False,
+                providers=["GROK", "CLAUDE"],
+                python_exe="python",
+                script_path="tools/universe_session_inject_hook.py",
+            )
+            self.assertEqual("CURRENT", again["providers"]["GROK_PROJECT"]["status"])
+            self.assertEqual("CURRENT", again["providers"]["CLAUDE_PROJECT"]["status"])
+
+    def test_setup_updates_existing_inject_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            grok_path = root / ".grok" / "hooks" / "session-start.json"
+            grok_path.parent.mkdir(parents=True)
+            grok_path.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "python tools/universe_session_inject_hook.py --repo-root . --from-stdin --trigger session_start",
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = setup_provider_hooks(
+                root,
+                global_=False,
+                providers=["GROK"],
+                python_exe="python",
+                script_path="tools/universe_session_inject_hook.py",
+            )
+            self.assertEqual("UPDATED", result["providers"]["GROK_PROJECT"]["status"])
+            self.assertIn("--provider GROK", grok_path.read_text(encoding="utf-8"))
+
+    def test_setup_repairs_claude_stamped_grok_observer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from urllib.parse import quote
+
+            session_id = "01a0172e-repair-me"
+            grok_home = root / "grok-home"
+            session_dir = (
+                grok_home / "sessions" / quote(str(root.resolve()), safe="") / session_id
+            )
+            session_dir.mkdir(parents=True)
+            db = root / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+            db.parent.mkdir(parents=True)
+            connection = __import__("sqlite3").connect(str(db))
+            connection.execute(
+                "CREATE TABLE mode_current_anchor (mode TEXT PRIMARY KEY, snapshot_json TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO mode_current_anchor(mode, snapshot_json) VALUES (?, ?)",
+                (
+                    "MASTER",
+                    json.dumps(
+                        {
+                            "snapshot": {
+                                "observer_session_ref": f"claude-code:{session_id}",
+                            }
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            result = setup_provider_hooks(
+                root,
+                global_=False,
+                providers=["GROK"],
+                python_exe="python",
+                script_path="tools/universe_session_inject_hook.py",
+                environment={"GROK_HOME": str(grok_home)},
+            )
+            repaired = [item for item in result["repairs"] if item.get("status") == "REPAIRED"]
+            self.assertEqual(1, len(repaired))
+            self.assertEqual(f"grok-cli:{session_id}", repaired[0]["to"])
 
 
 if __name__ == "__main__":

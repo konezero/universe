@@ -20,6 +20,7 @@ class FakePty:
         self.writes: list[bytes] = []
         self.closed = False
         self.size = (120, 32)
+        self.pid = 4242
 
     def write(self, data: bytes) -> None:
         self.writes.append(data)
@@ -53,6 +54,7 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual("GCS", created["project_id"])
         self.assertEqual("MASTER", created["mode"])
         self.assertEqual("LIVE", created["state"])
+        self.assertEqual(4242, created["pid"])
         self.assertTrue(created["terminal_id"].startswith("term_"))
         listed = host.list_sessions()
         self.assertEqual(1, len(listed))

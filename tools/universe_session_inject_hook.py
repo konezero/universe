@@ -130,6 +130,12 @@ def _grok_home(environment: Mapping[str, str]) -> Path:
 
 
 def _grok_agent_active(environment: Mapping[str, str]) -> bool:
+    # Grok sets these on every hook subprocess, including Claude-compat
+    # SessionStart commands loaded from .claude/settings.json.
+    if str(environment.get("GROK_HOOK_EVENT") or "").strip():
+        return True
+    if str(environment.get("GROK_HOOK_NAME") or "").strip():
+        return True
     value = str(environment.get("GROK_AGENT") or "").strip()
     if value.upper() in _GROK_AGENT_TRUTHY or value in _GROK_AGENT_TRUTHY:
         return True
@@ -979,7 +985,7 @@ def _merge_claude_settings(path: Path, hook_entry: dict[str, Any]) -> str:
             command = str(hook.get("command") or "")
             if script_marker not in command:
                 continue
-            if "--provider" not in command:
+            if command != new_cmd:
                 hook["command"] = new_cmd
                 updated = True
     if updated:
@@ -991,11 +997,116 @@ def _merge_claude_settings(path: Path, hook_entry: dict[str, Any]) -> str:
         for block in starts
         for h in (block.get("hooks") or [])
     ):
-        return "ALREADY_PRESENT"
+        return "CURRENT"
     starts.append(hook_entry["hooks"]["SessionStart"][0])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return "WRITTEN"
+
+
+def _write_grok_session_hook(hooks_dir: Path, python_exe: str, script_path: str) -> dict[str, Any]:
+    hook_path = hooks_dir / "session-start.json"
+    try:
+        existing_json: dict[str, Any] = {}
+        if hook_path.is_file():
+            try:
+                existing_json = json.loads(hook_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                existing_json = {}
+        marker = "universe_session_inject_hook.py"
+        payload = _grok_hook_payload(python_exe, script_path)
+        desired_cmd = payload["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        found = False
+        updated = False
+        starts = existing_json.setdefault("hooks", {}).setdefault("SessionStart", [])
+        for block in starts:
+            for item in block.get("hooks") or []:
+                command = str(item.get("command") or "")
+                if marker not in command:
+                    continue
+                found = True
+                if command != desired_cmd:
+                    item["command"] = desired_cmd
+                    updated = True
+        if found:
+            if updated:
+                hooks_dir.mkdir(parents=True, exist_ok=True)
+                hook_path.write_text(json.dumps(existing_json, indent=2) + "\n", encoding="utf-8")
+                return {"status": "UPDATED", "path": str(hook_path)}
+            return {"status": "CURRENT", "path": str(hook_path)}
+        starts.extend(payload["hooks"]["SessionStart"])
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook_path.write_text(json.dumps(existing_json, indent=2) + "\n", encoding="utf-8")
+        return {"status": "WRITTEN", "path": str(hook_path)}
+    except OSError as error:
+        return {"status": "ERROR", "detail": str(error), "path": str(hook_path)}
+
+
+def repair_claude_compat_observer_stamps(
+    repo_root: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Rewrite claude-code:<id> observers that belong to a Grok session."""
+    env = os.environ if environment is None else environment
+    store = Path(repo_root) / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+    repairs: list[dict[str, Any]] = []
+    if not store.is_file():
+        return [{"status": "ANCHOR_STORE_ABSENT"}]
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(str(store.resolve()), timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT mode, snapshot_json FROM mode_current_anchor"
+        ).fetchall()
+    except (OSError, sqlite3.Error) as error:
+        return [{"status": "ANCHOR_READ_FAILED", "detail": str(error)}]
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+    for row in rows:
+        mode = str(row["mode"] or "").strip().upper()
+        try:
+            payload = json.loads(str(row["snapshot_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        inner = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else payload
+        observer = str((inner or {}).get("observer_session_ref") or "").strip()
+        if not observer.lower().startswith("claude-code:"):
+            continue
+        session_ref = observer.split(":", 1)[1].strip()
+        if not session_ref:
+            continue
+        if not _grok_session_dir_exists(Path(repo_root), env, session_ref):
+            repairs.append(
+                {
+                    "status": "SKIPPED_NO_GROK_SESSION",
+                    "mode": mode,
+                    "observer_session_ref": observer,
+                }
+            )
+            continue
+        patched = patch_mode_current_anchor(
+            Path(repo_root),
+            provider="GROK",
+            session_ref=session_ref,
+            mode=mode,
+        )
+        repairs.append(
+            {
+                "status": "REPAIRED" if patched.get("status") == "ANCHOR_PATCHED" else patched.get("status"),
+                "mode": mode,
+                "from": observer,
+                "to": f"grok-cli:{session_ref}",
+                "session_ref": session_ref,
+                "anchor_patch": patched,
+            }
+        )
+    return repairs
 
 
 def setup_provider_hooks(
@@ -1005,6 +1116,7 @@ def setup_provider_hooks(
     providers: list[str] | None = None,
     python_exe: str | None = None,
     script_path: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Write SessionStart hook configs for Codex and/or Grok (and Claude).
 
@@ -1013,7 +1125,7 @@ def setup_provider_hooks(
     import sys as _sys
     py = python_exe or _sys.executable
     sp = script_path or str(Path(__file__).resolve())
-    targets = [p.upper() for p in (providers or ["CODEX", "GROK"])]
+    targets = [p.upper() for p in (providers or ["CODEX", "GROK", "CLAUDE"])]
     results: dict[str, Any] = {}
 
     home = Path.home()
@@ -1035,47 +1147,41 @@ def setup_provider_hooks(
             results["CODEX"] = {"status": "ERROR", "detail": str(e)}
 
     if "GROK" in targets:
-        hooks_dir = home / ".grok" / "hooks" if global_ else repo_root / ".grok" / "hooks"
-        hook_path = hooks_dir / "session-start.json"
-        try:
-            existing_json: dict[str, Any] = {}
-            if hook_path.is_file():
-                try:
-                    existing_json = json.loads(hook_path.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    existing_json = {}
-            marker = "universe_session_inject_hook.py"
-            existing_text = json.dumps(existing_json)
-            if marker in existing_text:
-                results["GROK"] = {"status": "ALREADY_PRESENT", "path": str(hook_path)}
-            else:
-                payload = _grok_hook_payload(py, sp)
-                if existing_json:
-                    # Merge into existing hooks
-                    ex_hooks = existing_json.setdefault("hooks", {})
-                    ex_starts = ex_hooks.setdefault("SessionStart", [])
-                    ex_starts.extend(payload["hooks"]["SessionStart"])
-                    merged = existing_json
-                else:
-                    merged = payload
-                hooks_dir.mkdir(parents=True, exist_ok=True)
-                hook_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-                results["GROK"] = {"status": "WRITTEN", "path": str(hook_path)}
-        except OSError as e:
-            results["GROK"] = {"status": "ERROR", "detail": str(e)}
-
-    if "CLAUDE" in targets:
-        settings_path = (
-            home / ".claude" / "settings.json" if global_
-            else repo_root / ".claude" / "settings.json"
+        if global_:
+            results["GROK"] = _write_grok_session_hook(home / ".grok" / "hooks", py, sp)
+        results["GROK_PROJECT"] = _write_grok_session_hook(
+            repo_root / ".grok" / "hooks", py, sp
         )
+    if "CLAUDE" in targets:
         try:
-            status = _merge_claude_settings(settings_path, _claude_settings_hook(sp))
-            results["CLAUDE"] = {"status": status, "path": str(settings_path)}
-        except OSError as e:
-            results["CLAUDE"] = {"status": "ERROR", "detail": str(e)}
+            results["CLAUDE_PROJECT"] = {
+                "status": _merge_claude_settings(
+                    repo_root / ".claude" / "settings.json",
+                    _claude_settings_hook(sp),
+                ),
+                "path": str((repo_root / ".claude" / "settings.json")),
+            }
+        except OSError as error:
+            results["CLAUDE_PROJECT"] = {"status": "ERROR", "detail": str(error)}
+        if global_:
+            settings_path = home / ".claude" / "settings.json"
+            try:
+                results["CLAUDE"] = {
+                    "status": _merge_claude_settings(
+                        settings_path, _claude_settings_hook(sp)
+                    ),
+                    "path": str(settings_path),
+                }
+            except OSError as error:
+                results["CLAUDE"] = {"status": "ERROR", "detail": str(error)}
 
-    return {"status": "SETUP_HOOKS_DONE", "global": global_, "providers": results}
+    repairs = repair_claude_compat_observer_stamps(repo_root, environment=environment)
+    return {
+        "status": "SETUP_HOOKS_DONE",
+        "global": global_,
+        "providers": results,
+        "repairs": repairs,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1085,7 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
         sub = argparse.ArgumentParser(description="Write SessionStart hook configs for Codex/Grok/Claude")
         sub.add_argument("--repo-root", type=Path, default=Path.cwd())
         sub.add_argument("--global", dest="global_", action="store_true", help="Write to global home config dirs")
-        sub.add_argument("--providers", nargs="+", default=["CODEX", "GROK"], metavar="PROVIDER")
+        sub.add_argument("--providers", nargs="+", default=["CODEX", "GROK", "CLAUDE"], metavar="PROVIDER")
         sub.add_argument("--python", dest="python_exe", default="")
         sub.add_argument("--script", dest="script_path", default="")
         args = sub.parse_args(raw[1:])

@@ -62,7 +62,18 @@ class TerminalSession:
             "cols": self.cols,
             "rows": self.rows,
             "created_at": self.created_at,
+            "pid": self.live_pid(),
         }
+
+    def live_pid(self) -> int | None:
+        backend = self.backend
+        if backend is None:
+            return None
+        pid = getattr(backend, "pid", None)
+        if not (isinstance(pid, int) and pid > 0):
+            pty = getattr(backend, "_pty", None)
+            pid = getattr(pty, "pid", None)
+        return int(pid) if isinstance(pid, int) and pid > 0 else None
 
 
 class TerminalHost:

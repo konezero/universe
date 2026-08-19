@@ -348,6 +348,14 @@ async function closeTerminalTab(terminalId) {
 }
 
 function focusTerminalForSession(coordinate, session) {
+  const wantedId = String(session?.terminal_id || "").trim();
+  if (wantedId) {
+    const exact = (state.terminals || []).find((item) => item.terminal_id === wantedId);
+    if (exact) {
+      selectTerminalTab(exact.terminal_id);
+      return true;
+    }
+  }
   const projectId = String(
     session?.project_id || session?.node || coordinate?.project?.project_id || ""
   ).trim();
@@ -374,6 +382,7 @@ async function loadTerminalTabs() {
     const opened = incoming.filter((item) => !previous.has(item.terminal_id));
     state.terminals = incoming;
     renderTerminalDock();
+    if (typeof renderNodeModes === "function") renderNodeModes();
     if (!state.activeTerminalId && incoming[0]) {
       selectTerminalTab(incoming[0].terminal_id);
       return;

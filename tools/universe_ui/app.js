@@ -315,6 +315,7 @@ const elements = {
   providerModelCatalog: document.querySelector("#provider-model-catalog"),
   refreshProviderModels: document.querySelector("#refresh-provider-models-button"),
   setupProviderHooks: document.querySelector("#setup-provider-hooks-button"),
+  setupProviderHooksStatus: document.querySelector("#setup-provider-hooks-status"),
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
@@ -1124,13 +1125,18 @@ async function api(path, options = {}) {
 }
 
 async function refreshSupervisorSessions() {
-  const [audit, legacy, activity, chatCatalog, sessionGraph] = await Promise.all([
+  const [audit, legacy, activity, chatCatalog, sessionGraph, terminals] = await Promise.all([
     api("/v1/runtime/audit"),
     api("/v1/supervisor/legacy-executors"),
     api("/v1/session-observer/sources"),
     api("/v1/session-observer/chat-rooms"),
     api("/v1/session-graph").catch(() => null),
+    api("/v1/terminals").catch(() => ({ terminals: state.terminals || [] })),
   ]);
+  if (Array.isArray(terminals?.terminals)) {
+    state.terminals = terminals.terminals;
+    if (typeof renderTerminalDock === "function") renderTerminalDock();
+  }
   state.runtimeAudit = audit;
   state.runtimePreflight = audit.preflight || null;
   state.supervisorSessions = audit.sessions || [];
@@ -1205,6 +1211,9 @@ async function tailProviderSessions() {
         state.providerLiveDeltas[room.chat_key] = [...existing, ...fresh].slice(-80);
         mergeProviderLiveDeltasIntoRoom(room.chat_key);
       }
+    }
+    if (typeof loadTerminalTabs === "function") {
+      await loadTerminalTabs();
     }
     renderSessionRail();
     renderNodeModes();
@@ -1981,6 +1990,13 @@ function nodeModeSessionIsCurrent(session) {
 }
 
 function vendorStreamStateForSession(session) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  if (terminalId) {
+    const live = (state.terminals || []).find(
+      (item) => item.terminal_id === terminalId && String(item.state || "").toUpperCase() === "LIVE"
+    );
+    if (live) return "LIVE";
+  }
   const room =
     providerSessionRoomForChatKey(session?.chat_key) ||
     providerChatRoomForSupervisorSession(session);
@@ -2063,6 +2079,13 @@ function nodeModeCoordinates() {
     coordinates.set(key, coordinate);
   };
 
+  for (const terminal of state.terminals || []) {
+    if (String(terminal.state || "").toUpperCase() !== "LIVE") continue;
+    record(terminal.project_id, terminal.mode, {
+      hasSession: true,
+      active: true,
+    });
+  }
   for (const session of state.projectAnchorSessions || []) {
     const projectId = String(session.project_id || session.node || "").trim();
     const mode = String(session.mode || "").trim().toUpperCase();
@@ -2106,6 +2129,9 @@ function nodeModeCoordinates() {
 }
 
 function nodeModeStatusLabel(coordinate) {
+  const live = ptyLiveTerminalsForCoordinate(coordinate).length > 0;
+  if (coordinate.current && live) return "CURRENT · LIVE";
+  if (live) return "LIVE";
   if (coordinate.current && coordinate.active) return "CURRENT · STREAM";
   if (coordinate.current) return "CURRENT";
   if (coordinate.active) return "STREAM";
@@ -2178,10 +2204,71 @@ async function selectNodeModeSession(coordinate, session) {
   await resumeNodeModeSession(coordinate, session);
 }
 
-function renderNodeModeSessionCards(coordinate) {
+function ptyLiveTerminalsForCoordinate(coordinate) {
+  const projectId = String(coordinate?.project?.project_id || coordinate?.nodeId || "").trim();
+  const mode = String(coordinate?.mode || "").trim().toUpperCase();
+  if (!projectId || !mode) return [];
+  return (state.terminals || []).filter(
+    (item) =>
+      String(item.state || "").toUpperCase() === "LIVE" &&
+      String(item.project_id || "") === projectId &&
+      String(item.mode || "").toUpperCase() === mode
+  );
+}
+
+function sessionFromPtyTerminal(terminal) {
+  return {
+    terminal_id: terminal.terminal_id,
+    project_id: terminal.project_id,
+    node: terminal.project_id,
+    mode: terminal.mode,
+    provider: terminal.provider,
+    alias: `${terminal.project_id} ${terminal.mode}`,
+    state: terminal.state || "LIVE",
+    pid: terminal.pid,
+    executable: terminal.executable,
+    cwd: terminal.cwd,
+    session_kind: "PTY_LIVE",
+    last_seen_at: terminal.created_at,
+    session_anchor_ref: `pty:${terminal.terminal_id}`,
+  };
+}
+
+function nodeModePanelSessions(coordinate, { liveOnly = false } = {}) {
+  const live = ptyLiveTerminalsForCoordinate(coordinate);
+  const bound = new Set();
+  const rows = [];
+  if (!liveOnly) {
+    for (const session of coordinate.sessions || []) {
+      const match = live.find((item) => {
+        if (bound.has(item.terminal_id)) return false;
+        const provider = String(session.provider || "").toUpperCase();
+        return !provider || provider === "AUTO" || provider === String(item.provider || "").toUpperCase();
+      });
+      if (match) {
+        bound.add(match.terminal_id);
+        rows.push({
+          ...session,
+          terminal_id: match.terminal_id,
+          pid: match.pid,
+          pty_live: true,
+        });
+      } else {
+        rows.push(session);
+      }
+    }
+  }
+  for (const terminal of live) {
+    if (bound.has(terminal.terminal_id)) continue;
+    rows.push(sessionFromPtyTerminal(terminal));
+  }
+  return rows;
+}
+
+function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
   const cards = node("div", "node-mode-session-cards");
   cards.dataset.coordinateKey = coordinate.key;
-  const sessions = coordinate.sessions || [];
+  const sessions = nodeModePanelSessions(coordinate, { liveOnly });
   if (!sessions.length) {
     cards.append(
       node("p", "node-mode-session-empty", "No persistent sessions in this mode")
@@ -2219,28 +2306,29 @@ function renderNodeModeSessionCards(coordinate) {
       String(Boolean(selected && anchorSessionKey(selected) === anchorSessionKey(session)))
     );
     const label = node("span", "node-mode-session-copy");
+    const detail = session.terminal_id
+      ? `${String(session.provider || "UNKNOWN").toUpperCase()} / PTY${session.pid ? ` ${session.pid}` : ""}`
+      : `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`;
     label.append(
       node("strong", "", sessionDisplayName(session)),
-      node(
-        "small",
-        "",
-        `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`
-      )
+      node("small", "", detail)
     );
     const stream = vendorStreamStateForSession(session);
     const current = nodeModeSessionIsCurrent(session);
     const activeIng = session.active_ing === true;
     const statusLabel = current && stream === "LIVE"
       ? "CURRENT · LIVE"
-      : current
-        ? "CURRENT"
-        : activeIng
-          ? String(session.state || "ING")
-          : stream === "LIVE"
-            ? "STREAM"
-            : stream === "NO_VENDOR"
-              ? "SAVED"
-              : stream;
+      : session.terminal_id && stream === "LIVE"
+        ? "LIVE"
+        : current
+          ? "CURRENT"
+          : activeIng
+            ? String(session.state || "ING")
+            : stream === "LIVE"
+              ? "STREAM"
+              : stream === "NO_VENDOR"
+                ? "SAVED"
+                : stream;
     const status = node("span", "node-mode-session-status", statusLabel);
     status.dataset.state = stream;
     status.dataset.current = String(current);
@@ -2334,8 +2422,9 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
-      if (modeSelected) {
-        list.append(renderNodeModeSessionCards(coordinate));
+      const liveCount = ptyLiveTerminalsForCoordinate(coordinate).length;
+      if (modeSelected || liveCount) {
+        list.append(renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected }));
       }
     }
     section.append(list);
@@ -5275,18 +5364,33 @@ async function refreshProviderModels() {
 }
 
 async function setupProviderHooks(opts = {}) {
-  elements.settingsError.textContent = "";
+  const button = elements.setupProviderHooks;
+  const status = elements.setupProviderHooksStatus;
+  if (elements.settingsError) elements.settingsError.textContent = "";
+  if (status) status.textContent = "Writing hook files…";
+  if (button) button.disabled = true;
   try {
     const result = await api("/v1/settings/setup-provider-hooks", {
       method: "POST",
-      body: { providers: ["CODEX", "GROK"], global: true, ...opts },
+      body: { providers: ["CODEX", "GROK", "CLAUDE"], global: true, ...opts },
     });
     const lines = Object.entries(result.providers || {})
-      .map(([p, r]) => `${p}: ${r.status}`)
+      .map(([p, r]) => `${p}: ${r.status || r}`)
       .join(", ");
-    toast(`CLI hooks: ${lines || "done"}`);
+    const repaired = (result.repairs || []).filter((item) => item.status === "REPAIRED");
+    const suffix = repaired.length
+      ? `; repaired ${repaired.map((item) => item.mode || "mode").join(", ")} to GROK`
+      : "";
+    const message = `CLI hooks: ${lines || "done"}${suffix}`;
+    if (status) status.textContent = message;
+    toast(message);
   } catch (error) {
-    elements.settingsError.textContent = error.message;
+    const message = error.message || "CLI hook setup failed";
+    if (status) status.textContent = message;
+    if (elements.settingsError) elements.settingsError.textContent = message;
+    toast(message, true);
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
