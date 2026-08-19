@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from universe_app.terminal_host import TerminalHostError
 
@@ -284,6 +284,33 @@ class SupervisedTerminalHost:
             "POST",
             f"/v1/terminals/{quote(terminal_id, safe='')}/resize",
             payload={"cols": cols, "rows": rows},
+        )
+
+    def bus_directory(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/bus/directory")
+
+    def bus_unread(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/bus/unread")
+
+    def bus_post(self, value: dict[str, Any] | None) -> dict[str, Any]:
+        return self._request("POST", "/v1/bus/messages", payload=dict(value or {}))
+
+    def bus_inbox(self, **kwargs: Any) -> dict[str, Any]:
+        query = {
+            key: ("1" if key == "headers_only" else str(value))
+            for key, value in kwargs.items()
+            if value not in (None, "", False)
+        }
+        if "headers_only" in query:
+            query["headers"] = query.pop("headers_only")
+        suffix = ("?" + urlencode(query)) if query else ""
+        return self._request("GET", "/v1/bus/inbox" + suffix)
+
+    def bus_ack(self, message_id: str, terminal_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/bus/messages/{quote(message_id, safe='')}/ack",
+            payload={"terminal_id": terminal_id},
         )
 
     def find_live(

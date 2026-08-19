@@ -78,6 +78,8 @@ const state = {
   sessionDelegations: [],
   /** Expanded left-rail mode whose persistent session cards are visible. */
   selectedModeCoordinateKey: null,
+  sessionBusUnread: {},
+  pendingSessionBus: null,
   observatoryShowAll: false,
   /** Expanded (node|mode) groups so operators can pick an alternate 1:1 session. */
   observatoryExpandedCoords: {},
@@ -212,8 +214,15 @@ const elements = {
   nodeSessionActionTitle: document.querySelector("#node-session-action-title"),
   nodeSessionActionSubtitle: document.querySelector("#node-session-action-subtitle"),
   nodeSessionInspect: document.querySelector("#node-session-inspect"),
+  nodeSessionInbox: document.querySelector("#node-session-inbox"),
   nodeSessionOpen: document.querySelector("#node-session-open"),
   nodeSessionStop: document.querySelector("#node-session-stop"),
+  sessionBusDialog: document.querySelector("#session-bus-dialog"),
+  sessionBusTitle: document.querySelector("#session-bus-title"),
+  sessionBusSubtitle: document.querySelector("#session-bus-subtitle"),
+  sessionBusMessages: document.querySelector("#session-bus-messages"),
+  sessionBusCompose: document.querySelector("#session-bus-compose"),
+  sessionBusBody: document.querySelector("#session-bus-body"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
   sessionObservatoryDetailMeta: document.querySelector(
     "#session-observatory-detail-meta"
@@ -1131,14 +1140,16 @@ async function api(path, options = {}) {
 }
 
 async function refreshSupervisorSessions() {
-  const [audit, legacy, activity, chatCatalog, sessionGraph, terminals] = await Promise.all([
+  const [audit, legacy, activity, chatCatalog, sessionGraph, terminals, busUnread] = await Promise.all([
     api("/v1/runtime/audit"),
     api("/v1/supervisor/legacy-executors"),
     api("/v1/session-observer/sources"),
     api("/v1/session-observer/chat-rooms"),
     api("/v1/session-graph").catch(() => null),
     api("/v1/terminals").catch(() => ({ terminals: state.terminals || [] })),
+    api("/v1/session-bus/unread").catch(() => ({ counts: {} })),
   ]);
+  state.sessionBusUnread = busUnread?.counts || {};
   if (Array.isArray(terminals?.terminals)) {
     state.supervisorTerminals = terminals.terminals;
   }
@@ -2226,9 +2237,113 @@ function openNodeModeSessionActions(coordinate, session) {
   if (elements.nodeSessionStop) {
     elements.nodeSessionStop.disabled = !String(session.terminal_id || "").trim();
   }
+  if (elements.nodeSessionInbox) {
+    elements.nodeSessionInbox.disabled = !String(session.terminal_id || "").trim();
+  }
   if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
     elements.nodeSessionActionDialog.showModal();
   }
+}
+
+function sessionBusTarget(session, coordinate) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  if (terminalId) return { terminal_id: terminalId };
+  return {
+    project_id: String(session?.project_id || coordinate?.project?.project_id || ""),
+    mode: String(session?.mode || coordinate?.mode || "").toUpperCase(),
+    provider: String(session?.provider || "").toUpperCase(),
+  };
+}
+
+async function refreshSessionBusMessages() {
+  const pending = state.pendingSessionBus;
+  if (!pending || !elements.sessionBusMessages) return;
+  const terminalId = String(pending.session?.terminal_id || "").trim();
+  const query = terminalId
+    ? "?terminal_id=" + encodeURIComponent(terminalId)
+    : "?project_id=" +
+      encodeURIComponent(pending.session?.project_id || pending.coordinate?.project?.project_id || "") +
+      "&mode=" +
+      encodeURIComponent(pending.session?.mode || pending.coordinate?.mode || "") +
+      "&provider=" +
+      encodeURIComponent(pending.session?.provider || "");
+  const payload = await api("/v1/session-bus/inbox" + query);
+  const rows = payload.messages || [];
+  elements.sessionBusMessages.replaceChildren();
+  if (!rows.length) {
+    elements.sessionBusMessages.append(node("p", "session-bus-empty", "No unread bus messages"));
+    return;
+  }
+  for (const message of rows) {
+    const item = node("article", "session-bus-item");
+    const from = message.from || {};
+    const heading = node(
+      "header",
+      "session-bus-item-head",
+      `${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
+    );
+    const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
+    const ack = node("button", "secondary-button", "Ack");
+    ack.type = "button";
+    ack.addEventListener("click", () => {
+      ackSessionBusMessage(message.message_id, message.terminal_id || terminalId).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+    item.append(heading, body, ack);
+    elements.sessionBusMessages.append(item);
+  }
+}
+
+async function openSessionBusInbox(coordinate, session) {
+  state.pendingSessionBus = { coordinate, session };
+  if (elements.sessionBusTitle) {
+    elements.sessionBusTitle.textContent = sessionDisplayName(session);
+  }
+  if (elements.sessionBusSubtitle) {
+    elements.sessionBusSubtitle.textContent = `${session.project_id || coordinate?.project?.project_id || "session"} / ${String(session.mode || coordinate?.mode || "").toUpperCase()} / ${String(session.provider || "UNKNOWN").toUpperCase()}`;
+  }
+  if (elements.sessionBusBody) elements.sessionBusBody.value = "";
+  await refreshSessionBusMessages();
+  if (elements.sessionBusDialog && !elements.sessionBusDialog.open) {
+    elements.sessionBusDialog.showModal();
+  }
+}
+
+async function ackSessionBusMessage(messageId, terminalId) {
+  await api("/v1/session-bus/messages/" + encodeURIComponent(messageId) + "/ack", {
+    method: "POST",
+    body: { terminal_id: terminalId },
+  });
+  await refreshSupervisorSessions();
+  renderNodeModes();
+  await refreshSessionBusMessages();
+}
+
+async function sendSessionBusCompose(event) {
+  event.preventDefault();
+  const pending = state.pendingSessionBus;
+  const body = String(elements.sessionBusBody?.value || "").trim();
+  if (!pending || !body) return;
+  await api("/v1/session-bus/messages", {
+    method: "POST",
+    body: {
+      to: sessionBusTarget(pending.session, pending.coordinate),
+      from: {
+        project_id: pending.coordinate?.project?.project_id || pending.session?.project_id || "",
+        mode: pending.coordinate?.mode || pending.session?.mode || "",
+        provider: "UI",
+      },
+      kind: "INSTRUCTION",
+      notify: "HEADER",
+      body_text: body,
+    },
+  });
+  if (elements.sessionBusBody) elements.sessionBusBody.value = "";
+  toast("Sent on the session bus");
+  await refreshSupervisorSessions();
+  renderNodeModes();
+  await refreshSessionBusMessages();
 }
 
 function openPtySessionInspectSummary(coordinate, session) {
@@ -2428,7 +2543,11 @@ function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
     const status = node("span", "node-mode-session-status", statusLabel);
     status.dataset.state = stream;
     status.dataset.current = String(current);
+    const unread = Number(state.sessionBusUnread?.[session.terminal_id] || 0);
     card.append(label, status);
+    if (unread > 0) {
+      card.append(node("span", "node-mode-session-bus-unread", String(Math.min(unread, 99))));
+    }
     card.title = nodeModeSessionIsCurrent(session)
       ? "Resume the DB Current session"
       : room
@@ -12640,6 +12759,21 @@ function bindEvents() {
         }
         toast(error.message, true);
       });
+    });
+  }
+  if (elements.nodeSessionInbox) {
+    elements.nodeSessionInbox.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      openSessionBusInbox(pending.coordinate, pending.session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+  }
+  if (elements.sessionBusCompose) {
+    elements.sessionBusCompose.addEventListener("submit", (event) => {
+      sendSessionBusCompose(event).catch((error) => toast(error.message, true));
     });
   }
   if (elements.nodeSessionInspect) {

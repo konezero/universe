@@ -27,6 +27,7 @@ from universe_app.pty_supervisor import (  # noqa: E402
     SCHEMA,
     default_state_path,
 )
+from universe_app.session_bus import SessionBusError  # noqa: E402
 from universe_app.terminal_host import (  # noqa: E402
     TerminalHost,
     TerminalHostError,
@@ -162,6 +163,37 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         supervisor = self.server.supervisor
+        if path == "/v1/bus/directory":
+            self._send(HTTPStatus.OK, supervisor.host.bus.directory(supervisor.host))
+            return
+        if path == "/v1/bus/unread":
+            self._send(HTTPStatus.OK, supervisor.host.bus_unread())
+            return
+        if path == "/v1/bus/inbox":
+            query = parse_qs(parsed.query)
+            try:
+                payload = supervisor.host.bus.inbox(
+                    supervisor.host,
+                    terminal_id=(query.get("terminal_id") or [""])[0],
+                    project_id=(query.get("project_id") or [""])[0],
+                    mode=(query.get("mode") or [""])[0],
+                    provider=(query.get("provider") or [""])[0],
+                    room_id=(query.get("room_id") or [""])[0],
+                    headers_only=(query.get("headers") or [""])[0] == "1",
+                )
+            except SessionBusError as error:
+                self._send(
+                    error.status,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(HTTPStatus.OK, payload)
+            return
         if path == "/v1/terminals":
             rows = [supervisor.public_session(item) for item in supervisor.host.list_sessions()]
             self._send(
@@ -222,6 +254,45 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         supervisor = self.server.supervisor
         body = self._read_json()
+        if path == "/v1/bus/messages":
+            try:
+                created = supervisor.host.bus.post(supervisor.host, body)
+            except SessionBusError as error:
+                self._send(
+                    error.status,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(HTTPStatus.CREATED, created)
+            return
+        bus_ack = path.split("/")
+        if (
+            len(bus_ack) == 6
+            and bus_ack[1:4] == ["v1", "bus", "messages"]
+            and bus_ack[5] == "ack"
+        ):
+            try:
+                result = supervisor.host.bus.ack(
+                    bus_ack[4], str(body.get("terminal_id") or "")
+                )
+            except SessionBusError as error:
+                self._send(
+                    error.status,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(HTTPStatus.OK, result)
+            return
         if path == "/v1/terminals":
             try:
                 created = supervisor.host.create(

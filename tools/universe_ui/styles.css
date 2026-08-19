@@ -3805,6 +3805,50 @@ body {
 .node-session-action-buttons button {
   flex: 1 1 96px;
 }
+.node-mode-session-bus-unread {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--amber);
+  color: #1a1203;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+.session-bus-dialog {
+  width: min(440px, calc(100vw - 24px));
+  max-height: min(720px, calc(100vh - 24px));
+  padding: 18px;
+  overflow: auto;
+}
+.session-bus-messages {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0;
+}
+.session-bus-item {
+  border: 1px solid var(--line-default);
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.session-bus-item-head {
+  color: var(--text-2);
+  font-size: 12px;
+}
+.session-bus-item-body {
+  margin: 0;
+  white-space: pre-wrap;
+  font: inherit;
+  color: var(--text);
+}
+.session-bus-compose textarea {
+  width: 100%;
+  min-height: 88px;
+  resize: vertical;
+}
 .session-summary-dialog {
   width: min(440px, calc(100vw - 24px));
   max-height: min(680px, calc(100vh - 24px));

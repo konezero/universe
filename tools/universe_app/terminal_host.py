@@ -84,9 +84,12 @@ class TerminalHost:
         *,
         spawn: Callable[[str, str, int, int], Any] | None = None,
     ) -> None:
+        from universe_app.session_bus import SessionBus
+
         self._spawn = spawn or spawn_conpty
         self._lock = threading.Lock()
         self._sessions: dict[str, TerminalSession] = {}
+        self.bus = SessionBus()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -172,6 +175,7 @@ class TerminalHost:
             session.pump_thread = None
         with self._lock:
             self._sessions.pop(session.terminal_id, None)
+        self.bus.drop_terminal(session.terminal_id)
         closer = getattr(backend, "close", None)
         if callable(closer):
             closer()
@@ -227,6 +231,25 @@ class TerminalHost:
             return None
         rows.sort(key=lambda item: item.created_at, reverse=True)
         return rows[0].public()
+
+    def bus_directory(self) -> dict[str, Any]:
+        return self.bus.directory(self)
+
+    def bus_post(self, value: dict[str, Any] | None) -> dict[str, Any]:
+        return self.bus.post(self, value)
+
+    def bus_inbox(self, **kwargs: Any) -> dict[str, Any]:
+        return self.bus.inbox(self, **kwargs)
+
+    def bus_ack(self, message_id: str, terminal_id: str) -> dict[str, Any]:
+        return self.bus.ack(message_id, terminal_id)
+
+    def bus_unread(self) -> dict[str, Any]:
+        return {
+            "schema": "universe.session-bus.v1",
+            "status": "OK",
+            "counts": self.bus.unread_map(),
+        }
 
     def subscribe(self, terminal_id: str) -> queue.Queue:
         session = self.get(terminal_id)

@@ -228,6 +228,7 @@ from universe_app.streaming import (
     ProjectRoomEventHub,
 )
 from universe_app.pty_supervisor import SupervisedTerminalHost
+from universe_app.session_bus import SessionBus, SessionBusError, fanout_meeting_bus
 from universe_app.terminal_host import TerminalHost, TerminalHostError
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
 from universe_app.provider_session_service import (
@@ -17044,6 +17045,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.terminal_host = SupervisedTerminalHost()
         else:
             self.terminal_host = TerminalHost()
+        self.session_bus = SessionBus()
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
@@ -20351,6 +20353,88 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.NOT_FOUND,
             ) from error
         return {"schema": API_SCHEMA, **result}
+
+    def session_bus_directory(self) -> dict[str, Any]:
+        try:
+            payload = dict(self.session_bus.directory(self.terminal_host))
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+        rooms = []
+        for room in self.multi_rooms.list_rooms(room_type="MEETING", state="OPEN"):
+            rooms.append(
+                {
+                    "room_id": room.get("room_id"),
+                    "room_type": room.get("room_type"),
+                    "title": room.get("title"),
+                    "project_id": room.get("project_id"),
+                    "state": room.get("state"),
+                    "slots": [
+                        {
+                            "binding_id": binding.get("binding_id"),
+                            "slot_role": binding.get("slot_role"),
+                            "provider": binding.get("provider"),
+                            "display_name": binding.get("display_name"),
+                        }
+                        for binding in self.multi_rooms.list_bindings(room["room_id"])
+                    ],
+                }
+            )
+        payload["rooms"] = rooms
+        return payload
+
+    def session_bus_unread(self) -> dict[str, Any]:
+        return {
+            "schema": "universe.session-bus.v1",
+            "status": "OK",
+            "counts": self.session_bus.unread_map(),
+        }
+
+    def session_bus_inbox(self, query: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        raw = query if isinstance(query, Mapping) else {}
+        try:
+            return self.session_bus.inbox(
+                self.terminal_host,
+                terminal_id=str(raw.get("terminal_id") or ""),
+                project_id=str(raw.get("project_id") or ""),
+                mode=str(raw.get("mode") or ""),
+                provider=str(raw.get("provider") or ""),
+                room_id=str(raw.get("room_id") or ""),
+                headers_only=str(raw.get("headers") or "") == "1",
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def post_session_bus_message(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
+        payload = dict(value or {})
+        destination = payload.get("to") if isinstance(payload.get("to"), Mapping) else {}
+        try:
+            if destination.get("room_id") or payload.get("room_id"):
+                return fanout_meeting_bus(
+                    rooms=self.multi_rooms,
+                    host=self.terminal_host,
+                    bus=self.session_bus,
+                    value=payload,
+                )
+            return self.session_bus.post(self.terminal_host, payload)
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def ack_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            return self.session_bus.ack(
+                message_id, str(payload.get("terminal_id") or "")
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
     def provider_chat_catalog(self) -> dict[str, Any]:
         """Join provider-owned chat metadata to optional Universe bindings.
@@ -24186,6 +24270,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, self.server.list_cli_terminals())
             return
+        if path in {
+            "/v1/session-bus/directory",
+            "/v1/session-bus/unread",
+            "/v1/session-bus/inbox",
+        }:
+            if not self._authorize():
+                return
+            try:
+                if path.endswith("/directory"):
+                    self._send(HTTPStatus.OK, self.server.session_bus_directory())
+                elif path.endswith("/unread"):
+                    self._send(HTTPStatus.OK, self.server.session_bus_unread())
+                else:
+                    query = {
+                        key: (values[0] if values else "")
+                        for key, values in parse_qs(urlsplit(self.path).query).items()
+                    }
+                    self._send(HTTPStatus.OK, self.server.session_bus_inbox(query))
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/health":
             self._send(
                 HTTPStatus.OK,
@@ -25439,6 +25544,30 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     HTTPStatus.CREATED,
                     self.server.create_cli_terminal(self._read_json()),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        if path == "/v1/session-bus/messages":
+            try:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.post_session_bus_message(self._read_json()),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_ack = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/ack", path
+        )
+        if session_bus_ack is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.ack_session_bus_message(
+                        unquote(session_bus_ack.group(1)),
+                        self._read_json(),
+                    ),
                 )
             except UniverseError as error:
                 self._send_error(error)

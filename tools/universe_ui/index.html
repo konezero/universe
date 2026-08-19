@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-11">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-12">
   <link rel="stylesheet" href="/xterm.min.css">
 </head>
 <body>
@@ -765,9 +765,31 @@
     </div>
     <div class="dialog-actions node-session-action-buttons">
       <button id="node-session-inspect" class="secondary-button" type="button">Inspector</button>
+      <button id="node-session-inbox" class="secondary-button" type="button">Inbox</button>
       <button id="node-session-open" class="primary-button" type="button">Open session</button>
       <button id="node-session-stop" class="secondary-button" type="button">End session</button>
     </div>
+  </dialog>
+
+  <dialog id="session-bus-dialog" class="session-bus-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Session bus</span>
+        <h2 id="session-bus-title">Inbox</h2>
+        <p id="session-bus-subtitle"></p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div id="session-bus-messages" class="session-bus-messages"></div>
+    <form id="session-bus-compose" class="session-bus-compose">
+      <label>
+        <span class="sr-only">Message</span>
+        <textarea id="session-bus-body" rows="4" placeholder="Send without pasting into the CLI"></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="submit">Send</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="session-summary-dialog" class="session-summary-dialog">
@@ -1277,6 +1299,6 @@
   <script src="/xterm.min.js"></script>
   <script src="/xterm-addon-fit.min.js"></script>
   <script src="/terminals.js?v=term-11" defer></script>
-  <script src="/app.js?v=work-spine-15" defer></script>
+  <script src="/app.js?v=work-spine-16" defer></script>
 </body>
 </html>
