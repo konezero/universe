@@ -23,6 +23,22 @@ TOOLS = Path(__file__).resolve().parent
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+# Strip AI-session markers immediately so PTY children never inherit them,
+# regardless of how this supervisor process was spawned.
+for _k in (
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CONVERSATION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "GROK_SESSION_ID",
+    "XAI_SESSION_ID",
+    "GROK_CONVERSATION_ID",
+):
+    os.environ.pop(_k, None)
+del _k
+
 from universe_app.pty_supervisor import (  # noqa: E402
     SCHEMA,
     default_state_path,
