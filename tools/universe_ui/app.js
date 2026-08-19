@@ -12822,6 +12822,15 @@ function bindEvents() {
       sendSessionBusCompose(event).catch((error) => toast(error.message, true));
     });
   }
+  if (elements.sessionBusBody) {
+    elements.sessionBusBody.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      if (event.isComposing || event.keyCode === 229) { event.preventDefault(); return; }
+      if (event.shiftKey) return;
+      event.preventDefault();
+      elements.sessionBusCompose?.requestSubmit();
+    });
+  }
   if (elements.nodeSessionInspect) {
     elements.nodeSessionInspect.addEventListener("click", () => {
       const pending = state.pendingNodeSessionAction;
@@ -13027,6 +13036,13 @@ function bindEvents() {
     openFreshProjectWizard();
   });
   elements.dispatchForm.addEventListener("submit", submitDispatch);
+  elements.dispatchInstruction.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    if (event.isComposing || event.keyCode === 229) { event.preventDefault(); return; }
+    if (event.shiftKey) return;
+    event.preventDefault();
+    elements.dispatchForm.requestSubmit();
+  });
   elements.composerActionButton.addEventListener("click", () =>
     toggleComposerActionMenu()
   );
