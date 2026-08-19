@@ -28,10 +28,7 @@ class WindowsConPTY:
         c = max(80, int(cols))
         r = max(24, int(rows))
         self._pty = winpty.PTY(c, r)
-        env = os.environ.copy()
-        # Strip parent session IDs and child-session markers so the child
-        # process starts as an independent session.
-        for _k in (
+        _STRIP_KEYS = (
             "CLAUDE_CODE_SESSION_ID",
             "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDE_SESSION_ID",
@@ -41,7 +38,9 @@ class WindowsConPTY:
             "GROK_SESSION_ID",
             "XAI_SESSION_ID",
             "GROK_CONVERSATION_ID",
-        ):
+        )
+        env = os.environ.copy()
+        for _k in _STRIP_KEYS:
             env.pop(_k, None)
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
@@ -51,7 +50,16 @@ class WindowsConPTY:
         kwargs: dict[str, Any] = {"cwd": str(Path(cwd)), "env": env_block}
         if args:
             kwargs["cmdline"] = " " + subprocess.list2cmdline(args)
-        self._pty.spawn(exe, **kwargs)
+        # Also temporarily remove from os.environ in case the PTY backend
+        # ignores the explicit env block and the child inherits the process env.
+        _saved: dict[str, str] = {}
+        for _k in _STRIP_KEYS:
+            if _k in os.environ:
+                _saved[_k] = os.environ.pop(_k)
+        try:
+            self._pty.spawn(exe, **kwargs)
+        finally:
+            os.environ.update(_saved)
         self._reader = threading.Thread(
             target=self._read_loop, name="conpty-read", daemon=True
         )

@@ -111,6 +111,18 @@ def supervisor_script() -> Path:
 
 def spawn_supervisor(*, state_path: Path | None = None) -> None:
     env = os.environ.copy()
+    for _k in (
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_CONVERSATION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "GROK_SESSION_ID",
+        "XAI_SESSION_ID",
+        "GROK_CONVERSATION_ID",
+    ):
+        env.pop(_k, None)
     if state_path is not None:
         env["UNIVERSE_PTY_SUPERVISOR_STATE"] = str(state_path)
     creationflags = 0
