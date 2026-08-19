@@ -29179,6 +29179,22 @@ def perform_session_ref_inject(
     )
     default_selection: Mapping[str, Any] | None = None
     if make_default and not bool(session.get("is_default")):
+        # Don't steal the default pointer from a session that is currently LIVE.
+        # A live default means a running PTY/harness session is active; the new
+        # inject should register alongside it rather than replacing it.
+        try:
+            live_default_exists = any(
+                s.get("is_default")
+                and str(s.get("state") or "").upper() in {"LIVE", "STARTING"}
+                for s in session_supervisor.list_sessions()
+                if str(s.get("node") or "") == normalized_node
+                and str(s.get("mode") or "") == normalized_mode
+            )
+        except Exception:
+            live_default_exists = False
+        if live_default_exists:
+            make_default = False
+    if make_default and not bool(session.get("is_default")):
         default_selection = session_supervisor.set_default(
             session_id,
             expected_pointer_version=session.get("default_pointer_version"),

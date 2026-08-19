@@ -2736,8 +2736,15 @@ function renderSessionRail() {
     if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) {
       group.unbound.push(room);
     } else if (
-      binding.is_default === true &&
-      binding.observer_currentness === "CURRENT"
+      (binding.is_default === true &&
+        binding.observer_currentness === "CURRENT") ||
+      (state.supervisorTerminals || []).some(
+        (t) =>
+          String(t.state || "").toUpperCase() === "LIVE" &&
+          String(t.project_id || "") === String(binding.node || binding.current_project_id || "") &&
+          String(t.mode || "").toUpperCase() === String(binding.mode || "").toUpperCase() &&
+          String(t.provider || "").toUpperCase() === String(room.provider || "").toUpperCase()
+      )
     ) {
       group.current.push(room);
     } else {
