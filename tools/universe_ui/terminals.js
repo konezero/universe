@@ -23,78 +23,11 @@ function activeTerminalSession() {
   return (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId) || null;
 }
 
-async function sendRemoteTerminalChat(text) {
-  const body = String(text || "").trim();
-  if (!body) return;
-  const session = activeTerminalSession();
-  const projectId = String(session?.project_id || "").trim();
-  if (!projectId) {
-    throw new Error("No local session is open to receive this chat");
-  }
-  await api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`, {
-    method: "POST",
-    body: {
-      kind: "QUESTION",
-      body,
-      idempotency_key: "remote-term-chat-" + Date.now(),
-    },
-  });
-}
-
-function sendTerminalInput(text) {
-  const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
-  if (!surface?.socket || surface.socket.readyState !== WebSocket.OPEN) {
-    throw new Error("CLI tab is not connected");
-  }
-  const payload = String(text || "");
-  if (!payload) return;
-  const body = payload.endsWith("\n") || payload.endsWith("\r") ? payload : payload + "\r";
-  surface.socket.send(new TextEncoder().encode(body));
-}
-
-function bindTerminalInput() {
-  const form = document.querySelector("#terminal-input-form");
-  const input = document.querySelector("#terminal-input");
-  if (!form || !input || form.dataset.bound === "true") return;
-  form.dataset.bound = "true";
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const value = String(input.value || "");
-    if (!value.trim()) return;
-    try {
-      if (isRemoteBrowser()) {
-        void sendRemoteTerminalChat(value);
-      } else {
-        sendTerminalInput(value);
-      }
-      input.value = "";
-    } catch (error) {
-      toast(error.message, true);
-    }
-    input.focus();
-  });
-}
-
 function focusTerminalInput() {
   const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
-  const form = document.querySelector("#terminal-input-form");
-  const input = document.querySelector("#terminal-input");
-  const remote = isRemoteBrowser();
-  if (form) {
-    form.hidden = !remote;
-    form.classList.toggle("remote-chat-slot", remote);
-  }
-  if (input) {
-    input.placeholder = remote
-      ? "Message the local session…"
-      : "Type a command and press Enter";
-    input.disabled = remote ? false : !surface;
-  }
-  if (surface?.term && !remote) {
+  if (surface?.term) {
     try { surface.term.focus(); } catch (_e) { /* pane not ready */ }
-    return;
   }
-  if (remote && input) input.focus();
 }
 
 function writeTerminalBytes(term, data) {
@@ -117,7 +50,6 @@ function renderTerminalDock() {
   const tabs = elements.terminalTabs;
   const stage = elements.terminalStage;
   if (!tabs || !stage) return;
-  bindTerminalInput();
   const sessions = state.terminals || [];
   tabs.replaceChildren();
   if (!sessions.length) {
@@ -168,17 +100,46 @@ function selectTerminalTab(terminalId) {
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = id !== terminalId;
-    if (id === terminalId && surface.fit) {
-      try {
-        surface.fit.fit();
-        surface.notifySize?.();
-      } catch (_error) {
-        /* ignore fit until the tab is visible */
-      }
-    }
+    if (id === terminalId) refitActiveTerminal();
   }
   applyCliDockTitle(session);
   focusTerminalInput();
+}
+
+function sendPtyText(socket, data) {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  const text = typeof data === "string" ? data.normalize("NFC") : String(data || "");
+  if (!text) return;
+  socket.send(new TextEncoder().encode(text));
+}
+
+function bindTerminalIme(term, socket) {
+  const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
+  let composing = false;
+  if (typeof term.attachCustomKeyEventHandler === "function") {
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.isComposing) return false;
+      return true;
+    });
+  }
+  if (textarea) {
+    textarea.setAttribute("autocapitalize", "off");
+    textarea.setAttribute("autocomplete", "off");
+    textarea.setAttribute("spellcheck", "false");
+    textarea.addEventListener("compositionstart", () => {
+      composing = true;
+    }, true);
+    textarea.addEventListener("compositionend", () => {
+      composing = false;
+      window.setTimeout(() => {
+        try { textarea.value = ""; } catch (_error) { /* ignore */ }
+      }, 0);
+    }, true);
+  }
+  term.onData((data) => {
+    if (composing) return;
+    sendPtyText(socket, data);
+  });
 }
 
 function ensureTerminalSurface(session) {
@@ -206,37 +167,48 @@ function ensureTerminalSurface(session) {
   if (fit) term.loadAddon(fit);
   term.open(element);
   if (fit) fit.fit();
+  try { term.reset(); } catch (_error) { /* xterm not ready */ }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(
     `${protocol}://${window.location.host}/v1/terminals/${encodeURIComponent(session.terminal_id)}/stream`
   );
   socket.binaryType = "arraybuffer";
   socket.addEventListener("message", (event) => writeTerminalBytes(term, event.data));
-  const remote = isRemoteBrowser();
-  if (remote) {
-    term.options.disableStdin = true;
-  }
-  term.onData((data) => {
-    if (remote) return;
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.send(new TextEncoder().encode(data));
-    }
-  });
-  const notifySize = () => {
+  bindTerminalIme(term, socket);
+  let lastSent = { cols: 0, rows: 0 };
+  let resizeTimer = 0;
+  const sendSize = (cols, rows) => {
     if (socket.readyState !== WebSocket.OPEN) return;
-    if (fit) {
-      try {
-        fit.fit();
-      } catch (_error) {
-        /* ignore until the pane has a box */
-      }
-    }
-    if (remote) return;
-    const cols = Math.max(80, Number(term.cols) || 80);
-    const rows = Math.max(24, Number(term.rows) || 24);
+    lastSent = { cols, rows };
     socket.send(JSON.stringify({ type: "resize", cols, rows }));
   };
-  socket.addEventListener("open", notifySize);
+  const notifySize = (force) => {
+    window.clearTimeout(resizeTimer);
+    resizeTimer = window.setTimeout(() => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      if (fit) {
+        try {
+          fit.fit();
+        } catch (_error) {
+          /* ignore until the pane has a box */
+        }
+      }
+      const cols = Math.max(80, Number(term.cols) || 80);
+      const rows = Math.max(24, Number(term.rows) || 24);
+      if (force) {
+        const bump = rows > 24 ? rows - 1 : rows + 1;
+        sendSize(cols, bump);
+        window.setTimeout(() => sendSize(cols, rows), 50);
+        return;
+      }
+      if (lastSent.cols === cols && lastSent.rows === rows) return;
+      sendSize(cols, rows);
+    }, force ? 0 : 150);
+  };
+  socket.addEventListener("open", () => {
+    lastSent = { cols: 0, rows: 0 };
+    notifySize(true);
+  });
   socket.addEventListener("close", (event) => {
     const detail = event.reason ? ` ${event.code}: ${event.reason}` : ` code=${event.code}`;
     term.write(`\r\n\x1b[90m[session closed${detail}]\x1b[0m\r\n`);
@@ -286,12 +258,18 @@ function terminalProviderFor(coordinate, session) {
 
 function terminalResumeRef(coordinate, session) {
   if (!session) return "";
+  const provider = terminalProviderFor(coordinate, session);
   const raw = String(
     session.provider_session_id ||
       session.observer_session_ref ||
       session.session_id ||
       ""
   ).trim();
+  const sessionProvider = String(session.provider || "").toUpperCase();
+  if (sessionProvider && sessionProvider !== "AUTO" && sessionProvider !== provider) return "";
+  if (/^grok-/i.test(raw) && provider !== "GROK") return "";
+  if (/^claude-/i.test(raw) && provider !== "CLAUDE") return "";
+  if (/^codex/i.test(raw) && provider !== "CODEX") return "";
   const stripped = raw.replace(
     /^(grok-acp:|grok-cli:|claude-code:|codex-app-server:|codex-app:|codex:|cli-terminal:)/i,
     ""
@@ -299,6 +277,8 @@ function terminalResumeRef(coordinate, session) {
   if (!stripped || /^(UNKNOWN|UNASSIGNED|NONE)$/i.test(stripped)) return "";
   if (/^[A-Z]+-CURRENT-/i.test(stripped)) return "";
   if (stripped.startsWith("UNIVERSE-")) return "";
+  if (stripped.startsWith("term_")) return "";
+  if (stripped.startsWith("pty:")) return "";
   return stripped;
 }
 
@@ -321,13 +301,49 @@ async function createTerminalTab(coordinate, session) {
     },
   });
   const tab = created.terminal || created;
+  state.dismissedTerminalIds = state.dismissedTerminalIds || {};
+  delete state.dismissedTerminalIds[tab.terminal_id];
+  state.supervisorTerminals = [
+    ...(state.supervisorTerminals || []).filter((item) => item.terminal_id !== tab.terminal_id),
+    tab,
+  ];
   state.terminals = [...(state.terminals || []).filter((item) => item.terminal_id !== tab.terminal_id), tab];
   selectTerminalTab(tab.terminal_id);
   return tab;
 }
 
+function refitActiveTerminal() {
+  const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
+  if (!surface) return;
+  const run = () => {
+    if (surface.element?.hidden) return false;
+    const box = surface.element.getBoundingClientRect();
+    if (box.width < 40 || box.height < 80) return false;
+    try { surface.fit?.fit(); } catch (_e) { /* pane not ready */ }
+    surface.notifySize?.(true);
+    return true;
+  };
+  run();
+  window.requestAnimationFrame(() => {
+    run();
+    window.setTimeout(run, 220);
+  });
+}
+
+async function stopTerminalSession(terminalId) {
+  const id = String(terminalId || "").trim();
+  if (!id) throw new Error("No live PTY session");
+  await api("/v1/terminals/" + encodeURIComponent(id), { method: "DELETE" });
+  if (state.dismissedTerminalIds) delete state.dismissedTerminalIds[id];
+  state.supervisorTerminals = (state.supervisorTerminals || []).filter(
+    (item) => item.terminal_id !== id
+  );
+  await closeTerminalTab(id);
+}
+
 async function closeTerminalTab(terminalId) {
-  await api("/v1/terminals/" + encodeURIComponent(terminalId), { method: "DELETE" });
+  state.dismissedTerminalIds = state.dismissedTerminalIds || {};
+  state.dismissedTerminalIds[terminalId] = true;
   const surface = (state.terminalSurfaces || {})[terminalId];
   if (surface) {
     try { surface.resizeObserver?.disconnect(); } catch (_e) { /* ok */ }
@@ -355,6 +371,14 @@ function focusTerminalForSession(coordinate, session) {
       selectTerminalTab(exact.terminal_id);
       return true;
     }
+    const live = (state.supervisorTerminals || []).find((item) => item.terminal_id === wantedId);
+    if (live) {
+      state.dismissedTerminalIds = state.dismissedTerminalIds || {};
+      delete state.dismissedTerminalIds[wantedId];
+      state.terminals = [...(state.terminals || []).filter((item) => item.terminal_id !== wantedId), live];
+      selectTerminalTab(wantedId);
+      return true;
+    }
   }
   const projectId = String(
     session?.project_id || session?.node || coordinate?.project?.project_id || ""
@@ -378,13 +402,21 @@ async function loadTerminalTabs() {
   try {
     const payload = await api("/v1/terminals");
     const incoming = payload.terminals || [];
+    state.supervisorTerminals = incoming;
+    const liveIds = new Set(incoming.map((item) => item.terminal_id));
+    state.dismissedTerminalIds = state.dismissedTerminalIds || {};
+    for (const id of Object.keys(state.dismissedTerminalIds)) {
+      if (!liveIds.has(id)) delete state.dismissedTerminalIds[id];
+    }
+    const dismissed = state.dismissedTerminalIds;
     const previous = new Set((state.terminals || []).map((item) => item.terminal_id));
-    const opened = incoming.filter((item) => !previous.has(item.terminal_id));
-    state.terminals = incoming;
+    const visible = incoming.filter((item) => !dismissed[item.terminal_id]);
+    const opened = visible.filter((item) => !previous.has(item.terminal_id));
+    state.terminals = visible;
     renderTerminalDock();
     if (typeof renderNodeModes === "function") renderNodeModes();
-    if (!state.activeTerminalId && incoming[0]) {
-      selectTerminalTab(incoming[0].terminal_id);
+    if (!state.activeTerminalId && visible[0]) {
+      selectTerminalTab(visible[0].terminal_id);
       return;
     }
     if (!isRemoteBrowser() && opened[0]) {

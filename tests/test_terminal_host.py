@@ -120,7 +120,7 @@ class TerminalHostTests(unittest.TestCase):
         class FeedingPty(FakePty):
             def __init__(self) -> None:
                 super().__init__()
-                self.pending = [b"hello-both"]
+                self.pending: list[bytes] = []
 
             def read(self, timeout: float = 0.2) -> bytes:
                 del timeout
@@ -129,10 +129,12 @@ class TerminalHostTests(unittest.TestCase):
                 time.sleep(0.01)
                 return b""
 
-        host = TerminalHost(spawn=lambda *_args, **_kwargs: FeedingPty())
+        pty = FeedingPty()
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
         created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT))
         first = host.subscribe(created["terminal_id"])
         second = host.subscribe(created["terminal_id"])
+        pty.pending.append(b"hello-both")
         seen = []
         deadline = time.time() + 1
         while time.time() < deadline and len(seen) < 2:
@@ -146,4 +148,37 @@ class TerminalHostTests(unittest.TestCase):
             if seen.count(b"hello-both") >= 2:
                 break
         self.assertGreaterEqual(seen.count(b"hello-both"), 2)
+        host.close(created["terminal_id"])
+
+    def test_late_subscriber_does_not_replay_history(self) -> None:
+        class FeedingPty(FakePty):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pending = [b"old-chunk"]
+
+            def read(self, timeout: float = 0.2) -> bytes:
+                del timeout
+                if self.pending:
+                    return self.pending.pop(0)
+                time.sleep(0.01)
+                return b""
+
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FeedingPty())
+        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT))
+        first = host.subscribe(created["terminal_id"])
+        deadline = time.time() + 1
+        seen = b""
+        while time.time() < deadline and b"old-chunk" not in seen:
+            try:
+                seen += first.get(timeout=0.05) or b""
+            except Exception:
+                continue
+        self.assertIn(b"old-chunk", seen)
+        late = host.subscribe(created["terminal_id"])
+        dumped = b""
+        try:
+            dumped = late.get(timeout=0.2) or b""
+        except Exception:
+            dumped = b""
+        self.assertNotIn(b"old-chunk", dumped)
         host.close(created["terminal_id"])

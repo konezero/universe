@@ -232,13 +232,9 @@ class TerminalHost:
         session = self.get(terminal_id)
         waiter: queue.Queue = queue.Queue(maxsize=256)
         with session.lock:
-            replay = b"".join(session.replay)
             session.subscribers.append(waiter)
-        if replay:
-            try:
-                waiter.put_nowait(replay)
-            except queue.Full:
-                pass
+        # Do not dump recent chunks into a new client. CLI TUIs address the
+        # cursor; a partial replay plus a live redraw garbles the screen.
         self._ensure_pump(session)
         return waiter
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-9">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-11">
   <link rel="stylesheet" href="/xterm.min.css">
 </head>
 <body>
@@ -220,10 +220,6 @@
           <div id="room-message-list" class="room-message-list hidden"></div>
           <div id="terminal-tabs" class="terminal-tabs" role="tablist"></div>
           <div id="terminal-stage" class="terminal-stage"></div>
-          <form id="terminal-input-form" class="terminal-input-form">
-            <input id="terminal-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type a command and press Enter">
-            <button type="submit">Send</button>
-          </form>
         </section>
 
         <form id="dispatch-form" class="command-composer project-room conductor-composer hidden">
@@ -758,6 +754,22 @@
     </form>
   </dialog>
 
+  <dialog id="node-session-action-dialog" class="node-session-action-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Session</span>
+        <h2 id="node-session-action-title">Session</h2>
+        <p id="node-session-action-subtitle"></p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div class="dialog-actions node-session-action-buttons">
+      <button id="node-session-inspect" class="secondary-button" type="button">Inspector</button>
+      <button id="node-session-open" class="primary-button" type="button">Open session</button>
+      <button id="node-session-stop" class="secondary-button" type="button">End session</button>
+    </div>
+  </dialog>
+
   <dialog id="session-summary-dialog" class="session-summary-dialog">
     <div class="dialog-heading">
       <div>
@@ -1264,7 +1276,7 @@
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <script src="/xterm.min.js"></script>
   <script src="/xterm-addon-fit.min.js"></script>
-  <script src="/terminals.js?v=term-8" defer></script>
-  <script src="/app.js?v=work-spine-13" defer></script>
+  <script src="/terminals.js?v=term-11" defer></script>
+  <script src="/app.js?v=work-spine-15" defer></script>
 </body>
 </html>

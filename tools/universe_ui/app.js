@@ -208,6 +208,12 @@ const elements = {
   sessionSummaryNew: document.querySelector("#session-summary-new"),
   sessionSummaryOpen: document.querySelector("#session-summary-open"),
   sessionSummaryManage: document.querySelector("#session-summary-manage"),
+  nodeSessionActionDialog: document.querySelector("#node-session-action-dialog"),
+  nodeSessionActionTitle: document.querySelector("#node-session-action-title"),
+  nodeSessionActionSubtitle: document.querySelector("#node-session-action-subtitle"),
+  nodeSessionInspect: document.querySelector("#node-session-inspect"),
+  nodeSessionOpen: document.querySelector("#node-session-open"),
+  nodeSessionStop: document.querySelector("#node-session-stop"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
   sessionObservatoryDetailMeta: document.querySelector(
     "#session-observatory-detail-meta"
@@ -1134,8 +1140,7 @@ async function refreshSupervisorSessions() {
     api("/v1/terminals").catch(() => ({ terminals: state.terminals || [] })),
   ]);
   if (Array.isArray(terminals?.terminals)) {
-    state.terminals = terminals.terminals;
-    if (typeof renderTerminalDock === "function") renderTerminalDock();
+    state.supervisorTerminals = terminals.terminals;
   }
   state.runtimeAudit = audit;
   state.runtimePreflight = audit.preflight || null;
@@ -1768,13 +1773,24 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   }
 }
 
+function applySessionSummaryInspectOnly() {
+  if (!state.sessionSummaryInspectOnly) return;
+  if (elements.sessionSummaryOpen) elements.sessionSummaryOpen.hidden = true;
+  if (elements.sessionSummaryManage) elements.sessionSummaryManage.hidden = true;
+  if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = true;
+  if (elements.sessionSummaryNew) elements.sessionSummaryNew.hidden = true;
+  if (elements.sessionSummaryConnection) elements.sessionSummaryConnection.hidden = true;
+}
+
 function renderProviderChatSummary() {
   if (!elements.sessionSummaryDialog) return;
   const room = (state.providerChatRooms || []).find(
     (item) => item.chat_key === state.selectedProviderChatKey
   );
   if (!room) {
-    if (elements.sessionSummaryDialog.open) elements.sessionSummaryDialog.close();
+    if (elements.sessionSummaryDialog.open && !state.sessionSummaryInspectOnly) {
+      elements.sessionSummaryDialog.close();
+    }
     return;
   }
   const binding = room.binding || { state: "UNBOUND" };
@@ -1851,9 +1867,11 @@ function renderProviderChatSummary() {
     : isAnchored && ["MASTER", "CONDUCTOR"].includes(mode)
       ? "View activity"
       : "Register session";
+  applySessionSummaryInspectOnly();
 }
 
-function openProviderChatSummary(room) {
+function openProviderChatSummary(room, options = {}) {
+  state.sessionSummaryInspectOnly = options.inspectOnly === true;
   state.selectedProviderChatKey = room.chat_key;
   state.pendingNewSessionCoordinate = null;
   markProviderSessionRead(room.chat_key);
@@ -1866,6 +1884,7 @@ function openProviderChatSummary(room) {
 }
 
 function openSessionSummaryForNew(coordinate) {
+  state.sessionSummaryInspectOnly = false;
   const mode = String(coordinate?.mode || "").toUpperCase();
   const project = coordinate?.project;
   const projectId = String(project?.project_id || "").trim();
@@ -1932,7 +1951,10 @@ function openSessionSummaryForNew(coordinate) {
         "Choose provider settings for the new session";
     }
     if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = true;
-    if (elements.sessionSummaryNew) elements.sessionSummaryNew.textContent = "Start new session";
+    if (elements.sessionSummaryNew) {
+      elements.sessionSummaryNew.hidden = false;
+      elements.sessionSummaryNew.textContent = "Start new session";
+    }
   }
   if (!elements.sessionSummaryDialog.open) {
     elements.sessionSummaryDialog.showModal();
@@ -1992,7 +2014,7 @@ function nodeModeSessionIsCurrent(session) {
 function vendorStreamStateForSession(session) {
   const terminalId = String(session?.terminal_id || "").trim();
   if (terminalId) {
-    const live = (state.terminals || []).find(
+    const live = (state.supervisorTerminals || state.terminals || []).find(
       (item) => item.terminal_id === terminalId && String(item.state || "").toUpperCase() === "LIVE"
     );
     if (live) return "LIVE";
@@ -2079,7 +2101,7 @@ function nodeModeCoordinates() {
     coordinates.set(key, coordinate);
   };
 
-  for (const terminal of state.terminals || []) {
+  for (const terminal of state.supervisorTerminals || state.terminals || []) {
     if (String(terminal.state || "").toUpperCase() !== "LIVE") continue;
     record(terminal.project_id, terminal.mode, {
       hasSession: true,
@@ -2190,6 +2212,78 @@ async function startNewNodeModeSession(coordinate) {
   expandConversationLayer();
 }
 
+function openNodeModeSessionActions(coordinate, session) {
+  state.pendingNodeSessionAction = { coordinate, session };
+  if (elements.nodeSessionActionTitle) {
+    elements.nodeSessionActionTitle.textContent = sessionDisplayName(session);
+  }
+  if (elements.nodeSessionActionSubtitle) {
+    const live = session.terminal_id
+      ? `${String(session.provider || "UNKNOWN").toUpperCase()} / PTY${session.pid ? ` ${session.pid}` : ""}`
+      : `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`;
+    elements.nodeSessionActionSubtitle.textContent = live;
+  }
+  if (elements.nodeSessionStop) {
+    elements.nodeSessionStop.disabled = !String(session.terminal_id || "").trim();
+  }
+  if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
+    elements.nodeSessionActionDialog.showModal();
+  }
+}
+
+function openPtySessionInspectSummary(coordinate, session) {
+  state.sessionSummaryInspectOnly = true;
+  state.selectedProviderChatKey = null;
+  if (elements.sessionSummaryTitle) {
+    elements.sessionSummaryTitle.textContent = sessionDisplayName(session);
+  }
+  if (elements.sessionSummarySubtitle) {
+    elements.sessionSummarySubtitle.textContent = `${coordinate?.project?.project_id || session.project_id || "session"} · inspect`;
+  }
+  if (elements.sessionSummaryFacts) {
+    elements.sessionSummaryFacts.replaceChildren();
+    const facts = [
+      ["Project", String(session.project_id || session.node || coordinate?.project?.project_id || "")],
+      ["Mode", String(session.mode || coordinate?.mode || "").toUpperCase()],
+      ["Provider", String(session.provider || "UNKNOWN").toUpperCase()],
+      ["PTY", session.terminal_id ? `${session.terminal_id}${session.pid ? ` / ${session.pid}` : ""}` : "none"],
+      ["State", String(session.state || vendorStreamStateForSession(session) || "")],
+    ];
+    for (const [label, value] of facts) {
+      const fact = node("div", "session-summary-fact");
+      fact.append(node("span", "", label), node("strong", "", value || "—"));
+      elements.sessionSummaryFacts.append(fact);
+    }
+  }
+  if (elements.sessionSummaryLive) elements.sessionSummaryLive.hidden = true;
+  applySessionSummaryInspectOnly();
+  if (elements.sessionSummaryDialog && !elements.sessionSummaryDialog.open) {
+    elements.sessionSummaryDialog.showModal();
+  }
+}
+
+async function inspectNodeModeSession(coordinate, session) {
+  const room = providerChatRoomForSupervisorSession(session);
+  if (room) {
+    openProviderChatSummary(room, { inspectOnly: true });
+    return;
+  }
+  openPtySessionInspectSummary(coordinate, session);
+}
+
+async function endNodeModePtySession(session) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  if (!terminalId) throw new Error("No live PTY session to end");
+  if (typeof stopTerminalSession === "function") {
+    await stopTerminalSession(terminalId);
+  } else {
+    await api("/v1/terminals/" + encodeURIComponent(terminalId), { method: "DELETE" });
+  }
+  await refreshSupervisorSessions();
+  if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
+  renderNodeModes();
+}
+
 async function selectNodeModeSession(coordinate, session) {
   if (!coordinate || !session) return;
   state.selectedModeCoordinateKey = coordinate.key;
@@ -2201,14 +2295,14 @@ async function selectNodeModeSession(coordinate, session) {
   renderNodeModes();
   renderSessionRail();
   renderSessionObservatory();
-  await resumeNodeModeSession(coordinate, session);
+  openNodeModeSessionActions(coordinate, session);
 }
 
 function ptyLiveTerminalsForCoordinate(coordinate) {
   const projectId = String(coordinate?.project?.project_id || coordinate?.nodeId || "").trim();
   const mode = String(coordinate?.mode || "").trim().toUpperCase();
   if (!projectId || !mode) return [];
-  return (state.terminals || []).filter(
+  return (state.supervisorTerminals || state.terminals || []).filter(
     (item) =>
       String(item.state || "").toUpperCase() === "LIVE" &&
       String(item.project_id || "") === projectId &&
@@ -2269,12 +2363,6 @@ function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
   const cards = node("div", "node-mode-session-cards");
   cards.dataset.coordinateKey = coordinate.key;
   const sessions = nodeModePanelSessions(coordinate, { liveOnly });
-  if (!sessions.length) {
-    cards.append(
-      node("p", "node-mode-session-empty", "No persistent sessions in this mode")
-    );
-    return cards;
-  }
   const selected = nodeModeSelectedSession(coordinate);
   const ordered = [...sessions].sort((left, right) => {
     const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
@@ -2287,10 +2375,18 @@ function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
   const create = node("button", "node-mode-session-new", "New session");
   create.type = "button";
   create.title = "Start a new vendor session for this Mode";
-  create.addEventListener("click", () => {
+  create.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
     openSessionSummaryForNew(coordinate);
   });
   cards.append(create);
+  if (!sessions.length) {
+    cards.append(
+      node("p", "node-mode-session-empty", "No persistent sessions in this mode")
+    );
+    return cards;
+  }
   for (const session of ordered) {
     const room = providerChatRoomForSupervisorSession(session);
     const row = node("div", "node-mode-session-row");
@@ -2362,8 +2458,11 @@ function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
 }
 
 function selectNodeModeNode(nodeId) {
+  const same =
+    String(state.selectedProject?.project_id || "").toLowerCase() ===
+    String(nodeId || "").toLowerCase();
   selectProject(nodeId, {
-    revealInspector: false,
+    revealInspector: same,
   })
     .then(() => renderNodeModes())
     .catch((error) => toast(error.message, true));
@@ -2423,7 +2522,7 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
       const liveCount = ptyLiveTerminalsForCoordinate(coordinate).length;
-      if (modeSelected || liveCount) {
+      if (modeSelected || liveCount || coordinate.mode === "MASTER") {
         list.append(renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected }));
       }
     }
@@ -4218,6 +4317,7 @@ function expandConversationLayer() {
   if (elements.conversationLayer.classList.contains("collapsed")) {
     elements.conversationLayer.classList.remove("collapsed");
     syncConversationToggle(false);
+    if (typeof refitActiveTerminal === "function") refitActiveTerminal();
   }
 }
 
@@ -12542,6 +12642,34 @@ function bindEvents() {
       });
     });
   }
+  if (elements.nodeSessionInspect) {
+    elements.nodeSessionInspect.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      inspectNodeModeSession(pending.coordinate, pending.session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+  }
+  if (elements.nodeSessionOpen) {
+    elements.nodeSessionOpen.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      resumeNodeModeSession(pending.coordinate, pending.session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+  }
+  if (elements.nodeSessionStop) {
+    elements.nodeSessionStop.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      endNodeModePtySession(pending.session).catch((error) => toast(error.message, true));
+    });
+  }
   if (elements.discoverProviderActivity) {
     elements.discoverProviderActivity.addEventListener("click", () => {
       discoverProviderActivitySources().catch((error) => toast(error.message, true));
@@ -12752,6 +12880,7 @@ function bindEvents() {
   elements.conversationToggle.addEventListener("click", () => {
     const collapsed = elements.conversationLayer.classList.toggle("collapsed");
     syncConversationToggle(collapsed);
+    if (!collapsed && typeof refitActiveTerminal === "function") refitActiveTerminal();
   });
   elements.conversationOpacity.addEventListener("input", () => {
     elements.conversationLayer.style.setProperty(

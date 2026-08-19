@@ -65,19 +65,10 @@ def decode_ws_frame(buffer: bytearray) -> tuple[int, bytes, int] | None:
     return opcode, payload, index + length
 
 
-def _is_remote_surface(handler: Any) -> bool:
-    surface = ""
-    headers = getattr(handler, "headers", None)
-    if headers is not None:
-        surface = str(headers.get("X-Universe-Access-Surface") or "")
-    return surface.strip().upper() == "REMOTE_BROWSER"
-
-
 def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
     sock: socket.socket = handler.connection
     sock.settimeout(0.2)
     stop = threading.Event()
-    viewer = _is_remote_surface(handler)
     waiter = host.subscribe(terminal_id)
 
     def emit() -> None:
@@ -96,14 +87,6 @@ def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
 
     reader = threading.Thread(target=emit, name="term-ws-out", daemon=True)
     reader.start()
-    try:
-        session = host.get(terminal_id)
-        banner = (
-            f"[{session.project_id} {session.mode}] {session.executable}  {session.cwd}\r\n"
-        ).encode("utf-8")
-        sock.sendall(encode_ws_frame(banner, opcode=2))
-    except Exception:
-        pass
     buffer = bytearray()
     try:
         while not stop.is_set():
@@ -132,15 +115,13 @@ def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
                     try:
                         message = json.loads(payload.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
-                        if payload and not viewer:
+                        if payload:
                             try:
                                 host.write(terminal_id, payload)
                             except Exception:
                                 pass
                         continue
                     kind = str(message.get("type") or "").lower()
-                    if viewer:
-                        continue
                     if kind == "resize":
                         try:
                             host.resize(
@@ -165,7 +146,7 @@ def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
                         except Exception:
                             pass
                     continue
-                if opcode == 2 and payload and not viewer:
+                if opcode == 2 and payload:
                     try:
                         host.write(terminal_id, payload)
                     except Exception:

@@ -870,31 +870,17 @@ body.inspector-open .graph-hint {
   height: 100%;
   overflow: hidden;
 }
-.terminal-input-form {
-  display: flex;
-  gap: 8px;
-  padding: 8px 10px 10px;
-}
-.terminal-input-form input {
-  flex: 1 1 auto;
-  min-height: 36px;
-  padding: 0 10px;
-  border: 1px solid rgba(90, 160, 230, 0.28);
-  border-radius: 8px;
-  background: #07141f;
-  color: inherit;
-}
-.terminal-input-form button {
-  min-width: 64px;
-  border: 1px solid rgba(61, 224, 255, 0.45);
-  border-radius: 8px;
-  background: rgba(10, 40, 48, 0.95);
-  color: inherit;
-  cursor: pointer;
+.terminal-pane .xterm .xterm-helper-textarea {
+  left: 0;
+  top: 0;
+  width: 14px;
+  height: 20px;
+  opacity: 0.01;
+  font-size: 13px;
+  z-index: 10;
 }
 .conversation-layer.collapsed .terminal-tabs,
-.conversation-layer.collapsed .terminal-stage,
-.conversation-layer.collapsed .terminal-input-form {
+.conversation-layer.collapsed .terminal-stage {
   display: none;
 }
 .conversation-layer.collapsed .room-message-list {
@@ -3806,6 +3792,19 @@ body {
 .new-session-fields select {
   width: 100%;
 }
+.node-session-action-dialog {
+  width: min(360px, calc(100vw - 24px));
+  padding: 18px;
+}
+.node-session-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+.node-session-action-buttons button {
+  flex: 1 1 96px;
+}
 .session-summary-dialog {
   width: min(440px, calc(100vw - 24px));
   max-height: min(680px, calc(100vh - 24px));
@@ -6506,12 +6505,6 @@ body.chat-resizing * {
   overflow: hidden;
   position: relative;
 }
-.app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer > .terminal-input-form {
-  flex: 0 0 auto;
-  border-top: 1px solid var(--ws-line);
-  background: #0a1917;
-}
-
 .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer.collapsed {
   flex: 0 0 48px;
   max-height: 48px;
