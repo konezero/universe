@@ -29,6 +29,18 @@ class WindowsConPTY:
         r = max(24, int(rows))
         self._pty = winpty.PTY(c, r)
         env = os.environ.copy()
+        # Strip parent session IDs so the child process generates its own.
+        for _k in (
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_SESSION_ID",
+            "CLAUDE_CONVERSATION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
+            "GROK_SESSION_ID",
+            "XAI_SESSION_ID",
+            "GROK_CONVERSATION_ID",
+        ):
+            env.pop(_k, None)
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env_block = "\0".join(f"{k}={v}" for k, v in env.items()) + "\0"
