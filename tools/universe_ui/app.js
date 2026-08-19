@@ -1803,7 +1803,9 @@ function renderProviderChatSummary() {
     (item) => item.chat_key === state.selectedProviderChatKey
   );
   if (!room) {
-    if (elements.sessionSummaryDialog.open && !state.sessionSummaryInspectOnly) {
+    // Keep the dialog open when it was explicitly opened for a new session
+    // (selectedProviderChatKey is null but pendingNewSessionCoordinate is set).
+    if (elements.sessionSummaryDialog.open && !state.sessionSummaryInspectOnly && !state.pendingNewSessionCoordinate) {
       elements.sessionSummaryDialog.close();
     }
     return;
