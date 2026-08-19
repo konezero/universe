@@ -114,7 +114,7 @@ function sendPtyText(socket, data) {
 }
 
 const TERMINAL_COLS = 80;
-const TERMINAL_ROWS = 24;
+const TERMINAL_ROWS = 80;
 
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
@@ -187,7 +187,8 @@ function ensureTerminalSurface(session) {
   term.open(element);
   const refreshAfterLayout = () => {
     if (!scaleFontToContainer(term, element)) return false;
-    try { term.refresh(0, term.rows - 1); } catch (_e) { /* ok */ }
+    // Re-measure cell dimensions so the canvas is sized correctly.
+    try { term.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_e) { /* ok */ }
     return true;
   };
   if (!refreshAfterLayout()) {
@@ -331,9 +332,11 @@ function refitActiveTerminal() {
     if (surface.element?.hidden) return false;
     const box = surface.element.getBoundingClientRect();
     if (box.width < 40 || box.height < 80) return false;
+    scaleFontToContainer(surface.term, surface.element);
+    // Resize forces xterm to re-measure cell dimensions and recreate the canvas.
+    // This fixes the case where open() was called while the container had 0 dimensions.
+    try { surface.term?.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_e) { /* ok */ }
     surface.notifySize?.();
-    // Force a full canvas repaint so content is visible without needing user input.
-    try { surface.term?.refresh(0, (surface.term.rows || 24) - 1); } catch (_e) { /* ok */ }
     return true;
   };
   run();
