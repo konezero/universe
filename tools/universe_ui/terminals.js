@@ -173,6 +173,7 @@ function ensureTerminalSurface(session) {
     fontFamily: 'D2Coding, "Nanum Gothic Coding", "Cascadia Code", Consolas, monospace',
     unicodeVersion: "11",
     convertEol: true,
+    smoothScrollDuration: 100,
     theme: {
       background: "#07101d",
       foreground: "#d7e6ff",
