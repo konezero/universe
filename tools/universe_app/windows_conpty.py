@@ -29,9 +29,11 @@ class WindowsConPTY:
         r = max(24, int(rows))
         self._pty = winpty.PTY(c, r)
         env = os.environ.copy()
-        # Strip parent session IDs so the child process generates its own.
+        # Strip parent session IDs and child-session markers so the child
+        # process starts as an independent session.
         for _k in (
             "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDE_SESSION_ID",
             "CLAUDE_CONVERSATION_ID",
             "CODEX_THREAD_ID",
