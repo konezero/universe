@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import queue
 import secrets
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +44,10 @@ class TerminalSession:
     rows: int = 32
     backend: Any = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    subscribers: list = field(default_factory=list)
+    replay: deque = field(default_factory=lambda: deque(maxlen=80))
+    pump_stop: threading.Event = field(default_factory=threading.Event)
+    pump_thread: Any = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -138,9 +144,21 @@ class TerminalHost:
 
     def close(self, terminal_id: str) -> dict[str, Any]:
         session = self.get(terminal_id)
+        session.pump_stop.set()
         backend = session.backend
         session.state = "CLOSED"
         session.backend = None
+        with session.lock:
+            waiters = list(session.subscribers)
+            session.subscribers.clear()
+        for waiter in waiters:
+            try:
+                waiter.put_nowait(None)
+            except Exception:
+                pass
+        if session.pump_thread is not None:
+            session.pump_thread.join(timeout=1)
+            session.pump_thread = None
         with self._lock:
             self._sessions.pop(session.terminal_id, None)
         closer = getattr(backend, "close", None)
@@ -170,6 +188,99 @@ class TerminalHost:
         if backend is None:
             return b""
         return backend.read(timeout)
+
+    def find_live(
+        self,
+        *,
+        project_id: str,
+        mode: str,
+        provider: str = "",
+    ) -> dict[str, Any] | None:
+        wanted_project = str(project_id or "").strip()
+        wanted_mode = str(mode or "").strip().upper()
+        wanted_provider = str(provider or "").strip().upper()
+        with self._lock:
+            rows = [
+                item
+                for item in self._sessions.values()
+                if item.state == "LIVE"
+                and item.project_id == wanted_project
+                and item.mode == wanted_mode
+                and (
+                    not wanted_provider
+                    or wanted_provider == "AUTO"
+                    or item.provider == wanted_provider
+                )
+            ]
+        if not rows:
+            return None
+        rows.sort(key=lambda item: item.created_at, reverse=True)
+        return rows[0].public()
+
+    def subscribe(self, terminal_id: str) -> queue.Queue:
+        session = self.get(terminal_id)
+        waiter: queue.Queue = queue.Queue(maxsize=256)
+        with session.lock:
+            replay = b"".join(session.replay)
+            session.subscribers.append(waiter)
+        if replay:
+            try:
+                waiter.put_nowait(replay)
+            except queue.Full:
+                pass
+        self._ensure_pump(session)
+        return waiter
+
+    def unsubscribe(self, terminal_id: str, waiter: queue.Queue) -> None:
+        try:
+            session = self.get(terminal_id)
+        except TerminalHostError:
+            return
+        with session.lock:
+            session.subscribers = [
+                item for item in session.subscribers if item is not waiter
+            ]
+
+    def _ensure_pump(self, session: TerminalSession) -> None:
+        with session.lock:
+            if session.pump_thread is not None and session.pump_thread.is_alive():
+                return
+            session.pump_stop.clear()
+            thread = threading.Thread(
+                target=self._pump_session,
+                args=(session,),
+                name=f"term-fanout-{session.terminal_id}",
+                daemon=True,
+            )
+            session.pump_thread = thread
+        thread.start()
+
+    def _pump_session(self, session: TerminalSession) -> None:
+        while not session.pump_stop.is_set() and session.state == "LIVE":
+            backend = session.backend
+            if backend is None:
+                break
+            try:
+                chunk = backend.read(0.2)
+            except Exception:
+                break
+            if not chunk:
+                continue
+            with session.lock:
+                session.replay.append(chunk)
+                waiters = list(session.subscribers)
+            for waiter in waiters:
+                try:
+                    waiter.put_nowait(chunk)
+                except queue.Full:
+                    try:
+                        waiter.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        waiter.put_nowait(chunk)
+                    except queue.Full:
+                        pass
 
 
 def resume_argv(provider: str, resume_session_ref: str) -> list[str]:

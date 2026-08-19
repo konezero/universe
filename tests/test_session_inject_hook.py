@@ -68,7 +68,7 @@ class SessionInjectHookTests(unittest.TestCase):
 
     def test_resolve_from_claude_stdin(self) -> None:
         provider, ref, source = resolve_provider_and_ref(
-            args=_args(),
+            args=_args(provider="CLAUDE"),
             stdin_payload={"session_id": "claude-sess-9", "source": "startup"},
             session_fields={},
             environment={},
@@ -76,6 +76,37 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("CLAUDE", provider)
         self.assertEqual("claude-sess-9", ref)
         self.assertEqual("STDIN.session_id", source)
+
+    def test_stdin_session_id_without_provider_is_not_claude(self) -> None:
+        provider, ref, source = resolve_provider_and_ref(
+            args=_args(),
+            stdin_payload={"session_id": "maybe-grok", "source": "startup"},
+            session_fields={},
+            environment={},
+        )
+        self.assertNotEqual("CLAUDE", provider)
+        self.assertIn(provider, {None, "GROK"})
+
+    def test_grok_session_folder_overrides_claude_compat_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "universe"
+            repo.mkdir()
+            grok_home = root / "grok-home"
+            from urllib.parse import quote
+
+            session_id = "01a0172e-grok-session"
+            session_dir = grok_home / "sessions" / quote(str(repo.resolve()), safe="") / session_id
+            session_dir.mkdir(parents=True)
+            provider, ref, source = resolve_provider_and_ref(
+                args=_args(provider="CLAUDE"),
+                stdin_payload={"sessionId": session_id},
+                session_fields={},
+                environment={"GROK_HOME": str(grok_home)},
+                repo_root=repo,
+            )
+        self.assertEqual("GROK", provider)
+        self.assertEqual(session_id, ref)
 
     def test_resolve_grok_from_active_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,6 +306,41 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("g-1", result["session_ref"])
         self.assertEqual("UNASSIGNED", result["authority"])
         self.assertTrue(result.get("observation_path"))
+
+    def test_patch_real_observer_overwrites_existing_observer(self) -> None:
+        from universe_session_inject_hook import patch_mode_current_anchor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / ".ai" / "runtime" / "state"
+            store.mkdir(parents=True)
+            db = store / "project_runtime.sqlite3"
+            import sqlite3
+
+            connection = sqlite3.connect(str(db))
+            connection.execute(
+                "CREATE TABLE mode_current_anchor (mode TEXT PRIMARY KEY, snapshot_json TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO mode_current_anchor(mode, snapshot_json) VALUES (?, ?)",
+                (
+                    "MASTER",
+                    json.dumps(
+                        {
+                            "snapshot": {
+                                "observer_session_ref": "grok-cli:keep-me",
+                            }
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            result = patch_mode_current_anchor(
+                root, provider="GROK", session_ref="real-grok", mode="MASTER"
+            )
+        self.assertEqual("ANCHOR_PATCHED", result["status"])
+        self.assertEqual("grok-cli:real-grok", result["observer_session_ref"])
 
     def test_offline_when_state_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

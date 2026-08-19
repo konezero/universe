@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -105,3 +106,42 @@ class TerminalHostTests(unittest.TestCase):
             ["--resume", "01a00fe6-afff-7bc0-a75a-fe9e1569b3bf"],
             spawned[0][4],
         )
+
+    def test_find_live_reuses_the_same_coordinate(self) -> None:
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+        first = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), provider="GROK")
+        found = host.find_live(project_id="universe", mode="MASTER", provider="GROK")
+        self.assertEqual(first["terminal_id"], found["terminal_id"])
+        self.assertIsNone(host.find_live(project_id="GCS", mode="MASTER", provider="GROK"))
+
+    def test_subscribers_receive_the_same_output(self) -> None:
+        class FeedingPty(FakePty):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pending = [b"hello-both"]
+
+            def read(self, timeout: float = 0.2) -> bytes:
+                del timeout
+                if self.pending:
+                    return self.pending.pop(0)
+                time.sleep(0.01)
+                return b""
+
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FeedingPty())
+        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT))
+        first = host.subscribe(created["terminal_id"])
+        second = host.subscribe(created["terminal_id"])
+        seen = []
+        deadline = time.time() + 1
+        while time.time() < deadline and len(seen) < 2:
+            for waiter in (first, second):
+                try:
+                    chunk = waiter.get(timeout=0.05)
+                except Exception:
+                    continue
+                if chunk:
+                    seen.append(chunk)
+            if seen.count(b"hello-both") >= 2:
+                break
+        self.assertGreaterEqual(seen.count(b"hello-both"), 2)
+        host.close(created["terminal_id"])

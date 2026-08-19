@@ -65,16 +65,28 @@ def decode_ws_frame(buffer: bytearray) -> tuple[int, bytes, int] | None:
     return opcode, payload, index + length
 
 
+def _is_remote_surface(handler: Any) -> bool:
+    surface = ""
+    headers = getattr(handler, "headers", None)
+    if headers is not None:
+        surface = str(headers.get("X-Universe-Access-Surface") or "")
+    return surface.strip().upper() == "REMOTE_BROWSER"
+
+
 def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
     sock: socket.socket = handler.connection
     sock.settimeout(0.2)
     stop = threading.Event()
+    viewer = _is_remote_surface(handler)
+    waiter = host.subscribe(terminal_id)
 
     def emit() -> None:
         while not stop.is_set():
             try:
-                chunk = host.read(terminal_id, timeout=0.2)
+                chunk = waiter.get(timeout=0.2)
             except Exception:
+                continue
+            if chunk is None:
                 break
             if chunk:
                 try:
@@ -120,13 +132,15 @@ def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
                     try:
                         message = json.loads(payload.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
-                        if payload:
+                        if payload and not viewer:
                             try:
                                 host.write(terminal_id, payload)
                             except Exception:
                                 pass
                         continue
                     kind = str(message.get("type") or "").lower()
+                    if viewer:
+                        continue
                     if kind == "resize":
                         try:
                             host.resize(
@@ -151,11 +165,15 @@ def pump_terminal_socket(handler: Any, terminal_id: str, host: Any) -> None:
                         except Exception:
                             pass
                     continue
-                if opcode == 2 and payload:
+                if opcode == 2 and payload and not viewer:
                     try:
                         host.write(terminal_id, payload)
                     except Exception:
                         pass
     finally:
         stop.set()
+        try:
+            host.unsubscribe(terminal_id, waiter)
+        except Exception:
+            pass
         reader.join(timeout=1)

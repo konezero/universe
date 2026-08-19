@@ -3865,6 +3865,18 @@ def normalize_permission_decision(value: Any) -> dict[str, str]:
     }
 
 
+def permission_option_is_reject(permission: Mapping[str, Any], option_id: str) -> bool:
+    wanted = str(option_id or "").strip()
+    for option in permission.get("options") or []:
+        if not isinstance(option, Mapping):
+            continue
+        if str(option.get("optionId") or "").strip() != wanted:
+            continue
+        kind = str(option.get("kind") or "").strip().lower()
+        return kind.startswith("reject") or kind in {"deny", "cancel"}
+    return False
+
+
 def normalize_governance_proposal_decision(value: Any) -> dict[str, str]:
     request = _exact_object_fields(
         value,
@@ -18727,9 +18739,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         project = self.store.get_project(project_id)
         artifact = self.store.get_release_artifact_binding(proposal["release_id"])
-        resident_stopped = False
-        if self.project_master_hosts is not None:
-            resident_stopped = self.project_master_hosts.stop(project_id)
         try:
             receipt = apply_project_release_proposal(
                 project_root=Path(project["project_root"]),
@@ -18740,18 +18749,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 manifest_path=Path(artifact["manifest_path"]),
             )
         except ProjectReleaseApplyError as error:
-            master_host = {"status": "NOT_RESTARTED"}
-            if resident_stopped:
-                try:
-                    master_host = self.ensure_project_master(project_id)
-                except (OSError, ProjectMasterHostError, UniverseError) as restart:
-                    master_host = {
-                        "status": "PROJECT_MASTER_RESTART_FAILED",
-                        "detail": str(restart),
-                    }
             raise UniverseError(
                 error.code,
-                f"{error}; master_host={master_host['status']}",
+                str(error),
                 HTTPStatus.CONFLICT,
             ) from error
 
@@ -18761,13 +18761,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             approval_digest=approval_digest,
             receipt=receipt,
         )
-        try:
-            master_host = self.ensure_project_master(project_id)
-        except (OSError, ProjectMasterHostError, UniverseError) as error:
-            master_host = {
-                "status": "PROJECT_MASTER_START_FAILED",
-                "detail": str(error),
-            }
         return {
             "schema": API_SCHEMA,
             "status": (
@@ -18779,7 +18772,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "proposal_id": proposal["proposal_id"],
             "approval": approval,
             "receipt": stored_receipt,
-            "master_host": master_host,
         }
 
     def provider_settings(self) -> dict[str, Any]:
@@ -20157,6 +20149,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         cwd = str(payload.get("cwd") or "").strip()
         resume_ref = str(payload.get("resume_session_ref") or "").strip()
         is_new_session = not resume_ref or resume_ref.upper() == "UNKNOWN"
+        existing = self.terminal_host.find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=str(payload.get("provider") or "AUTO"),
+        )
+        if existing is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "CLI_TERMINAL_ATTACHED",
+                "terminal": existing,
+            }
         if is_new_session and project_id and cwd:
             self._prepare_cli_mode_binding(project_id, mode, cwd)
         try:
@@ -20181,6 +20184,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "CLI_TERMINAL_CREATED",
             "terminal": terminal,
         }
+
+    @staticmethod
+    def _project_mode_anchor_present(project_root: Path, mode: str) -> bool:
+        store = Path(project_root) / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+        if not store.is_file():
+            return False
+        try:
+            connection = sqlite3.connect(
+                f"file:{store.resolve().as_posix()}?mode=ro", uri=True
+            )
+        except sqlite3.Error:
+            return False
+        try:
+            row = connection.execute(
+                "SELECT anchor_id FROM mode_current_anchor WHERE mode = ?",
+                (str(mode or "").strip().upper(),),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        finally:
+            connection.close()
+        return bool(row and str(row[0] or "").strip())
 
     def _prepare_cli_mode_binding(
         self,
@@ -20236,6 +20261,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         runtime_cli = project_root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         if not runtime_cli.is_file():
+            return
+        if self._project_mode_anchor_present(project_root, mode):
             return
         source_commit = str(release.get("source_commit") or "UNKNOWN")
         source_repository = str(release.get("source_repository") or "UNKNOWN")
@@ -22959,12 +22986,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "permission request already has another decision",
                 HTTPStatus.CONFLICT,
             )
-        if self.project_master_hosts is None or not (
-            self.project_master_hosts.resolve_permission(
-                project_id,
-                request_id,
-                decision["option_id"],
+        delivered = False
+        if self.project_master_hosts is not None:
+            delivered = bool(
+                self.project_master_hosts.resolve_permission(
+                    project_id,
+                    request_id,
+                    decision["option_id"],
+                )
             )
+        if not delivered and not permission_option_is_reject(
+            current, decision["option_id"]
         ):
             raise UniverseError(
                 "AGENT_PERMISSION_SESSION_UNAVAILABLE",

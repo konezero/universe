@@ -141,6 +141,44 @@ def _grok_agent_active(environment: Mapping[str, str]) -> bool:
     return False
 
 
+def _stdin_session_ref(stdin_payload: Mapping[str, Any] | None) -> tuple[str | None, str]:
+    if not stdin_payload:
+        return None, ""
+    for key in (
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+        "thread_id",
+        "threadId",
+    ):
+        raw = stdin_payload.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip(), f"STDIN.{key}"
+    nested = stdin_payload.get("session")
+    if isinstance(nested, Mapping):
+        for key in ("id", "session_id", "sessionId"):
+            raw = nested.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip(), f"STDIN.session.{key}"
+    return None, ""
+
+
+def _grok_session_dir_exists(
+    repo_root: Path | None,
+    environment: Mapping[str, str],
+    session_id: str,
+) -> bool:
+    if not session_id or repo_root is None:
+        return False
+    home = _grok_home(environment)
+    try:
+        sessions_root = home / "sessions" / _encode_grok_workspace_dir(Path(repo_root))
+    except OSError:
+        return False
+    return (sessions_root / session_id).is_dir()
+
+
 def _encode_grok_workspace_dir(repo_root: Path) -> str:
     """Match Grok TUI session folder naming: URL-quote of absolute path."""
     return quote(str(repo_root.resolve()), safe="")
@@ -286,6 +324,24 @@ def resolve_provider_and_ref(
         if provider in PROVIDERS and ref:
             return provider, ref, "CLI"
 
+    stdin_ref, stdin_source = _stdin_session_ref(stdin_payload)
+    # Grok TUI also runs project .claude/settings.json SessionStart hooks.
+    # Those historically omitted --provider and defaulted to CLAUDE, which
+    # overwrote Mode Current Anchor observer with claude-code:<grok-id>.
+    if _grok_agent_active(environment) or _grok_session_dir_exists(
+        repo_root, environment, stdin_ref or ""
+    ):
+        for env_key in PROVIDER_ENV_REFS["GROK"]:
+            env_ref = str(environment.get(env_key) or "").strip()
+            if env_ref:
+                return "GROK", env_ref, env_key
+        ref = stdin_ref
+        source = stdin_source
+        if not ref:
+            ref, source = resolve_grok_local_session_ref(repo_root, environment)
+        if ref:
+            return "GROK", ref, source or "GROK.local"
+
     if stdin_payload:
         # Explicit provider in stdin wins over Claude-shaped keys.
         provider_hint = stdin_payload.get("provider")
@@ -306,30 +362,32 @@ def resolve_provider_and_ref(
                 "STDIN.explicit",
             )
 
-        # Use --provider if supplied, otherwise default to CLAUDE for stdin reads.
+        # Require an explicit provider. Do not default stdin sessionId to CLAUDE;
+        # Grok compat runs the same Claude SessionStart command.
         stdin_provider = (
             str(args.provider).strip().upper()
             if args.provider and str(args.provider).strip().upper() in PROVIDERS
-            else "CLAUDE"
+            else ""
         )
-        for key in (
-            "session_id",
-            "sessionId",
-            "conversation_id",
-            "conversationId",
-            "thread_id",
-            "threadId",
-        ):
-            raw = stdin_payload.get(key)
-            if isinstance(raw, str) and raw.strip():
-                return stdin_provider, raw.strip(), f"STDIN.{key}"
-
-        nested = stdin_payload.get("session")
-        if isinstance(nested, Mapping):
-            for key in ("id", "session_id", "sessionId"):
-                raw = nested.get(key)
+        if stdin_provider:
+            for key in (
+                "session_id",
+                "sessionId",
+                "conversation_id",
+                "conversationId",
+                "thread_id",
+                "threadId",
+            ):
+                raw = stdin_payload.get(key)
                 if isinstance(raw, str) and raw.strip():
-                    return stdin_provider, raw.strip(), f"STDIN.session.{key}"
+                    return stdin_provider, raw.strip(), f"STDIN.{key}"
+
+            nested = stdin_payload.get("session")
+            if isinstance(nested, Mapping):
+                for key in ("id", "session_id", "sessionId"):
+                    raw = nested.get(key)
+                    if isinstance(raw, str) and raw.strip():
+                        return stdin_provider, raw.strip(), f"STDIN.session.{key}"
 
     # Explicit provider env + matching ref env.
     for key in PROVIDER_HINT_ENV:
@@ -893,7 +951,7 @@ def _claude_settings_hook(script_path: str) -> dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"python {script_path} --repo-root . --from-stdin --trigger session_start",
+                            "command": f"python {script_path} --repo-root . --provider CLAUDE --from-stdin --trigger session_start",
                         }
                     ]
                 }
@@ -915,6 +973,19 @@ def _merge_claude_settings(path: Path, hook_entry: dict[str, Any]) -> str:
     starts = hooks.setdefault("SessionStart", [])
     new_cmd = hook_entry["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     script_marker = "universe_session_inject_hook.py"
+    updated = False
+    for block in starts:
+        for hook in block.get("hooks") or []:
+            command = str(hook.get("command") or "")
+            if script_marker not in command:
+                continue
+            if "--provider" not in command:
+                hook["command"] = new_cmd
+                updated = True
+    if updated:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return "UPDATED"
     if any(
         script_marker in (h.get("command") or "")
         for block in starts

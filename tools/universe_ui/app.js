@@ -3631,6 +3631,9 @@ async function refresh({ syncSelectedProject = false } = {}) {
       state.masterBridge = null;
       renderEmpty();
     }
+    if (typeof loadTerminalTabs === "function") {
+      void loadTerminalTabs();
+    }
   } catch (error) {
     elements.serviceStatus.dataset.state = "error";
     elements.serviceStatus.textContent = "Unavailable";

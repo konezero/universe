@@ -22,7 +22,6 @@ from project_release_apply import (  # noqa: E402
     plan_project_release_lifecycle,
 )
 from release_runtime import ReleaseRuntime  # noqa: E402
-from windows_native_cli import NativeCliResult  # noqa: E402
 
 
 def digest(value: Any) -> str:
@@ -185,52 +184,13 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertEqual("OS_INSTALL", proposal["plan"]["user_command"])
         self.assertEqual("ABSENT", proposal["plan"]["installed_runtime"]["state"])
 
-    def test_applies_exact_approval_through_lifecycle_host(self) -> None:
+    def test_fresh_install_writes_release_files(self) -> None:
         proposal = self._proposal()
         approval = build_project_release_approval(
             project_id="demo",
             proposal=proposal,
             evidence_ref="universe://approval/demo",
         )
-        observed: dict[str, Any] = {}
-
-        def runner(request: Any) -> NativeCliResult:
-            request_path = Path(request.arguments[2])
-            lifecycle_request = json.loads(request_path.read_text(encoding="utf-8"))
-            observed.update(lifecycle_request)
-            bundle = Path(lifecycle_request["source"]["path"])
-            source_bundle = json.loads(
-                (bundle / "SOURCE_BUNDLE.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                "universe-release-db",
-                source_bundle["source"]["provider"],
-            )
-            payload = {
-                "result": "PASS",
-                "operation": "FRESH_INSTALL",
-                "user_command": "OS_INSTALL",
-                "repository_runtime": "VERIFIED",
-                "target": str(self.project.resolve()),
-                "source": {
-                    "provider": "universe-release-db",
-                    "binding": "provider-attested",
-                    "commit": self.commit,
-                },
-                "validate": {"validation_id": "validation-fixture"},
-                "boot_handoff": {"status": "READY_FOR_BOOT"},
-                "permit_receipt": {"receipt_id": "permit-fixture"},
-            }
-            return NativeCliResult(
-                contract="windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout=json.dumps(payload),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
 
         receipt = apply_project_release_proposal(
             project_root=self.project,
@@ -239,53 +199,27 @@ class ProjectReleaseApplyTests(unittest.TestCase):
             approval=approval,
             database_path=self.database,
             manifest_path=self.manifest,
-            native_runner=runner,
         )
 
         self.assertEqual("PROJECT_RELEASE_APPLIED", receipt["status"])
-        self.assertEqual("OS_INSTALL", receipt["user_command"])
-        self.assertEqual("universe-project-lifecycle-host", observed["host"])
-        self.assertEqual(
-            "provider-attested",
-            receipt["lifecycle_result"]["source"]["binding"],
+        self.assertEqual("FRESH_INSTALL", receipt["operation"])
+        self.assertIn("changed_count", receipt)
+        self.assertGreater(receipt["changed_count"], 0)
+        state_file = (
+            self.project
+            / ".ai"
+            / "runtime"
+            / "project_instance"
+            / "UNIVERSE_RELEASE_INSTALL.json"
         )
+        self.assertTrue(state_file.exists())
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(proposal["release_id"], state["release_id"])
+        core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        self.assertTrue(core_file.exists())
 
     def test_direct_plan_application_returns_no_proposal_or_approval_evidence(self) -> None:
         proposal = self._proposal()
-
-        def runner(request: Any) -> NativeCliResult:
-            lifecycle_request = json.loads(
-                Path(request.arguments[2]).read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                "universe://direct-command/project-connections/test",
-                lifecycle_request["approval"]["evidence_ref"],
-            )
-            payload = {
-                "result": "PASS",
-                "operation": "FRESH_INSTALL",
-                "user_command": "OS_INSTALL",
-                "repository_runtime": "VERIFIED",
-                "target": str(self.project.resolve()),
-                "source": {
-                    "provider": "universe-release-db",
-                    "binding": "provider-attested",
-                    "commit": self.commit,
-                },
-                "validate": {"validation_id": "validation-fixture"},
-                "boot_handoff": {"status": "READY_FOR_BOOT"},
-                "permit_receipt": {"receipt_id": "permit-fixture"},
-            }
-            return NativeCliResult(
-                contract="windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout=json.dumps(payload),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
 
         receipt = apply_project_release_plan(
             project_root=self.project,
@@ -295,55 +229,29 @@ class ProjectReleaseApplyTests(unittest.TestCase):
             instruction_ref="universe://direct-command/project-connections/test",
             database_path=self.database,
             manifest_path=self.manifest,
-            native_runner=runner,
         )
 
         self.assertEqual("PROJECT_RUNTIME_LIFECYCLE_APPLIED", receipt["status"])
+        self.assertEqual(
+            "universe://direct-command/project-connections/test",
+            receipt["instruction_ref"],
+        )
         self.assertNotIn("proposal_id", receipt)
         self.assertNotIn("proposal_digest", receipt)
         self.assertNotIn("approval_evidence_ref", receipt)
 
-    def test_project_state_change_rejects_stale_proposal_before_execution(self) -> None:
+    def test_collision_blocks_apply_for_unmanaged_modified_file(self) -> None:
         proposal = self._proposal()
         approval = build_project_release_approval(
             project_id="demo",
             proposal=proposal,
             evidence_ref="universe://approval/demo",
         )
-        manifest = (
-            self.project
-            / ".ai"
-            / "runtime"
-            / "project_instance"
-            / "DISTRIBUTION_MANIFEST.json"
-        )
-        manifest.parent.mkdir(parents=True)
-        manifest.write_text(
-            json.dumps(
-                {
-                    "schema": "ai-career.project-runtime-installation.v1",
-                    "installation": {"project": "demo"},
-                    "source": {"commit": self.commit},
-                }
-            ),
-            encoding="utf-8",
-        )
-        update_plan = plan_project_release_lifecycle(
-            project_root=self.project,
-            project_id="demo",
-            release_id=proposal["release_id"],
-            source_commit=self.commit,
-        )
-        self.assertEqual("RUNTIME_UPDATE", update_plan["operation"])
-        self.assertEqual("OS_UPDATE", update_plan["user_command"])
-        called = False
+        core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        core_file.parent.mkdir(parents=True)
+        core_file.write_text("# UNMANAGED DIFFERENT CONTENT\n", encoding="utf-8")
 
-        def runner(_: Any) -> NativeCliResult:
-            nonlocal called
-            called = True
-            raise AssertionError("stale proposal must not execute")
-
-        with self.assertRaisesRegex(ProjectReleaseApplyError, "state changed"):
+        with self.assertRaises(ProjectReleaseApplyError) as ctx:
             apply_project_release_proposal(
                 project_root=self.project,
                 project_id="demo",
@@ -351,9 +259,8 @@ class ProjectReleaseApplyTests(unittest.TestCase):
                 approval=approval,
                 database_path=self.database,
                 manifest_path=self.manifest,
-                native_runner=runner,
             )
-        self.assertFalse(called)
+        self.assertEqual("UNMANAGED_TARGET_COLLISION", ctx.exception.code)
 
 
 if __name__ == "__main__":

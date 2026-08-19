@@ -1,3 +1,7 @@
+function isRemoteBrowser() {
+  return String(state.accessSurface || "LOCAL_BROWSER").toUpperCase() === "REMOTE_BROWSER";
+}
+
 function terminalLabel(session) {
   const project = String(session?.project_id || "session").trim();
   const mode = String(session?.mode || "").trim().toUpperCase();
@@ -17,6 +21,24 @@ function applyCliDockTitle(session) {
 
 function activeTerminalSession() {
   return (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId) || null;
+}
+
+async function sendRemoteTerminalChat(text) {
+  const body = String(text || "").trim();
+  if (!body) return;
+  const session = activeTerminalSession();
+  const projectId = String(session?.project_id || "").trim();
+  if (!projectId) {
+    throw new Error("No local session is open to receive this chat");
+  }
+  await api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`, {
+    method: "POST",
+    body: {
+      kind: "QUESTION",
+      body,
+      idempotency_key: "remote-term-chat-" + Date.now(),
+    },
+  });
 }
 
 function sendTerminalInput(text) {
@@ -40,7 +62,11 @@ function bindTerminalInput() {
     const value = String(input.value || "");
     if (!value.trim()) return;
     try {
-      sendTerminalInput(value);
+      if (isRemoteBrowser()) {
+        void sendRemoteTerminalChat(value);
+      } else {
+        sendTerminalInput(value);
+      }
       input.value = "";
     } catch (error) {
       toast(error.message, true);
@@ -52,17 +78,23 @@ function bindTerminalInput() {
 function focusTerminalInput() {
   const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
   const form = document.querySelector("#terminal-input-form");
-  if (surface?.term) {
-    if (form) form.hidden = true;
+  const input = document.querySelector("#terminal-input");
+  const remote = isRemoteBrowser();
+  if (form) {
+    form.hidden = !remote;
+    form.classList.toggle("remote-chat-slot", remote);
+  }
+  if (input) {
+    input.placeholder = remote
+      ? "Message the local session…"
+      : "Type a command and press Enter";
+    input.disabled = remote ? false : !surface;
+  }
+  if (surface?.term && !remote) {
     try { surface.term.focus(); } catch (_e) { /* pane not ready */ }
     return;
   }
-  if (form) form.hidden = false;
-  const input = document.querySelector("#terminal-input");
-  if (input) {
-    input.disabled = !surface;
-    input.focus();
-  }
+  if (remote && input) input.focus();
 }
 
 function writeTerminalBytes(term, data) {
@@ -180,7 +212,12 @@ function ensureTerminalSurface(session) {
   );
   socket.binaryType = "arraybuffer";
   socket.addEventListener("message", (event) => writeTerminalBytes(term, event.data));
+  const remote = isRemoteBrowser();
+  if (remote) {
+    term.options.disableStdin = true;
+  }
   term.onData((data) => {
+    if (remote) return;
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(new TextEncoder().encode(data));
     }
@@ -194,6 +231,7 @@ function ensureTerminalSurface(session) {
         /* ignore until the pane has a box */
       }
     }
+    if (remote) return;
     const cols = Math.max(80, Number(term.cols) || 80);
     const rows = Math.max(24, Number(term.rows) || 24);
     socket.send(JSON.stringify({ type: "resize", cols, rows }));
@@ -331,12 +369,20 @@ function focusTerminalForSession(coordinate, session) {
 async function loadTerminalTabs() {
   try {
     const payload = await api("/v1/terminals");
-    state.terminals = payload.terminals || [];
-    if (!state.activeTerminalId && state.terminals[0]) {
-      state.activeTerminalId = state.terminals[0].terminal_id;
-    }
+    const incoming = payload.terminals || [];
+    const previous = new Set((state.terminals || []).map((item) => item.terminal_id));
+    const opened = incoming.filter((item) => !previous.has(item.terminal_id));
+    state.terminals = incoming;
     renderTerminalDock();
-    if (state.activeTerminalId) selectTerminalTab(state.activeTerminalId);
+    if (!state.activeTerminalId && incoming[0]) {
+      selectTerminalTab(incoming[0].terminal_id);
+      return;
+    }
+    if (!isRemoteBrowser() && opened[0]) {
+      selectTerminalTab(opened[0].terminal_id);
+      return;
+    }
+    if (state.activeTerminalId) applyCliDockTitle(activeTerminalSession());
     else applyCliDockTitle(null);
   } catch (_error) {
     state.terminals = state.terminals || [];

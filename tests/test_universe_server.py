@@ -329,10 +329,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "core_release.resolve_host_tool",
                 side_effect=self.server.host_profile.resolve,
             ),
-            patch(
-                "project_release_apply.resolve_host_tool",
-                side_effect=self.server.host_profile.resolve,
-            ),
         ]
         for patcher in self.host_tool_patchers:
             patcher.start()
@@ -5558,6 +5554,99 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "allow-once",
             resolved["permission"]["selected_option_id"],
         )
+
+    def test_orphaned_agent_permission_reject_persists_without_live_session(self) -> None:
+        class DeadPermissionHost:
+            def resolve_permission(self, project_id, request_id, option_id) -> bool:
+                return False
+
+            def close(self) -> None:
+                return
+
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        _, room_result = self.request(
+            "POST",
+            "/v1/projects/GCS/room/messages",
+            {
+                "kind": "QUESTION",
+                "body": "Run the guarded check.",
+                "idempotency_key": "permission-orphan-001",
+            },
+            self.token,
+        )
+        _, registered = self.request(
+            "POST",
+            "/v1/projects/GCS/master-bridge",
+            {
+                "endpoint": "http://127.0.0.1:9011",
+                "credential_env": "UNIVERSE_GCS_MASTER_BRIDGE_TOKEN",
+                "master_session_ref": "grok-acp:session-orphan",
+                "binding_evidence_ref": "project-host://GCS/acp/session-orphan",
+            },
+            self.token,
+        )
+        bridge = registered["bridge"]
+        os.environ["UNIVERSE_GCS_MASTER_BRIDGE_TOKEN"] = "bridge-test-token"
+        try:
+            status, requested = self.request(
+                "POST",
+                "/v1/projects/GCS/master-bridge/permissions",
+                {
+                    "bridge_id": bridge["bridge_id"],
+                    "in_reply_to": room_result["message"]["message_id"],
+                    "permission": {
+                        "request_id": "permission_orphan_001",
+                        "provider": "GROK",
+                        "session_id": "session-orphan",
+                        "tool_call": {
+                            "toolCallId": "tool-orphan-001",
+                            "title": "Stale command",
+                        },
+                        "options": [
+                            {
+                                "optionId": "allow-once",
+                                "name": "Allow once",
+                                "kind": "allow_once",
+                            },
+                            {
+                                "optionId": "reject-once",
+                                "name": "Reject",
+                                "kind": "reject_once",
+                            },
+                        ],
+                    },
+                },
+                self.token,
+                extra_headers={"X-Universe-Bridge-Token": "bridge-test-token"},
+            )
+        finally:
+            os.environ.pop("UNIVERSE_GCS_MASTER_BRIDGE_TOKEN", None)
+
+        self.assertEqual(201, status)
+        self.assertEqual("PENDING", requested["permission"]["state"])
+        self.server.project_master_hosts = DeadPermissionHost()
+
+        allow_status, allow_result = self.request(
+            "POST",
+            "/v1/projects/GCS/agent-session/permissions/permission_orphan_001/decision",
+            {"option_id": "allow-once"},
+            self.token,
+        )
+        self.assertEqual(409, allow_status)
+        self.assertEqual(
+            "AGENT_PERMISSION_SESSION_UNAVAILABLE",
+            allow_result["error_code"],
+        )
+
+        reject_status, rejected = self.request(
+            "POST",
+            "/v1/projects/GCS/agent-session/permissions/permission_orphan_001/decision",
+            {"option_id": "reject-once"},
+            self.token,
+        )
+        self.assertEqual(200, reject_status)
+        self.assertEqual("RESOLVED", rejected["permission"]["state"])
+        self.assertEqual("reject-once", rejected["permission"]["selected_option_id"])
 
     def test_room_participant_permission_round_trip_is_room_scoped(self) -> None:
         class PermissionParticipantHosts:
