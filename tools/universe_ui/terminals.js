@@ -144,7 +144,7 @@ function bindTerminalIme(term, socket) {
     }, true);
   }
   term.onData((data) => {
-    if (composing || justComposed) return;
+    if (composing) return;
     sendPtyText(socket, data);
   });
 }
