@@ -502,13 +502,21 @@ class MultiRoomStore:
             clauses.append("room_type = ?")
             params.append(room_type.upper())
         sql = (
-            "SELECT * FROM chat_room WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY created_at DESC, room_id DESC"
+            "SELECT r.*, COUNT(b.binding_id) AS participant_count"
+            " FROM chat_room r"
+            " LEFT JOIN chat_room_session b ON b.room_id = r.room_id AND b.state = 'ACTIVE'"
+            " WHERE " + " AND ".join(f"r.{c}" for c in clauses)
+            + " GROUP BY r.room_id"
+            + " ORDER BY r.created_at DESC, r.room_id DESC"
         )
         with self._connect() as connection:
             rows = connection.execute(sql, params).fetchall()
-            return [self._room_row(row) for row in rows]
+            result = []
+            for row in rows:
+                item = self._room_row(row)
+                item["participant_count"] = row["participant_count"]
+                result.append(item)
+            return result
 
     def close_room(self, room_id: str) -> dict[str, Any]:
         rid = _text(room_id, "room_id", limit=80)

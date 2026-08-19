@@ -2783,6 +2783,9 @@ dialog label {
   margin-top: 8px;
   min-height: 32px;
 }
+.danger-action { color: var(--ws-coral, #ff7c68); border-color: rgba(255,124,104,.4); }
+.danger-action:disabled { opacity: .38; pointer-events: none; }
+.multi-room-list-header { display: flex; justify-content: flex-end; padding: 4px 0 6px; }
 
 .wizard-handoff-actions {
   display: flex;

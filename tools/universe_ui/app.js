@@ -6217,17 +6217,40 @@ async function refreshMultiRooms() {
   if (!elements.multiRoomList) return;
   const data = await api("/v1/rooms");
   state.multiRooms = data.rooms || [];
+  const showAll = state.multiRoomShowAll || false;
+  const emptyMeeting = state.multiRooms.filter(
+    (r) => r.room_type === "MEETING" && (r.participant_count || 0) === 0
+  );
+  const visible = showAll
+    ? state.multiRooms
+    : state.multiRooms.filter(
+        (r) => r.room_type !== "MEETING" || (r.participant_count || 0) > 0
+      );
   elements.multiRoomList.replaceChildren();
-  if (!state.multiRooms.length) {
-    elements.multiRoomList.append(node("p", "empty-copy", "No multi-rooms yet"));
+  const header = node("div", "multi-room-list-header");
+  const toggle = node("button", "secondary-button compact-action");
+  toggle.type = "button";
+  toggle.textContent = showAll
+    ? "Hide empty rooms"
+    : `Show empty (${emptyMeeting.length})`;
+  toggle.style.display = emptyMeeting.length || showAll ? "" : "none";
+  toggle.addEventListener("click", () => {
+    state.multiRoomShowAll = !showAll;
+    refreshMultiRooms().catch(() => {});
+  });
+  header.append(toggle);
+  elements.multiRoomList.append(header);
+  if (!visible.length) {
+    elements.multiRoomList.append(node("p", "empty-copy", showAll ? "No rooms yet" : "No active rooms"));
     return;
   }
-  for (const room of state.multiRooms) {
+  for (const room of visible) {
+    const isLive = (room.participant_count || 0) > 0;
     const row = node("div", "remote-access-row");
     const copy = node("div", "remote-access-copy");
     copy.append(
       node("strong", "", `${room.room_type} · ${room.title}`),
-      node("small", "", room.room_id)
+      node("small", "", `${isLive ? `${room.participant_count} live` : "empty"} · ${room.room_id}`)
     );
     const open = node("button", "secondary-button compact-action", "Open");
     open.type = "button";
@@ -6236,7 +6259,19 @@ async function refreshMultiRooms() {
         elements.settingsError.textContent = error.message;
       });
     });
-    row.append(copy, open);
+    const del = node("button", "secondary-button compact-action danger-action", "Delete");
+    del.type = "button";
+    del.disabled = isLive;
+    del.title = isLive ? "Cannot delete a room with active participants" : "Delete this room";
+    del.addEventListener("click", async () => {
+      try {
+        await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`, { method: "DELETE" });
+        await refreshMultiRooms();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    row.append(copy, open, del);
     elements.multiRoomList.append(row);
   }
 }

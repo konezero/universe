@@ -27997,6 +27997,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        room_delete = re.fullmatch(r"/v1/rooms/([^/]+)$", path)
+        if room_delete is not None:
+            try:
+                room_id = unquote(room_delete.group(1))
+                room = self.server.multi_rooms.close_room(room_id)
+                self._send(
+                    HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "ROOM_CLOSED", "room": room},
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
         terminal_id = re.fullmatch(r"/v1/terminals/([^/]+)$", path)
         if terminal_id is not None:
             try:
