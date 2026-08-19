@@ -3786,12 +3786,14 @@ function showGoalPlanView() {
 
 /** Highlight top nav without toast placeholders. */
 function syncPrimaryNavSelection(primaryView) {
-  if (!elements.primaryNav) return;
-  for (const item of elements.primaryNav.querySelectorAll("[data-primary-view]")) {
-    item.classList.toggle(
-      "selected",
-      item.getAttribute("data-primary-view") === primaryView
-    );
+  for (const root of [elements.primaryNav, elements.utilityRail]) {
+    if (!root) continue;
+    for (const item of root.querySelectorAll("[data-primary-view]")) {
+      item.classList.toggle(
+        "selected",
+        item.getAttribute("data-primary-view") === primaryView
+      );
+    }
   }
 }
 
@@ -13213,7 +13215,7 @@ function bindGoalPlanEvents() {
     else if (view === "sessions") showGraphView("sessions");
     else if (view === "meeting") {
       state.settingsTab = "rooms";
-      openSettings().catch((error) => toast(error.message, true));
+      openProviderSettings().catch((error) => toast(error.message, true));
     }
     else if (["memory", "bench", "activity", "details"].includes(view)) openInspectorSurface(view);
   };
