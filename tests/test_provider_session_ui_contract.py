@@ -43,7 +43,8 @@ class ProviderSessionUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("[coordinate.key]: anchorSessionKey(session)", selection_slice)
-        self.assertIn("await resumeNodeModeSession(coordinate, session)", selection_slice)
+        self.assertIn("openNodeModeSessionActions(coordinate, session)", selection_slice)
+        self.assertNotIn("await resumeNodeModeSession(coordinate, session)", selection_slice)
         self.assertIn("createTerminalTab(coordinate, session)", resume_slice)
         self.assertIn("focusTerminalForSession(coordinate, session)", resume_slice)
         self.assertNotIn("attachProviderChatRoom", resume_slice)
@@ -156,11 +157,22 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         ]
         self.assertIn('sessionKind !== "WORKER"', eligibility)
         self.assertIn("function providerSessionObservedProjectId(room)", APP)
-        self.assertIn("providerSessionRoomIsSelected(chatKey)", eligibility)
+        self.assertIn('["BOUND", "ANCHOR_OBSERVED"].includes(bindingState)', eligibility)
         self.assertIn('currentness === "CURRENT"', eligibility)
-        self.assertIn("providerSessionRoomIsEligible(room)", APP)
-        self.assertIn("delete state.providerSessionRoomCaches[key]", APP)
-        self.assertIn("closeProviderSessionStream(chatKey)", APP)
+        self.assertNotIn("providerSessionRoomIsSelected(chatKey)", eligibility)
+
+        subscriptions = APP[
+            APP.index("function syncProviderSessionSubscriptions") : APP.index(
+                "function reconcileProviderSessionStreams"
+            )
+        ]
+        self.assertIn(
+            "eligible.has(key) || providerSessionRoomIsSelected(key)",
+            subscriptions,
+        )
+        self.assertIn("closeProviderSessionStream(key)", subscriptions)
+        self.assertIn("delete state.providerSessionRoomCaches[key]", subscriptions)
+        self.assertIn("delete state.providerSessionStreamStates[key]", subscriptions)
     def test_provider_session_cancel_uses_direct_endpoint_without_room_queue(self) -> None:
         self.assertIn("async function cancelProviderSessionTurn()", APP)
         cancel_slice = APP[

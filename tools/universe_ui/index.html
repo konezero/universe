@@ -98,7 +98,9 @@
       <nav class="mobile-work-tabs" aria-label="Project workspace">
         <button class="selected" type="button" data-mobile-work-view="goals">Goals</button>
         <button type="button" data-mobile-work-view="sessions">Sessions</button>
-        <button type="button" data-mobile-work-view="activity">Activity</button>
+        <button type="button" data-mobile-work-view="actions" aria-haspopup="dialog" aria-controls="action-inbox-dialog">
+          Actions <span id="mobile-action-inbox-badge" class="chat-badge hidden" aria-hidden="true"></span>
+        </button>
       </nav>
       <section id="goal-plan-workspace" class="goal-plan-workspace" aria-label="Project goal plan">
         <header class="goal-plan-header">
@@ -843,22 +845,22 @@
     </div>
   </dialog>
 
-  <dialog id="action-inbox-dialog" class="action-inbox-dialog">
+  <dialog id="action-inbox-dialog" class="action-inbox-dialog" aria-labelledby="action-inbox-title">
     <div class="dialog-heading">
       <div>
-        <span class="inspector-kicker">Inbox</span>
+        <span class="inspector-kicker">Approvals &amp; activity</span>
         <h2 id="action-inbox-title">Actions</h2>
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
     </div>
-    <div id="action-inbox-list" class="action-inbox-list"></div>
+    <div id="action-inbox-list" class="action-inbox-list" role="region" aria-label="Actions by category" aria-live="polite" aria-atomic="false"></div>
   </dialog>
 
-  <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog">
+  <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog" aria-labelledby="session-observatory-title">
     <div class="dialog-heading">
       <div>
         <span class="inspector-kicker">Local Supervisor</span>
-        <h2>Session Observatory</h2>
+        <h2 id="session-observatory-title">Session Observatory</h2>
         <p>Sessions keep one identity while their provider and Universe location change.</p>
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>

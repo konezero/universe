@@ -66,6 +66,8 @@ const state = {
   hostTools: null,
   runtimePreflight: null,
   runtimeAudit: null,
+  supervisorRefreshPromise: null,
+  supervisorRefreshedAt: 0,
   remoteAccess: null,
   accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
@@ -423,6 +425,7 @@ const elements = {
   conversationExpand: document.querySelector("#conversation-expand"),
   actionInboxButton: document.querySelector("#action-inbox-button"),
   actionInboxBadge: document.querySelector("#action-inbox-badge"),
+  mobileActionInboxBadge: document.querySelector("#mobile-action-inbox-badge"),
   actionInboxDialog: document.querySelector("#action-inbox-dialog"),
   actionInboxTitle: document.querySelector("#action-inbox-title"),
   actionInboxList: document.querySelector("#action-inbox-list"),
@@ -630,7 +633,7 @@ function observatoryEligibleSessions(sessions) {
     if (stateName === "STOPPED") return false;
     if (stateName === "LIVE" || session.is_default) return true;
     const activity = parseSessionDate(
-      session.last_activity_at || session.updated_at
+      session.last_activity_at || session.updated_at || session.last_seen_at
     );
     if (!activity) return stateName !== "DISCONNECTED";
     return Date.now() - activity.getTime() < 7 * 86_400_000;
@@ -1143,61 +1146,79 @@ async function api(path, options = {}) {
   return payload;
 }
 
-async function refreshSupervisorSessions() {
-  const [audit, legacy, activity, chatCatalog, sessionGraph, terminals, busUnread] = await Promise.all([
-    api("/v1/runtime/audit"),
-    api("/v1/supervisor/legacy-executors"),
-    api("/v1/session-observer/sources"),
-    api("/v1/session-observer/chat-rooms"),
-    api("/v1/session-graph").catch(() => null),
-    api("/v1/terminals").catch(() => ({ terminals: state.terminals || [] })),
-    api("/v1/session-bus/unread").catch(() => ({ counts: {} })),
-  ]);
-  state.sessionBusUnread = busUnread?.counts || {};
-  if (Array.isArray(terminals?.terminals)) {
-    state.supervisorTerminals = terminals.terminals;
-  }
-  state.runtimeAudit = audit;
-  state.runtimePreflight = audit.preflight || null;
-  state.supervisorSessions = audit.sessions || [];
+async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
+  if (state.supervisorRefreshPromise) return state.supervisorRefreshPromise;
+  const maxAge = Math.max(0, Number(maxAgeMs) || 0);
   if (
-    !state.selectedSupervisorAnchorKey ||
-    !state.supervisorSessions.some(
-      (session) =>
-        anchorSessionKey(session) === state.selectedSupervisorAnchorKey
-    )
+    maxAge > 0 &&
+    state.supervisorRefreshedAt > 0 &&
+    Date.now() - state.supervisorRefreshedAt < maxAge
   ) {
-    const preferred =
-      state.supervisorSessions.find(
-        (session) =>
-          session.is_default &&
-          ((state.conversationTarget.kind === "PROJECT_MASTER" &&
-            session.node === state.conversationTarget.projectId &&
-            session.mode === "MASTER") ||
-            (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR" &&
-              session.mode === "CONDUCTOR"))
-      ) ||
-      state.supervisorSessions.find((session) => session.is_default) ||
-      state.supervisorSessions[0];
-    state.selectedSupervisorAnchorKey = preferred
-      ? anchorSessionKey(preferred)
-      : null;
+    return state.runtimeAudit;
   }
-  state.roomSessionBindings = audit.room_session_bindings || [];
-  state.supervisorEvents = audit.recent_events || [];
-  state.legacyExecutors = legacy.executors || [];
-  state.providerActivitySources = activity.sources || [];
-  state.providerChatRooms = chatCatalog.rooms || [];
-  state.projectAnchorSessions = chatCatalog.anchor_sessions || [];
-  state.sessionGraph = sessionGraph?.graph || state.sessionGraph;
-  syncProviderSessionSubscriptions();
-  prefillsObservatoryInjectForm();
-  renderRuntimePreflight();
-  renderSessionObservatory();
-  renderSessionRail();
-  renderNodeModes();
-  renderProviderActivitySources();
-  if (state.view === "sessions") buildSessionGraph();
+
+  const refreshPromise = (async () => {
+    const [audit, legacy, activity, chatCatalog, sessionGraph, busUnread] = await Promise.all([
+      api("/v1/runtime/audit"),
+      api("/v1/supervisor/legacy-executors"),
+      api("/v1/session-observer/sources"),
+      api("/v1/session-observer/chat-rooms"),
+      api("/v1/session-graph").catch(() => null),
+      api("/v1/session-bus/unread").catch(() => ({ counts: {} })),
+    ]);
+    state.sessionBusUnread = busUnread?.counts || {};
+    state.runtimeAudit = audit;
+    state.runtimePreflight = audit.preflight || null;
+    state.supervisorSessions = audit.sessions || [];
+    if (
+      !state.selectedSupervisorAnchorKey ||
+      !state.supervisorSessions.some(
+        (session) =>
+          anchorSessionKey(session) === state.selectedSupervisorAnchorKey
+      )
+    ) {
+      const preferred =
+        state.supervisorSessions.find(
+          (session) =>
+            session.is_default &&
+            ((state.conversationTarget.kind === "PROJECT_MASTER" &&
+              session.node === state.conversationTarget.projectId &&
+              session.mode === "MASTER") ||
+              (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR" &&
+                session.mode === "CONDUCTOR"))
+        ) ||
+        state.supervisorSessions.find((session) => session.is_default) ||
+        state.supervisorSessions[0];
+      state.selectedSupervisorAnchorKey = preferred
+        ? anchorSessionKey(preferred)
+        : null;
+    }
+    state.roomSessionBindings = audit.room_session_bindings || [];
+    state.supervisorEvents = audit.recent_events || [];
+    state.legacyExecutors = legacy.executors || [];
+    state.providerActivitySources = activity.sources || [];
+    state.providerChatRooms = chatCatalog.rooms || [];
+    state.projectAnchorSessions = chatCatalog.anchor_sessions || [];
+    state.sessionGraph = sessionGraph?.graph || state.sessionGraph;
+    syncProviderSessionSubscriptions();
+    prefillsObservatoryInjectForm();
+    renderRuntimePreflight();
+    renderSessionObservatory();
+    renderSessionRail();
+    renderNodeModes();
+    renderProviderActivitySources();
+    if (state.view === "sessions") buildSessionGraph();
+    state.supervisorRefreshedAt = Date.now();
+    return audit;
+  })();
+  state.supervisorRefreshPromise = refreshPromise;
+  try {
+    return await refreshPromise;
+  } finally {
+    if (state.supervisorRefreshPromise === refreshPromise) {
+      state.supervisorRefreshPromise = null;
+    }
+  }
 }
 
 async function tailProviderSessions() {
@@ -3921,20 +3942,23 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.providerSettings = providerSettings;
     state.providerModels = providerModelsResult?.catalog || providerModelsResult;
     state.hostTools = hostTools;
-    try {
-      await refreshSupervisorSessions();
-    } catch (error) {
+    // Core project navigation must become interactive without waiting for the
+    // slower Session Observatory catalog and Runtime audit.
+    renderProjects();
+    renderNodeModes();
+    renderComposerActions();
+    renderReleaseCatalog();
+    void refreshSupervisorSessions().catch((error) => {
       state.supervisorSessions = [];
       state.supervisorEvents = [];
       state.legacyExecutors = [];
       renderSessionObservatory();
       console.warn("Session Supervisor refresh failed", error);
-    }
+    });
     // Multiverse keeps every project tree expanded — load all projections first.
     await loadAllProjectProjections();
     renderProjects();
-    renderComposerActions();
-    renderReleaseCatalog();
+    renderNodeModes();
     const preferred =
       state.selectedProject &&
       state.projects.find(
@@ -4302,11 +4326,13 @@ async function selectProject(
     workLoopResult,
     semanticGraphResult,
   ] = await Promise.all([
-    project.projection_available === false
-      ? Promise.resolve(null)
-      : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
-          () => null
-        ),
+    state.projectionsByProject?.[projectId]
+      ? Promise.resolve({ projection: state.projectionsByProject[projectId] })
+      : project.projection_available === false
+        ? Promise.resolve(null)
+        : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
+            () => null
+          ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/dispatches`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
@@ -4406,7 +4432,9 @@ async function selectProject(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
   ).catch(() => ({ goals: [], unassigned_todos: [] }));
   state.goals = goalPlanResult.goals || [];
-  state.unassignedTodos = goalPlanResult.unassigned_todos || [];
+  state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
+    (todo) => todo.state !== "DONE"
+  );
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -4606,17 +4634,21 @@ function pendingActionItems() {
         (item) => item.state === "PENDING"
       ),
       delegations: [],
+      activeReply: activeProviderSessionReply(),
       activities: [...(cache?.actions || [])].reverse(),
     };
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    const delegations = state.conductorDelegations || [];
+    const activeStates = ["QUEUED", "RUNNING", "CANCELLATION_REQUESTED"];
     return {
       permissions: (state.conductorPermissions || []).filter(
         (item) => item.state === "PENDING"
       ),
-      delegations: (state.conductorDelegations || []).filter((item) =>
-        ["QUEUED", "RUNNING", "CANCELLATION_REQUESTED"].includes(item.state)
-      ),
+      delegations: delegations.filter((item) => activeStates.includes(item.state)),
+      history: delegations
+        .filter((item) => !activeStates.includes(item.state))
+        .slice(0, 20),
       activities: [],
     };
   }
@@ -4634,15 +4666,19 @@ function actionInboxCount() {
   return (
     items.permissions.length +
     items.delegations.length +
+    (items.activeReply ? 1 : 0) +
     items.activities.length
   );
 }
 
 function updateActionInboxBadge() {
-  if (!elements.actionInboxBadge) return;
   const count = actionInboxCount();
-  elements.actionInboxBadge.textContent = count > 99 ? "99+" : String(count);
-  elements.actionInboxBadge.classList.toggle("hidden", count === 0);
+  const label = count > 99 ? "99+" : String(count);
+  for (const badge of [elements.actionInboxBadge, elements.mobileActionInboxBadge]) {
+    if (!badge) continue;
+    badge.textContent = label;
+    badge.classList.toggle("hidden", count === 0);
+  }
 }
 
 function renderGitActionCard(chatKey, action) {
@@ -4700,7 +4736,12 @@ async function deleteProviderSessionAction(chatKey, action) {
 
 function renderDelegationActionCard(delegation) {
   const item = node("article", "action-inbox-card delegation-action-card");
-  const summary = delegation.request?.summary || "Bounded delegated work";
+  const stateValue = String(delegation.state || "UNKNOWN").toUpperCase();
+  item.dataset.state = stateValue;
+  const summary = String(
+    delegation.request?.summary || "Bounded delegated work"
+  ).replace(/\s+/g, " " ).trim();
+  const preview = summary.length > 240 ? `${summary.slice(0, 237)}...` : summary;
   const progress = delegation.progress?.summary || "Awaiting coordinator progress";
   item.append(
     node(
@@ -4708,10 +4749,19 @@ function renderDelegationActionCard(delegation) {
       "",
       `DELEGATION / ${delegation.request?.worker_role || "WORKER"}`
     ),
-    node("p", "", summary),
-    node("small", "", `${delegation.state} / ${progress}`)
+    node("p", "delegation-action-summary", preview),
+    node("small", "delegation-action-state", stateValue),
+    node("p", "delegation-action-progress", `Last update: ${progress}`)
   );
-  if (["QUEUED", "RUNNING"].includes(delegation.state)) {
+  if (summary.length > 240) {
+    const disclosure = node("details", "action-inbox-disclosure");
+    disclosure.append(
+      node("summary", "", "View full request"),
+      node("p", "delegation-action-full", summary)
+    );
+    item.append(disclosure);
+  }
+  if (["QUEUED", "RUNNING"].includes(stateValue)) {
     const actions = node("div", "proposal-actions");
     const cancel = node("button", "secondary-button", "Cancel");
     cancel.type = "button";
@@ -4749,6 +4799,26 @@ async function cancelConductorDelegation(delegation) {
   }
 }
 
+function renderProviderReplyActionCard(reply) {
+  const item = node("article", "action-inbox-card provider-reply-action-card");
+  const stateValue = String(reply?.state || "STARTING").toUpperCase();
+  item.append(
+    node("strong", "", "PROVIDER REPLY / ACTIVE"),
+    node("p", "", "A Provider reply is still running for this room."),
+    node("small", "", stateValue.replaceAll("_", " "))
+  );
+  const actions = node("div", "proposal-actions");
+  const cancel = node("button", "secondary-button",
+    stateValue === "CANCELLATION_REQUESTED" ? "Cancellation requested" : "Cancel reply"
+  );
+  cancel.type = "button";
+  cancel.disabled = stateValue === "CANCELLATION_REQUESTED";
+  cancel.addEventListener("click", cancelProviderSessionTurn);
+  actions.append(cancel);
+  item.append(actions);
+  return item;
+}
+
 function renderActionInbox() {
   updateActionInboxBadge();
   if (!elements.actionInboxList) return;
@@ -4762,18 +4832,46 @@ function renderActionInbox() {
       ? `${state.conversationTarget.alias || state.conversationTarget.projectId} actions`
       : `${state.conversationTarget.projectId} actions`;
   if (elements.actionInboxTitle) elements.actionInboxTitle.textContent = title;
-  for (const permission of items.permissions) {
-    elements.actionInboxList.append(renderPermissionCard(permission));
-  }
-  for (const delegation of items.delegations) {
-    elements.actionInboxList.append(renderDelegationActionCard(delegation));
-  }
+
+  const appendSection = (label, cards) => {
+    if (!cards.length) return;
+    const section = node("section", "action-inbox-section");
+    section.setAttribute("aria-label", label);
+    section.append(node("h3", "action-inbox-section-title", label));
+    const list = node("div", "action-inbox-section-list");
+    list.append(...cards);
+    section.append(list);
+    elements.actionInboxList.append(section);
+  };
+
+  appendSection(
+    "Pending approvals",
+    items.permissions.map((permission) => renderPermissionCard(permission))
+  );
+  const activeWork = items.delegations.map((delegation) =>
+    renderDelegationActionCard(delegation)
+  );
+  if (items.activeReply) activeWork.push(renderProviderReplyActionCard(items.activeReply));
+  appendSection("Active work", activeWork);
   const chatKey = String(state.conversationTarget.chat_key || "").trim();
-  for (const activity of items.activities) {
-    elements.actionInboxList.append(renderGitActionCard(chatKey, activity));
-  }
+  const recentActivity = (items.history || []).map((delegation) =>
+    renderDelegationActionCard(delegation)
+  );
+  recentActivity.push(
+    ...items.activities.map((activity) => renderGitActionCard(chatKey, activity))
+  );
+  appendSection("Recent activity", recentActivity);
   if (!elements.actionInboxList.childElementCount) {
-    elements.actionInboxList.append(node("p", "empty-copy", "No actions"));
+    elements.actionInboxList.append(
+      node("p", "empty-copy", "No pending approvals, active work, or activity.")
+    );
+  }
+}
+
+function openActionInbox() {
+  renderActionInbox();
+  if (elements.actionInboxDialog && !elements.actionInboxDialog.open) {
+    elements.actionInboxDialog.showModal();
   }
 }
 
@@ -6637,12 +6735,25 @@ function setDialogCategoryTab(root, { tabAttr, panelAttr, stateKey, allowed, fal
   if (!root) return;
   const activeId = allowed.has(state[stateKey]) ? state[stateKey] : fallback;
   state[stateKey] = activeId;
-  for (const tab of root.querySelectorAll(`[${tabAttr}]`)) {
-    const active = tab.getAttribute(tabAttr) === activeId;
+  const tabs = Array.from(root.querySelectorAll(`[${tabAttr}]`));
+  const panels = Array.from(root.querySelectorAll(`[${panelAttr}]`));
+  const panelsById = new Map(
+    panels.map((panel) => [panel.getAttribute(panelAttr), panel])
+  );
+  for (const tab of tabs) {
+    const tabId = tab.getAttribute(tabAttr);
+    const panel = panelsById.get(tabId);
+    if (root.id && tabId && panel) {
+      if (!tab.id) tab.id = `${root.id}-${tabId}-tab`;
+      if (!panel.id) panel.id = `${root.id}-${tabId}-panel`;
+      tab.setAttribute("aria-controls", panel.id);
+      panel.setAttribute("aria-labelledby", tab.id);
+    }
+    const active = tabId === activeId;
     tab.classList.toggle("is-active", active);
     tab.setAttribute("aria-selected", active ? "true" : "false");
   }
-  for (const panel of root.querySelectorAll(`[${panelAttr}]`)) {
+  for (const panel of panels) {
     const active = panel.getAttribute(panelAttr) === activeId;
     panel.classList.toggle("is-active", active);
     if (active) panel.removeAttribute("hidden");
@@ -6979,6 +7090,7 @@ function providerSessionObservedProjectId(room) {
 function providerSessionRoomIsEligible(room) {
   const chatKey = String(room?.chat_key || "").trim();
   const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
+  const bindingState = String(room?.binding?.state || "").toUpperCase();
   const currentness = String(
     room?.binding?.observer_currentness || ""
   ).toUpperCase();
@@ -6989,7 +7101,8 @@ function providerSessionRoomIsEligible(room) {
       projectId &&
       sessionKind !== "WORKER" &&
       identityState === "VERIFIED" &&
-      (currentness === "CURRENT" || providerSessionRoomIsSelected(chatKey))
+      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
+      currentness === "CURRENT"
   );
 }
 
@@ -7281,12 +7394,15 @@ function syncProviderSessionSubscriptions() {
   for (const key of Object.keys(state.providerSessionStreams)) {
     if (eligible.has(key)) continue;
     closeProviderSessionStream(key);
-    delete state.providerSessionRoomCaches[key];
-    delete state.providerSessionStreamStates[key];
+    if (!providerSessionRoomIsSelected(key)) {
+      delete state.providerSessionRoomCaches[key];
+      delete state.providerSessionStreamStates[key];
+    }
   }
   for (const key of Object.keys(state.providerSessionRoomCaches)) {
-    if (eligible.has(key)) continue;
+    if (eligible.has(key) || providerSessionRoomIsSelected(key)) continue;
     delete state.providerSessionRoomCaches[key];
+    delete state.providerSessionStreamStates[key];
   }
   for (const key of eligible) {
     openProviderSessionStream(key);
@@ -7690,6 +7806,17 @@ function buildSemanticProjectGraph() {
   drawGraph();
 }
 
+function sessionGraphNodeLabel(item) {
+  const fallback = String(item?.label || item?.project_id || "Session").trim();
+  if (String(item?.entity_type || "").toUpperCase() !== "SESSION_ANCHOR") {
+    return fallback;
+  }
+  const provider = String(item?.provider || "").trim().toUpperCase();
+  if (!provider) return fallback;
+  const currentness = String(item?.currentness || "").trim().toUpperCase();
+  return currentness === "CURRENT" ? `${provider} CURRENT` : provider;
+}
+
 function buildSessionGraph() {
   setGraphLegend([
     { kind: "mode", label: "Mode" },
@@ -7714,7 +7841,7 @@ function buildSessionGraph() {
   };
   const graphNodes = sourceNodes.map((item) => ({
     id: item.id,
-    label: item.label,
+    label: sessionGraphNodeLabel(item),
     kind: String(item.entity_type || "UNKNOWN").toLowerCase(),
     depth: layerByType[item.entity_type] ?? 5,
     projectId: item.project_id || null,
@@ -7739,7 +7866,7 @@ function buildSessionGraph() {
         .sort((left, right) => left.id.localeCompare(right.id));
       layer.forEach((item, index) => {
         item.x = centerX + (index - (layer.length - 1) / 2) * 82;
-        item.y = -220 + depth * 105;
+        item.y = -270 + depth * 85;
       });
     }
   });
@@ -10344,7 +10471,9 @@ async function refreshGoalPlan() {
     `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`
   );
   state.goals = result.goals || [];
-  state.unassignedTodos = result.unassigned_todos || [];
+  state.unassignedTodos = (result.unassigned_todos || []).filter(
+    (todo) => todo.state !== "DONE"
+  );
   if (!state.goals.some((goal) => goal.goal_id === state.selectedGoalId)) {
     state.selectedGoalId = state.goals[0]?.goal_id || null;
   }
@@ -12672,10 +12801,11 @@ function bindEvents() {
   });
   elements.providerProfileForm.addEventListener("submit", submitProviderProfile);
   if (elements.actionInboxButton && elements.actionInboxDialog) {
-    elements.actionInboxButton.addEventListener("click", () => {
-      renderActionInbox();
-      if (!elements.actionInboxDialog.open) {
-        elements.actionInboxDialog.showModal();
+    elements.actionInboxButton.addEventListener("click", openActionInbox);
+    elements.actionInboxDialog.addEventListener("close", () => {
+      if (!elements.mobileWorkTabs || window.innerWidth > 720) return;
+      for (const item of elements.mobileWorkTabs.querySelectorAll("button")) {
+        item.classList.toggle("selected", item.dataset.mobileWorkView === "goals");
       }
     });
   }
@@ -12689,7 +12819,7 @@ function bindEvents() {
   }
   const openSessionObservatory = async () => {
     try {
-      await refreshSupervisorSessions();
+      await refreshSupervisorSessions({ maxAgeMs: 10_000 });
       setObservatoryTab(state.observatoryTab || "sessions");
       elements.sessionObservatoryDialog.showModal();
     } catch (error) {
@@ -13236,8 +13366,8 @@ function bindGoalPlanEvents() {
     for (const item of elements.mobileWorkTabs.querySelectorAll("button")) item.classList.toggle("selected", item === button);
     const view = button.getAttribute("data-mobile-work-view");
     if (view === "goals") showGoalPlanView();
-    else if (view === "sessions") elements.sessionObservatoryDialog?.showModal();
-    else openInspectorSurface("activity");
+    else if (view === "sessions") showGraphView("sessions");
+    else if (view === "actions") openActionInbox();
   });
   const activeGoal = () => state.goals.find((goal) => goal.goal_id === state.selectedGoalId) || state.goals[0];
   elements.mobileDelegateGoal?.addEventListener("click", () => {
@@ -13567,7 +13697,6 @@ window.addEventListener("beforeunload", closeAllProviderSessionStreams);
 refresh().finally(() => {
   openConductorRoomStream();
   void tailProviderSessions();
-  void loadTerminalTabs();
 });
 window.setInterval(refreshConductorRoom, 1200);
 state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);

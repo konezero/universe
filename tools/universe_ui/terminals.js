@@ -5,7 +5,11 @@ function isRemoteBrowser() {
 function terminalLabel(session) {
   const project = String(session?.project_id || "session").trim();
   const mode = String(session?.mode || "").trim().toUpperCase();
-  return mode ? `${project} ${mode}` : project;
+  const provider = String(session?.provider || "").trim().toUpperCase();
+  const coordinate = mode ? `${project} ${mode}` : project;
+  return provider && provider !== "AUTO"
+    ? `${coordinate} · ${provider}`
+    : coordinate;
 }
 
 function applyCliDockTitle(session) {
@@ -79,24 +83,12 @@ function renderTerminalDock() {
   }
 }
 
-function autoWidenForTerminal() {
-  const shell = document.querySelector(".app-shell");
-  if (!shell) return;
-  const current = parseInt(getComputedStyle(shell).getPropertyValue("--chat-panel-width")) || 380;
-  if (current < 600) {
-    shell.style.setProperty("--chat-panel-width", "680px");
-    const handle = document.querySelector("#chat-resize-handle");
-    if (handle) handle.setAttribute("aria-valuenow", "680");
-  }
-}
-
 function selectTerminalTab(terminalId) {
   const session = (state.terminals || []).find((item) => item.terminal_id === terminalId);
   if (!session) return;
   state.activeTerminalId = terminalId;
   renderTerminalDock();
   ensureTerminalSurface(session);
-  autoWidenForTerminal();
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = id !== terminalId;
@@ -113,16 +105,16 @@ function sendPtyText(socket, data) {
   socket.send(new TextEncoder().encode(text));
 }
 
-const TERMINAL_COLS = 80;
-const TERMINAL_ROWS = 50;
+const TERMINAL_COLS = 120;
+const TERMINAL_ROWS = 40;
 
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
-  let justComposed = false;
+  let lastComposed = null;
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
-      if (event.isComposing || event.keyCode === 229 || justComposed) return false;
+      if (event.isComposing) return false;
       return true;
     });
   }
@@ -132,19 +124,23 @@ function bindTerminalIme(term, socket) {
     textarea.setAttribute("spellcheck", "false");
     textarea.addEventListener("compositionstart", () => {
       composing = true;
-      justComposed = false;
+      lastComposed = null;
     }, true);
-    textarea.addEventListener("compositionend", () => {
+    textarea.addEventListener("compositionend", (event) => {
       composing = false;
-      justComposed = true;
+      const composed = event.data || "";
+      lastComposed = composed || null;
+      if (composed) sendPtyText(socket, composed);
       window.setTimeout(() => {
-        justComposed = false;
+        lastComposed = null;
         try { textarea.value = ""; } catch (_error) { /* ignore */ }
       }, 0);
     }, true);
   }
   term.onData((data) => {
     if (composing) return;
+    // Skip only if xterm echoes the exact composed char we already sent
+    if (lastComposed !== null && data === lastComposed) return;
     sendPtyText(socket, data);
   });
 }
@@ -178,6 +174,7 @@ function ensureTerminalSurface(session) {
     fontFamily: 'D2Coding, "Nanum Gothic Coding", "Cascadia Code", Consolas, monospace',
     unicodeVersion: "11",
     convertEol: true,
+    scrollback: 5000,
     smoothScrollDuration: 100,
     theme: {
       background: "#07101d",
@@ -217,6 +214,7 @@ function ensureTerminalSurface(session) {
     resizeTimer = window.setTimeout(() => {
       if (element.hidden) return;
       scaleFontToContainer(term, element);
+      try { term.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_e) { /* ok */ }
     }, 150);
   };
   socket.addEventListener("open", () => {

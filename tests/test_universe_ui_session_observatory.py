@@ -88,6 +88,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("function sendTerminalInput(text)", TERM)
         self.assertNotIn("term.options.disableStdin = true", TERM)
         self.assertIn("function applyCliDockTitle(session)", TERM)
+        terminal_label = TERM[
+            TERM.index("function terminalLabel(session)") : TERM.index(
+                "function applyCliDockTitle(session)"
+            )
+        ]
+        self.assertIn('session?.provider || ""', terminal_label)
+        self.assertIn('provider !== "AUTO"', terminal_label)
         self.assertIn("function focusTerminalForSession(coordinate, session)", TERM)
         self.assertIn("dismissedTerminalIds", TERM)
         self.assertIn("function refitActiveTerminal()", TERM)
@@ -109,6 +116,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("const session = created.terminal || created;", TERM)
         self.assertIn("resume_session_ref", TERM)
         self.assertIn("createTerminalTab(coordinate, session)", APP)
+        mobile_session_nav = APP[
+            APP.index('elements.mobileWorkTabs?.addEventListener("click"') : APP.index(
+                "const activeGoal ="
+            )
+        ]
+        self.assertIn(
+            'else if (view === "sessions") showGraphView("sessions");',
+            mobile_session_nav,
+        )
+        self.assertNotIn("sessionObservatoryDialog?.showModal()", mobile_session_nav)
         self.assertIn("function projectMasterSetting(projectId)", TERM)
         self.assertIn("function observerProvider(session)", TERM)
         self.assertIn("session.observer_session_ref", TERM)
@@ -158,7 +175,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("state.supervisorTerminals", TERM)
         self.assertIn("function nodeModePanelSessions", APP)
         self.assertIn('session_kind: "PTY_LIVE"', APP)
-        self.assertIn('api("/v1/terminals")', APP)
+        self.assertIn('api("/v1/terminals")', TERM)
         open_slice = APP[
             APP.index("function openNodeModeCoordinate") : APP.index(
                 "function renderNodeModes"
@@ -179,6 +196,12 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('data-primary-view="sessions"', HTML)
         self.assertIn('api("/v1/session-graph")', APP)
         self.assertIn("function buildSessionGraph()", APP)
+        self.assertIn("function sessionGraphNodeLabel(item)", APP)
+        self.assertIn('item?.entity_type || ""', APP)
+        self.assertIn('item?.provider || ""', APP)
+        self.assertIn('currentness === "CURRENT"', APP)
+        self.assertIn("label: sessionGraphNodeLabel(item)", APP)
+        self.assertIn("item.y = -270 + depth * 85;", APP)
         self.assertIn('state.view === "sessions"', APP)
         self.assertIn('item.kind === "session_anchor"', APP)
         self.assertIn("selectNodeModeSession(coordinate, session)", APP)
@@ -522,12 +545,42 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
     def test_actions_are_separate_from_chat_and_keep_scroll_stable(self) -> None:
         self.assertIn('id="action-inbox-button"', HTML)
         self.assertIn('id="action-inbox-dialog"', HTML)
+        self.assertIn('aria-labelledby="action-inbox-title"', HTML)
         self.assertIn('id="action-inbox-list"', HTML)
+        self.assertIn('aria-label="Actions by category"', HTML)
+        self.assertIn('data-mobile-work-view="actions"', HTML)
+        self.assertIn('id="mobile-action-inbox-badge"', HTML)
         self.assertIn("function renderActionInbox", APP)
+        self.assertIn("function openActionInbox", APP)
         self.assertIn("function pendingActionItems", APP)
         self.assertIn("function finishRoomMessageRender", APP)
+        self.assertIn('"Pending approvals"', APP)
+        self.assertIn('"Active work"', APP)
+        self.assertIn('"Recent activity"', APP)
+        self.assertIn("history: delegations", APP)
+        self.assertIn('.slice(0, 20)', APP)
+        self.assertIn("renderDelegationActionCard(delegation)", APP)
+        self.assertIn("delegation-action-summary", APP)
+        self.assertIn("delegation-action-state", APP)
+        self.assertIn("Last update:", APP)
+        self.assertIn("View full request", APP)
+        self.assertIn("action-inbox-disclosure", CSS)
+        self.assertIn("function renderProviderReplyActionCard", APP)
+        self.assertIn("cancelProviderSessionTurn", APP)
         self.assertIn("CANCELLATION_REQUESTED", APP)
         self.assertIn("/v1/conductor-room/delegations/", APP)
+        mobile_slice = APP[
+            APP.index('elements.mobileWorkTabs?.addEventListener("click"') :
+            APP.index("const activeGoal")
+        ]
+        self.assertIn('view === "actions"', mobile_slice)
+        self.assertIn("openActionInbox()", mobile_slice)
+        self.assertNotIn('openInspectorSurface("activity")', mobile_slice)
+        provider_reply_slice = APP[
+            APP.index("function renderProviderReplyActionCard") :
+            APP.index("function renderActionInbox")
+        ]
+        self.assertNotIn("reply.content", provider_reply_slice)
         message_slice = APP[
             APP.index("function renderRoomMessages") : APP.index(
                 "function renderComposerState"
@@ -536,7 +589,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("renderGovernanceProposalCard(proposal)", message_slice)
         self.assertNotIn("renderPermissionCard(permission)", message_slice)
         self.assertNotIn("scrollRoomToPendingAction", APP)
-        self.assertIn("action-inbox-dialog", CSS)
+        self.assertIn("action-inbox-dialog[open]", CSS)
+        self.assertIn("width: 100vw", CSS)
+        self.assertIn("height: 100dvh", CSS)
+        self.assertIn("overscroll-behavior-y: contain", CSS)
 
     def test_project_master_delivery_labels_distinguish_queue_and_acceptance(
         self,
@@ -626,6 +682,141 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("syncProviderSessionSubscriptions();", APP)
         self.assertIn("providerSessionActivityState(room)", APP)
         self.assertIn("providerSessionUnreadCount(room)", APP)
+
+    def test_initial_refresh_does_not_wait_for_observatory_or_duplicate_terminal_discovery(
+        self,
+    ) -> None:
+        refresh_slice = APP[
+            APP.index("async function refresh(") : APP.index("function projectDisplayName")
+        ]
+        self.assertLess(
+            refresh_slice.index("renderProjects();"),
+            refresh_slice.index("void refreshSupervisorSessions().catch"),
+        )
+        self.assertNotIn("await refreshSupervisorSessions()", refresh_slice)
+        self.assertEqual(refresh_slice.count("void loadTerminalTabs();"), 1)
+
+        supervisor_slice = APP[
+            APP.index("async function refreshSupervisorSessions") : APP.index(
+                "async function tailProviderSessions"
+            )
+        ]
+        self.assertNotIn('api("/v1/terminals")', supervisor_slice)
+        startup_slice = APP[APP.index("refresh().finally(() => {") :]
+        self.assertNotIn("loadTerminalTabs()", startup_slice)
+
+    def test_selected_projection_is_reused_and_completed_todos_leave_planning_inbox(
+        self,
+    ) -> None:
+        select_slice = APP[
+            APP.index("async function selectProject(") : APP.index(
+                "function mergeGovernanceProposalInbox"
+            )
+        ]
+        self.assertIn("state.projectionsByProject?.[projectId]", select_slice)
+        self.assertIn(
+            '(goalPlanResult.unassigned_todos || []).filter(',
+            select_slice,
+        )
+        refresh_goal_slice = APP[
+            APP.index("async function refreshGoalPlan()") : APP.index(
+                "function planTodoRow"
+            )
+        ]
+        self.assertIn('(result.unassigned_todos || []).filter(', refresh_goal_slice)
+        self.assertIn('todo.state !== "DONE"', select_slice)
+        self.assertIn('todo.state !== "DONE"', refresh_goal_slice)
+
+    def test_mobile_conversation_launcher_stays_inside_the_composer_dock(
+        self,
+    ) -> None:
+        selector = (
+            "  .app-shell.mockup-shell > .graph-workspace > .conductor-panel "
+            "> .conversation-layer {"
+        )
+        start = CSS.rindex(selector)
+        block = CSS[start : CSS.index("  }", start)]
+        self.assertIn("position: relative;", block)
+        self.assertIn("inset: auto;", block)
+        self.assertIn("width: 100%;", block)
+        self.assertIn("min-width: 0;", block)
+        self.assertIn("max-width: 100%;", block)
+
+    def test_terminal_selection_preserves_the_explicit_chat_panel_width(self) -> None:
+        self.assertNotIn("autoWidenForTerminal", TERM)
+        self.assertNotIn('--chat-panel-width", "680px', TERM)
+        self.assertIn("initChatPanelResize()", APP)
+
+    def test_supervisor_refreshes_are_coalesced_and_recent_open_reuses_cache(
+        self,
+    ) -> None:
+        refresh_slice = APP[
+            APP.index("async function refreshSupervisorSessions") : APP.index(
+                "async function tailProviderSessions"
+            )
+        ]
+        self.assertIn(
+            "if (state.supervisorRefreshPromise) return state.supervisorRefreshPromise",
+            refresh_slice,
+        )
+        self.assertIn("state.supervisorRefreshedAt = Date.now();", refresh_slice)
+        self.assertIn("state.supervisorRefreshPromise = refreshPromise;", refresh_slice)
+        self.assertIn("state.supervisorRefreshPromise = null;", refresh_slice)
+        open_start = APP.index("const openSessionObservatory = async () =>")
+        open_slice = APP[open_start : APP.index("if (elements.sessionObservatoryDialog)", open_start)]
+        self.assertIn(
+            "refreshSupervisorSessions({ maxAgeMs: 10_000 })",
+            open_slice,
+        )
+
+    def test_mobile_observatory_is_labeled_opaque_and_single_scroll(self) -> None:
+        self.assertIn(
+            'id="session-observatory-dialog" class="session-observatory-dialog wide-dialog" aria-labelledby="session-observatory-title"',
+            HTML,
+        )
+        self.assertIn('id="session-observatory-title"', HTML)
+        tab_helper = APP[
+            APP.index("function setDialogCategoryTab") : APP.index(
+                "function setSettingsTab"
+            )
+        ]
+        self.assertIn('tab.setAttribute("aria-controls", panel.id)', tab_helper)
+        self.assertIn('panel.setAttribute("aria-labelledby", tab.id)', tab_helper)
+
+        open_selector = ".session-observatory-dialog[open] {"
+        open_start = CSS.index(open_selector)
+        open_block = CSS[open_start : CSS.index("}", open_start)]
+        self.assertIn("display: flex;", open_block)
+        self.assertIn("overflow: hidden;", open_block)
+        self.assertIn("background: #071413;", CSS)
+
+        panels_selector = ".session-observatory-dialog > .observatory-tab-panels {"
+        panels_start = CSS.index(panels_selector)
+        panels_block = CSS[panels_start : CSS.index("}", panels_start)]
+        self.assertIn("min-height: 0;", panels_block)
+        self.assertIn("max-height: none;", panels_block)
+        self.assertIn("overflow-y: auto;", panels_block)
+
+        list_start = CSS.index(".session-observatory-list {")
+        list_block = CSS[list_start : CSS.index("}", list_start)]
+        self.assertIn("max-height: none;", list_block)
+        self.assertIn("overflow: visible;", list_block)
+
+        mobile_dialog_start = CSS.index("  .session-observatory-dialog[open] {")
+        mobile_dialog_block = CSS[
+            mobile_dialog_start : CSS.index("  }", mobile_dialog_start)
+        ]
+        self.assertIn("width: 100vw;", mobile_dialog_block)
+        self.assertIn("height: 100dvh;", mobile_dialog_block)
+        mobile_tabs_start = CSS.index(
+            "  .session-observatory-dialog > .dialog-tabs {",
+            mobile_dialog_start,
+        )
+        mobile_tabs_block = CSS[
+            mobile_tabs_start : CSS.index("  }", mobile_tabs_start)
+        ]
+        self.assertIn("flex-wrap: nowrap;", mobile_tabs_block)
+        self.assertIn("overflow-x: auto;", mobile_tabs_block)
 
 if __name__ == "__main__":
     unittest.main()

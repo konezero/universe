@@ -4428,6 +4428,8 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         executable, environment, default_model = _resolve_claude()
         if executable is None:
             raise ProjectMasterHostError("CLAUDE_CLI_UNAVAILABLE")
+        environment = dict(environment)
+        environment["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] = "1"
         model = self.model or default_model
 
         def observe_session(session_id: str) -> None:

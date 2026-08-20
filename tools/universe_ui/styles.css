@@ -869,6 +869,7 @@ body.inspector-open .graph-hint {
   width: 100%;
   height: 100%;
   overflow: hidden;
+  position: relative;
 }
 .terminal-pane .xterm .xterm-helper-textarea {
   left: 0;
@@ -3986,6 +3987,14 @@ body {
   width: min(520px, calc(100vw - 24px));
   max-height: min(680px, calc(100vh - 24px));
   padding: 18px;
+  color: var(--text);
+  background: #091714;
+}
+
+.action-inbox-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .action-inbox-dialog .dialog-heading {
@@ -3999,9 +4008,35 @@ body {
 
 .action-inbox-list {
   display: grid;
+  flex: 1 1 auto;
+  min-height: 0;
   max-height: min(520px, calc(100vh - 150px));
-  gap: 9px;
+  gap: 14px;
+  padding-right: 4px;
   overflow-y: auto;
+}
+
+.action-inbox-section {
+  display: grid;
+  gap: 8px;
+}
+
+.action-inbox-section + .action-inbox-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.action-inbox-section-title {
+  margin: 0;
+  color: var(--teal);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.action-inbox-section-list {
+  display: grid;
+  gap: 9px;
 }
 
 .action-inbox-card {
@@ -4010,10 +4045,59 @@ body {
   background: rgba(5, 7, 13, 0.45);
 }
 
+.action-inbox-card[data-state="COMPLETED"],
+.action-inbox-card[data-state="SUCCEEDED"],
+.action-inbox-card[data-state="RESULT_READY"] {
+  border-left-color: var(--green);
+}
+
+.action-inbox-card[data-state="FAILED"],
+.action-inbox-card[data-state="CANCELLED"] {
+  border-left-color: var(--red);
+}
+
 .action-inbox-card strong,
 .action-inbox-card small {
   color: var(--muted);
   font-size: 10px;
+}
+
+.delegation-action-summary {
+  margin: 8px 0;
+  color: var(--text);
+  line-height: 1.45;
+}
+
+.delegation-action-state {
+  display: inline-flex;
+  width: fit-content;
+  margin-top: 2px;
+  letter-spacing: 0.06em;
+}
+
+.delegation-action-progress {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.action-inbox-disclosure {
+  margin-top: 9px;
+}
+
+.action-inbox-disclosure summary {
+  color: var(--teal);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.delegation-action-full {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .git-action-summary {
@@ -4039,6 +4123,52 @@ body {
 .git-action-detail-row code {
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+@media (max-width: 720px) {
+  .mobile-work-tabs [data-mobile-work-view="actions"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .action-inbox-dialog[open] {
+    inset: 0;
+    width: 100vw;
+    max-width: none;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    box-sizing: border-box;
+    padding: 0;
+    border-radius: 0;
+  }
+  .action-inbox-dialog::backdrop {
+    background: rgba(2, 10, 9, 0.86);
+  }
+  .action-inbox-dialog > .dialog-heading {
+    flex: 0 0 auto;
+    gap: 12px;
+    margin: 0;
+    padding: 14px 12px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .action-inbox-dialog > .dialog-heading .icon-button {
+    flex: 0 0 40px;
+    width: 40px;
+    height: 40px;
+  }
+  .action-inbox-list {
+    max-height: none;
+    padding: 14px 12px 24px;
+    overscroll-behavior-y: contain;
+  }
+  .action-inbox-card {
+    padding: 12px;
+  }
+  .action-inbox-card .proposal-actions button {
+    min-height: 40px;
+  }
 }
 @media (max-width: 420px) {
   .session-rail-filters {
@@ -4072,7 +4202,34 @@ body {
 .session-observatory-dialog {
   width: min(920px, calc(100vw - 32px));
   max-height: min(780px, calc(100vh - 32px));
-  overflow: auto;
+  background: #071413;
+}
+
+.session-observatory-dialog[open] {
+  display: flex;
+  flex-direction: column;
+  height: min(780px, calc(100dvh - 32px));
+  overflow: hidden;
+}
+
+.session-observatory-dialog > .dialog-heading {
+  flex: 0 0 auto;
+  gap: 16px;
+  padding: 16px 16px 0;
+}
+
+.session-observatory-dialog > .dialog-tabs {
+  flex: 0 0 auto;
+  margin: 0 16px 2px;
+}
+
+.session-observatory-dialog > .observatory-tab-panels {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 14px 16px 16px;
 }
 
 .session-observatory-toolbar,
@@ -4098,8 +4255,8 @@ body {
   gap: 14px;
   margin: 12px 0 18px;
   padding: 4px 2px 12px;
-  max-height: min(52vh, 560px);
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 @media (min-width: 900px) {
@@ -4326,6 +4483,13 @@ body {
   font-size: 11px;
   color: var(--text-2);
   margin-left: auto;
+}
+
+.session-observatory-filter input[type="checkbox"] {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  margin: 0;
 }
 
 .session-token-pill {
@@ -5268,11 +5432,85 @@ body:not(.graph-mode) .conductor-panel {
   .session-observatory-list {
     grid-template-columns: 1fr;
     gap: 12px;
-    max-height: min(48vh, 420px);
+    margin-bottom: 0;
   }
-  .session-observatory-dialog {
-    width: calc(100vw - 16px);
-    max-height: calc(100vh - 16px);
+  .session-observatory-dialog[open] {
+    inset: 0;
+    width: 100vw;
+    max-width: none;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    box-sizing: border-box;
+    border-radius: 0;
+  }
+  .session-observatory-dialog::backdrop {
+    background: rgba(2, 10, 9, 0.82);
+  }
+  .session-observatory-dialog > .dialog-heading {
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 12px 0;
+  }
+  .session-observatory-dialog > .dialog-heading p {
+    margin: 4px 0 0;
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .session-observatory-dialog > .dialog-heading .icon-button {
+    flex: 0 0 40px;
+    width: 40px;
+    height: 40px;
+  }
+  .session-observatory-dialog > .dialog-tabs {
+    flex-wrap: nowrap;
+    gap: 6px;
+    margin: 0 12px 2px;
+    padding: 8px 0 10px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+  .session-observatory-dialog > .dialog-tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .session-observatory-dialog > .dialog-tabs .dialog-tab {
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: 7px 11px;
+  }
+  .session-observatory-dialog > .observatory-tab-panels {
+    padding: 0 10px 12px 12px;
+  }
+  .session-observatory-toolbar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    align-items: stretch;
+  }
+  #session-observatory-summary,
+  .session-observatory-filter {
+    grid-column: 1 / -1;
+  }
+  .session-observatory-filter {
+    margin-left: 0;
+  }
+  #cleanup-sessions-button,
+  #refresh-sessions-button {
+    width: 100%;
+    min-height: 40px;
+  }
+  .session-observatory-detail {
+    padding: 10px;
+  }
+  .session-detail-meta {
+    grid-template-columns: 1fr;
+  }
+  .supervisor-session-card {
+    padding: 12px;
+  }
+  .supervisor-session-card .session-card-actions > button {
+    min-height: 40px;
   }
   .session-card-actions { flex-wrap: wrap; }
   .session-event-section,
@@ -6647,6 +6885,11 @@ body.chat-resizing * {
   .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer {
     display: block;
     flex: none;
+    position: relative;
+    inset: auto;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
     max-height: 38px;
     overflow: hidden;
     border: 1px solid var(--ws-line);

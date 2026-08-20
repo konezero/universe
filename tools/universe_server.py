@@ -21917,6 +21917,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project = self.store.get_project(project_id)
         session_coordinates = None
         if session_action == "NEW":
+            # Apply any explicit provider / model / effort from the request so
+            # the new session actually starts with the user's chosen provider.
+            new_provider = str(request.get("provider") or "").strip().upper()
+            if new_provider and new_provider not in {"", "AUTO"}:
+                provider_update: dict[str, str] = {"provider": new_provider}
+                new_model = str(request.get("model_ref") or "").strip()
+                new_effort = str(request.get("effort") or "").strip().upper()
+                if new_model:
+                    provider_update["model_ref"] = new_model
+                if new_effort and new_effort != "AUTO":
+                    provider_update["effort"] = new_effort
+                self.set_project_provider_setting(project_id, provider_update)
             project_root = Path(project["project_root"])
             session_coordinates = self._validate_new_session_coordinates(
                 request,
