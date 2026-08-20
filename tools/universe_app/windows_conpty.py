@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -18,6 +19,7 @@ class WindowsConPTY:
         cols: int,
         rows: int,
         argv: list[str] | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         import winpty
 
@@ -42,6 +44,8 @@ class WindowsConPTY:
         env = os.environ.copy()
         for _k in _STRIP_KEYS:
             env.pop(_k, None)
+        for key, value in dict(environment or {}).items():
+            env[str(key)] = str(value)
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env_block = "\0".join(f"{k}={v}" for k, v in env.items()) + "\0"

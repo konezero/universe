@@ -707,6 +707,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Non-zero exit when inject cannot run (default: always 0)",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress stdout for lifecycle hosts that validate hook output",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Resolve inputs and print plan without HTTP inject",
@@ -922,7 +927,7 @@ def _toml_array(items: list[str]) -> str:
 
 def _codex_hook_block(python_exe: str, script_path: str) -> str:
     import subprocess as _sp
-    cmd_str = _sp.list2cmdline([python_exe, script_path, "--repo-root", ".", "--provider", "CODEX", "--from-stdin", "--trigger", "session_start"])
+    cmd_str = _sp.list2cmdline([python_exe, script_path, "--repo-root", ".", "--provider", "CODEX", "--from-stdin", "--trigger", "session_start", "--quiet"])
     return (
         "\n[[hooks.SessionStart]]\n"
         'matcher = "*"\n'
@@ -1208,7 +1213,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(raw)
     result = run_hook(args)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    codex_session_start = (
+        str(args.provider or "").strip().upper() == "CODEX"
+        and args.from_stdin
+        and str(args.trigger or "").strip().lower() == "session_start"
+    )
+    if not (args.quiet or codex_session_start):
+        print(json.dumps(result, indent=2, sort_keys=True))
     if args.strict and result.get("status") not in {"INJECTED", "DRY_RUN"}:
         return 1
     return 0

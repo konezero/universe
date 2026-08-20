@@ -8,7 +8,7 @@ import secrets
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,7 +82,7 @@ class TerminalHost:
     def __init__(
         self,
         *,
-        spawn: Callable[[str, str, int, int], Any] | None = None,
+        spawn: Callable[..., Any] | None = None,
     ) -> None:
         from universe_app.session_bus import SessionBus
 
@@ -142,9 +142,19 @@ class TerminalHost:
             cols=max(80, int(cols or 120)),
             rows=max(24, int(rows or 32)),
         )
+        child_environment = {
+            "UNIVERSE_PROJECT_ID": project,
+            "UNIVERSE_MODE": requested_mode,
+            "UNIVERSE_PROVIDER": resolved_provider,
+        }
         try:
             session.backend = self._spawn(
-                executable, session.cwd, session.cols, session.rows, argv
+                executable,
+                session.cwd,
+                session.cols,
+                session.rows,
+                argv,
+                child_environment,
             )
         except Exception as error:  # noqa: BLE001 - surface spawn failure
             raise TerminalHostError(
@@ -365,11 +375,19 @@ def spawn_conpty(
     cols: int,
     rows: int,
     argv: list[str] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> Any:
     if os.name == "nt":
         from universe_app.windows_conpty import WindowsConPTY
 
-        return WindowsConPTY(executable, cwd, cols, rows, argv=argv or [])
+        return WindowsConPTY(
+            executable,
+            cwd,
+            cols,
+            rows,
+            argv=argv or [],
+            environment=environment,
+        )
     raise TerminalHostError("PTY_UNSUPPORTED", "this Host does not expose a PTY")
 
 

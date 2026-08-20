@@ -38,10 +38,19 @@ class FakePty:
 
 class TerminalHostTests(unittest.TestCase):
     def test_create_list_and_close_without_vendor_jsonl(self) -> None:
-        spawned: list[tuple[str, str, int, int]] = []
+        spawned: list[tuple] = []
 
-        def spawn(executable: str, cwd: str, cols: int, rows: int, argv=None) -> FakePty:
-            spawned.append((executable, cwd, cols, rows, list(argv or [])))
+        def spawn(
+            executable: str,
+            cwd: str,
+            cols: int,
+            rows: int,
+            argv=None,
+            environment=None,
+        ) -> FakePty:
+            spawned.append(
+                (executable, cwd, cols, rows, list(argv or []), dict(environment or {}))
+            )
             return FakePty()
 
         host = TerminalHost(spawn=spawn)
@@ -66,6 +75,14 @@ class TerminalHostTests(unittest.TestCase):
         with self.assertRaises(TerminalHostError):
             host.get(created["terminal_id"])
         self.assertEqual(1, len(spawned))
+        self.assertEqual(
+            {
+                "UNIVERSE_PROJECT_ID": "GCS",
+                "UNIVERSE_MODE": "MASTER",
+                "UNIVERSE_PROVIDER": "GROK",
+            },
+            spawned[0][5],
+        )
 
     def test_missing_coordinate_is_rejected(self) -> None:
         host = TerminalHost(spawn=lambda *_args: FakePty())
@@ -92,8 +109,10 @@ class TerminalHostTests(unittest.TestCase):
     def test_create_passes_resume_argv_to_spawn(self) -> None:
         spawned: list[tuple] = []
 
-        def spawn(executable, cwd, cols, rows, argv=None):
-            spawned.append((executable, cwd, cols, rows, list(argv or [])))
+        def spawn(executable, cwd, cols, rows, argv=None, environment=None):
+            spawned.append(
+                (executable, cwd, cols, rows, list(argv or []), dict(environment or {}))
+            )
             return FakePty()
 
         host = TerminalHost(spawn=spawn)

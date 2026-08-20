@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import sys
 import tempfile
@@ -13,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_session_inject_hook import (  # noqa: E402
+    main,
     resolve_mode,
     resolve_project_id,
     resolve_provider_and_ref,
@@ -412,6 +415,44 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("INJECTED", result["status"])
         self.assertEqual("bind_1", result["inject_response"]["binding_id"])
         self.assertEqual("session_start", result["trigger"])
+
+    def test_codex_session_start_is_silent_for_legacy_hook_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = StringIO()
+            with (
+                mock.patch("sys.stdin", StringIO('{"session_id":"thread-1"}')),
+                redirect_stdout(output),
+            ):
+                code = main(
+                    [
+                        "--repo-root",
+                        tmp,
+                        "--provider",
+                        "CODEX",
+                        "--from-stdin",
+                        "--trigger",
+                        "session_start",
+                        "--dry-run",
+                    ]
+                )
+        self.assertEqual(0, code)
+        self.assertEqual("", output.getvalue())
+
+    def test_setup_writes_quiet_project_codex_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = setup_provider_hooks(
+                root,
+                global_=False,
+                providers=["CODEX"],
+                python_exe="python",
+                script_path="tools/universe_session_inject_hook.py",
+            )
+            config = (root / ".codex" / "config.toml").read_text(
+                encoding="utf-8"
+            )
+        self.assertEqual("WRITTEN", result["providers"]["CODEX"]["status"])
+        self.assertIn("--quiet", config)
 
     def test_setup_writes_project_claude_and_grok_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

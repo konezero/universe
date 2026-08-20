@@ -71,6 +71,7 @@ from universe_runtime_worker_dispatch import (
     RuntimeWorkerDispatcher,
     WorkerDispatchError,
 )
+from universe_session_inject_hook import patch_mode_current_anchor
 from worker_failure_evidence import WorkerFailureEvidenceStore
 
 
@@ -4970,6 +4971,18 @@ class ResidentModeSessionHost:
             self._provider_session_ref = raw_session_id.strip()
         else:
             self._provider_session_ref = self.store.session_ref_for(provider)
+        if self._provider_session_ref:
+            # App-server thread/start exposes the provider id before the
+            # first turn. Project it immediately so CLI attach and the
+            # browser session card observe the same Mode coordinate.
+            patch_mode_current_anchor(
+                self.repository_root,
+                provider=provider,
+                session_ref=_provider_session_identity(
+                    provider, self._provider_session_ref
+                ),
+                mode=self.requested_mode,
+            )
         return active
 
     def save_idle(self, idle_seconds: float) -> Mapping[str, Any] | None:

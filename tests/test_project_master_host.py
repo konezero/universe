@@ -817,6 +817,33 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
 
+    def test_resident_mode_session_projects_new_provider_id_before_first_turn(self) -> None:
+        class StartedProvider(PreparedFakeProvider):
+            def prepare_session(self) -> None:
+                super().prepare_session()
+                self.session_id = "codex-thread-started"
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-anchor-projection.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=lambda *_args: StartedProvider(),
+        )
+        try:
+            with patch("project_master_host.patch_mode_current_anchor") as project:
+                host.prepare("CODEX", session_action="NEW")
+        finally:
+            host.close()
+
+        project.assert_called_once_with(
+            self.root,
+            provider="CODEX",
+            session_ref="codex-thread-started",
+            mode="CONDUCTOR",
+        )
+
     def test_resident_mode_session_replaces_changed_provider_profile(self) -> None:
         created: list[PreparedFakeProvider] = []
 
