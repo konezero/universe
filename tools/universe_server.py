@@ -14617,19 +14617,24 @@ class UniverseStore:
                 binding_id = str(binding.get("binding_id") or "")
                 if not binding_id:
                     continue
+                binding_data = {
+                    key: binding.get(key)
+                    for key in (
+                        "binding_id", "slot_role", "provider", "supervisor_session_id",
+                        "session_anchor_ref", "participant_state", "created_at", "updated_at",
+                    )
+                    if binding.get(key) is not None
+                }
+                if binding.get("provider") == "TASK_FRAME_RUN":
+                    binding_data["task_frame_run_ref"] = binding.get(
+                        "provider_session_ref"
+                    )
                 binding_node = add_node(
                     "ROOM_BINDING", binding_id,
                     str(binding.get("display_name") or binding.get("slot_role") or binding_id),
                     str(binding.get("state") or "UNKNOWN"),
                     "MULTI_ROOM_BINDING", f"{source_ref}/bindings/{binding_id}",
-                    {
-                        key: binding.get(key)
-                        for key in (
-                            "binding_id", "slot_role", "provider", "supervisor_session_id",
-                            "session_anchor_ref", "participant_state", "created_at", "updated_at",
-                        )
-                        if binding.get(key) is not None
-                    },
+                    binding_data,
                 )
                 add_edge("CHAT_ROOM_HAS_BINDING", room_node, binding_node, source_ref)
                 anchor_ref = str(binding.get("session_anchor_ref") or "")

@@ -6670,6 +6670,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
             },
             run_refs,
         )
+        graph = self.server.store.semantic_project_graph("GCS")
+        graph_run_refs = {
+            item["data"].get("task_frame_run_ref")
+            for item in graph["nodes"]
+            if item["entity_type"] == "ROOM_BINDING"
+            and item["data"].get("task_frame_run_ref")
+        }
+        self.assertEqual(run_refs, graph_run_refs)
         forwarded = client.create_approved_descendant_task_frame.call_args.kwargs
         self.assertEqual(proposal["proposal_id"], forwarded["primary_proposal"]["proposal_id"])
         self.assertEqual("UNIVERSE_UI", forwarded["governance_approval"]["commander_surface"])
