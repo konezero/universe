@@ -8719,6 +8719,57 @@ class UniverseStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def record_semantic_collection_observation(
+        self,
+        *,
+        project_id: str,
+        source_kind: str,
+        event_id: str,
+        event_type: str,
+        source_material: Mapping[str, Any],
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Advance one collection source without retaining source text.
+
+        The cursor is a currentness coordinate, not an extraction result.  Its
+        caller supplies a redacted material envelope; only its digest is kept.
+        """
+
+        project = self.get_project(project_id)
+        normalized_kind = _required_text(source_kind, "source_kind").upper()
+        normalized_event_id = _required_text(event_id, "event_id")
+        normalized_event_type = _required_text(event_type, "event_type").upper()
+        now = utc_now()
+        cursor = {
+            "project_id": project["project_id"],
+            "source_kind": normalized_kind,
+            "last_event_id": normalized_event_id,
+            "last_event_type": normalized_event_type,
+            "source_digest": _json_sha256(dict(source_material)),
+            "observed_at": observed_at or now,
+            "updated_at": now,
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO semantic_collection_cursor(
+                    project_id, source_kind, last_event_id, last_event_type,
+                    source_digest, observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_event_type = excluded.last_event_type,
+                    source_digest = excluded.source_digest,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                tuple(cursor[key] for key in (
+                    "project_id", "source_kind", "last_event_id", "last_event_type",
+                    "source_digest", "observed_at", "updated_at",
+                )),
+            )
+        return cursor
+
     def list_project_goals(self, project_id: str) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
         with self._connection() as connection:
@@ -24514,6 +24565,60 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return permission, changed
 
+    def _observe_multi_room_collection(
+        self,
+        message: Mapping[str, Any],
+        *,
+        result_event: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record redacted MultiRoom collection currentness for one write."""
+
+        room_id = str(message.get("room_id") or "")
+        message_id = str(message.get("message_id") or "")
+        if not room_id or not message_id:
+            return
+        try:
+            room = self.multi_rooms.get_room(room_id)
+            project_id = str(room.get("project_id") or "")
+            if not project_id:
+                return
+            self.store.record_semantic_collection_observation(
+                project_id=project_id,
+                source_kind="MULTI_ROOM_MESSAGE",
+                event_id=message_id,
+                event_type="MESSAGE",
+                source_material={
+                    "room_id": room_id,
+                    "message_id": message_id,
+                    "room_sequence": message.get("room_sequence"),
+                    "author_role": message.get("author_role"),
+                    "body_digest": _json_sha256(
+                        {"body_text": str(message.get("body_text") or "")}
+                    ),
+                },
+                observed_at=str(message.get("created_at") or "") or None,
+            )
+            if result_event is not None:
+                event_id = str(result_event.get("event_id") or "")
+                if event_id:
+                    self.store.record_semantic_collection_observation(
+                        project_id=project_id,
+                        source_kind="MULTI_ROOM_RESULT",
+                        event_id=event_id,
+                        event_type=str(result_event.get("event_type") or "RESULT"),
+                        source_material={
+                            "room_id": room_id,
+                            "event_id": event_id,
+                            "event_type": result_event.get("event_type"),
+                            "message_id": message_id,
+                            "severity": result_event.get("severity"),
+                        },
+                        observed_at=str(result_event.get("created_at") or "") or None,
+                    )
+        except (MultiRoomError, UniverseError):
+            # Collection observation never changes room delivery semantics.
+            return
+
     def _observe_native_room_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("event")
         room_id = event.get("room_id")
@@ -24592,6 +24697,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "idempotency_key": provider_event_id,
                 },
             )
+            self._observe_multi_room_collection(message)
             self.multi_rooms.record_provider_observation(
                 binding_id,
                 provider_event_id,
@@ -28001,6 +28107,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     message = self.server.multi_rooms.post_message(
                         unquote(room_message_post.group(1)), body or {}
                     )
+                    self.server._observe_multi_room_collection(message)
                     delivery = self.server.multi_room_delivery.deliver_room(
                         message["room_id"]
                     )
@@ -28169,6 +28276,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 try:
                     result = self.server.multi_rooms.worker_report(
                         unquote(room_worker_report.group(1)), body or {}
+                    )
+                    self.server._observe_multi_room_collection(
+                        result["message"], result_event=result["event"]
                     )
                     self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:

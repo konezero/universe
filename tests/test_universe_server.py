@@ -1237,6 +1237,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("CHAT_ROOM_HAS_RESULT", edge_types)
         self.assertIn("ROOM_RESULT_REFS_MESSAGE", edge_types)
 
+    def test_multi_room_writes_advance_redacted_semantic_collection_cursors(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_boss_room(
+            project_id="GCS",
+            task_frame_id="tf-room-cursor-001",
+        )
+
+        status, recorded = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/worker-report",
+            {
+                "body_text": "Sensitive implementation detail remains outside cursor storage.",
+                "severity": "BLOCKER",
+                "idempotency_key": "room-cursor-worker-report-001",
+            },
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        cursors = {
+            item["source_kind"]: item
+            for item in self.server.store.list_semantic_collection_cursors("GCS")
+        }
+        message_cursor = cursors["MULTI_ROOM_MESSAGE"]
+        result_cursor = cursors["MULTI_ROOM_RESULT"]
+        self.assertEqual(recorded["message"]["message_id"], message_cursor["last_event_id"])
+        self.assertEqual(recorded["event"]["event_id"], result_cursor["last_event_id"])
+        self.assertNotIn("Sensitive implementation detail", json.dumps(cursors))
+
     def test_semantic_project_graph_projects_current_functional_seed_nodes(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, seed_result = self.request(
