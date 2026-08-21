@@ -1197,6 +1197,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
             }.issubset(edge_types)
         )
 
+    def test_semantic_project_graph_projects_current_functional_seed_nodes(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, seed_result = self.request(
+            "POST", "/v1/projects/GCS/seed", self.project_seed(), self.token
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+
+        status, semantic = self.request(
+            "GET", "/v1/projects/GCS/semantic-graph", None, self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        functional = {
+            item["data"]["node_id"]: item
+            for item in semantic["nodes"]
+            if item["entity_type"] == "FUNCTIONAL_NODE"
+        }
+        self.assertEqual(
+            {"broker-client", "strategy-viewer"}, set(functional)
+        )
+        self.assertTrue(
+            all(
+                item["provenance"]["source_ref"].endswith(seed_result["seed"]["seed_id"])
+                for item in functional.values()
+            )
+        )
+        self.assertIn(
+            "PROJECT_HAS_FUNCTIONAL_NODE",
+            {item["edge_type"] for item in semantic["edges"]},
+        )
+
     def test_todo_cannot_bind_to_a_goal_from_another_project(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration())
         _, goal_result = self.request(

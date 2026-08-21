@@ -14260,6 +14260,48 @@ class UniverseStore:
             )
             add_edge("PROJECT_HAS_TODO", project_node, todo_node, f"universe://todos/{todo_id}")
 
+        # A current Project Seed is the authoritative source for functional
+        # decomposition.  Its nodes are projected automatically; this does
+        # not create, promote, or mutate the Seed when one is absent.
+        try:
+            project_seed = self.get_project_seed(project_id)
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            project_seed = None
+        if project_seed is not None:
+            functional_nodes: dict[str, str] = {}
+            seed_id = str(project_seed.get("seed_id") or "UNKNOWN")
+            seed_ref = f"universe://project-seeds/{project_id}/{seed_id}"
+            for functional in project_seed.get("nodes") or []:
+                if not isinstance(functional, Mapping):
+                    continue
+                functional_id = str(functional.get("node_id") or "")
+                if not functional_id:
+                    continue
+                functional_node = add_node(
+                    "FUNCTIONAL_NODE", f"{project_id}:{functional_id}",
+                    str(functional.get("title") or functional_id),
+                    str(functional.get("state") or "CURRENT"),
+                    "PROJECT_SEED", seed_ref,
+                    {
+                        key: functional.get(key)
+                        for key in ("node_id", "kind", "title", "purpose", "acceptance_condition")
+                        if functional.get(key) is not None
+                    },
+                )
+                functional_nodes[functional_id] = functional_node
+                add_edge("PROJECT_HAS_FUNCTIONAL_NODE", project_node, functional_node, seed_ref)
+            for functional_edge in project_seed.get("edges") or []:
+                if not isinstance(functional_edge, Mapping):
+                    continue
+                source = functional_nodes.get(str(functional_edge.get("from_node") or ""))
+                target = functional_nodes.get(str(functional_edge.get("to_node") or ""))
+                if source is None or target is None:
+                    continue
+                relation = str(functional_edge.get("kind") or "RELATED_TO")
+                add_edge(f"FUNCTIONAL_{relation}", source, target, seed_ref)
+
         for prediction in self.list_work_loop_predictions(project_id):
             proposal_id = str(prediction.get("proposal_id") or "")
             if not proposal_id:
