@@ -2374,6 +2374,50 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("TARGET_ACCEPTED", resumed["progress"]["step"])
 
+    def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        delegation, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "GCS",
+                "summary": "Retry delivery after the verified chat appears in the catalog.",
+                "idempotency_key": "allocation-catalog-retry-001",
+                "worker_role": "PROJECT_MASTER",
+                "target_session_action": "NEW",
+                "origin_session_anchor_ref": "session-anchor-conductor-001",
+                "origin_session_chat_key": "provider_chat_1234567890abcdef12345678",
+            }
+        )
+        self.assertTrue(created)
+        self.server.store.start_conductor_delegation(delegation["delegation_id"])
+        self.server.store.update_conductor_delegation_progress(
+            delegation["delegation_id"],
+            {
+                "summary": "Hook verified the target; catalog entry is pending.",
+                "step": "WAITING_FOR_VENDOR_CHAT",
+                "target_session_anchor_ref": "session-anchor-new-master-001",
+            },
+        )
+        self.server.session_anchor_transport.deliver = Mock(
+            return_value={
+                "progress": {
+                    "summary": "Delivered after catalog visibility was confirmed.",
+                    "step": "TARGET_ACCEPTED",
+                }
+            }
+        )
+
+        self.server._resume_hook_verified_conductor_allocations(
+            "GCS",
+            "session-anchor-new-master-001",
+            retry_catalog_visibility=True,
+        )
+
+        self.server.session_anchor_transport.deliver.assert_called_once()
+        resumed = self.server.store.get_conductor_delegation(
+            delegation["delegation_id"]
+        )
+        self.assertEqual("TARGET_ACCEPTED", resumed["progress"]["step"])
+
     def test_semantic_graph_extracts_room_decisions_and_todo_candidates(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         decision, decision_created = self.server.store.create_room_message(

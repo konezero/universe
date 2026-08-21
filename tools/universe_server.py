@@ -22393,6 +22393,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     f"{source_id}/activity/{latest.get('activity_id')}"
                 ),
             )
+        # A Session Hook has already verified these anchors.  The provider
+        # catalog can still lag that hook by one or more scans, so retry only
+        # allocations that were explicitly parked for catalog visibility.
+        # Never use this path to bypass the initial Hook requirement.
+        for session in sessions_by_identity.values():
+            project_id = str(session.get("project_id") or "").strip()
+            session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+            if project_id and session_anchor_ref:
+                self._resume_hook_verified_conductor_allocations(
+                    project_id,
+                    session_anchor_ref,
+                    retry_catalog_visibility=True,
+                )
         return scans
 
     def tail_live_provider_sessions(self) -> dict[str, Any]:
@@ -24064,16 +24077,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
 
     def _resume_hook_verified_conductor_allocations(
-        self, project_id: str, session_anchor_ref: str
+        self,
+        project_id: str,
+        session_anchor_ref: str,
+        *,
+        retry_catalog_visibility: bool = False,
     ) -> None:
-        """Deliver only allocations whose Session Hook verified this target."""
+        """Deliver only allocations whose Session Hook verified this target.
+
+        The initial call runs from the Hook and may only advance
+        ``WAITING_FOR_VENDOR_HOOK``.  A later provider catalog scan may retry
+        the narrower ``WAITING_FOR_VENDOR_CHAT`` state, which exists only
+        after that Hook already succeeded.
+        """
+
+        waiting_step = (
+            "WAITING_FOR_VENDOR_CHAT"
+            if retry_catalog_visibility
+            else "WAITING_FOR_VENDOR_HOOK"
+        )
 
         waiting = [
             item
             for item in self.store.list_conductor_delegations(
                 project_id=project_id, state="RUNNING", limit=500
             )
-            if item.get("progress", {}).get("step") == "WAITING_FOR_VENDOR_HOOK"
+            if item.get("progress", {}).get("step") == waiting_step
             and item.get("progress", {}).get("target_session_anchor_ref")
             == session_anchor_ref
         ]
