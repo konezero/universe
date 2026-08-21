@@ -3229,7 +3229,14 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UniverseError("REQUEST_INVALID", "room message body must be an object")
     kind = _identifier(value.get("kind", "QUESTION"), "kind").upper()
-    if kind not in {"QUESTION", "REVIEW", "STATUS", "TASK_DRAFT", "RESULT"}:
+    if kind not in {
+        "QUESTION",
+        "REVIEW",
+        "STATUS",
+        "TASK_DRAFT",
+        "RESULT",
+        "DECISION",
+    }:
         raise UniverseError(
             "ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind"
         )
@@ -14742,6 +14749,63 @@ class UniverseStore:
             )
             room_message_nodes[message_id] = message_node
             add_edge("PROJECT_HAS_ROOM_MESSAGE", project_node, message_node, source_ref)
+            message_kind = str(message.get("kind") or "").upper()
+            if message_kind == "DECISION":
+                decision_node = add_node(
+                    "ROOM_DECISION",
+                    message_id,
+                    f"Decision · {message.get('sender') or 'UNKNOWN'}",
+                    str(message.get("delivery_state") or "RECORDED"),
+                    "PROJECT_ROOM_EXTRACTION",
+                    source_ref,
+                    {
+                        "message_id": message_id,
+                        "content_digest": message.get("content_digest"),
+                        "sender": message.get("sender"),
+                        "created_at": message.get("created_at"),
+                        "extraction_state": "AUTO_OBSERVED",
+                    },
+                )
+                add_edge(
+                    "ROOM_MESSAGE_DERIVES_DECISION",
+                    message_node,
+                    decision_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_ROOM_DECISION",
+                    project_node,
+                    decision_node,
+                    source_ref,
+                )
+            elif message_kind == "TASK_DRAFT":
+                candidate_node = add_node(
+                    "TODO_CANDIDATE",
+                    message_id,
+                    f"Todo candidate · {message.get('sender') or 'UNKNOWN'}",
+                    "PROPOSAL_ONLY",
+                    "PROJECT_ROOM_EXTRACTION",
+                    source_ref,
+                    {
+                        "message_id": message_id,
+                        "content_digest": message.get("content_digest"),
+                        "sender": message.get("sender"),
+                        "created_at": message.get("created_at"),
+                        "promotion_state": "USER_SELECTION_REQUIRED",
+                    },
+                )
+                add_edge(
+                    "ROOM_MESSAGE_DERIVES_TODO_CANDIDATE",
+                    message_node,
+                    candidate_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_TODO_CANDIDATE",
+                    project_node,
+                    candidate_node,
+                    source_ref,
+                )
             todo_id = str(message.get("todo_id") or "")
             if todo_id and f"todo:{todo_id}" in node_ids:
                 add_edge("ROOM_MESSAGE_REFERENCES_TODO", message_node, f"todo:{todo_id}", source_ref)

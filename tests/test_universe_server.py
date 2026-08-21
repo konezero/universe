@@ -2269,6 +2269,46 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("SESSION_ANCHOR_ALLOCATES_WORK", edge_types)
         self.assertIn("WORK_ALLOCATION_TARGETS_SESSION_ANCHOR", edge_types)
 
+    def test_semantic_graph_extracts_room_decisions_and_todo_candidates(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        decision, decision_created = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "DECISION",
+                "sender": "USER",
+                "body": "Use the anchor graph as the currentness source.",
+                "idempotency_key": "graph-decision-001",
+            },
+        )
+        candidate, candidate_created = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "TASK_DRAFT",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "Add durable cursors to the automatic collector.",
+                "idempotency_key": "graph-todo-candidate-001",
+            },
+        )
+        self.assertTrue(decision_created)
+        self.assertTrue(candidate_created)
+        graph = self.server.store.semantic_project_graph("GCS")
+        decision_nodes = [
+            item for item in graph["nodes"] if item["entity_type"] == "ROOM_DECISION"
+        ]
+        candidate_nodes = [
+            item for item in graph["nodes"] if item["entity_type"] == "TODO_CANDIDATE"
+        ]
+        self.assertEqual(decision["message_id"], decision_nodes[0]["data"]["message_id"])
+        self.assertEqual(candidate["message_id"], candidate_nodes[0]["data"]["message_id"])
+        self.assertNotIn("body", decision_nodes[0]["data"])
+        self.assertEqual(
+            "USER_SELECTION_REQUIRED",
+            candidate_nodes[0]["data"]["promotion_state"],
+        )
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertIn("ROOM_MESSAGE_DERIVES_DECISION", edge_types)
+        self.assertIn("ROOM_MESSAGE_DERIVES_TODO_CANDIDATE", edge_types)
+
     def test_session_inject_hook_becomes_deduplicated_redacted_graph_input(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         body = {
