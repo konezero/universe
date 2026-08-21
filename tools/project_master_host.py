@@ -224,45 +224,6 @@ class ProjectModeCoordinator:
         self._prepared = dict(anchor_preparation)
         return anchor_preparation
 
-    def _prepare_legacy_runtime(self) -> Mapping[str, Any]:
-        definition = self._mode_definition()
-        self._mode_role = definition["role"]
-        source = self._resolved_source_binding()
-        request = {
-            "command": "BOOT",
-            "source_state": "SOURCE_READY",
-            "source_ref": source["source_ref"],
-            "source_commit": source["source_commit"],
-            "source_repository": source["source_repository"],
-            "mode": self.requested_mode,
-            "role": definition["role"],
-            "scope": definition["scope"],
-            "host_session_ref": self.host_session_ref,
-            "anchor_snapshot_ref": "UNKNOWN",
-            "host_executable_capability": "AVAILABLE",
-            "mode_profile": definition["mode_profile"],
-            "task_requirement": "NONE",
-            "evidence_profile": "NONE",
-        }
-        result = self._invoke(
-            ("prepare-session", "--repo-root", str(self.project_root)),
-            request,
-        )
-        anchor = result.get("mode_current_anchor")
-        anchor_status = anchor.get("status") if isinstance(anchor, Mapping) else None
-        if result.get("status") != "SESSION_PREPARED" or anchor_status not in {
-            "MODE_CURRENT_ANCHOR_CREATED",
-            "MODE_CURRENT_ANCHOR_OBSERVED",
-        }:
-            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_PREPARATION_FAILED")
-        _mode_boot_binding(
-            result,
-            expected_mode=self.requested_mode,
-            expected_role=definition["role"],
-        )
-        self._prepared = dict(result)
-        return result
-
     def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
         message_id = _text(message.get("message_id"), "message.message_id")
         anchor_observation = self._anchor_graph_observation(
@@ -7593,29 +7554,6 @@ def _mode_current_anchor_ref(preparation: Mapping[str, Any]) -> str:
     if not isinstance(anchor_ref, str) or not anchor_ref.strip():
         raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
     return anchor_ref.strip()
-
-
-def _mode_boot_binding(
-    preparation: Mapping[str, Any],
-    *,
-    expected_mode: str,
-    expected_role: str,
-) -> dict[str, str]:
-    binding = preparation.get("mode_boot_binding")
-    if not isinstance(binding, Mapping) or binding.get("status") != "PREPARED":
-        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE")
-    normalized = {
-        field: _text(binding.get(field), f"mode_boot_binding.{field}")
-        for field in ("binding_id", "mode", "role", "frame_id", "anchor_id")
-    }
-    if (
-        normalized["mode"] != expected_mode
-        or normalized["role"] != expected_role
-    ):
-        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_MISMATCH")
-    if normalized["anchor_id"] != _mode_current_anchor_ref(preparation):
-        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_MISMATCH")
-    return normalized
 
 
 def _path_is_within(target: Path, root: Path) -> bool:
