@@ -14213,6 +14213,7 @@ class UniverseStore:
             f"universe://projects/{project_id}",
             project,
         )
+        session_nodes_by_provider_digest: dict[str, str] = {}
         for session in self.session_supervisor.list_sessions(
             node=project_id, include_hidden=True
         ):
@@ -14240,6 +14241,9 @@ class UniverseStore:
                 },
             )
             add_edge("PROJECT_HAS_SESSION", project_node, session_node, source_ref)
+            provider_session_ref = str(session.get("provider_session_ref") or "")
+            if provider_session_ref:
+                session_nodes_by_provider_digest[_json_sha256(provider_session_ref)] = session_node
             anchor_ref = str(session.get("session_anchor_ref") or "")
             if anchor_ref:
                 anchor_node = add_node(
@@ -14554,17 +14558,44 @@ class UniverseStore:
                 continue
             source_ref = f"universe://events/{event_id}"
             payload = event.get("payload")
+            event_type = str(event.get("event_type") or "EVENT")
+            event_data = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "created_at": event.get("created_at"),
+                "payload_digest": _json_sha256(payload),
+            }
+            entity_type = "EVENT"
+            label = event_type
+            if event_type == "GIT_WORK_STATUS" and isinstance(payload, Mapping):
+                entity_type = "GIT_MILESTONE"
+                operation = str(payload.get("operation") or "GIT")
+                state = str(payload.get("state") or "OBSERVED")
+                label = f"{operation} · {state}"
+                event_data.update(
+                    {
+                        key: payload.get(key)
+                        for key in (
+                            "source", "operation", "state", "exit_code", "commit_sha",
+                            "short_sha", "branch", "remote", "redaction_state",
+                        )
+                        if payload.get(key) is not None
+                    }
+                )
             event_node = add_node(
-                "EVENT", event_id, str(event.get("event_type") or "EVENT"),
+                entity_type, event_id, label,
                 "OBSERVED", "PROJECT_EVENT", source_ref,
-                {
-                    "event_id": event_id,
-                    "event_type": event.get("event_type"),
-                    "created_at": event.get("created_at"),
-                    "payload_digest": _json_sha256(payload),
-                },
+                event_data,
             )
             add_edge("PROJECT_HAS_EVENT", project_node, event_node, source_ref)
+            if event_type == "GIT_WORK_STATUS" and isinstance(payload, Mapping):
+                session_node = session_nodes_by_provider_digest.get(
+                    str(payload.get("provider_session_digest") or "")
+                )
+                if session_node is not None:
+                    add_edge(
+                        "GIT_MILESTONE_FROM_SESSION", event_node, session_node, source_ref
+                    )
 
         for observation in self.list_skill_observations(project_id, limit=200):
             observation_id = str(observation.get("observation_id") or "")

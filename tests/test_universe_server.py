@@ -1269,6 +1269,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
     def test_project_master_git_trace_status_becomes_redacted_graph_input(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "git-trace-semantic-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:vendor-secret-ref",
+            }
+        )
         completion = {
             "status": "COMPLETED",
             "project_id": "GCS",
@@ -1301,6 +1311,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertNotIn("changed_files", payload)
         self.assertNotEqual(
             completion["provider_session_ref"], payload["provider_session_digest"]
+        )
+        status, semantic = self.request(
+            "GET", "/v1/projects/GCS/semantic-graph", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn(
+            f"git_milestone:{git_events[0]['event_id']}",
+            {item["id"] for item in semantic["nodes"]},
+        )
+        self.assertIn(
+            "GIT_MILESTONE_FROM_SESSION",
+            {item["edge_type"] for item in semantic["edges"]},
         )
 
     def test_todo_cannot_bind_to_a_goal_from_another_project(self) -> None:
