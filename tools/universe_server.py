@@ -14953,6 +14953,117 @@ class UniverseStore:
                         source_ref,
                     )
 
+            # Multi-room messages are a separate durable conversation plane.
+            # Keep their text out of the graph while retaining the exact room,
+            # author binding, sequence, and content provenance needed by the
+            # automatic collector.  No message text is interpreted as a Todo,
+            # decision, or authority claim here; promotion stays user-driven.
+            multi_message_nodes: dict[str, str] = {}
+            for message in self.multi_rooms.list_messages(room_id, limit=200):
+                message_id = str(message.get("message_id") or "")
+                if not message_id:
+                    continue
+                message_ref = f"{source_ref}/messages/{message_id}"
+                content_digest = _json_sha256(
+                    {"body_text": str(message.get("body_text") or "")}
+                )
+                graph_message = {
+                    key: message.get(key)
+                    for key in (
+                        "message_id", "room_id", "room_event_id", "room_sequence",
+                        "author_role", "author_binding_id", "created_at",
+                    )
+                    if message.get(key) is not None
+                }
+                graph_message.update(
+                    {
+                        "content_digest": content_digest,
+                        "body_in_graph": False,
+                        "extraction_state": "AUTO_OBSERVED",
+                    }
+                )
+                if message.get("provider_event_id"):
+                    graph_message["provider_event_digest"] = _json_sha256(
+                        {"provider_event_id": message.get("provider_event_id")}
+                    )
+                if message.get("correlation_id"):
+                    graph_message["correlation_digest"] = _json_sha256(
+                        {"correlation_id": message.get("correlation_id")}
+                    )
+                message_node = add_node(
+                    "CHAT_ROOM_MESSAGE",
+                    f"{room_id}:{message_id}",
+                    f"{message.get('author_role') or 'UNKNOWN'} · room message",
+                    "RECORDED",
+                    "MULTI_ROOM_MESSAGE",
+                    message_ref,
+                    graph_message,
+                )
+                multi_message_nodes[message_id] = message_node
+                add_edge("CHAT_ROOM_HAS_MESSAGE", room_node, message_node, message_ref)
+                binding_id = str(message.get("author_binding_id") or "")
+                if binding_id:
+                    add_edge(
+                        "ROOM_MESSAGE_AUTHORED_BY_BINDING",
+                        message_node,
+                        f"room_binding:{binding_id}",
+                        message_ref,
+                    )
+
+            # BOSS-room Worker reports are results, not transcript messages.
+            # Project their structured, non-secret envelope independently so a
+            # graph consumer can distinguish a result from discussion text.
+            for event in self.multi_rooms.list_control_events(room_id, limit=200):
+                event_id = str(event.get("event_id") or "")
+                event_type = str(event.get("event_type") or "ROOM_CONTROL")
+                if not event_id:
+                    continue
+                event_ref = f"{source_ref}/control-events/{event_id}"
+                payload = event.get("payload")
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                if event_type == "WORKER_REPORT":
+                    message_id = str(event.get("message_id") or "")
+                    result_node = add_node(
+                        "ROOM_RESULT",
+                        event_id,
+                        "Worker report",
+                        str(payload.get("severity") or event.get("severity") or "INFO"),
+                        "MULTI_ROOM_RESULT",
+                        event_ref,
+                        {
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "room_id": room_id,
+                            "message_id": message_id or None,
+                            "severity": payload.get("severity") or event.get("severity"),
+                            "created_at": event.get("created_at"),
+                            "body_in_graph": False,
+                            "extraction_state": "AUTO_OBSERVED",
+                        },
+                    )
+                    add_edge("CHAT_ROOM_HAS_RESULT", room_node, result_node, event_ref)
+                    message_node = multi_message_nodes.get(message_id)
+                    if message_node is not None:
+                        add_edge("ROOM_RESULT_REFS_MESSAGE", result_node, message_node, event_ref)
+                else:
+                    control_node = add_node(
+                        "ROOM_CONTROL_EVENT",
+                        event_id,
+                        f"Room control · {event_type}",
+                        "RECORDED",
+                        "MULTI_ROOM_CONTROL_EVENT",
+                        event_ref,
+                        {
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "room_id": room_id,
+                            "created_at": event.get("created_at"),
+                            "payload_in_graph": False,
+                        },
+                    )
+                    add_edge("CHAT_ROOM_HAS_CONTROL_EVENT", room_node, control_node, event_ref)
+
         room_message_nodes: dict[str, str] = {}
         room_message_parents: list[tuple[str, str]] = []
         for message in self.list_room_messages(project_id, limit=200):

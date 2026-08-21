@@ -1197,6 +1197,46 @@ class UniverseLocalServiceTests(unittest.TestCase):
             }.issubset(edge_types)
         )
 
+    def test_semantic_project_graph_collects_redacted_multi_room_messages_and_results(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_boss_room(
+            project_id="GCS",
+            task_frame_id="tf-room-graph-001",
+        )
+        report = self.server.multi_rooms.worker_report(
+            room["room_id"],
+            {
+                "body_text": "Do not expose this worker report in the graph.",
+                "severity": "BLOCKER",
+                "idempotency_key": "room-graph-worker-report-001",
+            },
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        message = report["message"]
+        message_nodes = [
+            item for item in graph["nodes"]
+            if item["entity_type"] == "CHAT_ROOM_MESSAGE"
+            and item["data"].get("message_id") == message["message_id"]
+        ]
+        result_nodes = [
+            item for item in graph["nodes"]
+            if item["entity_type"] == "ROOM_RESULT"
+            and item["data"].get("event_id") == report["event"]["event_id"]
+        ]
+        self.assertEqual(1, len(message_nodes))
+        self.assertEqual(1, len(result_nodes))
+        self.assertTrue(message_nodes[0]["data"]["body_in_graph"] is False)
+        self.assertNotIn("body_text", message_nodes[0]["data"])
+        self.assertNotIn("Do not expose", json.dumps(graph))
+        self.assertEqual("BLOCKER", result_nodes[0]["data"]["severity"])
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertIn("CHAT_ROOM_HAS_MESSAGE", edge_types)
+        self.assertIn("CHAT_ROOM_HAS_RESULT", edge_types)
+        self.assertIn("ROOM_RESULT_REFS_MESSAGE", edge_types)
+
     def test_semantic_project_graph_projects_current_functional_seed_nodes(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, seed_result = self.request(
