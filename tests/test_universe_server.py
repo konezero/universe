@@ -142,7 +142,7 @@ class UniverseWorkPreflightTests(unittest.TestCase):
             ),
         ]
 
-    def test_work_preflight_requires_career_runtime_before_apply(self) -> None:
+    def test_work_preflight_requires_project_runtime_before_apply(self) -> None:
         with patch("universe_server.request_json", side_effect=self._responses()):
             status, result = resolve_project_work_preflight(
                 project_root=self.root,
@@ -152,7 +152,7 @@ class UniverseWorkPreflightTests(unittest.TestCase):
             )
 
         self.assertEqual(200, status)
-        self.assertEqual("CAREER_OS_INSTALL_REQUIRED", result["status"])
+        self.assertEqual("PROJECT_RUNTIME_INSTALL_REQUIRED", result["status"])
         self.assertEqual("NONE", result["effects"]["project_source_write"])
 
     def test_work_preflight_requires_exact_integration_approval_when_binding_missing(

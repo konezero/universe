@@ -30998,9 +30998,9 @@ def resolve_project_work_preflight(
             "universe": health.get("universe"),
         },
         "runtime_installation": (
-            "INSTALLED_CAREER_RUNTIME"
+            "INSTALLED_PROJECT_RUNTIME"
             if runtime_manifest.is_file() and not runtime_manifest.is_symlink()
-            else "MISSING_CAREER_RUNTIME"
+            else "MISSING_PROJECT_RUNTIME"
         ),
         "install_binding": {
             "status": "PRESENT" if install_binding is not None else "MISSING",
@@ -31036,11 +31036,11 @@ def resolve_project_work_preflight(
         "asset_count": len(proposal.get("assets") or []),
         "apply_contract": proposal.get("apply_contract"),
     }
-    if response["runtime_installation"] == "MISSING_CAREER_RUNTIME":
+    if response["runtime_installation"] == "MISSING_PROJECT_RUNTIME":
         response.update(
             {
-                "status": "CAREER_OS_INSTALL_REQUIRED",
-                "next_operation": "INSTALL_CAREER_RUNTIME_THROUGH_RELEASE_LIFECYCLE",
+                "status": "PROJECT_RUNTIME_INSTALL_REQUIRED",
+                "next_operation": "INSTALL_PROJECT_RUNTIME_FROM_RELEASE_ARTIFACT",
             }
         )
     elif install_binding is None:

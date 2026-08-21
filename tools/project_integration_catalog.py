@@ -161,7 +161,7 @@ def load_project_integration_catalog(root: Path | None = None) -> dict[str, Any]
         "effects": {
             "project_source_write": "NONE",
             "project_runtime_state_write": "NONE",
-            "career_release_write": "NONE",
+            "runtime_release_write": "NONE",
         },
     }
 
@@ -238,12 +238,12 @@ def build_project_integration_proposal(
         "effects": {
             "project_source_write": "PROPOSED",
             "project_runtime_state_write": "PROPOSED",
-            "career_release_write": "NONE",
+            "runtime_release_write": "NONE",
         },
         "apply_contract": {
             "owner": "UNIVERSE_PROJECT_LIFECYCLE_HOST",
             "project_binding": "PROJECT_SOURCE_APPROVAL_REQUIRED",
-            "local_runtime": "INSTALLED_CAREER_RUNTIME_REQUIRED",
+            "local_runtime": "INSTALLED_PROJECT_RUNTIME_REQUIRED",
             "execution": "NOT_STARTED",
         },
     }
