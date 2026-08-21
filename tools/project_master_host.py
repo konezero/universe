@@ -2099,48 +2099,19 @@ class ProjectModeCoordinator:
                 and self._runtime_process.poll() is None
             ):
                 return dict(self._runtime_binding)
-            # Runtime serving is a compatibility-only boundary used by the
-            # older mutation/Task Frame endpoints.  A resident chat prepares
-            # from its Session Anchor, so do not accidentally promote that
-            # lightweight preparation into a Mode Boot binding here.
-            prepared = dict(self._prepare_legacy_runtime())
-            anchor = prepared.get("mode_current_anchor")
-            snapshot = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
-            payload = (
-                snapshot.get("snapshot") if isinstance(snapshot, Mapping) else None
+            # A resident Host attaches directly to the exact Session Anchor
+            # observed by the Supervisor.  Mode Boot bindings remain only for
+            # already-running compatibility callers; creating one here would
+            # reintroduce the legacy prepare-session gate.
+            session = self._anchor_graph_session()
+            if session is None:
+                raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+            anchor_id = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+            session_id = _text(session.get("session_id"), "session_id")
+            frame_id = _text(
+                recover_task_frame_id or "current", "project_runtime.frame_id"
             )
-            anchor_id = (
-                _text(payload.get("anchor_id"), "mode_current_anchor.anchor_id")
-                if isinstance(payload, Mapping)
-                else ""
-            )
-            if not anchor_id:
-                raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
-            prepared_binding = prepared.get("mode_boot_binding")
-            prepared_role = (
-                str(prepared_binding.get("role") or "").strip().upper()
-                if isinstance(prepared_binding, Mapping)
-                else ""
-            )
-            expected_role = (
-                self._mode_role
-                or prepared_role
-                or self._mode_definition()["role"]
-            )
-            mode_boot_binding = _mode_boot_binding(
-                prepared,
-                expected_mode=self.requested_mode,
-                expected_role=expected_role,
-            )
-            self._mode_role = expected_role
-            if mode_boot_binding["anchor_id"] != anchor_id:
-                raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_MISMATCH")
-            frame_id = mode_boot_binding["frame_id"]
-            session_id = self._runtime_session_id(
-                anchor_id=anchor_id,
-                frame_id=frame_id,
-                recover_task_frame_id=recover_task_frame_id,
-            )
+            self._mode_role = "UNASSIGNED"
             token = secrets.token_urlsafe(32)
             python = _required_host_executable("python")
             command = [
@@ -2156,8 +2127,8 @@ class ProjectModeCoordinator:
                 frame_id,
                 "--anchor-id",
                 anchor_id,
-                "--boot-binding-id",
-                mode_boot_binding["binding_id"],
+                "--mode",
+                self.requested_mode,
                 "--host-action",
                 "PERSISTENT_SESSION_ATTACH",
                 "--session-location",
@@ -2197,12 +2168,10 @@ class ProjectModeCoordinator:
                     or not isinstance(runtime_state, Mapping)
                     or runtime_state.get("anchor_id") != anchor_id
                     or runtime_state.get("mode") != self.requested_mode
-                    or runtime_state.get("role") != self._mode_role
+                    or runtime_state.get("role") != "UNASSIGNED"
                     or runtime_state.get("executable_runtime_currentness") != "CURRENT"
-                    or not isinstance(startup.get("mode_boot_binding"), Mapping)
-                    or startup["mode_boot_binding"].get("binding_id")
-                    != mode_boot_binding["binding_id"]
-                    or startup["mode_boot_binding"].get("status") != "ACTIVE"
+                    or startup.get("attachment_path") != "ANCHOR_GRAPH"
+                    or "mode_boot_binding" in startup
                 ):
                     raise ProjectMasterHostError(
                         "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
@@ -2227,7 +2196,7 @@ class ProjectModeCoordinator:
                 "session_id": session_id,
                 "frame_id": frame_id,
                 "anchor_id": anchor_id,
-                "mode_boot_binding_id": mode_boot_binding["binding_id"],
+                "attachment_path": "ANCHOR_GRAPH",
                 "runtime_currentness_observation": str(
                     runtime_state["executable_runtime_currentness"]
                 ),

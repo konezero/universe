@@ -2463,26 +2463,10 @@ class ProjectMasterHostTests(unittest.TestCase):
             session["session_anchor_ref"], observation["snapshot"]["anchor_id"]
         )
 
-    def test_project_mode_coordinator_resolves_role_from_selected_mode(self) -> None:
+    def test_project_mode_coordinator_anchor_prepare_does_not_resolve_mode_role(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
-        registry = self.root / ".ai/runtime/project_instance/mode_registry.json"
-        registry.parent.mkdir(parents=True, exist_ok=True)
-        registry.write_text(
-            json.dumps(
-                {
-                    "modes": {
-                        "DESIGN": {
-                            "role": "DESIGNER",
-                            "scope": "product/ux",
-                            "mode_profile": "GOVERNANCE_ONLY",
-                        }
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
         requests: list[dict[str, Any]] = []
 
         def runner(request):
@@ -2490,31 +2474,22 @@ class ProjectMasterHostTests(unittest.TestCase):
                 request.arguments[request.arguments.index("--request") + 1]
             )
             requests.append(json.loads(request_path.read_text(encoding="utf-8")))
-            payload = {
-                "status": "SESSION_PREPARED",
-                "mode_current_anchor": {
-                    "status": "MODE_CURRENT_ANCHOR_OBSERVED",
-                    "snapshot": {"snapshot": {"anchor_id": "DESIGN-CURRENT-001"}},
-                },
-                "mode_boot_binding": {
-                    "status": "PREPARED",
-                    "binding_id": "mode-boot-design-001",
-                    "mode": "DESIGN",
-                    "role": "DESIGNER",
-                    "frame_id": "current",
-                    "anchor_id": "DESIGN-CURRENT-001",
-                },
+            raise AssertionError("Anchor Graph preparation must not invoke Runtime Boot")
+
+        supervisor = SessionSupervisorStore(self.root / "design-anchor.sqlite3")
+        supervisor.register_session(
+            {
+                "session_id": "session-design-001",
+                "node": "universe",
+                "project_id": "GCS",
+                "mode": "DESIGN",
+                "provider": "CODEX",
+                "provider_session_ref": "codex:session-design-001",
+                "anchor_ref": "DESIGN-CURRENT-001",
+                "state": "REGISTERED",
+                "currentness": "CURRENT",
             }
-            return NativeCliResult(
-                contract="universe.windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout=json.dumps(payload),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
+        )
 
         coordinator = ProjectModeCoordinator(
             self.root,
@@ -2523,16 +2498,17 @@ class ProjectMasterHostTests(unittest.TestCase):
             session_node="universe",
             requested_mode="DESIGN",
             native_runner=runner,
+            session_supervisor=supervisor,
             source_binding_resolver=lambda _root: self._selected_release(),
         )
 
-        coordinator.prepare()
+        preparation = coordinator.prepare()
 
         self.assertEqual("universe", coordinator.session_node)
         self.assertEqual("DESIGN", coordinator.requested_mode)
-        self.assertEqual("DESIGNER", coordinator._mode_role)
-        self.assertEqual("DESIGN", requests[0]["mode"])
-        self.assertEqual("DESIGNER", requests[0]["role"])
+        self.assertIsNone(coordinator._mode_role)
+        self.assertEqual("DESIGN", preparation["mode"])
+        self.assertEqual([], requests)
 
     def test_project_mode_coordinator_requires_exact_session_anchor(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
@@ -2588,7 +2564,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         ):
             coordinator.prepare()
 
-    def test_project_mode_runtime_uses_prepared_binding_and_anchor_frame(self) -> None:
+    def test_project_mode_runtime_attaches_directly_to_supervised_anchor(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
@@ -2598,23 +2574,16 @@ class ProjectMasterHostTests(unittest.TestCase):
             "codex:session-001",
             source_binding_resolver=lambda _root: self._selected_release(),
         )
-        coordinator._prepared = {
-            "status": "SESSION_PREPARED",
-            "mode_current_anchor": {
-                "status": "MODE_CURRENT_ANCHOR_CREATED",
-                "snapshot": {
-                    "snapshot": {"anchor_id": "MASTER-CURRENT-001"}
-                },
-            },
-            "mode_boot_binding": {
-                "status": "PREPARED",
-                "binding_id": "mode-boot-master-001",
-                "mode": "MASTER",
-                "role": "MASTER",
-                "frame_id": "current",
-                "anchor_id": "MASTER-CURRENT-001",
-            },
-        }
+        supervisor = SessionSupervisorStore(self.root / "runtime-anchor.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "runtime-state.sqlite3",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("CODEX")
+        state.observe_provider_session("CODEX", "codex:session-001")
+        coordinator.session_supervisor = supervisor
         process_holder: list[Any] = []
 
         class FakeRuntimeProcess:
@@ -2653,16 +2622,13 @@ class ProjectMasterHostTests(unittest.TestCase):
                         "token": token,
                     },
                     "runtime_state": {
-                        "anchor_id": "MASTER-CURRENT-001",
+                        "anchor_id": coordinator._anchor_graph_session()["session_anchor_ref"],
                         "mode": "MASTER",
-                        "role": "MASTER",
+                        "role": "UNASSIGNED",
                         "session_id": session_id,
                         "executable_runtime_currentness": "CURRENT",
                     },
-                    "mode_boot_binding": {
-                        "status": "ACTIVE",
-                        "binding_id": "mode-boot-master-001",
-                    },
+                    "attachment_path": "ANCHOR_GRAPH",
                 }
             )
             process.command = list(command)
@@ -2678,6 +2644,16 @@ class ProjectMasterHostTests(unittest.TestCase):
         ), patch(
             "project_master_host._WindowsKillOnCloseJob",
             return_value=FakeJob(),
+        ), patch(
+            "project_master_host.launched_process_identity",
+            return_value={
+                "pid": 5151,
+                "process_created_at": "2026-08-21T12:00:00.000000Z",
+                "executable": str(Path(sys.executable)),
+                "command": [str(Path(sys.executable)), "project-runtime", "serve"],
+                "endpoint": "http://127.0.0.1:41992",
+                "handshake_fingerprint": "a" * 64,
+            },
         ):
             binding = coordinator._ensure_runtime()
 
@@ -2685,15 +2661,10 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("project-runtime", command)
         self.assertNotIn("session-boot", command)
         self.assertEqual("current", binding["frame_id"])
-        self.assertEqual(
-            "mode-boot-master-001", binding["mode_boot_binding_id"]
-        )
-        self.assertEqual(
-            "mode-boot-master-001",
-            command[command.index("--boot-binding-id") + 1],
-        )
+        self.assertEqual("ANCHOR_GRAPH", binding["attachment_path"])
+        self.assertNotIn("--boot-binding-id", command)
+        self.assertEqual("MASTER", command[command.index("--mode") + 1])
         self.assertEqual("current", command[command.index("--frame-id") + 1])
-        coordinator.close()
 
     def test_task_frame_runtime_lease_does_not_replace_master_lease(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
