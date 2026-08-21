@@ -2243,6 +2243,32 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("Tests · changed · PASSED", test_nodes[0]["label"])
         self.assertEqual(12, test_nodes[0]["data"]["tests_run"])
 
+    def test_semantic_graph_projects_cross_session_work_allocation(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        allocation, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "GCS",
+                "summary": "Send the bounded implementation work to the selected Master.",
+                "idempotency_key": "graph-allocation-001",
+                "worker_role": "PROJECT_MASTER",
+                "origin_session_anchor_ref": "session-anchor-conductor-001",
+                "target_session_anchor_ref": "session-anchor-master-001",
+                "origin_session_chat_key": "provider_chat_1234567890abcdef12345678",
+            }
+        )
+        self.assertTrue(created)
+        graph = self.server.store.semantic_project_graph("GCS")
+        allocation_nodes = [
+            item
+            for item in graph["nodes"]
+            if item["entity_type"] == "WORK_ALLOCATION"
+        ]
+        self.assertEqual(1, len(allocation_nodes))
+        self.assertEqual(allocation["delegation_id"], allocation_nodes[0]["data"]["delegation_id"])
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertIn("SESSION_ANCHOR_ALLOCATES_WORK", edge_types)
+        self.assertIn("WORK_ALLOCATION_TARGETS_SESSION_ANCHOR", edge_types)
+
     def test_session_inject_hook_becomes_deduplicated_redacted_graph_input(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         body = {

@@ -14371,6 +14371,75 @@ class UniverseStore:
                 add_edge("TASK_FRAME_CONTINUES", parent_node, frame_node,
                          f"universe://task-frame-lineage/{frame_ref}")
 
+        # Automation dispatch stays out of the user chat queue.  Its durable
+        # record is projected as a work allocation that explicitly connects
+        # origin and target Session Anchors, even if one is currently offline.
+        # The bounded request summary is intentionally not copied into graph
+        # data: its source record remains the retrieval surface.
+        for allocation in self.list_conductor_delegations(
+            project_id=project_id, limit=200
+        ):
+            allocation_id = str(allocation.get("delegation_id") or "")
+            request = allocation.get("request")
+            if not allocation_id or not isinstance(request, Mapping):
+                continue
+            origin_ref = str(request.get("origin_session_anchor_ref") or "")
+            target_ref = str(request.get("target_session_anchor_ref") or "")
+            if not origin_ref or not target_ref:
+                continue
+            source_ref = f"universe://conductor/delegations/{allocation_id}"
+            allocation_node = add_node(
+                "WORK_ALLOCATION",
+                allocation_id,
+                f"Work allocation · {allocation.get('state') or 'QUEUED'}",
+                str(allocation.get("state") or "QUEUED"),
+                "CONDUCTOR_AUTOMATION",
+                source_ref,
+                {
+                    key: allocation.get(key)
+                    for key in (
+                        "delegation_id", "project_id", "state", "created_at",
+                        "updated_at", "started_at", "completed_at",
+                    )
+                    if allocation.get(key) is not None
+                }
+                | {
+                    "worker_role": request.get("worker_role"),
+                    "task_frame_ref": request.get("task_frame_ref"),
+                    "queue_scope": request.get("queue_scope"),
+                },
+            )
+            origin_node = session_nodes_by_anchor_ref.get(origin_ref)
+            if origin_node is None:
+                origin_node = add_node(
+                    "SESSION_ANCHOR", origin_ref,
+                    f"Session Anchor · {origin_ref}", "OBSERVED",
+                    "CONDUCTOR_ALLOCATION", source_ref,
+                    {"session_anchor_ref": origin_ref},
+                )
+                session_nodes_by_anchor_ref[origin_ref] = origin_node
+            target_node = session_nodes_by_anchor_ref.get(target_ref)
+            if target_node is None:
+                target_node = add_node(
+                    "SESSION_ANCHOR", target_ref,
+                    f"Session Anchor · {target_ref}", "OBSERVED",
+                    "CONDUCTOR_ALLOCATION", source_ref,
+                    {"session_anchor_ref": target_ref},
+                )
+                session_nodes_by_anchor_ref[target_ref] = target_node
+            add_edge(
+                "SESSION_ANCHOR_ALLOCATES_WORK",
+                origin_node,
+                allocation_node,
+                source_ref,
+            )
+            add_edge(
+                "WORK_ALLOCATION_TARGETS_SESSION_ANCHOR",
+                allocation_node,
+                target_node,
+                source_ref,
+            )
+
         goals = self.list_project_goals(project_id)
         assigned_todos: set[str] = set()
         for goal in goals:
