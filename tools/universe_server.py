@@ -4581,6 +4581,22 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_event_project_time
                 ON project_event(project_id, created_at, event_id);
 
+                CREATE TABLE IF NOT EXISTS semantic_collection_cursor (
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL,
+                    last_event_id TEXT NOT NULL,
+                    last_event_type TEXT NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, source_kind)
+                );
+
+                CREATE INDEX IF NOT EXISTS semantic_collection_cursor_project_time
+                ON semantic_collection_cursor(project_id, updated_at, source_kind);
+
                 CREATE TABLE IF NOT EXISTS project_goal (
                     goal_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -8463,6 +8479,42 @@ class UniverseStore:
                     event["created_at"],
                 ),
             )
+            source_kind = {
+                "GIT_WORK_STATUS": "GIT_TRACE2",
+                "HOOK_SESSION_BOUND": "SESSION_HOOK",
+                "TEST_WORK_STATUS": "TEST_RUNNER",
+            }.get(event["event_type"])
+            if source_kind is not None:
+                source_digest = _json_sha256(
+                    {
+                        "event_id": event["event_id"],
+                        "event_type": event["event_type"],
+                        "payload": event["payload"],
+                    }
+                )
+                connection.execute(
+                    """
+                    INSERT INTO semantic_collection_cursor(
+                        project_id, source_kind, last_event_id, last_event_type,
+                        source_digest, observed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                        last_event_id = excluded.last_event_id,
+                        last_event_type = excluded.last_event_type,
+                        source_digest = excluded.source_digest,
+                        observed_at = excluded.observed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        event["project_id"],
+                        source_kind,
+                        event["event_id"],
+                        event["event_type"],
+                        source_digest,
+                        event["created_at"],
+                        utc_now(),
+                    ),
+                )
         return event, True
 
     def register_provider_session_source(
@@ -8622,6 +8674,24 @@ class UniverseStore:
             }
             for row in rows
         ]
+
+    def list_semantic_collection_cursors(
+        self, project_id: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT project_id, source_kind, last_event_id, last_event_type,
+                       source_digest, observed_at, updated_at
+                FROM semantic_collection_cursor
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, source_kind
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_project_goals(self, project_id: str) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
@@ -14258,6 +14328,23 @@ class UniverseStore:
             f"universe://projects/{project_id}",
             project,
         )
+        for cursor in self.list_semantic_collection_cursors(project_id, limit=100):
+            source_kind = str(cursor.get("source_kind") or "UNKNOWN")
+            cursor_node = add_node(
+                "COLLECTION_CURSOR",
+                f"{project_id}:{source_kind}",
+                f"Collection cursor · {source_kind}",
+                "CURRENT",
+                "SEMANTIC_COLLECTION_CURSOR",
+                f"universe://semantic-collection-cursors/{project_id}/{source_kind}",
+                cursor,
+            )
+            add_edge(
+                "PROJECT_HAS_COLLECTION_CURSOR",
+                project_node,
+                cursor_node,
+                f"universe://semantic-collection-cursors/{project_id}/{source_kind}",
+            )
         session_nodes_by_provider_digest: dict[str, str] = {}
         project_session_anchor_refs: set[str] = set()
         session_nodes_by_anchor_ref: dict[str, str] = {}

@@ -2242,6 +2242,17 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(test_nodes))
         self.assertEqual("Tests · changed · PASSED", test_nodes[0]["label"])
         self.assertEqual(12, test_nodes[0]["data"]["tests_run"])
+        cursors = self.server.store.list_semantic_collection_cursors("GCS")
+        self.assertEqual("TEST_RUNNER", cursors[0]["source_kind"])
+        self.assertEqual("test-work-status-001", cursors[0]["last_event_id"])
+        self.assertIn(
+            "TEST_RUNNER",
+            {
+                item["data"]["source_kind"]
+                for item in graph["nodes"]
+                if item["entity_type"] == "COLLECTION_CURSOR"
+            },
+        )
 
     def test_semantic_graph_projects_cross_session_work_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
