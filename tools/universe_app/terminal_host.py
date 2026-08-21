@@ -36,6 +36,7 @@ class TerminalSession:
     project_id: str
     mode: str
     provider: str
+    supervisor_session_id: str
     cwd: str
     executable: str
     created_at: str
@@ -48,6 +49,7 @@ class TerminalSession:
     replay: deque = field(default_factory=lambda: deque(maxlen=80))
     pump_stop: threading.Event = field(default_factory=threading.Event)
     pump_thread: Any = None
+    exit_detail: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -56,6 +58,7 @@ class TerminalSession:
             "project_id": self.project_id,
             "mode": self.mode,
             "provider": self.provider,
+            "supervisor_session_id": self.supervisor_session_id,
             "cwd": self.cwd,
             "executable": Path(self.executable).name,
             "state": self.state,
@@ -63,6 +66,7 @@ class TerminalSession:
             "rows": self.rows,
             "created_at": self.created_at,
             "pid": self.live_pid(),
+            "exit_detail": self.exit_detail,
         }
 
     def live_pid(self) -> int | None:
@@ -93,7 +97,10 @@ class TerminalHost:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
-            rows = [item.public() for item in self._sessions.values()]
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            self._refresh_session_state(session)
+        rows = [item.public() for item in sessions]
         rows.sort(key=lambda item: str(item.get("created_at") or ""))
         return rows
 
@@ -102,6 +109,7 @@ class TerminalHost:
             session = self._sessions.get(str(terminal_id or "").strip())
         if session is None:
             raise TerminalHostError("TERMINAL_NOT_FOUND", "terminal session does not exist")
+        self._refresh_session_state(session)
         return session
 
     def create(
@@ -111,6 +119,7 @@ class TerminalHost:
         mode: str,
         cwd: str,
         provider: str = "AUTO",
+        supervisor_session_id: str = "",
         resume_session_ref: str = "",
         cols: int = 120,
         rows: int = 32,
@@ -129,6 +138,7 @@ class TerminalHost:
         selected = str(provider or "AUTO").strip().upper()
         executable = resolve_cli_executable(selected)
         resolved_provider = selected if selected != "AUTO" else infer_provider(executable)
+        supervisor = str(supervisor_session_id or "").strip()
         argv = resume_argv(resolved_provider, resume_session_ref)
         terminal_id = "term_" + secrets.token_hex(8)
         session = TerminalSession(
@@ -136,6 +146,7 @@ class TerminalHost:
             project_id=project,
             mode=requested_mode,
             provider=resolved_provider,
+            supervisor_session_id=supervisor,
             cwd=str(root.resolve()),
             executable=executable,
             created_at=_now(),
@@ -146,6 +157,8 @@ class TerminalHost:
             "UNIVERSE_PROJECT_ID": project,
             "UNIVERSE_MODE": requested_mode,
             "UNIVERSE_PROVIDER": resolved_provider,
+            "UNIVERSE_SUPERVISOR_SESSION_ID": supervisor,
+            "UNIVERSE_TERMINAL_ID": terminal_id,
         }
         try:
             session.backend = self._spawn(
@@ -220,27 +233,82 @@ class TerminalHost:
         project_id: str,
         mode: str,
         provider: str = "",
+        supervisor_session_id: str = "",
     ) -> dict[str, Any] | None:
         wanted_project = str(project_id or "").strip()
         wanted_mode = str(mode or "").strip().upper()
         wanted_provider = str(provider or "").strip().upper()
+        wanted_supervisor = str(supervisor_session_id or "").strip()
         with self._lock:
-            rows = [
-                item
-                for item in self._sessions.values()
-                if item.state == "LIVE"
-                and item.project_id == wanted_project
-                and item.mode == wanted_mode
-                and (
-                    not wanted_provider
-                    or wanted_provider == "AUTO"
-                    or item.provider == wanted_provider
-                )
-            ]
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            self._refresh_session_state(session)
+        rows = [
+            item
+            for item in sessions
+            if item.state == "LIVE"
+            and item.project_id == wanted_project
+            and item.mode == wanted_mode
+            and (
+                not wanted_provider
+                or wanted_provider == "AUTO"
+                or item.provider == wanted_provider
+            )
+            and (
+                not wanted_supervisor
+                or item.supervisor_session_id == wanted_supervisor
+            )
+        ]
         if not rows:
             return None
         rows.sort(key=lambda item: item.created_at, reverse=True)
         return rows[0].public()
+
+    @staticmethod
+    def _backend_is_alive(backend: Any) -> bool | None:
+        checker = getattr(backend, "is_alive", None)
+        if not callable(checker):
+            checker = getattr(backend, "isalive", None)
+        if not callable(checker):
+            return None
+        try:
+            return bool(checker())
+        except Exception:
+            return None
+
+    def _refresh_session_state(self, session: TerminalSession) -> None:
+        if session.state != "LIVE":
+            return
+        backend = session.backend
+        if backend is None or self._backend_is_alive(backend) is not False:
+            return
+        try:
+            tail = backend.read(0)
+        except Exception:
+            tail = b""
+        if tail:
+            with session.lock:
+                session.replay.append(tail)
+        self._mark_backend_exit(session)
+
+    def _mark_backend_exit(
+        self,
+        session: TerminalSession,
+        detail: str = "",
+    ) -> None:
+        with session.lock:
+            if session.state != "LIVE":
+                return
+            chunks = b"".join(session.replay)
+            diagnostic = chunks[-4096:].decode("utf-8", errors="replace").strip()
+            session.state = "FAILED"
+            session.exit_detail = diagnostic or detail or "CLI process exited"
+            waiters = list(session.subscribers)
+        for waiter in waiters:
+            try:
+                waiter.put_nowait(None)
+            except queue.Full:
+                pass
 
     def bus_directory(self) -> dict[str, Any]:
         return self.bus.directory(self)
@@ -265,6 +333,9 @@ class TerminalHost:
         session = self.get(terminal_id)
         waiter: queue.Queue = queue.Queue(maxsize=256)
         with session.lock:
+            if session.state != "LIVE":
+                waiter.put_nowait(None)
+                return waiter
             session.subscribers.append(waiter)
         # Do not dump recent chunks into a new client. CLI TUIs address the
         # cursor; a partial replay plus a live redraw garbles the screen.
@@ -302,9 +373,13 @@ class TerminalHost:
                 break
             try:
                 chunk = backend.read(0.2)
-            except Exception:
+            except Exception as error:
+                self._mark_backend_exit(session, str(error))
                 break
             if not chunk:
+                if self._backend_is_alive(backend) is False:
+                    self._mark_backend_exit(session)
+                    break
                 continue
             with session.lock:
                 session.replay.append(chunk)
@@ -324,10 +399,37 @@ class TerminalHost:
 
 
 def resume_argv(provider: str, resume_session_ref: str) -> list[str]:
+    name = str(provider or "").strip().upper()
     ref = str(resume_session_ref or "").strip()
     if not ref or ref.upper() == "UNKNOWN":
         return []
-    name = str(provider or "").strip().upper()
+    prefixes = {
+        "CODEX": ("codex-app-server:", "codex-app:", "codex:"),
+        "CLAUDE": ("claude-code:",),
+        "GROK": ("grok-acp:", "grok-cli:"),
+    }
+    lowered = ref.lower()
+    for owner, known_prefixes in prefixes.items():
+        for prefix in known_prefixes:
+            if lowered.startswith(prefix):
+                if owner != name:
+                    raise TerminalHostError(
+                        "TERMINAL_RESUME_PROVIDER_MISMATCH",
+                        "resume session provider does not match terminal provider",
+                    )
+                ref = ref[len(prefix) :].strip()
+                lowered = ref.lower()
+                break
+    upper = ref.upper()
+    if (
+        not ref
+        or lowered.startswith(("session_", "session-anchor_", "session_anchor_", "term_", "pty:", "cli-terminal:"))
+        or upper.startswith(("UNIVERSE-", "MASTER-CURRENT-", "CONDUCTOR-CURRENT-"))
+    ):
+        raise TerminalHostError(
+            "TERMINAL_RESUME_REF_INVALID",
+            "resume_session_ref must be a provider-owned session id",
+        )
     if name == "GROK":
         return ["--resume", ref]
     if name == "CLAUDE":
@@ -349,24 +451,21 @@ def infer_provider(executable: str) -> str:
 
 
 def resolve_cli_executable(provider: str) -> str:
-    order = []
-    mapped = PROVIDER_TOOLS.get(str(provider or "").upper())
-    if mapped:
-        order.append(mapped)
-    order.extend(["grok", "codex", "claude"])
-    seen: set[str] = set()
-    for tool in order:
-        if tool in seen:
-            continue
-        seen.add(tool)
-        resolved = resolve_host_tool(tool)
-        executable = getattr(resolved, "executable", None) if resolved is not None else None
-        if executable:
-            return str(executable)
-    comspec = str(os.environ.get("COMSPEC") or "").strip()
-    if comspec and Path(comspec).is_file():
-        return comspec
-    raise TerminalHostError("CLI_EXECUTABLE_UNAVAILABLE", "no host CLI is available")
+    selected = str(provider or "").strip().upper()
+    mapped = PROVIDER_TOOLS.get(selected)
+    if not mapped:
+        raise TerminalHostError(
+            "TERMINAL_PROVIDER_REQUIRED",
+            "choose CODEX, CLAUDE, or GROK for this terminal",
+        )
+    resolved = resolve_host_tool(mapped)
+    executable = getattr(resolved, "executable", None) if resolved is not None else None
+    if executable:
+        return str(executable)
+    raise TerminalHostError(
+        "CLI_EXECUTABLE_UNAVAILABLE",
+        f"{selected} CLI is not available on this host",
+    )
 
 
 def spawn_conpty(

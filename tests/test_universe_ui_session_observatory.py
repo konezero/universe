@@ -115,6 +115,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("const tab = created.terminal || created;", TERM)
         self.assertNotIn("const session = created.terminal || created;", TERM)
         self.assertIn("resume_session_ref", TERM)
+        self.assertIn("supervisor_session_id", TERM)
+        resume_slice = TERM[
+            TERM.index("function terminalResumeRef") : TERM.index(
+                "async function createTerminalTab"
+            )
+        ]
+        self.assertNotIn("session.session_id", resume_slice)
         self.assertIn("createTerminalTab(coordinate, session)", APP)
         mobile_session_nav = APP[
             APP.index('elements.mobileWorkTabs?.addEventListener("click"') : APP.index(
@@ -126,12 +133,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             mobile_session_nav,
         )
         self.assertNotIn("sessionObservatoryDialog?.showModal()", mobile_session_nav)
-        self.assertIn("function projectMasterSetting(projectId)", TERM)
+        self.assertNotIn("function projectMasterSetting(projectId)", TERM)
+        self.assertIn("session?.provider || session?.current_provider", TERM)
+        self.assertIn('throw new Error("Choose a provider for this session")', TERM)
         self.assertIn("function observerProvider(session)", TERM)
         self.assertIn("session.observer_session_ref", TERM)
         self.assertNotIn("last_session_ref", TERM)
         self.assertNotIn("last_provider", TERM)
-        self.assertIn("if (activeTerminal) return;", APP)
+        self.assertIn("if (showTerminal) return;", APP)
         self.assertNotIn(".terminal-input-form", CSS)
         self.assertIn("function projectForVendorWorkspace(room)", APP)
         self.assertIn("function unboundVendorSessionFromRoom(room, project, mode)", APP)
@@ -142,7 +151,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('currentness === "CURRENT"', APP)
         self.assertIn("state.projectAnchorSessions", APP)
         self.assertIn("chatCatalog.anchor_sessions", APP)
-        self.assertIn("for (const session of state.projectAnchorSessions", APP)
+        self.assertIn("...(state.projectAnchorSessions || [])", APP)
+        self.assertIn("...(state.supervisorSessions || [])", APP)
         self.assertIn("function providerSessionObservedProjectId(room)", APP)
         self.assertIn("coordinate.sessions.push(source.session)", APP)
         coords = APP[
@@ -297,6 +307,12 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('class="conductor-panel glass-panel"', HTML)
         self.assertIn('id="conversation-layer"', HTML)
         self.assertIn('id="action-inbox-button"', HTML)
+        self.assertNotIn('id="project-room-button"', HTML)
+        self.assertIn('kind: "NONE"', APP)
+        self.assertIn('state.conversationSurface === "CLI"', APP)
+        self.assertIn("async function openPreparedProviderSession", APP)
+        self.assertNotIn("function openProjectRoomSurface()", APP)
+        self.assertIn('state.conversationSurface = "CLI"', TERM)
         self.assertIn('id="close-inspector"', HTML)
         header_start = HTML.index('<header class="conversation-layer-header">')
         self.assertLess(
@@ -424,6 +440,32 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         )
         self.assertIn("session-summary-connection", CSS)
 
+    def test_prepared_master_and_conductor_open_provider_sessions_not_room_chat(self) -> None:
+        helper = APP[
+            APP.index("async function openPreparedProviderSession") : APP.index(
+                "async function callUniverseConductor"
+            )
+        ]
+        self.assertIn("providerChatRoomForSupervisorSession(session)", helper)
+        self.assertIn("await openProviderChatSession(room, { session })", helper)
+        self.assertIn("showSessionSelection(\"Session is ready. Select it from the session card.\")", helper)
+        conductor = APP[
+            APP.index("async function callUniverseConductor") : APP.index(
+                "async function callProjectMaster"
+            )
+        ]
+        master = APP[
+            APP.index("async function callProjectMaster") : APP.index(
+                "async function attachSelectedMasterSession"
+            )
+        ]
+        for route in (conductor, master):
+            self.assertIn("await openPreparedProviderSession({", route)
+            self.assertNotIn("openProjectRoomStream", route)
+            self.assertNotIn('kind: \"PROJECT_MASTER\"', route)
+            self.assertNotIn("returnToUniverseConductor", route)
+        self.assertEqual(1, APP.count("openProjectRoomStream(projectId)"))
+
     def test_session_popup_separates_resume_and_new_provider_session(self) -> None:
         connection_slice = APP[
             APP.index("function renderSessionSummaryConnection") : APP.index(
@@ -472,17 +514,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('"Provider setup required"', APP)
         self.assertIn('"LLM connected / Auto-approve " + autoApprove', APP)
 
-    def test_provider_profiles_use_one_provider_model_effort_dialog(self) -> None:
-        self.assertIn('id="provider-profile-dialog"', HTML)
-        self.assertIn('id="provider-profile-provider"', HTML)
-        self.assertIn('id="provider-profile-model"', HTML)
-        self.assertIn('id="provider-profile-model-custom"', HTML)
-        self.assertIn('id="provider-profile-effort"', HTML)
-        self.assertIn("function openProviderProfileDialog", APP)
-        self.assertIn("async function submitProviderProfile", APP)
-        self.assertIn("body: { provider, model_ref: modelRef, effort }", APP)
-        self.assertIn("provider-profile-row", CSS)
-        self.assertIn("provider-profile-dialog", CSS)
+    def test_provider_settings_start_with_worker_bindings(self) -> None:
+        providers_panel = HTML[
+            HTML.index('data-settings-panel="providers"') :
+            HTML.index('data-settings-panel="host"')
+        ]
+        self.assertIn("<strong>Worker bindings</strong>", providers_panel)
+        self.assertNotIn("Universe Conductor", providers_panel)
+        self.assertNotIn("Project Masters", providers_panel)
+        self.assertNotIn('id="project-provider-settings"', HTML)
+        self.assertNotIn('id="provider-profile-dialog"', HTML)
 
     def test_hidden_view_and_bounded_tail_are_wired(self) -> None:
         self.assertIn('id="session-rail-show-hidden"', HTML)
@@ -530,7 +571,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("expected_version: session.row_version", rebind_slice)
-        self.assertIn("await refreshSupervisorSessions()", rebind_slice)
+        self.assertIn("await openPreparedProviderSession({", rebind_slice)
+        self.assertNotIn("openProjectRoomStream", rebind_slice)
         self.assertIn("session?.provider_session_attached", APP)
         self.assertIn("session-working-directory", CSS)
         self.assertIn(".session-working-directory.hidden", CSS)

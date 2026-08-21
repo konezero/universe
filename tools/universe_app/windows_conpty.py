@@ -75,6 +75,17 @@ class WindowsConPTY:
         pid = getattr(pty, "pid", None)
         return int(pid) if isinstance(pid, int) and pid > 0 else None
 
+    def is_alive(self) -> bool:
+        if self._closed:
+            return False
+        pty = self._pty
+        if pty is None:
+            return False
+        try:
+            return bool(pty.isalive())
+        except Exception:
+            return False
+
     def write(self, data: bytes) -> None:
         if not data or self._closed:
             return

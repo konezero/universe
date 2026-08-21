@@ -313,11 +313,17 @@ class SessionInjectHookTests(unittest.TestCase):
                     dry_run=True,
                     trigger="mode_change",
                 ),
-                environment={},
+                environment={
+                    "UNIVERSE_SUPERVISOR_SESSION_ID": "session_web_terminal"
+                },
             )
         self.assertEqual("DRY_RUN", result["status"])
         self.assertEqual("GROK", result["provider"])
         self.assertEqual("g-1", result["session_ref"])
+        self.assertEqual(
+            "session_web_terminal",
+            result["inject_body"]["supervisor_session_id"],
+        )
         self.assertEqual("UNASSIGNED", result["authority"])
         self.assertTrue(result.get("observation_path"))
 

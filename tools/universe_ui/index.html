@@ -198,7 +198,7 @@
             </div>
           </div>
         </div>
-        <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Project Room conversation">
+        <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Session conversation">
           <header class="conversation-layer-header">
             <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse conversation" aria-label="Collapse conversation" aria-expanded="true">
               <span class="chat-dock-icon" aria-hidden="true">&#128172;</span>
@@ -570,24 +570,6 @@
 
         <!-- Providers -->
         <div class="settings-tab-panel" data-settings-panel="providers" role="tabpanel" hidden>
-          <section class="settings-section">
-            <div class="provider-profile-row" data-provider-profile-scope="UNIVERSE_CONDUCTOR">
-              <div class="provider-profile-copy">
-                <strong>Universe Conductor</strong>
-                <small id="universe-provider-status" class="provider-setting-status"></small>
-              </div>
-              <button id="universe-provider-setting" class="secondary-button provider-profile-button" type="button">
-                Configure
-              </button>
-            </div>
-          </section>
-          <section class="settings-section">
-            <div class="settings-section-heading">
-              <strong>Project Masters</strong>
-              <small>Overrides apply when the Project Master is next called.</small>
-            </div>
-            <div id="project-provider-settings" class="project-provider-settings"></div>
-          </section>
           <section class="settings-section worker-binding-section">
             <div class="settings-section-heading">
               <div>
@@ -655,54 +637,6 @@
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
         <button type="submit" class="primary-button">Save</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="provider-profile-dialog" class="provider-profile-dialog">
-    <form id="provider-profile-form" method="dialog">
-      <div class="dialog-heading">
-        <div>
-          <span class="inspector-kicker">Runtime profile</span>
-          <h2 id="provider-profile-title">Provider profile</h2>
-          <p id="provider-profile-subtitle">Choose one consistent session profile.</p>
-        </div>
-        <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
-      </div>
-      <div class="provider-profile-fields">
-        <label>
-          <span>Provider</span>
-          <select id="provider-profile-provider">
-            <option value="AUTO">Auto</option>
-            <option value="GROK">Grok</option>
-            <option value="CODEX">Codex</option>
-            <option value="CLAUDE">Claude</option>
-          </select>
-        </label>
-        <label>
-          <span>Model</span>
-          <select id="provider-profile-model"></select>
-        </label>
-        <label>
-          <span>Custom model</span>
-          <input id="provider-profile-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="Optional provider model id">
-        </label>
-        <label>
-          <span>Effort</span>
-          <select id="provider-profile-effort">
-            <option value="AUTO">Auto</option>
-            <option value="LOW">Low</option>
-            <option value="MEDIUM">Medium</option>
-            <option value="HIGH">High</option>
-            <option value="MAX">Max</option>
-          </select>
-        </label>
-      </div>
-      <p id="provider-profile-status" class="provider-setting-status" role="status"></p>
-      <p id="provider-profile-error" class="form-error" role="alert"></p>
-      <div class="dialog-actions">
-        <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
-        <button id="provider-profile-submit" type="submit" class="primary-button">Apply profile</button>
       </div>
     </form>
   </dialog>

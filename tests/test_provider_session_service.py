@@ -168,6 +168,38 @@ class FakeRepositoryGitObserver:
         self.closed = True
 
 
+class FakeActionStore:
+    def __init__(self) -> None:
+        self.todo_actions: list[tuple[str, dict[str, Any]]] = []
+        self.actions: list[dict[str, Any]] = []
+
+    def apply_todo_action(
+        self, todo_id: str, value: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        self.todo_actions.append((todo_id, dict(value)))
+        return {
+            "status": "TODO_ACTION_APPLIED",
+            "todo": {"todo_id": todo_id, "state": "IN_PROGRESS"},
+        }
+
+    def record_provider_session_action(
+        self, _chat_key: str, action: Mapping[str, Any], *, retain: int
+    ) -> Mapping[str, Any]:
+        self.actions.append(dict(action))
+        self.actions = self.actions[-retain:]
+        return dict(action)
+
+    def list_provider_session_actions(
+        self, _chat_key: str, *, limit: int
+    ) -> list[dict[str, Any]]:
+        return self.actions[-limit:]
+
+    def delete_provider_session_action(
+        self, _chat_key: str, _action_id: str
+    ) -> Mapping[str, Any] | None:
+        return None
+
+
 class ProviderSessionServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.hosts: list[FakeProviderHost] = []
@@ -208,6 +240,7 @@ class ProviderSessionServiceTests(unittest.TestCase):
         retained_idempotency: int | None = None,
         retained_permissions: int | None = None,
         repository_git_observer_factory: Callable[[Path], Any] | None = None,
+        action_store: Any = None,
     ) -> ProviderSessionService:
         return ProviderSessionService(
             resolver=self.resolver,
@@ -215,6 +248,7 @@ class ProviderSessionServiceTests(unittest.TestCase):
             permission_timeout_seconds=2,
             retained_idempotency=retained_idempotency,
             retained_permissions=retained_permissions,
+            action_store=action_store,
             repository_git_observer_factory=repository_git_observer_factory,
             repository_git_poll_seconds=0.01,
         )
@@ -295,6 +329,78 @@ class ProviderSessionServiceTests(unittest.TestCase):
         public = json.dumps(statuses)
         self.assertNotIn("argv", public)
         self.assertNotIn("repository_root", public)
+
+    def test_explicit_git_todo_marker_starts_but_does_not_complete_todo(
+        self,
+    ) -> None:
+        action_store = FakeActionStore()
+        self.service.close()
+        self.service = self._new_service(action_store=action_store)
+
+        commit_sha = "f" * 40
+        marked = self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-hook-001",
+            "COMPLETED",
+            operation="COMMIT",
+            details={
+                "source": "GIT_TRACE2",
+                "exit_code": 0,
+                "commit_sha": commit_sha,
+                "short_sha": "fffffff",
+                "commit_message": "feat: hook [Universe-Todo: todo_hook_001]",
+                "branch": "main",
+                "changed_files": 2,
+            },
+        )
+        self.assertEqual("todo_hook_001", marked["details"]["todo_id"])
+        self.assertEqual(
+            "IN_PROGRESS", action_store.actions[0]["todo_transition"]["state"]
+        )
+        self.assertEqual(
+            [
+                (
+                    "todo_hook_001",
+                    {
+                        "action_id": "git-commit-" + commit_sha,
+                        "outcome": "STARTED",
+                        "source": "GIT_TRACE2",
+                        "evidence_ref": "git://commit/" + commit_sha,
+                    },
+                )
+            ],
+            action_store.todo_actions,
+        )
+
+        self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-hook-002",
+            "COMPLETED",
+            operation="COMMIT",
+            details={
+                "source": "GIT_TRACE2",
+                "exit_code": 0,
+                "commit_sha": "e" * 40,
+                "short_sha": "eeeeeee",
+                "commit_message": "feat: unrelated",
+            },
+        )
+        self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-hook-003",
+            "COMPLETED",
+            operation="PUSH",
+            details={
+                "source": "GIT_TRACE2",
+                "exit_code": 0,
+                "commit_sha": commit_sha,
+                "short_sha": "fffffff",
+                "commit_message": "feat: hook [Universe-Todo: todo_hook_001]",
+                "branch": "main",
+                "remote": "origin",
+            },
+        )
+        self.assertEqual(1, len(action_store.todo_actions))
 
     def test_repository_git_milestone_reaches_registered_session_without_turn(self) -> None:
         observer = FakeRepositoryGitObserver()

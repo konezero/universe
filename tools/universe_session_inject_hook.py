@@ -792,6 +792,9 @@ def run_hook(
             **base,
         )
 
+    supervisor_session_id = str(
+        env.get("UNIVERSE_SUPERVISOR_SESSION_ID") or ""
+    ).strip()
     observation = {
         "schema": "universe.provider-session-observation.v1",
         "observed_at": utc_now(),
@@ -836,6 +839,8 @@ def run_hook(
             else ""
         ),
     }
+    if supervisor_session_id:
+        inject_body["supervisor_session_id"] = supervisor_session_id
 
     if args.dry_run:
         return _result(

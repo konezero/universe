@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +12,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_app.terminal_host import (  # noqa: E402
     TerminalHost,
     TerminalHostError,
+    resolve_cli_executable,
     resume_argv,
 )
 
@@ -80,6 +82,8 @@ class TerminalHostTests(unittest.TestCase):
                 "UNIVERSE_PROJECT_ID": "GCS",
                 "UNIVERSE_MODE": "MASTER",
                 "UNIVERSE_PROVIDER": "GROK",
+                "UNIVERSE_SUPERVISOR_SESSION_ID": "",
+                "UNIVERSE_TERMINAL_ID": created["terminal_id"],
             },
             spawned[0][5],
         )
@@ -92,12 +96,23 @@ class TerminalHostTests(unittest.TestCase):
     def test_resize_keeps_a_usable_cli_box(self) -> None:
         pty = FakePty()
         host = TerminalHost(spawn=lambda *_args: pty)
-        created = host.create(project_id="GCS", mode="MASTER", cwd=str(ROOT))
+        created = host.create(project_id="GCS", mode="MASTER", cwd=str(ROOT), provider="GROK")
         host.resize(created["terminal_id"], 20, 8)
         session = host.get(created["terminal_id"])
         self.assertGreaterEqual(session.cols, 80)
         self.assertGreaterEqual(session.rows, 24)
         self.assertEqual((session.cols, session.rows), pty.size)
+
+    def test_resolve_cli_executable_never_falls_back_to_another_provider(self) -> None:
+        with patch("universe_app.terminal_host.resolve_host_tool", return_value=None) as resolver:
+            with self.assertRaises(TerminalHostError) as missing:
+                resolve_cli_executable("CODEX")
+        self.assertEqual("CLI_EXECUTABLE_UNAVAILABLE", missing.exception.code)
+        resolver.assert_called_once_with("codex")
+
+        with self.assertRaises(TerminalHostError) as unselected:
+            resolve_cli_executable("AUTO")
+        self.assertEqual("TERMINAL_PROVIDER_REQUIRED", unselected.exception.code)
 
     def test_resume_argv_uses_provider_cli_flags(self) -> None:
         self.assertEqual(["--resume", "abc"], resume_argv("GROK", "abc"))
@@ -105,6 +120,42 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(["resume", "abc"], resume_argv("CODEX", "abc"))
         self.assertEqual([], resume_argv("GROK", "UNKNOWN"))
         self.assertEqual([], resume_argv("GROK", ""))
+
+    def test_resume_rejects_universe_internal_session_ids(self) -> None:
+        with self.assertRaises(TerminalHostError) as invalid:
+            resume_argv("CODEX", "session_123b6a5dac26bd0a91575526")
+        self.assertEqual("TERMINAL_RESUME_REF_INVALID", invalid.exception.code)
+        self.assertEqual(
+            ["resume", "vendor-thread"],
+            resume_argv("CODEX", "codex-app-server:vendor-thread"),
+        )
+
+    def test_exited_cli_is_failed_and_retains_startup_diagnostic(self) -> None:
+        class ExitedPty(FakePty):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pending = [b"ERROR: No saved session found with ID bad-ref"]
+
+            def read(self, timeout: float = 0.2) -> bytes:
+                del timeout
+                return self.pending.pop(0) if self.pending else b""
+
+            def is_alive(self) -> bool:
+                return False
+
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: ExitedPty())
+        created = host.create(
+            project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CODEX"
+        )
+        listed = host.list_sessions()
+        self.assertEqual("FAILED", listed[0]["state"])
+        self.assertIn("No saved session found", listed[0]["exit_detail"])
+        self.assertIsNone(
+            host.find_live(project_id="universe", mode="MASTER", provider="CODEX")
+        )
+        waiter = host.subscribe(created["terminal_id"])
+        self.assertIsNone(waiter.get(timeout=0.1))
+        self.assertEqual(created["terminal_id"], listed[0]["terminal_id"])
 
     def test_create_passes_resume_argv_to_spawn(self) -> None:
         spawned: list[tuple] = []
@@ -130,9 +181,28 @@ class TerminalHostTests(unittest.TestCase):
 
     def test_find_live_reuses_the_same_coordinate(self) -> None:
         host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
-        first = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), provider="GROK")
-        found = host.find_live(project_id="universe", mode="MASTER", provider="GROK")
+        first = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            provider="GROK",
+            supervisor_session_id="session_a",
+        )
+        found = host.find_live(
+            project_id="universe",
+            mode="MASTER",
+            provider="GROK",
+            supervisor_session_id="session_a",
+        )
         self.assertEqual(first["terminal_id"], found["terminal_id"])
+        self.assertIsNone(
+            host.find_live(
+                project_id="universe",
+                mode="MASTER",
+                provider="GROK",
+                supervisor_session_id="session_b",
+            )
+        )
         self.assertIsNone(host.find_live(project_id="GCS", mode="MASTER", provider="GROK"))
 
     def test_subscribers_receive_the_same_output(self) -> None:
@@ -150,7 +220,7 @@ class TerminalHostTests(unittest.TestCase):
 
         pty = FeedingPty()
         host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
-        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT))
+        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), provider="GROK")
         first = host.subscribe(created["terminal_id"])
         second = host.subscribe(created["terminal_id"])
         pty.pending.append(b"hello-both")
@@ -183,7 +253,7 @@ class TerminalHostTests(unittest.TestCase):
                 return b""
 
         host = TerminalHost(spawn=lambda *_args, **_kwargs: FeedingPty())
-        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT))
+        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), provider="GROK")
         first = host.subscribe(created["terminal_id"])
         deadline = time.time() + 1
         seen = b""

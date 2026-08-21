@@ -128,6 +128,7 @@ class PtySupervisorTests(unittest.TestCase):
             mode="MASTER",
             cwd=str(ROOT),
             provider="GROK",
+            supervisor_session_id="session_master_1",
         )
         terminal_id = created["terminal_id"]
         self.assertEqual(4242, created["pid"])
@@ -138,10 +139,21 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual(1, len(listed))
         self.assertEqual(terminal_id, listed[0]["terminal_id"])
         found = second.find_live(
-            project_id="universe", mode="MASTER", provider="GROK"
+            project_id="universe",
+            mode="MASTER",
+            provider="GROK",
+            supervisor_session_id="session_master_1",
         )
         self.assertIsNotNone(found)
         self.assertEqual(terminal_id, found["terminal_id"])
+        self.assertIsNone(
+            second.find_live(
+                project_id="universe",
+                mode="MASTER",
+                provider="GROK",
+                supervisor_session_id="session_master_2",
+            )
+        )
         waiter = second.subscribe(terminal_id)
         seen = b""
         deadline = time.time() + 1

@@ -473,6 +473,36 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
 
+    def test_new_session_creates_fresh_supervisor_anchor_lineage(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "new-session-lineage.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "new-session-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.observe_provider_session("GROK", "grok-old")
+        previous = next(
+            item
+            for item in supervisor.list_sessions(node="universe", mode="MASTER")
+            if item["is_default"]
+        )
+
+        fresh = state.ensure_supervisor_session("CODEX", new_session=True)
+        self.assertIsNotNone(fresh)
+        state.observe_provider_session("CODEX", "codex-new")
+
+        sessions = supervisor.list_sessions(node="universe", mode="MASTER")
+        self.assertEqual(2, len(sessions))
+        current = next(item for item in sessions if item["is_default"])
+        old = next(item for item in sessions if item["session_id"] == previous["session_id"])
+        self.assertNotEqual(old["session_anchor_ref"], current["session_anchor_ref"])
+        self.assertEqual("grok-old", old["provider_session_ref"])
+        self.assertEqual("codex-new", current["provider_session_ref"])
+        anchors = supervisor.list_project_mode_anchors(project_id="universe")
+        master = next(item for item in anchors if item["mode"] == "MASTER")
+        self.assertEqual(2, len(master["session_anchor_refs"]))
+
     def test_provider_rebind_uses_identity_owner_after_stale_default_pointer(self) -> None:
         supervisor = SessionSupervisorStore(self.root / "stale-pointer.sqlite3")
         state = ProjectMasterSessionStore(
@@ -3701,7 +3731,9 @@ class ProjectMasterHostTests(unittest.TestCase):
             },
         ]
 
-        contract = ProjectModeCoordinator._boss_allocation_output_contract(turns)
+        contract = ProjectModeCoordinator._boss_allocation_output_contract(
+            turns, parent_mutation_scope={"operations": [], "targets": []}
+        )
         allocations = contract["json_schema"]["properties"]["worker_allocations"]
 
         self.assertEqual(3, allocations["minItems"])
@@ -4391,6 +4423,39 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(
             "fake-provider:actual-session", selected["provider_session_ref"]
         )
+
+    def test_resident_manager_new_session_reserves_fresh_supervisor_slot(
+        self,
+    ) -> None:
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        with (
+            patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False),
+            patch.object(
+                ProjectMasterSessionStore,
+                "ensure_supervisor_session",
+                return_value=None,
+            ) as ensure_session,
+        ):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: FakeProvider(),
+                provider_resolver=lambda _project_id: "CODEX",
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
+            )
+            try:
+                manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)},
+                    session_action="NEW",
+                )
+            finally:
+                manager.close()
+
+        ensure_session.assert_called_once_with("CODEX", new_session=True)
 
     def test_resident_manager_restarts_when_provider_selection_changes(self) -> None:
         registrations: list[dict[str, Any]] = []

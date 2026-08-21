@@ -59,7 +59,7 @@ const state = {
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
-  providerProfileTarget: null,
+
   /** CLI+preset model catalog from /v1/settings/provider-models */
   providerModels: null,
   workerBindings: null,
@@ -123,8 +123,9 @@ const state = {
   providerSessionPermissions: [],
   providerSessionConnection: null,
   providerSessionStreamState: "IDLE",
+  conversationSurface: "CHAT",
   conversationTarget: {
-    kind: "UNIVERSE_CONDUCTOR",
+    kind: "NONE",
     projectId: null,
   },
   freshProject: {
@@ -309,24 +310,8 @@ const elements = {
   settingsForm: document.querySelector("#settings-form"),
   settingsError: document.querySelector("#settings-error"),
   localServiceStatus: document.querySelector("#local-service-status"),
-  universeProviderSetting: document.querySelector("#universe-provider-setting"),
-  providerProfileDialog: document.querySelector("#provider-profile-dialog"),
-  providerProfileForm: document.querySelector("#provider-profile-form"),
-  providerProfileTitle: document.querySelector("#provider-profile-title"),
-  providerProfileSubtitle: document.querySelector("#provider-profile-subtitle"),
-  providerProfileProvider: document.querySelector("#provider-profile-provider"),
-  providerProfileModel: document.querySelector("#provider-profile-model"),
-  providerProfileModelCustom: document.querySelector(
-    "#provider-profile-model-custom"
-  ),
-  providerProfileEffort: document.querySelector("#provider-profile-effort"),
-  providerProfileStatus: document.querySelector("#provider-profile-status"),
-  providerProfileError: document.querySelector("#provider-profile-error"),
-  providerProfileSubmit: document.querySelector("#provider-profile-submit"),
   memoryMaintainInterval: document.querySelector("#memory-maintain-interval"),
   memoryMaintainStatus: document.querySelector("#memory-maintain-status"),
-  universeProviderStatus: document.querySelector("#universe-provider-status"),
-  projectProviderSettings: document.querySelector("#project-provider-settings"),
   workerBindingScope: document.querySelector("#worker-binding-scope"),
   workerBindingSettings: document.querySelector("#worker-binding-settings"),
   providerModelCatalog: document.querySelector("#provider-model-catalog"),
@@ -1114,12 +1099,11 @@ async function rebindSelectedSessionWorkingDirectory() {
       }
     );
     await selectProject(projectId);
-    state.conversationTarget = { kind: "PROJECT_MASTER", projectId };
-    openProjectRoomStream(projectId);
-    await refreshSupervisorSessions();
-    renderComposerActions();
-    renderComposerState();
-    renderRoomMessages();
+    await openPreparedProviderSession({
+      mode: "MASTER",
+      projectId,
+      anchorKey: anchorSessionKey(session),
+    });
     toast(`Session moved to ${projectId}`);
   } finally {
     elements.sessionWorkingDirectoryApply.disabled = false;
@@ -1944,17 +1928,13 @@ function openSessionSummaryForNew(coordinate) {
   const section = elements.sessionSummaryConnection;
   if (section) {
     section.hidden = false;
-    const setting =
-      mode === "CONDUCTOR"
-        ? state.providerSettings?.universe_conductor || {}
-        : projectProviderSetting(projectId) || {};
-    const currentProvider = String(
-      setting.resolved_provider || setting.provider || "AUTO"
-    ).toUpperCase();
-    const configuredModel = setting.model_ref || setting.resolved_model || "";
-    const currentEffort = String(setting.effort || setting.resolved_effort || "AUTO").toUpperCase();
     const providers = state.providerSettings?.available_providers || [];
     elements.sessionSummaryProvider.replaceChildren();
+    const placeholder = node("option", "", "Choose provider");
+    placeholder.value = "";
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    elements.sessionSummaryProvider.append(placeholder);
     for (const provider of providers) {
       const key = String(provider.provider || "").toUpperCase();
       if (!key) continue;
@@ -1968,22 +1948,19 @@ function openSessionSummaryForNew(coordinate) {
       if (provider.reason) option.title = provider.reason;
       elements.sessionSummaryProvider.append(option);
     }
-    if (!elements.sessionSummaryProvider.options.length) {
+    if (elements.sessionSummaryProvider.options.length === 1) {
       for (const key of ["CODEX", "CLAUDE", "GROK"]) {
         const option = node("option", "", key);
         option.value = key;
         elements.sessionSummaryProvider.append(option);
       }
     }
-    elements.sessionSummaryProvider.value = currentProvider;
-    if (elements.sessionSummaryProvider.value !== currentProvider) {
-      elements.sessionSummaryProvider.selectedIndex = 0;
-    }
-    fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, configuredModel);
+    elements.sessionSummaryProvider.value = "";
+    fillSessionSummaryModelSelect("", "");
     elements.sessionSummaryProvider.onchange = () => {
       fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, "");
     };
-    if (elements.sessionSummaryEffort) elements.sessionSummaryEffort.value = currentEffort;
+    if (elements.sessionSummaryEffort) elements.sessionSummaryEffort.value = "AUTO";
     if (elements.sessionSummaryConnectionStatus) {
       elements.sessionSummaryConnectionStatus.textContent =
         "Choose provider settings for the new session";
@@ -2146,7 +2123,10 @@ function nodeModeCoordinates() {
       active: true,
     });
   }
-  for (const session of state.projectAnchorSessions || []) {
+  for (const session of [
+    ...(state.projectAnchorSessions || []),
+    ...(state.supervisorSessions || []),
+  ]) {
     const projectId = String(session.project_id || session.node || "").trim();
     const mode = String(session.mode || "").trim().toUpperCase();
     if (!projectId || !mode) continue;
@@ -2479,7 +2459,16 @@ function nodeModePanelSessions(coordinate, { liveOnly = false } = {}) {
       const match = live.find((item) => {
         if (bound.has(item.terminal_id)) return false;
         const provider = String(session.provider || "").toUpperCase();
-        return !provider || provider === "AUTO" || provider === String(item.provider || "").toUpperCase();
+        const supervisorSessionId = String(
+          session.session_id || session.universe_session_id || ""
+        ).trim();
+        return (
+          supervisorSessionId &&
+          String(item.supervisor_session_id || "") === supervisorSessionId &&
+          (!provider ||
+            provider === "AUTO" ||
+            provider === String(item.provider || "").toUpperCase())
+        );
       });
       if (match) {
         bound.add(match.terminal_id);
@@ -3105,17 +3094,16 @@ function renderSessionObservatory() {
         );
         state.selectedSupervisorAnchorKey = anchorSessionKey(session);
         elements.sessionObservatoryDialog.close();
-        if (project && session.mode === "MASTER") {
-          await callProjectMaster(project.project_id, {
-            anchorKey: state.selectedSupervisorAnchorKey,
-          });
-        } else if (session.mode === "CONDUCTOR") {
-          await callUniverseConductor({
-            provider: session.provider,
-            anchorKey: state.selectedSupervisorAnchorKey,
-          });
+        if ((project && session.mode === "MASTER") || session.mode === "CONDUCTOR") {
+          await activateAnchorSession(
+            session,
+            providerChatRoomForSupervisorSession(session)
+          );
         } else {
-          returnToUniverseConductor();
+          state.conversationSurface = "CHAT";
+          state.conversationTarget = { kind: "NONE", projectId: null };
+          renderComposerState();
+          renderRoomMessages();
         }
         await refreshSupervisorSessions();
       } catch (error) {
@@ -3367,8 +3355,8 @@ function renderComposerActions() {
           : bridgeRegistered
             ? "Bridge registered / awaiting delivery"
           : isCurrent
-            ? "Project Room only"
-            : "Open Project Room"
+            ? "Master session selected"
+            : "Prepare Master session"
       )
     );
     action.addEventListener("click", async () => {
@@ -3387,16 +3375,7 @@ function renderComposerActions() {
 }
 
 function returnToUniverseConductor() {
-  closeProjectRoomStream();
-  state.conversationTarget = {
-    kind: "UNIVERSE_CONDUCTOR",
-    projectId: null,
-  };
-  closeComposerActionMenu();
-  renderComposerActions();
-  renderComposerState();
-  renderRoomMessages();
-  elements.dispatchInstruction.focus();
+  showSessionSelection("");
 }
 
 function applyNewSessionCoordinates(
@@ -3417,6 +3396,59 @@ function applyNewSessionCoordinates(
   prepareBody.project_id = projectId;
   prepareBody.cwd = cwd;
   prepareBody.requested_mode = requestedMode;
+}
+
+function preparedSupervisorSession({ mode, projectId = "", connection = {}, anchorKey = "" }) {
+  const normalizedMode = String(mode || "").toUpperCase();
+  const normalizedProject = String(projectId || "").toLowerCase();
+  const expectedProvider = String(connection.last_provider || "").toUpperCase();
+  const expectedRef = String(connection.last_session_ref || "").trim();
+  const sessions = (state.supervisorSessions || []).filter((session) => {
+    if (String(session.mode || "").toUpperCase() !== normalizedMode) return false;
+    return !normalizedProject || String(session.node || "").toLowerCase() === normalizedProject;
+  });
+  const sessionRefMatches = (session) => [
+    session.provider_session_ref,
+    session.provider_session_id,
+    session.observer_session_ref,
+    session.session_ref,
+  ].some((value) => String(value || "").trim() === expectedRef);
+  return (
+    sessions.find((session) => anchorKey && anchorSessionKey(session) === anchorKey) ||
+    sessions.find((session) => expectedRef && sessionRefMatches(session)) ||
+    sessions.find((session) => session.is_default && (!expectedProvider || String(session.provider || "").toUpperCase() === expectedProvider)) ||
+    sessions.find((session) => session.is_default) ||
+    sessions.find((session) => !expectedProvider || String(session.provider || "").toUpperCase() === expectedProvider) ||
+    sessions[0] ||
+    null
+  );
+}
+
+function showSessionSelection(message = "Select a session to chat.") {
+  state.conversationSurface = "CHAT";
+  closeProjectRoomStream();
+  state.conversationTarget = { kind: "NONE", projectId: null };
+  closeComposerActionMenu();
+  renderComposerActions();
+  renderComposerState();
+  renderRoomMessages();
+  if (message) toast(message);
+}
+
+async function openPreparedProviderSession({ mode, projectId = "", connection = {}, anchorKey = "" }) {
+  try {
+    await refreshSupervisorSessions();
+  } catch (error) {
+    console.warn("Provider session refresh after prepare failed", error);
+  }
+  const session = preparedSupervisorSession({ mode, projectId, connection, anchorKey });
+  const room = providerChatRoomForSupervisorSession(session);
+  if (session && room) {
+    await openProviderChatSession(room, { session });
+    return true;
+  }
+  showSessionSelection("Session is ready. Select it from the session card.");
+  return false;
 }
 
 async function callUniverseConductor(options = {}) {
@@ -3467,19 +3499,12 @@ async function callUniverseConductor(options = {}) {
     throw new Error("Selected effort did not become the active Conductor connection");
   }
   state.providerSettings = await api("/v1/settings/providers");
-  returnToUniverseConductor();
-  if (options.anchorKey) {
-    state.selectedSupervisorAnchorKey = options.anchorKey;
-  }
-  try {
-    await refreshSupervisorSessions();
-  } catch (error) {
-    console.warn("Anchor Session refresh after Conductor prepare failed", error);
-  }
-  renderComposerActions();
-  renderComposerState();
-  renderRoomMessages();
-  elements.dispatchInstruction.focus();
+  await openPreparedProviderSession({
+    mode: "CONDUCTOR",
+    projectId: options.projectId,
+    connection,
+    anchorKey: options.anchorKey,
+  });
   return connection;
 }
 
@@ -3541,23 +3566,12 @@ async function callProjectMaster(projectId, options = {}) {
   }
   state.providerSettings = await api("/v1/settings/providers");
   await selectProject(projectId);
-  state.conversationTarget = {
-    kind: "PROJECT_MASTER",
+  await openPreparedProviderSession({
+    mode: "MASTER",
     projectId,
-  };
-  if (options.anchorKey) {
-    state.selectedSupervisorAnchorKey = options.anchorKey;
-  }
-  openProjectRoomStream(projectId);
-  try {
-    await refreshSupervisorSessions();
-  } catch (error) {
-    console.warn("Anchor Session refresh after Project Master prepare failed", error);
-  }
-  renderComposerActions();
-  renderComposerState();
-  renderRoomMessages();
-  elements.dispatchInstruction.focus();
+    connection,
+    anchorKey: options.anchorKey,
+  });
 }
 
 async function attachSelectedMasterSession(session) {
@@ -3691,10 +3705,39 @@ function renderComposerState() {
   const activeTerminal = typeof activeTerminalSession === "function"
     ? activeTerminalSession()
     : (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId);
-  if (typeof applyCliDockTitle === "function") {
-    applyCliDockTitle(activeTerminal || null);
+  const showTerminal =
+    state.conversationSurface === "CLI" && Boolean(activeTerminal);
+  const showConversation =
+    !showTerminal && state.conversationTarget.kind !== "NONE";
+  elements.roomMessageList.classList.toggle("hidden", !showConversation);
+  elements.dispatchForm.classList.toggle("hidden", !showConversation);
+  elements.terminalTabs.classList.toggle("hidden", !showTerminal);
+  elements.terminalStage.classList.toggle("hidden", !showTerminal);
+  const dockLabel = elements.conversationToggle?.querySelector(".chat-dock-label");
+  if (dockLabel) {
+    dockLabel.textContent = showTerminal
+      ? "CLI"
+      : state.conversationTarget.kind === "PROVIDER_SESSION"
+        ? "Chat"
+        : state.conversationTarget.kind === "NONE"
+          ? "Chat"
+          : "Project Room";
   }
-  if (activeTerminal) return;
+  if (typeof applyCliDockTitle === "function") {
+    applyCliDockTitle(showTerminal ? activeTerminal : null);
+  }
+  if (showTerminal) return;
+  if (!showConversation) {
+    elements.conversationTitle.textContent = "Chat";
+    elements.conversationTargetLabel.textContent = "Select a session";
+    return;
+  }
+  elements.conversationTitle.textContent =
+    state.conversationTarget.kind === "PROVIDER_SESSION" ? "Session Chat" : "Project Room";
+  elements.conversationTargetLabel.textContent =
+    state.conversationTarget.kind === "PROVIDER_SESSION"
+      ? "Anchor-bound provider session"
+      : "Anchor-bound room conversation";
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
     const draft = state.sessionDelegationDraft || state.conversationTarget;
     const originAnchorRef = String(draft.origin_anchor_ref || "UNKNOWN");
@@ -4893,6 +4936,13 @@ function renderRoomMessages() {
       elements.conversationExpand?.checked
   );
   elements.roomMessageList.replaceChildren();
+  if (state.conversationTarget.kind === "NONE") {
+    elements.roomMessageList.append(
+      node("p", "empty-copy", "Select a session to chat.")
+    );
+    finishRoomMessageRender(previousScrollTop, stickToBottom);
+    return;
+  }
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
     const draft = state.sessionDelegationDraft || state.conversationTarget;
     const delegation = (state.sessionDelegations || []).find(
@@ -5227,112 +5277,11 @@ function providerStatusText(setting) {
   )}`;
 }
 
-function providerProfileSetting(scopeKind, scopeId) {
-  if (scopeKind === "UNIVERSE_CONDUCTOR") {
-    return state.providerSettings?.universe_conductor || null;
-  }
-  return (
-    state.providerSettings?.project_masters?.find(
-      (item) => item.scope_id === scopeId
-    ) || null
-  );
-}
-
-function renderProviderSettings() {
-  const settings = state.providerSettings;
-  if (!settings) return;
-  const conductor = settings.universe_conductor;
-  elements.universeProviderSetting.textContent = "Configure";
-  elements.universeProviderStatus.textContent = providerStatusText(conductor);
-  elements.projectProviderSettings.replaceChildren();
-  for (const project of operableProjects()) {
-    const setting =
-      settings.project_masters?.find(
-        (item) => item.scope_id === project.project_id
-      ) || { provider: "AUTO", resolved_provider: "UNAVAILABLE" };
-    const row = node("div", "project-provider-row provider-profile-row");
-    row.dataset.projectId = project.project_id;
-    const copy = node("div", "project-provider-copy provider-profile-copy");
-    copy.append(
-      node("strong", "", `${project.project_id} Master`),
-      node("small", "", providerStatusText(setting))
-    );
-    const configure = node(
-      "button",
-      "secondary-button provider-profile-button",
-      "Configure"
-    );
-    configure.type = "button";
-    configure.addEventListener("click", () => {
-      openProviderProfileDialog({
-        scopeKind: "PROJECT_MASTER",
-        scopeId: project.project_id,
-        label: `${project.project_id} Master`,
-      });
-    });
-    row.append(copy, configure);
-    elements.projectProviderSettings.append(row);
-  }
-  if (!state.projects.length) {
-    elements.projectProviderSettings.append(
-      node("p", "empty-copy", "Connect a project to configure its Master CLI.")
-    );
-  }
-}
-
 function providerCatalogModels(provider) {
   const key = String(provider || "").toUpperCase();
   if (!key || key === "AUTO") return [];
   const entry = state.providerModels?.providers?.[key];
   return Array.isArray(entry?.models) ? entry.models : [];
-}
-
-function fillProviderProfileModelSelect(provider, selectedValue = "") {
-  const select = elements.providerProfileModel;
-  const custom = elements.providerProfileModelCustom;
-  if (!select || !custom) return;
-  const key = String(provider || "AUTO").toUpperCase();
-  const disabled = key === "AUTO";
-  const models = providerCatalogModels(key);
-  const selected = String(selectedValue || "").trim();
-  select.replaceChildren();
-  const hostDefault = node("option", "", disabled ? "Auto provider default" : "Host default");
-  hostDefault.value = "";
-  select.append(hostDefault);
-  for (const modelId of models) {
-    const option = node("option", "", modelId);
-    option.value = modelId;
-    select.append(option);
-  }
-  const catalogSelection = selected && models.includes(selected) ? selected : "";
-  select.value = catalogSelection;
-  custom.value = selected && !catalogSelection ? selected : "";
-  select.disabled = disabled;
-  custom.disabled = disabled;
-  if (disabled) custom.value = "";
-}
-
-function openProviderProfileDialog({ scopeKind, scopeId, label }) {
-  const setting = providerProfileSetting(scopeKind, scopeId) || {
-    provider: "AUTO",
-    model_ref: "",
-    effort: "AUTO",
-  };
-  state.providerProfileTarget = { scopeKind, scopeId, label };
-  elements.providerProfileTitle.textContent = label;
-  elements.providerProfileSubtitle.textContent =
-    scopeKind === "UNIVERSE_CONDUCTOR"
-      ? "Applied to the persistent Universe Conductor session."
-      : "Applied when this Project Master is opened or resumed.";
-  elements.providerProfileProvider.value = setting.provider || "AUTO";
-  elements.providerProfileEffort.value = setting.effort || "AUTO";
-  fillProviderProfileModelSelect(
-    elements.providerProfileProvider.value,
-    setting.model_ref || ""
-  );
-  elements.providerProfileStatus.textContent = providerStatusText(setting);
-  elements.providerProfileError.textContent = "";
-  elements.providerProfileDialog.showModal();
 }
 
 function openNewSessionDialog() {
@@ -5448,42 +5397,6 @@ async function submitNewSession(event) {
   } finally {
     if (elements.newSessionSubmit) elements.newSessionSubmit.disabled = false;
     if (elements.newSessionStatus) elements.newSessionStatus.textContent = "";
-  }
-}
-
-async function submitProviderProfile(event) {
-  event.preventDefault();
-  const target = state.providerProfileTarget;
-  if (!target) return;
-  elements.providerProfileError.textContent = "";
-  elements.providerProfileSubmit.disabled = true;
-  const provider = String(elements.providerProfileProvider.value || "AUTO").toUpperCase();
-  const modelRef = provider === "AUTO"
-    ? ""
-    : String(
-        elements.providerProfileModelCustom.value ||
-        elements.providerProfileModel.value ||
-        ""
-      ).trim();
-  const effort = String(elements.providerProfileEffort.value || "AUTO").toUpperCase();
-  const endpoint = target.scopeKind === "UNIVERSE_CONDUCTOR"
-    ? "/v1/settings/providers/universe"
-    : `/v1/projects/${encodeURIComponent(target.scopeId)}/provider-setting`;
-  try {
-    await api(endpoint, {
-      method: "POST",
-      body: { provider, model_ref: modelRef, effort },
-    });
-    state.providerSettings = await api("/v1/settings/providers");
-    renderProviderSettings();
-    renderComposerState();
-    if (elements.sessionSummaryDialog?.open) renderProviderChatSummary();
-    elements.providerProfileDialog.close();
-    toast(`${target.label} profile updated`);
-  } catch (error) {
-    elements.providerProfileError.textContent = error.message;
-  } finally {
-    elements.providerProfileSubmit.disabled = false;
   }
 }
 
@@ -6718,7 +6631,6 @@ async function openProviderSettings() {
         (worker.last_run?.ran_at ? ` · last ${worker.last_run.ran_at}` : "")
       : "0 = off. Server runs HEURISTIC maintain when > 0.";
   }
-  renderProviderSettings();
   renderWorkerBindingSettings();
   renderHostToolSettings();
   renderRuntimePreflight();
@@ -6844,7 +6756,6 @@ async function submitProviderSettings(event) {
       api("/v1/settings/providers"),
       api("/v1/settings/worker-bindings"),
     ]);
-    renderProviderSettings();
     renderWorkerBindingSettings();
     renderComposerState();
     elements.settingsDialog.close();
@@ -7486,6 +7397,7 @@ function openProviderSessionStream(chatKey) {
 }
 
 async function openProviderChatSession(room, options = {}) {
+  state.conversationSurface = "CHAT";
   const isCurrent =
     typeof options.isCurrent === "function" ? options.isCurrent : () => true;
   if (!isCurrent()) return false;
@@ -12784,22 +12696,6 @@ function bindEvents() {
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
-  elements.universeProviderSetting.addEventListener("click", () => {
-    openProviderProfileDialog({
-      scopeKind: "UNIVERSE_CONDUCTOR",
-      scopeId: "CONDUCTOR",
-      label: "Universe Conductor",
-    });
-  });
-  elements.providerProfileProvider.addEventListener("change", () => {
-    fillProviderProfileModelSelect(elements.providerProfileProvider.value, "");
-  });
-  elements.providerProfileModel.addEventListener("change", () => {
-    if (elements.providerProfileModel.value) {
-      elements.providerProfileModelCustom.value = "";
-    }
-  });
-  elements.providerProfileForm.addEventListener("submit", submitProviderProfile);
   if (elements.actionInboxButton && elements.actionInboxDialog) {
     elements.actionInboxButton.addEventListener("click", openActionInbox);
     elements.actionInboxDialog.addEventListener("close", () => {

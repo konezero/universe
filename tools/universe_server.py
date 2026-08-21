@@ -13378,7 +13378,174 @@ class UniverseStore:
         )
         return queued, True
 
+    def apply_todo_action(self, todo_id: str, value: Any) -> dict[str, Any]:
+        normalized_todo_id = _identifier(todo_id, "todo_id")
+        request = _exact_object_fields(
+            value,
+            field="todo action",
+            required=frozenset({"action_id", "outcome", "source", "evidence_ref"}),
+            optional=frozenset({"validation"}),
+        )
+        action_id = _required_text(request["action_id"], "action_id")
+        if len(action_id) > 160:
+            raise UniverseError("TODO_ACTION_ID_INVALID", "action_id is too long")
+        outcome = _required_text(request["outcome"], "outcome").upper()
+        desired_state = {
+            "STARTED": "IN_PROGRESS",
+            "COMPLETED": "DONE",
+            "FAILED": "BLOCKED",
+            "REOPENED": "READY",
+        }.get(outcome)
+        if desired_state is None:
+            raise UniverseError(
+                "TODO_ACTION_OUTCOME_INVALID",
+                "outcome must be STARTED, COMPLETED, FAILED, or REOPENED",
+            )
+        source = _required_text(request["source"], "source").upper()
+        if len(source) > 80:
+            raise UniverseError("TODO_ACTION_SOURCE_INVALID", "source is too long")
+        evidence_ref = _required_text(request["evidence_ref"], "evidence_ref")
+        if len(evidence_ref) > 1000:
+            raise UniverseError(
+                "TODO_ACTION_EVIDENCE_INVALID", "evidence_ref is too long"
+            )
+        validation_value = request.get("validation")
+        if validation_value is None:
+            validation: dict[str, str] = {}
+        else:
+            if not isinstance(validation_value, Mapping) or set(validation_value) != {
+                "status",
+                "evidence_ref",
+            }:
+                raise UniverseError(
+                    "TODO_ACTION_VALIDATION_INVALID",
+                    "validation must contain only status and evidence_ref",
+                )
+            validation = {
+                "status": _required_text(
+                    validation_value["status"], "validation.status"
+                ).upper(),
+                "evidence_ref": _required_text(
+                    validation_value["evidence_ref"], "validation.evidence_ref"
+                ),
+            }
+        if outcome == "COMPLETED" and validation.get("status") != "PASSED":
+            raise UniverseError(
+                "TODO_COMPLETION_VALIDATION_REQUIRED",
+                "COMPLETED requires validation.status PASSED and validation evidence",
+                HTTPStatus.CONFLICT,
+            )
+
+        event_payload = {
+            "todo_id": normalized_todo_id,
+            "action_id": action_id,
+            "outcome": outcome,
+            "source": source,
+            "evidence_ref": evidence_ref,
+            "validation": validation,
+            "state": desired_state,
+        }
+        event_id = "todo-action-" + _json_sha256(event_payload)[:32]
+        payload_json = json.dumps(
+            event_payload, sort_keys=True, separators=(",", ":")
+        )
+        now = utc_now()
+        with self._connection() as connection:
+            todo_row = connection.execute(
+                """
+                SELECT project_id, state, revision FROM project_todo
+                WHERE todo_id = ?
+                """,
+                (normalized_todo_id,),
+            ).fetchone()
+            if todo_row is None:
+                raise UniverseError(
+                    "TODO_NOT_FOUND", "todo does not exist", HTTPStatus.NOT_FOUND
+                )
+            project_id = todo_row["project_id"]
+            if not isinstance(project_id, str) or not project_id:
+                raise UniverseError(
+                    "TODO_ACTION_PROJECT_REQUIRED",
+                    "hook actions require a project-bound Todo",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = connection.execute(
+                """
+                SELECT project_id, event_type, payload_json
+                FROM project_event WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["project_id"] != project_id
+                    or existing["event_type"] != "TODO_ACTION_APPLIED"
+                ):
+                    raise UniverseError(
+                        "TODO_ACTION_ID_CONFLICT",
+                        "action_id already refers to different Todo action content",
+                        HTTPStatus.CONFLICT,
+                    )
+                return {
+                    "status": "TODO_ACTION_ALREADY_APPLIED",
+                    "action_id": action_id,
+                    "event_id": event_id,
+                    "todo": self.get_todo(normalized_todo_id),
+                }
+
+            current_state = str(todo_row["state"])
+            if current_state == "DONE" and outcome != "REOPENED":
+                next_state = "DONE"
+            else:
+                next_state = desired_state
+            if next_state != current_state:
+                cursor = connection.execute(
+                    """
+                    UPDATE project_todo
+                    SET state = ?, revision = revision + 1, updated_at = ?
+                    WHERE todo_id = ? AND revision = ?
+                    """,
+                    (
+                        next_state,
+                        now,
+                        normalized_todo_id,
+                        todo_row["revision"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise UniverseError(
+                        "TODO_REVISION_CONFLICT",
+                        "todo changed before the hook action could be applied",
+                        HTTPStatus.CONFLICT,
+                    )
+            event_payload["state"] = next_state
+            payload_json = json.dumps(
+                event_payload, sort_keys=True, separators=(",", ":")
+            )
+            connection.execute(
+                """
+                INSERT INTO project_event(
+                    event_id, project_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, 'TODO_ACTION_APPLIED', ?, ?)
+                """,
+                (event_id, project_id, payload_json, now),
+            )
+
+        todo = self.get_todo(normalized_todo_id)
+        result = {
+            "status": "TODO_ACTION_APPLIED",
+            "action_id": action_id,
+            "event_id": event_id,
+            "todo": todo,
+        }
+        if outcome in {"COMPLETED", "FAILED"}:
+            result["result_fanout"] = self.record_todo_result_fanout(
+                project_id, normalized_todo_id, outcome, todo["state"]
+            )
+        return result
+
     def apply_master_message_todo_transition(
+
         self,
         project_id: str,
         message_id: str,
@@ -18249,6 +18416,76 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "task_frame": dict(host_result),
         }
 
+    def run_instruction_authorized_task_frame(
+        self,
+        project_id: str,
+        proposal_id: str,
+        task_frame_id: str,
+    ) -> dict[str, Any]:
+        """Run a direct-instruction v2 Task Frame without approval evidence."""
+
+        project = self.store.get_project(project_id)
+        primary_id = _required_text(proposal_id, "primary_proposal_id")
+        frame_id = _required_text(task_frame_id, "task_frame_id")
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == primary_id
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        primary_digest = _sha256(
+            proposal.get("proposal_digest"), "primary_proposal.proposal_digest"
+        )
+        try:
+            self.ensure_project_master(project["project_id"])
+            bridge = self.store.get_master_bridge(project["project_id"])
+            receipt = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+            ).run_instruction_authorized_task_frame(
+                bridge=bridge,
+                task_frame_id=frame_id,
+                primary_proposal_id=primary_id,
+                primary_proposal_digest=primary_digest,
+            )
+        except (DispatchError, OSError, ProjectMasterHostError) as error:
+            raise UniverseError(
+                "INSTRUCTION_TASK_FRAME_RUN_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        host_result = receipt.get("host_response")
+        if (
+            not isinstance(host_result, Mapping)
+            or host_result.get("status") != "INSTRUCTION_TASK_FRAME_COMPLETED"
+            or host_result.get("project_id") != project["project_id"]
+            or host_result.get("primary_proposal_id") != primary_id
+            or host_result.get("task_frame_id") != frame_id
+        ):
+            raise UniverseError(
+                "INSTRUCTION_TASK_FRAME_RUN_RECEIPT_INVALID",
+                "Project Master did not return a matching instruction Task Frame completion receipt",
+                HTTPStatus.CONFLICT,
+            )
+        self.publish_project_room_changed(project["project_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "INSTRUCTION_TASK_FRAME_COMPLETED",
+            "project_id": project["project_id"],
+            "primary_proposal_id": primary_id,
+            "task_frame": dict(host_result),
+        }
+
     def run_approved_descendant_task_frame(
         self,
         project_id: str,
@@ -20170,12 +20407,65 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id = str(payload.get("project_id") or "").strip()
         mode = str(payload.get("mode") or "MASTER").strip().upper()
         cwd = str(payload.get("cwd") or "").strip()
+        provider = str(payload.get("provider") or "AUTO").strip().upper()
         resume_ref = str(payload.get("resume_session_ref") or "").strip()
+        supervisor_session_id = str(
+            payload.get("supervisor_session_id") or ""
+        ).strip()
+        if supervisor_session_id:
+            try:
+                supervised = self.session_supervisor.get_session(
+                    supervisor_session_id
+                )
+            except SessionSupervisorError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+            supervised_project = str(
+                supervised.get("current_project_id")
+                or supervised.get("node")
+                or ""
+            ).strip()
+            supervised_mode = str(supervised.get("mode") or "").upper()
+            supervised_provider = str(
+                supervised.get("provider") or ""
+            ).upper()
+            if (
+                supervised_project.casefold() != project_id.casefold()
+                or supervised_mode != mode
+                or (provider not in {"", "AUTO"} and provider != supervised_provider)
+            ):
+                raise UniverseError(
+                    "TERMINAL_SESSION_COORDINATE_MISMATCH",
+                    "Supervisor session does not match the requested terminal coordinate",
+                    HTTPStatus.CONFLICT,
+                )
+            provider = supervised_provider
+            stored_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            if not stored_ref:
+                raise UniverseError(
+                    "TERMINAL_PROVIDER_SESSION_UNAVAILABLE",
+                    "Supervisor session has no provider-owned session id",
+                    HTTPStatus.CONFLICT,
+                )
+            vendor_identity = _vendor_identity_from_observer(stored_ref)
+            if vendor_identity is not None:
+                stored_provider, stored_ref = vendor_identity
+                if stored_provider != provider:
+                    raise UniverseError(
+                        "TERMINAL_RESUME_PROVIDER_MISMATCH",
+                        "Stored provider session does not match the terminal provider",
+                        HTTPStatus.CONFLICT,
+                    )
+            resume_ref = stored_ref
         is_new_session = not resume_ref or resume_ref.upper() == "UNKNOWN"
+        if not supervisor_session_id:
+            supervisor_session_id = "session_" + secrets.token_hex(12)
         existing = self.terminal_host.find_live(
             project_id=project_id,
             mode=mode,
-            provider=str(payload.get("provider") or "AUTO"),
+            provider=provider,
+            supervisor_session_id=supervisor_session_id,
         )
         if existing is not None:
             return {
@@ -20190,7 +20480,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 project_id=project_id,
                 mode=mode,
                 cwd=cwd,
-                provider=str(payload.get("provider") or "AUTO"),
+                provider=provider,
+                supervisor_session_id=supervisor_session_id,
                 resume_session_ref=resume_ref,
                 cols=int(payload.get("cols") or 120),
                 rows=int(payload.get("rows") or 32),
@@ -26655,6 +26946,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            todo_action_match = re.fullmatch(
+                r"/v1/todos/([^/]+)/actions", path
+            )
+            if todo_action_match is not None:
+                result = self.server.store.apply_todo_action(
+                    unquote(todo_action_match.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **result,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
             project_goals = re.fullmatch(r"/v1/projects/([^/]+)/goals", path)
             if project_goals is not None:
                 goal = self.server.store.create_goal(
@@ -27197,7 +27505,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             instruction_task_frame_parts = self._instruction_authorized_task_frame_path(
                 path
             )
+            instruction_task_frame_run_parts = (
+                self._instruction_authorized_task_frame_run_path(path)
+            )
             approved_task_frame_run_parts = self._approved_descendant_task_frame_run_path(path)
+            if instruction_task_frame_run_parts is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.run_instruction_authorized_task_frame(
+                        instruction_task_frame_run_parts[0],
+                        instruction_task_frame_run_parts[1],
+                        instruction_task_frame_run_parts[2],
+                    ),
+                )
+                return
             if approved_task_frame_run_parts is not None:
                 self._send(
                     HTTPStatus.OK,
@@ -28356,6 +28677,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not project_id or "/" in project_id or not proposal_id or "/" in proposal_id:
             return None
         return unquote(project_id), unquote(proposal_id)
+
+    @staticmethod
+    def _instruction_authorized_task_frame_run_path(
+        path: str,
+    ) -> tuple[str, str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/governance-proposals/"
+        separator = "/instruction-task-frames/"
+        suffix = "/run"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or separator not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, proposal_path = remainder.split(marker, 1)
+        proposal_id, frame_path = proposal_path.split(separator, 1)
+        frame_id = frame_path[: -len(suffix)]
+        if (
+            not project_id
+            or "/" in project_id
+            or not proposal_id
+            or "/" in proposal_id
+            or not frame_id
+            or "/" in frame_id
+        ):
+            return None
+        return unquote(project_id), unquote(proposal_id), unquote(frame_id)
 
     @staticmethod
     def _approved_descendant_task_frame_run_path(

@@ -32,6 +32,11 @@ WORK_STATUS_SCHEMA = "universe.work-status-notification.v1"
 PROVIDER_ACTION_SCHEMA = "universe.provider-session-action.v1"
 CHAT_KEY_PATTERN = re.compile(r"^provider_chat_[0-9a-f]{24}$")
 ACTION_ID_PATTERN = re.compile(r"^provider_action_[0-9a-f]{24}$")
+TODO_ID_PATTERN = re.compile(r"^todo_[A-Za-z0-9_-]+$")
+TODO_COMMIT_MARKER_PATTERN = re.compile(
+    r"(?:^|[\s\[])Universe-Todo\s*[:=]\s*(todo_[A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 
 
 def _utc_now() -> str:
@@ -70,6 +75,17 @@ def _action_id(value: Any) -> str:
             400,
         )
     return action_id
+
+
+def _explicit_todo_id(details: Mapping[str, Any] | None) -> str | None:
+    if details is None:
+        return None
+    direct = str(details.get("todo_id") or "").strip()
+    if direct and TODO_ID_PATTERN.fullmatch(direct):
+        return direct
+    message = str(details.get("commit_message") or "")
+    match = TODO_COMMIT_MARKER_PATTERN.search(message)
+    return match.group(1) if match is not None else None
 
 
 def _json_copy(value: Any) -> Any:
@@ -117,6 +133,11 @@ class ProviderActionStore(Protocol):
     def delete_provider_session_action(
         self, chat_key: str, action_id: str
     ) -> Mapping[str, Any] | None: ...
+
+
+    def apply_todo_action(
+        self, todo_id: str, value: Mapping[str, Any]
+    ) -> Mapping[str, Any]: ...
 
 
 class ProviderSessionEventHub:
@@ -943,6 +964,9 @@ class ProviderSessionService:
             )
             if details is not None and key in details
         }
+        todo_id = _explicit_todo_id(details)
+        if todo_id is not None:
+            safe_details["todo_id"] = todo_id
         status = {
             "schema": WORK_STATUS_SCHEMA,
             "operation": operation,
@@ -985,6 +1009,40 @@ class ProviderSessionService:
                 "message_id": message_id,
                 "created_at": updated_at,
             }
+        if (
+            action is not None
+            and self.action_store is not None
+            and operation == "COMMIT"
+            and state == "COMPLETED"
+            and todo_id is not None
+        ):
+            commit_sha = str(safe_details.get("commit_sha") or "").strip().lower()
+            updater = getattr(self.action_store, "apply_todo_action", None)
+            if commit_sha and callable(updater):
+                try:
+                    transition = updater(
+                        todo_id,
+                        {
+                            "action_id": f"git-commit-{commit_sha}",
+                            "outcome": "STARTED",
+                            "source": "GIT_TRACE2",
+                            "evidence_ref": f"git://commit/{commit_sha}",
+                        },
+                    )
+                except Exception as error:  # noqa: BLE001 - hook failure stays informational
+                    action["todo_transition"] = {
+                        "status": "BLOCKED",
+                        "error_code": str(
+                            getattr(error, "code", type(error).__name__)
+                        ).upper()[:120],
+                    }
+                else:
+                    transition_todo = transition.get("todo", {})
+                    action["todo_transition"] = {
+                        "status": str(transition.get("status") or "UNKNOWN"),
+                        "todo_id": todo_id,
+                        "state": str(transition_todo.get("state") or "UNKNOWN"),
+                    }
         if action is not None and self.action_store is not None:
             action = dict(
                 self.action_store.record_provider_session_action(

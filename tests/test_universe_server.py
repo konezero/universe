@@ -872,6 +872,78 @@ class UniverseLocalServiceTests(unittest.TestCase):
             other.identity()["universe_id"],
         )
 
+    def test_todo_actions_are_idempotent_and_completion_requires_validation(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+        status, created = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Currentize from hook actions",
+                "detail": "",
+                "priority": "P1",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status)
+        todo_id = created["todo"]["todo_id"]
+
+        started_action = {
+            "action_id": "git-commit-" + "a" * 40,
+            "outcome": "STARTED",
+            "source": "GIT_TRACE2",
+            "evidence_ref": "git://commit/" + "a" * 40,
+        }
+        status, started = self.request(
+            "POST", f"/v1/todos/{todo_id}/actions", started_action
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("TODO_ACTION_APPLIED", started["status"])
+        self.assertEqual("IN_PROGRESS", started["todo"]["state"])
+        self.assertFalse(started["task_frame_created"])
+        self.assertFalse(started["execution_assignment_created"])
+
+        status, repeated = self.request(
+            "POST", f"/v1/todos/{todo_id}/actions", started_action
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("TODO_ACTION_ALREADY_APPLIED", repeated["status"])
+
+        completed_action = {
+            "action_id": "validation-run-001",
+            "outcome": "COMPLETED",
+            "source": "TEST_HOOK",
+            "evidence_ref": "test-run://validation-run-001",
+        }
+        status, blocked = self.request(
+            "POST", f"/v1/todos/{todo_id}/actions", completed_action
+        )
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "TODO_COMPLETION_VALIDATION_REQUIRED", blocked["error_code"]
+        )
+
+        completed_action["validation"] = {
+            "status": "PASSED",
+            "evidence_ref": "test-run://validation-run-001/passed",
+        }
+        status, completed = self.request(
+            "POST", f"/v1/todos/{todo_id}/actions", completed_action
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("DONE", completed["todo"]["state"])
+        self.assertIn("result_fanout", completed)
+
+        status, todos = self.request("GET", "/v1/todos")
+        self.assertEqual(200, status)
+        retained = next(item for item in todos["todos"] if item["todo_id"] == todo_id)
+        self.assertEqual("DONE", retained["state"])
+
     def test_todo_work_map_is_editable_prioritized_and_execution_neutral(
         self,
     ) -> None:
@@ -3256,6 +3328,50 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 },
             )
         self.assertEqual("SESSION_CWD_MISMATCH", raised.exception.code)
+
+    def test_cli_terminal_resolves_vendor_ref_from_supervisor_session(self) -> None:
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_internal_coordinate",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:vendor-thread-123",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.create.return_value = {
+            "terminal_id": "term_vendor_resume",
+            "state": "LIVE",
+        }
+        self.server.terminal_host = terminal_host
+
+        created = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CODEX",
+                "supervisor_session_id": supervised["session_id"],
+                "resume_session_ref": supervised["session_id"],
+            }
+        )
+
+        self.assertEqual("CLI_TERMINAL_CREATED", created["status"])
+        terminal_host.create.assert_called_once_with(
+            project_id="GCS",
+            mode="MASTER",
+            cwd=str(self.project_root),
+            provider="CODEX",
+            supervisor_session_id="session_internal_coordinate",
+            resume_session_ref="vendor-thread-123",
+            cols=120,
+            rows=32,
+        )
 
     def test_conductor_prepare_rejects_model_from_another_provider(self) -> None:
         prepared = self.server.prepare_conductor_session(
@@ -6317,6 +6433,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(request["task_frame"], forwarded["task_frame"])
         self.assertNotIn("approval", forwarded)
+
+        completion = {
+            "status": "INSTRUCTION_TASK_FRAME_COMPLETED",
+            "project_id": "GCS",
+            "primary_proposal_id": proposal["proposal_id"],
+            "task_frame_id": "instruction-frame-001",
+            "repository_write": False,
+        }
+        client.run_instruction_authorized_task_frame.return_value = {
+            "host_response": completion
+        }
+        with (
+            patch.object(self.server, "ensure_project_master", return_value={}),
+            patch.object(self.server.store, "get_master_bridge", return_value=bridge),
+            patch("universe_server.HttpProjectMasterBridge", return_value=client),
+        ):
+            run_status, run_result = self.request(
+                "POST",
+                "/v1/projects/GCS/governance-proposals/"
+                "task_proposal_test_001/instruction-task-frames/"
+                "instruction-frame-001/run",
+                {},
+                self.token,
+            )
+
+        self.assertEqual(HTTPStatus.OK, run_status)
+        self.assertEqual("INSTRUCTION_TASK_FRAME_COMPLETED", run_result["status"])
+        run_forwarded = (
+            client.run_instruction_authorized_task_frame.call_args.kwargs
+        )
+        self.assertNotIn("approval_evidence_ref", run_forwarded)
 
     def test_conductor_approval_uses_durable_governance_decision(self) -> None:
         proposal = self.create_task_proposal_fixture()

@@ -331,8 +331,10 @@ class SupervisedTerminalHost:
         project_id: str,
         mode: str,
         provider: str = "",
+        supervisor_session_id: str = "",
     ) -> dict[str, Any] | None:
         wanted_provider = str(provider or "").strip().upper()
+        wanted_supervisor = str(supervisor_session_id or "").strip()
         rows = [
             item
             for item in self.list_sessions()
@@ -343,6 +345,11 @@ class SupervisedTerminalHost:
                 not wanted_provider
                 or wanted_provider == "AUTO"
                 or str(item.get("provider") or "").upper() == wanted_provider
+            )
+            and (
+                not wanted_supervisor
+                or str(item.get("supervisor_session_id") or "")
+                == wanted_supervisor
             )
         ]
         if not rows:

@@ -1038,10 +1038,12 @@ class RuntimeWorkerDispatcher:
         if not mutation_evidence_required and not (pass_seen or fail_seen):
             invalid("WORKER_REVIEW_CONCLUSION_REQUIRED")
         if mutation_evidence_required:
-            evidence_refs(
+            mutation_evidence = evidence_refs(
                 result.get("mutation_evidence_refs"),
                 "WORKER_MUTATION_EVIDENCE_REQUIRED",
             )
+            if any("no-mutation-performed" in item for item in mutation_evidence):
+                invalid("WORKER_MUTATION_NOT_PERFORMED")
     @staticmethod
     def _skill_bindings(
         planned_invocation: Mapping[str, Any],

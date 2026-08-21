@@ -902,7 +902,7 @@ class ProjectModeCoordinator:
         task_frame_id: str,
         primary_proposal_id: str,
         primary_proposal_digest: str,
-        approval_evidence_ref: str,
+        approval_evidence_ref: str | None,
     ) -> Mapping[str, Any]:
         """Run one approved Frame through the Host-owned worker dispatcher.
 
@@ -913,7 +913,11 @@ class ProjectModeCoordinator:
         frame_id = _text(task_frame_id, "task_frame_id")
         primary_id = _text(primary_proposal_id, "primary_proposal_id")
         _text(primary_proposal_digest, "primary_proposal_digest")
-        approval_ref = _text(approval_evidence_ref, "approval_evidence_ref")
+        approval_ref = (
+            _text(approval_evidence_ref, "approval_evidence_ref")
+            if approval_evidence_ref is not None
+            else None
+        )
         binding = self._ensure_runtime(recover_task_frame_id=frame_id)
         self._validate_task_frame_session_lineage(
             task_frame_id=frame_id,
@@ -937,11 +941,16 @@ class ProjectModeCoordinator:
         gate = execution.get("execution_gate")
         if not isinstance(gate, Mapping):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_GATE_UNAVAILABLE")
-        if gate.get("approval_ref") != approval_ref:
-            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_LINEAGE_MISMATCH")
+        if approval_ref is not None:
+            if gate.get("approval_ref") != approval_ref:
+                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_LINEAGE_MISMATCH")
+        elif gate.get("approval_ref") not in {None, "NONE"}:
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_LINEAGE_MISMATCH")
         plan = gate.get("execution_plan")
         if not isinstance(plan, Mapping):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PLAN_INVALID")
+        if approval_ref is None and plan.get("profile_id") != "task-frame-instruction-v2":
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_PROFILE_MISMATCH")
         if _text(plan.get("frame_id"), "execution_plan.frame_id") != frame_id:
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PLAN_MISMATCH")
         parent_actor_ref = _text(
@@ -1000,7 +1009,9 @@ class ProjectModeCoordinator:
                 "execution_plan": dict(plan),
                 "input_bundle": boss_input,
             },
-            "output_contract": self._boss_allocation_output_contract(turns),
+            "output_contract": self._boss_allocation_output_contract(
+                turns, parent_mutation_scope=parent_mutation_scope
+            ),
             "max_turns": 1,
             "result_mode": "STRUCTURED_JSON",
             "defer_terminal_result": True,
@@ -1138,7 +1149,11 @@ class ProjectModeCoordinator:
         if boss_completion.get("status") != "TASK_COMPLETED":
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_COMPLETION_FAILED")
         return {
-            "status": "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED",
+            "status": (
+                "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED"
+                if approval_ref is not None
+                else "INSTRUCTION_TASK_FRAME_COMPLETED"
+            ),
             "project_id": self.project_id,
             "primary_proposal_id": primary_id,
             "task_frame_id": frame_id,
@@ -1343,19 +1358,17 @@ class ProjectModeCoordinator:
     @staticmethod
     def _boss_allocation_output_contract(
         turns: Sequence[Mapping[str, Any]],
+        *,
+        parent_mutation_scope: Mapping[str, Any],
     ) -> dict[str, Any]:
-        mutation_scope = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["operations", "targets"],
-            "properties": {
-                "operations": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["CREATE", "MODIFY", "DELETE"]},
-                },
-                "targets": {"type": "array", "items": {"type": "string"}},
-            },
-        }
+        parent_operations = [
+            str(value).strip().upper()
+            for value in parent_mutation_scope.get("operations", [])
+        ]
+        parent_targets = [
+            str(value).strip()
+            for value in parent_mutation_scope.get("targets", [])
+        ]
         supported_roles = {
             "IMPLEMENTER",
             "SECURITY_REVIEWER",
@@ -1386,6 +1399,36 @@ class ProjectModeCoordinator:
                 "execution_plan.turn.worker_slot_ref",
             )
             worker_path = f"/root/boss/{leaf}"
+            if role == "IMPLEMENTER":
+                mutation_scope = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["operations", "targets"],
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "enum": parent_operations},
+                        },
+                        "targets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "enum": parent_targets},
+                        },
+                    },
+                }
+            else:
+                mutation_scope = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["operations", "targets"],
+                    "properties": {
+                        "operations": {"type": "array", "maxItems": 0},
+                        "targets": {"type": "array", "maxItems": 0},
+                    },
+                }
             allocation_variants.append(
                 {
                     "type": "object",
@@ -1411,6 +1454,7 @@ class ProjectModeCoordinator:
                         "mutation_scope": mutation_scope,
                         "skill_bindings": {
                             "type": "array",
+                            "maxItems": 0,
                             "items": {"type": "object"},
                         },
                     },
@@ -1540,7 +1584,7 @@ class ProjectModeCoordinator:
                     raise ProjectMasterHostError(
                         "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
                     )
-                runtime_role = "SUB_REVIEWER"
+                runtime_role = role
                 inputs = [previous_turn_id]
             declared.append(
                 {
@@ -3144,10 +3188,39 @@ class ProjectMasterSessionStore:
             return None
         return coordinate["session_ref"]
 
-    def ensure_supervisor_session(self, provider: str) -> dict[str, Any] | None:
+    def ensure_supervisor_session(
+        self,
+        provider: str,
+        *,
+        new_session: bool = False,
+    ) -> dict[str, Any] | None:
         """Create the persistent Mode-session slot before its processes start."""
         if self.session_supervisor is None:
             return None
+        normalized_provider = _provider(provider)
+        if new_session:
+            supervisor_session_id = "session_" + secrets.token_hex(12)
+            session, _ = self.session_supervisor.register_session(
+                {
+                    "session_id": supervisor_session_id,
+                    "node": self.session_node,
+                    "mode": self.requested_mode,
+                    "provider": normalized_provider,
+                    "provider_session_ref": None,
+                    "state": "REGISTERED",
+                    "currentness": "UNKNOWN",
+                    "activity_state": "BOOTSTRAPPING",
+                    "location_evidence_ref": (
+                        "universe://mode-session-new/"
+                        f"{self.session_node}/{self.requested_mode}"
+                    ),
+                }
+            )
+            self.session_supervisor.set_default(
+                supervisor_session_id,
+                expected_pointer_version=session["default_pointer_version"],
+            )
+            return self.session_supervisor.get_session(supervisor_session_id)
         sessions = self.session_supervisor.list_sessions(
             node=self.session_node,
             mode=self.requested_mode,
@@ -3178,7 +3251,6 @@ class ProjectMasterSessionStore:
             )
         if selected is not None:
             return selected
-        normalized_provider = _provider(provider)
         supervisor_session_id = self._supervisor_session_id(normalized_provider, "")
         session, _ = self.session_supervisor.register_session(
             {
@@ -4922,6 +4994,11 @@ class ResidentModeSessionHost:
             close = getattr(previous, "close", None)
             if callable(close):
                 close()
+        if force_new_session:
+            # NEW owns a fresh Supervisor Session Anchor before the provider
+            # reports its vendor session id. The provider observation binds to
+            # this slot instead of rewriting the previous default session.
+            self.store.ensure_supervisor_session(provider, new_session=True)
         if self._custom_provider_factory is None:
             active = self._default_provider(
                 provider,
@@ -6181,6 +6258,32 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
         except ProjectMasterHostError as error:
             raise ProjectMasterBridgeError(str(error)) from error
 
+    def run_instruction_authorized_task_frame(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "task_frame_id",
+            "primary_proposal_id",
+            "primary_proposal_digest",
+        }:
+            raise ProjectMasterBridgeError(
+                "INSTRUCTION_TASK_FRAME_RUN_REQUEST_INVALID"
+            )
+        run = getattr(self._coordinator, "run_approved_descendant_task_frame", None)
+        if not callable(run):
+            raise ProjectMasterBridgeError(
+                "INSTRUCTION_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return dict(
+                run(
+                    task_frame_id=request["task_frame_id"],
+                    primary_proposal_id=request["primary_proposal_id"],
+                    primary_proposal_digest=request["primary_proposal_digest"],
+                    approval_evidence_ref=None,
+                )
+            )
+        except ProjectMasterHostError as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
     def run_approved_descendant_task_frame(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping) or set(request) != {
             "task_frame_id",
@@ -6442,7 +6545,9 @@ class ResidentProjectMasterHostManager:
                 # executor must acquire its lease before a provider can report
                 # one. Reserve only the persistent node/mode slot here; the
                 # real provider session replaces the UNKNOWN binding later.
-                store.ensure_supervisor_session(selected_provider)
+                store.ensure_supervisor_session(
+                    selected_provider, new_session=force_new_session
+                )
                 bind_permission = getattr(provider, "set_permission_requester", None)
                 if callable(bind_permission):
                     bind_permission(self._permission_before_worker)

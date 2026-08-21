@@ -87,7 +87,9 @@ function selectTerminalTab(terminalId) {
   const session = (state.terminals || []).find((item) => item.terminal_id === terminalId);
   if (!session) return;
   state.activeTerminalId = terminalId;
+  state.conversationSurface = "CLI";
   renderTerminalDock();
+  if (typeof renderComposerState === "function") renderComposerState();
   ensureTerminalSurface(session);
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
@@ -235,12 +237,6 @@ function ensureTerminalSurface(session) {
   return surface;
 }
 
-function projectMasterSetting(projectId) {
-  return ((state.providerSettings || {}).project_masters || []).find(
-    (item) => item.scope_id === projectId
-  );
-}
-
 function observerProvider(session) {
   const raw = String(
     session?.observer_session_ref || session?.session_id || ""
@@ -251,20 +247,16 @@ function observerProvider(session) {
   return "";
 }
 
-function terminalProviderFor(coordinate, session) {
+function terminalProviderFor(_coordinate, session) {
+  const boundProvider = String(
+    session?.provider || session?.current_provider || ""
+  ).toUpperCase();
+  if (["GROK", "CODEX", "CLAUDE"].includes(boundProvider)) {
+    return boundProvider;
+  }
   const fromObserver = observerProvider(session);
   if (fromObserver) return fromObserver;
-  const projectId = String(
-    coordinate?.project?.project_id ||
-      coordinate?.nodeId ||
-      session?.project_id ||
-      session?.node ||
-      ""
-  ).trim();
-  const setting = projectMasterSetting(projectId);
-  const configured = String(setting?.provider || "").toUpperCase();
-  if (configured && configured !== "AUTO") return configured;
-  return String(setting?.resolved_provider || "AUTO").toUpperCase();
+  throw new Error("Choose a provider for this session");
 }
 
 function terminalResumeRef(coordinate, session) {
@@ -273,7 +265,6 @@ function terminalResumeRef(coordinate, session) {
   const raw = String(
     session.provider_session_id ||
       session.observer_session_ref ||
-      session.session_id ||
       ""
   ).trim();
   const sessionProvider = String(session.provider || "").toUpperCase();
@@ -308,6 +299,9 @@ async function createTerminalTab(coordinate, session) {
       mode,
       cwd,
       provider: terminalProviderFor(coordinate, session),
+      supervisor_session_id: String(
+        session?.session_id || session?.universe_session_id || ""
+      ).trim(),
       resume_session_ref: terminalResumeRef(coordinate, session),
     },
   });
@@ -372,9 +366,12 @@ async function closeTerminalTab(terminalId) {
   }
   if (state.activeTerminalId) selectTerminalTab(state.activeTerminalId);
   else {
+    state.conversationSurface = "CHAT";
     applyCliDockTitle(null);
     renderTerminalDock();
   }
+  if (typeof renderComposerState === "function") renderComposerState();
+  if (typeof renderRoomMessages === "function") renderRoomMessages();
 }
 
 function focusTerminalForSession(coordinate, session) {
@@ -399,11 +396,16 @@ function focusTerminalForSession(coordinate, session) {
   ).trim();
   const mode = String(session?.mode || coordinate?.mode || "").toUpperCase();
   const provider = terminalProviderFor(coordinate, session);
+  const supervisorSessionId = String(
+    session?.session_id || session?.universe_session_id || ""
+  ).trim();
   const match = (state.terminals || []).find(
     (item) =>
       item.project_id === projectId &&
       item.mode === mode &&
-      (!provider || provider === "AUTO" || item.provider === provider)
+      (!provider || provider === "AUTO" || item.provider === provider) &&
+      supervisorSessionId &&
+      String(item.supervisor_session_id || "") === supervisorSessionId
   );
   if (match) {
     selectTerminalTab(match.terminal_id);
