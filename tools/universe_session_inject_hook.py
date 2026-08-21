@@ -832,6 +832,14 @@ def run_hook(
         "provider_session_ref": session_ref,
         "make_default": make_default,
         "bounded_summary": f"Hook inject ({args.trigger})",
+        # This is metadata about a successful local hook observation, not a
+        # second provider coordinate.  Universe redacts and deduplicates it
+        # into the semantic graph after the inject succeeds.
+        "hook_observation": {
+            "schema": "universe.hook-session-observation.v1",
+            "trigger": args.trigger,
+            "observed_at": observation["observed_at"],
+        },
         # Product label for PROJECT room MASTER slot (UI Project Master room).
         "display_name": (
             "Project Master"

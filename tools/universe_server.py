@@ -14659,6 +14659,21 @@ class UniverseStore:
                         if payload.get(key) is not None
                     }
                 )
+            elif event_type == "HOOK_SESSION_BOUND" and isinstance(payload, Mapping):
+                entity_type = "HOOK_OBSERVATION"
+                trigger = str(payload.get("trigger") or "SESSION_START")
+                label = f"Hook · {trigger}"
+                event_data.update(
+                    {
+                        key: payload.get(key)
+                        for key in (
+                            "source", "trigger", "observed_at", "session_anchor_ref",
+                            "supervisor_session_id", "provider",
+                            "provider_session_digest", "redaction_state",
+                        )
+                        if payload.get(key) is not None
+                    }
+                )
             event_node = add_node(
                 entity_type, event_id, label,
                 "OBSERVED", "PROJECT_EVENT", source_ref,
@@ -14672,6 +14687,14 @@ class UniverseStore:
                 if session_node is not None:
                     add_edge(
                         "GIT_MILESTONE_FROM_SESSION", event_node, session_node, source_ref
+                    )
+            elif event_type == "HOOK_SESSION_BOUND" and isinstance(payload, Mapping):
+                session_node = session_nodes_by_anchor_ref.get(
+                    str(payload.get("session_anchor_ref") or "")
+                )
+                if session_node is not None:
+                    add_edge(
+                        "HOOK_OBSERVATION_FOR_SESSION", event_node, session_node, source_ref
                     )
 
         for observation in self.list_skill_observations(project_id, limit=200):
@@ -23534,6 +23557,77 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 # A stale project connection must not perturb the provider turn.
                 continue
 
+    def record_session_hook_observation(
+        self,
+        request: Mapping[str, Any],
+        injected: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Record one redacted SessionStart/ModeChange binding observation.
+
+        The hook itself remains best-effort.  This method only observes a
+        successful inject, and keeps the provider coordinate as a digest so
+        graph consumers can join it to a supervised session without exposing
+        a vendor session identifier.
+        """
+
+        raw_hook = request.get("hook_observation")
+        if not isinstance(raw_hook, Mapping):
+            return None
+        project_id = str(request.get("project_id") or "").strip()
+        session = injected.get("supervisor_session")
+        if not project_id or not isinstance(session, Mapping):
+            return None
+        try:
+            self.store.get_project(project_id)
+        except UniverseError:
+            return None
+        trigger = str(raw_hook.get("trigger") or "SESSION_START").strip().upper()
+        if trigger not in {"SESSION_START", "MODE_CHANGE", "MANUAL"}:
+            trigger = "OTHER"
+        provider_session_ref = str(session.get("provider_session_ref") or "")
+        provider_digest = (
+            _json_sha256(provider_session_ref) if provider_session_ref else "UNKNOWN"
+        )
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        if not session_anchor_ref:
+            return None
+        observed_at = str(raw_hook.get("observed_at") or "").strip()
+        payload = {
+            "schema": "universe.hook-session-observation.v1",
+            "source": "SESSION_INJECT_HOOK",
+            "trigger": trigger,
+            "observed_at": observed_at or utc_now(),
+            "session_anchor_ref": session_anchor_ref,
+            "supervisor_session_id": str(session.get("session_id") or ""),
+            "provider": str(session.get("provider") or "UNKNOWN"),
+            "provider_session_digest": provider_digest,
+            "redaction_state": "REDACTED",
+        }
+        event_id = "hook_session_" + _json_sha256(
+            {
+                "project_id": project_id,
+                "session_anchor_ref": session_anchor_ref,
+                "provider_session_digest": provider_digest,
+                "trigger": trigger,
+            }
+        )[:24]
+        try:
+            event, created = self.store.append_event(
+                project_id,
+                {
+                    "event_id": event_id,
+                    "event_type": "HOOK_SESSION_BOUND",
+                    "payload": payload,
+                },
+            )
+        except UniverseError:
+            return None
+        return {
+            "event_id": event.get("event_id"),
+            "created": created,
+            "redaction_state": "REDACTED",
+        }
+
     def _resolve_project_master_delegation(
         self, event: Mapping[str, Any]
     ) -> None:
@@ -27052,6 +27146,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         multi_rooms=self.server.multi_rooms,
                         body=body or {},
                     )
+                    hook_observation = self.server.record_session_hook_observation(
+                        body or {}, result
+                    )
+                    if hook_observation is not None:
+                        result["hook_observation"] = hook_observation
                     self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)

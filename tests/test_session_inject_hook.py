@@ -324,6 +324,14 @@ class SessionInjectHookTests(unittest.TestCase):
             "session_web_terminal",
             result["inject_body"]["supervisor_session_id"],
         )
+        self.assertEqual(
+            "mode_change",
+            result["inject_body"]["hook_observation"]["trigger"],
+        )
+        self.assertEqual(
+            "universe.hook-session-observation.v1",
+            result["inject_body"]["hook_observation"]["schema"],
+        )
         self.assertEqual("UNASSIGNED", result["authority"])
         self.assertTrue(result.get("observation_path"))
 

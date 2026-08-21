@@ -2219,6 +2219,41 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("TASK_FRAME_TARGETS_SESSION_ANCHOR", edge_types)
         self.assertIn("TASK_FRAME_HAS_RESULT", edge_types)
 
+    def test_session_inject_hook_becomes_deduplicated_redacted_graph_input(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        body = {
+            "project_id": "GCS",
+            "node": "GCS",
+            "mode": "MASTER",
+            "room_type": "PROJECT",
+            "slot_role": "MASTER",
+            "provider": "CODEX",
+            "provider_session_ref": "vendor-session-secret-001",
+            "hook_observation": {
+                "schema": "universe.hook-session-observation.v1",
+                "trigger": "session_start",
+                "observed_at": "2026-08-21T00:00:00Z",
+            },
+        }
+        status, first = self.request("POST", "/v1/sessions/inject", body, self.token)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(first["hook_observation"]["created"])
+        status, second = self.request("POST", "/v1/sessions/inject", body, self.token)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertFalse(second["hook_observation"]["created"])
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        hooks = [item for item in graph["nodes"] if item["entity_type"] == "HOOK_OBSERVATION"]
+        self.assertEqual(1, len(hooks))
+        hook = hooks[0]
+        self.assertEqual("Hook · SESSION_START", hook["label"])
+        self.assertEqual("REDACTED", hook["data"]["redaction_state"])
+        self.assertNotIn("vendor-session-secret-001", json.dumps(hook))
+        self.assertIn(
+            "HOOK_OBSERVATION_FOR_SESSION",
+            {item["edge_type"] for item in graph["edges"]},
+        )
+
     def test_cross_session_delegation_fails_closed_without_project_room_delivery(
         self,
     ) -> None:
