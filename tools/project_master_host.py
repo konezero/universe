@@ -2235,6 +2235,19 @@ class ProjectModeCoordinator:
             return "UNKNOWN"
         return str(session.get("session_anchor_ref") or "UNKNOWN")
 
+    def session_anchor_ref(self) -> str:
+        """Return only the Supervisor-verified Session Anchor for this Host."""
+
+        with self._runtime_lock:
+            binding = (
+                dict(self._runtime_binding)
+                if self._runtime_binding is not None
+                else None
+            )
+        if binding is None:
+            return "UNKNOWN"
+        return self._origin_session_anchor_ref(binding)
+
     def _task_frame_session_lineage(self, task_frame_id: str) -> dict[str, str] | None:
         path = self._task_frame_session_lineage_path
         if not path.is_file():
@@ -6554,6 +6567,11 @@ class ResidentProjectMasterHostManager:
                 prepare_provider = getattr(provider, "prepare_session", None)
                 if callable(prepare_provider):
                     prepare_provider()
+                # A provider adapter may create or resume its vendor session
+                # during preparation.  Persist that exact coordinate before
+                # the lease and Room connection are reported, so Room binding
+                # never has to infer an anchor from title, workspace, or mode.
+                store.observe_provider_session(selected_provider, provider.session_ref)
                 coordinator = self.coordinator_factory(
                     project_root,
                     project_id,
@@ -7253,8 +7271,8 @@ class ResidentProjectMasterHostManager:
         except Exception:
             return None
 
-    @staticmethod
     def _handle_connection(
+        self,
         handle: ResidentProjectMasterHandle,
     ) -> dict[str, Any]:
         active = handle.worker.provider
@@ -7272,6 +7290,11 @@ class ResidentProjectMasterHostManager:
         connection["runtime_observation"] = (
             ProjectMasterConversationWorker._runtime_observation(active)
         )
+        connection["session_anchor_ref"] = self._session_anchor_ref_for_connection(
+            project_id=handle.project_id,
+            provider=str(connection.get("last_provider") or ""),
+            provider_session_ref=str(connection.get("last_session_ref") or ""),
+        )
         context = handle.worker.governance_context
         if context is None:
             connection["governance_context"] = {"status": "ABSENT"}
@@ -7284,6 +7307,35 @@ class ResidentProjectMasterHostManager:
                 "selector_digest": context.get("selector_digest"),
             }
         return connection
+
+    def _session_anchor_ref_for_connection(
+        self,
+        *,
+        project_id: str,
+        provider: str,
+        provider_session_ref: str,
+    ) -> str:
+        """Resolve only an exact Supervisor session identity to its anchor."""
+
+        if self.session_supervisor is None or not provider or not provider_session_ref:
+            return "UNKNOWN"
+        candidates = [
+            item
+            for item in self.session_supervisor.list_sessions(
+                node=project_id,
+                mode="MASTER",
+                include_hidden=True,
+            )
+            if str(item.get("provider") or "").upper() == provider.upper()
+            and _same_provider_session_ref(
+                provider,
+                item.get("provider_session_ref"),
+                provider_session_ref,
+            )
+        ]
+        if len(candidates) != 1:
+            return "UNKNOWN"
+        return str(candidates[0].get("session_anchor_ref") or "UNKNOWN")
 
     @staticmethod
     def _default_provider(

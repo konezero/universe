@@ -3805,7 +3805,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["BOSS", "SUB_REVIEWER", "SUB_REVIEWER", "SUB_REVIEWER"],
+            ["BOSS", "IMPLEMENTER", "SECURITY_REVIEWER", "QA_REVIEWER"],
             [turn["role"] for turn in declared],
         )
         self.assertEqual(
@@ -4049,6 +4049,10 @@ class ProjectMasterHostTests(unittest.TestCase):
                 self.assertEqual("STARTED", result["status"])
                 self.assertEqual("LIVE", live["state"])
                 self.assertEqual("OWNED", live["process_lease"]["lease_state"])
+                self.assertEqual(
+                    live["session_anchor_ref"],
+                    result["session_connection"]["session_anchor_ref"],
+                )
                 self.assertEqual(4321, live["process_lease"]["process_identity"]["pid"])
                 handle = manager._handles["GCS"]
                 owned_before_reuse = supervisor.get_session(

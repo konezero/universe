@@ -22431,6 +22431,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "provider_session_ref": connection.get("session_ref")
                         or connection.get("last_session_ref")
                         or connection.get("provider_session_ref"),
+                        "session_anchor_ref": connection.get("session_anchor_ref"),
                         "display_name": "Project Master",
                         # A re-prepared Project Master is an explicit recovery
                         # action, so it may retry only a prior failed delivery.
