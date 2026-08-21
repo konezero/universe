@@ -22777,6 +22777,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ]
         return self.run_memory_batch(project_id, request)
 
+    def _propose_prediction_after_collection(self, project_id: str) -> dict[str, Any]:
+        """Create an idempotent review-only prediction after collection.
+
+        A collection result may produce a candidate, but it must never create
+        a Goal, Todo, Task Frame, or assignment.  Those remain explicit user
+        promotion decisions.
+        """
+
+        try:
+            proposal, created = self.store.propose_work_loop_predictions(project_id)
+        except UniverseError as error:
+            return {
+                "status": "PREDICTION_NOT_AVAILABLE",
+                "reason": error.code,
+                "proposal_created": False,
+            }
+        return {
+            "status": "PREDICTION_PROPOSAL_READY",
+            "proposal_id": proposal.get("proposal_id"),
+            "review_state": proposal.get("review_state", "PROPOSAL_ONLY"),
+            "proposal_created": created,
+            "goal_created": False,
+            "todo_created": False,
+            "task_frame_created": False,
+            "execution_assignment_created": False,
+        }
+
     def run_memory_batch(self, project_id: str, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise UniverseError(
@@ -22834,6 +22861,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     },
                 ),
                 "run": result,
+                "prediction": self._propose_prediction_after_collection(project_id),
             }
 
         if (
@@ -22920,6 +22948,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         },
                         "execution": existing["result"].get("execution", {}),
                         "run": existing["result"],
+                        "prediction": self._propose_prediction_after_collection(
+                            project_id
+                        ),
                     }
 
             binding_digest = str(
@@ -23085,6 +23116,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "candidate_digest": normalized_skill["candidate_digest"],
                         "observation_count": len(skill_result["observations"]),
                     },
+                    "prediction": self._propose_prediction_after_collection(project_id),
                 }
             except (FastExtractError, RuntimeHostError, UniverseError) as error:
                 error_code = getattr(error, "code", "FAST_EXTRACT_FAILED")

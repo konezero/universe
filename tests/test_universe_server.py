@@ -2277,6 +2277,28 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("memory-batch-run-001", cursors[0]["last_event_id"])
         self.assertEqual("c" * 64, cursors[0]["source_digest"])
 
+    def test_collection_prediction_is_proposal_only(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.propose_work_loop_predictions = Mock(
+            return_value=(
+                {
+                    "proposal_id": "prediction-001",
+                    "review_state": "PROPOSAL_ONLY",
+                },
+                True,
+            )
+        )
+
+        prediction = self.server._propose_prediction_after_collection("GCS")
+
+        self.assertEqual("PREDICTION_PROPOSAL_READY", prediction["status"])
+        self.assertEqual("prediction-001", prediction["proposal_id"])
+        self.assertTrue(prediction["proposal_created"])
+        self.assertFalse(prediction["goal_created"])
+        self.assertFalse(prediction["todo_created"])
+        self.assertFalse(prediction["task_frame_created"])
+        self.assertFalse(prediction["execution_assignment_created"])
+
     def test_semantic_graph_projects_cross_session_work_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         allocation, created = self.server.store.create_conductor_delegation(
