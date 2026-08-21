@@ -2650,7 +2650,10 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
       const liveCount = ptyLiveTerminalsForCoordinate(coordinate).length;
-      if (modeSelected || liveCount || coordinate.mode === "MASTER") {
+      // A collapsed mode must not render a misleading empty persistent-session
+      // state.  Selecting its card expands the complete Anchor Session lineage;
+      // an unselected mode renders a session area only when it has a live PTY.
+      if (modeSelected || liveCount) {
         list.append(renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected }));
       }
     }
