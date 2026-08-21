@@ -4234,7 +4234,7 @@ function renderReleaseCatalog() {
     action.type = "button";
     action.disabled = !state.selectedReleaseTargetProjectId;
     action.addEventListener("click", () =>
-      proposeProjectRelease(release.release_id)
+      proposeProjectRelease(release.release_id, action)
     );
     card.append(action);
     elements.releaseList.append(card);
@@ -4298,13 +4298,21 @@ function showReleaseProposal(proposal) {
   }
 }
 
-async function proposeProjectRelease(releaseId) {
+function releasePlanErrorMessage(error) {
+  const detail = error && typeof error.message === "string"
+    ? error.message.trim()
+    : "";
+  return detail || "Project update plan could not be created";
+}
+
+async function proposeProjectRelease(releaseId, button = null) {
   const projectId = state.selectedReleaseTargetProjectId;
   if (!projectId) {
     toast("Select a target project", true);
     return;
   }
   elements.releaseFormError.textContent = "";
+  if (button) button.disabled = true;
   try {
     const result = await api(
       `/v1/projects/${encodeURIComponent(
@@ -4324,7 +4332,11 @@ async function proposeProjectRelease(releaseId) {
     showReleaseProposal(result.proposal);
     toast("Project update plan recorded");
   } catch (error) {
-    elements.releaseFormError.textContent = error.message;
+    const detail = releasePlanErrorMessage(error);
+    elements.releaseFormError.textContent = detail;
+    toast(detail, true);
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -4609,7 +4621,9 @@ async function applyProjectRelease(proposal, button) {
     toast(`Runtime update applied to ${projectId}`);
     await refresh({ syncSelectedProject: false });
   } catch (error) {
-    elements.releaseFormError.textContent = error.message;
+    const detail = releasePlanErrorMessage(error);
+    elements.releaseFormError.textContent = detail;
+    toast(detail, true);
     button.disabled = false;
   }
 }
