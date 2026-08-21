@@ -18636,6 +18636,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 error.detail,
                 HTTPStatus.CONFLICT,
             ) from error
+        task_frame_room = self._ensure_task_frame_room(
+            project["project_id"], host_result
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -18644,6 +18647,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "primary_proposal_id": primary_id,
             "primary_proposal_digest": primary_digest,
             "task_frame": dict(host_result),
+            "task_frame_room": task_frame_room,
         }
 
     def create_instruction_authorized_task_frame(
@@ -18744,6 +18748,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 error.detail,
                 HTTPStatus.CONFLICT,
             ) from error
+        task_frame_room = self._ensure_task_frame_room(
+            project["project_id"], host_result
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -18753,7 +18760,96 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "proposal_digest": primary_digest,
             "parent_instruction_ref": instruction_ref,
             "task_frame": dict(host_result),
+            "task_frame_room": task_frame_room,
         }
+
+    def _ensure_task_frame_room(
+        self,
+        project_id: str,
+        task_frame: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Ensure the ephemeral Task Frame Room is bound to its origin anchor."""
+
+        frame_id = _required_text(task_frame.get("task_frame_id"), "task_frame_id")
+        origin_anchor = _required_text(
+            task_frame.get("origin_session_anchor_ref"),
+            "origin_session_anchor_ref",
+        )
+        try:
+            room = self.multi_rooms.create_boss_room(
+                project_id=project_id,
+                task_frame_id=frame_id,
+                title=f"Task Frame / {frame_id}",
+            )
+            matching_session = next(
+                (
+                    item
+                    for item in self.session_supervisor.list_sessions(
+                        node=project_id, include_hidden=True
+                    )
+                    if item.get("session_anchor_ref") == origin_anchor
+                ),
+                None,
+            )
+            bindings = self.multi_rooms.list_bindings(room["room_id"])
+            master = next(
+                (
+                    item
+                    for item in bindings
+                    if item.get("state") == "ACTIVE"
+                    and item.get("slot_role") == "MASTER"
+                    and item.get("session_anchor_ref") == origin_anchor
+                ),
+                None,
+            )
+            if master is None:
+                self.multi_rooms.attach_session(
+                    room["room_id"],
+                    {
+                        "slot_role": "MASTER",
+                        "display_name": "Project Master",
+                        "provider": (
+                            matching_session.get("provider")
+                            if isinstance(matching_session, Mapping)
+                            else None
+                        ),
+                        "provider_session_ref": (
+                            matching_session.get("provider_session_ref")
+                            if isinstance(matching_session, Mapping)
+                            else None
+                        ),
+                        "supervisor_session_id": (
+                            matching_session.get("session_id")
+                            if isinstance(matching_session, Mapping)
+                            else None
+                        ),
+                        "session_anchor_ref": origin_anchor,
+                        "participant_state": "ATTACHED",
+                    },
+                )
+            return self.multi_rooms.room_snapshot(room["room_id"])
+        except MultiRoomError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def _complete_task_frame_room(
+        self, project_id: str, task_frame_id: str
+    ) -> dict[str, Any] | None:
+        """Close the ephemeral Task Frame Room after its terminal result."""
+
+        try:
+            rooms = self.multi_rooms.list_rooms(
+                project_id=project_id, room_type="BOSS", state="OPEN"
+            )
+            room = next(
+                (item for item in rooms if item.get("task_frame_id") == task_frame_id),
+                None,
+            )
+            if room is None:
+                return None
+            closed = self.multi_rooms.close_room(room["room_id"])
+            return self.multi_rooms.room_snapshot(closed["room_id"])
+        except MultiRoomError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
     def run_instruction_authorized_task_frame(
         self,
@@ -18816,6 +18912,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching instruction Task Frame completion receipt",
                 HTTPStatus.CONFLICT,
             )
+        task_frame_room = self._complete_task_frame_room(
+            project["project_id"], frame_id
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -18823,6 +18922,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project["project_id"],
             "primary_proposal_id": primary_id,
             "task_frame": dict(host_result),
+            "task_frame_room": task_frame_room,
         }
 
     def run_approved_descendant_task_frame(
@@ -18920,6 +19020,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching Task Frame completion receipt",
                 HTTPStatus.CONFLICT,
             )
+        task_frame_room = self._complete_task_frame_room(
+            project["project_id"], frame_id
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -18927,6 +19030,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project["project_id"],
             "primary_proposal_id": primary_id,
             "task_frame": dict(host_result),
+            "task_frame_room": task_frame_room,
         }
 
     def _project_master_governance_context(self, project_id: str) -> dict[str, Any]:

@@ -6521,6 +6521,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("APPROVED_DESCENDANT_TASK_FRAME_CREATED", result["status"])
         self.assertEqual(host_result, result["task_frame"])
+        self.assertEqual("BOSS", result["task_frame_room"]["room"]["room_type"])
+        self.assertEqual(
+            "gcs-bootstrap-frame-001",
+            result["task_frame_room"]["room"]["task_frame_id"],
+        )
+        self.assertEqual(
+            "session-anchor-approved-001",
+            result["task_frame_room"]["bindings"][0]["session_anchor_ref"],
+        )
         self.assertEqual(
             "session-anchor-approved-001",
             self.server.task_frame_lineage.get_task_frame(
@@ -6583,6 +6592,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("INSTRUCTION_TASK_FRAME_CREATED", result["status"])
         self.assertEqual(proposal["request_ref"], result["parent_instruction_ref"])
+        self.assertEqual("BOSS", result["task_frame_room"]["room"]["room_type"])
+        self.assertEqual(
+            "session-anchor-instruction-001",
+            result["task_frame_room"]["bindings"][0]["session_anchor_ref"],
+        )
         self.assertEqual(
             "session-anchor-instruction-001",
             self.server.task_frame_lineage.get_task_frame(
@@ -6627,6 +6641,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.OK, run_status)
         self.assertEqual("INSTRUCTION_TASK_FRAME_COMPLETED", run_result["status"])
+        self.assertEqual("CLOSED", run_result["task_frame_room"]["room"]["state"])
+        self.assertFalse(run_result["task_frame_room"]["user_may_write"])
         run_forwarded = (
             client.run_instruction_authorized_task_frame.call_args.kwargs
         )
