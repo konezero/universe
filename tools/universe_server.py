@@ -14200,6 +14200,18 @@ class UniverseStore:
             item["review_state"] = row["review_state"]
             item["created_at"] = row["created_at"]
             item["reviewed_at"] = row["reviewed_at"]
+            item["feedback"] = {
+                "state": (
+                    "HIT"
+                    if row["review_state"] == "KEPT"
+                    else "MISS"
+                    if row["review_state"] == "REJECTED"
+                    else "PENDING"
+                ),
+                "basis": "USER_REVIEW",
+                "recorded_at": row["reviewed_at"],
+                "effects": {"goal_created": False, "todo_created": False},
+            }
             items.append(item)
         return items
 
@@ -14244,6 +14256,12 @@ class UniverseStore:
                 stored["reviewed_at"] = row["reviewed_at"]
                 stored["goal_created"] = False
                 stored["todo_created"] = False
+                stored["feedback"] = {
+                    "state": "HIT" if row["review_state"] == "KEPT" else "MISS",
+                    "basis": "USER_REVIEW",
+                    "recorded_at": row["reviewed_at"],
+                    "effects": {"goal_created": False, "todo_created": False},
+                }
                 return stored, False
             if row["review_state"] != "PROPOSAL_ONLY":
                 raise UniverseError(
@@ -14265,6 +14283,12 @@ class UniverseStore:
         stored["reviewed_at"] = now
         stored["goal_created"] = False
         stored["todo_created"] = False
+        stored["feedback"] = {
+            "state": "HIT" if next_state == "KEPT" else "MISS",
+            "basis": "USER_REVIEW",
+            "recorded_at": now,
+            "effects": {"goal_created": False, "todo_created": False},
+        }
         stored["schema"] = WORK_LOOP_PREDICTION_SCHEMA
         return stored, True
 

@@ -9232,6 +9232,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("KEPT", reviewed["prediction"]["review_state"])
+        self.assertEqual("HIT", reviewed["prediction"]["feedback"]["state"])
+        self.assertEqual(
+            "USER_REVIEW", reviewed["prediction"]["feedback"]["basis"]
+        )
         self.assertFalse(reviewed["prediction"]["goal_created"])
         self.assertFalse(reviewed["prediction"]["todo_created"])
         goals_after = self.request("GET", "/v1/projects/GCS/goals", token=self.token)[1]
