@@ -4481,6 +4481,10 @@ class UniverseStore:
         # multi-room source must live beside the other project stores.  The
         # HTTP server reuses this instance for its event/control surface.
         self.multi_rooms = MultiRoomStore(str(self.database_path))
+        # Task Frame lineage also feeds the semantic project graph.  Keep a
+        # single store instance so projection and delivery observe the same
+        # durable Anchor Graph source.
+        self.task_frame_lineage = TaskFrameLineageStore(self.database_path)
         self.memory_batch_execution_service = MemoryBatchExecutionService(self)
 
     def _connect(self) -> sqlite3.Connection:
@@ -14214,6 +14218,8 @@ class UniverseStore:
             project,
         )
         session_nodes_by_provider_digest: dict[str, str] = {}
+        project_session_anchor_refs: set[str] = set()
+        session_nodes_by_anchor_ref: dict[str, str] = {}
         for session in self.session_supervisor.list_sessions(
             node=project_id, include_hidden=True
         ):
@@ -14246,12 +14252,14 @@ class UniverseStore:
                 session_nodes_by_provider_digest[_json_sha256(provider_session_ref)] = session_node
             anchor_ref = str(session.get("session_anchor_ref") or "")
             if anchor_ref:
+                project_session_anchor_refs.add(anchor_ref)
                 anchor_node = add_node(
                     "SESSION_ANCHOR", anchor_ref, f"Session Anchor · {anchor_ref}",
                     str(session.get("currentness") or "OBSERVED"),
                     "SESSION_SUPERVISOR", source_ref,
                     {"session_anchor_ref": anchor_ref, "session_id": session_id},
                 )
+                session_nodes_by_anchor_ref[anchor_ref] = anchor_node
                 add_edge("SESSION_OWNS_ANCHOR", session_node, anchor_node, source_ref)
         for mode_anchor in self.session_supervisor.list_project_mode_anchors(
             project_id=project_id
@@ -14294,6 +14302,75 @@ class UniverseStore:
                     "MODE_ANCHOR_REFS_SESSION_ANCHOR", mode_node, session_anchor_node,
                     source_ref,
                 )
+
+        # Task Frame lineage is durable Anchor Graph input, not a separate
+        # ephemeral execution view.  Only result digests/times are projected:
+        # a Result Packet can contain provider or source details that do not
+        # belong in the shared semantic graph.
+        project_task_frames = [
+            frame
+            for frame in self.task_frame_lineage.list_task_frames()
+            if str(frame.get("origin_session_anchor_ref") or "")
+            in project_session_anchor_refs
+        ]
+        task_frame_nodes: dict[str, str] = {}
+        for frame in project_task_frames:
+            frame_ref = str(frame.get("frame_ref") or "")
+            origin_anchor_ref = str(frame.get("origin_session_anchor_ref") or "")
+            if not frame_ref or not origin_anchor_ref:
+                continue
+            source_ref = f"universe://task-frame-lineage/{frame_ref}"
+            frame_node = add_node(
+                "TASK_FRAME", frame_ref, f"Task Frame · {frame_ref}",
+                "OBSERVED", "TASK_FRAME_LINEAGE", source_ref,
+                {
+                    key: frame.get(key)
+                    for key in (
+                        "frame_ref", "origin_session_anchor_ref",
+                        "target_session_anchor_ref", "parent_task_frame_ref",
+                        "frame_digest", "revision", "created_at",
+                    )
+                    if frame.get(key) is not None
+                }
+                | {"result_count": len(frame.get("results") or [])},
+            )
+            task_frame_nodes[frame_ref] = frame_node
+            add_edge("PROJECT_HAS_TASK_FRAME", project_node, frame_node, source_ref)
+            origin_node = session_nodes_by_anchor_ref.get(origin_anchor_ref)
+            if origin_node is not None:
+                add_edge("SESSION_ANCHOR_HAS_TASK_FRAME", origin_node, frame_node, source_ref)
+            target_anchor_ref = str(frame.get("target_session_anchor_ref") or "")
+            target_node = session_nodes_by_anchor_ref.get(target_anchor_ref)
+            if target_node is not None:
+                add_edge("TASK_FRAME_TARGETS_SESSION_ANCHOR", frame_node, target_node, source_ref)
+            for result in frame.get("results") or []:
+                if not isinstance(result, Mapping):
+                    continue
+                result_ref = str(result.get("result_ref") or "")
+                if not result_ref:
+                    continue
+                result_node = add_node(
+                    "TASK_FRAME_RESULT", result_ref, f"Result · {result_ref}",
+                    "ATTACHED", "TASK_FRAME_LINEAGE", f"{source_ref}/results/{result_ref}",
+                    {
+                        key: result.get(key)
+                        for key in (
+                            "result_ref", "frame_ref", "origin_session_anchor_ref",
+                            "result_digest", "attached_at",
+                        )
+                        if result.get(key) is not None
+                    },
+                )
+                add_edge("TASK_FRAME_HAS_RESULT", frame_node, result_node, source_ref)
+        for frame in project_task_frames:
+            frame_ref = str(frame.get("frame_ref") or "")
+            parent_ref = str(frame.get("parent_task_frame_ref") or "")
+            frame_node = task_frame_nodes.get(frame_ref)
+            parent_node = task_frame_nodes.get(parent_ref)
+            if frame_node is not None and parent_node is not None:
+                add_edge("TASK_FRAME_CONTINUES", parent_node, frame_node,
+                         f"universe://task-frame-lineage/{frame_ref}")
+
         goals = self.list_project_goals(project_id)
         assigned_todos: set[str] = set()
         for goal in goals:
@@ -17657,7 +17734,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             action_store=self.store,
         )
-        self.task_frame_lineage = TaskFrameLineageStore(store.database_path)
+        self.task_frame_lineage = store.task_frame_lineage
         self.session_anchor_transport = SessionAnchorTransport(
             database_path=store.database_path,
             session_supervisor=self.session_supervisor,

@@ -2172,6 +2172,53 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("SESSION_ANCHOR_HAS_TASK_FRAME", edge_types)
         self.assertIn("TASK_FRAME_TARGETS_SESSION", edge_types)
 
+    def test_semantic_graph_projects_task_frame_lineage_without_result_payload(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        first, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "semantic-task-frame-one",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-semantic-task-frame-one",
+            }
+        )
+        second, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "semantic-task-frame-two",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-semantic-task-frame-two",
+            }
+        )
+        self.server.task_frame_lineage.create_task_frame(
+            frame_ref="semantic-task-frame-001",
+            origin_session_anchor_ref=first["session_anchor_ref"],
+            target_session_anchor_ref=second["session_anchor_ref"],
+        )
+        self.server.task_frame_lineage.attach_result(
+            result_ref="semantic-task-frame-result-001",
+            frame_ref="semantic-task-frame-001",
+            origin_session_anchor_ref=first["session_anchor_ref"],
+            result={"summary": "secret provider transcript must not project"},
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        nodes = {item["id"]: item for item in graph["nodes"]}
+        self.assertIn("task_frame:semantic-task-frame-001", nodes)
+        result = nodes["task_frame_result:semantic-task-frame-result-001"]
+        self.assertEqual("ATTACHED", result["lifecycle_state"])
+        self.assertNotIn("result", result["data"])
+        self.assertNotIn("secret provider transcript", json.dumps(result))
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertIn("PROJECT_HAS_TASK_FRAME", edge_types)
+        self.assertIn("SESSION_ANCHOR_HAS_TASK_FRAME", edge_types)
+        self.assertIn("TASK_FRAME_TARGETS_SESSION_ANCHOR", edge_types)
+        self.assertIn("TASK_FRAME_HAS_RESULT", edge_types)
+
     def test_cross_session_delegation_fails_closed_without_project_room_delivery(
         self,
     ) -> None:
