@@ -2421,6 +2421,46 @@ class ProjectMasterHostTests(unittest.TestCase):
             requests[1]["evidence_ref"],
         )
 
+    def test_project_mode_coordinator_uses_observed_session_anchor_for_chat(self) -> None:
+        runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        supervisor = SessionSupervisorStore(self.root / "anchor-graph.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("CODEX")
+        state.observe_provider_session("CODEX", "codex-anchor-001")
+
+        def unexpected_runner(_request):
+            raise AssertionError("resident chat must not invoke Runtime Boot")
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex-anchor-001",
+            native_runner=unexpected_runner,
+            session_supervisor=supervisor,
+        )
+
+        preparation = coordinator.prepare()
+        observation = coordinator.observe(self._envelope()["message"])
+
+        session = next(
+            item
+            for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+            if item["provider_session_ref"] == "codex-anchor-001"
+        )
+        self.assertEqual("ANCHOR_GRAPH", preparation["preparation_path"])
+        self.assertEqual(session["session_anchor_ref"], preparation["session_anchor_ref"])
+        self.assertEqual("COMMANDER_INPUT_OBSERVED", observation["status"])
+        self.assertEqual(
+            session["session_anchor_ref"], observation["snapshot"]["anchor_id"]
+        )
+
     def test_project_mode_coordinator_resolves_role_from_selected_mode(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)

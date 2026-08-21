@@ -209,6 +209,25 @@ class ProjectModeCoordinator:
         )
 
     def prepare(self) -> Mapping[str, Any]:
+        """Prepare the live conversation coordinate without starting Runtime Boot.
+
+        A resident provider is already observed by ``SessionSupervisorStore``
+        before this method is called.  That Session Anchor is the coordinate a
+        chat needs; launching the legacy ``prepare-session`` Runtime merely to
+        open the chat made an otherwise healthy provider session depend on a
+        second process, a Release selection, and a Mode Boot binding.
+
+        The old path remains isolated in ``_prepare_legacy_runtime`` for the
+        compatibility-only mutation/Task Frame endpoints below.  It is not a
+        prerequisite for a Project Master conversation.
+        """
+        anchor_preparation = self._anchor_graph_preparation()
+        if anchor_preparation is not None:
+            self._prepared = dict(anchor_preparation)
+            return anchor_preparation
+        return self._prepare_legacy_runtime()
+
+    def _prepare_legacy_runtime(self) -> Mapping[str, Any]:
         definition = self._mode_definition()
         self._mode_role = definition["role"]
         source = self._resolved_source_binding()
@@ -249,6 +268,11 @@ class ProjectModeCoordinator:
 
     def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
         message_id = _text(message.get("message_id"), "message.message_id")
+        anchor_observation = self._anchor_graph_observation(
+            evidence_ref=f"universe://project-room/messages/{message_id}"
+        )
+        if anchor_observation is not None:
+            return anchor_observation
         result = self._invoke(
             (
                 "mode-anchor",
@@ -272,6 +296,11 @@ class ProjectModeCoordinator:
         message = event.get("message")
         if not isinstance(message, Mapping) or message.get("author_role") != "USER":
             raise ProjectMasterHostError("PROJECT_COMMANDER_ROOM_EVENT_INVALID")
+        anchor_observation = self._anchor_graph_observation(
+            evidence_ref=f"universe://rooms/{room_id}/events/{room_event_id}"
+        )
+        if anchor_observation is not None:
+            return anchor_observation
         result = self._invoke(
             (
                 "mode-anchor",
@@ -290,6 +319,92 @@ class ProjectModeCoordinator:
         if result.get("status") != "COMMANDER_INPUT_OBSERVED":
             raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
         return result
+
+    def _anchor_graph_preparation(self) -> dict[str, Any] | None:
+        """Return the exact observed Session Anchor for a resident provider.
+
+        ``None`` deliberately means that this coordinator is being used by a
+        legacy standalone bridge that has no Supervisor.  Those callers retain
+        their compatibility path; the Universe resident Host always supplies
+        the Supervisor and therefore never needs Runtime Boot to open chat.
+        """
+        session = self._anchor_graph_session()
+        if session is None:
+            return None
+        anchor_ref = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+        mode = _text(session.get("mode"), "session.mode").upper()
+        if mode != self.requested_mode:
+            raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_MODE_MISMATCH")
+        observed_at = utc_now()
+        return {
+            "schema": "universe.anchor-graph-session-preparation.v1",
+            "status": "SESSION_PREPARED",
+            "preparation_path": "ANCHOR_GRAPH",
+            "project_id": self.project_id,
+            "mode": mode,
+            "session_id": _text(session.get("session_id"), "session_id"),
+            "session_anchor_ref": anchor_ref,
+            "mode_current_anchor": {
+                "status": "MODE_CURRENT_ANCHOR_OBSERVED",
+                "snapshot": {
+                    "anchor_id": anchor_ref,
+                    "observed_at": observed_at,
+                    "snapshot": {
+                        "anchor_id": anchor_ref,
+                        "coordinates": {
+                            "mode": mode,
+                            "commander_surface": "UNIVERSE_UI",
+                        },
+                    },
+                },
+            },
+        }
+
+    def _anchor_graph_observation(
+        self, *, evidence_ref: str
+    ) -> dict[str, Any] | None:
+        session = self._anchor_graph_session()
+        if session is None:
+            return None
+        anchor_ref = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+        mode = _text(session.get("mode"), "session.mode").upper()
+        if mode != self.requested_mode:
+            raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_MODE_MISMATCH")
+        observed_at = utc_now()
+        return {
+            "schema": "universe.anchor-graph-commander-observation.v1",
+            "status": "COMMANDER_INPUT_OBSERVED",
+            "anchor_mode": mode,
+            "evidence_ref": _text(evidence_ref, "evidence_ref"),
+            "snapshot": {
+                "anchor_id": anchor_ref,
+                "observed_at": observed_at,
+                "snapshot": {
+                    "anchor_id": anchor_ref,
+                    "coordinates": {
+                        "mode": mode,
+                        "commander_surface": "UNIVERSE_UI",
+                    },
+                },
+            },
+        }
+
+    def _anchor_graph_session(self) -> Mapping[str, Any] | None:
+        if self.session_supervisor is None:
+            return None
+        candidates = [
+            item
+            for item in self.session_supervisor.list_sessions(
+                node=self.session_node,
+                mode=self.requested_mode,
+                include_hidden=True,
+            )
+            if str(item.get("provider_session_ref") or "").strip()
+            == self.host_session_ref
+        ]
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
 
     def apply_file(
         self,
@@ -2020,7 +2135,11 @@ class ProjectModeCoordinator:
                 and self._runtime_process.poll() is None
             ):
                 return dict(self._runtime_binding)
-            prepared = self._prepared or dict(self.prepare())
+            # Runtime serving is a compatibility-only boundary used by the
+            # older mutation/Task Frame endpoints.  A resident chat prepares
+            # from its Session Anchor, so do not accidentally promote that
+            # lightweight preparation into a Mode Boot binding here.
+            prepared = dict(self._prepare_legacy_runtime())
             anchor = prepared.get("mode_current_anchor")
             snapshot = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
             payload = (
@@ -6598,10 +6717,9 @@ class ResidentProjectMasterHostManager:
                 )
             )
             try:
-                # A fresh Project has no provider coordinate yet, but the Boot
-                # executor must acquire its lease before a provider can report
-                # one. Reserve only the persistent node/mode slot here; the
-                # real provider session replaces the UNKNOWN binding later.
+                # A fresh Project has no provider coordinate yet. Reserve only
+                # the persistent node/mode slot; the provider hook replaces
+                # the UNKNOWN binding with its exact vendor session later.
                 store.ensure_supervisor_session(
                     selected_provider, new_session=force_new_session
                 )
