@@ -62,7 +62,6 @@ const state = {
 
   /** CLI+preset model catalog from /v1/settings/provider-models */
   providerModels: null,
-  workerBindings: null,
   hostTools: null,
   runtimePreflight: null,
   runtimeAudit: null,
@@ -310,8 +309,6 @@ const elements = {
   localServiceStatus: document.querySelector("#local-service-status"),
   memoryMaintainInterval: document.querySelector("#memory-maintain-interval"),
   memoryMaintainStatus: document.querySelector("#memory-maintain-status"),
-  workerBindingScope: document.querySelector("#worker-binding-scope"),
-  workerBindingSettings: document.querySelector("#worker-binding-settings"),
   providerModelCatalog: document.querySelector("#provider-model-catalog"),
   refreshProviderModels: document.querySelector("#refresh-provider-models-button"),
   setupProviderHooks: document.querySelector("#setup-provider-hooks-button"),
@@ -5385,109 +5382,6 @@ async function submitNewSession(event) {
   }
 }
 
-function fillWorkerBindingModelSelect(select, provider, selectedValue) {
-  select.replaceChildren();
-  const hostDefault = node("option", "", "Host default");
-  hostDefault.value = "";
-  select.append(hostDefault);
-  const models = providerCatalogModels(provider);
-  const selected = String(selectedValue || "");
-  for (const modelId of models) {
-    const option = node("option", "", modelId);
-    option.value = modelId;
-    select.append(option);
-  }
-  if (selected && !models.includes(selected)) {
-    const option = node("option", "", `${selected} (current)`);
-    option.value = selected;
-    select.append(option);
-  }
-  select.value = selected && (models.includes(selected) || selected)
-    ? selected
-    : "";
-}
-
-function renderWorkerBindingSettings() {
-  if (!elements.workerBindingScope || !elements.workerBindingSettings) return;
-  const previousScope = elements.workerBindingScope.value || "UNIVERSE:UNIVERSE";
-  elements.workerBindingScope.replaceChildren();
-  const scopes = [
-    { value: "UNIVERSE:UNIVERSE", label: "Universe defaults" },
-    ...operableProjects().map((project) => ({
-      value: `PROJECT:${project.project_id}`,
-      label: `${project.project_id} project`,
-    })),
-  ];
-  for (const scope of scopes) {
-    const option = node("option", "", scope.label);
-    option.value = scope.value;
-    elements.workerBindingScope.append(option);
-  }
-  elements.workerBindingScope.value = scopes.some(
-    (scope) => scope.value === previousScope
-  )
-    ? previousScope
-    : "UNIVERSE:UNIVERSE";
-  const [scopeKind, scopeId] = elements.workerBindingScope.value.split(":", 2);
-  const profiles = state.workerBindings?.profiles || [];
-  elements.workerBindingSettings.replaceChildren();
-  for (const role of ["IMPLEMENTER", "REVIEWER", "QA", "SCOUT", "ROUTINE"]) {
-    const profile = profiles.find(
-      (item) =>
-        item.scope_kind === scopeKind &&
-        item.scope_id === scopeId &&
-        item.worker_role === role &&
-        item.task_type === "*"
-    );
-    const row = node("div", "worker-binding-row");
-    row.dataset.role = role;
-    const copy = node("div", "worker-binding-copy");
-    copy.append(
-      node("strong", "", role[0] + role.slice(1).toLowerCase()),
-      node(
-        "small",
-        "",
-        profile ? `Revision ${profile.revision}` : "Inherited AUTO"
-      )
-    );
-    const provider = node("select", "worker-binding-provider");
-    for (const value of ["AUTO", "GROK", "CODEX", "CLAUDE"]) {
-      const option = node("option", "", value[0] + value.slice(1).toLowerCase());
-      option.value = value;
-      provider.append(option);
-    }
-    provider.value = profile?.provider || "AUTO";
-    const model = node("select", "worker-binding-model");
-    fillWorkerBindingModelSelect(
-      model,
-      provider.value,
-      profile?.model_ref || ""
-    );
-    provider.addEventListener("change", () => {
-      fillWorkerBindingModelSelect(model, provider.value, model.value);
-    });
-    const modelCustom = node("input", "worker-binding-model-custom");
-    modelCustom.type = "text";
-    modelCustom.placeholder = "custom model id (optional)";
-    modelCustom.autocomplete = "off";
-    modelCustom.spellcheck = false;
-    const effort = node("select", "worker-binding-effort");
-    for (const value of ["AUTO", "LOW", "MEDIUM", "HIGH", "MAX"]) {
-      const option = node("option", "", value[0] + value.slice(1).toLowerCase());
-      option.value = value;
-      effort.append(option);
-    }
-    effort.value = profile?.effort || "AUTO";
-    const skills = node("input", "worker-binding-skills");
-    skills.type = "text";
-    skills.placeholder = "skill-a, skill-b";
-    skills.value = (profile?.skill_refs || []).join(", ");
-    row.append(copy, provider, model, modelCustom, effort, skills);
-    elements.workerBindingSettings.append(row);
-  }
-  renderProviderModelCatalog();
-}
-
 function renderProviderModelCatalog() {
   const root = elements.providerModelCatalog;
   if (!root) return;
@@ -6585,7 +6479,6 @@ async function openProviderSettings() {
   elements.settingsError.textContent = "";
   [
     state.providerSettings,
-    state.workerBindings,
     state.hostTools,
     state.serviceSettings,
     state.remoteAccess,
@@ -6594,7 +6487,6 @@ async function openProviderSettings() {
     state.providerModels,
   ] = await Promise.all([
     api("/v1/settings/providers"),
-    api("/v1/settings/worker-bindings"),
     api("/v1/settings/host-tools"),
     api("/v1/settings/service").catch(() => null),
     api("/v1/settings/remote-access"),
@@ -6616,7 +6508,6 @@ async function openProviderSettings() {
         (worker.last_run?.ran_at ? ` · last ${worker.last_run.ran_at}` : "")
       : "0 = off. Server runs HEURISTIC maintain when > 0.";
   }
-  renderWorkerBindingSettings();
   renderHostToolSettings();
   renderRuntimePreflight();
   renderLocalServiceStatus();
@@ -6699,37 +6590,6 @@ async function submitProviderSettings(event) {
   elements.settingsError.textContent = "";
   elements.settingsForm.querySelector("button[type='submit']").disabled = true;
   try {
-    const requests = [];
-    const [scopeKind, scopeId] = elements.workerBindingScope.value.split(":", 2);
-    for (const row of elements.workerBindingSettings.querySelectorAll(
-      ".worker-binding-row"
-    )) {
-      requests.push(
-        api("/v1/settings/worker-bindings", {
-          method: "POST",
-          body: {
-            scope_kind: scopeKind,
-            scope_id: scopeId,
-            worker_role: row.dataset.role,
-            task_type: "*",
-            provider: row.querySelector(".worker-binding-provider").value,
-            model_ref: (
-              row.querySelector(".worker-binding-model-custom")?.value ||
-              row.querySelector(".worker-binding-model")?.value ||
-              ""
-            ).trim(),
-            effort: row.querySelector(".worker-binding-effort").value,
-            skill_refs: row
-              .querySelector(".worker-binding-skills")
-              .value.split(",")
-              .map((value) => value.trim())
-              .filter(Boolean),
-            enabled: true,
-          },
-        })
-      );
-    }
-    await Promise.all(requests);
     if (elements.memoryMaintainInterval) {
       const hours = Number(elements.memoryMaintainInterval.value || 0);
       state.serviceSettings = await api("/v1/settings/service", {
@@ -6737,11 +6597,7 @@ async function submitProviderSettings(event) {
         body: { memory_maintain: { interval_hours: Number.isFinite(hours) ? hours : 0 } },
       });
     }
-    [state.providerSettings, state.workerBindings] = await Promise.all([
-      api("/v1/settings/providers"),
-      api("/v1/settings/worker-bindings"),
-    ]);
-    renderWorkerBindingSettings();
+    state.providerSettings = await api("/v1/settings/providers");
     renderComposerState();
     elements.settingsDialog.close();
     toast("Settings saved");
@@ -13108,7 +12964,6 @@ function bindEvents() {
   elements.freshProjectRootBrowse.addEventListener("click", selectFreshProjectRoot);
   elements.releaseDatabaseBrowse.addEventListener("click", selectReleaseDatabase);
   elements.releaseManifestBrowse.addEventListener("click", selectReleaseManifest);
-  elements.workerBindingScope.addEventListener("change", renderWorkerBindingSettings);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
 
   document.querySelectorAll(".ghost-action[data-primary-view]").forEach((button) => {
