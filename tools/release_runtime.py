@@ -525,7 +525,10 @@ class ReleaseRuntime:
                 action = "CREATE"
             elif actual["sha256"] == item.sha256:
                 action = "NOOP"
-            elif isinstance(prior_digest, str) and actual["sha256"] == prior_digest:
+            elif isinstance(prior_digest, str) and (
+                actual["sha256"] == prior_digest
+                or previous.get("legacy_managed_update", False)
+            ):
                 action = "UPDATE"
             else:
                 action = "COLLISION"
@@ -764,6 +767,12 @@ def _load_install_state(root: Path) -> dict[str, Any] | None:
         "schema": INSTALL_STATE_SCHEMA,
         "release_id": str(legacy.get("release_id") or "LEGACY"),
         "inventory": inventory,
+        # A legacy Core installation owns these paths, but its file digests can
+        # legitimately differ after a Runtime package revision.  The first
+        # Release DB update must migrate those owned paths instead of treating
+        # the whole Core as project-owned collisions.  Subsequent updates use
+        # the Release DB state and retain strict digest collision checks.
+        "legacy_managed_update": True,
     }
 
 
