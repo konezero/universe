@@ -2219,6 +2219,30 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("TASK_FRAME_TARGETS_SESSION_ANCHOR", edge_types)
         self.assertIn("TASK_FRAME_HAS_RESULT", edge_types)
 
+    def test_semantic_graph_projects_test_work_status(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.append_event(
+            "GCS",
+            {
+                "event_id": "test-work-status-001",
+                "event_type": "TEST_WORK_STATUS",
+                "payload": {
+                    "schema": "universe.test-tier-result.v1",
+                    "source": "RUN_TEST_TIER",
+                    "tier": "changed",
+                    "successful": True,
+                    "tests_run": 12,
+                    "elapsed_seconds": 1.25,
+                    "redaction_state": "SUMMARY_ONLY",
+                },
+            },
+        )
+        graph = self.server.store.semantic_project_graph("GCS")
+        test_nodes = [item for item in graph["nodes"] if item["entity_type"] == "TEST_RUN"]
+        self.assertEqual(1, len(test_nodes))
+        self.assertEqual("Tests · changed · PASSED", test_nodes[0]["label"])
+        self.assertEqual(12, test_nodes[0]["data"]["tests_run"])
+
     def test_session_inject_hook_becomes_deduplicated_redacted_graph_input(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         body = {
