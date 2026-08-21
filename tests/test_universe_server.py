@@ -2277,6 +2277,21 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("memory-batch-run-001", cursors[0]["last_event_id"])
         self.assertEqual("c" * 64, cursors[0]["source_digest"])
 
+    def test_skill_observation_advances_bench_collection_cursor(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        result, created = self.server.store.ingest_skill_observations(
+            "GCS", self.skill_observation_candidate()
+        )
+
+        self.assertTrue(created)
+        cursors = self.server.store.list_semantic_collection_cursors("GCS")
+        self.assertEqual(1, len(cursors))
+        self.assertEqual("BENCH_OBSERVATION", cursors[0]["source_kind"])
+        self.assertEqual(
+            result["observations"][-1]["observation_id"],
+            cursors[0]["last_event_id"],
+        )
+
     def test_collection_prediction_is_proposal_only(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.server.store.propose_work_loop_predictions = Mock(

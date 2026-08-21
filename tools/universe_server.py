@@ -9119,6 +9119,31 @@ class UniverseStore:
                         "recorded_at": now,
                     }
                 )
+            if rows:
+                latest = rows[-1]
+                connection.execute(
+                    """
+                    INSERT INTO semantic_collection_cursor(
+                        project_id, source_kind, last_event_id, last_event_type,
+                        source_digest, observed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                        last_event_id = excluded.last_event_id,
+                        last_event_type = excluded.last_event_type,
+                        source_digest = excluded.source_digest,
+                        observed_at = excluded.observed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        project["project_id"],
+                        "BENCH_OBSERVATION",
+                        latest["observation_id"],
+                        "SKILL_RUN_OBSERVATION",
+                        request["candidate_digest"],
+                        candidate["observed_at"],
+                        now,
+                    ),
+                )
         created = not existing_candidate
         return {
             "project_id": project["project_id"],
