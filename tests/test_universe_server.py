@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -4160,6 +4160,36 @@ class UniverseLocalServiceTests(unittest.TestCase):
             provider="CODEX",
             supervisor_session_id="session_internal_coordinate",
             resume_session_ref="vendor-thread-123",
+            cols=120,
+            rows=32,
+        )
+
+    def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.create.return_value = {
+            "terminal_id": "term_new_session",
+            "state": "LIVE",
+        }
+        self.server.terminal_host = terminal_host
+
+        created = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CODEX",
+            }
+        )
+
+        self.assertEqual("CLI_TERMINAL_CREATED", created["status"])
+        terminal_host.create.assert_called_once_with(
+            project_id="GCS",
+            mode="MASTER",
+            cwd=str(self.project_root),
+            provider="CODEX",
+            supervisor_session_id=ANY,
+            resume_session_ref="",
             cols=120,
             rows=32,
         )
