@@ -552,6 +552,11 @@ class ReleaseRuntime:
         for path, prior_digest in sorted(previous_inventory.items()):
             if path in desired:
                 continue
+            # The first Release DB migration must not delete paths that were
+            # only tracked by the legacy Core installer.  They may be
+            # project-local runtime surfaces absent from this release bundle.
+            if previous.get("legacy_managed_update", False):
+                continue
             target = _target_path(root, path)
             actual = _file_state(target)
             if actual["status"] == "ABSENT":
