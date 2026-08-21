@@ -13121,7 +13121,10 @@ function bindGoalPlanEvents() {
     const view = button.getAttribute("data-mobile-work-view");
     if (view === "goals") showGoalPlanView();
     else if (view === "sessions") showGraphView("sessions");
-    else if (view === "bench") showGraphView("bench");
+    // Bench is project context, not a graph canvas mode. On mobile the
+    // Inspector becomes the focused surface so the comparison data remains
+    // reachable instead of silently falling back to the Universe graph.
+    else if (view === "bench") openInspectorSurface("bench");
     else if (view === "actions") openActionInbox();
   });
   const activeGoal = () => state.goals.find((goal) => goal.goal_id === state.selectedGoalId) || state.goals[0];

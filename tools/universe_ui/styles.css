@@ -6118,6 +6118,33 @@ body:not(.graph-mode) .conductor-panel {
   .goal-plan-workspace { padding: 14px 12px 174px; }
 }
 
+/* Mobile workspace tabs must be able to surface project-context data.
+   Bench, Memory, and Future use the Inspector rather than graph canvas modes. */
+@media (max-width: 720px) {
+  body.inspector-open .app-shell.mockup-shell > .inspector {
+    position: fixed;
+    inset: var(--topbar-h) 0 0;
+    z-index: 70;
+    display: flex !important;
+    width: 100%;
+    height: calc(100dvh - var(--topbar-h));
+    max-width: none;
+    transform: none;
+    visibility: visible;
+    opacity: 1;
+    pointer-events: auto;
+    border: 0;
+    border-top: 1px solid var(--ws-line);
+    border-right: 0;
+  }
+
+  body.inspector-open .app-shell.mockup-shell > .inspector .inspector-panel {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0;
+  }
+}
+
 #conversation-expand {
   display: inline-grid !important;
   flex: 0 0 30px !important;
