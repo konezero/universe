@@ -23040,6 +23040,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         promotion decisions.
         """
 
+        document_automation = self._propose_document_after_collection(project_id)
         try:
             proposal, created = self.store.propose_work_loop_predictions(project_id)
         except UniverseError as error:
@@ -23047,6 +23048,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "status": "PREDICTION_NOT_AVAILABLE",
                 "reason": error.code,
                 "proposal_created": False,
+                "document_automation": document_automation,
             }
         return {
             "status": "PREDICTION_PROPOSAL_READY",
@@ -23057,6 +23059,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "todo_created": False,
             "task_frame_created": False,
             "execution_assignment_created": False,
+            "document_automation": document_automation,
+        }
+
+    def _propose_document_after_collection(self, project_id: str) -> dict[str, Any]:
+        """Create the projection-derived Docs candidate without changing source.
+
+        Collection may create a durable, idempotent incorporation proposal. It
+        does not write a document, alter a project plan, or require an approval;
+        those effects remain a later user promotion.
+        """
+        try:
+            proposal, created = self.store.create_document_incorporation_proposal(
+                project_id, {}
+            )
+        except UniverseError as error:
+            return {
+                "status": "DOCUMENT_AUTOMATION_NOT_AVAILABLE",
+                "reason": error.code,
+                "proposal_created": False,
+                "document_written": False,
+            }
+        return {
+            "status": "DOCUMENT_AUTOMATION_PROPOSAL_READY",
+            "proposal_id": proposal.get("proposal_id"),
+            "proposal_created": created,
+            "document_written": False,
         }
 
     def run_memory_batch(self, project_id: str, value: Any) -> dict[str, Any]:

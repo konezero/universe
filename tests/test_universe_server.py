@@ -2532,6 +2532,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertFalse(prediction["task_frame_created"])
         self.assertFalse(prediction["execution_assignment_created"])
 
+    def test_collection_creates_document_automation_candidate_without_write(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.create_document_incorporation_proposal = Mock(
+            return_value=({"proposal_id": "document-automation-001"}, True)
+        )
+
+        result = self.server._propose_document_after_collection("GCS")
+
+        self.assertEqual("DOCUMENT_AUTOMATION_PROPOSAL_READY", result["status"])
+        self.assertEqual("document-automation-001", result["proposal_id"])
+        self.assertTrue(result["proposal_created"])
+        self.assertFalse(result["document_written"])
+
     def test_semantic_graph_projects_cross_session_work_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         allocation, created = self.server.store.create_conductor_delegation(
