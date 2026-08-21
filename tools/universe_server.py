@@ -3580,6 +3580,7 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         "model_ref",
         "origin_session_anchor_ref",
         "target_session_anchor_ref",
+        "target_session_action",
         "origin_session_chat_key",
     }
     forbidden = {
@@ -3659,12 +3660,25 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
     target_session_anchor_ref = str(
         value.get("target_session_anchor_ref") or ""
     ).strip()
-    if not origin_session_anchor_ref or not target_session_anchor_ref:
+    target_session_action = str(
+        value.get("target_session_action") or "EXISTING"
+    ).strip().upper()
+    if target_session_action not in {"EXISTING", "RESUME", "NEW"}:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_TARGET_ACTION_INVALID",
+            "target_session_action must be EXISTING, RESUME, or NEW",
+        )
+    if not origin_session_anchor_ref or (
+        target_session_action == "EXISTING" and not target_session_anchor_ref
+    ):
         raise UniverseError(
             "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
-            "cross-session delegation requires both origin and target Session Anchors",
+            "cross-session delegation requires an origin and an existing target Session Anchor",
         )
-    if origin_session_anchor_ref == target_session_anchor_ref:
+    if (
+        target_session_anchor_ref
+        and origin_session_anchor_ref == target_session_anchor_ref
+    ):
         raise UniverseError(
             "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
             "origin and target Session Anchors must be different",
@@ -3699,7 +3713,8 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         # User chat stays attached to its selected vendor Session Anchor.
         "queue_scope": "CROSS_SESSION_DELEGATION",
         "origin_session_anchor_ref": origin_session_anchor_ref,
-        "target_session_anchor_ref": target_session_anchor_ref,
+        "target_session_anchor_ref": target_session_anchor_ref or None,
+        "target_session_action": target_session_action,
         "origin_session_chat_key": origin_session_chat_key,
     }
 
@@ -12738,10 +12753,11 @@ class UniverseStore:
             "step",
             "sequence",
             "project_room_message_id",
+            "target_session_anchor_ref",
         }:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
-                "progress accepts summary, step, sequence, and a bounded room reference only",
+                "progress accepts summary, step, sequence, bounded room and target-session references only",
             )
         summary = _required_text(value.get("summary"), "progress.summary")
         if len(summary) > 1000:
@@ -12765,6 +12781,21 @@ class UniverseStore:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
                 "progress.project_room_message_id is invalid",
+            )
+        target_session_anchor_ref = str(
+            value.get("target_session_anchor_ref") or ""
+        ).strip()
+        if target_session_anchor_ref and (
+            len(target_session_anchor_ref) > 256
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}",
+                target_session_anchor_ref,
+            )
+            is None
+        ):
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                "progress.target_session_anchor_ref is invalid",
             )
         now = utc_now()
         normalized = _required_text(delegation_id, "delegation_id")
@@ -12800,6 +12831,7 @@ class UniverseStore:
                     "accepted_at",
                     "recovered_at",
                     "project_room_message_id",
+                    "target_session_anchor_ref",
                 )
                 if previous.get(key) is not None
             }
@@ -12811,6 +12843,8 @@ class UniverseStore:
             })
             if project_room_message_id:
                 progress["project_room_message_id"] = project_room_message_id
+            if target_session_anchor_ref:
+                progress["target_session_anchor_ref"] = target_session_anchor_ref
             update = connection.execute(
                 """
                 UPDATE conductor_delegation
@@ -23933,11 +23967,68 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         except UniverseError:
             return None
+        self._resume_hook_verified_conductor_allocations(
+            project_id, session_anchor_ref
+        )
         return {
             "event_id": event.get("event_id"),
             "created": created,
             "redaction_state": "REDACTED",
         }
+
+    def _resume_hook_verified_conductor_allocations(
+        self, project_id: str, session_anchor_ref: str
+    ) -> None:
+        """Deliver only allocations whose Session Hook verified this target."""
+
+        waiting = [
+            item
+            for item in self.store.list_conductor_delegations(
+                project_id=project_id, state="RUNNING", limit=500
+            )
+            if item.get("progress", {}).get("step") == "WAITING_FOR_VENDOR_HOOK"
+            and item.get("progress", {}).get("target_session_anchor_ref")
+            == session_anchor_ref
+        ]
+        for delegation in waiting:
+            try:
+                outcome = self._dispatch_project_master_delegation(delegation)
+            except UniverseError as error:
+                # A successful inject is necessary but catalog visibility can
+                # lag one observation cycle.  Preserve the allocation rather
+                # than turning a not-yet-visible verified chat into failure.
+                if error.code in {
+                    "TARGET_SESSION_TRANSPORT_UNAVAILABLE",
+                    "TARGET_SESSION_ANCHOR_STALE",
+                }:
+                    updated = self.store.update_conductor_delegation_progress(
+                        delegation["delegation_id"],
+                        {
+                            "summary": (
+                                "Session Hook verified the target; awaiting the "
+                                "exact vendor chat catalog entry for delivery."
+                            ),
+                            "step": "WAITING_FOR_VENDOR_CHAT",
+                            "target_session_anchor_ref": session_anchor_ref,
+                        },
+                    )
+                    self._publish_conductor_delegation(updated)
+                    continue
+                failed = self.store.fail_conductor_delegation(
+                    delegation["delegation_id"],
+                    code=error.code,
+                    reason=error.detail,
+                )
+                self._publish_conductor_delegation(failed)
+                continue
+            if not isinstance(outcome, Mapping):
+                continue
+            progress = outcome.get("progress")
+            if isinstance(progress, Mapping):
+                updated = self.store.update_conductor_delegation_progress(
+                    delegation["delegation_id"], progress
+                )
+                self._publish_conductor_delegation(updated)
 
     def _resolve_project_master_delegation(
         self, event: Mapping[str, Any]
@@ -24628,10 +24719,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         target_session_anchor_ref = str(
             request.get("target_session_anchor_ref") or ""
         ).strip()
-        if not origin_session_anchor_ref or not target_session_anchor_ref:
+        target_session_action = str(
+            request.get("target_session_action") or "EXISTING"
+        ).upper()
+        progress = record.get("progress")
+        if not target_session_anchor_ref and isinstance(progress, Mapping):
+            target_session_anchor_ref = str(
+                progress.get("target_session_anchor_ref") or ""
+            ).strip()
+        if not origin_session_anchor_ref:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
-                "cross-session delegation requires both origin and target Session Anchors",
+                "cross-session delegation requires an origin Session Anchor",
                 HTTPStatus.CONFLICT,
             )
         project_id = _project_id(record.get("project_id"))
@@ -24644,8 +24743,58 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "delegation provider does not match the resident Project Master",
                     HTTPStatus.CONFLICT,
                 )
+        if not target_session_anchor_ref:
+            if target_session_action not in {"NEW", "RESUME"}:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
+                    "existing allocation requires a target Session Anchor",
+                    HTTPStatus.CONFLICT,
+                )
+            prepared = self.prepare_project_master_session(
+                project_id,
+                {"session_action": target_session_action},
+            )
+            connection = prepared.get("session_connection")
+            if not isinstance(connection, Mapping):
+                return {
+                    "progress": {
+                        "summary": (
+                            "Session allocation requested; awaiting a Session Anchor "
+                            "from the Session Card preparation path."
+                        ),
+                        "step": "WAITING_FOR_SESSION_ANCHOR",
+                    }
+                }
+            target_session_anchor_ref = str(
+                connection.get("session_anchor_ref") or ""
+            ).strip()
+            if not target_session_anchor_ref:
+                return {
+                    "progress": {
+                        "summary": (
+                            "Session allocation prepared; awaiting Session Anchor "
+                            "registration before delivery."
+                        ),
+                        "step": "WAITING_FOR_SESSION_ANCHOR",
+                    }
+                }
+            return {
+                "progress": {
+                    "summary": (
+                        "Session allocation prepared; awaiting the Session Hook to "
+                        "verify the exact vendor Session ID before delivery."
+                    ),
+                    "step": "WAITING_FOR_VENDOR_HOOK",
+                    "target_session_anchor_ref": target_session_anchor_ref,
+                }
+            }
         try:
-            return self.session_anchor_transport.deliver(record)
+            delivery_request = dict(request)
+            delivery_request["target_session_anchor_ref"] = target_session_anchor_ref
+            delivery_request["target_session_action"] = "EXISTING"
+            return self.session_anchor_transport.deliver(
+                {**dict(record), "request": delivery_request}
+            )
         except SessionAnchorTransportError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 

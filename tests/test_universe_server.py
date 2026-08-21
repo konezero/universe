@@ -2269,6 +2269,100 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("SESSION_ANCHOR_ALLOCATES_WORK", edge_types)
         self.assertIn("WORK_ALLOCATION_TARGETS_SESSION_ANCHOR", edge_types)
 
+    def test_new_session_allocation_waits_for_hook_before_transport(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        request = normalize_conductor_delegation(
+            {
+                "project_id": "GCS",
+                "summary": "Open a Master session for automatic bounded work.",
+                "idempotency_key": "allocation-new-001",
+                "worker_role": "PROJECT_MASTER",
+                "target_session_action": "NEW",
+                "origin_session_anchor_ref": "session-anchor-conductor-001",
+                "origin_session_chat_key": "provider_chat_1234567890abcdef12345678",
+            }
+        )
+        self.server.prepare_project_master_session = Mock(
+            return_value={
+                "session_connection": {
+                    "session_anchor_ref": "session-anchor-new-master-001"
+                }
+            }
+        )
+        self.server.session_anchor_transport.deliver = Mock()
+        outcome = self.server._dispatch_project_master_delegation(
+            {
+                "delegation_id": "delegation-new-001",
+                "project_id": "GCS",
+                "request": request,
+                "progress": {},
+            }
+        )
+        self.assertEqual("WAITING_FOR_VENDOR_HOOK", outcome["progress"]["step"])
+        self.assertEqual(
+            "session-anchor-new-master-001",
+            outcome["progress"]["target_session_anchor_ref"],
+        )
+        self.server.prepare_project_master_session.assert_called_once_with(
+            "GCS", {"session_action": "NEW"}
+        )
+        self.server.session_anchor_transport.deliver.assert_not_called()
+
+    def test_hook_resumes_only_matching_waiting_session_allocation(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        delegation, created = self.server.store.create_conductor_delegation(
+            {
+                "project_id": "GCS",
+                "summary": "Wait for the exact target vendor session hook.",
+                "idempotency_key": "allocation-hook-001",
+                "worker_role": "PROJECT_MASTER",
+                "target_session_action": "NEW",
+                "origin_session_anchor_ref": "session-anchor-conductor-001",
+                "origin_session_chat_key": "provider_chat_1234567890abcdef12345678",
+            }
+        )
+        self.assertTrue(created)
+        self.server.store.start_conductor_delegation(delegation["delegation_id"])
+        self.server.store.update_conductor_delegation_progress(
+            delegation["delegation_id"],
+            {
+                "summary": "Awaiting the exact vendor Session Hook.",
+                "step": "WAITING_FOR_VENDOR_HOOK",
+                "target_session_anchor_ref": "session-anchor-new-master-001",
+            },
+        )
+        self.server.session_anchor_transport.deliver = Mock(
+            return_value={
+                "progress": {
+                    "summary": "Delivered to the verified target session.",
+                    "step": "TARGET_ACCEPTED",
+                }
+            }
+        )
+        observed = self.server.record_session_hook_observation(
+            {
+                "project_id": "GCS",
+                "hook_observation": {
+                    "trigger": "SESSION_START",
+                    "observed_at": "2026-08-21T00:00:00Z",
+                },
+            },
+            {
+                "supervisor_session": {
+                    "session_id": "supervisor-new-master-001",
+                    "provider": "CODEX",
+                    "provider_session_ref": "vendor-session-001",
+                    "session_anchor_ref": "session-anchor-new-master-001",
+                }
+            },
+        )
+        self.assertIsNotNone(observed)
+        self.server.session_anchor_transport.deliver.assert_called_once()
+        resumed = self.server.store.get_conductor_delegation(
+            delegation["delegation_id"]
+        )
+        self.assertEqual("TARGET_ACCEPTED", resumed["progress"]["step"])
+
     def test_semantic_graph_extracts_room_decisions_and_todo_candidates(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         decision, decision_created = self.server.store.create_room_message(
