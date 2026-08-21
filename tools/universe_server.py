@@ -15022,7 +15022,7 @@ class UniverseStore:
                     key: message.get(key)
                     for key in (
                         "message_id", "room_id", "room_event_id", "room_sequence",
-                        "author_role", "author_binding_id", "created_at",
+                        "kind", "author_role", "author_binding_id", "created_at",
                     )
                     if message.get(key) is not None
                 }
@@ -15060,6 +15060,77 @@ class UniverseStore:
                         f"room_binding:{binding_id}",
                         message_ref,
                     )
+                message_kind = str(message.get("kind") or "MESSAGE").upper()
+                if message_kind == "DECISION":
+                    decision_node = add_node(
+                        "ROOM_DECISION",
+                        f"{room_id}:{message_id}",
+                        f"Room decision · {message.get('author_role') or 'UNKNOWN'}",
+                        "AUTO_OBSERVED",
+                        "MULTI_ROOM_EXTRACTION",
+                        message_ref,
+                        {
+                            "room_id": room_id,
+                            "message_id": message_id,
+                            "content_digest": content_digest,
+                            "created_at": message.get("created_at"),
+                            "body_in_graph": False,
+                        },
+                    )
+                    add_edge("ROOM_MESSAGE_DERIVES_DECISION", message_node, decision_node, message_ref)
+                    add_edge("PROJECT_HAS_ROOM_DECISION", project_node, decision_node, message_ref)
+                elif message_kind in {"TASK_DRAFT", "DOCUMENT_DRAFT", "FAILURE"}:
+                    candidate_type = {
+                        "TASK_DRAFT": "TODO_CANDIDATE",
+                        "DOCUMENT_DRAFT": "DOCUMENT_CANDIDATE",
+                        "FAILURE": "FAILURE_CANDIDATE",
+                    }[message_kind]
+                    candidate_node = add_node(
+                        candidate_type,
+                        f"{room_id}:{message_id}",
+                        f"{candidate_type.replace('_', ' ').title()} · room",
+                        "PROPOSAL_ONLY",
+                        "MULTI_ROOM_EXTRACTION",
+                        message_ref,
+                        {
+                            "room_id": room_id,
+                            "message_id": message_id,
+                            "content_digest": content_digest,
+                            "created_at": message.get("created_at"),
+                            "promotion_state": "USER_SELECTION_REQUIRED",
+                            "body_in_graph": False,
+                        },
+                    )
+                    add_edge(
+                        f"ROOM_MESSAGE_DERIVES_{candidate_type}",
+                        message_node,
+                        candidate_node,
+                        message_ref,
+                    )
+                    add_edge(
+                        f"PROJECT_HAS_{candidate_type}",
+                        project_node,
+                        candidate_node,
+                        message_ref,
+                    )
+                elif message_kind == "BENCH_OBSERVATION":
+                    bench_node = add_node(
+                        "BENCH_OBSERVATION",
+                        f"{room_id}:{message_id}",
+                        "Bench observation · room",
+                        "AUTO_OBSERVED",
+                        "MULTI_ROOM_EXTRACTION",
+                        message_ref,
+                        {
+                            "room_id": room_id,
+                            "message_id": message_id,
+                            "content_digest": content_digest,
+                            "created_at": message.get("created_at"),
+                            "body_in_graph": False,
+                        },
+                    )
+                    add_edge("ROOM_MESSAGE_DERIVES_BENCH_OBSERVATION", message_node, bench_node, message_ref)
+                    add_edge("PROJECT_HAS_BENCH_OBSERVATION", project_node, bench_node, message_ref)
 
             # BOSS-room Worker reports are results, not transcript messages.
             # Project their structured, non-secret envelope independently so a

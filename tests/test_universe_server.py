@@ -1268,6 +1268,68 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(recorded["event"]["event_id"], result_cursor["last_event_id"])
         self.assertNotIn("Sensitive implementation detail", json.dumps(cursors))
 
+    def test_semantic_graph_extracts_only_explicit_typed_multi_room_messages(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Typed extraction",
+            host_role="CONDUCTOR",
+            project_id="GCS",
+        )
+        for kind in (
+            "MESSAGE",
+            "DECISION",
+            "TASK_DRAFT",
+            "DOCUMENT_DRAFT",
+            "FAILURE",
+            "BENCH_OBSERVATION",
+        ):
+            self.server.multi_rooms.post_message(
+                room["room_id"],
+                {
+                    "author_role": "USER",
+                    "kind": kind,
+                    "body_text": f"private {kind} source text",
+                    "idempotency_key": f"typed-room-{kind}",
+                },
+            )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        typed = {
+            item["entity_type"]: item
+            for item in graph["nodes"]
+            if item["provenance"]["source_kind"] == "MULTI_ROOM_EXTRACTION"
+        }
+        self.assertEqual(
+            {"ROOM_DECISION", "TODO_CANDIDATE", "DOCUMENT_CANDIDATE", "FAILURE_CANDIDATE", "BENCH_OBSERVATION"},
+            set(typed),
+        )
+        self.assertEqual(
+            "USER_SELECTION_REQUIRED", typed["TODO_CANDIDATE"]["data"]["promotion_state"]
+        )
+        self.assertEqual(
+            "AUTO_OBSERVED", typed["BENCH_OBSERVATION"]["lifecycle_state"]
+        )
+        self.assertNotIn("private MESSAGE source text", json.dumps(graph))
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertNotIn("ROOM_MESSAGE_DERIVES_MESSAGE", edge_types)
+        self.assertIn("ROOM_MESSAGE_DERIVES_DECISION", edge_types)
+        self.assertIn("ROOM_MESSAGE_DERIVES_DOCUMENT_CANDIDATE", edge_types)
+
+    def test_multi_room_rejects_unknown_explicit_message_kind(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Typed validation",
+            host_role="CONDUCTOR",
+            project_id="GCS",
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported message_kind"):
+            self.server.multi_rooms.post_message(
+                room["room_id"],
+                {"author_role": "USER", "kind": "AUTO_TODO", "body_text": "no"},
+            )
+
     def test_semantic_project_graph_projects_current_functional_seed_nodes(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, seed_result = self.request(

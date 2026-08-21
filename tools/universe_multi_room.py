@@ -31,6 +31,16 @@ MEETING_SUMMARY_SCHEMA = "universe.meeting-summary.v1"
 
 ROOM_TYPES = frozenset({"PROJECT", "BOSS", "MEETING"})
 ROOM_STATES = frozenset({"OPEN", "CLOSED"})
+MESSAGE_KINDS = frozenset(
+    {
+        "MESSAGE",
+        "DECISION",
+        "TASK_DRAFT",
+        "DOCUMENT_DRAFT",
+        "FAILURE",
+        "BENCH_OBSERVATION",
+    }
+)
 ATTACH_STATES = frozenset({"ACTIVE", "DETACHED", "STALE"})
 PARTICIPANT_STATES = frozenset(
     {"OBSERVED", "ATTACHED", "CONTROLLED", "LIVE", "DISCONNECTED"}
@@ -809,6 +819,15 @@ class MultiRoomStore:
                 403,
             )
         body_text = _text(value.get("body_text") or value.get("text") or value.get("body"), "body_text", limit=20000)
+        message_kind = _text(
+            value.get("kind") or value.get("message_kind") or "MESSAGE",
+            "message_kind",
+            limit=64,
+        ).upper()
+        if message_kind not in MESSAGE_KINDS:
+            raise MultiRoomError(
+                "MESSAGE_KIND_INVALID", f"unsupported message_kind: {message_kind}"
+            )
         idem = _optional_text(value.get("idempotency_key"), "idempotency_key", limit=120)
         if not idem:
             idem = "idem_" + secrets.token_hex(16)
@@ -876,6 +895,7 @@ class MultiRoomStore:
                 "room_id": room["room_id"],
                 "room_event_id": room_event_id,
                 "room_sequence": room_sequence,
+                "kind": message_kind,
                 "author_role": author_role,
                 "author_binding_id": author_binding_id,
                 "provider_event_id": provider_event_id,
