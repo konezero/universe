@@ -14113,6 +14113,22 @@ class UniverseStore:
             )
             add_edge("PROJECT_HAS_MEMORY", project_node, memory_node, f"universe://memories/{memory_id}")
 
+        for candidate in self.list_memory_candidates(project_id, limit=200):
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                continue
+            candidate_node = add_node(
+                "MEMORY_CANDIDATE", candidate_id,
+                str(candidate.get("title") or candidate.get("summary") or candidate_id),
+                str(candidate.get("state") or "REVIEW_REQUIRED"),
+                "MEMORY_CANDIDATE",
+                f"universe://memory-candidates/{candidate_id}", candidate,
+            )
+            add_edge(
+                "PROJECT_HAS_MEMORY_CANDIDATE", project_node, candidate_node,
+                f"universe://memory-candidates/{candidate_id}",
+            )
+
         for candidate in self.list_work_loop_review_candidates(project_id):
             if str(candidate.get("sink_kind") or "").upper() != "BENCH":
                 continue
