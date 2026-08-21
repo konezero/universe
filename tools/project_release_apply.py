@@ -247,6 +247,11 @@ def _rehydrate_runtime_surfaces(
                 "--commander-surface", "UNIVERSE_UI",
                 "--execution-surface", "repo-local",
                 "--repository-location", str(root),
+                # ReleaseRuntime already checked this exact immutable release
+                # against the prior managed inventory.  The Core installer may
+                # otherwise see its previous DISTRIBUTION_MANIFEST hashes while
+                # the release has already replaced a managed Core file.
+                "--force",
             ),
             cwd=root,
             timeout_seconds=120,
