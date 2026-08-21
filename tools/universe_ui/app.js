@@ -13106,6 +13106,7 @@ function bindGoalPlanEvents() {
     const view = button.getAttribute("data-mobile-work-view");
     if (view === "goals") showGoalPlanView();
     else if (view === "sessions") showGraphView("sessions");
+    else if (view === "bench") showGraphView("bench");
     else if (view === "actions") openActionInbox();
   });
   const activeGoal = () => state.goals.find((goal) => goal.goal_id === state.selectedGoalId) || state.goals[0];
