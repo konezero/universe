@@ -3926,8 +3926,26 @@ async function refresh({ syncSelectedProject = false } = {}) {
         state.accessSurface === "REMOTE_BROWSER" ? "목록 · 다른 유니버스" : "목록";
     }
 
+    // Project navigation is the first usable UI surface after a server
+    // restart.  Do not hold its first render behind optional catalog,
+    // provider, and room requests: one slow request used to display an empty
+    // Node Modes panel for several seconds even though the project DB had
+    // already responded.
+    const projectResultPromise = api("/v1/projects");
+    const todoResultPromise = api("/v1/todos");
+    const releaseResultPromise = api("/v1/releases");
+    const conductorRoomResultPromise = api("/v1/conductor-room/messages");
+    const governanceProposalInboxResultPromise = api("/v1/governance-proposals");
+    const providerSettingsPromise = api("/v1/settings/providers");
+    const hostToolsPromise = api("/v1/settings/host-tools");
+    const providerModelsResultPromise = api("/v1/settings/provider-models").catch(
+      () => null
+    );
+    const projectResult = await projectResultPromise;
+    state.projects = projectResult.projects;
+    renderProjects();
+    renderNodeModes();
     const [
-      projectResult,
       todoResult,
       releaseResult,
       conductorRoomResult,
@@ -3935,18 +3953,15 @@ async function refresh({ syncSelectedProject = false } = {}) {
       providerSettings,
       hostTools,
       providerModelsResult,
-    ] =
-      await Promise.all([
-      api("/v1/projects"),
-      api("/v1/todos"),
-      api("/v1/releases"),
-      api("/v1/conductor-room/messages"),
-      api("/v1/governance-proposals"),
-      api("/v1/settings/providers"),
-      api("/v1/settings/host-tools"),
-      api("/v1/settings/provider-models").catch(() => null),
+    ] = await Promise.all([
+      todoResultPromise,
+      releaseResultPromise,
+      conductorRoomResultPromise,
+      governanceProposalInboxResultPromise,
+      providerSettingsPromise,
+      hostToolsPromise,
+      providerModelsResultPromise,
     ]);
-    state.projects = projectResult.projects;
     state.todos = todoResult.todos;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];

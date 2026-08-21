@@ -178,7 +178,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("selectedModeCoordinateKey: null", APP)
         self.assertIn("function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {})", APP)
         self.assertIn("node-mode-session-card", APP)
-        self.assertIn("if (modeSelected || liveCount || coordinate.mode === \"MASTER\")", APP)
+        self.assertIn("if (modeSelected || liveCount)", APP)
         self.assertIn("renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected })", APP)
         self.assertIn("function ptyLiveTerminalsForCoordinate", APP)
         self.assertIn("state.supervisorTerminals", APP)
@@ -514,12 +514,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('"Provider setup required"', APP)
         self.assertIn('"LLM connected / Auto-approve " + autoApprove', APP)
 
-    def test_provider_settings_start_with_worker_bindings(self) -> None:
+    def test_provider_settings_expose_models_without_worker_bindings(self) -> None:
         providers_panel = HTML[
             HTML.index('data-settings-panel="providers"') :
             HTML.index('data-settings-panel="host"')
         ]
-        self.assertIn("<strong>Worker bindings</strong>", providers_panel)
+        self.assertIn("<strong>Provider models</strong>", providers_panel)
+        self.assertNotIn("<strong>Worker bindings</strong>", providers_panel)
         self.assertNotIn("Universe Conductor", providers_panel)
         self.assertNotIn("Project Masters", providers_panel)
         self.assertNotIn('id="project-provider-settings"', HTML)
