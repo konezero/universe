@@ -2418,6 +2418,31 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("TARGET_ACCEPTED", resumed["progress"]["step"])
 
+    def test_provider_tail_retries_only_catalog_waiting_anchor(self) -> None:
+        self.server.session_supervisor.list_sessions = Mock(
+            return_value=[
+                {
+                    "session_id": "supervisor-new-master-001",
+                    "project_id": "GCS",
+                    "provider": "CODEX",
+                    "provider_session_ref": "vendor-session-001",
+                    "session_anchor_ref": "session-anchor-new-master-001",
+                }
+            ]
+        )
+        self.server.store.discover_provider_session_sources = Mock(return_value=[])
+        self.server.store.scan_registered_provider_sources = Mock(return_value=[])
+        self.server._resume_hook_verified_conductor_allocations = Mock()
+
+        scans = self.server.tail_bound_provider_sessions()
+
+        self.assertEqual([], scans)
+        self.server._resume_hook_verified_conductor_allocations.assert_called_once_with(
+            "GCS",
+            "session-anchor-new-master-001",
+            retry_catalog_visibility=True,
+        )
+
     def test_semantic_graph_extracts_room_decisions_and_todo_candidates(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         decision, decision_created = self.server.store.create_room_message(
