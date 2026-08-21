@@ -6605,6 +6605,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "approval_evidence_ref": evidence_ref,
             "task_frame_id": "gcs-bootstrap-frame-001",
             "origin_session_anchor_ref": "session-anchor-approved-001",
+            "turns": [
+                {"turn_id": "/root/boss", "role": "BOSS"},
+                {"turn_id": "/root/implement", "role": "IMPLEMENTER"},
+                {"turn_id": "/root/review", "role": "QA_REVIEWER"},
+            ],
             "repository_write": False,
         }
         client = Mock()
@@ -6632,15 +6637,38 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "gcs-bootstrap-frame-001",
             result["task_frame_room"]["room"]["task_frame_id"],
         )
+        master_binding = next(
+            binding
+            for binding in result["task_frame_room"]["bindings"]
+            if binding["slot_role"] == "MASTER"
+        )
         self.assertEqual(
             "session-anchor-approved-001",
-            result["task_frame_room"]["bindings"][0]["session_anchor_ref"],
+            master_binding["session_anchor_ref"],
         )
         self.assertEqual(
             "session-anchor-approved-001",
             self.server.task_frame_lineage.get_task_frame(
                 "gcs-bootstrap-frame-001"
             )["origin_session_anchor_ref"],
+        )
+        bindings = result["task_frame_room"]["bindings"]
+        self.assertEqual(
+            {"MASTER", "BOSS", "WORKER", "REVIEWER"},
+            {binding["slot_role"] for binding in bindings},
+        )
+        run_refs = {
+            binding["provider_session_ref"]
+            for binding in bindings
+            if binding.get("provider") == "TASK_FRAME_RUN"
+        }
+        self.assertEqual(
+            {
+                "task-frame-run:gcs-bootstrap-frame-001:/root/boss",
+                "task-frame-run:gcs-bootstrap-frame-001:/root/implement",
+                "task-frame-run:gcs-bootstrap-frame-001:/root/review",
+            },
+            run_refs,
         )
         forwarded = client.create_approved_descendant_task_frame.call_args.kwargs
         self.assertEqual(proposal["proposal_id"], forwarded["primary_proposal"]["proposal_id"])

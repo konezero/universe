@@ -55,6 +55,7 @@ MEMBER_ROLES = frozenset(
         "MASTER",
         "BOSS",
         "WORKER",
+        "REVIEWER",
         "MODEL",
         "OBSERVER",
     }
@@ -62,7 +63,7 @@ MEMBER_ROLES = frozenset(
 # Who may POST chat messages in each room type (product write matrix).
 WRITE_ROLES: dict[str, frozenset[str]] = {
     "PROJECT": frozenset({"USER", "CONDUCTOR", "MASTER"}),
-    "BOSS": frozenset({"BOSS", "WORKER", "MASTER"}),  # user observe-only
+    "BOSS": frozenset({"BOSS", "WORKER", "REVIEWER", "MASTER"}),  # user observe-only
     "MEETING": frozenset({"USER", "CONDUCTOR", "MODEL", "MASTER"}),
 }
 

@@ -19014,6 +19014,49 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "participant_state": "ATTACHED",
                     },
                 )
+            # Task Frame turns are run references, not extra vendor sessions.
+            # Keep their identity visible in the one Room Engine without
+            # creating the duplicate session cards that previously confused
+            # MASTER/CONDUCTOR routing.
+            role_to_slot = {
+                "BOSS": "BOSS",
+                "IMPLEMENTER": "WORKER",
+                "SECURITY_REVIEWER": "REVIEWER",
+                "QA_REVIEWER": "REVIEWER",
+                "SUB_REVIEWER": "REVIEWER",
+            }
+            existing_run_refs = {
+                str(binding.get("provider_session_ref") or "")
+                for binding in self.multi_rooms.list_bindings(room["room_id"])
+                if binding.get("state") == "ACTIVE"
+                and binding.get("provider") == "TASK_FRAME_RUN"
+            }
+            turns = task_frame.get("turns")
+            if isinstance(turns, list):
+                for turn in turns:
+                    if not isinstance(turn, Mapping):
+                        continue
+                    turn_id = str(turn.get("turn_id") or "").strip()
+                    slot_role = role_to_slot.get(
+                        str(turn.get("role") or "").strip().upper()
+                    )
+                    if not turn_id or slot_role is None:
+                        continue
+                    run_ref = f"task-frame-run:{frame_id}:{turn_id}"
+                    if run_ref in existing_run_refs:
+                        continue
+                    self.multi_rooms.attach_session(
+                        room["room_id"],
+                        {
+                            "slot_role": slot_role,
+                            "display_name": (
+                                f"{slot_role.title()} run · {turn_id}"
+                            ),
+                            "provider": "TASK_FRAME_RUN",
+                            "provider_session_ref": run_ref,
+                            "participant_state": "OBSERVED",
+                        },
+                    )
             return self.multi_rooms.room_snapshot(room["room_id"])
         except MultiRoomError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error

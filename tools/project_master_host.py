@@ -893,6 +893,10 @@ class ProjectModeCoordinator:
             "task_frame_id": normalized_frame["frame_id"],
             "profile": str(TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH),
             "origin_session_anchor_ref": origin_session_anchor_ref,
+            "turns": [
+                {"turn_id": turn["turn_id"], "role": turn["role"]}
+                for turn in normalized_frame["turns"]
+            ],
             "repository_write": False,
         }
 
