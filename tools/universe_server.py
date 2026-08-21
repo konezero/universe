@@ -14280,22 +14280,6 @@ class UniverseStore:
             )
             add_edge("PROJECT_HAS_MEMORY", project_node, memory_node, f"universe://memories/{memory_id}")
 
-        for candidate in self.list_memory_candidates(project_id, limit=200):
-            candidate_id = str(candidate.get("candidate_id") or "")
-            if not candidate_id:
-                continue
-            candidate_node = add_node(
-                "MEMORY_CANDIDATE", candidate_id,
-                str(candidate.get("title") or candidate.get("summary") or candidate_id),
-                str(candidate.get("state") or "REVIEW_REQUIRED"),
-                "MEMORY_CANDIDATE",
-                f"universe://memory-candidates/{candidate_id}", candidate,
-            )
-            add_edge(
-                "PROJECT_HAS_MEMORY_CANDIDATE", project_node, candidate_node,
-                f"universe://memory-candidates/{candidate_id}",
-            )
-
         for candidate in self.list_work_loop_review_candidates(project_id):
             if str(candidate.get("sink_kind") or "").upper() != "BENCH":
                 continue
@@ -14309,6 +14293,151 @@ class UniverseStore:
                 "WORK_LOOP_BENCH_CANDIDATE", f"universe://work-loop/review-candidates/{candidate_id}", candidate,
             )
             add_edge("PROJECT_HAS_BENCH_CANDIDATE", project_node, bench_node, f"universe://work-loop/review-candidates/{candidate_id}")
+
+        memory_candidates = self.list_memory_candidates(project_id, limit=200)
+        memory_candidate_nodes: dict[str, str] = {}
+        for candidate in memory_candidates:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                continue
+            candidate_node = add_node(
+                "MEMORY_CANDIDATE", candidate_id,
+                str(candidate.get("title") or candidate.get("summary") or candidate_id),
+                str(candidate.get("state") or "REVIEW_REQUIRED"),
+                "MEMORY_CANDIDATE",
+                f"universe://memory-candidates/{candidate_id}", candidate,
+            )
+            memory_candidate_nodes[candidate_id] = candidate_node
+            add_edge(
+                "PROJECT_HAS_MEMORY_CANDIDATE", project_node, candidate_node,
+                f"universe://memory-candidates/{candidate_id}",
+            )
+        for candidate in memory_candidates:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            source_node = memory_candidate_nodes.get(candidate_id)
+            if source_node is None:
+                continue
+            for relation in candidate.get("relations") or []:
+                if not isinstance(relation, Mapping):
+                    continue
+                target_node = memory_candidate_nodes.get(
+                    str(relation.get("candidate_id") or "")
+                )
+                relation_type = str(relation.get("relation") or "RELATED_TO")
+                if target_node is not None:
+                    add_edge(
+                        f"MEMORY_CANDIDATE_{relation_type}", source_node, target_node,
+                        f"universe://memory-candidates/{candidate_id}",
+                    )
+
+        room_message_nodes: dict[str, str] = {}
+        room_message_parents: list[tuple[str, str]] = []
+        for message in self.list_room_messages(project_id, limit=200):
+            message_id = str(message.get("message_id") or "")
+            if not message_id:
+                continue
+            source_ref = f"universe://project-room/{project_id}/messages/{message_id}"
+            graph_message = {
+                key: message.get(key)
+                for key in (
+                    "message_id", "kind", "sender", "todo_id", "in_reply_to",
+                    "delivery_state", "created_at", "updated_at", "content_digest",
+                )
+                if message.get(key) is not None
+            }
+            graph_message["delivery_digest"] = _json_sha256(message.get("delivery") or {})
+            message_node = add_node(
+                "ROOM_MESSAGE", message_id,
+                f"{message.get('kind') or 'MESSAGE'} · {message.get('sender') or 'UNKNOWN'}",
+                str(message.get("delivery_state") or "RECORDED"),
+                "PROJECT_ROOM_MESSAGE", source_ref, graph_message,
+            )
+            room_message_nodes[message_id] = message_node
+            add_edge("PROJECT_HAS_ROOM_MESSAGE", project_node, message_node, source_ref)
+            todo_id = str(message.get("todo_id") or "")
+            if todo_id and f"todo:{todo_id}" in node_ids:
+                add_edge("ROOM_MESSAGE_REFERENCES_TODO", message_node, f"todo:{todo_id}", source_ref)
+            parent_id = str(message.get("in_reply_to") or "")
+            if parent_id:
+                room_message_parents.append((message_id, parent_id))
+        for message_id, parent_id in room_message_parents:
+            parent_node = room_message_nodes.get(parent_id)
+            child_node = room_message_nodes.get(message_id)
+            if parent_node is not None and child_node is not None:
+                add_edge(
+                    "ROOM_MESSAGE_REPLIES_TO", child_node, parent_node,
+                    f"universe://project-room/{project_id}/messages/{message_id}",
+                )
+
+        for event in self.list_events(project_id, limit=200):
+            event_id = str(event.get("event_id") or "")
+            if not event_id:
+                continue
+            source_ref = f"universe://events/{event_id}"
+            payload = event.get("payload")
+            event_node = add_node(
+                "EVENT", event_id, str(event.get("event_type") or "EVENT"),
+                "OBSERVED", "PROJECT_EVENT", source_ref,
+                {
+                    "event_id": event_id,
+                    "event_type": event.get("event_type"),
+                    "created_at": event.get("created_at"),
+                    "payload_digest": _json_sha256(payload),
+                },
+            )
+            add_edge("PROJECT_HAS_EVENT", project_node, event_node, source_ref)
+
+        for observation in self.list_skill_observations(project_id, limit=200):
+            observation_id = str(observation.get("observation_id") or "")
+            if not observation_id:
+                continue
+            source_ref = str(observation.get("source_ref") or f"universe://skill-observations/{observation_id}")
+            execution_context = observation.get("execution_context")
+            if not isinstance(execution_context, Mapping):
+                execution_context = {}
+            observation_node = add_node(
+                "SKILL_OBSERVATION", observation_id,
+                f"{(observation.get('skill') or {}).get('skill_id') or 'skill'} · {observation.get('outcome') or 'UNKNOWN'}",
+                str(observation.get("validation_state") or "UNKNOWN"),
+                "SKILL_OBSERVATION", source_ref,
+                {
+                    "observation_id": observation_id,
+                    "candidate_id": observation.get("candidate_id"),
+                    "outcome": observation.get("outcome"),
+                    "validation_state": observation.get("validation_state"),
+                    "skill": observation.get("skill"),
+                    "execution_context": dict(execution_context),
+                    "observed_at": observation.get("observed_at"),
+                    "recorded_at": observation.get("recorded_at"),
+                },
+            )
+            add_edge("PROJECT_HAS_SKILL_OBSERVATION", project_node, observation_node, source_ref)
+            task_frame_ref = str(observation.get("task_frame_ref") or "")
+            if task_frame_ref:
+                frame_node = add_node(
+                    "TASK_FRAME", task_frame_ref, f"Task Frame · {task_frame_ref}",
+                    "OBSERVED", "TASK_FRAME_REFERENCE", task_frame_ref,
+                    {"task_frame_ref": task_frame_ref},
+                )
+                add_edge("SKILL_OBSERVATION_FROM_TASK_FRAME", observation_node, frame_node, source_ref)
+            failure_kind = str(execution_context.get("failure_kind") or "NONE")
+            if failure_kind not in {"", "NONE", "UNKNOWN"}:
+                failure_node = add_node(
+                    "FAILURE", f"{observation_id}:{failure_kind}", failure_kind,
+                    str(observation.get("outcome") or "OBSERVED"),
+                    "SKILL_OBSERVATION_FAILURE", source_ref,
+                    {"failure_kind": failure_kind, "observation_id": observation_id},
+                )
+                add_edge("SKILL_OBSERVATION_REPORTED_FAILURE", observation_node, failure_node, source_ref)
+            bench_node = add_node(
+                "BENCH", observation_id,
+                f"Bench · {observation.get('outcome') or 'UNKNOWN'}",
+                str(observation.get("validation_state") or "UNKNOWN"),
+                "SKILL_OBSERVATION_BENCH", source_ref,
+                {"observation_id": observation_id, "metrics": observation.get("metrics") or {}},
+            )
+            add_edge("PROJECT_HAS_BENCH_OBSERVATION", project_node, bench_node, source_ref)
+            add_edge("BENCH_DERIVED_FROM_SKILL_OBSERVATION", bench_node, observation_node, source_ref)
 
         return {
             "schema": "universe.semantic-project-graph.v1",

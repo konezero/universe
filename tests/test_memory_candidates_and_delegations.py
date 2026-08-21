@@ -286,6 +286,61 @@ class MemoryCandidateApiTests(unittest.TestCase):
         body.update(overrides)
         return self.request("POST", "/v1/projects/TEST/memory-batch-config", body)
 
+    def test_semantic_graph_projects_redacted_room_event_and_bench_facts(self) -> None:
+        todo = self.server.store.create_todo(
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "TEST",
+                "title": "Graph projection fixture",
+                "detail": "Fixture only",
+                "priority": "P1",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            }
+        )
+        message, _created = self.server.store.create_room_message(
+            "TEST",
+            {
+                "kind": "STATUS",
+                "sender": "MASTER",
+                "body": "raw room text must not be projected",
+                "todo_id": todo["todo_id"],
+                "idempotency_key": "semantic-graph-room-fixture",
+            },
+        )
+        self.server.store.append_event(
+            "TEST",
+            {
+                "event_id": "semantic_graph_fixture_event",
+                "event_type": "HOOK_OBSERVED",
+                "payload": {"secret": "must-not-project"},
+            },
+        )
+        fixture = json.loads(
+            (ROOT / "tests" / "fixtures" / "skill_observation_dogfood.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fixture["candidate"]["project_ref"] = "project://TEST"
+        fixture["candidate"]["observations"][0]["execution_context"][
+            "failure_kind"
+        ] = "TIMEOUT"
+        self.server.store.ingest_skill_observations("TEST", fixture)
+
+        graph = self.server.store.semantic_project_graph("TEST")
+        node_ids = {node["id"] for node in graph["nodes"]}
+        edge_types = {edge["edge_type"] for edge in graph["edges"]}
+        rendered = json.dumps(graph, sort_keys=True)
+        self.assertIn(f"room_message:{message['message_id']}", node_ids)
+        self.assertIn("event:semantic_graph_fixture_event", node_ids)
+        self.assertIn("skill_observation:", rendered)
+        self.assertIn("PROJECT_HAS_BENCH_OBSERVATION", edge_types)
+        self.assertIn("SKILL_OBSERVATION_REPORTED_FAILURE", edge_types)
+        self.assertIn("ROOM_MESSAGE_REFERENCES_TODO", edge_types)
+        self.assertNotIn("raw room text must not be projected", rendered)
+        self.assertNotIn("must-not-project", rendered)
+
     def test_config_roundtrip_quota_and_candidates_review(self) -> None:
         status, saved = self.configure(
             "FAST_EXTRACT",
