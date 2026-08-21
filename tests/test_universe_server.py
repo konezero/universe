@@ -2435,6 +2435,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {item["edge_type"] for item in graph["edges"]},
         )
 
+    def test_semantic_graph_derives_drift_only_for_live_stale_sessions(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        stale, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "semantic-drift-live",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "semantic-drift-live-provider",
+                "state": "LIVE",
+                "currentness": "STALE",
+            }
+        )
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "semantic-drift-historical",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "semantic-drift-historical-provider",
+                "state": "STOPPED",
+                "currentness": "STALE",
+            }
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        drifts = [item for item in graph["nodes"] if item["entity_type"] == "DRIFT_CANDIDATE"]
+        self.assertEqual(1, len(drifts))
+        self.assertEqual(stale["session_id"], drifts[0]["data"]["session_id"])
+        self.assertEqual("USER_SELECTION_REQUIRED", drifts[0]["data"]["promotion_state"])
+        self.assertIn(
+            "SESSION_DERIVES_DRIFT_CANDIDATE",
+            {item["edge_type"] for item in graph["edges"]},
+        )
+
     def test_memory_batch_completion_advances_semantic_collection_cursor(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.server.store.persist_memory_batch_result(

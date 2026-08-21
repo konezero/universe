@@ -14501,6 +14501,38 @@ class UniverseStore:
                 },
             )
             add_edge("PROJECT_HAS_SESSION", project_node, session_node, source_ref)
+            if (
+                str(session.get("currentness") or "").upper() == "STALE"
+                and str(session.get("state") or "").upper() in {"LIVE", "STARTING"}
+            ):
+                drift_node = add_node(
+                    "DRIFT_CANDIDATE",
+                    session_id,
+                    f"Session drift candidate · {session.get('mode') or 'UNKNOWN'}",
+                    "AUTO_OBSERVED",
+                    "SESSION_CURRENTNESS_DRIFT",
+                    source_ref,
+                    {
+                        "session_id": session_id,
+                        "session_anchor_ref": session.get("session_anchor_ref"),
+                        "observed_state": session.get("state"),
+                        "observed_currentness": session.get("currentness"),
+                        "updated_at": session.get("updated_at"),
+                        "promotion_state": "USER_SELECTION_REQUIRED",
+                    },
+                )
+                add_edge(
+                    "SESSION_DERIVES_DRIFT_CANDIDATE",
+                    session_node,
+                    drift_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_DRIFT_CANDIDATE",
+                    project_node,
+                    drift_node,
+                    source_ref,
+                )
             provider_session_ref = str(session.get("provider_session_ref") or "")
             if provider_session_ref:
                 session_nodes_by_provider_digest[_json_sha256(provider_session_ref)] = session_node
