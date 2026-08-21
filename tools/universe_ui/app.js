@@ -89,7 +89,6 @@ const state = {
   observatoryTab: "sessions",
   todoTab: "board",
   supervisorEvents: [],
-  legacyExecutors: [],
   providerActivitySources: [],
   providerActivityDiscoveries: [],
   providerChatRooms: [],
@@ -245,7 +244,6 @@ const elements = {
   ),
   observatoryShowAllToggle: document.querySelector("#observatory-show-all"),
   cleanupSessionsButton: document.querySelector("#cleanup-sessions-button"),
-  legacyExecutorList: document.querySelector("#legacy-executor-list"),
   sessionEventList: document.querySelector("#session-event-list"),
   runtimeAuditGrid: document.querySelector("#runtime-audit-grid"),
   refreshSessionsButton: document.querySelector("#refresh-sessions-button"),
@@ -1142,9 +1140,8 @@ async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
   }
 
   const refreshPromise = (async () => {
-    const [audit, legacy, activity, chatCatalog, sessionGraph, busUnread] = await Promise.all([
+    const [audit, activity, chatCatalog, sessionGraph, busUnread] = await Promise.all([
       api("/v1/runtime/audit"),
-      api("/v1/supervisor/legacy-executors"),
       api("/v1/session-observer/sources"),
       api("/v1/session-observer/chat-rooms"),
       api("/v1/session-graph").catch(() => null),
@@ -1179,7 +1176,6 @@ async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
     }
     state.roomSessionBindings = audit.room_session_bindings || [];
     state.supervisorEvents = audit.recent_events || [];
-    state.legacyExecutors = legacy.executors || [];
     state.providerActivitySources = activity.sources || [];
     state.providerChatRooms = chatCatalog.rooms || [];
     state.projectAnchorSessions = chatCatalog.anchor_sessions || [];
@@ -3151,28 +3147,6 @@ function renderSessionObservatory() {
   renderSelectedSessionDetail();
   renderSessionRail();
 
-  if (elements.legacyExecutorList) {
-    elements.legacyExecutorList.replaceChildren();
-    for (const executor of state.legacyExecutors || []) {
-      const observation = executor.observation || {};
-      const row = node("article", "legacy-executor-row");
-      row.dataset.state = executor.status || "UNKNOWN";
-      const command = observation.command_profile || "Command unavailable";
-      row.append(
-        node("strong", "", executor.status || "UNKNOWN"),
-        node("span", "", `PID ${observation.pid || "UNKNOWN"}`),
-        node("code", "", command),
-        node("small", "", executor.reason || executor.required_route || "Observed")
-      );
-      elements.legacyExecutorList.append(row);
-    }
-    if (!(state.legacyExecutors || []).length) {
-      elements.legacyExecutorList.append(
-        node("p", "empty-copy", "No legacy Session Boot executor was observed.")
-      );
-    }
-  }
-
   elements.sessionEventList.replaceChildren();
   for (const event of (state.supervisorEvents || []).slice(0, 20)) {
     const row = node("div", "session-event-row");
@@ -3994,7 +3968,6 @@ async function refresh({ syncSelectedProject = false } = {}) {
     void refreshSupervisorSessions().catch((error) => {
       state.supervisorSessions = [];
       state.supervisorEvents = [];
-      state.legacyExecutors = [];
       renderSessionObservatory();
       console.warn("Session Supervisor refresh failed", error);
     });
@@ -10002,7 +9975,7 @@ async function submitDispatch(event) {
       renderReleaseCatalog();
       renderComposerState();
       renderRoomMessages();
-      toast("Choose one imported Release DB before OS_UPDATE", true);
+      toast("Choose one imported Release DB before applying the project runtime", true);
       showInspectorTab("activity");
       return;
     }
