@@ -47,6 +47,7 @@ class MultiRoomStoreTests(unittest.TestCase):
                 "slot_role": "MASTER",
                 "provider": "GROK",
                 "provider_session_ref": "sess-abc",
+                "session_anchor_ref": "MASTER-CURRENT-PROJ-DEMO",
                 "display_name": "Master",
             },
         )
@@ -56,6 +57,10 @@ class MultiRoomStoreTests(unittest.TestCase):
         snap = self.store.room_snapshot(room["room_id"])
         self.assertTrue(snap["user_may_write"])
         self.assertEqual(1, len(snap["bindings"]))
+        self.assertEqual(
+            "MASTER-CURRENT-PROJ-DEMO",
+            snap["bindings"][0]["session_anchor_ref"],
+        )
 
     def test_boss_room_user_cannot_write(self) -> None:
         room = self.store.create_boss_room(

@@ -555,6 +555,16 @@ class MultiRoomStore:
             limit=128,
         )
         display_name = _optional_text(value.get("display_name"), "display_name", limit=120)
+        session_anchor_ref = _optional_text(
+            value.get("session_anchor_ref") or value.get("anchor_ref"),
+            "session_anchor_ref",
+            limit=256,
+        )
+        binding_metadata = (
+            {"session_anchor_ref": session_anchor_ref}
+            if session_anchor_ref is not None
+            else {}
+        )
         resume_pending_delivery = value.get("resume_pending_delivery") is True
         participant_state = str(value.get("participant_state") or "OBSERVED").upper()
         if participant_state not in PARTICIPANT_STATES:
@@ -628,7 +638,7 @@ class MultiRoomStore:
                     binding_id, room_id, slot_role, provider, provider_session_ref,
                     supervisor_session_id, display_name, state, metadata_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', '{}', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
                 """,
                 (
                     binding_id,
@@ -638,6 +648,7 @@ class MultiRoomStore:
                     provider_session_ref,
                     supervisor_session_id,
                     display_name,
+                    json.dumps(binding_metadata, ensure_ascii=False, separators=(",", ":")),
                     now,
                     now,
                 ),
@@ -1795,6 +1806,10 @@ class MultiRoomStore:
         }
 
     def _binding_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
         return {
             "schema": ROOM_ATTACH_SCHEMA,
             "binding_id": row["binding_id"],
@@ -1804,6 +1819,8 @@ class MultiRoomStore:
             "provider_session_ref": row["provider_session_ref"],
             "supervisor_session_id": row["supervisor_session_id"],
             "display_name": row["display_name"],
+            "session_anchor_ref": metadata.get("session_anchor_ref"),
+            "metadata": metadata,
             "state": row["state"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
