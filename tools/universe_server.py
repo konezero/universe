@@ -4476,6 +4476,7 @@ class UniverseStore:
         self.provider_session_observer = ProviderSessionObserverStore(
             self.database_path
         )
+        self.session_supervisor = SessionSupervisorStore(self.database_path)
         # The semantic graph is a UniverseStore projection, so its durable
         # multi-room source must live beside the other project stores.  The
         # HTTP server reuses this instance for its event/control surface.
@@ -14212,6 +14213,83 @@ class UniverseStore:
             f"universe://projects/{project_id}",
             project,
         )
+        for session in self.session_supervisor.list_sessions(
+            node=project_id, include_hidden=True
+        ):
+            session_id = str(session.get("session_id") or "")
+            if not session_id:
+                continue
+            source_ref = f"universe://supervisor/sessions/{session_id}"
+            session_node = add_node(
+                "SESSION", session_id,
+                str(session.get("display_name") or session_id),
+                str(session.get("state") or "UNKNOWN"),
+                "SESSION_SUPERVISOR", source_ref,
+                {
+                    key: session.get(key)
+                    for key in (
+                        "session_id", "node", "mode", "provider", "state",
+                        "currentness", "activity_state", "is_default", "updated_at",
+                    )
+                    if session.get(key) is not None
+                }
+                | {
+                    "provider_session_digest": _json_sha256(
+                        session.get("provider_session_ref") or ""
+                    )
+                },
+            )
+            add_edge("PROJECT_HAS_SESSION", project_node, session_node, source_ref)
+            anchor_ref = str(session.get("session_anchor_ref") or "")
+            if anchor_ref:
+                anchor_node = add_node(
+                    "SESSION_ANCHOR", anchor_ref, f"Session Anchor · {anchor_ref}",
+                    str(session.get("currentness") or "OBSERVED"),
+                    "SESSION_SUPERVISOR", source_ref,
+                    {"session_anchor_ref": anchor_ref, "session_id": session_id},
+                )
+                add_edge("SESSION_OWNS_ANCHOR", session_node, anchor_node, source_ref)
+        for mode_anchor in self.session_supervisor.list_project_mode_anchors(
+            project_id=project_id
+        ):
+            mode = str(mode_anchor.get("mode") or "UNKNOWN")
+            anchor_ref = str(mode_anchor.get("anchor_ref") or "")
+            if not anchor_ref:
+                continue
+            source_ref = f"universe://project-mode-anchors/{project_id}/{mode}"
+            mode_node = add_node(
+                "MODE_ANCHOR", anchor_ref, f"{mode} Mode Anchor",
+                "CURRENT", "PROJECT_MODE_ANCHOR", source_ref,
+                {
+                    "project_id": project_id,
+                    "mode": mode,
+                    "anchor_ref": anchor_ref,
+                    "revision": mode_anchor.get("revision"),
+                    "updated_at": mode_anchor.get("updated_at"),
+                },
+            )
+            add_edge("PROJECT_HAS_MODE_ANCHOR", project_node, mode_node, source_ref)
+            for attachment in mode_anchor.get("session_anchor_refs") or []:
+                if not isinstance(attachment, Mapping):
+                    continue
+                session_anchor_ref = str(attachment.get("session_anchor_ref") or "")
+                if not session_anchor_ref:
+                    continue
+                session_anchor_node = add_node(
+                    "SESSION_ANCHOR", session_anchor_ref,
+                    f"Session Anchor · {session_anchor_ref}", "OBSERVED",
+                    "PROJECT_MODE_ANCHOR", source_ref,
+                    {
+                        "session_anchor_ref": session_anchor_ref,
+                        "session_id": attachment.get("session_id"),
+                        "revision": attachment.get("revision"),
+                        "attached_at": attachment.get("attached_at"),
+                    },
+                )
+                add_edge(
+                    "MODE_ANCHOR_REFS_SESSION_ANCHOR", mode_node, session_anchor_node,
+                    source_ref,
+                )
         goals = self.list_project_goals(project_id)
         assigned_todos: set[str] = set()
         for goal in goals:
@@ -17437,7 +17515,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     ):
         self.store = store
         self.project_task_proposals = ProjectTaskProposalAdapter()
-        self.session_supervisor = SessionSupervisorStore(store.database_path)
+        self.session_supervisor = store.session_supervisor
         self.token = token
         self.service_state_path = (service_state_path or default_state_path()).resolve()
         self.remote_gateway_state_path = (

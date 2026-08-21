@@ -1228,6 +1228,45 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {item["edge_type"] for item in semantic["edges"]},
         )
 
+    def test_semantic_project_graph_projects_session_anchor_lineage(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "semantic-graph-session-001",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-vendor-semantic-graph-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        mode_anchor = self.server.session_supervisor.get_project_mode_anchor(
+            "GCS", "MASTER"
+        )
+
+        status, semantic = self.request(
+            "GET", "/v1/projects/GCS/semantic-graph", None, self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        node_ids = {item["id"] for item in semantic["nodes"]}
+        self.assertIn("session:semantic-graph-session-001", node_ids)
+        self.assertIn(
+            f"session_anchor:{session['session_anchor_ref']}", node_ids
+        )
+        self.assertIn(f"mode_anchor:{mode_anchor['anchor_ref']}", node_ids)
+        edge_types = {item["edge_type"] for item in semantic["edges"]}
+        self.assertTrue(
+            {
+                "PROJECT_HAS_SESSION",
+                "SESSION_OWNS_ANCHOR",
+                "PROJECT_HAS_MODE_ANCHOR",
+                "MODE_ANCHOR_REFS_SESSION_ANCHOR",
+            }.issubset(edge_types)
+        )
+
     def test_todo_cannot_bind_to_a_goal_from_another_project(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration())
         _, goal_result = self.request(
