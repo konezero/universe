@@ -14755,12 +14755,44 @@ class UniverseStore:
             memory_id = str(memory.get("memory_id") or "")
             if not memory_id:
                 continue
+            source_ref = str(memory.get("origin_ref") or f"universe://memories/{memory_id}")
+            # Project Memory may retain a reviewable body in its source store.
+            # The semantic graph is a redacted navigation projection, so only
+            # stable identity/link metadata belongs here.
+            memory_data = {
+                key: memory.get(key)
+                for key in (
+                    "memory_id", "title", "state", "link_state", "origin_ref",
+                    "node_ref", "graph", "created_at", "updated_at",
+                )
+                if memory.get(key) is not None
+            }
             memory_node = add_node(
                 "MEMORY", memory_id, str(memory.get("title") or memory_id),
                 str(memory.get("link_state") or memory.get("state") or "LINKED_ONLY"),
-                "PROJECT_MEMORY", str(memory.get("origin_ref") or f"universe://memories/{memory_id}"), memory,
+                "PROJECT_MEMORY", source_ref, memory_data,
             )
             add_edge("PROJECT_HAS_MEMORY", project_node, memory_node, f"universe://memories/{memory_id}")
+            if str(memory.get("link_state") or "").upper() == "LINKED":
+                rag_node = add_node(
+                    "RAG_SOURCE",
+                    memory_id,
+                    f"RAG source · {memory.get('title') or memory_id}",
+                    "LINKED_ONLY",
+                    "PROJECT_MEMORY_RAG",
+                    source_ref,
+                    {
+                        key: memory.get(key)
+                        for key in ("memory_id", "node_ref", "graph", "link_state")
+                        if memory.get(key) is not None
+                    }
+                    | {
+                        "retrieval_policy": "LINKED_ONLY",
+                        "body_in_graph": False,
+                    },
+                )
+                add_edge("PROJECT_HAS_RAG_SOURCE", project_node, rag_node, source_ref)
+                add_edge("RAG_SOURCE_USES_MEMORY", rag_node, memory_node, source_ref)
 
         for candidate in self.list_work_loop_review_candidates(project_id):
             if str(candidate.get("sink_kind") or "").upper() != "BENCH":

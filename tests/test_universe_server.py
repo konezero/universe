@@ -9768,6 +9768,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
             ],
         )
 
+    def test_semantic_graph_projects_linked_memory_as_redacted_rag_source(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        memory = self.server.store.create_project_memory(
+            "GCS",
+            {
+                "title": "Broker review context",
+                "body": "Secret review notes must remain in the source memory store.",
+                "state": "OBSERVED",
+            },
+        )
+        self.server.store.link_project_memory(
+            "GCS",
+            memory["memory_id"],
+            {
+                "node_ref": "broker-client",
+                "graph": "functional",
+                "link_state": "LINKED",
+            },
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+
+        rag_nodes = [item for item in graph["nodes"] if item["entity_type"] == "RAG_SOURCE"]
+        self.assertEqual(1, len(rag_nodes))
+        self.assertEqual(memory["memory_id"], rag_nodes[0]["data"]["memory_id"])
+        self.assertTrue(rag_nodes[0]["data"]["body_in_graph"] is False)
+        self.assertNotIn("Secret review notes", json.dumps(graph))
+        edge_types = {item["edge_type"] for item in graph["edges"]}
+        self.assertIn("PROJECT_HAS_RAG_SOURCE", edge_types)
+        self.assertIn("RAG_SOURCE_USES_MEMORY", edge_types)
+
     def test_selected_skill_plan_is_bound_to_master_context_once(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.request("POST", "/v1/projects/GCS/seed", self.project_seed(), self.token)
