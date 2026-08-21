@@ -2346,6 +2346,15 @@ class ProjectMasterHostTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        supervisor = SessionSupervisorStore(self.root / "anchor-graph.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("GROK")
+        state.observe_provider_session("GROK", "grok-cli:session-001")
         requests: list[dict[str, Any]] = []
 
         def runner(request):
@@ -2390,6 +2399,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "GCS",
             "grok-cli:session-001",
             native_runner=runner,
+            session_supervisor=supervisor,
             source_binding_resolver=lambda _root: {
                 "status": "SELECTED",
                 "release_id": "core-test",
@@ -2402,23 +2412,15 @@ class ProjectMasterHostTests(unittest.TestCase):
             "project_master_host._required_host_executable",
             return_value=Path(sys.executable),
         ):
-            coordinator.prepare()
-            coordinator.observe(self._envelope()["message"])
+            preparation = coordinator.prepare()
+            observation = coordinator.observe(self._envelope()["message"])
 
-        self.assertEqual("MASTER", requests[0]["mode"])
+        self.assertEqual([], requests)
+        self.assertEqual("ANCHOR_GRAPH", preparation["preparation_path"])
+        self.assertEqual("MASTER", preparation["mode"])
+        self.assertEqual("COMMANDER_INPUT_OBSERVED", observation["status"])
         self.assertEqual(
-            f"universe-release-db://core-test@{'c' * 64}",
-            requests[0]["source_ref"],
-        )
-        self.assertEqual("b" * 40, requests[0]["source_commit"])
-        self.assertEqual(
-            "fixture/universe-private", requests[0]["source_repository"]
-        )
-        self.assertEqual("grok-cli:session-001", requests[0]["host_session_ref"])
-        self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
-        self.assertEqual(
-            f"universe://project-room/messages/{self._message_id()}",
-            requests[1]["evidence_ref"],
+            preparation["session_anchor_ref"], observation["snapshot"]["anchor_id"]
         )
 
     def test_project_mode_coordinator_uses_observed_session_anchor_for_chat(self) -> None:
@@ -2532,7 +2534,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("DESIGN", requests[0]["mode"])
         self.assertEqual("DESIGNER", requests[0]["role"])
 
-    def test_project_mode_coordinator_requires_mode_boot_binding(self) -> None:
+    def test_project_mode_coordinator_requires_exact_session_anchor(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
@@ -2582,7 +2584,7 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ProjectMasterHostError,
-            "PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE",
+            "PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE",
         ):
             coordinator.prepare()
 

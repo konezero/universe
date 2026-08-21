@@ -217,15 +217,12 @@ class ProjectModeCoordinator:
         open the chat made an otherwise healthy provider session depend on a
         second process, a Release selection, and a Mode Boot binding.
 
-        The old path remains isolated in ``_prepare_legacy_runtime`` for the
-        compatibility-only mutation/Task Frame endpoints below.  It is not a
-        prerequisite for a Project Master conversation.
         """
         anchor_preparation = self._anchor_graph_preparation()
-        if anchor_preparation is not None:
-            self._prepared = dict(anchor_preparation)
-            return anchor_preparation
-        return self._prepare_legacy_runtime()
+        if anchor_preparation is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+        self._prepared = dict(anchor_preparation)
+        return anchor_preparation
 
     def _prepare_legacy_runtime(self) -> Mapping[str, Any]:
         definition = self._mode_definition()
@@ -271,24 +268,9 @@ class ProjectModeCoordinator:
         anchor_observation = self._anchor_graph_observation(
             evidence_ref=f"universe://project-room/messages/{message_id}"
         )
-        if anchor_observation is not None:
-            return anchor_observation
-        result = self._invoke(
-            (
-                "mode-anchor",
-                "observe-commander-input",
-                "--repo-root",
-                str(self.project_root),
-            ),
-            {
-                "mode": self.requested_mode,
-                "commander_surface": "UNIVERSE_UI",
-                "evidence_ref": (f"universe://project-room/messages/{message_id}"),
-            },
-        )
-        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
-            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
-        return result
+        if anchor_observation is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+        return anchor_observation
 
     def observe_room_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]:
         room_id = _text(event.get("room_id"), "event.room_id")
@@ -299,34 +281,16 @@ class ProjectModeCoordinator:
         anchor_observation = self._anchor_graph_observation(
             evidence_ref=f"universe://rooms/{room_id}/events/{room_event_id}"
         )
-        if anchor_observation is not None:
-            return anchor_observation
-        result = self._invoke(
-            (
-                "mode-anchor",
-                "observe-commander-input",
-                "--repo-root",
-                str(self.project_root),
-            ),
-            {
-                "mode": self.requested_mode,
-                "commander_surface": "UNIVERSE_UI",
-                "evidence_ref": (
-                    f"universe://rooms/{room_id}/events/{room_event_id}"
-                ),
-            },
-        )
-        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
-            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
-        return result
+        if anchor_observation is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+        return anchor_observation
 
     def _anchor_graph_preparation(self) -> dict[str, Any] | None:
         """Return the exact observed Session Anchor for a resident provider.
 
-        ``None`` deliberately means that this coordinator is being used by a
-        legacy standalone bridge that has no Supervisor.  Those callers retain
-        their compatibility path; the Universe resident Host always supplies
-        the Supervisor and therefore never needs Runtime Boot to open chat.
+        ``None`` means no exact supervised Session Anchor owns this provider
+        coordinate.  The caller must stop instead of manufacturing one through
+        legacy Runtime Boot or a Mode Current Anchor.
         """
         session = self._anchor_graph_session()
         if session is None:
