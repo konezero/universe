@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
+from windows_native_cli import NativeCliRequest, run_native_cli
 
 
 RELEASE_APPROVAL_SCHEMA = "universe.project-release-approval.v1"
@@ -14,6 +16,10 @@ DIRECT_LIFECYCLE_RECEIPT_SCHEMA = "universe.project-runtime-lifecycle-receipt.v1
 LIFECYCLE_PLAN_SCHEMA = "universe.project-runtime-lifecycle-plan.v1"
 INSTALLATION_MANIFEST_PATH = (
     ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
+)
+INSTALLER_PATH = (
+    ".ai/distribution/context_management_runtime_pack/"
+    "project_runtime_installer.py"
 )
 
 
@@ -184,6 +190,11 @@ def apply_project_release_proposal(
                 target_root=root,
                 approved_plan_digest=install_plan["plan_digest"],
             )
+            runtime_surface_result = _rehydrate_runtime_surfaces(
+                runtime=runtime,
+                root=root,
+                project_id=normalized_proposal["project_id"],
+            )
     except ProjectReleaseApplyError:
         raise
     except (OSError, ReleaseRuntimeError) as error:
@@ -202,6 +213,7 @@ def apply_project_release_proposal(
         "operation": install_result["operation"],
         "changed_count": install_result["changed_count"],
         "changed": install_result["changed"],
+        "runtime_surface_result": runtime_surface_result,
     }
     return {
         "schema": RELEASE_APPLY_RECEIPT_SCHEMA,
@@ -209,6 +221,59 @@ def apply_project_release_proposal(
         **material,
         "receipt_digest": _digest(material),
     }
+
+
+def _rehydrate_runtime_surfaces(
+    *, runtime: ReleaseRuntime, root: Path, project_id: str
+) -> dict[str, Any]:
+    """Regenerate Runtime-owned project surfaces from the applied release."""
+
+    bundle_root = root / ".ai" / "runtime" / "release_db" / runtime.release_id
+    if not bundle_root.exists():
+        runtime.materialize_source_bundle(bundle_root)
+    installer = root / INSTALLER_PATH
+    result = run_native_cli(
+        NativeCliRequest(
+            executable=Path(sys.executable),
+            arguments=(
+                str(installer),
+                "install",
+                "--source-bundle", str(bundle_root),
+                "--target", str(root),
+                "--project", project_id,
+                "--node", project_id,
+                "--mode", "MASTER",
+                "--host", "universe-release-db",
+                "--commander-surface", "UNIVERSE_UI",
+                "--execution-surface", "repo-local",
+                "--repository-location", str(root),
+            ),
+            cwd=root,
+            timeout_seconds=120,
+        )
+    )
+    if result.status != "COMPLETED":
+        raise ProjectReleaseApplyError(
+            "PROJECT_RUNTIME_SURFACE_REHYDRATION_FAILED",
+            result.stderr or "Runtime surface installer failed",
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ProjectReleaseApplyError(
+            "PROJECT_RUNTIME_SURFACE_REHYDRATION_FAILED",
+            "Runtime surface installer returned invalid JSON",
+        ) from error
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("result") != "PASS"
+        or payload.get("repository_runtime") != "VERIFIED"
+    ):
+        raise ProjectReleaseApplyError(
+            "PROJECT_RUNTIME_SURFACE_REHYDRATION_FAILED",
+            "Runtime surface installer did not verify the applied Runtime",
+        )
+    return {"result": "REHYDRATED", "validation": dict(payload)}
 
 
 def apply_project_release_plan(

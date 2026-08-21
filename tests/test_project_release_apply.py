@@ -116,7 +116,28 @@ class ProjectReleaseApplyTests(unittest.TestCase):
                 sort_keys=True,
             ),
         )
-        self._write(installer, "INSTALLER = True\n")
+        self._write(
+            installer,
+            "import argparse\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('command')\n"
+            "parser.add_argument('--source-bundle')\n"
+            "parser.add_argument('--target')\n"
+            "parser.add_argument('--project')\n"
+            "parser.add_argument('--node')\n"
+            "parser.add_argument('--mode')\n"
+            "parser.add_argument('--host')\n"
+            "parser.add_argument('--commander-surface')\n"
+            "parser.add_argument('--execution-surface')\n"
+            "parser.add_argument('--repository-location')\n"
+            "args = parser.parse_args()\n"
+            "target = Path(args.target) / '.ai' / 'START_HERE.md'\n"
+            "target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "target.write_text('# Runtime entry\\n', encoding='utf-8')\n"
+            "print(json.dumps({'result': 'PASS', 'repository_runtime': 'VERIFIED'}))\n",
+        )
         self._write(host, "HOST = True\n")
         self._write(core, "# Core\n")
         self._write(
@@ -217,6 +238,10 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertEqual(proposal["release_id"], state["release_id"])
         core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
         self.assertTrue(core_file.exists())
+        self.assertTrue((self.project / ".ai" / "START_HERE.md").exists())
+        self.assertEqual(
+            "REHYDRATED", receipt["runtime_surface_result"]["result"]
+        )
 
     def test_direct_plan_application_returns_no_proposal_or_approval_evidence(self) -> None:
         proposal = self._proposal()
