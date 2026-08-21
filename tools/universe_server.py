@@ -7041,6 +7041,32 @@ class UniverseStore:
                         run_id,
                     ),
                 )
+            # Batch output is already a redacted, durable collection result.
+            # Keep only its digest and run coordinate as graph currentness;
+            # never promote candidates or expose collected text from here.
+            connection.execute(
+                """
+                INSERT INTO semantic_collection_cursor(
+                    project_id, source_kind, last_event_id, last_event_type,
+                    source_digest, observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_event_type = excluded.last_event_type,
+                    source_digest = excluded.source_digest,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project_id,
+                    f"MEMORY_BATCH_{str(stage).upper()}",
+                    run_id,
+                    str(result["status"]),
+                    output_digest,
+                    now,
+                    now,
+                ),
+            )
 
     @staticmethod
     def memory_batch_run_id(

@@ -2254,6 +2254,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
             },
         )
 
+    def test_memory_batch_completion_advances_semantic_collection_cursor(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.persist_memory_batch_result(
+            run_id="memory-batch-run-001",
+            project_id="GCS",
+            stage="FAST_EXTRACT",
+            result={
+                "config_digest": "a" * 64,
+                "status": "COMPLETED",
+                "candidate_ids": [],
+            },
+            input_digest="b" * 64,
+            output_digest="c" * 64,
+            now="2026-08-21T00:00:00Z",
+        )
+
+        cursors = self.server.store.list_semantic_collection_cursors("GCS")
+
+        self.assertEqual(1, len(cursors))
+        self.assertEqual("MEMORY_BATCH_FAST_EXTRACT", cursors[0]["source_kind"])
+        self.assertEqual("memory-batch-run-001", cursors[0]["last_event_id"])
+        self.assertEqual("c" * 64, cursors[0]["source_digest"])
+
     def test_semantic_graph_projects_cross_session_work_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         allocation, created = self.server.store.create_conductor_delegation(
