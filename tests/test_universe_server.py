@@ -9953,6 +9953,25 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 for operation in proposal["operations"]
             )
         )
+        graph = self.server.store.semantic_project_graph("GCS")
+        document_nodes = [
+            item
+            for item in graph["nodes"]
+            if item["entity_type"] == "DOCUMENT_AUTOMATION"
+        ]
+        self.assertEqual(1, len(document_nodes))
+        self.assertEqual(
+            proposal["proposal_id"], document_nodes[0]["data"]["proposal_id"]
+        )
+        self.assertEqual(
+            len(proposal["operations"]),
+            document_nodes[0]["data"]["operation_count"],
+        )
+        self.assertNotIn("source_path", document_nodes[0]["data"])
+        self.assertIn(
+            "PROJECT_HAS_DOCUMENT_AUTOMATION",
+            {item["edge_type"] for item in graph["edges"]},
+        )
         self.assertFalse((self.project_root / ".ai" / "universe").exists())
         reopened = UniverseStore(self.server.store.database_path)
         self.assertEqual(

@@ -14474,6 +14474,60 @@ class UniverseStore:
             )
             add_edge("PROJECT_HAS_PREDICTION", project_node, prediction_node, f"universe://work-loop/predictions/{proposal_id}")
 
+        # Document automation remains review-only, but it must be visible as a
+        # graph input alongside the other automatic work-loop outputs. Do not
+        # project source/target paths: they can disclose repository layout and
+        # are not needed for navigation or adoption decisions.
+        for proposal in self.list_document_incorporation_proposals(project_id):
+            proposal_id = str(proposal.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            operations = proposal.get("operations")
+            normalized_operations = (
+                [item for item in operations if isinstance(item, Mapping)]
+                if isinstance(operations, list)
+                else []
+            )
+            operations_by_kind: dict[str, int] = {}
+            roles: set[str] = set()
+            for operation in normalized_operations:
+                operation_kind = str(operation.get("operation") or "UNKNOWN")
+                operations_by_kind[operation_kind] = (
+                    operations_by_kind.get(operation_kind, 0) + 1
+                )
+                role = str(operation.get("role") or "")
+                if role:
+                    roles.add(role)
+            source_ref = f"universe://document-incorporation-proposals/{proposal_id}"
+            document_node = add_node(
+                "DOCUMENT_AUTOMATION",
+                proposal_id,
+                f"Document automation · {len(normalized_operations)} operation(s)",
+                str(proposal.get("status") or "INCORPORATION_PROPOSAL_READY"),
+                "DOCUMENT_INCORPORATION_PROPOSAL",
+                source_ref,
+                {
+                    key: proposal.get(key)
+                    for key in (
+                        "proposal_id", "projection_id", "projection_digest",
+                        "proposal_digest", "approval", "execution_owner",
+                        "next_operation", "created_at",
+                    )
+                    if proposal.get(key) is not None
+                }
+                | {
+                    "operation_count": len(normalized_operations),
+                    "operations_by_kind": operations_by_kind,
+                    "roles": sorted(roles),
+                },
+            )
+            add_edge(
+                "PROJECT_HAS_DOCUMENT_AUTOMATION",
+                project_node,
+                document_node,
+                source_ref,
+            )
+
         for memory in self.list_project_memories(project_id, limit=200):
             memory_id = str(memory.get("memory_id") or "")
             if not memory_id:
@@ -15820,6 +15874,31 @@ class UniverseStore:
             )
         proposal["created_at"] = now
         return proposal, True
+
+    def list_document_incorporation_proposals(
+        self, project_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return durable document-automation proposals without source content."""
+
+        project = self.get_project(project_id)
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM document_incorporation_proposal
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], bounded_limit),
+            ).fetchall()
+        proposals: list[dict[str, Any]] = []
+        for row in rows:
+            proposal = json.loads(row["proposal_json"])
+            proposal["created_at"] = row["created_at"]
+            proposals.append(proposal)
+        return proposals
 
     def import_release(self, value: Any) -> tuple[dict[str, Any], bool]:
         request = _exact_object_fields(
