@@ -18951,6 +18951,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except MultiRoomError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
+    def _record_task_frame_terminal_result(
+        self, task_frame_id: str, host_result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Append a redacted terminal result to the exact Task Frame lineage."""
+
+        try:
+            frame = self.task_frame_lineage.get_task_frame(task_frame_id)
+            result_ref = "task-frame-terminal:" + _json_sha256(
+                {
+                    "task_frame_id": task_frame_id,
+                    "status": host_result.get("status"),
+                    "boss_turn_id": host_result.get("boss_turn_id"),
+                }
+            )[:24]
+            child_results = host_result.get("child_results")
+            safe_children = [
+                {
+                    key: item.get(key)
+                    for key in ("turn_id", "status")
+                    if item.get(key) is not None
+                }
+                for item in child_results
+                if isinstance(item, Mapping)
+            ] if isinstance(child_results, list) else []
+            result, created = self.task_frame_lineage.attach_result(
+                result_ref=result_ref,
+                frame_ref=task_frame_id,
+                origin_session_anchor_ref=frame["origin_session_anchor_ref"],
+                result={
+                    "status": host_result.get("status"),
+                    "boss_turn_id": host_result.get("boss_turn_id"),
+                    "child_results": safe_children,
+                    "redaction_state": "SUMMARY_ONLY",
+                },
+            )
+            return {"result": result, "created": created}
+        except TaskFrameLineageError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
     def run_instruction_authorized_task_frame(
         self,
         project_id: str,
@@ -19012,6 +19051,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching instruction Task Frame completion receipt",
                 HTTPStatus.CONFLICT,
             )
+        task_frame_result = self._record_task_frame_terminal_result(frame_id, host_result)
         task_frame_room = self._complete_task_frame_room(
             project["project_id"], frame_id
         )
@@ -19022,6 +19062,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project["project_id"],
             "primary_proposal_id": primary_id,
             "task_frame": dict(host_result),
+            "task_frame_result": task_frame_result,
             "task_frame_room": task_frame_room,
         }
 
@@ -19120,6 +19161,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching Task Frame completion receipt",
                 HTTPStatus.CONFLICT,
             )
+        task_frame_result = self._record_task_frame_terminal_result(frame_id, host_result)
         task_frame_room = self._complete_task_frame_room(
             project["project_id"], frame_id
         )
@@ -19130,6 +19172,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project["project_id"],
             "primary_proposal_id": primary_id,
             "task_frame": dict(host_result),
+            "task_frame_result": task_frame_result,
             "task_frame_room": task_frame_room,
         }
 

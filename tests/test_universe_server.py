@@ -6723,6 +6723,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.OK, run_status)
         self.assertEqual("INSTRUCTION_TASK_FRAME_COMPLETED", run_result["status"])
+        self.assertTrue(run_result["task_frame_result"]["created"])
+        self.assertEqual(
+            1,
+            len(
+                self.server.task_frame_lineage.get_task_frame(
+                    "instruction-frame-001"
+                )["results"]
+            ),
+        )
         self.assertEqual("CLOSED", run_result["task_frame_room"]["room"]["state"])
         self.assertFalse(run_result["task_frame_room"]["user_may_write"])
         run_forwarded = (
