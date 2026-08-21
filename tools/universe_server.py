@@ -15270,6 +15270,40 @@ class UniverseStore:
                 event_data,
             )
             add_edge("PROJECT_HAS_EVENT", project_node, event_node, source_ref)
+            if (
+                event_type == "TEST_WORK_STATUS"
+                and isinstance(payload, Mapping)
+                and payload.get("successful") is False
+            ):
+                failure_node = add_node(
+                    "FAILURE_CANDIDATE",
+                    event_id,
+                    f"Failure candidate · {payload.get('tier') or 'UNKNOWN'} tests",
+                    "PROPOSAL_ONLY",
+                    "TEST_FAILURE_EXTRACTION",
+                    source_ref,
+                    {
+                        "event_id": event_id,
+                        "event_type": event_type,
+                        "payload_digest": event_data["payload_digest"],
+                        "tier": payload.get("tier"),
+                        "created_at": event.get("created_at"),
+                        "extraction_state": "AUTO_OBSERVED",
+                        "promotion_state": "USER_SELECTION_REQUIRED",
+                    },
+                )
+                add_edge(
+                    "TEST_RUN_DERIVES_FAILURE_CANDIDATE",
+                    event_node,
+                    failure_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_FAILURE_CANDIDATE",
+                    project_node,
+                    failure_node,
+                    source_ref,
+                )
             if event_type == "GIT_WORK_STATUS" and isinstance(payload, Mapping):
                 session_node = session_nodes_by_provider_digest.get(
                     str(payload.get("provider_session_digest") or "")

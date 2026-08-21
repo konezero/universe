@@ -2340,6 +2340,39 @@ class UniverseLocalServiceTests(unittest.TestCase):
             },
         )
 
+    def test_semantic_graph_derives_failure_candidate_from_failed_test_status(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.append_event(
+            "GCS",
+            {
+                "event_id": "test-work-status-failed-001",
+                "event_type": "TEST_WORK_STATUS",
+                "payload": {
+                    "schema": "universe.test-tier-result.v1",
+                    "source": "RUN_TEST_TIER",
+                    "tier": "changed",
+                    "successful": False,
+                    "tests_run": 3,
+                    "failure_output": "private test output must stay out of graph",
+                },
+            },
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        candidates = [
+            item for item in graph["nodes"]
+            if item["entity_type"] == "FAILURE_CANDIDATE"
+        ]
+        self.assertEqual(1, len(candidates))
+        candidate = candidates[0]
+        self.assertEqual("USER_SELECTION_REQUIRED", candidate["data"]["promotion_state"])
+        self.assertNotIn("failure_output", candidate["data"])
+        self.assertNotIn("private test output", json.dumps(graph))
+        self.assertIn(
+            "TEST_RUN_DERIVES_FAILURE_CANDIDATE",
+            {item["edge_type"] for item in graph["edges"]},
+        )
+
     def test_memory_batch_completion_advances_semantic_collection_cursor(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.server.store.persist_memory_batch_result(
