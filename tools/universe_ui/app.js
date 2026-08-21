@@ -4682,16 +4682,14 @@ function pendingActionItems() {
     };
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    const delegations = state.conductorDelegations || [];
-    const activeStates = ["QUEUED", "RUNNING", "CANCELLATION_REQUESTED"];
     return {
       permissions: (state.conductorPermissions || []).filter(
         (item) => item.state === "PENDING"
       ),
-      delegations: delegations.filter((item) => activeStates.includes(item.state)),
-      history: delegations
-        .filter((item) => !activeStates.includes(item.state))
-        .slice(0, 20),
+      // Cross-session delivery is internal automation state.  A user chats
+      // with the selected Session Card; it is not a generic work queue.
+      delegations: [],
+      history: [],
       activities: [],
     };
   }
