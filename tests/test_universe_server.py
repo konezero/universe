@@ -1267,6 +1267,42 @@ class UniverseLocalServiceTests(unittest.TestCase):
             }.issubset(edge_types)
         )
 
+    def test_project_master_git_trace_status_becomes_redacted_graph_input(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        completion = {
+            "status": "COMPLETED",
+            "project_id": "GCS",
+            "message_id": "master-message-git-001",
+            "provider_session_ref": "codex-app-server:vendor-secret-ref",
+            "work_statuses": [
+                {
+                    "schema": "universe.git-trace2-work-status.v1",
+                    "source": "GIT_TRACE2",
+                    "operation": "PUSH",
+                    "state": "COMPLETED",
+                    "exit_code": 0,
+                    "commit_sha": "b" * 40,
+                    "commit_message": "must be ignored",
+                    "changed_files": ["must-not-appear.txt"],
+                }
+            ],
+        }
+
+        self.server._observe_project_master_completion(completion)
+        self.server._observe_project_master_completion(completion)
+
+        events = self.server.store.list_events("GCS")
+        git_events = [item for item in events if item["event_type"] == "GIT_WORK_STATUS"]
+        self.assertEqual(1, len(git_events))
+        payload = git_events[0]["payload"]
+        self.assertEqual("REDACTED", payload["redaction_state"])
+        self.assertEqual("PUSH", payload["operation"])
+        self.assertNotIn("commit_message", payload)
+        self.assertNotIn("changed_files", payload)
+        self.assertNotEqual(
+            completion["provider_session_ref"], payload["provider_session_digest"]
+        )
+
     def test_todo_cannot_bind_to_a_goal_from_another_project(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration())
         _, goal_result = self.request(

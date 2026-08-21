@@ -23266,8 +23266,61 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # A missing/old room message must not turn a completed provider turn
             # into an error or invent a Todo linkage.
             pass
+        self._record_project_master_work_statuses(event)
         self._resolve_project_master_delegation(event)
         self.publish_project_room_changed(project_id)
+
+    def _record_project_master_work_statuses(self, event: Mapping[str, Any]) -> None:
+        """Persist redacted provider Git milestones as idempotent graph inputs."""
+
+        project_id = str(event.get("project_id") or "").strip()
+        message_id = str(event.get("message_id") or "").strip()
+        provider_session_ref = str(event.get("provider_session_ref") or "").strip()
+        raw_statuses = event.get("work_statuses")
+        if not project_id or not message_id or not isinstance(raw_statuses, list):
+            return
+        session_digest = _json_sha256(provider_session_ref) if provider_session_ref else "UNKNOWN"
+        for raw in raw_statuses:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("schema") or "") != "universe.git-trace2-work-status.v1":
+                continue
+            operation = str(raw.get("operation") or "").upper()
+            state = str(raw.get("state") or "").upper()
+            exit_code = raw.get("exit_code")
+            if operation not in {"COMMIT", "PUSH"} or state not in {"COMPLETED", "FAILED"}:
+                continue
+            if not isinstance(exit_code, int):
+                continue
+            payload: dict[str, Any] = {
+                "schema": "universe.git-work-observation.v1",
+                "source": "GIT_TRACE2",
+                "message_id": message_id,
+                "provider_session_digest": session_digest,
+                "operation": operation,
+                "state": state,
+                "exit_code": exit_code,
+                "redaction_state": "REDACTED",
+            }
+            for key in ("commit_sha", "short_sha", "branch", "remote"):
+                value = raw.get(key)
+                if isinstance(value, str) and value.strip():
+                    payload[key] = value.strip()
+            event_id = "git_work_" + _json_sha256(
+                {"project_id": project_id, **payload}
+            )[:24]
+            try:
+                self.store.append_event(
+                    project_id,
+                    {
+                        "event_id": event_id,
+                        "event_type": "GIT_WORK_STATUS",
+                        "payload": payload,
+                    },
+                )
+            except UniverseError:
+                # A stale project connection must not perturb the provider turn.
+                continue
 
     def _resolve_project_master_delegation(
         self, event: Mapping[str, Any]

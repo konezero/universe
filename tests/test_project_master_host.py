@@ -1926,6 +1926,51 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         self.assertEqual(retrieval, self.provider.messages[0]["retrieval_context"])
 
+    def test_project_master_completion_redacts_git_trace_statuses(self) -> None:
+        completions: list[dict[str, Any]] = []
+        self.provider.drain_work_statuses = lambda: [
+            {
+                "schema": "universe.git-trace2-work-status.v1",
+                "source": "GIT_TRACE2",
+                "operation": "COMMIT",
+                "state": "COMPLETED",
+                "exit_code": 0,
+                "commit_sha": "a" * 40,
+                "commit_message": "do not persist this",
+                "changed_files": ["secret-path.txt"],
+            }
+        ]
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            completion_observer=lambda event: completions.append(dict(event)),
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(1, len(completions))
+        self.assertEqual(
+            [{
+                "schema": "universe.git-trace2-work-status.v1",
+                "source": "GIT_TRACE2",
+                "operation": "COMMIT",
+                "state": "COMPLETED",
+                "exit_code": 0,
+                "commit_sha": "a" * 40,
+            }],
+            completions[0]["work_statuses"],
+        )
+
     def test_native_room_event_sends_only_incremental_input_and_observes_output(
         self,
     ) -> None:

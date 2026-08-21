@@ -5923,6 +5923,7 @@ class ProjectMasterConversationWorker:
                     "message_id": message_id,
                     "provider_session_ref": self.provider.session_ref,
                     "runtime_context": provider_message.get("runtime_context", {}),
+                    "work_statuses": self._drain_work_statuses(),
                 }
                 self._last_completion = completion
                 self._last_completion_at = time.monotonic()
@@ -5931,6 +5932,45 @@ class ProjectMasterConversationWorker:
                 pass
         self._active_bridge_id = ""
         self._active_message_id = ""
+
+    def _drain_work_statuses(self) -> list[dict[str, Any]]:
+        """Return only redacted Git Trace2 milestones from the provider host."""
+
+        reader = getattr(self.provider, "drain_work_statuses", None)
+        if not callable(reader):
+            return []
+        try:
+            raw_statuses = reader()
+        except Exception:
+            return []
+        if not isinstance(raw_statuses, list):
+            return []
+        statuses: list[dict[str, Any]] = []
+        for raw in raw_statuses:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("schema") or "") != "universe.git-trace2-work-status.v1":
+                continue
+            operation = str(raw.get("operation") or "").upper()
+            state = str(raw.get("state") or "").upper()
+            exit_code = raw.get("exit_code")
+            if operation not in {"COMMIT", "PUSH"} or state not in {"COMPLETED", "FAILED"}:
+                continue
+            if not isinstance(exit_code, int):
+                continue
+            status = {
+                "schema": "universe.git-trace2-work-status.v1",
+                "source": "GIT_TRACE2",
+                "operation": operation,
+                "state": state,
+                "exit_code": exit_code,
+            }
+            for key in ("commit_sha", "short_sha", "branch", "remote"):
+                value = raw.get(key)
+                if isinstance(value, str) and value.strip():
+                    status[key] = value.strip()
+            statuses.append(status)
+        return statuses
 
     def _process_room_event(self, job: Mapping[str, Any]) -> None:
         binding = job["binding"]
