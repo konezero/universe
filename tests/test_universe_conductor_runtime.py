@@ -60,25 +60,27 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             ):
                 runtime._resolved_source_binding()
 
-    def test_prepare_without_mode_boot_binding_fails_before_process_start(self) -> None:
-        prepared = {
-            "status": "SESSION_PREPARED",
-            "mode_current_anchor": {
-                "status": "MODE_CURRENT_ANCHOR_CREATED",
-                "snapshot": {
-                    "snapshot": {"anchor_id": "UNIVERSE-CURRENT-001"}
+    def test_start_requires_supervised_conductor_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+            runtime_cli.parent.mkdir(parents=True)
+            runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
+            runtime = UniverseConductorRuntime(
+                root,
+                source_binding_resolver=lambda _root: {
+                    "status": "SELECTED",
+                    "release_id": "core-test",
+                    "source_repository": "fixture/universe-private",
+                    "source_commit": "b" * 40,
+                    "database_sha256": "c" * 64,
                 },
-            },
-        }
-
-        anchor_id = UniverseConductorRuntime._prepared_anchor_id(prepared)
-        with self.assertRaisesRegex(
-            RuntimeError, "UNIVERSE_MODE_BOOT_BINDING_UNAVAILABLE"
-        ):
-            UniverseConductorRuntime._prepared_mode_boot_binding(
-                prepared,
-                anchor_id=anchor_id,
             )
+        with self.assertRaisesRegex(
+            UniverseConductorRuntimeError,
+            "UNIVERSE_CONDUCTOR_SESSION_ANCHOR_UNAVAILABLE",
+        ):
+            runtime.start()
 
     def test_start_prepares_conductor_mode_and_owns_session_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -86,63 +88,11 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
             runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
             runtime_cli.parent.mkdir(parents=True)
             runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
-            registry = (
-                root / ".ai" / "runtime" / "project_instance" / "mode_registry.json"
-            )
-            registry.parent.mkdir(parents=True)
-            registry.write_text(
-                json.dumps(
-                    {
-                        "modes": {
-                            "CONDUCTOR": {
-                                "role": "CONDUCTOR",
-                                "scope": "project-network/navigation/distribution",
-                                "mode_profile": "GOVERNANCE_ONLY",
-                            }
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-
             requests: list[dict[str, Any]] = []
 
             def native_runner(request: Any) -> NativeCliResult:
-                request_path = Path(request.arguments[-1])
-                requests.append(json.loads(request_path.read_text(encoding="utf-8")))
-                payload = (
-                    {
-                        "status": "SESSION_PREPARED",
-                        "mode_current_anchor": {
-                            "status": "MODE_CURRENT_ANCHOR_CREATED",
-                            "snapshot": {
-                                "snapshot": {
-                                    "anchor_id": "UNIVERSE-CURRENT-001"
-                                }
-                            },
-                        },
-                        "mode_boot_binding": {
-                            "status": "PREPARED",
-                            "binding_id": "mode-boot-conductor-001",
-                            "mode": "CONDUCTOR",
-                            "role": "CONDUCTOR",
-                            "frame_id": "current",
-                            "anchor_id": "UNIVERSE-CURRENT-001",
-                        },
-                    }
-                    if len(requests) == 1
-                    else {"status": "COMMANDER_INPUT_OBSERVED"}
-                )
-                return NativeCliResult(
-                    contract="universe.windows-native-cli.v1",
-                    status="COMPLETED",
-                    return_code=0,
-                    duration_ms=1,
-                    stdout=json.dumps(payload),
-                    stderr="",
-                    stdout_truncated=False,
-                    stderr_truncated=False,
-                )
+                del request
+                raise AssertionError("Anchor Graph runtime must not invoke Runtime Boot")
 
             process: FakeProcess | None = None
 
@@ -150,6 +100,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 nonlocal process
                 token = command[command.index("--token") + 1]
                 session_id = command[command.index("--session-id") + 1]
+                anchor_id = command[command.index("--anchor-id") + 1]
                 process = FakeProcess(
                     {
                         "status": "PERSISTENT_SESSION_ATTACHED",
@@ -158,16 +109,13 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                             "token": token,
                         },
                         "runtime_state": {
-                            "anchor_id": "UNIVERSE-CURRENT-001",
+                            "anchor_id": anchor_id,
                             "mode": "CONDUCTOR",
-                            "role": "CONDUCTOR",
+                            "role": "UNASSIGNED",
                             "session_id": session_id,
                             "executable_runtime_currentness": "CURRENT",
                         },
-                        "mode_boot_binding": {
-                            "status": "ACTIVE",
-                            "binding_id": "mode-boot-conductor-001",
-                        },
+                        "attachment_path": "ANCHOR_GRAPH",
                     }
                 )
                 process.command = list(command)
@@ -202,6 +150,8 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                     "mode": "CONDUCTOR",
                     "provider": "CODEX",
                     "provider_session_ref": "codex-session",
+                    "anchor_ref": "CONDUCTOR-CURRENT-001",
+                    "currentness": "CURRENT",
                 }
             )
             supervisor.set_default(
@@ -226,7 +176,7 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 binding = runtime.start()
                 observed = runtime.observe("message-001")
 
-            self.assertEqual("UNIVERSE-CURRENT-001", binding["origin_anchor_ref"])
+            self.assertEqual(session["session_anchor_ref"], binding["origin_anchor_ref"])
             self.assertEqual(
                 "CURRENT", binding["runtime_currentness_observation"]
             )
@@ -240,20 +190,11 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                 "fixture/universe-private", binding["source_repository"]
             )
             self.assertEqual("COMMANDER_INPUT_OBSERVED", observed["status"])
-            self.assertEqual("CONDUCTOR", requests[0]["mode"])
-            self.assertEqual("CONDUCTOR", requests[0]["role"])
-            self.assertEqual(
-                f"universe-release-db://core-test@{'c' * 64}",
-                requests[0]["source_ref"],
-            )
-            self.assertEqual("b" * 40, requests[0]["source_commit"])
-            self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
+            self.assertEqual([], requests)
             self.assertIn("project-runtime", process.command)
             self.assertNotIn("session-boot", process.command)
-            self.assertEqual(
-                "mode-boot-conductor-001",
-                process.command[process.command.index("--boot-binding-id") + 1],
-            )
+            self.assertNotIn("--boot-binding-id", process.command)
+            self.assertEqual("CONDUCTOR", process.command[process.command.index("--mode") + 1])
             self.assertEqual(
                 "current",
                 process.command[process.command.index("--frame-id") + 1],
