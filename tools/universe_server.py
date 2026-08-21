@@ -20876,6 +20876,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     frame_node,
                     f"session_anchor:{target_ref}",
                 )
+            for result in frame.get("results") or []:
+                result_ref = str(result.get("result_ref") or "")
+                if not result_ref:
+                    continue
+                result_node = f"task_frame_result:{result_ref}"
+                add_node(
+                    result_node,
+                    "TASK_FRAME_RESULT",
+                    f"Result · {result_ref}",
+                    ref=result_ref,
+                    frame_ref=frame_ref,
+                    origin_session_anchor_ref=result.get(
+                        "origin_session_anchor_ref"
+                    ),
+                    result_digest=result.get("result_digest"),
+                    attached_at=result.get("attached_at"),
+                    result_in_graph=False,
+                    source_ref=(
+                        f"universe://task-frame-lineage/{frame_ref}/results/{result_ref}"
+                    ),
+                )
+                add_edge("TASK_FRAME_HAS_RESULT", frame_node, result_node)
+                result_origin = str(result.get("origin_session_anchor_ref") or "")
+                if result_origin in included_session_refs:
+                    add_edge(
+                        "TASK_FRAME_RESULT_ORIGINATES_FROM_SESSION",
+                        result_node,
+                        f"session_anchor:{result_origin}",
+                    )
 
         return {
             "schema": "universe.session-graph-projection.v1",

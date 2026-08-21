@@ -2225,6 +2225,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             origin_session_anchor_ref=first["session_anchor_ref"],
             target_session_anchor_ref=second["session_anchor_ref"],
         )
+        self.server.task_frame_lineage.attach_result(
+            result_ref="task-frame-session-graph-result",
+            frame_ref="task-frame-session-graph",
+            origin_session_anchor_ref=first["session_anchor_ref"],
+            result={"text": "private provider output must not enter the graph"},
+        )
 
         status, response = self.request(
             "GET", "/v1/session-graph?project_id=GCS", None, self.token
@@ -2238,10 +2244,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, node_types.count("MODE_ANCHOR"))
         self.assertEqual(2, node_types.count("SESSION_ANCHOR"))
         self.assertEqual(1, node_types.count("TASK_FRAME"))
+        self.assertEqual(1, node_types.count("TASK_FRAME_RESULT"))
+        result_node = next(
+            item for item in graph["nodes"]
+            if item["entity_type"] == "TASK_FRAME_RESULT"
+        )
+        self.assertFalse(result_node["result_in_graph"])
+        self.assertNotIn("private provider output", json.dumps(graph))
         edge_types = {item["edge_type"] for item in graph["edges"]}
         self.assertIn("MODE_ANCHOR_HAS_SESSION_ANCHOR", edge_types)
         self.assertIn("SESSION_ANCHOR_HAS_TASK_FRAME", edge_types)
         self.assertIn("TASK_FRAME_TARGETS_SESSION", edge_types)
+        self.assertIn("TASK_FRAME_HAS_RESULT", edge_types)
+        self.assertIn("TASK_FRAME_RESULT_ORIGINATES_FROM_SESSION", edge_types)
 
     def test_semantic_graph_projects_task_frame_lineage_without_result_payload(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
