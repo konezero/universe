@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import sys
 import time
 import unittest
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib import request as urlrequest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +22,32 @@ DEFAULT_MANIFEST = ROOT / "tests" / "test_tiers.json"
 
 class TierError(ValueError):
     pass
+
+
+def publish_test_observation(result: dict[str, Any]) -> None:
+    """Best-effort automatic Project event when a runner has local routing."""
+    project_id = os.environ.get("UNIVERSE_PROJECT_ID", "").strip()
+    endpoint = os.environ.get("UNIVERSE_ENDPOINT", "").strip().rstrip("/")
+    token = os.environ.get("UNIVERSE_TOKEN", "").strip()
+    if not project_id or not endpoint or not token:
+        return
+    payload = {
+        "event_id": "test_run_" + uuid.uuid4().hex[:24],
+        "event_type": "TEST_WORK_STATUS",
+        "payload": {**result, "source": "RUN_TEST_TIER", "redaction_state": "SUMMARY_ONLY"},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urlrequest.Request(
+        f"{endpoint}/v1/projects/{project_id}/events",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=2):
+            pass
+    except OSError:
+        return
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -98,16 +127,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         elapsed = time.monotonic() - started
         target = manifest["tiers"][args.tier].get("target_seconds")
+        result_payload = {
+            "schema": "universe.test-tier-result.v1",
+            "tier": args.tier,
+            "successful": result.wasSuccessful(),
+            "tests_run": result.testsRun,
+            "elapsed_seconds": round(elapsed, 3),
+            "target_seconds": target,
+        }
+        publish_test_observation(result_payload)
         print(
             json.dumps(
-                {
-                    "schema": "universe.test-tier-result.v1",
-                    "tier": args.tier,
-                    "successful": result.wasSuccessful(),
-                    "tests_run": result.testsRun,
-                    "elapsed_seconds": round(elapsed, 3),
-                    "target_seconds": target,
-                },
+                result_payload,
                 separators=(",", ":"),
                 sort_keys=True,
             )

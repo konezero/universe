@@ -14674,6 +14674,14 @@ class UniverseStore:
                         if payload.get(key) is not None
                     }
                 )
+            elif event_type == "TEST_WORK_STATUS" and isinstance(payload, Mapping):
+                entity_type = "TEST_RUN"
+                state = "PASSED" if payload.get("successful") is True else "FAILED"
+                label = f"Tests · {payload.get('tier') or 'UNKNOWN'} · {state}"
+                event_data.update({key: payload.get(key) for key in (
+                    "source", "tier", "successful", "tests_run", "elapsed_seconds",
+                    "target_seconds", "redaction_state",
+                ) if payload.get(key) is not None})
             event_node = add_node(
                 entity_type, event_id, label,
                 "OBSERVED", "PROJECT_EVENT", source_ref,
