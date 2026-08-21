@@ -1158,6 +1158,45 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("GOAL_REVISION_CONFLICT", conflict["error_code"])
 
+    def test_semantic_project_graph_projects_room_anchor_bindings(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.ensure_project_room("GCS")
+        attached = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-vendor-thread-graph",
+                "supervisor_session_id": "session-graph-master",
+                "session_anchor_ref": "session_anchor_graph_master",
+                "display_name": "GCS Master",
+                "participant_state": "ATTACHED",
+            },
+        )
+        binding = attached["binding"]
+
+        status, semantic = self.request(
+            "GET", "/v1/projects/GCS/semantic-graph", None, self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        node_ids = {item["id"] for item in semantic["nodes"]}
+        self.assertTrue(
+            {
+                f"chat_room:{room['room_id']}",
+                f"room_binding:{binding['binding_id']}",
+                "session_anchor:session_anchor_graph_master",
+            }.issubset(node_ids)
+        )
+        edge_types = {item["edge_type"] for item in semantic["edges"]}
+        self.assertTrue(
+            {
+                "PROJECT_HAS_CHAT_ROOM",
+                "CHAT_ROOM_HAS_BINDING",
+                "ROOM_BINDING_REFS_SESSION_ANCHOR",
+            }.issubset(edge_types)
+        )
+
     def test_todo_cannot_bind_to_a_goal_from_another_project(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration())
         _, goal_result = self.request(

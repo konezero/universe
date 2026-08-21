@@ -4476,6 +4476,10 @@ class UniverseStore:
         self.provider_session_observer = ProviderSessionObserverStore(
             self.database_path
         )
+        # The semantic graph is a UniverseStore projection, so its durable
+        # multi-room source must live beside the other project stores.  The
+        # HTTP server reuses this instance for its event/control surface.
+        self.multi_rooms = MultiRoomStore(str(self.database_path))
         self.memory_batch_execution_service = MemoryBatchExecutionService(self)
 
     def _connect(self) -> sqlite3.Connection:
@@ -14330,6 +14334,61 @@ class UniverseStore:
                         f"universe://memory-candidates/{candidate_id}",
                     )
 
+        # Rooms are a separate conversation plane from the legacy Project Room
+        # message feed below.  Project the durable room/binding records here so
+        # graph consumers can navigate the exact session-anchor relationship
+        # without treating a provider transcript or queue item as a session.
+        for room in self.multi_rooms.list_rooms(project_id=project_id):
+            room_id = str(room.get("room_id") or "")
+            if not room_id:
+                continue
+            source_ref = f"universe://chat-rooms/{room_id}"
+            room_node = add_node(
+                "CHAT_ROOM", room_id,
+                str(room.get("title") or room_id),
+                str(room.get("state") or "OPEN"),
+                "MULTI_ROOM", source_ref,
+                {
+                    key: room.get(key)
+                    for key in (
+                        "room_id", "room_type", "project_id", "task_frame_id",
+                        "host_role", "participant_count", "created_at", "updated_at",
+                    )
+                    if room.get(key) is not None
+                },
+            )
+            add_edge("PROJECT_HAS_CHAT_ROOM", project_node, room_node, source_ref)
+            for binding in self.multi_rooms.list_bindings(room_id):
+                binding_id = str(binding.get("binding_id") or "")
+                if not binding_id:
+                    continue
+                binding_node = add_node(
+                    "ROOM_BINDING", binding_id,
+                    str(binding.get("display_name") or binding.get("slot_role") or binding_id),
+                    str(binding.get("state") or "UNKNOWN"),
+                    "MULTI_ROOM_BINDING", f"{source_ref}/bindings/{binding_id}",
+                    {
+                        key: binding.get(key)
+                        for key in (
+                            "binding_id", "slot_role", "provider", "supervisor_session_id",
+                            "session_anchor_ref", "participant_state", "created_at", "updated_at",
+                        )
+                        if binding.get(key) is not None
+                    },
+                )
+                add_edge("CHAT_ROOM_HAS_BINDING", room_node, binding_node, source_ref)
+                anchor_ref = str(binding.get("session_anchor_ref") or "")
+                if anchor_ref:
+                    anchor_node = add_node(
+                        "SESSION_ANCHOR", anchor_ref, f"Session Anchor · {anchor_ref}",
+                        "OBSERVED", "ROOM_SESSION_ANCHOR", source_ref,
+                        {"session_anchor_ref": anchor_ref},
+                    )
+                    add_edge(
+                        "ROOM_BINDING_REFS_SESSION_ANCHOR", binding_node, anchor_node,
+                        source_ref,
+                    )
+
         room_message_nodes: dict[str, str] = {}
         room_message_parents: list[tuple[str, str]] = []
         for message in self.list_room_messages(project_id, limit=200):
@@ -17428,7 +17487,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.project_room_events = ProjectRoomEventHub()
         self._project_master_stream_lock = threading.RLock()
         self._active_project_master_streams: dict[str, dict[str, Any]] = {}
-        self.multi_rooms = MultiRoomStore(str(store.database_path))
+        self.multi_rooms = store.multi_rooms
         self.multi_room_native_controls = MultiRoomNativeControlRegistry(
             self.multi_rooms
         )
