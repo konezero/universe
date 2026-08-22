@@ -4473,10 +4473,12 @@ async function selectProject(
   state.memoryCandidates = memoryCandidateResult.candidates || [];
   state.workLoop = workLoopResult || null;
   state.semanticGraph = semanticGraphResult || null;
+  const universeGoalResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
   const goalPlanResult = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
   ).catch(() => ({ goals: [], unassigned_todos: [] }));
   state.goals = goalPlanResult.goals || [];
+  state.universeGoals = universeGoalResult.goals || [];
   state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
     (todo) => todo.state !== "DONE"
   );
@@ -10246,6 +10248,7 @@ function goalProgress(goal) {
 async function refreshGoalPlan() {
   if (!state.selectedProject) {
     state.goals = [];
+    state.universeGoals = [];
     state.unassignedTodos = [];
     renderGoalPlan();
     return;
@@ -10253,7 +10256,9 @@ async function refreshGoalPlan() {
   const result = await api(
     `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`
   );
+  const universeResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
   state.goals = result.goals || [];
+  state.universeGoals = universeResult.goals || [];
   state.unassignedTodos = (result.unassigned_todos || []).filter(
     (todo) => todo.state !== "DONE"
   );
@@ -10265,12 +10270,75 @@ async function refreshGoalPlan() {
 
 function planTodoRow(todo) {
   const row = node("article", "plan-todo-row");
+  const priority = todoSelect(
+    [["P0", "P0"], ["P1", "P1"], ["P2", "P2"], ["P3", "P3"]],
+    todo.priority,
+    "plan-todo-priority"
+  );
+  priority.title = "Change priority";
+  priority.addEventListener("change", async () => {
+    await updateTodo(todo, { ...todo, priority: priority.value });
+    await refreshGoalPlan();
+  });
+  const recommendation = todo.priority_recommendation || null;
+  const suggested = recommendation && recommendation.priority !== todo.priority
+    ? node("button", "secondary-button compact", `Use ${recommendation.priority}`)
+    : null;
+  if (suggested) {
+    suggested.type = "button";
+    suggested.title = `${recommendation.method}: ${(recommendation.reasons || []).join(", ")}`;
+    suggested.addEventListener("click", async () => {
+      await updateTodo(todo, { ...todo, priority: recommendation.priority });
+      await refreshGoalPlan();
+    });
+  }
   row.append(
     node("span", `todo-priority ${String(todo.priority).toLowerCase()}`, todo.priority),
     node("span", "plan-todo-title", todo.title),
-    node("span", `plan-state ${String(todo.state).toLowerCase()}`, planStateLabel(todo.state))
+    node("span", `plan-state ${String(todo.state).toLowerCase()}`, planStateLabel(todo.state)),
+    priority
   );
+  if (suggested) row.append(suggested);
   return row;
+}
+
+function renderUniverseGoalCard(goal) {
+  const card = node("article", "goal-card universe-goal-card");
+  const header = node("header", "goal-card-header");
+  header.append(
+    node("span", "goal-index", "U"),
+    node("h2", "", goal.title),
+    node("span", `plan-state ${String(goal.state).toLowerCase()}`, planStateLabel(goal.state))
+  );
+  card.append(header, node("p", "goal-card-description", goal.description || "No global outcome yet."));
+  const linked = node("div", "milestone-list");
+  for (const todo of goal.todos || []) linked.append(planTodoRow(todo));
+  for (const projectGoal of goal.project_goals || []) {
+    const item = node("div", "milestone-block");
+    item.append(
+      node("strong", "", `${projectGoal.project_id} — ${projectGoal.title}`),
+      node("span", `plan-state ${String(projectGoal.state).toLowerCase()}`, planStateLabel(projectGoal.state))
+    );
+    linked.append(item);
+  }
+  const globalCandidates = (state.todos || []).filter(
+    (todo) => todo.scope_kind === "UNIVERSE" && !todo.universe_goal_id && todo.state !== "DONE"
+  );
+  if (globalCandidates.length) {
+    const assign = node("select", "goal-assign-select");
+    assign.append(new Option("Attach global Todo...", ""));
+    for (const todo of globalCandidates) assign.append(new Option(todo.title, todo.todo_id));
+    assign.addEventListener("change", async () => {
+      const todo = globalCandidates.find((item) => item.todo_id === assign.value);
+      if (!todo) return;
+      await updateTodo(todo, { ...todo, universe_goal_id: goal.universe_goal_id });
+      await refreshGoalPlan();
+    });
+    linked.append(assign);
+  }
+  if (!linked.childElementCount) linked.append(node("small", "empty-copy", "Connect global or project work to this goal."));
+  card.append(linked);
+  return card;
 }
 
 function renderGoalInspector(goal, index) {
@@ -10341,6 +10409,10 @@ function openGoalEditor(goal) {
   elements.goalForm.elements.description.value = goal.description || "";
   elements.goalForm.elements.owner.value = goal.owner || "Project Master";
   elements.goalForm.elements.state.value = goal.state || "DESIGNING";
+  prepareGoalHierarchyFields({
+    scopeKind: "PROJECT",
+    universeGoalId: goal.universe_goal_id || "",
+  });
   elements.goalDialog.querySelector("h2").textContent = "Edit goal";
   elements.goalDialog.querySelector('[type="submit"]').textContent = "Save goal";
   elements.goalDialog.showModal();
@@ -10359,7 +10431,7 @@ function renderGoalPlan() {
       : "Project > Goal Plan";
   }
   elements.goalPlanSubtitle.textContent = project
-    ? "Goal -> Milestone / Phase -> Todo"
+    ? "Universe Goal -> Project Goal -> Milestone / Phase -> Todo"
     : "Select a project to shape its delivery plan.";
   elements.addGoalButton.disabled = !project;
   const todos = state.goals.flatMap((goal) => [
@@ -10387,7 +10459,12 @@ function renderGoalPlan() {
   elements.goalPlanList.replaceChildren();
   if (!project) {
     elements.goalPlanList.append(node("div", "goal-plan-empty", "Choose a project to begin planning."));
-  } else if (!state.goals.length) {
+  } else {
+    for (const universeGoal of state.universeGoals || []) {
+      elements.goalPlanList.append(renderUniverseGoalCard(universeGoal));
+    }
+  }
+  if (project && !state.goals.length) {
     const empty = node("div", "goal-plan-empty");
     empty.append(
       node("strong", "", "No goals yet"),
@@ -10619,6 +10696,7 @@ async function updateTodo(todo, changes) {
     scope_kind: todo.scope_kind,
     project_id: todo.project_id,
     node_ref: todo.node_ref,
+    universe_goal_id: changes.universe_goal_id ?? todo.universe_goal_id ?? null,
     title: changes.title.trim(),
     detail: changes.detail,
     priority: changes.priority,
@@ -10631,6 +10709,7 @@ async function updateTodo(todo, changes) {
   };
   if (body.project_id === null) delete body.project_id;
   if (body.node_ref === null) delete body.node_ref;
+  if (body.universe_goal_id === null) delete body.universe_goal_id;
   try {
     const result = await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}`, {
       method: "PATCH",
@@ -11093,7 +11172,7 @@ async function loadFreshProjectPlanningOptions() {
   } else if (!available) {
     elements.planningRunStatus.textContent =
       "No planning provider is currently available.";
-  } else {
+  } else if (project) {
     elements.planningRunStatus.textContent =
       "Ready to create a proposal. No model has been called.";
   }
@@ -13069,6 +13148,20 @@ function syncConductorSummaryToggle(collapsed) {
   elements.conductorSummaryToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
 }
 
+function prepareGoalHierarchyFields({ scopeKind = "UNIVERSE", universeGoalId = "" } = {}) {
+  const form = elements.goalForm;
+  if (!form) return;
+  const scope = form.elements.scope_kind;
+  const parent = form.elements.universe_goal_id;
+  scope.value = scopeKind;
+  parent.replaceChildren(new Option("No global parent", ""));
+  for (const goal of state.universeGoals || []) {
+    parent.append(new Option(goal.title, goal.universe_goal_id));
+  }
+  parent.value = universeGoalId || "";
+  parent.disabled = scopeKind === "UNIVERSE";
+}
+
 function bindGoalPlanEvents() {
   elements.addGoalButton?.addEventListener("click", () => {
     if (!state.selectedProject) return;
@@ -13077,8 +13170,15 @@ function bindGoalPlanEvents() {
     elements.goalDialog.querySelector("h2").textContent = "New goal";
     elements.goalDialog.querySelector('[type="submit"]').textContent = "Create goal";
     elements.goalForm.elements.owner.value = "Project Master";
+    prepareGoalHierarchyFields({ scopeKind: "UNIVERSE" });
     elements.goalFormError.textContent = "";
     elements.goalDialog.showModal();
+  });
+  elements.goalForm?.elements.scope_kind?.addEventListener("change", () => {
+    prepareGoalHierarchyFields({
+      scopeKind: elements.goalForm.elements.scope_kind.value,
+      universeGoalId: elements.goalForm.elements.universe_goal_id.value,
+    });
   });
   if (elements.conversationExpand) {
     let parent = elements.conversationLayer.parentElement;
@@ -13159,8 +13259,14 @@ function bindGoalPlanEvents() {
     const data = new FormData(elements.goalForm);
     try {
       const goalId = elements.goalForm.dataset.goalId;
+      const scopeKind = String(data.get("scope_kind") || "UNIVERSE");
+      const globalGoal = scopeKind === "UNIVERSE";
+      if (goalId && globalGoal) throw new Error("Existing project goals stay in the selected project scope.");
+      const parentGoalId = String(data.get("universe_goal_id") || "");
       await api(
-        goalId
+        globalGoal
+          ? "/v1/universe-goals"
+          : goalId
           ? `/v1/goals/${encodeURIComponent(goalId)}`
           : `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`, {
         method: goalId ? "PATCH" : "POST",
@@ -13169,9 +13275,12 @@ function bindGoalPlanEvents() {
           description: String(data.get("description") || "").trim(),
           owner: String(data.get("owner") || "").trim(),
           state: String(data.get("state") || "DESIGNING"),
-          sort_order: goalId
+          sort_order: globalGoal
+            ? (state.universeGoals || []).length
+            : goalId
             ? state.goals.find((goal) => goal.goal_id === goalId)?.sort_order || 0
             : state.goals.length,
+          ...(!globalGoal && parentGoalId ? { universe_goal_id: parentGoalId } : {}),
           ...(goalId ? { revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision } : {}),
         },
       });

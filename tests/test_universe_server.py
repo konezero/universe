@@ -1158,6 +1158,95 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("GOAL_REVISION_CONFLICT", conflict["error_code"])
 
+    def test_universe_goal_connects_project_goal_and_auto_prioritizes_global_work(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+        status, root_result = self.request(
+            "POST",
+            "/v1/universe-goals",
+            {
+                "title": "Keep the semantic work spine current",
+                "description": "Connect global automation to project delivery.",
+                "owner": "Universe Master",
+                "state": "ACTIVE",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status, root_result)
+        root = root_result["goal"]
+
+        status, project_result = self.request(
+            "POST",
+            "/v1/projects/GCS/goals",
+            {
+                "title": "Apply the work spine to GCS",
+                "description": "Project delivery stays connected to the global outcome.",
+                "owner": "GCS Master",
+                "state": "READY",
+                "sort_order": 0,
+                "universe_goal_id": root["universe_goal_id"],
+            },
+        )
+        self.assertEqual(201, status, project_result)
+
+        status, todo_result = self.request(
+            "POST",
+            "/v1/todos",
+            {
+                "scope_kind": "UNIVERSE",
+                "universe_goal_id": root["universe_goal_id"],
+                "title": "Repair global runtime anchor failure",
+                "detail": "Restore the runtime foundation before further automation.",
+                "priority": "AUTO",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            },
+        )
+        self.assertEqual(201, status, todo_result)
+        todo = todo_result["todo"]
+        self.assertEqual("P0", todo["priority"])
+        self.assertEqual("P0", todo["priority_recommendation"]["priority"])
+
+        status, manually_ranked = self.request(
+            "PATCH",
+            f"/v1/todos/{todo['todo_id']}",
+            {
+                "scope_kind": todo["scope_kind"],
+                "title": todo["title"],
+                "detail": todo["detail"],
+                "priority": "P3",
+                "state": todo["state"],
+                "source_kind": todo["source_kind"],
+                "sort_order": todo["sort_order"],
+                "universe_goal_id": todo["universe_goal_id"],
+                "revision": todo["revision"],
+            },
+        )
+        self.assertEqual(200, status, manually_ranked)
+        self.assertEqual("P3", manually_ranked["todo"]["priority"])
+
+        status, global_plan = self.request("GET", "/v1/universe-goals")
+        self.assertEqual(200, status)
+        self.assertEqual("UNIVERSE_GOAL_PLAN_COLLECTED", global_plan["status"])
+        self.assertEqual(todo["todo_id"], global_plan["goals"][0]["todos"][0]["todo_id"])
+        self.assertEqual(
+            project_result["goal"]["goal_id"],
+            global_plan["goals"][0]["project_goals"][0]["goal_id"],
+        )
+
+        status, semantic = self.request("GET", "/v1/projects/GCS/semantic-graph")
+        self.assertEqual(200, status)
+        node_types = {item["entity_type"] for item in semantic["nodes"]}
+        self.assertTrue({"UNIVERSE", "UNIVERSE_GOAL"}.issubset(node_types))
+        edge_types = {item["edge_type"] for item in semantic["edges"]}
+        self.assertTrue(
+            {
+                "UNIVERSE_HAS_GOAL",
+                "UNIVERSE_GOAL_HAS_PROJECT_GOAL",
+                "UNIVERSE_GOAL_HAS_TODO",
+            }.issubset(edge_types)
+        )
+
     def test_semantic_project_graph_projects_room_anchor_bindings(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         room = self.server.multi_rooms.ensure_project_room("GCS")

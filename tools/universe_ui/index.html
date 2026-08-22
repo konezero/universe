@@ -108,7 +108,7 @@
           <div>
             <span id="goal-plan-breadcrumb" class="goal-plan-kicker">Project &gt; Goal Plan</span>
             <h1 id="goal-plan-title">Goal Plan</h1>
-            <p id="goal-plan-subtitle">Goal &rarr; Milestone / Phase &rarr; Todo</p>
+            <p id="goal-plan-subtitle">Universe Goal &rarr; Project Goal &rarr; Milestone / Phase &rarr; Todo</p>
           </div>
           <div class="goal-plan-actions">
             <button id="plan-project-button" class="secondary-button" type="button">Plan project</button>
@@ -323,6 +323,8 @@
       <label>Goal title<input name="title" maxlength="160" required></label>
       <label>Outcome<textarea name="description" rows="4" maxlength="4000" required></textarea></label>
       <div class="form-grid two-columns">
+        <label>Scope<select name="scope_kind"><option value="UNIVERSE">Universe (global)</option><option value="PROJECT">Selected project</option></select></label>
+        <label>Global parent<select name="universe_goal_id"><option value="">No global parent</option></select></label>
         <label>Owner<input name="owner" maxlength="80" value="Project Master" required></label>
         <label>State<select name="state"><option value="DESIGNING">Designing</option><option value="READY">Ready</option><option value="ACTIVE">Active</option><option value="BLOCKED">Blocked</option><option value="DONE">Done</option></select></label>
       </div>
@@ -1128,8 +1130,9 @@
             </label>
             <label>
               Priority
-              <select name="priority">
-                <option value="P0">P0 Critical</option>
+                <select name="priority">
+                  <option value="AUTO" selected>Auto recommend</option>
+                  <option value="P0">P0 Critical</option>
                 <option value="P1" selected>P1 High</option>
                 <option value="P2">P2 Normal</option>
                 <option value="P3">P3 Low</option>
