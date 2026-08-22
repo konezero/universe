@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import queue
 import secrets
+import tempfile
 import threading
 import time
 from collections import deque
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from host_profile import resolve_host_tool
+from claude_channel_broker import ClaudeChannelBroker, MCP_SERVER_NAME
 
 TERMINAL_SCHEMA = "universe.cli-terminal.v1"
 PROVIDER_TOOLS = {
@@ -52,6 +54,7 @@ class TerminalSession:
     pump_stop: threading.Event = field(default_factory=threading.Event)
     pump_thread: Any = None
     exit_detail: str | None = None
+    channel_broker: ClaudeChannelBroker | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,12 @@ class TerminalSession:
             "created_at": self.created_at,
             "pid": self.live_pid(),
             "exit_detail": self.exit_detail,
+            "automation_transport": (
+                "CLAUDE_CODE_CHANNEL" if self.channel_broker is not None else "PTY"
+            ),
+            "channel_registered": (
+                self.channel_broker.registered if self.channel_broker is not None else False
+            ),
         }
 
     def live_pid(self) -> int | None:
@@ -147,13 +156,26 @@ class TerminalHost:
         selected_model = str(model_ref or "").strip()
         selected_effort = str(effort or "AUTO").strip().upper() or "AUTO"
         supervisor = str(supervisor_session_id or "").strip()
+        terminal_id = "term_" + secrets.token_hex(8)
+        channel_broker: ClaudeChannelBroker | None = None
+        channel_config: Path | None = None
+        if resolved_provider == "CLAUDE":
+            channel_broker = ClaudeChannelBroker(
+                terminal_id=terminal_id,
+                project_id=project,
+                mode=requested_mode,
+                provider=resolved_provider,
+                supervisor_session_id=supervisor,
+            ).start()
+            config_root = Path(tempfile.mkdtemp(prefix="universe-claude-channel-"))
+            channel_config = channel_broker.write_mcp_config(config_root / "mcp.json")
         argv = startup_argv(
             resolved_provider,
             resume_session_ref,
             model_ref=selected_model,
             effort=selected_effort,
+            claude_channel_mcp_config=str(channel_config) if channel_config else "",
         )
-        terminal_id = "term_" + secrets.token_hex(8)
         session = TerminalSession(
             terminal_id=terminal_id,
             project_id=project,
@@ -167,6 +189,7 @@ class TerminalHost:
             effort=selected_effort,
             cols=max(80, int(cols or 120)),
             rows=max(24, int(rows or 32)),
+            channel_broker=channel_broker,
         )
         child_environment = {
             "UNIVERSE_PROJECT_ID": project,
@@ -187,6 +210,8 @@ class TerminalHost:
                 child_environment,
             )
         except Exception as error:  # noqa: BLE001 - surface spawn failure
+            if channel_broker is not None:
+                channel_broker.close()
             raise TerminalHostError(
                 "TERMINAL_SPAWN_FAILED",
                 str(error) or "failed to start CLI",
@@ -219,6 +244,8 @@ class TerminalHost:
         closer = getattr(backend, "close", None)
         if callable(closer):
             closer()
+        if session.channel_broker is not None:
+            session.channel_broker.close()
         return {"status": "TERMINAL_CLOSED", "terminal_id": session.terminal_id}
 
     def write(self, terminal_id: str, data: bytes) -> None:
@@ -227,6 +254,48 @@ class TerminalHost:
         if backend is None or session.state != "LIVE":
             raise TerminalHostError("TERMINAL_NOT_LIVE", "terminal is not live")
         backend.write(data)
+
+    def emit_output(self, terminal_id: str, data: bytes) -> None:
+        """Fan out display-only bytes without sending them to the CLI stdin."""
+
+        session = self.get(terminal_id)
+        if session.state != "LIVE":
+            raise TerminalHostError("TERMINAL_NOT_LIVE", "terminal is not live")
+        with session.lock:
+            session.replay.append(bytes(data))
+            waiters = list(session.subscribers)
+        for waiter in waiters:
+            try:
+                waiter.put_nowait(bytes(data))
+            except queue.Full:
+                try:
+                    waiter.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    waiter.put_nowait(bytes(data))
+                except queue.Full:
+                    pass
+
+    def push_channel(self, terminal_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        broker = session.channel_broker
+        if broker is None:
+            raise TerminalHostError(
+                "TERMINAL_CHANNEL_UNAVAILABLE",
+                "terminal has no Claude Code channel bridge",
+            )
+        try:
+            return broker.push(payload)
+        except Exception as error:  # noqa: BLE001 - preserve terminal error contract
+            raise TerminalHostError("TERMINAL_CHANNEL_UNAVAILABLE", str(error)) from error
+
+    def channel_state(self, terminal_id: str) -> str:
+        session = self.get(terminal_id)
+        broker = session.channel_broker
+        if broker is None:
+            return "UNAVAILABLE"
+        return "READY" if broker.registered else "PENDING"
 
     def resize(self, terminal_id: str, cols: int, rows: int) -> None:
         session = self.get(terminal_id)
@@ -353,9 +422,16 @@ class TerminalHost:
             if session.state != "LIVE":
                 waiter.put_nowait(None)
                 return waiter
+            # A browser can attach after the provider has already rendered a
+            # prompt or response (for example after a refresh or service
+            # restart).  Replay the bounded PTY tail before joining the live
+            # fan-out so xterm paints the existing screen without requiring a
+            # new keypress.  Clear the new emulator first; the PTY tail may
+            # contain cursor/color escapes but must not inherit stale cells.
+            replay = b"".join(session.replay)
+            if replay:
+                waiter.put_nowait(b"\x1b[2J\x1b[H" + replay)
             session.subscribers.append(waiter)
-        # Do not dump recent chunks into a new client. CLI TUIs address the
-        # cursor; a partial replay plus a live redraw garbles the screen.
         self._ensure_pump(session)
         return waiter
 
@@ -462,6 +538,7 @@ def startup_argv(
     *,
     model_ref: str = "",
     effort: str = "AUTO",
+    claude_channel_mcp_config: str = "",
 ) -> list[str]:
     """Build one interactive CLI command without changing its supervisor anchor.
 
@@ -483,6 +560,11 @@ def startup_argv(
         elif name == "CODEX":
             argv.extend(("--config", f"model_reasoning_effort={selected_effort.lower()}"))
     argv.extend(resume_argv(name, resume_session_ref))
+    if name == "CLAUDE":
+        argv.append("--dangerously-skip-permissions")
+        channel_config = str(claude_channel_mcp_config or "").strip()
+        if channel_config:
+            argv.extend(("--mcp-config", channel_config))
     return argv
 
 

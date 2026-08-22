@@ -130,8 +130,20 @@ class TerminalHostTests(unittest.TestCase):
             startup_argv("GROK", "abc", model_ref="grok-4.6", effort="MAX"),
         )
         self.assertEqual(
-            ["--model", "opus", "--effort", "medium", "--resume", "abc"],
+            ["--model", "opus", "--effort", "medium", "--resume", "abc", "--dangerously-skip-permissions"],
             startup_argv("CLAUDE", "abc", model_ref="opus", effort="MEDIUM"),
+        )
+        self.assertEqual(
+            [
+                "--dangerously-skip-permissions",
+                "--mcp-config",
+                "C:/tmp/universe-channel.json",
+            ],
+            startup_argv(
+                "CLAUDE",
+                "",
+                claude_channel_mcp_config="C:/tmp/universe-channel.json",
+            ),
         )
         self.assertEqual(
             [
@@ -263,7 +275,7 @@ class TerminalHostTests(unittest.TestCase):
         self.assertGreaterEqual(seen.count(b"hello-both"), 2)
         host.close(created["terminal_id"])
 
-    def test_late_subscriber_does_not_replay_history(self) -> None:
+    def test_late_subscriber_replays_bounded_history(self) -> None:
         class FeedingPty(FakePty):
             def __init__(self) -> None:
                 super().__init__()
@@ -293,5 +305,6 @@ class TerminalHostTests(unittest.TestCase):
             dumped = late.get(timeout=0.2) or b""
         except Exception:
             dumped = b""
-        self.assertNotIn(b"old-chunk", dumped)
+        self.assertIn(b"\x1b[2J\x1b[H", dumped)
+        self.assertIn(b"old-chunk", dumped)
         host.close(created["terminal_id"])
