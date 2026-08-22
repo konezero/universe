@@ -2445,50 +2445,16 @@ function sessionFromPtyTerminal(terminal) {
   };
 }
 
-function nodeModePanelSessions(coordinate, { liveOnly = false } = {}) {
-  const live = ptyLiveTerminalsForCoordinate(coordinate);
-  const bound = new Set();
-  const rows = [];
-  if (!liveOnly) {
-    for (const session of coordinate.sessions || []) {
-      const match = live.find((item) => {
-        if (bound.has(item.terminal_id)) return false;
-        const provider = String(session.provider || "").toUpperCase();
-        const supervisorSessionId = String(
-          session.session_id || session.universe_session_id || ""
-        ).trim();
-        return (
-          supervisorSessionId &&
-          String(item.supervisor_session_id || "") === supervisorSessionId &&
-          (!provider ||
-            provider === "AUTO" ||
-            provider === String(item.provider || "").toUpperCase())
-        );
-      });
-      if (match) {
-        bound.add(match.terminal_id);
-        rows.push({
-          ...session,
-          terminal_id: match.terminal_id,
-          pid: match.pid,
-          pty_live: true,
-        });
-      } else {
-        rows.push(session);
-      }
-    }
-  }
-  for (const terminal of live) {
-    if (bound.has(terminal.terminal_id)) continue;
-    rows.push(sessionFromPtyTerminal(terminal));
-  }
-  return rows;
+function nodeModePanelSessions(coordinate) {
+  // Node/Mode cards are a live PTY control surface, not the Supervisor
+  // archive. Historical Anchor Sessions stay in the Observatory.
+  return ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
 }
 
-function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
+function renderNodeModeSessionCards(coordinate) {
   const cards = node("div", "node-mode-session-cards");
   cards.dataset.coordinateKey = coordinate.key;
-  const sessions = nodeModePanelSessions(coordinate, { liveOnly });
+  const sessions = nodeModePanelSessions(coordinate);
   const selected = nodeModeSelectedSession(coordinate);
   const ordered = [...sessions].sort((left, right) => {
     const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
@@ -2509,7 +2475,7 @@ function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
   cards.append(create);
   if (!sessions.length) {
     cards.append(
-      node("p", "node-mode-session-empty", "No persistent sessions in this mode")
+      node("p", "node-mode-session-empty", "No live PTY sessions in this mode")
     );
     return cards;
   }
@@ -2571,17 +2537,6 @@ function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {}) {
       );
     });
     row.append(card);
-    if (room && state.conversationTarget.kind === "PROVIDER_SESSION") {
-      const delegate = node("button", "node-mode-session-delegate", "Delegate here");
-      delegate.type = "button";
-      delegate.dataset.targetAnchorRef = sessionAnchorRef(session);
-      delegate.title = "Delegate bounded work from the selected direct session";
-      delegate.disabled =
-        String(state.conversationTarget.session_anchor_ref || "").trim() ===
-        sessionAnchorRef(session);
-      delegate.addEventListener("click", () => beginCrossSessionDelegation(session));
-      row.append(delegate);
-    }
     cards.append(row);
   }
   return cards;
@@ -2656,7 +2611,7 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       // state.  Selecting its card expands the complete Anchor Session lineage;
       // an unselected mode renders a session area only when it has a live PTY.
       if (modeSelected || liveCount) {
-        list.append(renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected }));
+        list.append(renderNodeModeSessionCards(coordinate));
       }
     }
     section.append(list);
@@ -10320,6 +10275,10 @@ function planTodoRow(todo) {
   return row;
 }
 
+function openPlanTodos(todos) {
+  return (todos || []).filter((todo) => todo.state !== "DONE");
+}
+
 function renderUniverseGoalCard(goal) {
   const card = node("article", "goal-card universe-goal-card");
   const header = node("header", "goal-card-header");
@@ -10330,7 +10289,7 @@ function renderUniverseGoalCard(goal) {
   );
   card.append(header, node("p", "goal-card-description", goal.description || "No global outcome yet."));
   const linked = node("div", "milestone-list");
-  for (const todo of goal.todos || []) linked.append(planTodoRow(todo));
+  for (const todo of openPlanTodos(goal.todos)) linked.append(planTodoRow(todo));
   for (const projectGoal of goal.project_goals || []) {
     const item = node("div", "milestone-block");
     item.append(
@@ -10552,12 +10511,12 @@ function renderGoalPlan() {
       item.append(itemHeader);
       if (milestone.description) item.append(node("p", "milestone-description", milestone.description));
       const list = node("div", "milestone-todos");
-      for (const todo of milestone.todos || []) list.append(planTodoRow(todo));
+      for (const todo of openPlanTodos(milestone.todos)) list.append(planTodoRow(todo));
       if (!list.childElementCount) list.append(node("small", "empty-copy", "No work assigned to this milestone."));
       item.append(list);
       milestones.append(item);
     }
-    for (const todo of goal.todos || []) milestones.append(planTodoRow(todo));
+    for (const todo of openPlanTodos(goal.todos)) milestones.append(planTodoRow(todo));
     if (!milestones.childElementCount) milestones.append(node("div", "milestone-empty", "Add a milestone to shape the delivery path."));
     milestones.hidden = state.expandedGoals[goal.goal_id] === false;
     card.append(header, progressBar, progressLabel, milestones);

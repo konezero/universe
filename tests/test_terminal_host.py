@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 from pathlib import Path
 
@@ -138,6 +139,8 @@ class TerminalHostTests(unittest.TestCase):
                 "--dangerously-skip-permissions",
                 "--mcp-config",
                 "C:/tmp/universe-channel.json",
+                "--dangerously-load-development-channels",
+                "server:universe_channel",
             ],
             startup_argv(
                 "CLAUDE",
@@ -156,6 +159,31 @@ class TerminalHostTests(unittest.TestCase):
             ],
             startup_argv("CODEX", "abc", model_ref="gpt-5.6", effort="HIGH"),
         )
+
+    def test_fresh_claude_terminal_uses_a_new_session_id_without_resume(self) -> None:
+        spawned: list[tuple] = []
+
+        def spawn(executable, cwd, cols, rows, argv=None, environment=None):
+            spawned.append((executable, cwd, cols, rows, list(argv or []), dict(environment or {})))
+            return FakePty()
+
+        host = TerminalHost(spawn=spawn)
+        with patch(
+            "universe_app.terminal_host.uuid.uuid4",
+            return_value=uuid.UUID("12345678-1234-4678-9234-567812345678"),
+        ):
+            created = host.create(
+                project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CLAUDE"
+            )
+        argv = spawned[0][4]
+        self.assertIn("--session-id", argv)
+        self.assertEqual("12345678-1234-4678-9234-567812345678", argv[argv.index("--session-id") + 1])
+        self.assertNotIn("--resume", argv)
+        self.assertEqual(
+            ["--dangerously-load-development-channels", "server:universe_channel"],
+            argv[-2:],
+        )
+        host.close(created["terminal_id"])
 
     def test_resume_rejects_universe_internal_session_ids(self) -> None:
         with self.assertRaises(TerminalHostError) as invalid:

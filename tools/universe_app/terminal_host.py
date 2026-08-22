@@ -6,6 +6,7 @@ import os
 import queue
 import secrets
 import tempfile
+import uuid
 import threading
 import time
 from collections import deque
@@ -169,11 +170,17 @@ class TerminalHost:
             ).start()
             config_root = Path(tempfile.mkdtemp(prefix="universe-claude-channel-"))
             channel_config = channel_broker.write_mcp_config(config_root / "mcp.json")
+        fresh_claude_session_id = (
+            str(uuid.uuid4())
+            if resolved_provider == "CLAUDE" and not str(resume_session_ref or "").strip()
+            else ""
+        )
         argv = startup_argv(
             resolved_provider,
             resume_session_ref,
             model_ref=selected_model,
             effort=selected_effort,
+            claude_session_id=fresh_claude_session_id,
             claude_channel_mcp_config=str(channel_config) if channel_config else "",
         )
         session = TerminalSession(
@@ -538,6 +545,7 @@ def startup_argv(
     *,
     model_ref: str = "",
     effort: str = "AUTO",
+    claude_session_id: str = "",
     claude_channel_mcp_config: str = "",
 ) -> list[str]:
     """Build one interactive CLI command without changing its supervisor anchor.
@@ -561,10 +569,17 @@ def startup_argv(
             argv.extend(("--config", f"model_reasoning_effort={selected_effort.lower()}"))
     argv.extend(resume_argv(name, resume_session_ref))
     if name == "CLAUDE":
+        session_id = str(claude_session_id or "").strip()
+        if session_id:
+            argv.extend(("--session-id", session_id))
         argv.append("--dangerously-skip-permissions")
         channel_config = str(claude_channel_mcp_config or "").strip()
         if channel_config:
+            # Claude Code channels are a preview feature. The explicit local
+            # opt-in prevents the startup warning from treating our bounded
+            # loopback channel as an unapproved implicit channel.
             argv.extend(("--mcp-config", channel_config))
+            argv.extend(("--dangerously-load-development-channels", f"server:{MCP_SERVER_NAME}"))
     return argv
 
 

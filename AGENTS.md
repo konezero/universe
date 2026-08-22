@@ -146,3 +146,7 @@ Role: MASTER
 Authority: UNASSIGNED
 Execution Assignment: UNASSIGNED
 <!-- ai-career-project-runtime-overlay:end -->
+
+## Browser test artifacts
+
+Playwright and browser-test screenshots must use `.artifacts/ui/` as their explicit output directory. Do not write test captures into the repository root.

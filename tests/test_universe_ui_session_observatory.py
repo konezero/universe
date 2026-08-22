@@ -185,12 +185,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("childrenByParent.get(group.nodeId)", APP)
         self.assertIn(".node-mode-group-nested", CSS)
 
-    def test_mode_click_expands_persistent_session_cards_without_auto_routing(self) -> None:
+    def test_mode_cards_show_only_live_ptys_without_auto_routing(self) -> None:
         self.assertIn("selectedModeCoordinateKey: null", APP)
-        self.assertIn("function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {})", APP)
+        self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
         self.assertIn("node-mode-session-card", APP)
         self.assertIn("if (modeSelected || liveCount)", APP)
-        self.assertIn("renderNodeModeSessionCards(coordinate, { liveOnly: !modeSelected })", APP)
+        self.assertIn("renderNodeModeSessionCards(coordinate)", APP)
+        self.assertIn("return ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);", APP)
         self.assertIn("function ptyLiveTerminalsForCoordinate", APP)
         self.assertIn("state.supervisorTerminals", APP)
         self.assertIn("state.supervisorTerminals", TERM)
@@ -212,6 +213,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("resumeNodeModeSession(pending.coordinate, pending.session)", APP)
         self.assertNotIn("await resumeNodeModeSession(coordinate, session)", APP)
         self.assertIn("New session", APP)
+        card_slice = APP[APP.index("function renderNodeModeSessionCards") : APP.index("function selectNodeModeNode")]
+        self.assertNotIn("Delegate here", card_slice)
+
+    def test_goal_plan_hides_done_todos_but_keeps_completion_metrics(self) -> None:
+        plan_slice = APP[APP.index("function openPlanTodos") : APP.index("function renderTodos")]
+        self.assertIn('todo.state !== "DONE"', plan_slice)
+        self.assertIn("openPlanTodos(milestone.todos)", plan_slice)
+        self.assertIn("openPlanTodos(goal.todos)", plan_slice)
+        self.assertIn('todos.filter((todo) => todo.state === "DONE")', plan_slice)
 
     def test_session_graph_is_a_separate_read_only_navigation_surface(self) -> None:
         self.assertIn('data-primary-view="sessions"', HTML)
@@ -343,7 +353,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             CSS,
         )
         self.assertIn('id="chat-resize-handle"', HTML)
-        self.assertIn("function renderNodeModeSessionCards(coordinate, { liveOnly = false } = {})", APP)
+        self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
         self.assertIn("id=\"terminal-tabs\"", HTML)
         self.assertIn("createTerminalTab(coordinate)", APP)
         self.assertIn("initChatPanelResize()", APP)
