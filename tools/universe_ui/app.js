@@ -6880,13 +6880,27 @@ function providerSessionRoomIsEligible(room) {
   ).toUpperCase();
   const identityState = String(room?.identity_state || "").toUpperCase();
   const projectId = providerSessionObservedProjectId(room);
+  const identityAttached = providerSessionRoomIdentityIsAttached(room);
   return Boolean(
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
-      identityState === "VERIFIED" &&
+      identityAttached &&
       ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
       currentness === "CURRENT"
+  );
+}
+
+function providerSessionRoomIdentityIsAttached(room) {
+  const identityState = String(room?.identity_state || "").toUpperCase();
+  if (identityState === "VERIFIED") return true;
+  if (identityState !== "SUPERVISOR_OBSERVED") return false;
+  const binding = room?.binding || {};
+  const bindingState = String(binding.state || "").toUpperCase();
+  return Boolean(
+    ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
+      String(binding.universe_session_id || "").trim() &&
+      String(binding.session_anchor_ref || "").trim()
   );
 }
 
@@ -7014,13 +7028,12 @@ function providerSessionActivityState(room) {
 function providerSessionRoomIsOpenable(room) {
   const chatKey = String(room?.chat_key || "").trim();
   const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
-  const identityState = String(room?.identity_state || "").toUpperCase();
   const projectId = providerSessionObservedProjectId(room);
   return Boolean(
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
-      identityState === "VERIFIED"
+      providerSessionRoomIdentityIsAttached(room)
   );
 }
 
@@ -7214,7 +7227,12 @@ async function refreshProviderSession(chatKey) {
 function openProviderSessionStream(chatKey) {
   const key = String(chatKey || "").trim();
   const room = providerSessionRoomForChatKey(key);
-  if (!providerSessionRoomIsEligible(room)) return null;
+  // Background subscriptions remain currentness-gated by
+  // providerSessionRoomIsEligible().  An explicitly selected attached
+  // Supervisor session may have no provider source-file observation (and thus
+  // UNKNOWN observer currentness), but it is still streamable after the
+  // private resolver attests its persistent target.
+  if (!providerSessionRoomIsOpenable(room)) return null;
   if (state.providerSessionStreams[key]) {
     syncSelectedProviderSessionState(key);
     return state.providerSessionStreams[key];
