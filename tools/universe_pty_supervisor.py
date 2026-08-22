@@ -316,6 +316,8 @@ class Handler(BaseHTTPRequestHandler):
                     mode=str(body.get("mode") or "MASTER"),
                     cwd=str(body.get("cwd") or ""),
                     provider=str(body.get("provider") or "AUTO"),
+                    model_ref=str(body.get("model_ref") or ""),
+                    effort=str(body.get("effort") or "AUTO"),
                     supervisor_session_id=str(
                         body.get("supervisor_session_id") or ""
                     ),

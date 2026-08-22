@@ -82,11 +82,15 @@ class PtySupervisorTests(unittest.TestCase):
                 "mode": "MASTER",
                 "cwd": str(ROOT),
                 "provider": "GROK",
+                "model_ref": "grok-4.6",
+                "effort": "MAX",
             },
         )
         self.assertEqual(201, status)
         terminal_id = created["terminal"]["terminal_id"]
         self.assertEqual(4242, created["terminal"]["pid"])
+        self.assertEqual("grok-4.6", created["terminal"]["model_ref"])
+        self.assertEqual("MAX", created["terminal"]["effort"])
         _status, listed = self.request("GET", "/v1/terminals")
         self.assertEqual(1, len(listed["terminals"]))
         _status, attached = self.request("POST", f"/v1/terminals/{terminal_id}/attach")
