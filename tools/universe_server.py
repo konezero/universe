@@ -22313,11 +22313,89 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     bus=self.session_bus,
                     value=payload,
                 )
-            return self.session_bus.post(self.terminal_host, payload)
+            posted = self.session_bus.post(self.terminal_host, payload)
+            # A SessionStart hook owns boot-time delivery.  Once a terminal is
+            # already live, however, waiting for a hypothetical next boot
+            # leaves a direct UI instruction stranded in PENDING.  Bind the
+            # same atomic claim to the live Session Anchor and use the common
+            # Runtime's TURN_IDLE delivery contract instead.
+            self._dispatch_live_posted_session_instructions(posted)
+            return posted
         except SessionBusError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
         except TerminalHostError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def _dispatch_live_posted_session_instructions(
+        self, posted: Mapping[str, Any]
+    ) -> None:
+        """Deliver newly posted instructions to an already verified live session.
+
+        This is deliberately best-effort.  A terminal without a current
+        Session Anchor keeps its message PENDING for the normal SessionStart
+        hook; posting must not manufacture an Anchor or a provider session.
+        """
+
+        messages = posted.get("messages")
+        if not isinstance(messages, list):
+            return
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            if (
+                str(message.get("kind") or "").upper() != "INSTRUCTION"
+                or str(message.get("delivery_state") or "").upper() != "PENDING"
+            ):
+                continue
+            target = message.get("to")
+            terminal_id = (
+                str(target.get("terminal_id") or "").strip()
+                if isinstance(target, Mapping)
+                else ""
+            )
+            if not terminal_id:
+                continue
+            try:
+                terminal_value = self.terminal_host.get(terminal_id)
+                terminal = (
+                    terminal_value.public()
+                    if hasattr(terminal_value, "public")
+                    and callable(terminal_value.public)
+                    else terminal_value
+                )
+                if not isinstance(terminal, Mapping):
+                    continue
+                if str(terminal.get("state") or "").upper() != "LIVE":
+                    continue
+                session_id = str(terminal.get("supervisor_session_id") or "").strip()
+                if not session_id:
+                    continue
+                session_value = self.session_supervisor.get_session(session_id)
+                session = (
+                    session_value.public()
+                    if hasattr(session_value, "public")
+                    and callable(session_value.public)
+                    else session_value
+                )
+                if not isinstance(session, Mapping):
+                    continue
+                project_id = str(terminal.get("project_id") or "").strip()
+                if not project_id:
+                    continue
+                dispatch = self._dispatch_pending_session_instruction(
+                    project_id=project_id,
+                    session=session,
+                    trigger="TURN_IDLE",
+                )
+                if isinstance(message, dict):
+                    message["delivery_state"] = (
+                        "DISPATCHED"
+                        if dispatch.get("status") == "DISPATCHED"
+                        else str(message.get("delivery_state") or "PENDING")
+                    )
+                    message["dispatch_status"] = dispatch.get("status")
+            except (SessionSupervisorError, TerminalHostError, UniverseError):
+                continue
 
     def ack_session_bus_message(
         self, message_id: str, value: Mapping[str, Any] | None
@@ -22864,7 +22942,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "alias": binding.get("alias") or room.get("display_name"),
                     "model_ref": setting.get("model_ref") or "UNKNOWN",
                     "session_kind": room.get("session_kind") or "CHAT",
-                    "identity_state": room.get("identity_state") or "UNKNOWN",
+                    # The public catalog deliberately keeps this row as
+                    # ``SUPERVISOR_OBSERVED`` because it has no provider
+                    # transcript source file.  At this private resolution
+                    # boundary, however, the exact provider/session pair was
+                    # checked against the attached Session Supervisor record
+                    # above.  ProviderSessionService needs that attestation to
+                    # open the persistent target; do not make it rediscover a
+                    # source file that is not required for supervisor-owned
+                    # sessions.
+                    "identity_state": "VERIFIED",
+                    "identity_source": "SESSION_SUPERVISOR",
                 }
         candidates: list[dict[str, Any]] = []
         for source in self.store.discover_provider_session_sources(provider):
@@ -24741,6 +24829,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         except UniverseError:
             return None
+        instruction_dispatch = self._dispatch_pending_session_instruction(
+            project_id=project_id,
+            session=session,
+            trigger=trigger,
+        )
         self._resume_hook_verified_conductor_allocations(
             project_id, session_anchor_ref
         )
@@ -24748,7 +24841,357 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "event_id": event.get("event_id"),
             "created": created,
             "redaction_state": "REDACTED",
+            "pending_instruction_dispatch": instruction_dispatch,
         }
+
+    def _dispatch_pending_session_instruction(
+        self,
+        *,
+        project_id: str,
+        session: Mapping[str, Any],
+        trigger: str,
+    ) -> dict[str, Any]:
+        """Claim and deliver one anchor-bound bus instruction at a safe point.
+
+        The common Runtime validates the claimed payload and selects provider
+        hook output.  A bound Provider Session receives the raw body through
+        its native user-turn adapter or, for Claude PTY sessions, the
+        authenticated Claude Code Channel. PTY is retained only as the
+        explicit fallback for non-Claude live manual terminals with no native
+        transport; Claude bus instructions fail closed until Channel is ready.
+        """
+
+        if trigger not in {"SESSION_START", "TURN_IDLE"}:
+            return {"status": "NOT_APPLICABLE", "trigger": trigger}
+        session_id = str(session.get("session_id") or "").strip()
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        provider = str(session.get("provider") or "").strip().upper()
+        provider_session_ref = str(
+            session.get("provider_session_ref") or ""
+        ).strip()
+        mode = str(session.get("mode") or "").strip().upper()
+        if not session_id or not session_anchor_ref or not provider or not mode:
+            return {"status": "COORDINATE_UNAVAILABLE"}
+        terminal = self.terminal_host.find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=session_id,
+        )
+        if not isinstance(terminal, Mapping):
+            return {"status": "TERMINAL_UNAVAILABLE"}
+        terminal_id = str(terminal.get("terminal_id") or "").strip()
+        if not terminal_id:
+            return {"status": "TERMINAL_UNAVAILABLE"}
+        try:
+            claim = self.session_bus.claim_instruction(
+                self.terminal_host,
+                terminal_id=terminal_id,
+                session_anchor_ref=session_anchor_ref,
+            )
+        except (SessionBusError, TerminalHostError) as error:
+            return {"status": "CLAIM_UNAVAILABLE", "detail": str(error)}
+        if claim is None:
+            return {"status": "NO_PENDING_INSTRUCTION"}
+        try:
+            runtime_root = Path(__file__).resolve().parents[1] / ".ai" / "runtime"
+            if str(runtime_root) not in sys.path:
+                sys.path.insert(0, str(runtime_root))
+            from reference_runtime.session_instruction_hook_runtime import (
+                REQUEST_SCHEMA,
+                evaluate_session_instruction_hook,
+            )
+
+            outcome = evaluate_session_instruction_hook(
+                {
+                    "schema": REQUEST_SCHEMA,
+                    "provider": provider,
+                    "trigger": "SESSION_START",
+                    "session_anchor_ref": session_anchor_ref,
+                    "pending_instruction": {
+                        "message_id": claim["message_id"],
+                        "instruction_ref": "session-bus:" + claim["message_id"],
+                        "body_text": claim["body_text"],
+                        "provenance": claim.get("provenance"),
+                    },
+                }
+            )
+        except Exception as error:  # Common Runtime must never break provider boot.
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {"status": "COMMON_HOOK_UNAVAILABLE", "detail": str(error)}
+        delivery = outcome.get("provider_adapter_delivery")
+        if not isinstance(delivery, Mapping):
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {"status": "DELIVERY_UNAVAILABLE"}
+
+        # Claude's interactive CLI stays in the existing PTY/xterm, but a
+        # session-bus instruction must not be typed into that PTY.  The
+        # terminal host provisions an authenticated Claude Code Channel MCP
+        # child for each Claude terminal.  Prefer that channel even when a
+        # provider-native catalog entry happens to be visible: the channel is
+        # bound to this exact live supervisor terminal and Session Anchor.
+        if provider == "CLAUDE":
+            try:
+                channel_state = self.terminal_host.channel_state(terminal_id)
+            except (AttributeError, TerminalHostError):
+                channel_state = "UNAVAILABLE"
+            if channel_state == "PENDING":
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim.get("message_id") or ""),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {
+                    "status": "CLAUDE_CHANNEL_PENDING",
+                    "delivery_mode": "CLAUDE_CODE_CHANNEL_PENDING",
+                    "provider": provider,
+                    "session_anchor_ref": session_anchor_ref,
+                    "hook_stdout": outcome.get("hook_stdout"),
+                }
+            if channel_state == "READY":
+                provenance = claim.get("provenance")
+                sender_id = (
+                    "UNIVERSE_UI"
+                    if isinstance(provenance, Mapping)
+                    and bool(provenance.get("user_authorized"))
+                    else "UNIVERSE_SESSION_BUS"
+                )
+                message_id = str(claim.get("message_id") or "")
+                channel_payload = {
+                    "message_id": message_id,
+                    "session_anchor_ref": session_anchor_ref,
+                    "content": str(delivery["body_text"]),
+                    "meta": {
+                        "message_id": message_id,
+                        "session_anchor_ref": session_anchor_ref,
+                        "sender_id": sender_id,
+                        "kind": "INSTRUCTION",
+                        "project_id": str(project_id),
+                        "mode": mode,
+                    },
+                }
+                try:
+                    channel_result = self.terminal_host.push_channel(
+                        terminal_id,
+                        channel_payload,
+                    )
+                    completed = self.session_bus.complete_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                except (SessionBusError, TerminalHostError, UnicodeError) as error:
+                    self.session_bus.release_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                    return {
+                        "status": "CLAUDE_CHANNEL_DELIVERY_FAILED",
+                        "delivery_mode": "CLAUDE_CODE_CHANNEL",
+                        "provider": provider,
+                        "detail": str(error),
+                        "session_anchor_ref": session_anchor_ref,
+                        "hook_stdout": outcome.get("hook_stdout"),
+                    }
+                return {
+                    "status": "DISPATCHED",
+                    "delivery_mode": "CLAUDE_CODE_CHANNEL",
+                    "provider": provider,
+                    "message_id": completed["message_id"],
+                    "channel_result": channel_result,
+                    "session_anchor_ref": session_anchor_ref,
+                    "hook_stdout": outcome.get("hook_stdout"),
+                }
+
+        native_chat_key = self._provider_chat_key_for_session_instruction(
+            session=session,
+        )
+        if native_chat_key:
+            accepted_holder: dict[str, str] = {}
+
+            def observe_native_accept(reply: Mapping[str, Any]) -> None:
+                provider_message_id = str(reply.get("message_id") or "").strip()
+                if not provider_message_id:
+                    raise ProviderSessionError(
+                        "PROVIDER_SESSION_REPLY_ID_MISSING",
+                        "native Provider Session did not return an accepted reply id",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                accepted_holder["provider_message_id"] = provider_message_id
+
+            try:
+                native_result = self.provider_sessions.submit(
+                    native_chat_key,
+                    {
+                        # The adapter turns this into the provider's official
+                        # user turn.  Do not add a prose "verified" marker:
+                        # provenance is enforced by Universe before dispatch.
+                        "body": str(delivery["body_text"]),
+                        "idempotency_key": "session-bus:" + str(claim["message_id"]),
+                    },
+                    on_accepted=observe_native_accept,
+                )
+                # ``submit`` only returns after the native turn worker is
+                # started. A prior idempotent submission skips the callback,
+                # but this fresh bus claim still completes here.
+                completed = self.session_bus.complete_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim["message_id"]),
+                    session_anchor_ref=session_anchor_ref,
+                )
+            except (
+                ProviderSessionError,
+                SessionBusError,
+                TerminalHostError,
+                UnicodeError,
+            ) as error:
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim.get("message_id") or ""),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {"status": "DELIVERY_FAILED", "detail": str(error)}
+            return {
+                "status": "DISPATCHED",
+                "delivery_mode": "PROVIDER_NATIVE",
+                "provider": provider,
+                "chat_key": native_chat_key,
+                "message_id": completed["message_id"],
+                "provider_message_id": accepted_holder.get("provider_message_id"),
+                "provider_result": native_result,
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
+
+        if provider_session_ref:
+            # A supervised provider session must never receive a bus payload by
+            # PTY injection. Keep the claim pending until its exact opaque
+            # native chat is visible in the catalog (or the next hook retries).
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {
+                "status": "NATIVE_PROVIDER_UNAVAILABLE",
+                "delivery_mode": "PROVIDER_NATIVE_PENDING",
+                "provider": provider,
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
+
+        if provider == "CLAUDE":
+            # A Claude terminal without a registered Channel is not allowed to
+            # fall back to typing the bus body into PTY stdin.  The operator can
+            # still use xterm manually; automated delivery remains pending
+            # until the authenticated channel is available.
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {
+                "status": "CLAUDE_CHANNEL_UNAVAILABLE",
+                "delivery_mode": "CLAUDE_CODE_CHANNEL_REQUIRED",
+                "provider": provider,
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
+
+        try:
+            # Manual-terminal fallback. This is intentionally not the Session
+            # Bus HEADER path: the SessionStart hook verified this exact live
+            # PTY and the message was atomically claimed for its Session Anchor.
+            self.terminal_host.write(
+                terminal_id,
+                (str(delivery["body_text"]) + "\r").encode("utf-8"),
+            )
+            completed = self.session_bus.complete_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(delivery["message_id"]),
+                session_anchor_ref=session_anchor_ref,
+            )
+        except (SessionBusError, TerminalHostError, UnicodeError) as error:
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {"status": "DELIVERY_FAILED", "detail": str(error)}
+        return {
+            "status": "DISPATCHED",
+            "delivery_mode": "PTY_FALLBACK",
+            "message_id": completed["message_id"],
+            "session_anchor_ref": session_anchor_ref,
+            "hook_stdout": outcome.get("hook_stdout"),
+        }
+
+    def _provider_chat_key_for_session_instruction(
+        self,
+        *,
+        session: Mapping[str, Any],
+    ) -> str | None:
+        """Resolve an exact native chat for one supervised Session Anchor.
+
+        The opaque chat key is accepted only when the catalog binds the same
+        Universe supervisor session and Session Anchor.  A provider/session
+        coordinate alone is insufficient; unresolved or ambiguous sessions
+        return no key so the caller can keep supervised delivery pending.
+        """
+
+        session_id = str(session.get("session_id") or "").strip()
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        provider = str(session.get("provider") or "").strip().upper()
+        provider_ref = str(session.get("provider_session_ref") or "").strip()
+        if not session_id or not session_anchor_ref or not provider or not provider_ref:
+            return None
+        try:
+            expected_key = _vendor_chat_key(provider, provider_ref)
+            catalog = self.provider_chat_catalog()
+        except Exception:
+            return None
+        matches: list[Mapping[str, Any]] = []
+        for room in catalog.get("rooms", []):
+            if not isinstance(room, Mapping):
+                continue
+            if str(room.get("chat_key") or "") != expected_key:
+                continue
+            if str(room.get("provider") or "").upper() != provider:
+                continue
+            binding = room.get("binding")
+            if not isinstance(binding, Mapping):
+                continue
+            if str(binding.get("universe_session_id") or "") != session_id:
+                continue
+            if str(binding.get("session_anchor_ref") or "") != session_anchor_ref:
+                continue
+            if str(binding.get("state") or "").upper() not in {
+                "BOUND",
+                "ANCHOR_OBSERVED",
+            }:
+                continue
+            matches.append(room)
+        if len(matches) != 1:
+            return None
+        try:
+            descriptor = self.resolve_provider_chat_session(expected_key)
+        except Exception:
+            return None
+        if (
+            str(descriptor.get("provider") or "").upper() != provider
+            or str(descriptor.get("provider_session_ref") or "") != provider_ref
+        ):
+            return None
+        return expected_key
 
     def _resume_hook_verified_conductor_allocations(
         self,
@@ -28471,6 +28914,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     )
                     if hook_observation is not None:
                         result["hook_observation"] = hook_observation
+                        result["pending_instruction_dispatch"] = (
+                            hook_observation.get("pending_instruction_dispatch")
+                        )
                     self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
@@ -31566,6 +32012,23 @@ def perform_session_ref_inject(
         provider=normalized_provider,
         provider_session_ref=normalized_ref,
     )
+    # A provider may not expose its own conversation id until after the first
+    # interactive turn.  A SessionStart hook still identifies the durable
+    # Supervisor session, so retain its current provider ref instead of
+    # accidentally rebinding that Session Anchor to ``None``.
+    if not normalized_ref and explicit_session_id:
+        try:
+            current_session = session_supervisor.get_session(explicit_session_id)
+        except SessionSupervisorError:
+            current_session = None
+        if (
+            isinstance(current_session, Mapping)
+            and str(current_session.get("provider") or "").upper()
+            == normalized_provider
+        ):
+            normalized_ref = str(
+                current_session.get("provider_session_ref") or ""
+            ).strip()
     if str(body.get("alias") or "").strip():
         normalized_alias = str(body.get("alias")).strip()
     elif normalized_node == normalized_mode:

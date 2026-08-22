@@ -295,6 +295,16 @@ class ProviderSessionServiceTests(unittest.TestCase):
         )
         self.assertFalse(snapshot["room_queue_used"])
 
+    def test_supervisor_attested_target_is_accepted_as_persistent_session(self) -> None:
+        self.descriptor_overrides.update(
+            {
+                "identity_state": "VERIFIED",
+                "identity_source": "SESSION_SUPERVISOR",
+            }
+        )
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual("PROVIDER_SESSION_SNAPSHOT_COLLECTED", snapshot["status"])
+
     def test_git_trace2_milestones_publish_without_command_arguments(self) -> None:
         self.service.submit(
             CHAT_KEY,

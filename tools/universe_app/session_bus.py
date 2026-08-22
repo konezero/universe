@@ -1,8 +1,9 @@
 """RAM pull mailbox for live PTY sessions.
 
-Bodies stay on the bus. The only optional stdin write is a one-line HEADER
-pointer. Meeting-room fan-out is a Universe-side helper that copies one
-thread into each live participant inbox.
+Bodies stay on the bus. The only optional terminal notification is a one-line
+HEADER pointer emitted to the xterm display surface; it never crosses a
+provider's stdin boundary. Meeting-room fan-out is a Universe-side helper
+that copies one thread into each live participant inbox.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ MAX_BODY_BYTES = 32 * 1024
 MAX_INBOX = 32
 KINDS = frozenset({"NOTE", "INSTRUCTION"})
 NOTIFY_MODES = frozenset({"NONE", "HEADER"})
+INSTRUCTION_DELIVERY_STATES = frozenset({"PENDING", "CLAIMED", "DISPATCHED"})
 
 
 class SessionBusError(ValueError):
@@ -52,6 +54,18 @@ def _coord(value: Any) -> dict[str, str]:
         "provider": _text(raw.get("provider"), "provider", limit=64).upper(),
         "terminal_id": _text(raw.get("terminal_id"), "terminal_id", limit=80),
     }
+
+
+def _instruction_provenance(source: Mapping[str, str], kind: str) -> dict[str, Any]:
+    """Derive trusted direct-user provenance only at the Universe UI boundary."""
+
+    if kind == "INSTRUCTION" and str(source.get("provider") or "").upper() == "UI":
+        return {
+            "kind": "DIRECT_USER_INSTRUCTION",
+            "verified_by": "UNIVERSE_UI",
+            "user_authorized": True,
+        }
+    return {"kind": "SESSION_BUS_INSTRUCTION", "user_authorized": False}
 
 
 def _public_session(host: Any, terminal_id: str) -> dict[str, Any]:
@@ -170,12 +184,30 @@ class SessionBus:
 
     def unread_map(self) -> dict[str, int]:
         with self._lock:
-            return {key: len(ids) for key, ids in self._inbox.items() if ids}
+            return {
+                terminal_id: sum(
+                    1
+                    for message_id in message_ids
+                    if (self._messages.get(message_id) or {}).get("delivery_state")
+                    != "DISPATCHED"
+                )
+                for terminal_id, message_ids in self._inbox.items()
+                if any(
+                    (self._messages.get(message_id) or {}).get("delivery_state")
+                    != "DISPATCHED"
+                    for message_id in message_ids
+                )
+            }
 
     def unread_count(self, terminal_id: str) -> int:
         tid = str(terminal_id or "").strip()
         with self._lock:
-            return len(self._inbox.get(tid, []))
+            return sum(
+                1
+                for message_id in self._inbox.get(tid, [])
+                if (self._messages.get(message_id) or {}).get("delivery_state")
+                != "DISPATCHED"
+            )
 
     def directory(self, host: Any) -> dict[str, Any]:
         counts = self.unread_map()
@@ -213,6 +245,9 @@ class SessionBus:
             "to": dict(message.get("to") or {}),
             "created_at": message["created_at"],
             "bytes": int(message.get("bytes") or len(body.encode("utf-8"))),
+            "delivery_state": str(message.get("delivery_state") or "UNREAD"),
+            "session_anchor_ref": str(message.get("session_anchor_ref") or ""),
+            "provenance": dict(message.get("provenance") or {}),
         }
         if not headers_only:
             payload["body_text"] = body
@@ -326,6 +361,9 @@ class SessionBus:
             "body_text": body,
             "bytes": len(body.encode("utf-8")),
             "created_at": utc_now(),
+            "delivery_state": "PENDING" if kind == "INSTRUCTION" else "UNREAD",
+            "session_anchor_ref": "",
+            "provenance": _instruction_provenance(source, kind),
         }
         with self._lock:
             inbox = self._inbox.setdefault(terminal_id, [])
@@ -340,8 +378,122 @@ class SessionBus:
                         self._messages.pop(old_id, None)
             self._messages[message_id] = message
         if notify == "HEADER":
-            host.write(terminal_id, format_header(message))
+            # A bus notification is display-only.  Never send the header back
+            # through the provider's stdin: Claude may interpret it as a user
+            # prompt (and it can trigger the same prompt-injection path as the
+            # instruction body).  TerminalHost emits it to xterm subscribers
+            # without crossing the PTY input boundary.
+            emitter = getattr(host, "emit_output", None)
+            if callable(emitter):
+                emitter(terminal_id, format_header(message))
+            else:
+                # Compatibility for small test/dummy hosts that predate the
+                # display-only surface.
+                host.write(terminal_id, format_header(message))
         return self._public_message(message, headers_only=False)
+
+    def claim_instruction(
+        self,
+        host: Any,
+        *,
+        terminal_id: str,
+        session_anchor_ref: str,
+    ) -> dict[str, Any] | None:
+        """Atomically bind one pending instruction to the live Session Anchor.
+
+        The caller invokes this only from an observed provider lifecycle hook.
+        It does not send bytes to the terminal; the product adapter owns the
+        provider transport and must complete or release this claim.
+        """
+
+        terminal = _public_session(host, terminal_id)
+        if str(terminal.get("state") or "").upper() != "LIVE":
+            raise SessionBusError("BUS_TARGET_NOT_FOUND", "terminal is not live", 404)
+        anchor = _text(
+            session_anchor_ref,
+            "session_anchor_ref",
+            required=True,
+            limit=256,
+        )
+        tid = _text(terminal_id, "terminal_id", required=True, limit=80)
+        with self._lock:
+            for message_id in self._inbox.get(tid, []):
+                message = self._messages.get(message_id)
+                if not isinstance(message, dict):
+                    continue
+                if message.get("kind") != "INSTRUCTION":
+                    continue
+                if message.get("delivery_state") != "PENDING":
+                    continue
+                message["delivery_state"] = "CLAIMED"
+                message["session_anchor_ref"] = anchor
+                message["claimed_at"] = utc_now()
+                return dict(message)
+        return None
+
+    def complete_instruction_claim(
+        self,
+        *,
+        terminal_id: str,
+        message_id: str,
+        session_anchor_ref: str,
+    ) -> dict[str, Any]:
+        """Record successful provider-adapter delivery for the exact claim."""
+
+        tid = _text(terminal_id, "terminal_id", required=True, limit=80)
+        mid = _text(message_id, "message_id", required=True, limit=80)
+        anchor = _text(
+            session_anchor_ref,
+            "session_anchor_ref",
+            required=True,
+            limit=256,
+        )
+        with self._lock:
+            message = self._messages.get(mid)
+            if not isinstance(message, dict) or mid not in self._inbox.get(tid, []):
+                raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message is not in that inbox", 404)
+            if (
+                message.get("kind") != "INSTRUCTION"
+                or message.get("delivery_state") != "CLAIMED"
+                or message.get("session_anchor_ref") != anchor
+            ):
+                raise SessionBusError(
+                    "BUS_INSTRUCTION_CLAIM_INVALID",
+                    "instruction claim does not match the Session Anchor",
+                    409,
+                )
+            message["delivery_state"] = "DISPATCHED"
+            message["dispatched_at"] = utc_now()
+            return self._public_message(message, headers_only=False)
+
+    def release_instruction_claim(
+        self,
+        *,
+        terminal_id: str,
+        message_id: str,
+        session_anchor_ref: str,
+    ) -> None:
+        """Return a failed delivery to pending without changing its target."""
+
+        tid = _text(terminal_id, "terminal_id", required=True, limit=80)
+        mid = _text(message_id, "message_id", required=True, limit=80)
+        anchor = _text(
+            session_anchor_ref,
+            "session_anchor_ref",
+            required=True,
+            limit=256,
+        )
+        with self._lock:
+            message = self._messages.get(mid)
+            if not isinstance(message, dict) or mid not in self._inbox.get(tid, []):
+                return
+            if (
+                message.get("delivery_state") == "CLAIMED"
+                and message.get("session_anchor_ref") == anchor
+            ):
+                message["delivery_state"] = "PENDING"
+                message["session_anchor_ref"] = ""
+                message.pop("claimed_at", None)
 
     def inbox(
         self,

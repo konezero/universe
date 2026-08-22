@@ -1367,6 +1367,35 @@ class SessionSupervisorStore:
                 raise SessionSupervisorError(
                     "SESSION_VERSION_CONFLICT", "session row version changed", status=409
                 )
+            provider_ref_hash = self._hash_provider_ref(normalized_ref)
+            owner = connection.execute(
+                """
+                SELECT session_id
+                FROM session_binding_history
+                WHERE provider = ?
+                  AND provider_session_ref_hash = ?
+                  AND is_current = 1
+                LIMIT 1
+                """,
+                (normalized_provider, provider_ref_hash),
+            ).fetchone()
+            if owner is not None:
+                owner_id = str(owner["session_id"])
+                if (
+                    owner_id == normalized_id
+                    and str(row["provider"] or "").upper() == normalized_provider
+                    and str(row["provider_session_ref"] or "") == normalized_ref
+                ):
+                    # Provider attach is retried by the host during startup
+                    # and after a Session Hook refresh.  Repeating the exact
+                    # bind must not append a second history row or advance the
+                    # session version.
+                    return self._session_material(connection, row)
+                raise SessionSupervisorError(
+                    "PROVIDER_SESSION_ALREADY_BOUND",
+                    "provider session is already bound to another Universe session",
+                    status=409,
+                )
             next_version = version + 1
             binding_ref = self._append_provider_binding(
                 connection,

@@ -90,6 +90,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("function sendTerminalInput(text)", TERM)
         self.assertNotIn("term.options.disableStdin = true", TERM)
         self.assertIn("function applyCliDockTitle(session)", TERM)
+        self.assertIn("function terminalDockVisible(session)", TERM)
+        self.assertIn("terminalDockVisible(item)", TERM)
+        self.assertIn('state.activeTerminalId = null;', TERM)
         terminal_label = TERM[
             TERM.index("function terminalLabel(session)") : TERM.index(
                 "function applyCliDockTitle(session)"
@@ -98,6 +101,12 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('session?.provider || ""', terminal_label)
         self.assertIn('provider !== "AUTO"', terminal_label)
         self.assertIn("function focusTerminalForSession(coordinate, session)", TERM)
+        focus_slice = TERM[
+            TERM.index("function focusTerminalForSession(coordinate, session)") : TERM.index(
+                "async function loadTerminalTabs()"
+            )
+        ]
+        self.assertIn("terminalDockVisible(item)", focus_slice)
         self.assertIn("dismissedTerminalIds", TERM)
         self.assertIn("function refitActiveTerminal()", TERM)
         self.assertIn("window.setTimeout(run, 220)", TERM)
@@ -674,7 +683,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("binding.anchor_temporality", rail_slice)
 
 
-    def test_provider_session_stream_requires_verified_identity(self) -> None:
+    def test_provider_session_stream_requires_attached_identity(self) -> None:
         eligible_slice = APP[
             APP.index("function providerSessionRoomIsEligible") : APP.index(
                 "function providerSessionRoomCacheFor"
@@ -686,8 +695,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn('identityState === "VERIFIED"', eligible_slice)
+        self.assertIn("function providerSessionRoomIdentityIsAttached", eligible_slice)
+        self.assertIn('identityState !== "SUPERVISOR_OBSERVED"', eligible_slice)
         self.assertIn('currentness === "CURRENT"', eligible_slice)
-        self.assertIn('identityState === "VERIFIED"', openable_slice)
+        self.assertIn("providerSessionRoomIdentityIsAttached(room)", openable_slice)
 
     def test_provider_session_background_events_keep_selected_transcript_focused(self) -> None:
         selection_slice = APP[
@@ -715,6 +726,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("if (providerSessionRoomIsSelected(key))", stream_slice)
         self.assertIn("renderRoomMessages()", stream_slice)
         self.assertIn("renderSessionRail()", stream_slice)
+        self.assertIn("providerSessionRoomIsOpenable(room)", stream_slice)
         self.assertNotIn(
             "state.providerSessionMessages = dedupeProviderSessionMessages",
             stream_slice,

@@ -63,6 +63,10 @@ class SessionBusTests(unittest.TestCase):
             provider="CODEX",
         )
 
+    def tearDown(self) -> None:
+        for item in self.host.list_sessions():
+            self.host.close(item["terminal_id"])
+
     def pty(self, terminal_id: str) -> FakePty:
         return self.host.get(terminal_id).backend
 
@@ -107,7 +111,8 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual([], self.pty(self.universe["terminal_id"]).writes)
 
-    def test_notify_header_writes_pointer_only(self) -> None:
+    def test_notify_header_emits_display_pointer_without_cli_stdin(self) -> None:
+        display = self.host.subscribe(self.universe["terminal_id"])
         posted = self.host.bus.post(
             self.host,
             {
@@ -118,15 +123,71 @@ class SessionBusTests(unittest.TestCase):
             },
         )
         writes = self.pty(self.universe["terminal_id"]).writes
-        self.assertEqual(1, len(writes))
-        text = writes[0].decode("utf-8")
+        self.assertEqual([], writes)
+        text = (display.get(timeout=0.5) or b"").decode("utf-8")
         self.assertIn("[session-bus] 1 unread", text)
         self.assertIn(posted["message_id"], text)
         self.assertNotIn("secret brief", text)
         self.assertEqual(
-            writes[0],
+            text.encode("utf-8"),
             format_header(posted["messages"][0]),
         )
+
+    def test_hook_claim_binds_one_instruction_to_anchor_and_dispatches_once(self) -> None:
+        posted = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "kind": "INSTRUCTION",
+                "body_text": "Prepare the documentation.",
+            },
+        )
+
+        claim = self.host.bus.claim_instruction(
+            self.host,
+            terminal_id=self.universe["terminal_id"],
+            session_anchor_ref="session_anchor_target_1",
+        )
+        self.assertEqual(posted["message_id"], claim["message_id"])
+        self.assertEqual("CLAIMED", claim["delivery_state"])
+        self.assertEqual("session_anchor_target_1", claim["session_anchor_ref"])
+        self.assertIsNone(
+            self.host.bus.claim_instruction(
+                self.host,
+                terminal_id=self.universe["terminal_id"],
+                session_anchor_ref="session_anchor_target_1",
+            )
+        )
+
+        completed = self.host.bus.complete_instruction_claim(
+            terminal_id=self.universe["terminal_id"],
+            message_id=posted["message_id"],
+            session_anchor_ref="session_anchor_target_1",
+        )
+        self.assertEqual("DISPATCHED", completed["delivery_state"])
+        self.assertEqual(0, self.host.bus.unread_count(self.universe["terminal_id"]))
+
+    def test_ui_instruction_carries_verified_direct_user_provenance(self) -> None:
+        posted = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+                "kind": "INSTRUCTION",
+                "body_text": "Implement the requested change.",
+            },
+        )
+
+        claim = self.host.bus.claim_instruction(
+            self.host,
+            terminal_id=self.universe["terminal_id"],
+            session_anchor_ref="session_anchor_direct_user_1",
+        )
+
+        self.assertEqual("DIRECT_USER_INSTRUCTION", posted["messages"][0]["provenance"]["kind"])
+        self.assertTrue(claim["provenance"]["user_authorized"])
+        self.assertEqual("UNIVERSE_UI", claim["provenance"]["verified_by"])
 
     def test_mailbox_uses_host_write_without_supervisor_bus_routes(self) -> None:
         class WriteOnlyHost:
@@ -216,10 +277,12 @@ class SessionBusTests(unittest.TestCase):
             self.universe["terminal_id"],
             self.gcs["terminal_id"],
         ):
-            writes = b"".join(self.pty(terminal_id).writes).decode("utf-8")
-            self.assertIn("[session-bus] 1 unread", writes)
-            self.assertIn(room_id, writes)
-            self.assertNotIn("debate the bus", writes)
+            self.assertEqual([], self.pty(terminal_id).writes)
+            display = self.host.subscribe(terminal_id)
+            replay = (display.get(timeout=0.5) or b"").decode("utf-8")
+            self.assertIn("[session-bus] 1 unread", replay)
+            self.assertIn(room_id, replay)
+            self.assertNotIn("debate the bus", replay)
         self.assertEqual([], self.pty(grok2["terminal_id"]).writes)
         grok_inbox = self.host.bus.inbox(
             self.host,

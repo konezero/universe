@@ -58,6 +58,7 @@ class CapabilityToken:
         self.process_id = os.getpid()
         self.value = secrets.token_urlsafe(32)
         self._revoked = threading.Event()
+        self._session_lock = threading.Lock()
 
     @property
     def revoked(self) -> bool:
@@ -65,6 +66,24 @@ class CapabilityToken:
 
     def revoke(self) -> None:
         self._revoked.set()
+
+    def bind_session_ref(self, session_ref: str) -> None:
+        """Replace only the one-time pending provider coordinate."""
+
+        normalized = str(session_ref or "").strip()
+        if not normalized:
+            raise ClaudePermissionBrokerError("CLAUDE_PERMISSION_SESSION_REF_INVALID")
+        with self._session_lock:
+            current = str(self.session_ref).strip()
+            if current == normalized:
+                return
+            if not current.lower().startswith("claude-code:pending:"):
+                raise ClaudePermissionBrokerError("CLAUDE_PERMISSION_SESSION_MISMATCH")
+            self.session_ref = normalized
+
+    def current_session_ref(self) -> str:
+        with self._session_lock:
+            return str(self.session_ref)
 
     def matches(self, presented: str | None) -> bool:
         if self._revoked.is_set() or not presented:
@@ -76,7 +95,7 @@ class CapabilityToken:
 
         return {
             "provider": self.provider,
-            "session_ref": self.session_ref,
+            "session_ref": self.current_session_ref(),
             "target": self.target,
             "process_id": self.process_id,
         }
@@ -131,6 +150,12 @@ class ClaudePermissionBroker:
         )
         self._thread.start()
         return self
+
+    def bind_session_ref(self, session_ref: str) -> None:
+        """Bind the token and bridge to Claude's observed session id."""
+
+        self.token.bind_session_ref(session_ref)
+        self.bridge.bind_session_ref(session_ref)
 
     def close(self) -> None:
         if self._stopped.is_set():
@@ -293,10 +318,10 @@ class ClaudePermissionBroker:
 
         claimed_session = payload.get("session_ref")
         if claimed_session is not None:
-            if str(claimed_session) != self.token.session_ref:
+            if str(claimed_session) != self.token.current_session_ref():
                 return deny("CLAUDE_PERMISSION_SESSION_MISMATCH")
         request = dict(payload)
-        request.setdefault("session_ref", self.token.session_ref)
+        request.setdefault("session_ref", self.token.current_session_ref())
         return self.bridge.handle(request)
 
     def _handler_type(self) -> type[BaseHTTPRequestHandler]:

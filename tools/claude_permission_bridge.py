@@ -102,6 +102,27 @@ class ClaudePermissionBridge:
             self._turn_id = str(turn_id) if turn_id else None
             self._turn_revision += 1
 
+    def bind_session_ref(self, session_ref: str) -> None:
+        """Bind the provider session once Claude reports its real id.
+
+        A NEW resident has no vendor id before Claude emits its ``init``
+        event, so the bridge starts with a local ``claude-code:pending:*``
+        coordinate. That placeholder may be replaced exactly once. A
+        non-pending coordinate can only be rebound to itself; silently
+        accepting another id would let a permission prompt cross sessions.
+        """
+
+        normalized = _text(session_ref, "session_ref")
+        with self._lock:
+            if self._closed.is_set():
+                raise ClaudePermissionError("CLAUDE_PERMISSION_BRIDGE_CLOSED")
+            current = str(self.session_ref).strip()
+            if current == normalized:
+                return
+            if not current.lower().startswith("claude-code:pending:"):
+                raise ClaudePermissionError("CLAUDE_PERMISSION_SESSION_MISMATCH")
+            self.session_ref = normalized
+
     def set_permission_requester(
         self,
         requester: Callable[[Mapping[str, Any]], str | None],

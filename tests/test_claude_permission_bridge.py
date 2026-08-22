@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from claude_permission_bridge import (  # noqa: E402
     CLAUDE_PERMISSION_OPTIONS,
     PERMISSION_REQUEST_SCHEMA,
+    ClaudePermissionError,
     ClaudePermissionBridge,
 )
 
@@ -122,6 +123,17 @@ class ClaudePermissionBridgeTests(unittest.TestCase):
 
         self.assertEqual("deny", result["behavior"])
         self.assertIn("SESSION_MISMATCH", result["message"])
+
+    def test_pending_session_can_bind_once_to_observed_vendor_id(self) -> None:
+        bridge = ClaudePermissionBridge(
+            session_ref="claude-code:pending:GCS",
+            permission_requester=lambda _request: "allow-once",
+        )
+        bridge.bind_session_ref("claude-code:vendor-session")
+        self.assertEqual("claude-code:vendor-session", bridge.session_ref)
+        bridge.bind_session_ref("claude-code:vendor-session")
+        with self.assertRaisesRegex(ClaudePermissionError, "SESSION_MISMATCH"):
+            bridge.bind_session_ref("claude-code:other-session")
 
     def test_turn_mismatch_fails_closed(self) -> None:
         bridge = self._bridge("allow-once")

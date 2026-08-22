@@ -932,6 +932,9 @@ def run_hook(
                 if isinstance(response.get("room"), dict)
                 else None,
                 "bridge_line": response.get("bridge_line"),
+                "pending_instruction_dispatch": response.get(
+                    "pending_instruction_dispatch"
+                ),
             },
             **base,
         )
@@ -951,6 +954,28 @@ def run_hook(
 
 def _toml_array(items: list[str]) -> str:
     return "[" + ", ".join(json.dumps(i) for i in items) + "]"
+
+
+def provider_hook_stdout(
+    result: Mapping[str, Any],
+    *,
+    provider: str,
+    trigger: str,
+) -> dict[str, Any] | None:
+    """Extract only Common Runtime's provider-specific hook response."""
+
+    if str(trigger or "").strip().lower() != "session_start":
+        return None
+    if str(provider or "").strip().upper() != "CLAUDE":
+        return None
+    injected = result.get("inject_response")
+    if not isinstance(injected, Mapping):
+        return None
+    dispatch = injected.get("pending_instruction_dispatch")
+    if not isinstance(dispatch, Mapping):
+        return None
+    output = dispatch.get("hook_stdout")
+    return dict(output) if isinstance(output, Mapping) else None
 
 
 def _codex_hook_block(python_exe: str, script_path: str) -> str:
@@ -1246,7 +1271,18 @@ def main(argv: list[str] | None = None) -> int:
         and args.from_stdin
         and str(args.trigger or "").strip().lower() == "session_start"
     )
-    if not (args.quiet or codex_session_start):
+    hook_output = provider_hook_stdout(
+        result,
+        provider=str(args.provider or result.get("provider") or ""),
+        trigger=str(args.trigger or ""),
+    )
+    lifecycle_session_start = (
+        args.from_stdin
+        and str(args.trigger or "").strip().lower() == "session_start"
+    )
+    if hook_output is not None:
+        print(json.dumps(hook_output, separators=(",", ":"), sort_keys=True))
+    elif not (args.quiet or codex_session_start or lifecycle_session_start):
         print(json.dumps(result, indent=2, sort_keys=True))
     if args.strict and result.get("status") not in {"INJECTED", "DRY_RUN"}:
         return 1

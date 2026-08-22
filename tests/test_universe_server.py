@@ -15,7 +15,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 from unittest.mock import ANY, Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -40,6 +40,7 @@ from universe_server import (  # noqa: E402
     HttpUniverseTransport,
     UniverseError,
     UniverseStore,
+    _vendor_chat_key,
     attach_supervisor_session,
     load_server_state,
     load_universe_mode_registry,
@@ -56,6 +57,7 @@ from universe_server import (  # noqa: E402
     normalize_planning_runtime_binding,
     normalize_project_attachment,
     normalize_skill_observation_candidate,
+    perform_session_ref_inject,
     provider_ref_from_model_ref,
     publish_skill_observation,
     prepare_skill_observation_archive,
@@ -2072,6 +2074,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "codex-app-server:current",
             descriptor["provider_session_ref"],
         )
+        self.assertEqual("VERIFIED", descriptor["identity_state"])
+        self.assertEqual("SESSION_SUPERVISOR", descriptor["identity_source"])
         self.assertEqual(str(self.project_root), descriptor["repository_root"])
         rendered = json.dumps(catalog)
         self.assertNotIn("codex-app-server:current", rendered)
@@ -2753,6 +2757,350 @@ class UniverseLocalServiceTests(unittest.TestCase):
             delegation["delegation_id"]
         )
         self.assertEqual("TARGET_ACCEPTED", resumed["progress"]["step"])
+
+    def test_session_hook_keeps_existing_provider_ref_when_turn_id_is_unavailable(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        existing, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-hook-preserve-ref-001",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-code:existing-turn-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        injected = perform_session_ref_inject(
+            session_supervisor=self.server.session_supervisor,
+            multi_rooms=self.server.multi_rooms,
+            body={
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "supervisor_session_id": existing["session_id"],
+                "state": "LIVE",
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "make_default": False,
+            },
+        )
+
+        self.assertEqual(
+            "claude-code:existing-turn-001",
+            injected["supervisor_session"]["provider_session_ref"],
+        )
+
+    def test_claude_session_without_channel_does_not_inject_pty(self) -> None:
+        terminal = {
+            "terminal_id": "term-session-hook-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-session-hook-001",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.write = Mock()
+        self.server._provider_chat_key_for_session_instruction = Mock(
+            return_value=None
+        )
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "MASTER", "provider": "CLAUDE"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Create the requested project documents.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": "supervisor-session-hook-001",
+                "session_anchor_ref": "session-anchor-hook-001",
+                "provider": "CLAUDE",
+                "mode": "MASTER",
+            },
+            trigger="SESSION_START",
+        )
+
+        self.assertEqual("CLAUDE_CHANNEL_UNAVAILABLE", dispatched["status"])
+        self.assertEqual("CLAUDE_CODE_CHANNEL_REQUIRED", dispatched["delivery_mode"])
+        self.assertIsNone(dispatched["hook_stdout"])
+        self.server.terminal_host.write.assert_not_called()
+        self.assertEqual(1, self.server.session_bus.unread_count("term-session-hook-001"))
+        self.assertEqual(
+            posted["message_id"],
+            self.server.session_bus.inbox(
+                self.server.terminal_host,
+                terminal_id="term-session-hook-001",
+            )["messages"][0]["message_id"],
+        )
+
+    def test_claude_session_bus_uses_channel_without_pty_injection(self) -> None:
+        terminal = {
+            "terminal_id": "term-session-channel-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-session-channel-001",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.channel_state = Mock(return_value="READY")
+        self.server.terminal_host.push_channel = Mock(
+            return_value={"status": "QUEUED", "message_id": "msg-channel-001"}
+        )
+        self.server.terminal_host.write = Mock()
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "MASTER", "provider": "CLAUDE"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Create the requested project documents.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": "supervisor-session-channel-001",
+                "session_anchor_ref": "session-anchor-channel-001",
+                "provider": "CLAUDE",
+                "mode": "MASTER",
+            },
+            trigger="SESSION_START",
+        )
+
+        self.assertEqual("DISPATCHED", dispatched["status"])
+        self.assertEqual("CLAUDE_CODE_CHANNEL", dispatched["delivery_mode"])
+        self.assertEqual(posted["message_id"], dispatched["message_id"])
+        self.server.terminal_host.write.assert_not_called()
+        payload = self.server.terminal_host.push_channel.call_args.args[1]
+        self.assertEqual("Create the requested project documents.", payload["content"])
+        self.assertEqual("UNIVERSE_UI", payload["meta"]["sender_id"])
+        self.assertEqual(0, self.server.session_bus.unread_count(terminal["terminal_id"]))
+
+    def test_claude_channel_pending_does_not_fall_back_to_pty(self) -> None:
+        terminal = {
+            "terminal_id": "term-session-channel-pending-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-session-channel-pending-001",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.channel_state = Mock(return_value="PENDING")
+        self.server.terminal_host.write = Mock()
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "MASTER", "provider": "CLAUDE"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Wait for the authenticated channel.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": "supervisor-session-channel-pending-001",
+                "session_anchor_ref": "session-anchor-channel-pending-001",
+                "provider": "CLAUDE",
+                "mode": "MASTER",
+            },
+            trigger="SESSION_START",
+        )
+
+        self.assertEqual("CLAUDE_CHANNEL_PENDING", dispatched["status"])
+        self.assertEqual("CLAUDE_CODE_CHANNEL_PENDING", dispatched["delivery_mode"])
+        self.server.terminal_host.write.assert_not_called()
+        self.assertEqual(1, self.server.session_bus.unread_count(terminal["terminal_id"]))
+        self.assertEqual(
+            posted["message_id"],
+            self.server.session_bus.inbox(
+                self.server.terminal_host,
+                terminal_id=terminal["terminal_id"],
+            )["messages"][0]["message_id"],
+        )
+
+    def test_supervised_session_keeps_instruction_pending_until_native_chat_is_visible(self) -> None:
+        terminal = {
+            "terminal_id": "term-native-pending-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-native-pending-001",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.write = Mock()
+        self.server._provider_chat_key_for_session_instruction = Mock(
+            return_value=None
+        )
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "MASTER", "provider": "CLAUDE"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Wait for the native Claude session.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": "supervisor-native-pending-001",
+                "session_anchor_ref": "session-anchor-native-pending-001",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-code:pending-turn-001",
+                "mode": "MASTER",
+            },
+            trigger="SESSION_START",
+        )
+
+        self.assertEqual("NATIVE_PROVIDER_UNAVAILABLE", dispatched["status"])
+        self.assertEqual("PROVIDER_NATIVE_PENDING", dispatched["delivery_mode"])
+        self.server.terminal_host.write.assert_not_called()
+        self.assertEqual(1, self.server.session_bus.unread_count(terminal["terminal_id"]))
+        self.assertEqual(posted["message_id"], self.server.session_bus.inbox(
+            self.server.terminal_host,
+            terminal_id=terminal["terminal_id"],
+        )["messages"][0]["message_id"])
+
+    def test_native_chat_resolution_requires_exact_supervisor_anchor(self) -> None:
+        chat_key = _vendor_chat_key("CLAUDE", "claude-code:native-001")
+        self.server.provider_chat_catalog = Mock(
+            return_value={
+                "rooms": [
+                    {
+                        "chat_key": chat_key,
+                        "provider": "CLAUDE",
+                        "binding": {
+                            "state": "BOUND",
+                            "universe_session_id": "supervisor-native-001",
+                            "session_anchor_ref": "session-anchor-native-001",
+                        },
+                    }
+                ]
+            }
+        )
+        self.server.resolve_provider_chat_session = Mock(
+            return_value={
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-code:native-001",
+            }
+        )
+
+        self.assertEqual(
+            chat_key,
+            self.server._provider_chat_key_for_session_instruction(
+                session={
+                    "session_id": "supervisor-native-001",
+                    "session_anchor_ref": "session-anchor-native-001",
+                    "provider": "CLAUDE",
+                    "provider_session_ref": "claude-code:native-001",
+                }
+            ),
+        )
+        self.assertIsNone(
+            self.server._provider_chat_key_for_session_instruction(
+                session={
+                    "session_id": "supervisor-native-001",
+                    "session_anchor_ref": "session-anchor-other-001",
+                    "provider": "CLAUDE",
+                    "provider_session_ref": "claude-code:native-001",
+                }
+            )
+        )
+
+    def test_live_ui_instruction_dispatches_without_waiting_for_next_session_start(self) -> None:
+        terminal = {
+            "terminal_id": "term-live-session-hook-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-live-session-hook-001",
+        }
+        self.server.terminal_host.list_sessions = Mock(return_value=[terminal])
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.write = Mock()
+        native_chat_key = "provider_chat_1234567890abcdef12345678"
+        self.server._provider_chat_key_for_session_instruction = Mock(
+            return_value=native_chat_key
+        )
+
+        def accept_native_turn(
+            chat_key: str,
+            value: Mapping[str, Any],
+            *,
+            on_accepted: Callable[[Mapping[str, Any]], None] | None = None,
+            on_terminal: Callable[[Mapping[str, Any]], None] | None = None,
+        ) -> dict[str, Any]:
+            self.assertEqual(native_chat_key, chat_key)
+            self.assertEqual(
+                "Reply with exactly: HOOK_DISPATCH_CONFIRMED",
+                value["body"],
+            )
+            self.assertTrue(
+                str(value["idempotency_key"]).startswith("session-bus:msg_")
+            )
+            if on_accepted is not None:
+                on_accepted({"message_id": "provider-reply-001"})
+            return {
+                "status": "PROVIDER_SESSION_INPUT_ACCEPTED",
+                "message": {"message_id": "provider-user-001"},
+                "reply": {"message_id": "provider-reply-001"},
+            }
+
+        self.server.provider_sessions.submit = Mock(side_effect=accept_native_turn)
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "supervisor-live-session-hook-001",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-code:live-turn-001",
+                "session_anchor_ref": "session-anchor-live-hook-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        posted = self.server.post_session_bus_message(
+            {
+                "to": {"terminal_id": terminal["terminal_id"]},
+                "from": {
+                    "project_id": "universe",
+                    "mode": "CONDUCTOR",
+                    "provider": "UI",
+                },
+                "kind": "INSTRUCTION",
+                "body_text": "Reply with exactly: HOOK_DISPATCH_CONFIRMED",
+            }
+        )
+
+        message = posted["messages"][0]
+        self.assertEqual("DISPATCHED", message["delivery_state"])
+        self.assertEqual("DISPATCHED", message["dispatch_status"])
+        self.server.provider_sessions.submit.assert_called_once()
+        self.server.terminal_host.write.assert_not_called()
 
     def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

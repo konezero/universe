@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_session_inject_hook import (  # noqa: E402
     main,
+    provider_hook_stdout,
     resolve_mode,
     resolve_project_id,
     resolve_provider_and_ref,
@@ -484,6 +485,50 @@ class SessionInjectHookTests(unittest.TestCase):
                         tmp,
                         "--provider",
                         "CODEX",
+                        "--from-stdin",
+                        "--trigger",
+                        "session_start",
+                        "--dry-run",
+                    ]
+                )
+        self.assertEqual(0, code)
+        self.assertEqual("", output.getvalue())
+
+    def test_claude_hook_stdout_uses_common_runtime_event_shape(self) -> None:
+        output = provider_hook_stdout(
+            {
+                "inject_response": {
+                    "pending_instruction_dispatch": {
+                        "status": "DISPATCHED",
+                        "hook_stdout": {
+                            "hookSpecificOutput": {
+                                "hookEventName": "SessionStart",
+                                "additionalContext": "A pending instruction was claimed.",
+                            }
+                        },
+                    }
+                }
+            },
+            provider="CLAUDE",
+            trigger="session_start",
+        )
+        self.assertEqual(
+            "SessionStart", output["hookSpecificOutput"]["hookEventName"]
+        )
+
+    def test_claude_session_start_is_silent_without_common_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = StringIO()
+            with (
+                mock.patch("sys.stdin", StringIO('{"session_id":"claude-1"}')),
+                redirect_stdout(output),
+            ):
+                code = main(
+                    [
+                        "--repo-root",
+                        tmp,
+                        "--provider",
+                        "CLAUDE",
                         "--from-stdin",
                         "--trigger",
                         "session_start",

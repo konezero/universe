@@ -27,6 +27,15 @@ function activeTerminalSession() {
   return (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId) || null;
 }
 
+function terminalDockVisible(session) {
+  const stateValue = String(session?.state || "").trim().toUpperCase();
+  // Failed/closed PTYs remain in the supervisor as diagnostic history.  They
+  // must not be restored into the interactive dock after a service restart:
+  // doing so makes a stale provider --resume error look like a new-session
+  // failure and blocks the user from opening a fresh tab.
+  return ["LIVE", "STARTING", "CONNECTING"].includes(stateValue);
+}
+
 function focusTerminalInput() {
   const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
   if (surface?.term) {
@@ -160,6 +169,23 @@ function scaleFontToContainer(term, element) {
   return true;
 }
 
+function fitTerminalToContainer(term, element, fitAddon) {
+  const width = element.clientWidth;
+  const height = element.clientHeight;
+  if (!width || !height) return false;
+  if (fitAddon && typeof fitAddon.fit === "function") {
+    try {
+      fitAddon.fit();
+      return Boolean(term.cols && term.rows);
+    } catch (_error) {
+      // A just-mounted pane may not be measurable yet; use the fallback below.
+    }
+  }
+  if (!scaleFontToContainer(term, element)) return false;
+  try { term.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_error) { /* ok */ }
+  return true;
+}
+
 function ensureTerminalSurface(session) {
   if (!elements.terminalStage || typeof Terminal !== "function") return;
   state.terminalSurfaces = state.terminalSurfaces || {};
@@ -168,12 +194,17 @@ function ensureTerminalSurface(session) {
   const element = node("div", "terminal-pane");
   element.dataset.terminalId = session.terminal_id;
   elements.terminalStage.append(element);
+  const fitAddon = (
+    typeof window.FitAddon?.FitAddon === "function"
+      ? new window.FitAddon.FitAddon()
+      : null
+  );
   const term = new Terminal({
     cols: TERMINAL_COLS,
     rows: TERMINAL_ROWS,
     cursorBlink: true,
     fontSize: 13,
-    fontFamily: 'D2Coding, "Nanum Gothic Coding", "Cascadia Code", Consolas, monospace',
+    fontFamily: 'Consolas, "Cascadia Code", D2Coding, "Nanum Gothic Coding", monospace',
     unicodeVersion: "11",
     convertEol: true,
     scrollback: 5000,
@@ -184,43 +215,66 @@ function ensureTerminalSurface(session) {
     },
   });
   term.open(element);
-  const refreshAfterLayout = () => {
-    if (!scaleFontToContainer(term, element)) return false;
-    // Re-measure cell dimensions so the canvas is sized correctly.
-    try { term.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_e) { /* ok */ }
-    return true;
-  };
-  if (!refreshAfterLayout()) {
-    // element not yet laid out — retry after paint
-    window.requestAnimationFrame(() => {
-      if (!refreshAfterLayout()) {
-        window.setTimeout(refreshAfterLayout, 200);
-      }
-    });
+  if (fitAddon) {
+    try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
   }
+  const refreshAfterLayout = () => {
+    return fitTerminalToContainer(term, element, fitAddon);
+  };
+  // Keep the initial PTY geometry while its bounded replay is painted. A
+  // replay contains cursor-positioned TUI bytes from the old geometry; fitting
+  // first would wrap those bytes into vertical fragments. Fit after the
+  // initial stream quiets so the provider receives the resize and can redraw.
+  let initialLayoutPending = true;
+  let initialLayoutTimer = 0;
+  const scheduleInitialLayout = (delay = 240) => {
+    if (!initialLayoutPending) return;
+    window.clearTimeout(initialLayoutTimer);
+    initialLayoutTimer = window.setTimeout(() => {
+      if (!initialLayoutPending || element.hidden) return;
+      if (!refreshAfterLayout()) {
+        scheduleInitialLayout(200);
+        return;
+      }
+      initialLayoutPending = false;
+      if (surface) surface.initialLayoutPending = false;
+      sendCurrentSize();
+    }, delay);
+  };
   try { term.reset(); } catch (_error) { /* xterm not ready */ }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(
     `${protocol}://${window.location.host}/v1/terminals/${encodeURIComponent(session.terminal_id)}/stream`
   );
   socket.binaryType = "arraybuffer";
-  socket.addEventListener("message", (event) => writeTerminalBytes(term, event.data));
+  socket.addEventListener("message", (event) => {
+    writeTerminalBytes(term, event.data);
+    scheduleInitialLayout(240);
+  });
   bindTerminalIme(term, socket);
   let resizeTimer = 0;
-  const sendFixedSize = () => {
+  const sendCurrentSize = () => {
     if (socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: "resize", cols: TERMINAL_COLS, rows: TERMINAL_ROWS }));
+    socket.send(JSON.stringify({
+      type: "resize",
+      cols: Math.max(40, Number(term.cols) || TERMINAL_COLS),
+      rows: Math.max(20, Number(term.rows) || TERMINAL_ROWS),
+    }));
   };
   const notifySize = () => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       if (element.hidden) return;
-      scaleFontToContainer(term, element);
-      try { term.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_e) { /* ok */ }
+      if (initialLayoutPending) {
+        scheduleInitialLayout(240);
+        return;
+      }
+      fitTerminalToContainer(term, element, fitAddon);
+      sendCurrentSize();
     }, 150);
   };
   socket.addEventListener("open", () => {
-    sendFixedSize();
+    scheduleInitialLayout(360);
   });
   socket.addEventListener("close", (event) => {
     const detail = event.reason ? ` ${event.code}: ${event.reason}` : ` code=${event.code}`;
@@ -232,7 +286,16 @@ function ensureTerminalSurface(session) {
     notifySize();
   });
   resizeObserver.observe(element);
-  surface = { element, term, socket, notifySize, resizeObserver };
+  surface = {
+    element,
+    term,
+    socket,
+    notifySize,
+    resizeObserver,
+    fitAddon,
+    initialLayoutPending: true,
+    scheduleInitialLayout,
+  };
   state.terminalSurfaces[session.terminal_id] = surface;
   return surface;
 }
@@ -330,10 +393,13 @@ function refitActiveTerminal() {
     if (surface.element?.hidden) return false;
     const box = surface.element.getBoundingClientRect();
     if (box.width < 40 || box.height < 80) return false;
-    scaleFontToContainer(surface.term, surface.element);
+    if (surface.initialLayoutPending) {
+      surface.scheduleInitialLayout?.(240);
+      return true;
+    }
+    fitTerminalToContainer(surface.term, surface.element, surface.fitAddon);
     // Resize forces xterm to re-measure cell dimensions and recreate the canvas.
     // This fixes the case where open() was called while the container had 0 dimensions.
-    try { surface.term?.resize(TERMINAL_COLS, TERMINAL_ROWS); } catch (_e) { /* ok */ }
     surface.notifySize?.();
     return true;
   };
@@ -388,7 +454,11 @@ function focusTerminalForSession(coordinate, session) {
       selectTerminalTab(exact.terminal_id);
       return true;
     }
-    const live = (state.supervisorTerminals || []).find((item) => item.terminal_id === wantedId);
+    const live = (state.supervisorTerminals || []).find(
+      (item) =>
+        item.terminal_id === wantedId &&
+        terminalDockVisible(item)
+    );
     if (live) {
       state.dismissedTerminalIds = state.dismissedTerminalIds || {};
       delete state.dismissedTerminalIds[wantedId];
@@ -432,7 +502,16 @@ async function loadTerminalTabs() {
     }
     const dismissed = state.dismissedTerminalIds;
     const previous = new Set((state.terminals || []).map((item) => item.terminal_id));
-    const visible = incoming.filter((item) => !dismissed[item.terminal_id]);
+    const visible = incoming.filter(
+      (item) => !dismissed[item.terminal_id] && terminalDockVisible(item)
+    );
+    if (
+      state.activeTerminalId &&
+      !visible.some((item) => item.terminal_id === state.activeTerminalId)
+    ) {
+      state.activeTerminalId = null;
+      state.conversationSurface = "CHAT";
+    }
     const opened = visible.filter((item) => !previous.has(item.terminal_id));
     state.terminals = visible;
     renderTerminalDock();

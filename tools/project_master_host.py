@@ -4026,6 +4026,11 @@ class GrokProjectMasterRuntime:
             None
         )
         self._gateway: UniverseAcpGateway | None = None
+        # Provider startup can publish its session id from a background
+        # reader while the host is being replaced.  Advancing this epoch
+        # before closing the old gateway makes those late callbacks inert;
+        # otherwise a stale provider id can be bound to the fresh NEW slot.
+        self._observer_epoch = 0
 
     @property
     def session_ref(self) -> str:
@@ -4091,6 +4096,7 @@ class GrokProjectMasterRuntime:
         }
 
     def close(self) -> None:
+        self._observer_epoch += 1
         if self._gateway is not None:
             self._gateway.close()
             self._gateway = None
@@ -4117,7 +4123,11 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
         model = self.model or default_model
 
+        observer_epoch = self._observer_epoch
+
         def observe_session(session_id: str) -> None:
+            if observer_epoch != self._observer_epoch:
+                return
             self.session_id = session_id
             self.connection_state = self.store.observe_provider_session(
                 "GROK", session_id
@@ -4225,6 +4235,11 @@ class CodexProjectMasterRuntime:
             None
         )
         self._gateway: UniverseAcpGateway | None = None
+        # Provider startup can publish its session id from a background
+        # reader while the host is being replaced.  Advancing this epoch
+        # before closing the old gateway makes those late callbacks inert;
+        # otherwise a stale provider id can be bound to the fresh NEW slot.
+        self._observer_epoch = 0
 
     @property
     def session_ref(self) -> str:
@@ -4340,7 +4355,11 @@ class CodexProjectMasterRuntime:
             raise ProjectMasterHostError("CODEX_CLI_UNAVAILABLE")
         model = self.model or default_model
 
+        observer_epoch = self._observer_epoch
+
         def observe_session(session_id: str) -> None:
+            if observer_epoch != self._observer_epoch:
+                return
             self.session_id = session_id
             self.connection_state = self.store.observe_provider_session(
                 "CODEX", session_id
@@ -4535,8 +4554,25 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         environment["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] = "1"
         model = self.model or default_model
 
+        # A NEW Claude resident has only a local pending coordinate until the
+        # provider emits its ``system/init`` session id. Bind the permission
+        # bridge and broker to that real id before the first prompt.
+        bridge = ClaudePermissionBridge(
+            session_ref=self.session_ref,
+            permission_requester=self._permission_requester,
+        )
+        broker: ClaudePermissionBroker | None = None
+
+        observer_epoch = self._observer_epoch
+
         def observe_session(session_id: str) -> None:
+            if observer_epoch != self._observer_epoch:
+                return
             self.session_id = session_id
+            if broker is not None:
+                broker.bind_session_ref(self.session_ref)
+            else:
+                bridge.bind_session_ref(self.session_ref)
             self.connection_state = self.store.observe_provider_session(
                 "CLAUDE", session_id
             )
@@ -4545,11 +4581,6 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         # Resident Claude: one long-lived stream-json process for this target,
         # with permission prompts routed to the existing requester through the
         # loopback MCP bridge.
-        bridge = ClaudePermissionBridge(
-            session_ref=self.session_ref,
-            permission_requester=self._permission_requester,
-        )
-        broker: ClaudePermissionBroker | None = None
         config_root: Path | None = None
         try:
             broker = ClaudePermissionBroker(
