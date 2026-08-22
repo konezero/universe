@@ -40,6 +40,8 @@ class TerminalSession:
     cwd: str
     executable: str
     created_at: str
+    model_ref: str = ""
+    effort: str = "AUTO"
     state: str = "STARTING"
     cols: int = 120
     rows: int = 32
@@ -58,6 +60,8 @@ class TerminalSession:
             "project_id": self.project_id,
             "mode": self.mode,
             "provider": self.provider,
+            "model_ref": self.model_ref,
+            "effort": self.effort,
             "supervisor_session_id": self.supervisor_session_id,
             "cwd": self.cwd,
             "executable": Path(self.executable).name,
@@ -119,6 +123,8 @@ class TerminalHost:
         mode: str,
         cwd: str,
         provider: str = "AUTO",
+        model_ref: str = "",
+        effort: str = "AUTO",
         supervisor_session_id: str = "",
         resume_session_ref: str = "",
         cols: int = 120,
@@ -138,8 +144,15 @@ class TerminalHost:
         selected = str(provider or "AUTO").strip().upper()
         executable = resolve_cli_executable(selected)
         resolved_provider = selected if selected != "AUTO" else infer_provider(executable)
+        selected_model = str(model_ref or "").strip()
+        selected_effort = str(effort or "AUTO").strip().upper() or "AUTO"
         supervisor = str(supervisor_session_id or "").strip()
-        argv = resume_argv(resolved_provider, resume_session_ref)
+        argv = startup_argv(
+            resolved_provider,
+            resume_session_ref,
+            model_ref=selected_model,
+            effort=selected_effort,
+        )
         terminal_id = "term_" + secrets.token_hex(8)
         session = TerminalSession(
             terminal_id=terminal_id,
@@ -150,6 +163,8 @@ class TerminalHost:
             cwd=str(root.resolve()),
             executable=executable,
             created_at=_now(),
+            model_ref=selected_model,
+            effort=selected_effort,
             cols=max(80, int(cols or 120)),
             rows=max(24, int(rows or 32)),
         )
@@ -157,6 +172,8 @@ class TerminalHost:
             "UNIVERSE_PROJECT_ID": project,
             "UNIVERSE_MODE": requested_mode,
             "UNIVERSE_PROVIDER": resolved_provider,
+            "UNIVERSE_MODEL_REF": selected_model,
+            "UNIVERSE_EFFORT": selected_effort,
             "UNIVERSE_SUPERVISOR_SESSION_ID": supervisor,
             "UNIVERSE_TERMINAL_ID": terminal_id,
         }
@@ -437,6 +454,36 @@ def resume_argv(provider: str, resume_session_ref: str) -> list[str]:
     if name == "CODEX":
         return ["resume", ref]
     return []
+
+
+def startup_argv(
+    provider: str,
+    resume_session_ref: str,
+    *,
+    model_ref: str = "",
+    effort: str = "AUTO",
+) -> list[str]:
+    """Build one interactive CLI command without changing its supervisor anchor.
+
+    Model and effort are per-terminal launch preferences.  They are not written
+    back into the project default, and a later provider session id only enriches
+    the supervisor session created for this PTY.
+    """
+    name = str(provider or "").strip().upper()
+    model = str(model_ref or "").strip()
+    selected_effort = str(effort or "AUTO").strip().upper() or "AUTO"
+    argv: list[str] = []
+    if name in {"GROK", "CLAUDE", "CODEX"} and model:
+        argv.extend(("--model", model))
+    if selected_effort != "AUTO":
+        if name == "GROK":
+            argv.extend(("--reasoning-effort", selected_effort.lower()))
+        elif name == "CLAUDE":
+            argv.extend(("--effort", selected_effort.lower()))
+        elif name == "CODEX":
+            argv.extend(("--config", f"model_reasoning_effort={selected_effort.lower()}"))
+    argv.extend(resume_argv(name, resume_session_ref))
+    return argv
 
 
 def infer_provider(executable: str) -> str:

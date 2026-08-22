@@ -248,6 +248,10 @@ function observerProvider(session) {
 }
 
 function terminalProviderFor(_coordinate, session) {
+  const selectedProvider = String(_coordinate?.provider || "").toUpperCase();
+  if (["GROK", "CODEX", "CLAUDE"].includes(selectedProvider)) {
+    return selectedProvider;
+  }
   const boundProvider = String(
     session?.provider || session?.current_provider || ""
   ).toUpperCase();
@@ -299,6 +303,8 @@ async function createTerminalTab(coordinate, session) {
       mode,
       cwd,
       provider: terminalProviderFor(coordinate, session),
+      model_ref: String(coordinate?.modelRef || coordinate?.model_ref || "").trim(),
+      effort: String(coordinate?.effort || "AUTO").toUpperCase(),
       supervisor_session_id: String(
         session?.session_id || session?.universe_session_id || ""
       ).trim(),

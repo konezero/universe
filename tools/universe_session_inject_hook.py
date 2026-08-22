@@ -741,6 +741,9 @@ def run_hook(
         environment=env,
         repo_root=repo_root,
     )
+    supervisor_session_id = str(
+        env.get("UNIVERSE_SUPERVISOR_SESSION_ID") or ""
+    ).strip()
     project_id = resolve_project_id(
         args=args,
         session_fields=session_fields,
@@ -779,10 +782,15 @@ def run_hook(
             detail="provider not resolved",
             **base,
         )
-    if not session_ref:
+    # A PTY-backed CLI is already a concrete session host.  Some providers do
+    # not publish their durable conversation id until the first turn, so the
+    # SessionStart hook must still establish the Session Anchor from the
+    # supervisor coordinate.  The provider id is bound later to this same
+    # session; it must never cause a replacement anchor.
+    if not session_ref and not supervisor_session_id:
         return _result(
             "SKIPPED",
-            detail="session_ref not resolved",
+            detail="provider session ref and supervisor session id not resolved",
             **base,
         )
     if not project_id:
@@ -792,9 +800,6 @@ def run_hook(
             **base,
         )
 
-    supervisor_session_id = str(
-        env.get("UNIVERSE_SUPERVISOR_SESSION_ID") or ""
-    ).strip()
     observation = {
         "schema": "universe.provider-session-observation.v1",
         "observed_at": utc_now(),
@@ -815,11 +820,18 @@ def run_hook(
 
     # Patch mode_current_anchor.snapshot_json with observer_session_ref.
     # Local SQLite write — runs even when Universe is offline.
-    anchor_patch = patch_mode_current_anchor(
-        repo_root,
-        provider=provider,
-        session_ref=session_ref,
-        mode=mode,
+    anchor_patch = (
+        patch_mode_current_anchor(
+            repo_root,
+            provider=provider,
+            session_ref=session_ref,
+            mode=mode,
+        )
+        if session_ref
+        else {
+            "status": "DEFERRED_PROVIDER_IDENTITY",
+            "detail": "Session Anchor is created from the PTY supervisor; provider identity is attached later.",
+        }
     )
 
     inject_body = {
@@ -829,7 +841,6 @@ def run_hook(
         "room_type": room_type,
         "slot_role": slot_role,
         "provider": provider,
-        "provider_session_ref": session_ref,
         "make_default": make_default,
         "bounded_summary": f"Hook inject ({args.trigger})",
         # This is metadata about a successful local hook observation, not a
@@ -847,8 +858,12 @@ def run_hook(
             else ""
         ),
     }
+    if session_ref:
+        inject_body["provider_session_ref"] = session_ref
     if supervisor_session_id:
         inject_body["supervisor_session_id"] = supervisor_session_id
+        if str(args.trigger or "").strip().lower() == "session_start":
+            inject_body["state"] = "STARTING"
 
     if args.dry_run:
         return _result(

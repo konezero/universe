@@ -14,6 +14,7 @@ from universe_app.terminal_host import (  # noqa: E402
     TerminalHostError,
     resolve_cli_executable,
     resume_argv,
+    startup_argv,
 )
 
 
@@ -82,6 +83,8 @@ class TerminalHostTests(unittest.TestCase):
                 "UNIVERSE_PROJECT_ID": "GCS",
                 "UNIVERSE_MODE": "MASTER",
                 "UNIVERSE_PROVIDER": "GROK",
+                "UNIVERSE_MODEL_REF": "",
+                "UNIVERSE_EFFORT": "AUTO",
                 "UNIVERSE_SUPERVISOR_SESSION_ID": "",
                 "UNIVERSE_TERMINAL_ID": created["terminal_id"],
             },
@@ -120,6 +123,27 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(["resume", "abc"], resume_argv("CODEX", "abc"))
         self.assertEqual([], resume_argv("GROK", "UNKNOWN"))
         self.assertEqual([], resume_argv("GROK", ""))
+
+    def test_startup_argv_keeps_model_and_effort_with_provider_resume(self) -> None:
+        self.assertEqual(
+            ["--model", "grok-4.6", "--reasoning-effort", "max", "--resume", "abc"],
+            startup_argv("GROK", "abc", model_ref="grok-4.6", effort="MAX"),
+        )
+        self.assertEqual(
+            ["--model", "opus", "--effort", "medium", "--resume", "abc"],
+            startup_argv("CLAUDE", "abc", model_ref="opus", effort="MEDIUM"),
+        )
+        self.assertEqual(
+            [
+                "--model",
+                "gpt-5.6",
+                "--config",
+                "model_reasoning_effort=high",
+                "resume",
+                "abc",
+            ],
+            startup_argv("CODEX", "abc", model_ref="gpt-5.6", effort="HIGH"),
+        )
 
     def test_resume_rejects_universe_internal_session_ids(self) -> None:
         with self.assertRaises(TerminalHostError) as invalid:

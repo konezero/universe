@@ -2218,6 +2218,8 @@ async function startNewNodeModeSession(coordinate) {
   if (!projectId || !cwd || !mode) {
     throw new Error("New sessions require a registered project and Mode");
   }
+  const selectedProvider = String(coordinate?.provider || "").trim().toUpperCase();
+  if (selectedProvider) coordinate.provider = selectedProvider;
   await createTerminalTab(coordinate);
   await refreshSupervisorSessions();
   expandConversationLayer();
@@ -5374,6 +5376,10 @@ async function submitNewSession(event) {
   const project = (state.projects || []).find(
     (item) => String(item.project_id || "").toLowerCase() === projectId.toLowerCase()
   );
+  const universeProject = (state.projects || []).find((item) =>
+    String(item.project_id || "").toLowerCase() === "universe" ||
+    String(item.metadata?.network_role || "").toUpperCase() === "UNIVERSE_HOME"
+  );
   if (mode === "MASTER" && !project?.project_root) {
     if (elements.newSessionError) elements.newSessionError.textContent = "Project has no registered root path";
     return;
@@ -5384,12 +5390,18 @@ async function submitNewSession(event) {
   }
   if (elements.newSessionError) elements.newSessionError.textContent = "";
   try {
-    const options = { provider, modelRef, effort, sessionAction: "NEW" };
-    if (mode === "CONDUCTOR") {
-      await callUniverseConductor(options);
-    } else {
-      await callProjectMaster(projectId, { ...options, cwd: project.project_root, requestedMode: "MASTER" });
+    const terminalProject = mode === "CONDUCTOR" ? universeProject : project;
+    if (!terminalProject?.project_root) {
+      throw new Error("Universe home has no registered root path");
     }
+    await startNewNodeModeSession({
+      project: terminalProject,
+      nodeId: terminalProject.project_id,
+      mode,
+      provider,
+      modelRef,
+      effort,
+    });
     elements.newSessionDialog.close();
     toast(`New ${mode === "CONDUCTOR" ? "Conductor" : "Master"} session started: ${provider} / ${modelRef || "host default"} / ${effort}`);
   } catch (error) {

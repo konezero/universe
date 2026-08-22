@@ -21818,6 +21818,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         mode = str(payload.get("mode") or "MASTER").strip().upper()
         cwd = str(payload.get("cwd") or "").strip()
         provider = str(payload.get("provider") or "AUTO").strip().upper()
+        model_ref = str(payload.get("model_ref") or "").strip()
+        effort = str(payload.get("effort") or "AUTO").strip().upper() or "AUTO"
         resume_ref = str(payload.get("resume_session_ref") or "").strip()
         supervisor_session_id = str(
             payload.get("supervisor_session_id") or ""
@@ -21888,6 +21890,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 mode=mode,
                 cwd=cwd,
                 provider=provider,
+                model_ref=model_ref,
+                effort=effort,
                 supervisor_session_id=supervisor_session_id,
                 resume_session_ref=resume_ref,
                 cols=int(payload.get("cols") or 120),
@@ -31139,6 +31143,9 @@ def perform_session_ref_inject(
     normalized_ref = str(
         body.get("provider_session_ref") or body.get("session_ref") or ""
     ).strip()
+    explicit_session_id = str(
+        body.get("supervisor_session_id") or body.get("session_id") or ""
+    ).strip()
     ref_source = "EXPLICIT"
     if not normalized_ref:
         env = os.environ if environment is None else environment
@@ -31147,10 +31154,10 @@ def perform_session_ref_inject(
             normalized_ref = str(env.get(environment_key) or "").strip()
             if normalized_ref:
                 ref_source = environment_key
-    if not normalized_ref:
+    if not normalized_ref and not explicit_session_id:
         raise UniverseError(
             "PROVIDER_SESSION_REF_REQUIRED",
-            "provider session ref is required; Codex Desktop may supply CODEX_THREAD_ID",
+            "provider session ref is required unless a live PTY supervisor session is supplied",
         )
 
     room_id = body.get("room_id")
@@ -31180,9 +31187,6 @@ def perform_session_ref_inject(
         normalized_node = "CONDUCTOR"
     normalized_mode = str(body.get("mode") or "MASTER").strip().upper() or "MASTER"
 
-    explicit_session_id = str(
-        body.get("supervisor_session_id") or body.get("session_id") or ""
-    ).strip()
     session_id = explicit_session_id or supervisor_session_id_for(
         node=normalized_node,
         mode=normalized_mode,
@@ -31207,7 +31211,7 @@ def perform_session_ref_inject(
             "node": normalized_node,
             "mode": normalized_mode,
             "provider": normalized_provider,
-            "provider_session_ref": normalized_ref,
+            "provider_session_ref": normalized_ref or None,
             "alias": normalized_alias,
             "state": str(body.get("state") or "DISCONNECTED").strip().upper()
             or "DISCONNECTED",
@@ -31276,7 +31280,7 @@ def perform_session_ref_inject(
             "room_type": room_type,
             "slot_role": slot_role,
             "provider": normalized_provider,
-            "provider_session_ref": normalized_ref,
+            "provider_session_ref": normalized_ref or None,
             "supervisor_session_id": session_id,
             "display_name": display_name,
         }
@@ -31303,8 +31307,12 @@ def perform_session_ref_inject(
                 session_supervisor=session_supervisor,
                 requested_mode=normalized_mode or "MASTER",
             )
-            observation = master_store.observe_provider_session(
-                normalized_provider, normalized_ref
+            observation = (
+                master_store.observe_provider_session(
+                    normalized_provider, normalized_ref
+                )
+                if normalized_ref
+                else "SUPERVISOR_OBSERVED"
             )
             project_master = {
                 "project_id": str(project_id),
@@ -31340,6 +31348,9 @@ def perform_session_ref_inject(
         "supervisor_session": session,
         "supervisor_session_created": created,
         "provider_session_ref_source": ref_source,
+        "provider_identity_state": (
+            "VERIFIED" if normalized_ref else "SUPERVISOR_OBSERVED"
+        ),
         "make_default": make_default,
         "default_selection": (
             dict(default_selection) if default_selection is not None else None

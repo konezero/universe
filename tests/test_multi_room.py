@@ -873,6 +873,32 @@ class MultiRoomStoreTests(unittest.TestCase):
         self.assertFalse(again["supervisor_session_created"])
         self.assertEqual(expected_id, again["binding"]["supervisor_session_id"])
 
+    def test_pty_session_start_can_bind_before_provider_identity_exists(self) -> None:
+        injected = perform_session_ref_inject(
+            session_supervisor=self.supervisor,
+            multi_rooms=self.store,
+            body={
+                "project_id": "proj_pty_start",
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "provider": "CLAUDE",
+                "supervisor_session_id": "session_pty_start_1",
+                "state": "STARTING",
+            },
+        )
+        self.assertEqual("SESSION_REF_INJECTED", injected["status"])
+        self.assertEqual(
+            "SUPERVISOR_OBSERVED", injected["provider_identity_state"]
+        )
+        self.assertEqual(
+            "session_pty_start_1", injected["supervisor_session"]["session_id"]
+        )
+        self.assertIsNone(injected["supervisor_session"]["provider_session_ref"])
+        self.assertEqual(
+            "session_pty_start_1", injected["binding"]["supervisor_session_id"]
+        )
+        self.assertIsNone(injected["binding"]["provider_session_ref"])
+
     def test_inject_model_slot_skips_default_by_default(self) -> None:
         room = self.store.create_meeting_room(
             {

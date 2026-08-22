@@ -61,6 +61,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("function normalizeNodeModeNode(nodeId)", APP)
         self.assertIn("function nodeModeCatalog(project)", APP)
         self.assertIn('const modes = isUniverseHome ? ["MASTER", "CONDUCTOR"] : ["MASTER"];', APP)
+        self.assertIn("const terminalProject = mode === \"CONDUCTOR\" ? universeProject : project;", APP)
+        self.assertIn("await startNewNodeModeSession({", APP)
         self.assertIn("function nodeModeSessionIsActive(session)", APP)
         self.assertIn("function nodeModeSessionIsCurrent(session)", APP)
         self.assertIn("function vendorStreamStateForSession(session)", APP)

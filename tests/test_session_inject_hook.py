@@ -430,6 +430,47 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("bind_1", result["inject_response"]["binding_id"])
         self.assertEqual("session_start", result["trigger"])
 
+    def test_session_start_binds_live_pty_before_provider_id_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "server.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "http://127.0.0.1:59999",
+                        "token": "test-token",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            captured: dict[str, object] = {}
+
+            def post(*, payload, **_kwargs):
+                captured.update(payload)
+                return 200, {"status": "SESSION_REF_INJECTED"}, None
+
+            with mock.patch(
+                "universe_session_inject_hook.endpoint_reachable",
+                return_value=True,
+            ), mock.patch("universe_session_inject_hook.post_inject", side_effect=post):
+                result = run_hook(
+                    _args(
+                        repo_root=root,
+                        project_id="proj_pty_start",
+                        provider="CLAUDE",
+                        state_file=state,
+                        trigger="session_start",
+                    ),
+                    environment={
+                        "UNIVERSE_SUPERVISOR_SESSION_ID": "session_pty_start_1"
+                    },
+                )
+        self.assertEqual("INJECTED", result["status"])
+        self.assertEqual("session_pty_start_1", captured["supervisor_session_id"])
+        self.assertNotIn("provider_session_ref", captured)
+        self.assertEqual("STARTING", captured["state"])
+        self.assertEqual("DEFERRED_PROVIDER_IDENTITY", result["anchor_patch"]["status"])
+
     def test_codex_session_start_is_silent_for_legacy_hook_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = StringIO()
