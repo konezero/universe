@@ -423,6 +423,9 @@ TODO_STATES = frozenset({"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
 GOAL_STATES = frozenset({"DESIGNING", "READY", "ACTIVE", "BLOCKED", "DONE"})
 MILESTONE_STATES = frozenset({"PLANNED", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
 TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
+TODO_MUTATION_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
+TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
+TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
@@ -1648,6 +1651,66 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
             )
         normalized["revision"] = revision
     return normalized
+
+
+def normalize_todo_mutation_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="todo_mutation_request",
+        required=frozenset(
+            {
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "instruction_ref",
+                "todo",
+            }
+        ),
+        optional=frozenset({"schema", "ttl_seconds"}),
+    )
+    provider = _required_text(request["provider"], "provider").upper()
+    if provider not in TODO_MUTATION_PROVIDERS:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_INVALID",
+            "provider must be CODEX, CLAUDE, or GROK",
+        )
+    provider_session_ref = _required_text(
+        request["provider_session_ref"], "provider_session_ref"
+    )
+    if len(provider_session_ref) > 1000:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_SESSION_REF_INVALID",
+            "provider_session_ref is too long",
+        )
+    instruction_ref = _required_text(request["instruction_ref"], "instruction_ref")
+    if len(instruction_ref) > 512:
+        raise UniverseError(
+            "TODO_MUTATION_INSTRUCTION_REF_INVALID",
+            "instruction_ref is too long",
+        )
+    ttl_seconds = request.get("ttl_seconds", TODO_MUTATION_RECEIPT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds < 1
+        or ttl_seconds > TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "TODO_MUTATION_TTL_INVALID",
+            f"ttl_seconds must be between 1 and {TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS}",
+        )
+    return {
+        "provider": provider,
+        "provider_session_ref": provider_session_ref,
+        "session_id": _identifier(request["session_id"], "session_id"),
+        "session_anchor_ref": _required_text(
+            request["session_anchor_ref"], "session_anchor_ref"
+        ),
+        "instruction_ref": instruction_ref,
+        "todo": request["todo"],
+        "ttl_seconds": ttl_seconds,
+    }
 
 
 def _optional_identifier(value: Any, field: str) -> str | None:
@@ -4806,6 +4869,25 @@ class UniverseStore:
                     scope_kind, project_id, node_ref, state, priority,
                     sort_order, updated_at, todo_id
                 );
+
+                CREATE TABLE IF NOT EXISTS todo_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    instruction_ref TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PREPARED', 'CONSUMED')),
+                    todo_id TEXT,
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(session_id, instruction_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS todo_mutation_receipt_status_expiry
+                ON todo_mutation_receipt(status, expires_at, receipt_id);
 
                 CREATE TABLE IF NOT EXISTS skill_catalog (
                     skill_id TEXT NOT NULL,
@@ -9178,49 +9260,270 @@ class UniverseStore:
                 )
 
     def create_todo(self, value: Any) -> dict[str, Any]:
+        todo = self._prepare_todo_for_insert(value)
+        todo_id = todo.get("todo_id") or "todo_" + uuid.uuid4().hex
+        now = utc_now()
+        with self._connection() as connection:
+            self._insert_todo(connection, todo_id, todo, now)
+        return self.get_todo(todo_id)
+
+    def _prepare_todo_for_insert(self, value: Any) -> dict[str, Any]:
         todo = normalize_todo(value)
         if todo["priority"] == "AUTO":
             todo["priority"] = infer_todo_priority(todo)["priority"]
         if todo["project_id"] is not None:
             self.get_project(todo["project_id"])
         self._validate_todo_plan_binding(todo)
-        todo_id = todo.get("todo_id") or "todo_" + uuid.uuid4().hex
-        now = utc_now()
+        return todo
+
+    @staticmethod
+    def _insert_todo(
+        connection: sqlite3.Connection,
+        todo_id: str,
+        todo: Mapping[str, Any],
+        now: str,
+    ) -> None:
+        try:
+            connection.execute(
+                """
+                INSERT INTO project_todo(
+                    todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
+                    priority, state, source_kind, sort_order, revision,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    todo_id,
+                    todo["scope_kind"],
+                    todo["project_id"],
+                    todo["node_ref"],
+                    todo["universe_goal_id"],
+                    todo["goal_id"],
+                    todo["milestone_id"],
+                    todo["title"],
+                    todo["detail"],
+                    todo["priority"],
+                    todo["state"],
+                    todo["source_kind"],
+                    todo["sort_order"],
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise UniverseError(
+                "TODO_ID_CONFLICT",
+                "todo_id already exists",
+                HTTPStatus.CONFLICT,
+            ) from error
+
+    @staticmethod
+    def _todo_mutation_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": "universe.todo-mutation-receipt.v1",
+            "receipt_id": row["receipt_id"],
+            "session_id": row["session_id"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "provider": row["provider"],
+            "provider_session_ref_hash": row["provider_session_ref_hash"],
+            "instruction_ref": row["instruction_ref"],
+            "payload_sha256": row["payload_sha256"],
+            "status": row["status"],
+            "todo_id": row["todo_id"],
+            "prepared_at": row["prepared_at"],
+            "expires_at": row["expires_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    def _bound_todo_mutation(
+        self,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str, str]:
+        todo = self._prepare_todo_for_insert(request["todo"])
+        if "todo_id" not in todo:
+            stable_material = {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+                "todo": todo,
+            }
+            todo["todo_id"] = "todo_" + _json_sha256(stable_material)[:32]
+        payload_sha256 = _json_sha256(todo)
+        provider_ref_hash = hashlib.sha256(
+            str(request["provider_session_ref"]).encode("utf-8")
+        ).hexdigest()
+        return todo, payload_sha256, provider_ref_hash
+
+    def prepare_todo_mutation_receipt(
+        self,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        _, payload_sha256, provider_ref_hash = self._bound_todo_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=int(request["ttl_seconds"]))
+        ).isoformat().replace("+00:00", "Z")
+        receipt_id = "todo_receipt_" + _json_sha256(
+            {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+            }
+        )[:24]
         with self._connection() as connection:
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO project_todo(
-                        todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
-                        priority, state, source_kind, sort_order, revision,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                    """,
-                    (
-                        todo_id,
-                        todo["scope_kind"],
-                        todo["project_id"],
-                        todo["node_ref"],
-                        todo["universe_goal_id"],
-                        todo["goal_id"],
-                        todo["milestone_id"],
-                        todo["title"],
-                        todo["detail"],
-                        todo["priority"],
-                        todo["state"],
-                        todo["source_kind"],
-                        todo["sort_order"],
-                        now,
-                        now,
-                    ),
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE session_id = ? AND instruction_ref = ?",
+                (request["session_id"], request["instruction_ref"]),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    payload_sha256,
                 )
-            except sqlite3.IntegrityError as error:
+                actual = (
+                    existing["session_anchor_ref"],
+                    existing["provider"],
+                    existing["provider_session_ref_hash"],
+                    existing["payload_sha256"],
+                )
+                if actual != expected:
+                    raise UniverseError(
+                        "TODO_MUTATION_RECEIPT_CONFLICT",
+                        "instruction_ref is already bound to different mutation material",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "PREPARED" and datetime.fromisoformat(
+                    str(existing["expires_at"]).replace("Z", "+00:00")
+                ) <= now_datetime:
+                    connection.execute(
+                        "UPDATE todo_mutation_receipt SET prepared_at = ?, expires_at = ? WHERE receipt_id = ?",
+                        (now, expires_at, existing["receipt_id"]),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                        (existing["receipt_id"],),
+                    ).fetchone()
+                return self._todo_mutation_receipt_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO todo_mutation_receipt(
+                    receipt_id, session_id, session_anchor_ref, provider,
+                    provider_session_ref_hash, instruction_ref, payload_sha256,
+                    status, todo_id, prepared_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', NULL, ?, ?, NULL)
+                """,
+                (
+                    receipt_id,
+                    request["session_id"],
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["instruction_ref"],
+                    payload_sha256,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        return self._todo_mutation_receipt_row(row), True
+
+    def consume_todo_mutation_receipt(
+        self,
+        receipt_id: str,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        normalized_receipt_id = _identifier(receipt_id, "receipt_id")
+        todo, payload_sha256, provider_ref_hash = self._bound_todo_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                (normalized_receipt_id,),
+            ).fetchone()
+            if receipt is None:
                 raise UniverseError(
-                    "TODO_ID_CONFLICT",
-                    "todo_id already exists",
+                    "TODO_MUTATION_RECEIPT_NOT_FOUND",
+                    "Todo mutation receipt does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            expected = (
+                request["session_id"],
+                request["session_anchor_ref"],
+                request["provider"],
+                provider_ref_hash,
+                request["instruction_ref"],
+                payload_sha256,
+            )
+            actual = (
+                receipt["session_id"],
+                receipt["session_anchor_ref"],
+                receipt["provider"],
+                receipt["provider_session_ref_hash"],
+                receipt["instruction_ref"],
+                receipt["payload_sha256"],
+            )
+            if actual != expected:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "receipt is not bound to this session, Anchor, instruction, and payload",
                     HTTPStatus.CONFLICT,
-                ) from error
-        return self.get_todo(todo_id)
+                )
+            if receipt["status"] == "CONSUMED":
+                todo_row = connection.execute(
+                    "SELECT * FROM project_todo WHERE todo_id = ?",
+                    (receipt["todo_id"],),
+                ).fetchone()
+                if todo_row is None:
+                    raise UniverseError(
+                        "TODO_MUTATION_RECEIPT_CORRUPT",
+                        "consumed receipt has no persisted Todo",
+                        HTTPStatus.CONFLICT,
+                    )
+                return (
+                    self._todo_mutation_receipt_row(receipt),
+                    self._todo_row(todo_row),
+                    True,
+                )
+            if datetime.fromisoformat(
+                str(receipt["expires_at"]).replace("Z", "+00:00")
+            ) <= now_datetime:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_EXPIRED",
+                    "Todo mutation receipt expired before consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            todo_id = str(todo["todo_id"])
+            self._insert_todo(connection, todo_id, todo, now)
+            updated = connection.execute(
+                """
+                UPDATE todo_mutation_receipt
+                SET status = 'CONSUMED', todo_id = ?, consumed_at = ?
+                WHERE receipt_id = ? AND status = 'PREPARED'
+                """,
+                (todo_id, now, normalized_receipt_id),
+            )
+            if updated.rowcount != 1:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "Todo mutation receipt changed during consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            receipt = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                (normalized_receipt_id,),
+            ).fetchone()
+            todo_row = connection.execute(
+                "SELECT * FROM project_todo WHERE todo_id = ?",
+                (todo_id,),
+            ).fetchone()
+        return self._todo_mutation_receipt_row(receipt), self._todo_row(todo_row), False
 
     def list_todos(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -18993,6 +19296,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
+
+    def resolve_todo_mutation_session(
+        self,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        matching = [
+            session
+            for session in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(session.get("provider") or "").upper() == request["provider"]
+            and str(session.get("provider_session_ref") or "")
+            == request["provider_session_ref"]
+        ]
+        current = [session for session in matching if session.get("currentness") == "CURRENT"]
+        if not current:
+            raise UniverseError(
+                "TODO_MUTATION_SESSION_NOT_CURRENT",
+                "provider session is not current in the Session Supervisor",
+                HTTPStatus.CONFLICT,
+            )
+        if len(current) != 1:
+            raise UniverseError(
+                "TODO_MUTATION_SESSION_AMBIGUOUS",
+                "provider session resolves to more than one current supervised session",
+                HTTPStatus.CONFLICT,
+            )
+        session = current[0]
+        if session["session_id"] != request["session_id"]:
+            raise UniverseError(
+                "TODO_MUTATION_SESSION_MISMATCH",
+                "request session_id does not match the current provider session",
+                HTTPStatus.CONFLICT,
+            )
+        if session["session_anchor_ref"] != request["session_anchor_ref"]:
+            raise UniverseError(
+                "TODO_MUTATION_ANCHOR_MISMATCH",
+                "request Session Anchor is not current for the provider session",
+                HTTPStatus.CONFLICT,
+            )
+        return session
 
     def _resume_remote_access_background(self) -> None:
         try:
@@ -29463,6 +29805,43 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "TODO_RECORDED",
                         "todo": todo,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            if path == "/v1/todo-mutation-receipts":
+                request = normalize_todo_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, created = self.server.store.prepare_todo_mutation_receipt(
+                    request
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_MUTATION_RECEIPT_PREPARED",
+                        "receipt": receipt,
+                    },
+                )
+                return
+            todo_mutation_consume = re.fullmatch(
+                r"/v1/todo-mutation-receipts/([^/]+)/consume", path
+            )
+            if todo_mutation_consume is not None:
+                request = normalize_todo_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, todo, replayed = self.server.store.consume_todo_mutation_receipt(
+                    unquote(todo_mutation_consume.group(1)), request
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_MUTATION_APPLIED",
+                        "receipt": receipt,
+                        "todo": todo,
+                        "replayed": replayed,
                         "task_frame_created": False,
                         "execution_assignment_created": False,
                     },

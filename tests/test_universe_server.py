@@ -29,6 +29,7 @@ JsonObject = dict[str, Any]
 
 from core_release import build_release  # noqa: E402
 from host_profile import HostProfileStore  # noqa: E402
+from todo_mutation_gateway import TodoMutationGateway, TodoMutationGatewayError  # noqa: E402
 from project_master_host import (  # noqa: E402
     ProjectMasterHostError,
     ProjectTaskProposalAdapter,
@@ -945,6 +946,156 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         retained = next(item for item in todos["todos"] if item["todo_id"] == todo_id)
         self.assertEqual("DONE", retained["state"])
+
+    def test_todo_mutation_gateway_is_identical_for_attached_and_standalone_sessions(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        attached, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "todo-attached-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "todo-attached-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        standalone, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "todo-standalone-session",
+                "project_id": "standalone-project",
+                "node": "standalone-project",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "todo-standalone-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        gateway = TodoMutationGateway(self.endpoint, self.token)
+        todo = {
+            "scope_kind": "UNIVERSE",
+            "title": "Use one receipt path",
+            "detail": "Mode and source_kind are not mutation authority.",
+            "priority": "P1",
+            "state": "READY",
+            "source_kind": "CONDUCTOR",
+            "sort_order": 0,
+        }
+
+        attached_result = gateway.create_todo(
+            provider="CODEX",
+            provider_session_ref="todo-attached-provider-ref",
+            session_id=attached["session_id"],
+            session_anchor_ref=attached["session_anchor_ref"],
+            instruction_ref="conversation://test/attached-todo",
+            todo=todo,
+        )
+        standalone_result = gateway.create_todo(
+            provider="CLAUDE",
+            provider_session_ref="todo-standalone-provider-ref",
+            session_id=standalone["session_id"],
+            session_anchor_ref=standalone["session_anchor_ref"],
+            instruction_ref="conversation://test/standalone-todo",
+            todo={**todo, "title": "Use one standalone receipt path"},
+        )
+
+        self.assertEqual("TODO_MUTATION_APPLIED", attached_result["status"])
+        self.assertEqual("TODO_MUTATION_APPLIED", standalone_result["status"])
+        self.assertEqual(
+            "CONSUMED", attached_result["receipt"]["status"]
+        )
+        self.assertEqual(
+            "CONSUMED", standalone_result["receipt"]["status"]
+        )
+        self.assertNotIn(
+            "todo-attached-provider-ref", json.dumps(attached_result)
+        )
+
+        replay = gateway.create_todo(
+            provider="CODEX",
+            provider_session_ref="todo-attached-provider-ref",
+            session_id=attached["session_id"],
+            session_anchor_ref=attached["session_anchor_ref"],
+            instruction_ref="conversation://test/attached-todo",
+            todo=todo,
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(
+            attached_result["todo"]["todo_id"], replay["todo"]["todo_id"]
+        )
+        with self.assertRaises(TodoMutationGatewayError) as caught:
+            gateway.create_todo(
+                provider="CODEX",
+                provider_session_ref="todo-attached-provider-ref",
+                session_id=attached["session_id"],
+                session_anchor_ref=attached["session_anchor_ref"],
+                instruction_ref="conversation://test/attached-todo",
+                todo={**todo, "title": "Conflicting replay"},
+            )
+        self.assertEqual("TODO_MUTATION_RECEIPT_CONFLICT", caught.exception.code)
+
+    def test_todo_mutation_gateway_rejects_wrong_anchor_and_expired_receipt(self) -> None:
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "todo-guard-session",
+                "project_id": "standalone-project",
+                "node": "standalone-project",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "todo-guard-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        gateway = TodoMutationGateway(self.endpoint, self.token)
+        todo = {
+            "scope_kind": "UNIVERSE",
+            "title": "Reject stale mutation",
+            "detail": "",
+            "priority": "P1",
+            "state": "READY",
+            "source_kind": "MASTER",
+            "sort_order": 0,
+        }
+        wrong_anchor = gateway.mutation_request(
+            provider="CODEX",
+            provider_session_ref="todo-guard-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref="session_anchor_wrong",
+            instruction_ref="conversation://test/wrong-anchor",
+            todo=todo,
+        )
+        with self.assertRaises(TodoMutationGatewayError) as caught:
+            gateway.prepare(wrong_anchor)
+        self.assertEqual("TODO_MUTATION_ANCHOR_MISMATCH", caught.exception.code)
+
+        expiring = gateway.mutation_request(
+            provider="CODEX",
+            provider_session_ref="todo-guard-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref=session["session_anchor_ref"],
+            instruction_ref="conversation://test/expired-receipt",
+            todo=todo,
+            ttl_seconds=1,
+        )
+        prepared = gateway.prepare(expiring)
+        receipt_id = prepared["receipt"]["receipt_id"]
+        connection = sqlite3.connect(self.server.store.database_path)
+        try:
+            connection.execute(
+                "UPDATE todo_mutation_receipt SET expires_at = ? WHERE receipt_id = ?",
+                ("2000-01-01T00:00:00Z", receipt_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(TodoMutationGatewayError) as caught:
+            gateway.consume(receipt_id, expiring)
+        self.assertEqual("TODO_MUTATION_RECEIPT_EXPIRED", caught.exception.code)
 
     def test_todo_work_map_is_editable_prioritized_and_execution_neutral(
         self,
