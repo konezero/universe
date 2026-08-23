@@ -71,6 +71,7 @@ const state = {
   remoteAccess: null,
   accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
+  supervisorTerminals: [],
   roomSessionBindings: [],
   selectedSupervisorAnchorKey: null,
   /** A mode can expose many persistent sessions; this is its one chat selection. */
@@ -2041,8 +2042,40 @@ function vendorStreamStateForSession(session) {
   ).toUpperCase();
 }
 
+const NODE_MODE_WORKING_ACTIVITY_STATES = new Set([
+  "ACTIVE",
+  "STARTING",
+  "RUNNING",
+  "WORKING",
+  "EXECUTING",
+  "BOOTING",
+  "INDEXING",
+  "INSTALLING",
+  "VALIDATING",
+  "SYNCING",
+  "CHECKPOINTING",
+  "REBUILDING",
+  "WAITING_USER",
+  "WAITING_COMMANDER",
+]);
+
+function nodeModeSessionActivityState(session) {
+  return String(
+    session?.current_activity_state ||
+      (session?.active_ing === true ? session?.state : "") ||
+      "IDLE"
+  ).trim().toUpperCase();
+}
+
+function nodeModeSessionIsWorking(session) {
+  return (
+    session?.active_ing === true ||
+    NODE_MODE_WORKING_ACTIVITY_STATES.has(nodeModeSessionActivityState(session))
+  );
+}
+
 function nodeModeSessionIsActive(session) {
-  return vendorStreamStateForSession(session) === "LIVE";
+  return nodeModeSessionIsWorking(session);
 }
 
 function nodeModeRoomIsActive(room) {
@@ -2114,9 +2147,10 @@ function nodeModeCoordinates() {
 
   for (const terminal of state.supervisorTerminals || state.terminals || []) {
     if (String(terminal.state || "").toUpperCase() !== "LIVE") continue;
+    const terminalSession = sessionFromPtyTerminal(terminal);
     record(terminal.project_id, terminal.mode, {
       hasSession: true,
-      active: true,
+      active: nodeModeSessionIsWorking(terminalSession),
     });
   }
   for (const session of [
@@ -2165,12 +2199,11 @@ function nodeModeCoordinates() {
 }
 
 function nodeModeStatusLabel(coordinate) {
-  const live = ptyLiveTerminalsForCoordinate(coordinate).length > 0;
-  if (coordinate.current && live) return "CURRENT · LIVE";
-  if (live) return "LIVE";
-  // A browser EventSource subscription is not provider execution. Persisted
-  // anchors remain CURRENT/SAVED until a live PTY terminal proves otherwise.
+  const buckets = nodeModePanelSessionBuckets(coordinate);
+  if (coordinate.current && buckets.working.length) return "CURRENT · WORKING";
+  if (buckets.working.length) return "WORKING";
   if (coordinate.current) return "CURRENT";
+  if (buckets.idle.length) return "IDLE";
   return coordinate.hasSession ? "SAVED" : "NO SESSION";
 }
 
@@ -2431,32 +2464,51 @@ function ptyLiveTerminalsForCoordinate(coordinate) {
 }
 
 function sessionFromPtyTerminal(terminal) {
+  const supervisorSessionId = String(terminal?.supervisor_session_id || "").trim();
+  const supervised = (state.supervisorSessions || []).find(
+    (session) => String(session.session_id || "") === supervisorSessionId
+  );
   return {
+    ...(supervised || {}),
     terminal_id: terminal.terminal_id,
+    supervisor_session_id: supervisorSessionId,
     project_id: terminal.project_id,
     node: terminal.project_id,
     mode: terminal.mode,
     provider: terminal.provider,
-    alias: `${terminal.project_id} ${terminal.mode}`,
-    state: terminal.state || "LIVE",
+    alias: supervised?.alias || `${terminal.project_id} ${terminal.mode}`,
+    terminal_state: terminal.state || "LIVE",
+    state: supervised?.state || "UNKNOWN",
+    current_activity_state: supervised?.current_activity_state || "IDLE",
     pid: terminal.pid,
     executable: terminal.executable,
     cwd: terminal.cwd,
     session_kind: "PTY_LIVE",
-    last_seen_at: terminal.created_at,
-    session_anchor_ref: `pty:${terminal.terminal_id}`,
+    last_seen_at: supervised?.last_seen_at || terminal.created_at,
+    session_anchor_ref:
+      supervised?.session_anchor_ref || `pty:${terminal.terminal_id}`,
+  };
+}
+
+function nodeModePanelSessionBuckets(coordinate) {
+  // Keep every live connection visible; activity changes the card status.
+  // Historical sessions remain available through the Observatory.
+  const sessions = ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
+  return {
+    working: sessions.filter(nodeModeSessionIsWorking),
+    idle: sessions.filter((session) => !nodeModeSessionIsWorking(session)),
   };
 }
 
 function nodeModePanelSessions(coordinate) {
-  // Node/Mode cards are a live PTY control surface, not the Supervisor
-  // archive. Historical Anchor Sessions stay in the Observatory.
-  return ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
+  const buckets = nodeModePanelSessionBuckets(coordinate);
+  return [...buckets.working, ...buckets.idle];
 }
 
 function renderNodeModeSessionCards(coordinate) {
   const cards = node("div", "node-mode-session-cards");
   cards.dataset.coordinateKey = coordinate.key;
+  const buckets = nodeModePanelSessionBuckets(coordinate);
   const sessions = nodeModePanelSessions(coordinate);
   const selected = nodeModeSelectedSession(coordinate);
   const ordered = [...sessions].sort((left, right) => {
@@ -2478,7 +2530,7 @@ function renderNodeModeSessionCards(coordinate) {
   cards.append(create);
   if (!sessions.length) {
     cards.append(
-      node("p", "node-mode-session-empty", "No live PTY sessions in this mode")
+      node("p", "node-mode-session-empty", "No connected sessions in this mode")
     );
     return cards;
   }
@@ -2504,35 +2556,21 @@ function renderNodeModeSessionCards(coordinate) {
       node("strong", "", sessionDisplayName(session)),
       node("small", "", detail)
     );
-    const stream = vendorStreamStateForSession(session);
+    const activityState = nodeModeSessionActivityState(session);
+    const visualState = nodeModeSessionIsWorking(session) ? activityState : "IDLE";
     const current = nodeModeSessionIsCurrent(session);
-    const activeIng = session.active_ing === true;
-    const statusLabel = current && stream === "LIVE"
-      ? "CURRENT · LIVE"
-      : session.terminal_id && stream === "LIVE"
-        ? "LIVE"
-        : current
-          ? "CURRENT"
-          : activeIng
-            ? String(session.state || "ING")
-            : stream === "LIVE"
-              ? "STREAM"
-              : stream === "NO_VENDOR"
-                ? "SAVED"
-                : stream;
+    const statusLabel = visualState === "ACTIVE" ? "WORKING" : visualState;
     const status = node("span", "node-mode-session-status", statusLabel);
-    status.dataset.state = stream;
+    status.dataset.state = visualState;
     status.dataset.current = String(current);
     const unread = Number(state.sessionBusUnread?.[session.terminal_id] || 0);
     card.append(label, status);
     if (unread > 0) {
       card.append(node("span", "node-mode-session-bus-unread", String(Math.min(unread, 99))));
     }
-    card.title = nodeModeSessionIsCurrent(session)
-      ? "Resume the DB Current session"
-      : room
-        ? "Resume this saved vendor session"
-        : "Saved session with no vendor stream yet";
+    card.title = current
+      ? "Inspect the DB Current connected session"
+      : "Inspect this connected session";
     card.dataset.current = String(nodeModeSessionIsCurrent(session));
     card.addEventListener("click", () => {
       selectNodeModeSession(coordinate, session).catch((error) =>
@@ -2609,10 +2647,8 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
-      const liveCount = ptyLiveTerminalsForCoordinate(coordinate).length;
-      // A collapsed mode must not render a misleading empty persistent-session
-      // state.  Selecting its card expands the complete Anchor Session lineage;
-      // an unselected mode renders a session area only when it has a live PTY.
+      const liveCount = nodeModePanelSessions(coordinate).length;
+      // Collapsed modes keep every live connection visible as a session card.
       if (modeSelected || liveCount) {
         list.append(renderNodeModeSessionCards(coordinate));
       }
