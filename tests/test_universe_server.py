@@ -4767,6 +4767,129 @@ class UniverseLocalServiceTests(unittest.TestCase):
             rows=32,
         )
 
+    def test_live_terminal_and_inbox_follow_current_session_anchor_location(self) -> None:
+        original, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_anchor_location_001",
+                "node": "universe",
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-anchor-location-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        terminal = {
+            "terminal_id": "term_anchor_location_001",
+            "project_id": "universe",
+            "mode": "CONDUCTOR",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "created_at": "2026-08-23T03:19:38Z",
+            "supervisor_session_id": original["session_id"],
+        }
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = [terminal]
+        terminal_host.get.return_value = terminal
+        self.server.terminal_host = terminal_host
+
+        conductor_message = self.server.post_session_bus_message(
+            {
+                "to": {
+                    "project_id": "universe",
+                    "mode": "CONDUCTOR",
+                    "provider": "CODEX",
+                },
+                "from": {
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "provider": "UI",
+                },
+                "kind": "NOTE",
+                "body_text": "follow this terminal when its Session Anchor moves",
+            }
+        )
+
+        relocated, created = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_requested_master_001",
+                "node": "universe",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-anchor-location-001",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(original["session_id"], relocated["session_id"])
+        self.assertNotEqual(
+            original["session_anchor_ref"], relocated["session_anchor_ref"]
+        )
+        projected = self.server.list_cli_terminals()["terminals"][0]
+        self.assertEqual("CONDUCTOR", projected["created_mode"])
+        self.assertEqual("MASTER", projected["mode"])
+        self.assertEqual("SESSION_ANCHOR", projected["location_source"])
+        self.assertTrue(projected["location_rebound"])
+        self.assertEqual(
+            relocated["session_anchor_ref"], projected["active_session_anchor_ref"]
+        )
+        directory = self.server.session_bus_directory()["terminals"]
+        self.assertEqual("MASTER", directory[0]["mode"])
+        moved_inbox = self.server.session_bus_inbox(
+            {
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+            }
+        )
+        self.assertEqual(
+            conductor_message["message_id"], moved_inbox["messages"][0]["message_id"]
+        )
+
+        with self.assertRaises(UniverseError) as raised:
+            self.server.post_session_bus_message(
+                {
+                    "to": {
+                        "project_id": "universe",
+                        "mode": "CONDUCTOR",
+                        "provider": "CODEX",
+                    },
+                    "from": {
+                        "project_id": "universe",
+                        "mode": "MASTER",
+                        "provider": "UI",
+                    },
+                    "kind": "NOTE",
+                    "body_text": "must not follow the PTY birth coordinate",
+                }
+            )
+        self.assertEqual("BUS_TARGET_NOT_FOUND", raised.exception.code)
+
+        posted = self.server.post_session_bus_message(
+            {
+                "to": {
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "provider": "CODEX",
+                },
+                "from": {
+                    "project_id": "universe",
+                    "mode": "CONDUCTOR",
+                    "provider": "UI",
+                },
+                "kind": "NOTE",
+                "body_text": "follow the active Session Anchor",
+            }
+        )
+        self.assertEqual("MASTER", posted["messages"][0]["to"]["mode"])
+        self.assertEqual(
+            terminal["terminal_id"], posted["messages"][0]["to"]["terminal_id"]
+        )
+
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None

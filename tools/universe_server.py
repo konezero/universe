@@ -19000,6 +19000,104 @@ def select_file_with_native_dialog(kind: str) -> str | None:
     return str(selected).strip() or None
 
 
+class _ProjectedTerminalSession:
+    """Expose a projected public coordinate while retaining Host operations."""
+
+    def __init__(self, source: Any, payload: Mapping[str, Any]) -> None:
+        self._source = source
+        self._payload = dict(payload)
+
+    def public(self) -> dict[str, Any]:
+        return dict(self._payload)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+
+class _SessionAnchorTerminalHost:
+    """Project PTY location from its Supervisor session's current Anchor."""
+
+    def __init__(
+        self,
+        host: Any,
+        resolver: Callable[[Mapping[str, Any]], dict[str, Any]],
+    ) -> None:
+        self._host = host
+        self._resolver = resolver
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        rows = self._host.list_sessions()
+        if not isinstance(rows, (list, tuple)):
+            return []
+        return [self._resolver(item) for item in rows if isinstance(item, Mapping)]
+
+    def get(self, terminal_id: str) -> Any:
+        source = self._host.get(terminal_id)
+        public = source.public() if hasattr(source, "public") else source
+        if not isinstance(public, Mapping):
+            return source
+        projected = self._resolver(public)
+        if isinstance(source, Mapping):
+            return projected
+        return _ProjectedTerminalSession(source, projected)
+
+    def find_live(
+        self,
+        *,
+        project_id: str,
+        mode: str,
+        provider: str = "",
+        supervisor_session_id: str = "",
+    ) -> dict[str, Any] | None:
+        wanted_mode = str(mode or "").upper()
+        wanted_provider = str(provider or "").upper()
+        wanted_session = str(supervisor_session_id or "")
+
+        def matches(item: Mapping[str, Any]) -> bool:
+            return (
+                str(item.get("state") or "").upper() == "LIVE"
+                and str(item.get("project_id") or "") == str(project_id or "")
+                and str(item.get("mode") or "").upper() == wanted_mode
+                and (
+                    not wanted_provider
+                    or wanted_provider == "AUTO"
+                    or str(item.get("provider") or "").upper() == wanted_provider
+                )
+                and (
+                    not wanted_session
+                    or str(item.get("supervisor_session_id") or "")
+                    == wanted_session
+                )
+            )
+
+        candidate = self._host.find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=supervisor_session_id,
+        )
+        if isinstance(candidate, Mapping):
+            projected_candidate = self._resolver(candidate)
+            if matches(projected_candidate):
+                return projected_candidate
+
+        rows = self._host.list_sessions()
+        if not isinstance(rows, (list, tuple)):
+            return None
+        matched = [
+            item
+            for item in (self._resolver(row) for row in rows if isinstance(row, Mapping))
+            if matches(item)
+        ]
+        if not matched:
+            return None
+        matched.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return matched[0]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._host, name)
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -22484,8 +22582,65 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return {
             "schema": API_SCHEMA,
             "status": "CLI_TERMINALS_COLLECTED",
-            "terminals": self.terminal_host.list_sessions(),
+            "terminals": self._session_anchor_terminal_host().list_sessions(),
         }
+
+    def _session_anchor_terminal_host(self) -> _SessionAnchorTerminalHost:
+        return _SessionAnchorTerminalHost(
+            self.terminal_host,
+            self._project_terminal_session_location,
+        )
+
+    def _project_terminal_session_location(
+        self, terminal: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Keep PTY birth coordinates as history and project its active location."""
+
+        projected = dict(terminal)
+        created_project_id = str(terminal.get("project_id") or "").strip()
+        created_mode = str(terminal.get("mode") or "").strip().upper()
+        projected["created_project_id"] = created_project_id
+        projected["created_mode"] = created_mode
+        projected["creation_coordinate"] = {
+            "project_id": created_project_id,
+            "mode": created_mode,
+        }
+        session_id = str(terminal.get("supervisor_session_id") or "").strip()
+        if not session_id:
+            projected["location_source"] = "PTY_CREATION"
+            return projected
+        try:
+            session = self.session_supervisor.get_session(session_id)
+        except SessionSupervisorError:
+            projected["location_source"] = "PTY_CREATION"
+            return projected
+        current_location = next(
+            (
+                item
+                for item in reversed(list(session.get("location_history") or []))
+                if item.get("is_current")
+            ),
+            {},
+        )
+        current_project_id = str(
+            current_location.get("project_id")
+            or session.get("current_project_id")
+            or session.get("node")
+            or created_project_id
+        ).strip()
+        current_mode = str(
+            current_location.get("mode") or session.get("mode") or created_mode
+        ).strip().upper()
+        projected["project_id"] = current_project_id
+        projected["mode"] = current_mode
+        projected["active_session_anchor_ref"] = str(
+            session.get("session_anchor_ref") or ""
+        )
+        projected["location_source"] = "SESSION_ANCHOR"
+        projected["location_rebound"] = (
+            current_project_id != created_project_id or current_mode != created_mode
+        )
+        return projected
 
     def create_cli_terminal(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
@@ -22547,7 +22702,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             resume_ref = stored_ref
         if not supervisor_session_id:
             supervisor_session_id = "session_" + secrets.token_hex(12)
-        existing = self.terminal_host.find_live(
+        existing = self._session_anchor_terminal_host().find_live(
             project_id=project_id,
             mode=mode,
             provider=provider,
@@ -22598,7 +22753,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def session_bus_directory(self) -> dict[str, Any]:
         try:
-            payload = dict(self.session_bus.directory(self.terminal_host))
+            payload = dict(
+                self.session_bus.directory(self._session_anchor_terminal_host())
+            )
         except TerminalHostError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
         rooms = []
@@ -22635,7 +22792,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         raw = query if isinstance(query, Mapping) else {}
         try:
             return self.session_bus.inbox(
-                self.terminal_host,
+                self._session_anchor_terminal_host(),
                 terminal_id=str(raw.get("terminal_id") or ""),
                 project_id=str(raw.get("project_id") or ""),
                 mode=str(raw.get("mode") or ""),
@@ -22655,11 +22812,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if destination.get("room_id") or payload.get("room_id"):
                 return fanout_meeting_bus(
                     rooms=self.multi_rooms,
-                    host=self.terminal_host,
+                    host=self._session_anchor_terminal_host(),
                     bus=self.session_bus,
                     value=payload,
                 )
-            posted = self.session_bus.post(self.terminal_host, payload)
+            posted = self.session_bus.post(
+                self._session_anchor_terminal_host(), payload
+            )
             # A SessionStart hook owns boot-time delivery.  Once a terminal is
             # already live, however, waiting for a hypothetical next boot
             # leaves a direct UI instruction stranded in PENDING.  Bind the
@@ -22702,7 +22861,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if not terminal_id:
                 continue
             try:
-                terminal_value = self.terminal_host.get(terminal_id)
+                terminal_value = self._session_anchor_terminal_host().get(
+                    terminal_id
+                )
                 terminal = (
                     terminal_value.public()
                     if hasattr(terminal_value, "public")
@@ -25218,7 +25379,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         mode = str(session.get("mode") or "").strip().upper()
         if not session_id or not session_anchor_ref or not provider or not mode:
             return {"status": "COORDINATE_UNAVAILABLE"}
-        terminal = self.terminal_host.find_live(
+        terminal = self._session_anchor_terminal_host().find_live(
             project_id=project_id,
             mode=mode,
             provider=provider,
@@ -25231,7 +25392,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return {"status": "TERMINAL_UNAVAILABLE"}
         try:
             claim = self.session_bus.claim_instruction(
-                self.terminal_host,
+                self._session_anchor_terminal_host(),
                 terminal_id=terminal_id,
                 session_anchor_ref=session_anchor_ref,
             )
@@ -32500,7 +32661,7 @@ def perform_session_ref_inject(
             "slot_role": slot_role,
             "provider": normalized_provider,
             "provider_session_ref": normalized_ref or None,
-            "supervisor_session_id": session_id,
+            "supervisor_session_id": effective_session_id,
             "display_name": display_name,
         }
     )

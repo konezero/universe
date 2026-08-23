@@ -899,6 +899,38 @@ class MultiRoomStoreTests(unittest.TestCase):
         )
         self.assertIsNone(injected["binding"]["provider_session_ref"])
 
+    def test_cross_mode_reinject_binds_room_to_effective_provider_identity(self) -> None:
+        conductor = perform_session_ref_inject(
+            session_supervisor=self.supervisor,
+            multi_rooms=self.store,
+            body={
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "session_ref": "codex-shared-mode-identity-001",
+                "make_default": False,
+            },
+        )
+
+        master = perform_session_ref_inject(
+            session_supervisor=self.supervisor,
+            multi_rooms=self.store,
+            body={
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "session_ref": "codex-shared-mode-identity-001",
+                "make_default": False,
+            },
+        )
+
+        effective_session_id = conductor["supervisor_session"]["session_id"]
+        self.assertEqual(
+            effective_session_id, master["supervisor_session"]["session_id"]
+        )
+        self.assertEqual(effective_session_id, master["binding"]["supervisor_session_id"])
+        self.assertEqual("MASTER", master["supervisor_session"]["mode"])
+
     def test_inject_model_slot_skips_default_by_default(self) -> None:
         room = self.store.create_meeting_room(
             {
