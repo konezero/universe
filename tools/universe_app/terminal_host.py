@@ -223,6 +223,17 @@ class TerminalHost:
                 "TERMINAL_SPAWN_FAILED",
                 str(error) or "failed to start CLI",
             ) from error
+        if channel_config is not None:
+            # --dangerously-load-development-channels gates the MCP channel
+            # server behind an interactive "I am using this for local
+            # development" confirmation menu (already-highlighted default,
+            # Enter to confirm). No human is at the keyboard for a PTY spawned
+            # by the UI, so without this the channel never loads and the
+            # session eventually fails on an unrelated-looking error.
+            try:
+                session.backend.write(b"\r")
+            except Exception:  # noqa: BLE001 - best effort, never block terminal creation
+                pass
         session.state = "LIVE"
         with self._lock:
             self._sessions[terminal_id] = session

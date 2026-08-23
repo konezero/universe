@@ -3586,7 +3586,19 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       expectedModel: isNew ? undefined : modelRef,
       expectedEffort: isNew ? undefined : effort,
     };
-    if (mode === "CONDUCTOR") {
+    if (isNew) {
+      // New sessions must first create the PTY-backed CLI surface.  Provider
+      // session identity is then observed and bound by the terminal Hook.
+      await startNewNodeModeSession({
+        ...(pendingCoord || {}),
+        project: registeredProject || pendingCoord?.project,
+        nodeId: registeredProject?.project_id || pendingCoord?.nodeId || project.projectId,
+        mode,
+        provider,
+        modelRef,
+        effort,
+      });
+    } else if (mode === "CONDUCTOR") {
       await callUniverseConductor(options);
     } else {
       await callProjectMaster(project.projectId, options);
