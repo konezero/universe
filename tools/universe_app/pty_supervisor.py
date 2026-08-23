@@ -129,7 +129,6 @@ def spawn_supervisor(*, state_path: Path | None = None) -> None:
     if os.name == "nt":
         creationflags = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
     subprocess.Popen(  # noqa: S603

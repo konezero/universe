@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,6 +21,7 @@ from universe_app.pty_supervisor import (  # noqa: E402
     SCHEMA,
     SupervisedTerminalHost,
     restart_supervisor,
+    spawn_supervisor,
 )
 from universe_app.terminal_host import TerminalHost  # noqa: E402
 from universe_pty_supervisor import Server  # noqa: E402
@@ -62,6 +64,23 @@ class PtySupervisorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+
+    def test_spawn_supervisor_hides_its_windows_console(self) -> None:
+        script = ROOT / "tools" / "universe_pty_supervisor.py"
+        with patch("universe_app.pty_supervisor.os.name", "nt"), patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 1, create=True
+        ), patch.object(
+            subprocess, "DETACHED_PROCESS", 2, create=True
+        ), patch.object(
+            subprocess, "CREATE_NO_WINDOW", 4, create=True
+        ), patch(
+            "universe_app.pty_supervisor.supervisor_script", return_value=script
+        ), patch(
+            "universe_app.pty_supervisor.subprocess.Popen"
+        ) as popen:
+            spawn_supervisor()
+
+        self.assertEqual(1 | 4, popen.call_args.kwargs["creationflags"])
 
     def test_restart_ends_existing_supervisor_before_starting_replacement(self) -> None:
         state_path = Path(tempfile.mkdtemp(prefix="pty-restart-")) / "pty-supervisor.json"
