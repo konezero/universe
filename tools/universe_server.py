@@ -227,7 +227,11 @@ from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
 )
-from universe_app.pty_supervisor import SupervisedTerminalHost
+from universe_app.pty_supervisor import (
+    SupervisedTerminalHost,
+    default_state_path as default_pty_supervisor_state_path,
+    restart_supervisor,
+)
 from universe_app.session_bus import SessionBus, SessionBusError, fanout_meeting_bus
 from universe_app.terminal_host import TerminalHost, TerminalHostError
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
@@ -32669,6 +32673,14 @@ def parser() -> argparse.ArgumentParser:
     )
     restart_command.set_defaults(open_ui=False)
 
+    pty_restart_command = commands.add_parser(
+        "pty-restart",
+        help="Restart the standalone PTY Supervisor and end its active terminals",
+    )
+    pty_restart_command.add_argument(
+        "--state-file", type=Path, default=default_pty_supervisor_state_path()
+    )
+
     tray_command = commands.add_parser(
         "tray",
         help="Start the Windows system-tray host (packaging/windows/Universe-Tray.ps1)",
@@ -32827,6 +32839,11 @@ def _windows_tray_creationflags() -> int:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "pty-restart":
+            result = restart_supervisor(state_path=args.state_file)
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
         if args.command in {"status", "start", "stop", "restart", "tray"}:
             from universe_service_control import (
                 restart_service,

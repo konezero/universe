@@ -9,13 +9,18 @@ import threading
 import time
 import unittest
 import urllib.error
+from unittest.mock import patch
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from universe_app.pty_supervisor import SCHEMA, SupervisedTerminalHost  # noqa: E402
+from universe_app.pty_supervisor import (  # noqa: E402
+    SCHEMA,
+    SupervisedTerminalHost,
+    restart_supervisor,
+)
 from universe_app.terminal_host import TerminalHost  # noqa: E402
 from universe_pty_supervisor import Server  # noqa: E402
 
@@ -57,6 +62,37 @@ class PtySupervisorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+
+    def test_restart_ends_existing_supervisor_before_starting_replacement(self) -> None:
+        state_path = Path(tempfile.mkdtemp(prefix="pty-restart-")) / "pty-supervisor.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema": SCHEMA,
+                    "status": "READY",
+                    "pid": 1234,
+                    "endpoint": "http://127.0.0.1:50000",
+                    "token": "test-token",
+                }
+            ),
+            encoding="utf-8",
+        )
+        replacement = {"pid": 5678, "endpoint": "http://127.0.0.1:50001"}
+        with patch(
+            "universe_app.pty_supervisor.pid_is_running", side_effect=[True, False, False]
+        ), patch(
+            "universe_app.pty_supervisor._terminate_supervisor_process", return_value=True
+        ) as terminate, patch(
+            "universe_app.pty_supervisor.ensure_supervisor", return_value=replacement
+        ) as ensure:
+            result = restart_supervisor(state_path=state_path)
+
+        terminate.assert_called_once_with(1234)
+        ensure.assert_called_once_with(state_path=state_path, timeout=8.0)
+        self.assertEqual("RESTARTED", result["status"])
+        self.assertEqual(1234, result["previous_pid"])
+        self.assertEqual(5678, result["pid"])
+        self.assertTrue(result["active_terminals_ended"])
 
     def request(self, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
         body = None

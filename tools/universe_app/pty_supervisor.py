@@ -174,6 +174,57 @@ def ensure_supervisor(
     )
 
 
+def _terminate_supervisor_process(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        process_terminate = 0x0001
+        handle = ctypes.windll.kernel32.OpenProcess(process_terminate, False, pid)
+        if not handle:
+            return False
+        try:
+            return bool(ctypes.windll.kernel32.TerminateProcess(handle, 0))
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        return False
+    return True
+
+
+def restart_supervisor(*, state_path: Path | None = None, timeout: float = 8.0) -> dict[str, Any]:
+    """Restart only the standalone PTY Supervisor and end its active terminals."""
+    path = state_path or default_state_path()
+    previous = load_state(path) or {}
+    pid = int(previous.get("pid") or 0)
+    if pid > 0 and pid_is_running(pid):
+        if not _terminate_supervisor_process(pid):
+            raise TerminalHostError(
+                "PTY_SUPERVISOR_STOP_FAILED",
+                "could not stop the recorded PTY supervisor process",
+            )
+        deadline = time.time() + max(1.0, timeout)
+        while time.time() < deadline:
+            if not pid_is_running(pid):
+                break
+            time.sleep(0.1)
+        if pid_is_running(pid):
+            raise TerminalHostError(
+                "PTY_SUPERVISOR_STOP_TIMEOUT",
+                "PTY supervisor did not exit before restart timeout",
+            )
+    current = ensure_supervisor(state_path=path, timeout=timeout)
+    return {
+        "schema": SCHEMA,
+        "status": "RESTARTED",
+        "previous_pid": pid or None,
+        "pid": int(current.get("pid") or 0) or None,
+        "endpoint": str(current.get("endpoint") or ""),
+        "active_terminals_ended": bool(pid),
+    }
+
+
 @dataclass
 class SupervisedSession:
     payload: dict[str, Any]
