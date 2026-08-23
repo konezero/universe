@@ -380,6 +380,17 @@ function terminalProviderFor(_coordinate, session) {
   throw new Error("Choose a provider for this session");
 }
 
+function terminalSupervisorSessionId(session) {
+  const candidate = String(
+    session?.session_id || session?.universe_session_id || ""
+  ).trim();
+  if (!candidate) return "";
+  const supervised = (state.supervisorSessions || []).find(
+    (item) => String(item?.session_id || "").trim() === candidate
+  );
+  return supervised ? candidate : "";
+}
+
 function terminalResumeRef(coordinate, session) {
   if (!session) return "";
   const provider = terminalProviderFor(coordinate, session);
@@ -422,9 +433,7 @@ async function createTerminalTab(coordinate, session) {
       provider: terminalProviderFor(coordinate, session),
       model_ref: String(coordinate?.modelRef || coordinate?.model_ref || "").trim(),
       effort: String(coordinate?.effort || "AUTO").toUpperCase(),
-      supervisor_session_id: String(
-        session?.session_id || session?.universe_session_id || ""
-      ).trim(),
+      supervisor_session_id: terminalSupervisorSessionId(session),
       resume_session_ref: terminalResumeRef(coordinate, session),
     },
   });

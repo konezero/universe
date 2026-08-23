@@ -132,6 +132,23 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("const session = created.terminal || created;", TERM)
         self.assertIn("resume_session_ref", TERM)
         self.assertIn("supervisor_session_id", TERM)
+        self.assertIn("function terminalSupervisorSessionId(session)", TERM)
+        supervisor_slice = TERM[
+            TERM.index("function terminalSupervisorSessionId") : TERM.index(
+                "function terminalResumeRef"
+            )
+        ]
+        self.assertIn("state.supervisorSessions", supervisor_slice)
+        self.assertIn("return supervised ? candidate", supervisor_slice)
+        create_slice = TERM[
+            TERM.index("async function createTerminalTab") : TERM.index(
+                "function refitActiveTerminal"
+            )
+        ]
+        self.assertIn(
+            "supervisor_session_id: terminalSupervisorSessionId(session)",
+            create_slice,
+        )
         resume_slice = TERM[
             TERM.index("function terminalResumeRef") : TERM.index(
                 "async function createTerminalTab"
