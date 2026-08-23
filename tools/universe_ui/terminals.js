@@ -92,9 +92,35 @@ function renderTerminalDock() {
   }
 }
 
+function captureTerminalViewport(surface) {
+  const buffer = surface?.term?.buffer?.active;
+  if (!buffer) return;
+  surface.savedViewport = {
+    atBottom: buffer.viewportY >= buffer.baseY,
+    line: buffer.viewportY,
+  };
+}
+
+function restoreTerminalViewport(surface) {
+  const term = surface?.term;
+  const buffer = term?.buffer?.active;
+  if (!term || !buffer) return;
+  const saved = surface.savedViewport;
+  try {
+    if (!saved || saved.atBottom) term.scrollToBottom();
+    else term.scrollToLine(Math.min(saved.line, buffer.baseY));
+    term.refresh(0, Math.max(0, term.rows - 1));
+  } catch (_error) { /* surface may still be measuring */ }
+}
+
 function selectTerminalTab(terminalId) {
   const session = (state.terminals || []).find((item) => item.terminal_id === terminalId);
   if (!session) return;
+  const previousId = state.activeTerminalId;
+  const switchingTabs = Boolean(previousId && previousId !== terminalId);
+  if (switchingTabs) {
+    captureTerminalViewport((state.terminalSurfaces || {})[previousId]);
+  }
   state.activeTerminalId = terminalId;
   state.conversationSurface = "CLI";
   renderTerminalDock();
@@ -103,7 +129,10 @@ function selectTerminalTab(terminalId) {
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = id !== terminalId;
-    if (id === terminalId) refitActiveTerminal();
+    if (id === terminalId) {
+      surface.restoreSavedViewport = switchingTabs;
+      refitActiveTerminal();
+    }
   }
   applyCliDockTitle(session);
   focusTerminalInput();
@@ -175,6 +204,12 @@ function fitTerminalToContainer(term, element, fitAddon) {
   if (!width || !height) return false;
   if (fitAddon && typeof fitAddon.fit === "function") {
     try {
+      const proposed = typeof fitAddon.proposeDimensions === "function"
+        ? fitAddon.proposeDimensions()
+        : null;
+      if (proposed && proposed.cols === term.cols && proposed.rows === term.rows) {
+        return true;
+      }
       fitAddon.fit();
       return Boolean(term.cols && term.rows);
     } catch (_error) {
@@ -239,6 +274,8 @@ function ensureTerminalSurface(session) {
       initialLayoutPending = false;
       if (surface) surface.initialLayoutPending = false;
       sendCurrentSize();
+      restoreTerminalViewport(surface);
+      if (surface) surface.restoreSavedViewport = false;
     }, delay);
   };
   try { term.reset(); } catch (_error) { /* xterm not ready */ }
@@ -254,14 +291,20 @@ function ensureTerminalSurface(session) {
   bindTerminalIme(term, socket);
   let resizeTimer = 0;
   const sendCurrentSize = () => {
-    if (socket.readyState !== WebSocket.OPEN) return;
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    const cols = Math.max(40, Number(term.cols) || TERMINAL_COLS);
+    const rows = Math.max(20, Number(term.rows) || TERMINAL_ROWS);
+    const sizeKey = `${cols}x${rows}`;
+    if (surface?.lastSentSizeKey === sizeKey) return false;
     socket.send(JSON.stringify({
       type: "resize",
-      cols: Math.max(40, Number(term.cols) || TERMINAL_COLS),
-      rows: Math.max(20, Number(term.rows) || TERMINAL_ROWS),
+      cols,
+      rows,
     }));
+    if (surface) surface.lastSentSizeKey = sizeKey;
+    return true;
   };
-  const notifySize = () => {
+  const notifySize = (delay = 150) => {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       if (element.hidden) return;
@@ -269,9 +312,17 @@ function ensureTerminalSurface(session) {
         scheduleInitialLayout(240);
         return;
       }
+      const restoringTab = Boolean(surface?.restoreSavedViewport);
+      if (!restoringTab) captureTerminalViewport(surface);
+      const previousCols = term.cols;
+      const previousRows = term.rows;
       fitTerminalToContainer(term, element, fitAddon);
+      const geometryChanged = term.cols !== previousCols || term.rows !== previousRows;
       sendCurrentSize();
-    }, 150);
+      if (restoringTab || geometryChanged) restoreTerminalViewport(surface);
+      else if (surface) surface.savedViewport = null;
+      if (surface) surface.restoreSavedViewport = false;
+    }, delay);
   };
   socket.addEventListener("open", () => {
     scheduleInitialLayout(360);
@@ -295,6 +346,9 @@ function ensureTerminalSurface(session) {
     fitAddon,
     initialLayoutPending: true,
     scheduleInitialLayout,
+    lastSentSizeKey: null,
+    savedViewport: null,
+    restoreSavedViewport: false,
   };
   state.terminalSurfaces[session.terminal_id] = surface;
   return surface;
@@ -389,25 +443,14 @@ async function createTerminalTab(coordinate, session) {
 function refitActiveTerminal() {
   const surface = (state.terminalSurfaces || {})[state.activeTerminalId];
   if (!surface) return;
-  const run = () => {
-    if (surface.element?.hidden) return false;
-    const box = surface.element.getBoundingClientRect();
-    if (box.width < 40 || box.height < 80) return false;
-    if (surface.initialLayoutPending) {
-      surface.scheduleInitialLayout?.(240);
-      return true;
-    }
-    fitTerminalToContainer(surface.term, surface.element, surface.fitAddon);
-    // Resize forces xterm to re-measure cell dimensions and recreate the canvas.
-    // This fixes the case where open() was called while the container had 0 dimensions.
-    surface.notifySize?.();
-    return true;
-  };
-  run();
-  window.requestAnimationFrame(() => {
-    run();
-    window.setTimeout(run, 220);
-  });
+  if (surface.element?.hidden) return;
+  const box = surface.element.getBoundingClientRect();
+  if (box.width < 40 || box.height < 80) return;
+  if (surface.initialLayoutPending) {
+    surface.scheduleInitialLayout?.(240);
+    return;
+  }
+  surface.notifySize?.(0);
 }
 
 async function stopTerminalSession(terminalId) {
