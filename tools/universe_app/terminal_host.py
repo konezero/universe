@@ -114,13 +114,14 @@ class TerminalHost:
         self,
         *,
         spawn: Callable[..., Any] | None = None,
+        database_path: Path | str | None = None,
     ) -> None:
         from universe_app.session_bus import SessionBus
 
         self._spawn = spawn or spawn_conpty
         self._lock = threading.Lock()
         self._sessions: dict[str, TerminalSession] = {}
-        self.bus = SessionBus()
+        self.bus = SessionBus(database_path=database_path)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:

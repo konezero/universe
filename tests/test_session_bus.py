@@ -381,5 +381,116 @@ class SessionBusHttpTests(unittest.TestCase):
         self.assertEqual("BUS_ROOM_REQUIRES_UNIVERSE", payload.get("error_code"))
 
 
+class SessionBusDurabilityTests(unittest.TestCase):
+    """Regression: inbox messages must survive across SessionBus instances."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db_path = Path(self.temporary.name) / "bus_durable.sqlite3"
+        self.host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+        self.terminal = self.host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            provider="GROK",
+        )
+        self.terminal_id = self.terminal["terminal_id"]
+
+    def tearDown(self) -> None:
+        for item in self.host.list_sessions():
+            self.host.close(item["terminal_id"])
+        self.temporary.cleanup()
+
+    def test_messages_survive_bus_restart(self) -> None:
+        bus_a = SessionBus(database_path=self.db_path)
+        posted = bus_a.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "body_text": "durable payload",
+            },
+        )
+        self.assertEqual("CREATED", posted["status"])
+        message_id = posted["message_id"]
+
+        bus_b = SessionBus(database_path=self.db_path)
+        inbox = bus_b.inbox(self.host, terminal_id=self.terminal_id)
+        self.assertEqual(1, len(inbox["messages"]))
+        self.assertEqual(message_id, inbox["messages"][0]["message_id"])
+        self.assertEqual("durable payload", inbox["messages"][0]["body_text"])
+
+    def test_instruction_claim_state_survives_restart(self) -> None:
+        bus_a = SessionBus(database_path=self.db_path)
+        bus_a.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "kind": "INSTRUCTION",
+                "body_text": "durable instruction",
+            },
+        )
+        claim = bus_a.claim_instruction(
+            self.host,
+            terminal_id=self.terminal_id,
+            session_anchor_ref="anchor_durable_test",
+        )
+        self.assertEqual("CLAIMED", claim["delivery_state"])
+
+        bus_b = SessionBus(database_path=self.db_path)
+        inbox = bus_b.inbox(self.host, terminal_id=self.terminal_id)
+        self.assertEqual(1, len(inbox["messages"]))
+        self.assertEqual("CLAIMED", inbox["messages"][0]["delivery_state"])
+        self.assertEqual("anchor_durable_test", inbox["messages"][0]["session_anchor_ref"])
+
+    def test_ack_removes_message_durably(self) -> None:
+        bus_a = SessionBus(database_path=self.db_path)
+        posted = bus_a.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "body_text": "ephemeral message",
+            },
+        )
+        bus_a.ack(posted["message_id"], self.terminal_id)
+
+        bus_b = SessionBus(database_path=self.db_path)
+        inbox = bus_b.inbox(self.host, terminal_id=self.terminal_id)
+        self.assertEqual(0, len(inbox["messages"]))
+
+    def test_thread_id_preserved_across_restart(self) -> None:
+        bus_a = SessionBus(database_path=self.db_path)
+        posted = bus_a.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "body_text": "thread root",
+                "thread_id": "thread_durable_001",
+            },
+        )
+        self.assertEqual("thread_durable_001", posted["thread_id"])
+
+        bus_b = SessionBus(database_path=self.db_path)
+        inbox = bus_b.inbox(self.host, terminal_id=self.terminal_id)
+        self.assertEqual("thread_durable_001", inbox["messages"][0]["thread_id"])
+
+    def test_ram_only_bus_still_works_without_database(self) -> None:
+        bus = SessionBus()
+        posted = bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "body_text": "ram only",
+            },
+        )
+        inbox = bus.inbox(self.host, terminal_id=self.terminal_id)
+        self.assertEqual(1, len(inbox["messages"]))
+        self.assertEqual("ram only", inbox["messages"][0]["body_text"])
+
+
 if __name__ == "__main__":
     unittest.main()

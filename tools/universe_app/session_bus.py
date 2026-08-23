@@ -1,17 +1,22 @@
-"""RAM pull mailbox for live PTY sessions.
+"""Durable pull mailbox for live PTY sessions.
 
-Bodies stay on the bus. The only optional terminal notification is a one-line
-HEADER pointer emitted to the xterm display surface; it never crosses a
-provider's stdin boundary. Meeting-room fan-out is a Universe-side helper
-that copies one thread into each live participant inbox.
+Messages are persisted to SQLite when a database_path is supplied so that
+inboxes and conversation threads survive PTY, provider, and service restarts.
+The only optional terminal notification is a one-line HEADER pointer emitted
+to the xterm display surface; it never crosses a provider's stdin boundary.
+Meeting-room fan-out is a Universe-side helper that copies one thread into
+each live participant inbox.
 """
 
 from __future__ import annotations
 
+import json as _json_mod
 import secrets
+import sqlite3
 import threading
 import time
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Mapping
 
 from universe_app.terminal_host import TerminalHostError
@@ -166,10 +171,142 @@ def resolve_direct_targets(host: Any, to: Mapping[str, str]) -> list[dict[str, A
 
 
 class SessionBus:
-    def __init__(self) -> None:
+    def __init__(self, database_path: Path | str | None = None) -> None:
         self._lock = threading.Lock()
         self._messages: dict[str, dict[str, Any]] = {}
         self._inbox: dict[str, list[str]] = {}
+        self._database_path: Path | None = (
+            Path(database_path).resolve() if database_path else None
+        )
+        if self._database_path is not None:
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize_store()
+            self._hydrate()
+
+    def _db_connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self._database_path), timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _initialize_store(self) -> None:
+        conn = self._db_connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_bus_message (
+                    message_id TEXT PRIMARY KEY,
+                    terminal_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    room_id TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT 'NOTE',
+                    from_json TEXT NOT NULL DEFAULT '{}',
+                    to_json TEXT NOT NULL DEFAULT '{}',
+                    body_text TEXT NOT NULL DEFAULT '',
+                    bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL DEFAULT 'UNREAD',
+                    session_anchor_ref TEXT NOT NULL DEFAULT '',
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
+                    claimed_at TEXT,
+                    dispatched_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sbm_terminal "
+                "ON session_bus_message (terminal_id)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _hydrate(self) -> None:
+        conn = self._db_connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM session_bus_message ORDER BY created_at"
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            message = self._row_to_message(row)
+            mid = message["message_id"]
+            tid = message["_terminal_id"]
+            self._messages[mid] = message
+            self._inbox.setdefault(tid, []).append(mid)
+
+    @staticmethod
+    def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        msg: dict[str, Any] = {
+            "message_id": d["message_id"],
+            "_terminal_id": d["terminal_id"],
+            "thread_id": d["thread_id"],
+            "room_id": d["room_id"],
+            "kind": d["kind"],
+            "from": _json_mod.loads(d["from_json"]),
+            "to": _json_mod.loads(d["to_json"]),
+            "body_text": d["body_text"],
+            "bytes": d["bytes"],
+            "created_at": d["created_at"],
+            "delivery_state": d["delivery_state"],
+            "session_anchor_ref": d["session_anchor_ref"],
+            "provenance": _json_mod.loads(d["provenance_json"]),
+        }
+        if d.get("claimed_at"):
+            msg["claimed_at"] = d["claimed_at"]
+        if d.get("dispatched_at"):
+            msg["dispatched_at"] = d["dispatched_at"]
+        return msg
+
+    def _persist_message(self, terminal_id: str, message: dict[str, Any]) -> None:
+        if self._database_path is None:
+            return
+        conn = self._db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO session_bus_message (
+                    message_id, terminal_id, thread_id, room_id, kind,
+                    from_json, to_json, body_text, bytes, created_at,
+                    delivery_state, session_anchor_ref, provenance_json,
+                    claimed_at, dispatched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message["message_id"],
+                    terminal_id,
+                    message["thread_id"],
+                    message.get("room_id") or "",
+                    message["kind"],
+                    _json_mod.dumps(message.get("from") or {}),
+                    _json_mod.dumps(message.get("to") or {}),
+                    message.get("body_text") or "",
+                    message.get("bytes") or 0,
+                    message["created_at"],
+                    message.get("delivery_state") or "UNREAD",
+                    message.get("session_anchor_ref") or "",
+                    _json_mod.dumps(message.get("provenance") or {}),
+                    message.get("claimed_at"),
+                    message.get("dispatched_at"),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _delete_message(self, message_id: str) -> None:
+        if self._database_path is None:
+            return
+        conn = self._db_connect()
+        try:
+            conn.execute(
+                "DELETE FROM session_bus_message WHERE message_id = ?",
+                (message_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def drop_terminal(self, terminal_id: str) -> None:
         tid = str(terminal_id or "").strip()
@@ -181,6 +318,7 @@ class SessionBus:
             for message_id in ids:
                 if message_id not in remaining:
                     self._messages.pop(message_id, None)
+                    self._delete_message(message_id)
 
     def unread_map(self) -> dict[str, int]:
         with self._lock:
@@ -376,7 +514,9 @@ class SessionBus:
                 for old_id in dropped:
                     if old_id not in remaining:
                         self._messages.pop(old_id, None)
+                        self._delete_message(old_id)
             self._messages[message_id] = message
+        self._persist_message(terminal_id, message)
         if notify == "HEADER":
             # A bus notification is display-only.  Never send the header back
             # through the provider's stdin: Claude may interpret it as a user
@@ -428,6 +568,7 @@ class SessionBus:
                 message["delivery_state"] = "CLAIMED"
                 message["session_anchor_ref"] = anchor
                 message["claimed_at"] = utc_now()
+                self._persist_message(tid, message)
                 return dict(message)
         return None
 
@@ -464,6 +605,7 @@ class SessionBus:
                 )
             message["delivery_state"] = "DISPATCHED"
             message["dispatched_at"] = utc_now()
+            self._persist_message(tid, message)
             return self._public_message(message, headers_only=False)
 
     def release_instruction_claim(
@@ -494,6 +636,7 @@ class SessionBus:
                 message["delivery_state"] = "PENDING"
                 message["session_anchor_ref"] = ""
                 message.pop("claimed_at", None)
+                self._persist_message(tid, message)
 
     def inbox(
         self,
@@ -564,6 +707,7 @@ class SessionBus:
             remaining = {item for bucket in self._inbox.values() for item in bucket}
             if mid not in remaining:
                 self._messages.pop(mid, None)
+                self._delete_message(mid)
         return {"schema": BUS_SCHEMA, "status": "OK", "message_id": mid, "terminal_id": tid}
 
 

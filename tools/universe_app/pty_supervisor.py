@@ -342,6 +342,14 @@ class SupervisedTerminalHost:
             payload={"data_b64": base64.b64encode(data).decode("ascii")},
         )
 
+    def emit_output(self, terminal_id: str, data: bytes) -> None:
+        """Fan out display-only bytes without sending them to CLI stdin."""
+        self._request(
+            "POST",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/emit",
+            payload={"data_b64": base64.b64encode(data).decode("ascii")},
+        )
+
     def resize(self, terminal_id: str, cols: int, rows: int) -> None:
         self._request(
             "POST",

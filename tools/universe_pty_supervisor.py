@@ -369,6 +369,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
             return
+        if path.startswith("/v1/terminals/") and path.endswith("/emit"):
+            terminal_id = path.split("/")[3]
+            raw = str(body.get("data_b64") or "")
+            try:
+                data = base64.b64decode(raw) if raw else b""
+                supervisor.host.emit_output(terminal_id, data)
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                )
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
+            return
         if path.startswith("/v1/terminals/") and path.endswith("/resize"):
             terminal_id = path.split("/")[3]
             try:

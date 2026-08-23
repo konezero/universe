@@ -18751,8 +18751,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if use_pty_supervisor:
             self.terminal_host = SupervisedTerminalHost()
         else:
-            self.terminal_host = TerminalHost()
-        self.session_bus = SessionBus()
+            self.terminal_host = TerminalHost(database_path=store.database_path)
+        self.session_bus = SessionBus(database_path=store.database_path)
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
