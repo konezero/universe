@@ -137,15 +137,13 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(
             [
                 "--dangerously-skip-permissions",
-                "--mcp-config",
-                "C:/tmp/universe-channel.json",
                 "--dangerously-load-development-channels",
                 "server:universe_channel",
             ],
             startup_argv(
                 "CLAUDE",
                 "",
-                claude_channel_mcp_config="C:/tmp/universe-channel.json",
+                claude_channel_enabled=True,
             ),
         )
         self.assertEqual(
@@ -171,7 +169,7 @@ class TerminalHostTests(unittest.TestCase):
         with patch(
             "universe_app.terminal_host.uuid.uuid4",
             return_value=uuid.UUID("12345678-1234-4678-9234-567812345678"),
-        ):
+        ), patch("universe_app.terminal_host.ensure_local_channel_server_registered"):
             created = host.create(
                 project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CLAUDE"
             )

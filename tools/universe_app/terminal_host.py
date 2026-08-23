@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import secrets
-import tempfile
 import uuid
 import threading
 import time
@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from host_profile import resolve_host_tool
-from claude_channel_broker import ClaudeChannelBroker, MCP_SERVER_NAME
+from claude_channel_broker import (
+    ClaudeChannelBroker,
+    MCP_SERVER_NAME,
+    ensure_local_channel_server_registered,
+)
 
 TERMINAL_SCHEMA = "universe.cli-terminal.v1"
 PROVIDER_TOOLS = {
@@ -24,6 +28,15 @@ PROVIDER_TOOLS = {
     "CODEX": "codex",
     "CLAUDE": "claude",
 }
+
+# Matches ANSI CSI (`ESC[...letter`) and OSC (`ESC]...BEL`/`ESC]...ESC\`)
+# sequences so terminal output can be checked as plain text.
+_ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+# The CLI renders each word of its --dangerously-load-development-channels
+# confirmation prompt with its own cursor-column jump instead of a literal
+# space, so after stripping escapes the words land back to back with no
+# separator at all - hence no `\s*` between "local" and "development" below.
+_DEV_CHANNEL_PROMPT_RE = re.compile(rb"localdevelopment", re.IGNORECASE)
 
 
 class TerminalHostError(ValueError):
@@ -159,8 +172,15 @@ class TerminalHost:
         supervisor = str(supervisor_session_id or "").strip()
         terminal_id = "term_" + secrets.token_hex(8)
         channel_broker: ClaudeChannelBroker | None = None
-        channel_config: Path | None = None
         if resolved_provider == "CLAUDE":
+            # The --channels allowlist Claude Code checks at startup only
+            # recognizes MCP servers that are persistently registered
+            # (enterprise/user/project/local scope) - a one-off --mcp-config
+            # file is invisible to it. Register the (stable, secret-free)
+            # server entry once per project instead; each session's actual
+            # broker connection is discovered by the spawned MCP child via
+            # UNIVERSE_TERMINAL_ID, not via this registration.
+            ensure_local_channel_server_registered(str(root.resolve()))
             channel_broker = ClaudeChannelBroker(
                 terminal_id=terminal_id,
                 project_id=project,
@@ -168,8 +188,6 @@ class TerminalHost:
                 provider=resolved_provider,
                 supervisor_session_id=supervisor,
             ).start()
-            config_root = Path(tempfile.mkdtemp(prefix="universe-claude-channel-"))
-            channel_config = channel_broker.write_mcp_config(config_root / "mcp.json")
         fresh_claude_session_id = (
             str(uuid.uuid4())
             if resolved_provider == "CLAUDE" and not str(resume_session_ref or "").strip()
@@ -181,7 +199,7 @@ class TerminalHost:
             model_ref=selected_model,
             effort=selected_effort,
             claude_session_id=fresh_claude_session_id,
-            claude_channel_mcp_config=str(channel_config) if channel_config else "",
+            claude_channel_enabled=channel_broker is not None,
         )
         session = TerminalSession(
             terminal_id=terminal_id,
@@ -491,13 +509,20 @@ class TerminalHost:
                     break
                 continue
             if awaiting_channel_confirm:
-                channel_confirm_tail = (channel_confirm_tail + chunk)[-256:]
-                if b"local development" in channel_confirm_tail.lower():
+                # Search the full accumulated buffer *before* capping it - the
+                # confirmation screen is one large write (box borders, ANSI
+                # color codes, the warning paragraph, ...) and the phrase can
+                # sit well before the end of it, so trimming first would cut
+                # the match off.
+                channel_confirm_tail += chunk
+                if _DEV_CHANNEL_PROMPT_RE.search(_ANSI_ESCAPE_RE.sub(b"", channel_confirm_tail)):
                     awaiting_channel_confirm = False
                     try:
                         backend.write(b"\r")
                     except Exception:  # noqa: BLE001 - best effort
                         pass
+                elif len(channel_confirm_tail) > 4096:
+                    channel_confirm_tail = channel_confirm_tail[-64:]
             with session.lock:
                 session.replay.append(chunk)
                 waiters = list(session.subscribers)
@@ -563,7 +588,7 @@ def startup_argv(
     model_ref: str = "",
     effort: str = "AUTO",
     claude_session_id: str = "",
-    claude_channel_mcp_config: str = "",
+    claude_channel_enabled: bool = False,
 ) -> list[str]:
     """Build one interactive CLI command without changing its supervisor anchor.
 
@@ -590,12 +615,13 @@ def startup_argv(
         if session_id:
             argv.extend(("--session-id", session_id))
         argv.append("--dangerously-skip-permissions")
-        channel_config = str(claude_channel_mcp_config or "").strip()
-        if channel_config:
-            # Claude Code channels are a preview feature. The explicit local
-            # opt-in prevents the startup warning from treating our bounded
-            # loopback channel as an unapproved implicit channel.
-            argv.extend(("--mcp-config", channel_config))
+        if claude_channel_enabled:
+            # Claude Code channels are a preview feature restricted to MCP
+            # servers already registered in persistent (not --mcp-config)
+            # scope - see ensure_local_channel_server_registered. This flag
+            # opts that registered server into channel/push privileges for
+            # this one launch and triggers its confirmation menu (auto
+            # confirmed in _pump_session once it renders).
             argv.extend(("--dangerously-load-development-channels", f"server:{MCP_SERVER_NAME}"))
     return argv
 

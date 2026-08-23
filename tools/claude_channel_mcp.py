@@ -17,11 +17,12 @@ import urllib.error
 import urllib.request
 from typing import Any, Mapping
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from claude_channel_broker import TERMINAL_ID_ENVIRONMENT, session_lookup_path  # noqa: E402
+
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "universe_channel"
-CHANNEL_ENDPOINT_ENVIRONMENT = "UNIVERSE_CLAUDE_CHANNEL_ENDPOINT"
-CHANNEL_BOOTSTRAP_ENVIRONMENT = "UNIVERSE_CLAUDE_CHANNEL_BOOTSTRAP"
 CHANNEL_TOKEN_HEADER = "X-Universe-Claude-Channel-Token"
 CHANNEL_EXCHANGE_PATH = "/v1/claude-channel/exchange"
 CHANNEL_POLL_PATH = "/v1/claude-channel/poll"
@@ -29,20 +30,36 @@ REQUEST_TIMEOUT_SECONDS = 10.0
 POLL_TIMEOUT_SECONDS = 2.0
 
 _SESSION_TOKEN: str | None = None
+_ENDPOINT: str | None = None
 _STOP = threading.Event()
 _WRITE_LOCK = threading.Lock()
 _POLL_THREAD: threading.Thread | None = None
 
 
-def _endpoint() -> str | None:
-    value = os.environ.get(CHANNEL_ENDPOINT_ENVIRONMENT, "").strip().rstrip("/")
-    if not value.startswith(("http://127.0.0.1:", "http://localhost:")):
+def _session_lookup() -> tuple[str, str] | None:
+    # universe_channel is now a persistently-registered (static) local-scope
+    # MCP server, so it can no longer receive a per-session endpoint/token
+    # via its own config's env. Discover the current session instead through
+    # UNIVERSE_TERMINAL_ID (inherited from the parent CLI process) plus the
+    # small per-terminal file the broker writes at session start.
+    terminal_id = os.environ.get(TERMINAL_ID_ENVIRONMENT, "").strip()
+    if not terminal_id:
         return None
-    return value
+    try:
+        data = json.loads(session_lookup_path(terminal_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    endpoint = str(data.get("endpoint") or "").strip().rstrip("/")
+    bootstrap = str(data.get("bootstrap_token") or "").strip()
+    if not endpoint.startswith(("http://127.0.0.1:", "http://localhost:")) or not bootstrap:
+        return None
+    return endpoint, bootstrap
 
 
 def _post(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] | None:
-    endpoint = _endpoint()
+    endpoint = _ENDPOINT
     if endpoint is None or not token:
         return None
     body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
@@ -64,12 +81,13 @@ def _post(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] |
 
 
 def register() -> bool:
-    global _SESSION_TOKEN
+    global _SESSION_TOKEN, _ENDPOINT
     if _SESSION_TOKEN:
         return True
-    bootstrap = os.environ.pop(CHANNEL_BOOTSTRAP_ENVIRONMENT, "").strip()
-    if not bootstrap:
+    found = _session_lookup()
+    if found is None:
         return False
+    _ENDPOINT, bootstrap = found
     result = _post(CHANNEL_EXCHANGE_PATH, {}, bootstrap)
     if not isinstance(result, Mapping) or result.get("status") != "REGISTERED":
         return False

@@ -14,6 +14,7 @@ the caller before ``push`` is reached.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import secrets
@@ -27,16 +28,107 @@ from typing import Any, Mapping
 CHANNEL_SCHEMA = "universe.claude-channel.v1"
 MCP_SERVER_NAME = "universe_channel"
 MCP_SOURCE = "universe"
-CHANNEL_BOOTSTRAP_ENVIRONMENT = "UNIVERSE_CLAUDE_CHANNEL_BOOTSTRAP"
-CHANNEL_ENDPOINT_ENVIRONMENT = "UNIVERSE_CLAUDE_CHANNEL_ENDPOINT"
 CHANNEL_TOKEN_HEADER = "X-Universe-Claude-Channel-Token"
 CHANNEL_EXCHANGE_PATH = "/v1/claude-channel/exchange"
 CHANNEL_PUSH_PATH = "/v1/claude-channel/push"
 CHANNEL_POLL_PATH = "/v1/claude-channel/poll"
+TERMINAL_ID_ENVIRONMENT = "UNIVERSE_TERMINAL_ID"
 MAX_CONTENT_BYTES = 32 * 1024
 MAX_QUEUE = 64
 MAX_META_KEYS = 16
 _META_KEY = re.compile(r"^[A-Za-z0-9_]+$")
+_REGISTRATION_LOCK = threading.Lock()
+
+
+def _data_dir() -> Path:
+    # Mirrors universe_app.pty_supervisor.default_data_dir() without
+    # importing it - that module imports terminal_host, which imports this
+    # one, so importing it back here would be circular.
+    override = os.environ.get("UNIVERSE_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "Universe"
+    return Path.home() / ".local" / "share" / "universe"
+
+
+def session_lookup_path(terminal_id: str) -> Path:
+    """Where a channel MCP child looks up its broker's endpoint/token.
+
+    Claude Code's --channels allowlist only recognizes MCP servers that are
+    persistently registered (enterprise/user/project/local scope), not ones
+    supplied via a one-off --mcp-config file. So the registered server entry
+    is now static per project, and each spawned MCP child instead discovers
+    its own session's broker via UNIVERSE_TERMINAL_ID (inherited from the
+    parent CLI process) plus this small per-terminal lookup file.
+    """
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(terminal_id or "").strip())
+    return _data_dir() / "channel-sessions" / f"{safe_id}.json"
+
+
+def _channel_python_executable() -> str:
+    # This script only ever talks over stdio to its parent (Claude Code), so
+    # it never needs a console of its own - use the windowless interpreter on
+    # Windows so launching it doesn't pop a console window per session.
+    if os.name == "nt":
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if pythonw.is_file():
+            return str(pythonw)
+    return sys.executable
+
+
+def _claude_config_path() -> Path:
+    override = os.environ.get("UNIVERSE_CLAUDE_CONFIG_PATH")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".claude.json"
+
+
+def ensure_local_channel_server_registered(project_root: str) -> None:
+    """Idempotently register universe_channel as a local-scope MCP server.
+
+    This edits the user's shared ~/.claude.json, so it only writes when the
+    entry is missing or stale, and does a fresh read-merge-atomic-replace
+    right before writing to keep the window where a concurrent Claude Code
+    write could be clobbered as small as possible.
+    """
+    root = str(Path(project_root or "").expanduser())
+    if not root:
+        return
+    keys = {root, root.replace("\\", "/")}
+    server_script = Path(__file__).with_name("claude_channel_mcp.py")
+    desired = {"command": _channel_python_executable(), "args": [str(server_script)]}
+    config_path = _claude_config_path()
+    with _REGISTRATION_LOCK:
+        try:
+            raw = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            data = json.loads(raw) if raw.strip() else {}
+        except (OSError, ValueError):
+            return  # best effort - never clobber a file we cannot parse
+        if not isinstance(data, dict):
+            return
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            return
+        changed = False
+        for key in keys:
+            entry = projects.get(key)
+            if not isinstance(entry, dict):
+                entry = {}
+                projects[key] = entry
+            servers = entry.get("mcpServers")
+            if not isinstance(servers, dict):
+                servers = {}
+                entry["mcpServers"] = servers
+            if servers.get(MCP_SERVER_NAME) != desired:
+                servers[MCP_SERVER_NAME] = desired
+                changed = True
+        if not changed:
+            return
+        tmp = config_path.with_name(config_path.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, config_path)
 
 
 class ClaudeChannelError(RuntimeError):
@@ -129,8 +221,6 @@ class ClaudeChannelBroker:
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=MAX_QUEUE)
         self._seen: set[str] = set()
         self._seen_lock = threading.Lock()
-        self._mcp_config_path: Path | None = None
-        self._mcp_config_lock = threading.Lock()
         self._server = ThreadingHTTPServer((host, port), self._handler_type())
         self._thread: threading.Thread | None = None
 
@@ -156,6 +246,7 @@ class ClaudeChannelBroker:
             daemon=True,
         )
         self._thread.start()
+        self._write_session_lookup()
         return self
 
     def close(self) -> None:
@@ -171,7 +262,7 @@ class ClaudeChannelBroker:
             self._thread.join(timeout=2)
             self._thread = None
         self._server.server_close()
-        self._cleanup_mcp_config()
+        self._cleanup_session_lookup()
 
     def exchange_bootstrap(self, presented: str | None) -> dict[str, Any]:
         if self._stopped.is_set():
@@ -192,26 +283,13 @@ class ClaudeChannelBroker:
         # one-time and cannot be reused.
         return {"status": "REGISTERED", "session_token": self.token.value}
 
-    def write_mcp_config(self, path: Path) -> Path:
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        server_script = Path(__file__).with_name("claude_channel_mcp.py")
-        config = {
-            "mcpServers": {
-                MCP_SERVER_NAME: {
-                    "command": sys.executable,
-                    "args": [str(server_script)],
-                    "env": {
-                        CHANNEL_ENDPOINT_ENVIRONMENT: self.endpoint,
-                        CHANNEL_BOOTSTRAP_ENVIRONMENT: self._bootstrap_token,
-                    },
-                }
-            }
-        }
-        target.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
-        with self._mcp_config_lock:
-            self._mcp_config_path = target
-        return target
+    def _write_session_lookup(self) -> None:
+        path = session_lookup_path(self.token.terminal_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"endpoint": self.endpoint, "bootstrap_token": self._bootstrap_token}
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
 
     def push(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if self._stopped.is_set():
@@ -346,17 +424,8 @@ class ClaudeChannelBroker:
 
         return Handler
 
-    def _cleanup_mcp_config(self) -> None:
-        with self._mcp_config_lock:
-            path = self._mcp_config_path
-            self._mcp_config_path = None
-        if path is None:
-            return
+    def _cleanup_session_lookup(self) -> None:
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            return
-        try:
-            path.parent.rmdir()
+            session_lookup_path(self.token.terminal_id).unlink(missing_ok=True)
         except OSError:
             pass

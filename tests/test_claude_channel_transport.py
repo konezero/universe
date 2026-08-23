@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from claude_channel_broker import (  # noqa: E402
-    CHANNEL_BOOTSTRAP_ENVIRONMENT,
     ClaudeChannelBroker,
     ClaudeChannelError,
+    session_lookup_path,
 )
 from claude_channel_mcp import handle_message  # noqa: E402
 from universe_app.terminal_host import TerminalHost  # noqa: E402
@@ -35,9 +36,16 @@ class FakePty:
 
 
 class ClaudeChannelBrokerTests(unittest.TestCase):
-    def make_broker(self) -> ClaudeChannelBroker:
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.dict(os.environ, {"UNIVERSE_DATA_DIR": directory.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_broker(self, terminal_id: str = "term_channel_001") -> ClaudeChannelBroker:
         broker = ClaudeChannelBroker(
-            terminal_id="term_channel_001",
+            terminal_id=terminal_id,
             project_id="universe",
             mode="CONDUCTOR",
             provider="CLAUDE",
@@ -48,13 +56,11 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
 
     def test_bootstrap_is_single_use_and_push_poll_is_authenticated(self) -> None:
         broker = self.make_broker()
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = broker.write_mcp_config(Path(directory) / "mcp.json")
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            environment = config["mcpServers"]["universe_channel"]["env"]
-            bootstrap = environment[CHANNEL_BOOTSTRAP_ENVIRONMENT]
-            registered = broker.exchange_bootstrap(bootstrap)
-            self.assertTrue(config_path.is_file())
+        lookup_path = session_lookup_path(broker.token.terminal_id)
+        lookup = json.loads(lookup_path.read_text(encoding="utf-8"))
+        bootstrap = lookup["bootstrap_token"]
+        registered = broker.exchange_bootstrap(bootstrap)
+        self.assertTrue(lookup_path.is_file())
 
         self.assertEqual("REGISTERED", registered["status"])
         self.assertEqual("READY", "READY" if broker.registered else "PENDING")
@@ -96,14 +102,11 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
                 host="0.0.0.0",
             )
 
-        broker = self.make_broker()
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = broker.write_mcp_config(Path(directory) / "mcp.json")
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            bootstrap = config["mcpServers"]["universe_channel"]["env"][
-                CHANNEL_BOOTSTRAP_ENVIRONMENT
-            ]
-        broker.exchange_bootstrap(bootstrap)
+        broker = self.make_broker(terminal_id="term_channel_002")
+        lookup = json.loads(
+            session_lookup_path(broker.token.terminal_id).read_text(encoding="utf-8")
+        )
+        broker.exchange_bootstrap(lookup["bootstrap_token"])
         with self.assertRaisesRegex(ClaudeChannelError, "META_KEY"):
             broker.push(
                 {
@@ -147,10 +150,14 @@ class ClaudeChannelMcpToolTests(unittest.TestCase):
 
 class ClaudeChannelTerminalHostTests(unittest.TestCase):
     def test_claude_terminal_keeps_pty_and_adds_channel_transport(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
         with patch(
             "universe_app.terminal_host.resolve_cli_executable",
             return_value="claude",
-        ):
+        ), patch(
+            "universe_app.terminal_host.ensure_local_channel_server_registered"
+        ), patch.dict(os.environ, {"UNIVERSE_DATA_DIR": directory.name}):
             host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
             created = host.create(
                 project_id="universe",
