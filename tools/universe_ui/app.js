@@ -2165,9 +2165,9 @@ function nodeModeStatusLabel(coordinate) {
   const live = ptyLiveTerminalsForCoordinate(coordinate).length > 0;
   if (coordinate.current && live) return "CURRENT · LIVE";
   if (live) return "LIVE";
-  if (coordinate.current && coordinate.active) return "CURRENT · STREAM";
+  // A browser EventSource subscription is not provider execution. Persisted
+  // anchors remain CURRENT/SAVED until a live PTY terminal proves otherwise.
   if (coordinate.current) return "CURRENT";
-  if (coordinate.active) return "STREAM";
   return coordinate.hasSession ? "SAVED" : "NO SESSION";
 }
 
@@ -3970,7 +3970,10 @@ async function refresh({ syncSelectedProject = false } = {}) {
         syncAssets: syncSelectedProject,
       });
     } else if (state.projects.length) {
-      await selectProject(state.projects[0].project_id, {
+      const initialProject =
+        state.projects.find((project) => project.project_id === "universe") ||
+        state.projects[0];
+      await selectProject(initialProject.project_id, {
         revealInspector: false,
         syncAssets: syncSelectedProject,
       });
