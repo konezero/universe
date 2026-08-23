@@ -118,28 +118,7 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         )
         self._write(
             installer,
-            "import argparse\n"
-            "import json\n"
-            "from pathlib import Path\n"
-            "parser = argparse.ArgumentParser()\n"
-            "parser.add_argument('command')\n"
-            "parser.add_argument('--source-bundle')\n"
-            "parser.add_argument('--target')\n"
-            "parser.add_argument('--project')\n"
-            "parser.add_argument('--node')\n"
-            "parser.add_argument('--mode')\n"
-            "parser.add_argument('--host')\n"
-            "parser.add_argument('--commander-surface')\n"
-            "parser.add_argument('--execution-surface')\n"
-            "parser.add_argument('--repository-location')\n"
-            "parser.add_argument('--force', action='store_true')\n"
-            "args = parser.parse_args()\n"
-            "if not args.force:\n"
-            "    raise SystemExit('expected release rehydration force flag')\n"
-            "target = Path(args.target) / '.ai' / 'START_HERE.md'\n"
-            "target.parent.mkdir(parents=True, exist_ok=True)\n"
-            "target.write_text('# Runtime entry\\n', encoding='utf-8')\n"
-            "print(json.dumps({'result': 'PASS', 'repository_runtime': 'VERIFIED'}))\n",
+            "raise SystemExit(\"release database installation must not invoke runtime installer\")\n",
         )
         self._write(host, "HOST = True\n")
         self._write(core, "# Core\n")
@@ -241,10 +220,8 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertEqual(proposal["release_id"], state["release_id"])
         core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
         self.assertTrue(core_file.exists())
-        self.assertTrue((self.project / ".ai" / "START_HERE.md").exists())
-        self.assertEqual(
-            "REHYDRATED", receipt["runtime_surface_result"]["result"]
-        )
+        self.assertFalse((self.project / ".ai" / "START_HERE.md").exists())
+        self.assertNotIn("runtime_surface_result", receipt)
 
     def test_direct_plan_application_returns_no_proposal_or_approval_evidence(self) -> None:
         proposal = self._proposal()
