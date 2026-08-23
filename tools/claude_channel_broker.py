@@ -186,7 +186,10 @@ class ClaudeChannelBroker:
             self._bootstrap_consumed = True
             self._bootstrap_token = ""
             self._registered.set()
-        self._cleanup_mcp_config()
+        # Claude Code can re-read --mcp-config after the initial channel
+        # handshake (for example from its MCP inspector). Keep the ephemeral
+        # config until the terminal broker closes; the bootstrap is already
+        # one-time and cannot be reused.
         return {"status": "REGISTERED", "session_token": self.token.value}
 
     def write_mcp_config(self, path: Path) -> Path:

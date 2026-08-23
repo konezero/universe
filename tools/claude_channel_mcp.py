@@ -153,7 +153,47 @@ def handle_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
             _POLL_THREAD.start()
         return None
     elif method == "tools/list":
-        result = {"tools": []}
+        # This channel is notification-first, but exposing one read-only tool
+        # makes its presence and current registration state discoverable to the
+        # provider instead of looking like an empty or missing MCP server.
+        result = {
+            "tools": [
+                {
+                    "name": "universe_channel_status",
+                    "description": (
+                        "Show the connection state of the authenticated local "
+                        "Universe message channel. This tool is read-only."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        }
+    elif method == "tools/call":
+        params = message.get("params")
+        params = dict(params) if isinstance(params, Mapping) else {}
+        if params.get("name") != "universe_channel_status":
+            result = {
+                "content": [{"type": "text", "text": "Unknown Universe channel tool."}],
+                "isError": True,
+            }
+        else:
+            status = {
+                "server": SERVER_NAME,
+                "transport": "CLAUDE_CODE_CHANNEL",
+                "connection": "CONNECTED" if _SESSION_TOKEN else "PENDING",
+                "delivery": "INBOUND_CHANNEL_EVENTS",
+                "writable": False,
+            }
+            result = {
+                "content": [
+                    {"type": "text", "text": json.dumps(status, ensure_ascii=False)}
+                ],
+                "structuredContent": status,
+            }
     elif method == "ping":
         result = {}
     else:

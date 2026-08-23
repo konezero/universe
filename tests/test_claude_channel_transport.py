@@ -16,6 +16,7 @@ from claude_channel_broker import (  # noqa: E402
     ClaudeChannelBroker,
     ClaudeChannelError,
 )
+from claude_channel_mcp import handle_message  # noqa: E402
 from universe_app.terminal_host import TerminalHost  # noqa: E402
 
 
@@ -53,6 +54,7 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
             environment = config["mcpServers"]["universe_channel"]["env"]
             bootstrap = environment[CHANNEL_BOOTSTRAP_ENVIRONMENT]
             registered = broker.exchange_bootstrap(bootstrap)
+            self.assertTrue(config_path.is_file())
 
         self.assertEqual("REGISTERED", registered["status"])
         self.assertEqual("READY", "READY" if broker.registered else "PENDING")
@@ -120,6 +122,27 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
                     "meta": {"sender_id": "REMOTE_UNVERIFIED"},
                 }
             )
+
+
+class ClaudeChannelMcpToolTests(unittest.TestCase):
+    def test_status_tool_is_discoverable_and_read_only(self) -> None:
+        listed = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tool = listed["result"]["tools"][0]
+        self.assertEqual("universe_channel_status", tool["name"])
+        self.assertEqual({}, tool["inputSchema"]["properties"])
+
+        response = handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "universe_channel_status", "arguments": {}},
+            }
+        )
+        status = response["result"]["structuredContent"]
+        self.assertEqual("universe_channel", status["server"])
+        self.assertEqual("CLAUDE_CODE_CHANNEL", status["transport"])
+        self.assertFalse(status["writable"])
 
 
 class ClaudeChannelTerminalHostTests(unittest.TestCase):
