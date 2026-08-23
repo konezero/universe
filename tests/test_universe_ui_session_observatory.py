@@ -535,13 +535,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('"Provider setup required"', APP)
         self.assertIn('"LLM connected / Auto-approve " + autoApprove', APP)
 
-    def test_provider_settings_expose_models_without_worker_bindings(self) -> None:
+    def test_provider_settings_expose_models_and_worker_bindings(self) -> None:
         providers_panel = HTML[
             HTML.index('data-settings-panel="providers"') :
             HTML.index('data-settings-panel="host"')
         ]
         self.assertIn("<strong>Provider models</strong>", providers_panel)
-        self.assertNotIn("<strong>Worker bindings</strong>", providers_panel)
+        self.assertIn("<strong>Worker bindings</strong>", providers_panel)
+        self.assertIn('id="worker-binding-scope"', providers_panel)
+        self.assertIn('id="worker-binding-settings"', providers_panel)
         self.assertNotIn("Universe Conductor", providers_panel)
         self.assertNotIn("Project Masters", providers_panel)
         self.assertNotIn('id="project-provider-settings"', HTML)

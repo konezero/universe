@@ -573,6 +573,25 @@
 
         <!-- Providers -->
         <div class="settings-tab-panel" data-settings-panel="providers" role="tabpanel" hidden>
+          <section class="settings-section worker-binding-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Worker bindings</strong>
+                <small>Task defaults for implementation, review, QA, scouting, and routine work.</small>
+              </div>
+              <label class="worker-binding-scope-label" for="worker-binding-scope">
+                Scope
+                <select id="worker-binding-scope"></select>
+              </label>
+            </div>
+            <div class="worker-binding-legend" aria-hidden="true">
+              <span>Role</span><span>Provider</span><span>Model</span><span>Custom</span><span>Effort</span><span>Skills</span>
+            </div>
+            <div id="worker-binding-settings" class="worker-binding-settings"></div>
+            <small class="provider-setting-status">
+              Model list = CLI discover + presets. Leave Host default empty, or pick a catalog model. Optional custom id overrides the select.
+            </small>
+          </section>
           <section class="settings-section">
             <div class="settings-section-heading">
               <div>
