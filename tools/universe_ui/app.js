@@ -2486,23 +2486,60 @@ function sessionFromPtyTerminal(terminal) {
     session_kind: "PTY_LIVE",
     last_seen_at: supervised?.last_seen_at || terminal.created_at,
     session_anchor_ref:
-      supervised?.session_anchor_ref || `pty:${terminal.terminal_id}`,
+      supervised?.session_anchor_ref ||
+      terminal.session_anchor_ref ||
+      `pty:${terminal.terminal_id}`,
   };
 }
 
+const NODE_MODE_RECENT_SESSION_LIMIT = 5;
+
+function recentAnchorSessionsForCoordinate(coordinate) {
+  const projectId = String(
+    coordinate?.project?.project_id || coordinate?.nodeId || ""
+  ).trim();
+  const mode = String(coordinate?.mode || "").trim().toUpperCase();
+  if (!projectId || !mode) return [];
+  return (state.projectAnchorSessions || [])
+    .filter(
+      (session) =>
+        String(session.project_id || session.node || "").trim() === projectId &&
+        String(session.mode || "").trim().toUpperCase() === mode
+    )
+    .sort((left, right) => {
+      const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
+      const rightCurrent = nodeModeSessionIsCurrent(right) ? 0 : 1;
+      if (leftCurrent !== rightCurrent) return leftCurrent - rightCurrent;
+      return String(right.last_seen_at || "").localeCompare(
+        String(left.last_seen_at || "")
+      );
+    });
+}
+
 function nodeModePanelSessionBuckets(coordinate) {
-  // Keep every live connection visible; activity changes the card status.
-  // Historical sessions remain available through the Observatory.
-  const sessions = ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
+  // LIVE PTYs always win. Durable anchors fill the remaining recent slots.
+  const live = ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
+  const seenAnchorKeys = new Set(live.map(anchorSessionKey).filter(Boolean));
+  const recentCandidates = recentAnchorSessionsForCoordinate(coordinate).filter(
+    (session) => {
+      const anchorKey = anchorSessionKey(session);
+      if (!anchorKey || seenAnchorKeys.has(anchorKey)) return false;
+      seenAnchorKeys.add(anchorKey);
+      return true;
+    }
+  );
+  const recentSlots = Math.max(0, NODE_MODE_RECENT_SESSION_LIMIT - live.length);
+  const recent = recentCandidates.slice(0, recentSlots);
   return {
-    working: sessions.filter(nodeModeSessionIsWorking),
-    idle: sessions.filter((session) => !nodeModeSessionIsWorking(session)),
+    working: live.filter(nodeModeSessionIsWorking),
+    idle: live.filter((session) => !nodeModeSessionIsWorking(session)),
+    recent,
+    sessions: [...live, ...recent],
   };
 }
 
 function nodeModePanelSessions(coordinate) {
-  const buckets = nodeModePanelSessionBuckets(coordinate);
-  return [...buckets.working, ...buckets.idle];
+  return nodeModePanelSessionBuckets(coordinate).sessions;
 }
 
 function renderNodeModeSessionCards(coordinate) {
@@ -2512,6 +2549,9 @@ function renderNodeModeSessionCards(coordinate) {
   const sessions = nodeModePanelSessions(coordinate);
   const selected = nodeModeSelectedSession(coordinate);
   const ordered = [...sessions].sort((left, right) => {
+    const leftLive = left.terminal_id ? 0 : 1;
+    const rightLive = right.terminal_id ? 0 : 1;
+    if (leftLive !== rightLive) return leftLive - rightLive;
     const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
     const rightCurrent = nodeModeSessionIsCurrent(right) ? 0 : 1;
     if (leftCurrent !== rightCurrent) return leftCurrent - rightCurrent;
@@ -2530,7 +2570,7 @@ function renderNodeModeSessionCards(coordinate) {
   cards.append(create);
   if (!sessions.length) {
     cards.append(
-      node("p", "node-mode-session-empty", "No connected sessions in this mode")
+      node("p", "node-mode-session-empty", "No live or recent sessions in this mode")
     );
     return cards;
   }
@@ -2557,9 +2597,21 @@ function renderNodeModeSessionCards(coordinate) {
       node("small", "", detail)
     );
     const activityState = nodeModeSessionActivityState(session);
-    const visualState = nodeModeSessionIsWorking(session) ? activityState : "IDLE";
     const current = nodeModeSessionIsCurrent(session);
-    const statusLabel = visualState === "ACTIVE" ? "WORKING" : visualState;
+    const livePty = Boolean(session.terminal_id);
+    let visualState = "RECENT";
+    let statusLabel = "RECENT";
+    if (livePty) {
+      visualState = nodeModeSessionIsWorking(session) ? activityState : "IDLE";
+      statusLabel = visualState === "ACTIVE" ? "WORKING" : visualState;
+    } else if (session.active_ing === true) {
+      const offlineState = String(session.state || "ING").toUpperCase();
+      visualState = "OFFLINE";
+      statusLabel = `${offlineState} · OFFLINE`;
+    } else if (current) {
+      visualState = "OFFLINE";
+      statusLabel = "CURRENT · OFFLINE";
+    }
     const status = node("span", "node-mode-session-status", statusLabel);
     status.dataset.state = visualState;
     status.dataset.current = String(current);
@@ -2568,9 +2620,13 @@ function renderNodeModeSessionCards(coordinate) {
     if (unread > 0) {
       card.append(node("span", "node-mode-session-bus-unread", String(Math.min(unread, 99))));
     }
-    card.title = current
-      ? "Inspect the DB Current connected session"
-      : "Inspect this connected session";
+    card.title = livePty
+      ? current
+        ? "Inspect the DB Current connected session"
+        : "Inspect this connected session"
+      : current
+        ? "Inspect the DB Current session anchor (PTY offline)"
+        : "Inspect this recent session anchor";
     card.dataset.current = String(nodeModeSessionIsCurrent(session));
     card.addEventListener("click", () => {
       selectNodeModeSession(coordinate, session).catch((error) =>
@@ -2647,9 +2703,9 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
-      const liveCount = nodeModePanelSessions(coordinate).length;
-      // Collapsed modes keep every live connection visible as a session card.
-      if (modeSelected || liveCount) {
+      const sessionCount = nodeModePanelSessions(coordinate).length;
+      // Collapsed modes keep LIVE and bounded recent sessions discoverable.
+      if (modeSelected || sessionCount) {
         list.append(renderNodeModeSessionCards(coordinate));
       }
     }

@@ -148,6 +148,17 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _audit_context(self, fallback_source: str) -> dict[str, str]:
+        return {
+            "source": str(
+                self.headers.get("X-Universe-Audit-Source") or fallback_source
+            ),
+            "access_surface": str(
+                self.headers.get("X-Universe-Access-Surface") or "UNKNOWN"
+            ),
+            "request_id": str(self.headers.get("X-Universe-Request-Id") or ""),
+        }
+
     def _read_json(self) -> dict[str, Any]:
         try:
             length = int(self.headers.get("Content-Length") or "0")
@@ -179,6 +190,24 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         supervisor = self.server.supervisor
+        if path == "/v1/audit-events":
+            query = parse_qs(parsed.query)
+            try:
+                limit = int((query.get("limit") or ["200"])[0])
+            except ValueError:
+                limit = 200
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "TERMINAL_AUDIT_EVENTS_COLLECTED",
+                    "events": supervisor.host.audit_events(
+                        terminal_id=(query.get("terminal_id") or [""])[0],
+                        limit=limit,
+                    ),
+                },
+            )
+            return
         if path == "/v1/bus/directory":
             self._send(HTTPStatus.OK, supervisor.host.bus.directory(supervisor.host))
             return
@@ -324,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
                     resume_session_ref=str(body.get("resume_session_ref") or ""),
                     cols=int(body.get("cols") or 120),
                     rows=int(body.get("rows") or 32),
+                    audit_context=self._audit_context("PTY_SUPERVISOR_CREATE"),
                 )
             except TerminalHostError as error:
                 self._send(
@@ -360,7 +390,11 @@ class Handler(BaseHTTPRequestHandler):
             raw = str(body.get("data_b64") or "")
             try:
                 data = base64.b64decode(raw) if raw else b""
-                supervisor.host.write(terminal_id, data)
+                supervisor.host.write(
+                    terminal_id,
+                    data,
+                    audit_context=self._audit_context("PTY_SUPERVISOR_WRITE"),
+                )
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.CONFLICT,
@@ -414,7 +448,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/terminals/") and path.count("/") == 3:
             terminal_id = path.rsplit("/", 1)[-1]
             try:
-                result = supervisor.host.close(terminal_id)
+                result = supervisor.host.close(
+                    terminal_id,
+                    audit_context=self._audit_context("PTY_SUPERVISOR_DELETE"),
+                )
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.NOT_FOUND,
@@ -440,7 +477,9 @@ class Server(ThreadingHTTPServer):
 def main() -> int:
     state_path = default_state_path()
     token = secrets.token_urlsafe(24)
-    server = Server(token)
+    audit_database_path = state_path.parent / "universe.sqlite3"
+    terminal_host = TerminalHost(audit_database_path=audit_database_path)
+    server = Server(token, host=terminal_host)
     host, port = server.server_address[:2]
     endpoint = f"http://{host}:{port}"
     _write_json_atomic(
@@ -454,11 +493,21 @@ def main() -> int:
             "token": token,
         },
     )
+    terminal_host.record_audit_event(
+        "SUPERVISOR_STARTED",
+        context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
+        details={"pid": os.getpid(), "endpoint": endpoint},
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        terminal_host.record_audit_event(
+            "SUPERVISOR_STOPPING",
+            context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
+            details={"pid": os.getpid()},
+        )
         server.server_close()
     return 0
 

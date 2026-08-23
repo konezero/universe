@@ -3658,7 +3658,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         )
 
-    def test_project_anchor_sessions_list_current_and_beyond_ing_from_store(self) -> None:
+    def test_project_anchor_sessions_list_current_and_recent_from_store(self) -> None:
         status, _ = self.request(
             "POST", "/v1/projects/register", self.registration(), self.token
         )
@@ -3798,7 +3798,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         write_session_store(
             "UNIVERSE-MASTER-READY-001",
-            "MASTER-CURRENT-OLD-ING",
+            "MASTER-SESSION-READY",
             "READY",
             {
                 "session_id": "UNIVERSE-MASTER-READY-001",
@@ -3838,8 +3838,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertTrue(by_id["UNIVERSE-MASTER-TEST-001"]["active_ing"])
         self.assertEqual("EXECUTING", by_id["UNIVERSE-MASTER-TEST-001"]["state"])
-        self.assertNotIn("UNIVERSE-MASTER-READY-001", by_id)
-        self.assertNotIn("UNIVERSE-MASTER-STOPPED-001", by_id)
+        self.assertIn("UNIVERSE-MASTER-READY-001", by_id)
+        self.assertFalse(by_id["UNIVERSE-MASTER-READY-001"]["active_ing"])
+        self.assertEqual("SESSION", by_id["UNIVERSE-MASTER-READY-001"]["temporality"])
+        self.assertIn("UNIVERSE-MASTER-STOPPED-001", by_id)
+        self.assertFalse(by_id["UNIVERSE-MASTER-STOPPED-001"]["active_ing"])
+        self.assertEqual("BEYOND", by_id["UNIVERSE-MASTER-STOPPED-001"]["temporality"])
         catalog = self.server.provider_chat_catalog()
         self.assertTrue(
             any(

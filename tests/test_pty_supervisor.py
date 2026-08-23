@@ -54,7 +54,12 @@ class FakePty:
 
 class PtySupervisorTests(unittest.TestCase):
     def setUp(self) -> None:
-        host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+        self.audit_dir = tempfile.TemporaryDirectory(prefix="pty-audit-test-")
+        audit_path = Path(self.audit_dir.name) / "audit.sqlite3"
+        host = TerminalHost(
+            spawn=lambda *_args, **_kwargs: FakePty(),
+            audit_database_path=audit_path,
+        )
         self.server = Server("sup-token", host=host)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -64,6 +69,7 @@ class PtySupervisorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+        self.audit_dir.cleanup()
 
     def test_spawn_supervisor_hides_its_windows_console(self) -> None:
         script = ROOT / "tools" / "universe_pty_supervisor.py"
@@ -225,6 +231,43 @@ class PtySupervisorTests(unittest.TestCase):
                 seen += chunk
         self.assertIn(b"hello-supervisor", seen)
         second.unsubscribe(terminal_id, waiter)
+
+
+    def test_http_control_and_delete_are_durably_attributed(self) -> None:
+        _status, created = self.request(
+            "POST",
+            "/v1/terminals",
+            {
+                "project_id": "universe",
+                "mode": "MASTER",
+                "cwd": str(ROOT),
+                "provider": "CODEX",
+                "supervisor_session_id": "session_master_1",
+            },
+        )
+        terminal_id = created["terminal"]["terminal_id"]
+        self.request(
+            "POST",
+            f"/v1/terminals/{terminal_id}/write",
+            {"data_b64": base64.b64encode(b"\x03").decode("ascii")},
+        )
+        self.request("DELETE", f"/v1/terminals/{terminal_id}")
+        _status, payload = self.request(
+            "GET", f"/v1/audit-events?terminal_id={terminal_id}"
+        )
+        events = list(reversed(payload["events"]))
+        self.assertEqual(
+            [
+                "TERMINAL_CREATED",
+                "INPUT_CONTROL_WRITTEN",
+                "CLOSE_REQUESTED",
+                "TERMINAL_CLOSED",
+            ],
+            [event["event_type"] for event in events],
+        )
+        self.assertEqual("PTY_SUPERVISOR_WRITE", events[1]["source"])
+        self.assertEqual(["CTRL_C"], events[1]["details"]["control_classes"])
+        self.assertEqual("PTY_SUPERVISOR_DELETE", events[2]["source"])
 
 
 if __name__ == "__main__":

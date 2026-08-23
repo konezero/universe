@@ -1055,8 +1055,6 @@ def _public_anchor_session(
 ) -> dict[str, Any]:
     universe_id = session_id if str(session_id).startswith("UNIVERSE-") else None
     observer = str(observer_session_ref or "").strip()
-    identity = _vendor_identity_from_observer(observer or session_id)
-    provider_session_id = identity[1] if identity is not None else ""
     return {
         "schema": "universe.project-anchor-session.v1",
         "project_id": project_id,
@@ -1067,7 +1065,6 @@ def _public_anchor_session(
         "alias": session_id if universe_id else f"{project_id} {mode}",
         "provider": provider,
         "observer_session_ref": observer,
-        "provider_session_id": provider_session_id,
         "session_anchor_ref": session_anchor_ref,
         "current_anchor_ref": current_anchor_ref,
         "origin_anchor_ref": origin_anchor_ref,
@@ -22413,7 +22410,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
 
     def list_project_anchor_sessions(self, project_id: str) -> dict[str, Any]:
-        """List Current and in-progress Beyond sessions from the project store."""
+        """List Current and durable recent sessions from the project store."""
 
         project = self.store.get_project(project_id)
         project_root = Path(str(project.get("project_root") or "")).resolve(
@@ -22504,11 +22501,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         for row in store_rows:
             anchor_id = str(row.get("anchor_id") or "").strip()
-            if not anchor_id or anchor_id not in beyond_by_anchor:
+            if not anchor_id:
                 continue
-            if not is_active_ing_state(row.get("state")):
-                continue
-            beyond = beyond_by_anchor[anchor_id]
+            beyond = beyond_by_anchor.get(anchor_id) or {}
             mode = str(row.get("mode") or beyond.get("mode") or "").upper()
             session_id = (
                 str(row.get("session_id") or "").strip()
@@ -22536,15 +22531,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     session_id=session_id,
                     provider=provider,
                     session_anchor_ref=anchor_id,
-                    current_anchor_ref=str(
-                        current.get("anchor_id") or beyond.get("anchor_id") or ""
-                    ),
+                    current_anchor_ref=str(current.get("anchor_id") or anchor_id),
                     origin_anchor_ref=anchor_id,
-                    temporality="BEYOND",
+                    temporality="BEYOND" if beyond else "SESSION",
                     currentness="PAST",
                     currentness_source="SESSION_STORE",
-                    state=str(row.get("state") or "UNKNOWN"),
-                    last_seen_at=str(row.get("observed_at") or ""),
+                    state=str(row.get("state") or beyond.get("state") or "UNKNOWN"),
+                    last_seen_at=str(
+                        row.get("observed_at") or beyond.get("observed_at") or ""
+                    ),
                     chat_key=chat_key,
                     observer_session_ref=observer,
                     store_present=True,
@@ -22552,10 +22547,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
 
         sessions.sort(
+            key=lambda item: str(item.get("last_seen_at") or ""),
+            reverse=True,
+        )
+        sessions.sort(
             key=lambda item: (
                 0 if item.get("currentness") == "CURRENT" else 1,
                 str(item.get("mode") or ""),
-                str(item.get("last_seen_at") or ""),
             )
         )
         return {
@@ -22583,6 +22581,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "schema": API_SCHEMA,
             "status": "CLI_TERMINALS_COLLECTED",
             "terminals": self._session_anchor_terminal_host().list_sessions(),
+        }
+
+    def list_cli_terminal_audit_events(
+        self, query: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        raw = query if isinstance(query, Mapping) else {}
+        try:
+            limit = int(raw.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        return {
+            "schema": API_SCHEMA,
+            "status": "TERMINAL_AUDIT_EVENTS_COLLECTED",
+            "events": self.terminal_host.audit_events(
+                terminal_id=str(raw.get("terminal_id") or ""),
+                limit=limit,
+            ),
         }
 
     def _session_anchor_terminal_host(self) -> _SessionAnchorTerminalHost:
@@ -27511,6 +27526,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if not self._authorize():
                 return
             self._send(HTTPStatus.OK, self.server.list_cli_terminals())
+            return
+        if path == "/v1/terminal-audit-events":
+            if not self._authorize():
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            self._send(
+                HTTPStatus.OK,
+                self.server.list_cli_terminal_audit_events(
+                    {key: values[0] for key, values in query.items() if values}
+                ),
+            )
             return
         if path in {
             "/v1/session-bus/directory",

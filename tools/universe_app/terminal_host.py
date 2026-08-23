@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
+import sqlite3
 import re
 import secrets
 import uuid
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +26,7 @@ from claude_channel_broker import (
 )
 
 TERMINAL_SCHEMA = "universe.cli-terminal.v1"
+TERMINAL_AUDIT_SCHEMA = "universe.terminal-audit-event.v1"
 PROVIDER_TOOLS = {
     "GROK": "grok",
     "CODEX": "codex",
@@ -107,6 +111,116 @@ class TerminalSession:
         return int(pid) if isinstance(pid, int) and pid > 0 else None
 
 
+class TerminalAuditStore:
+    """Append-only, content-free lifecycle evidence for PTY attribution."""
+
+    def __init__(self, database_path: Path | str | None) -> None:
+        self._path = Path(database_path).resolve() if database_path else None
+        self._lock = threading.Lock()
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connection() as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS terminal_audit_event (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        terminal_id TEXT NOT NULL DEFAULT '',
+                        pid INTEGER,
+                        project_id TEXT NOT NULL DEFAULT '',
+                        mode TEXT NOT NULL DEFAULT '',
+                        provider TEXT NOT NULL DEFAULT '',
+                        supervisor_session_id TEXT NOT NULL DEFAULT '',
+                        event_type TEXT NOT NULL,
+                        source TEXT NOT NULL DEFAULT 'UNKNOWN',
+                        access_surface TEXT NOT NULL DEFAULT 'UNKNOWN',
+                        request_id TEXT NOT NULL DEFAULT '',
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        occurred_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS terminal_audit_event_terminal_time
+                    ON terminal_audit_event(terminal_id, event_id DESC);
+                    """
+                )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self._path), timeout=10)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def append(
+        self,
+        *,
+        event_type: str,
+        terminal: Mapping[str, Any] | None = None,
+        context: Mapping[str, Any] | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        if self._path is None:
+            return
+        row = terminal if isinstance(terminal, Mapping) else {}
+        audit = context if isinstance(context, Mapping) else {}
+        pid = row.get("pid")
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO terminal_audit_event(
+                    terminal_id, pid, project_id, mode, provider,
+                    supervisor_session_id, event_type, source, access_surface,
+                    request_id, details_json, occurred_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(row.get("terminal_id") or ""),
+                    int(pid) if isinstance(pid, int) and pid > 0 else None,
+                    str(row.get("project_id") or ""),
+                    str(row.get("mode") or ""),
+                    str(row.get("provider") or ""),
+                    str(row.get("supervisor_session_id") or ""),
+                    str(event_type or "UNKNOWN").strip().upper(),
+                    str(audit.get("source") or "UNKNOWN")[:80],
+                    str(audit.get("access_surface") or "UNKNOWN")[:80],
+                    str(audit.get("request_id") or "")[:120],
+                    json.dumps(dict(details or {}), sort_keys=True, separators=(",", ":")),
+                    _now(),
+                ),
+            )
+
+    def list(self, *, terminal_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        if self._path is None:
+            return []
+        bounded = max(1, min(int(limit or 200), 1000))
+        with self._lock, self._connection() as connection:
+            if terminal_id:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM terminal_audit_event
+                    WHERE terminal_id = ? ORDER BY event_id DESC LIMIT ?
+                    """,
+                    (terminal_id, bounded),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM terminal_audit_event ORDER BY event_id DESC LIMIT ?",
+                    (bounded,),
+                ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["schema"] = TERMINAL_AUDIT_SCHEMA
+            item["details"] = json.loads(item.pop("details_json") or "{}")
+            result.append(item)
+        return result
+
+
 class TerminalHost:
     """In-process registry of ConPTY-backed CLI tabs."""
 
@@ -115,6 +229,7 @@ class TerminalHost:
         *,
         spawn: Callable[..., Any] | None = None,
         database_path: Path | str | None = None,
+        audit_database_path: Path | str | None = None,
     ) -> None:
         from universe_app.session_bus import SessionBus
 
@@ -122,6 +237,7 @@ class TerminalHost:
         self._lock = threading.Lock()
         self._sessions: dict[str, TerminalSession] = {}
         self.bus = SessionBus(database_path=database_path)
+        self.audit = TerminalAuditStore(audit_database_path or database_path)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -131,6 +247,21 @@ class TerminalHost:
         rows = [item.public() for item in sessions]
         rows.sort(key=lambda item: str(item.get("created_at") or ""))
         return rows
+
+    def audit_events(self, *, terminal_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        return self.audit.list(terminal_id=terminal_id, limit=limit)
+
+    def record_audit_event(
+        self,
+        event_type: str,
+        *,
+        terminal: Mapping[str, Any] | None = None,
+        context: Mapping[str, Any] | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.audit.append(
+            event_type=event_type, terminal=terminal, context=context, details=details
+        )
 
     def get(self, terminal_id: str) -> TerminalSession:
         with self._lock:
@@ -153,6 +284,7 @@ class TerminalHost:
         resume_session_ref: str = "",
         cols: int = 120,
         rows: int = 32,
+        audit_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         project = str(project_id or "").strip()
         requested_mode = str(mode or "").strip().upper()
@@ -245,10 +377,20 @@ class TerminalHost:
         session.state = "LIVE"
         with self._lock:
             self._sessions[terminal_id] = session
-        return session.public()
+        created = session.public()
+        self.record_audit_event(
+            "TERMINAL_CREATED", terminal=created, context=audit_context
+        )
+        return created
 
-    def close(self, terminal_id: str) -> dict[str, Any]:
+    def close(
+        self, terminal_id: str, *, audit_context: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         session = self.get(terminal_id)
+        terminal = session.public()
+        self.record_audit_event(
+            "CLOSE_REQUESTED", terminal=terminal, context=audit_context
+        )
         session.pump_stop.set()
         backend = session.backend
         session.state = "CLOSED"
@@ -272,14 +414,31 @@ class TerminalHost:
             closer()
         if session.channel_broker is not None:
             session.channel_broker.close()
+        self.record_audit_event(
+            "TERMINAL_CLOSED", terminal=terminal, context=audit_context
+        )
         return {"status": "TERMINAL_CLOSED", "terminal_id": session.terminal_id}
 
-    def write(self, terminal_id: str, data: bytes) -> None:
+    def write(
+        self,
+        terminal_id: str,
+        data: bytes,
+        *,
+        audit_context: Mapping[str, Any] | None = None,
+    ) -> None:
         session = self.get(terminal_id)
         backend = session.backend
         if backend is None or session.state != "LIVE":
             raise TerminalHostError("TERMINAL_NOT_LIVE", "terminal is not live")
         backend.write(data)
+        controls = _input_control_metadata(data)
+        if controls:
+            self.record_audit_event(
+                "INPUT_CONTROL_WRITTEN",
+                terminal=session.public(),
+                context=audit_context,
+                details=controls,
+            )
 
     def emit_output(self, terminal_id: str, data: bytes) -> None:
         """Fan out display-only bytes without sending them to the CLI stdin."""
@@ -416,6 +575,15 @@ class TerminalHost:
             session.state = "FAILED"
             session.exit_detail = diagnostic or detail or "CLI process exited"
             waiters = list(session.subscribers)
+        self.record_audit_event(
+            "BACKEND_EXITED",
+            terminal=session.public(),
+            context={"source": "PTY_MONITOR", "access_surface": "SUPERVISOR"},
+            details={
+                "diagnostic_present": bool(diagnostic),
+                "diagnostic_chars": len(diagnostic),
+            },
+        )
         for waiter in waiters:
             try:
                 waiter.put_nowait(None)
@@ -520,6 +688,15 @@ class TerminalHost:
                     awaiting_channel_confirm = False
                     try:
                         backend.write(b"\r")
+                        self.record_audit_event(
+                            "INPUT_CONTROL_WRITTEN",
+                            terminal=session.public(),
+                            context={
+                                "source": "SUPERVISOR_AUTO_CONFIRM",
+                                "access_surface": "SUPERVISOR",
+                            },
+                            details=_input_control_metadata(b"\r"),
+                        )
                     except Exception:  # noqa: BLE001 - best effort
                         pass
                 elif len(channel_confirm_tail) > 4096:
@@ -539,6 +716,28 @@ class TerminalHost:
                         waiter.put_nowait(chunk)
                     except queue.Full:
                         pass
+
+
+def _input_control_metadata(data: bytes) -> dict[str, Any]:
+    raw = bytes(data or b"")
+    names = []
+    for value, name in (
+        (3, "CTRL_C"),
+        (4, "CTRL_D"),
+        (26, "CTRL_Z"),
+        (27, "ESCAPE"),
+        (13, "CARRIAGE_RETURN"),
+        (10, "LINE_FEED"),
+    ):
+        if value in raw:
+            names.append(name)
+    if not names:
+        return {}
+    return {
+        "byte_count": len(raw),
+        "control_classes": names,
+        "content_persisted": False,
+    }
 
 
 def resume_argv(provider: str, resume_session_ref: str) -> list[str]:

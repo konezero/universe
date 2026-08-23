@@ -275,12 +275,15 @@ class SupervisedTerminalHost:
         *,
         payload: dict[str, Any] | None = None,
         timeout: float = 8.0,
+        audit_source: str = "UNIVERSE_SERVER",
     ) -> dict[str, Any]:
         state = self._refresh()
         body = None
         headers = {
             "Authorization": f"Bearer {state['token']}",
             "Accept": "application/json",
+            "X-Universe-Audit-Source": audit_source,
+            "X-Universe-Request-Id": "termreq_" + os.urandom(8).hex(),
         }
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
@@ -325,20 +328,27 @@ class SupervisedTerminalHost:
         return SupervisedSession(terminal)
 
     def create(self, **kwargs: Any) -> dict[str, Any]:
-        payload = self._request("POST", "/v1/terminals", payload=kwargs)
+        payload = self._request(
+            "POST", "/v1/terminals", payload=kwargs, audit_source="UNIVERSE_TERMINAL_CREATE"
+        )
         terminal = payload.get("terminal")
         if not isinstance(terminal, dict):
             raise TerminalHostError("TERMINAL_SPAWN_FAILED", "supervisor create returned no terminal")
         return terminal
 
     def close(self, terminal_id: str) -> dict[str, Any]:
-        return self._request("DELETE", f"/v1/terminals/{quote(terminal_id, safe='')}")
+        return self._request(
+            "DELETE",
+            f"/v1/terminals/{quote(terminal_id, safe='')}",
+            audit_source="UNIVERSE_TERMINAL_DELETE",
+        )
 
     def write(self, terminal_id: str, data: bytes) -> None:
         self._request(
             "POST",
             f"/v1/terminals/{quote(terminal_id, safe='')}/write",
             payload={"data_b64": base64.b64encode(data).decode("ascii")},
+            audit_source="UNIVERSE_TERMINAL_STREAM",
         )
 
     def emit_output(self, terminal_id: str, data: bytes) -> None:
@@ -355,6 +365,15 @@ class SupervisedTerminalHost:
             f"/v1/terminals/{quote(terminal_id, safe='')}/resize",
             payload={"cols": cols, "rows": rows},
         )
+
+    def audit_events(
+        self, *, terminal_id: str = "", limit: int = 200
+    ) -> list[dict[str, Any]]:
+        query = {"limit": str(max(1, min(int(limit or 200), 1000)))}
+        if terminal_id:
+            query["terminal_id"] = terminal_id
+        payload = self._request("GET", "/v1/audit-events?" + urlencode(query))
+        return list(payload.get("events") or [])
 
     def bus_directory(self) -> dict[str, Any]:
         return self._request("GET", "/v1/bus/directory")

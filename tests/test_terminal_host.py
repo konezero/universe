@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -334,3 +335,61 @@ class TerminalHostTests(unittest.TestCase):
         self.assertIn(b"\x1b[2J\x1b[H", dumped)
         self.assertIn(b"old-chunk", dumped)
         host.close(created["terminal_id"])
+
+    def test_durable_audit_distinguishes_control_close_and_backend_exit(self) -> None:
+        database_path = Path(tempfile.mkdtemp(prefix="terminal-audit-")) / "audit.sqlite3"
+        pty = FakePty()
+        host = TerminalHost(
+            spawn=lambda *_args, **_kwargs: pty,
+            audit_database_path=database_path,
+        )
+        created = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            provider="CODEX",
+            supervisor_session_id="session_master_1",
+            audit_context={"source": "TEST_CREATE", "request_id": "req-create"},
+        )
+        host.write(created["terminal_id"], b"plain-text")
+        host.write(
+            created["terminal_id"],
+            b"\x03",
+            audit_context={"source": "TEST_STREAM", "request_id": "req-input"},
+        )
+        host.close(
+            created["terminal_id"],
+            audit_context={"source": "TEST_DELETE", "request_id": "req-close"},
+        )
+
+        events = list(reversed(host.audit_events(terminal_id=created["terminal_id"])))
+        self.assertEqual(
+            [
+                "TERMINAL_CREATED",
+                "INPUT_CONTROL_WRITTEN",
+                "CLOSE_REQUESTED",
+                "TERMINAL_CLOSED",
+            ],
+            [event["event_type"] for event in events],
+        )
+        self.assertEqual(4242, events[0]["pid"])
+        self.assertEqual("TEST_STREAM", events[1]["source"])
+        self.assertEqual(["CTRL_C"], events[1]["details"]["control_classes"])
+        self.assertFalse(events[1]["details"]["content_persisted"])
+        self.assertEqual("TEST_DELETE", events[2]["source"])
+
+        class ExitedPty(FakePty):
+            def is_alive(self) -> bool:
+                return False
+
+        exited_host = TerminalHost(
+            spawn=lambda *_args, **_kwargs: ExitedPty(),
+            audit_database_path=database_path,
+        )
+        exited = exited_host.create(
+            project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CODEX"
+        )
+        exited_host.list_sessions()
+        exit_events = exited_host.audit_events(terminal_id=exited["terminal_id"])
+        self.assertEqual("BACKEND_EXITED", exit_events[0]["event_type"])
+        self.assertEqual("PTY_MONITOR", exit_events[0]["source"])
