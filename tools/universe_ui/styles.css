@@ -3848,6 +3848,23 @@ body {
   font: inherit;
   color: var(--text);
 }
+.session-bus-evidence {
+  color: var(--text-2);
+  font-size: 11px;
+}
+.session-bus-evidence summary {
+  cursor: pointer;
+}
+.session-bus-evidence-row {
+  display: grid;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 4px;
+}
+.session-bus-evidence-row code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
 .session-bus-compose textarea {
   width: 100%;
   min-height: 88px;

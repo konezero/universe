@@ -2308,6 +2308,37 @@ function sessionBusTarget(session, coordinate) {
   };
 }
 
+function sessionBusEvidenceRows(message) {
+  const provenance = message?.provenance || {};
+  const lifecycle = message?.lifecycle || {};
+  const target = message?.to || {};
+  const artifactRefs = [
+    ...(Array.isArray(provenance.artifact_refs) ? provenance.artifact_refs : []),
+    lifecycle.result_ref,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  return [
+    ["Event", message?.message_id],
+    ["Source event", message?.in_reply_to || message?.message_id],
+    ["Session Anchor", message?.recipient_anchor_ref || message?.session_anchor_ref],
+    ["Thread", message?.thread_id],
+    ["Room", message?.room_id],
+    ["Task Frame", provenance.task_frame_ref || lifecycle.task_frame_ref],
+    ["Node", target.project_id],
+    ["Artifacts", [...new Set(artifactRefs)].join(", ")],
+  ].filter(([, value]) => String(value || "").trim());
+}
+
+function renderSessionBusEvidence(message) {
+  const details = node("details", "session-bus-evidence");
+  details.append(node("summary", "", "Event coordinates"));
+  for (const [label, value] of sessionBusEvidenceRows(message)) {
+    const row = node("div", "session-bus-evidence-row");
+    row.append(node("span", "", label), node("code", "", String(value)));
+    details.append(row);
+  }
+  return details;
+}
+
 async function refreshSessionBusMessages() {
   const pending = state.pendingSessionBus;
   if (!pending || !elements.sessionBusMessages) return;
@@ -2343,7 +2374,7 @@ async function refreshSessionBusMessages() {
       `${message.kind || "NOTE"} · ${message.lifecycle_state || message.delivery_state || "UNKNOWN"} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
     );
     const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
-    item.append(heading, body);
+    item.append(heading, body, renderSessionBusEvidence(message));
     const messageTerminalId = String(message.terminal_id || terminalId).trim();
     if (projection === "INBOX" && messageTerminalId) {
       const ack = node("button", "secondary-button", "Ack");
@@ -4779,16 +4810,32 @@ function initChatPanelResize() {
   });
 }
 
+function pendingConversationPermissions() {
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    return (state.providerSessionPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    );
+  }
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    return (state.conductorPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    );
+  }
+  if (state.conversationTarget.kind === "PROJECT_MASTER") {
+    return (state.projectPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    );
+  }
+  return [];
+}
+
 function pendingActionItems() {
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
-    return { permissions: [], delegations: [], activities: [] };
+    return { delegations: [], activities: [] };
   }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     const cache = providerSessionRoomCacheFor(state.conversationTarget.chat_key);
     return {
-      permissions: (state.providerSessionPermissions || []).filter(
-        (item) => item.state === "PENDING"
-      ),
       delegations: [],
       activeReply: activeProviderSessionReply(),
       activities: [...(cache?.actions || [])].reverse(),
@@ -4796,9 +4843,6 @@ function pendingActionItems() {
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     return {
-      permissions: (state.conductorPermissions || []).filter(
-        (item) => item.state === "PENDING"
-      ),
       // Cross-session delivery is internal automation state.  A user chats
       // with the selected Session Card; it is not a generic work queue.
       delegations: [],
@@ -4806,19 +4850,12 @@ function pendingActionItems() {
       activities: [],
     };
   }
-  return {
-    permissions: (state.projectPermissions || []).filter(
-      (item) => item.state === "PENDING"
-    ),
-    delegations: [],
-    activities: [],
-  };
+  return { delegations: [], activities: [] };
 }
 
 function actionInboxCount() {
   const items = pendingActionItems();
   return (
-    items.permissions.length +
     items.delegations.length +
     (items.activeReply ? 1 : 0) +
     items.activities.length
@@ -4998,10 +5035,6 @@ function renderActionInbox() {
     elements.actionInboxList.append(section);
   };
 
-  appendSection(
-    "Pending approvals",
-    items.permissions.map((permission) => renderPermissionCard(permission))
-  );
   const activeWork = items.delegations.map((delegation) =>
     renderDelegationActionCard(delegation)
   );
@@ -5017,7 +5050,7 @@ function renderActionInbox() {
   appendSection("Recent activity", recentActivity);
   if (!elements.actionInboxList.childElementCount) {
     elements.actionInboxList.append(
-      node("p", "empty-copy", "No pending approvals, active work, or activity.")
+      node("p", "empty-copy", "No active work or recent activity.")
     );
   }
 }
@@ -5053,6 +5086,9 @@ function renderRoomMessages() {
     );
     finishRoomMessageRender(previousScrollTop, stickToBottom);
     return;
+  }
+  for (const permission of pendingConversationPermissions()) {
+    elements.roomMessageList.append(renderPermissionCard(permission));
   }
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
     const draft = state.sessionDelegationDraft || state.conversationTarget;
