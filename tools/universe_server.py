@@ -94,6 +94,15 @@ from project_rag_freshness import (
     parse_timestamp as parse_rag_timestamp,
     retrieval_state as rag_retrieval_state,
 )
+from intent_skill_routing import (
+    IntentRoutingError,
+    build_skill_candidate,
+    execute_plan_fallback,
+    normalize_gap_observation,
+    normalize_intent_decision,
+    normalize_registry_snapshot,
+    resolve_skill,
+)
 from project_seed_apply import build_project_seed_asset_approval
 from project_integration_catalog import (
     ProjectIntegrationCatalogError,
@@ -4903,6 +4912,97 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS todo_mutation_receipt_status_expiry
                 ON todo_mutation_receipt(status, expires_at, receipt_id);
+
+                CREATE TABLE IF NOT EXISTS skill_registry_snapshot (
+                    snapshot_id TEXT PRIMARY KEY,
+                    registry_digest TEXT NOT NULL UNIQUE,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS intent_decision (
+                    decision_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    frame_id TEXT NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    project_id TEXT,
+                    node_ref TEXT,
+                    intent_class TEXT NOT NULL,
+                    required_capability TEXT NOT NULL,
+                    effect_class TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS intent_decision_session_time
+                ON intent_decision(session_id, created_at, decision_id);
+
+                CREATE TABLE IF NOT EXISTS skill_resolution (
+                    resolution_id TEXT PRIMARY KEY,
+                    intent_decision_id TEXT NOT NULL
+                        REFERENCES intent_decision(decision_id)
+                        ON DELETE CASCADE,
+                    registry_digest TEXT NOT NULL,
+                    project_id TEXT,
+                    node_ref TEXT,
+                    required_capability TEXT NOT NULL,
+                    effect_class TEXT NOT NULL,
+                    selected_handler_kind TEXT NOT NULL,
+                    resolution_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS skill_resolution_intent_time
+                ON skill_resolution(intent_decision_id, created_at, resolution_id);
+
+                CREATE TABLE IF NOT EXISTS skill_gap_observation (
+                    observation_id TEXT PRIMARY KEY,
+                    observation_digest TEXT NOT NULL,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    node_ref TEXT,
+                    intent_decision_id TEXT NOT NULL
+                        REFERENCES intent_decision(decision_id)
+                        ON DELETE CASCADE,
+                    resolution_id TEXT NOT NULL
+                        REFERENCES skill_resolution(resolution_id)
+                        ON DELETE CASCADE,
+                    capability TEXT NOT NULL,
+                    effect_class TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    validation_state TEXT NOT NULL,
+                    context_fingerprint TEXT NOT NULL,
+                    observation_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS skill_gap_project_capability_time
+                ON skill_gap_observation(project_id, capability, observed_at, observation_id);
+
+                CREATE TABLE IF NOT EXISTS skill_candidate (
+                    candidate_id TEXT PRIMARY KEY,
+                    candidate_digest TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    capability TEXT NOT NULL,
+                    candidate_state TEXT NOT NULL,
+                    threshold_policy_version TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_candidate_support (
+                    candidate_id TEXT NOT NULL
+                        REFERENCES skill_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    observation_id TEXT NOT NULL
+                        REFERENCES skill_gap_observation(observation_id)
+                        ON DELETE CASCADE,
+                    PRIMARY KEY(candidate_id, observation_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS skill_catalog (
                     skill_id TEXT NOT NULL,
@@ -9841,6 +9941,217 @@ class UniverseStore:
                 HTTPStatus.NOT_FOUND,
             )
         return {"todo_id": normalized, "deleted": True}
+
+    @staticmethod
+    def _intent_routing_error(error: IntentRoutingError) -> UniverseError:
+        status = HTTPStatus.CONFLICT if error.code in {
+            "INTENT_DECISION_STALE",
+            "INTENT_TARGET_AMBIGUOUS",
+            "SKILL_RESOLUTION_AMBIGUOUS",
+            "SKILL_EFFECT_MISMATCH",
+            "FALLBACK_HANDLER_UNAVAILABLE",
+            "CAPABILITY_UNAVAILABLE",
+            "SKILL_CANDIDATE_SUPPORT_INSUFFICIENT",
+        } else HTTPStatus.BAD_REQUEST
+        return UniverseError(error.code, error.detail, status)
+
+    def create_intent_decision(self, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            decision = normalize_intent_decision(value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT decision_json FROM intent_decision WHERE decision_id = ?",
+                (decision["decision_id"],),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["decision_json"]), False
+            connection.execute(
+                """
+                INSERT INTO intent_decision(
+                    decision_id, session_id, frame_id, anchor_id, project_id,
+                    node_ref, intent_class, required_capability, effect_class,
+                    decision_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision["decision_id"], decision["session_id"],
+                    decision["frame_id"], decision["anchor_id"],
+                    decision.get("project_id"), decision.get("node_ref"),
+                    decision["intent_class"], decision["required_capability"],
+                    decision["effect_class"], _canonical_json(decision), now,
+                ),
+            )
+        return decision, True
+
+    def register_skill_registry_snapshot(self, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            snapshot = normalize_registry_snapshot(value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT snapshot_json FROM skill_registry_snapshot WHERE registry_digest = ?",
+                (snapshot["registry_digest"],),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["snapshot_json"]), False
+            connection.execute(
+                "INSERT INTO skill_registry_snapshot(snapshot_id, registry_digest, snapshot_json, created_at) VALUES (?, ?, ?, ?)",
+                (snapshot["snapshot_id"], snapshot["registry_digest"], _canonical_json(snapshot), now),
+            )
+        return snapshot, True
+
+    def list_skill_registry_snapshots(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT snapshot_json, created_at FROM skill_registry_snapshot ORDER BY created_at DESC, snapshot_id DESC"
+            ).fetchall()
+        return [{**json.loads(row["snapshot_json"]), "created_at": row["created_at"]} for row in rows]
+
+    def _skill_registry_snapshot(self, registry_digest: str | None) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json FROM skill_registry_snapshot "
+                + ("WHERE registry_digest = ?" if registry_digest else "ORDER BY created_at DESC, snapshot_id DESC LIMIT 1"),
+                ((registry_digest,) if registry_digest else ()),
+            ).fetchone()
+        if row is not None:
+            return json.loads(row["snapshot_json"])
+        if registry_digest:
+            raise UniverseError("SKILL_REGISTRY_UNAVAILABLE", "requested Registry snapshot is unavailable", HTTPStatus.NOT_FOUND)
+        snapshot, _ = self.register_skill_registry_snapshot(
+            {"skills": [], "source_ref": "universe://skill-registry/empty"}
+        )
+        return snapshot
+
+    def get_intent_decision(self, decision_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT decision_json FROM intent_decision WHERE decision_id = ?", (_identifier(decision_id, "decision_id"),)).fetchone()
+        if row is None:
+            raise UniverseError("INTENT_DECISION_NOT_FOUND", "Intent Decision does not exist", HTTPStatus.NOT_FOUND)
+        return json.loads(row["decision_json"])
+
+    def create_skill_resolution(self, value: Any) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value, field="skill_resolution_request",
+            required=frozenset({"intent_decision_id"}),
+            optional=frozenset({"registry_digest", "explicit_skill_id", "project_id", "node_ref", "available_fallback_handlers"}),
+        )
+        decision = self.get_intent_decision(request["intent_decision_id"])
+        snapshot = self._skill_registry_snapshot(request.get("registry_digest"))
+        options = {key: request[key] for key in ("explicit_skill_id", "project_id", "node_ref", "available_fallback_handlers") if key in request}
+        try:
+            resolution = resolve_skill(decision, snapshot, options)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute("SELECT resolution_json FROM skill_resolution WHERE resolution_id = ?", (resolution["resolution_id"],)).fetchone()
+            if existing is not None:
+                return json.loads(existing["resolution_json"]), False
+            connection.execute(
+                """
+                INSERT INTO skill_resolution(
+                    resolution_id, intent_decision_id, registry_digest, project_id,
+                    node_ref, required_capability, effect_class,
+                    selected_handler_kind, resolution_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (resolution["resolution_id"], resolution["intent_decision_id"], resolution["registry_digest"], request.get("project_id") or decision.get("project_id"), request.get("node_ref") or decision.get("node_ref"), resolution["required_capability"], resolution["effect_class"], resolution["selected_handler_kind"], _canonical_json(resolution), now),
+            )
+        return resolution, True
+
+    def get_skill_resolution(self, resolution_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT resolution_json FROM skill_resolution WHERE resolution_id = ?", (_identifier(resolution_id, "resolution_id"),)).fetchone()
+        if row is None:
+            raise UniverseError("SKILL_RESOLUTION_NOT_FOUND", "Skill Resolution does not exist", HTTPStatus.NOT_FOUND)
+        return json.loads(row["resolution_json"])
+
+    def run_skill_resolution_fallback(self, resolution_id: str, value: Any) -> dict[str, Any]:
+        try:
+            return execute_plan_fallback(self.get_skill_resolution(resolution_id), value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+
+    def create_skill_gap_observation(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            observation = normalize_gap_observation(project["project_id"], value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        resolution = self.get_skill_resolution(observation["resolution_id"])
+        decision = self.get_intent_decision(observation["intent_decision_id"])
+        if not resolution["fallback_used"] or any((observation["capability"] != resolution["required_capability"], observation["effect_class"] != resolution["effect_class"], observation["fallback_handler"] != resolution["fallback_handler"], observation["output_contract"] != resolution["output_contract"], resolution["intent_decision_id"] != decision["decision_id"])):
+            raise UniverseError("SKILL_GAP_OBSERVATION_INVALID", "observation does not match its fallback Resolution", HTTPStatus.CONFLICT)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute("SELECT observation_digest, observation_json FROM skill_gap_observation WHERE observation_id = ?", (observation["observation_id"],)).fetchone()
+            if existing is not None:
+                if existing["observation_digest"] != observation["observation_digest"]:
+                    raise UniverseError("SKILL_GAP_OBSERVATION_CONFLICT", "observation_id already refers to different redacted content", HTTPStatus.CONFLICT)
+                return json.loads(existing["observation_json"]), False
+            connection.execute(
+                """
+                INSERT INTO skill_gap_observation(
+                    observation_id, observation_digest, project_id, node_ref,
+                    intent_decision_id, resolution_id, capability, effect_class,
+                    outcome, validation_state, context_fingerprint,
+                    observation_json, observed_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (observation["observation_id"], observation["observation_digest"], project["project_id"], observation.get("node_ref"), observation["intent_decision_id"], observation["resolution_id"], observation["capability"], observation["effect_class"], observation["outcome"], observation["validation_state"], observation["context_fingerprint"], _canonical_json(observation), observation["observed_at"], now),
+            )
+        return observation, True
+
+    def list_skill_gap_observations(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute("SELECT observation_json FROM skill_gap_observation WHERE project_id = ? ORDER BY observed_at DESC, observation_id DESC", (project["project_id"],)).fetchall()
+        return [json.loads(row["observation_json"]) for row in rows]
+
+    def skill_gap_summary(self, project_id: str) -> dict[str, Any]:
+        observations = self.list_skill_gap_observations(project_id)
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in observations:
+            key = (item["capability"], item["effect_class"], item["output_contract"])
+            group = groups.setdefault(key, {"capability": key[0], "effect_class": key[1], "output_contract": key[2], "observation_count": 0, "validated_success_count": 0, "failed_count": 0, "distinct_context_count": 0, "_contexts": set()})
+            group["observation_count"] += 1
+            group["validated_success_count"] += int(item["outcome"] == "SUCCESS" and item["validation_state"] == "VALIDATED")
+            group["failed_count"] += int(item["outcome"] == "FAILED")
+            group["_contexts"].add(item["context_fingerprint"])
+        summary = []
+        for group in groups.values():
+            group["distinct_context_count"] = len(group.pop("_contexts"))
+            summary.append(group)
+        return {"schema": "universe.skill-gap-summary.v1", "project_id": project_id, "groups": sorted(summary, key=lambda item: (-item["observation_count"], item["capability"])), "observation_count": len(observations)}
+
+    def create_skill_candidate(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        observations = self.list_skill_gap_observations(project["project_id"])
+        try:
+            candidate = build_skill_candidate(project["project_id"], observations, value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute("SELECT candidate_json FROM skill_candidate WHERE candidate_digest = ?", (candidate["candidate_digest"],)).fetchone()
+            if existing is not None:
+                return json.loads(existing["candidate_json"]), False
+            connection.execute("INSERT INTO skill_candidate(candidate_id, candidate_digest, project_id, capability, candidate_state, threshold_policy_version, candidate_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (candidate["candidate_id"], candidate["candidate_digest"], project["project_id"], candidate["capability"], candidate["candidate_state"], candidate["threshold_policy"]["version"], _canonical_json(candidate), now))
+            for observation_id in candidate["supporting_observation_ids"]:
+                connection.execute("INSERT INTO skill_candidate_support(candidate_id, observation_id) VALUES (?, ?)", (candidate["candidate_id"], observation_id))
+        return candidate, True
+
+    def list_skill_candidates(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute("SELECT candidate_json, created_at FROM skill_candidate WHERE project_id = ? ORDER BY created_at DESC, candidate_id DESC", (project["project_id"],)).fetchall()
+        return [{**json.loads(row["candidate_json"]), "created_at": row["created_at"]} for row in rows]
 
     def ingest_skill_observations(
         self, project_id: str, value: Any
@@ -28766,6 +29077,32 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/skill-registry-snapshots":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_REGISTRY_SNAPSHOTS_COLLECTED",
+                    "snapshots": self.server.store.list_skill_registry_snapshots(),
+                },
+            )
+            return
+        skill_resolution_get = re.fullmatch(r"/v1/skill-resolutions/([^/]+)", path)
+        if skill_resolution_get is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_RESOLUTION_COLLECTED",
+                        "resolution": self.server.store.get_skill_resolution(
+                            unquote(skill_resolution_get.group(1))
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/session-observer/sources":
             sources = [
                 _public_provider_source(source)
@@ -29112,6 +29449,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "observations": self.server.store.list_skill_observations(
                             project_id
                         ),
+                    },
+                )
+                return
+            if suffix == "/skill-gap-summary":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_GAP_SUMMARY_COLLECTED",
+                        "summary": self.server.store.skill_gap_summary(project_id),
+                    },
+                )
+                return
+            if suffix == "/skill-candidates":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_CANDIDATES_COLLECTED",
+                        "project_id": project_id,
+                        "candidates": self.server.store.list_skill_candidates(project_id),
                     },
                 )
                 return
@@ -30616,6 +30974,52 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/v1/intent-decisions":
+                decision, created = self.server.store.create_intent_decision(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "INTENT_DECISION_RECORDED" if created else "INTENT_DECISION_ALREADY_RECORDED",
+                        "decision": decision,
+                    },
+                )
+                return
+            if path == "/v1/skill-registry-snapshots":
+                snapshot, created = self.server.store.register_skill_registry_snapshot(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_REGISTRY_SNAPSHOT_RECORDED" if created else "SKILL_REGISTRY_SNAPSHOT_ALREADY_RECORDED",
+                        "snapshot": snapshot,
+                    },
+                )
+                return
+            if path == "/v1/skill-resolutions":
+                resolution, created = self.server.store.create_skill_resolution(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_RESOLUTION_RECORDED" if created else "SKILL_RESOLUTION_ALREADY_RECORDED",
+                        "resolution": resolution,
+                    },
+                )
+                return
+            skill_fallback = re.fullmatch(r"/v1/skill-resolutions/([^/]+)/fallback", path)
+            if skill_fallback is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_FALLBACK_COMPLETED",
+                        "result": self.server.store.run_skill_resolution_fallback(
+                            unquote(skill_fallback.group(1)), body
+                        ),
+                    },
+                )
+                return
             if path == "/v1/todo-mutation-receipts":
                 request = normalize_todo_mutation_request(body)
                 self.server.resolve_todo_mutation_session(request)
@@ -31418,6 +31822,32 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "SKILL_OBSERVATIONS_ALREADY_INGESTED"
                         ),
                         **result,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-gap-observations":
+                observation, created = self.server.store.create_skill_gap_observation(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_GAP_OBSERVATION_RECORDED" if created else "SKILL_GAP_OBSERVATION_ALREADY_RECORDED",
+                        "observation": observation,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-candidates":
+                candidate, created = self.server.store.create_skill_candidate(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_CANDIDATE_RECORDED" if created else "SKILL_CANDIDATE_ALREADY_RECORDED",
+                        "candidate": candidate,
                     },
                 )
                 return
@@ -32240,6 +32670,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/projection",
             "/events",
             "/skill-observations",
+            "/skill-gap-observations",
+            "/skill-gap-summary",
+            "/skill-candidates",
             "/skill-observation-queue",
             "/seed-asset-proposal/apply",
             "/seed-asset-proposal",

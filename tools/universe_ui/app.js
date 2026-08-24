@@ -25,6 +25,8 @@ const state = {
   skillPlanAdoptions: [],
   skillObservations: [],
   skillBench: [],
+  skillGapSummary: null,
+  skillCandidates: [],
   experienceCases: [],
   benchComparisons: [],
   experiencePatterns: [],
@@ -4423,6 +4425,8 @@ async function selectProject(
     handoffResult,
     skillPlanAdoptionResult,
     observationResult,
+    skillGapResult,
+    skillCandidateResult,
     benchResult,
     benchCompareResult,
     experienceResult,
@@ -4462,6 +4466,12 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/skill-observations`
     ).catch(() => ({ observations: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/skill-gap-summary`
+    ).catch(() => ({ summary: { groups: [], observation_count: 0 } })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/skill-candidates`
+    ).catch(() => ({ candidates: [] })),
     api("/v1/bench/skills").catch(() => ({ bench: [] })),
     api("/v1/bench/compare?group_by=worker&limit=20").catch(() => ({
       comparisons: [],
@@ -4526,6 +4536,8 @@ async function selectProject(
   state.masterHandoffs = handoffResult.handoffs || [];
   state.skillPlanAdoptions = skillPlanAdoptionResult.adoptions || [];
   state.skillObservations = observationResult.observations || [];
+  state.skillGapSummary = skillGapResult.summary || { groups: [], observation_count: 0 };
+  state.skillCandidates = skillCandidateResult.candidates || [];
   state.skillBench = benchResult.bench || [];
   state.benchComparisons = benchCompareResult.comparisons || [];
   state.experienceCases = experienceResult.cases || [];
@@ -11857,6 +11869,53 @@ function renderBench() {
     obsGroup.append(record);
   }
   elements.benchPanel.append(obsGroup);
+
+  const gapGroup = node("div", "detail-group");
+  const gapSummary = state.skillGapSummary || { groups: [], observation_count: 0 };
+  gapGroup.append(
+    node("h3", "", `Fallback gaps (${gapSummary.observation_count || 0})`)
+  );
+  if (!(gapSummary.groups || []).length) {
+    gapGroup.append(
+      node(
+        "p",
+        "empty-copy",
+        "No redacted fallback gaps yet. Dedicated Skill misses remain separate from installed Skill observations."
+      )
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const row of gapSummary.groups.slice(0, 8)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${row.capability || "CAPABILITY"} / ${row.effect_class || "NONE"} / n=${row.observation_count || 0} / validated=${row.validated_success_count || 0} / failed=${row.failed_count || 0} / contexts=${row.distinct_context_count || 0}`
+        )
+      );
+    }
+    gapGroup.append(list);
+  }
+  const candidates = state.skillCandidates || [];
+  gapGroup.append(node("h3", "", `Skill candidates (${candidates.length})`));
+  if (!candidates.length) {
+    gapGroup.append(
+      node("p", "empty-copy", "No Candidate has been derived from threshold-bound fallback evidence.")
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const candidate of candidates.slice(0, 8)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${candidate.candidate_state || "OBSERVED"} / ${candidate.capability || "CAPABILITY"} / support=${candidate.evidence?.observation_count || 0} / installed=${candidate.installation_state || "NOT_INSTALLED"}`
+        )
+      );
+    }
+    gapGroup.append(list);
+  }
+  elements.benchPanel.append(gapGroup);
 
   const benchGroup = node("div", "detail-group");
   const benchRows = projectBenchRows();
