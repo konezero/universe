@@ -130,6 +130,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("historyBeforeCursor", TERM)
         self.assertIn("screen_snapshot_base64", TERM)
         self.assertIn("rebuilt.baseY - distanceFromBottom", TERM)
+        self.assertIn(
+            "surface.historyLoading = true;\n  surface.rebuildingHistory = true;",
+            TERM,
+        )
+        self.assertIn("function trimHistoryCoveredLiveTail(historyChunks, retainedLiveChunks)", TERM)
+        self.assertIn("surface.retainedLiveChunks.push({", TERM)
+        self.assertIn("await writeUndisplayedLiveTail(surface)", TERM)
         self.assertIn("fitAddon.proposeDimensions()", TERM)
         self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
         self.assertIn("surface.notifySize?.(0)", TERM)

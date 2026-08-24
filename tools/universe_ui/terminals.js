@@ -74,9 +74,77 @@ function writeTerminalChunk(term, data) {
   });
 }
 
+function cloneTerminalChunk(data) {
+  if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  }
+  return new TextEncoder().encode(String(data || ""));
+}
+
+function concatTerminalChunks(chunks) {
+  const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return joined;
+}
+
+function trimHistoryCoveredLiveTail(historyChunks, retainedLiveChunks) {
+  if (!historyChunks.length || !retainedLiveChunks.length) return;
+  const history = concatTerminalChunks(historyChunks);
+  const live = concatTerminalChunks(retainedLiveChunks.map((entry) => entry.data));
+  if (!history.length || !live.length) return;
+  const separator = 256;
+  const liveLength = live.length;
+  const total = liveLength + 1 + history.length;
+  const prefix = new Uint32Array(total);
+  const valueAt = (index) => {
+    if (index < liveLength) return live[index];
+    if (index === liveLength) return separator;
+    return history[index - liveLength - 1];
+  };
+  for (let index = 1; index < total; index += 1) {
+    let matched = prefix[index - 1];
+    const value = valueAt(index);
+    while (matched > 0 && value !== valueAt(matched)) {
+      matched = prefix[matched - 1];
+    }
+    if (value === valueAt(matched)) matched += 1;
+    prefix[index] = matched;
+  }
+  let covered = Math.min(liveLength, prefix[total - 1]);
+  while (covered > 0 && retainedLiveChunks.length) {
+    const entry = retainedLiveChunks[0];
+    if (covered >= entry.data.length) {
+      covered -= entry.data.length;
+      retainedLiveChunks.shift();
+    } else {
+      entry.data = entry.data.slice(covered);
+      covered = 0;
+    }
+  }
+}
+
+async function writeUndisplayedLiveTail(surface) {
+  let index = 0;
+  while (index < surface.retainedLiveChunks.length) {
+    const entry = surface.retainedLiveChunks[index];
+    if (!entry.displayed) {
+      await writeTerminalChunk(surface.term, entry.data);
+      entry.displayed = true;
+    }
+    index += 1;
+  }
+}
+
 async function loadOlderTerminalHistory(surface, session) {
   if (!surface || surface.historyLoading || surface.historyExhausted) return;
   surface.historyLoading = true;
+  surface.rebuildingHistory = true;
   const buffer = surface.term?.buffer?.active;
   const distanceFromBottom = buffer
     ? Math.max(0, buffer.baseY - buffer.viewportY)
@@ -105,8 +173,9 @@ async function loadOlderTerminalHistory(surface, session) {
     const ordered = [...surface.historyChunks.entries()]
       .sort((left, right) => left[0] - right[0])
       .map((entry) => entry[1]);
+    trimHistoryCoveredLiveTail(ordered, surface.retainedLiveChunks);
+    for (const entry of surface.retainedLiveChunks) entry.displayed = false;
     const snapshot = decodeTerminalHistoryChunk(payload.screen_snapshot_base64);
-    surface.rebuildingHistory = true;
     try { surface.term.reset(); } catch (_error) { /* xterm not ready */ }
     for (const chunk of ordered) await writeTerminalChunk(surface.term, chunk);
     // A WebSocket attachment already paints the current screen snapshot. Use the
@@ -115,9 +184,8 @@ async function loadOlderTerminalHistory(surface, session) {
     if (!ordered.length && snapshot.length) {
       await writeTerminalChunk(surface.term, snapshot);
     }
-    for (const chunk of surface.pendingLiveChunks.splice(0)) {
-      await writeTerminalChunk(surface.term, chunk);
-    }
+    await writeUndisplayedLiveTail(surface);
+    surface.historyInitialized = true;
     const rebuilt = surface.term?.buffer?.active;
     if (rebuilt) {
       surface.term.scrollToLine(
@@ -125,6 +193,7 @@ async function loadOlderTerminalHistory(surface, session) {
       );
     }
   } finally {
+    await writeUndisplayedLiveTail(surface);
     surface.rebuildingHistory = false;
     surface.historyLoading = false;
   }
@@ -356,14 +425,14 @@ function ensureTerminalSurface(session) {
   );
   socket.binaryType = "arraybuffer";
   socket.addEventListener("message", (event) => {
-    if (surface?.rebuildingHistory) {
-      const pending = event.data instanceof ArrayBuffer
-        ? new Uint8Array(event.data.slice(0))
-        : event.data;
-      surface.pendingLiveChunks.push(pending);
-    } else {
-      writeTerminalBytes(term, event.data);
+    const live = cloneTerminalChunk(event.data);
+    if (surface && (surface.rebuildingHistory || surface.historyInitialized)) {
+      surface.retainedLiveChunks.push({
+        data: live,
+        displayed: !surface.rebuildingHistory,
+      });
     }
+    if (!surface?.rebuildingHistory) writeTerminalBytes(term, live);
     scheduleInitialLayout(240);
   });
   bindTerminalIme(term, socket);
@@ -432,7 +501,8 @@ function ensureTerminalSurface(session) {
     historyLoading: false,
     historyExhausted: false,
     rebuildingHistory: false,
-    pendingLiveChunks: [],
+    historyInitialized: false,
+    retainedLiveChunks: [],
   };
   term.onScroll((viewportY) => {
     if (viewportY > 2 || surface.rebuildingHistory) return;
