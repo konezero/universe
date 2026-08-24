@@ -3343,7 +3343,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "terminal_id": terminal_id,
                 "session_anchor_ref": anchor_ref,
             },
-            source={"provider": "UI"},
+            source={
+                "provider": "UI",
+                "node_ref": "GCS",
+                "task_frame_ref": "task-frame://http-result",
+            },
             kind="INSTRUCTION",
             notify="NONE",
             body="return an HTTP result",
@@ -3393,6 +3397,24 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(200, status)
         self.assertEqual("HTTP durable result", projected["messages"][0]["body_text"])
+        context = projected["messages"][0]["event_context"]
+        self.assertEqual(posted["message_id"], context["source_event_id"])
+        self.assertEqual(anchor_ref, context["session_anchor_ref"])
+        self.assertEqual("task-frame://http-result", context["task_frame_ref"])
+        self.assertEqual("GCS", context["node_ref"])
+        self.assertEqual(["artifact://result-001"], context["artifact_refs"])
+        status, filtered = self.request(
+            "GET",
+            "/v1/session-bus/inbox?session_anchor_ref="
+            + anchor_ref
+            + "&projection=RESULTS&event_kind=RESULT"
+            + "&lifecycle_state=COMPLETED"
+            + "&task_frame_ref=task-frame%3A%2F%2Fhttp-result"
+            + "&node_ref=GCS",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([reply["result"]["message_id"]], [item["message_id"] for item in filtered["messages"]])
 
     def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

@@ -2309,22 +2309,26 @@ function sessionBusTarget(session, coordinate) {
 }
 
 function sessionBusEvidenceRows(message) {
+  const context = message?.event_context || {};
   const provenance = message?.provenance || {};
   const lifecycle = message?.lifecycle || {};
   const target = message?.to || {};
-  const artifactRefs = [
-    ...(Array.isArray(provenance.artifact_refs) ? provenance.artifact_refs : []),
-    lifecycle.result_ref,
-  ].map((value) => String(value || "").trim()).filter(Boolean);
+  const artifactRefs = Array.isArray(context.artifact_refs)
+    ? context.artifact_refs
+    : [
+        ...(Array.isArray(provenance.artifact_refs) ? provenance.artifact_refs : []),
+        lifecycle.result_ref,
+      ];
   return [
     ["Event", message?.message_id],
-    ["Source event", message?.in_reply_to || message?.message_id],
-    ["Session Anchor", message?.recipient_anchor_ref || message?.session_anchor_ref],
-    ["Thread", message?.thread_id],
-    ["Room", message?.room_id],
-    ["Task Frame", provenance.task_frame_ref || lifecycle.task_frame_ref],
-    ["Node", target.project_id],
-    ["Artifacts", [...new Set(artifactRefs)].join(", ")],
+    ["Source event", context.source_event_id || message?.in_reply_to || message?.message_id],
+    ["Session Anchor", context.session_anchor_ref || message?.recipient_anchor_ref || message?.session_anchor_ref],
+    ["Thread", context.thread_id || message?.thread_id],
+    ["Room", context.room_id || message?.room_id],
+    ["Task Frame", context.task_frame_ref || provenance.task_frame_ref || lifecycle.task_frame_ref],
+    ["Node", context.node_ref || target.node_ref || target.project_id],
+    ["State", context.projection_state || message?.lifecycle_state],
+    ["Artifacts", [...new Set(artifactRefs.map((value) => String(value || "").trim()).filter(Boolean))].join(", ")],
   ].filter(([, value]) => String(value || "").trim());
 }
 

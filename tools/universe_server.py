@@ -23752,6 +23752,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 session_anchor_ref=str(raw.get("session_anchor_ref") or ""),
                 thread_id=str(raw.get("thread_id") or ""),
                 projection=str(raw.get("projection") or "INBOX"),
+                event_kind=str(raw.get("event_kind") or raw.get("kind") or ""),
+                lifecycle_state=str(raw.get("lifecycle_state") or ""),
+                task_frame_ref=str(raw.get("task_frame_ref") or ""),
+                node_ref=str(raw.get("node_ref") or ""),
                 headers_only=str(raw.get("headers") or "") == "1",
             )
         except SessionBusError as error:

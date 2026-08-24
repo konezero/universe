@@ -50,6 +50,8 @@ LIFECYCLE_TRANSITIONS = {
     "DONE": frozenset(),
 }
 INBOX_LIFECYCLE_STATES = frozenset({"QUEUED", "ACCEPTED"})
+RESULT_LIFECYCLE_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+PROJECTION_STATES = frozenset({"DECISION_NEEDED"})
 
 
 class SessionBusError(ValueError):
@@ -83,6 +85,12 @@ def _coord(value: Any) -> dict[str, str]:
         "session_anchor_ref": _text(
             raw.get("session_anchor_ref"), "session_anchor_ref", limit=256
         ),
+        "node_ref": _text(
+            raw.get("node_ref") or raw.get("node"), "node_ref", limit=160
+        ),
+        "task_frame_ref": _text(
+            raw.get("task_frame_ref"), "task_frame_ref", limit=256
+        ),
     }
 
 
@@ -113,6 +121,71 @@ def _is_inbox_message(message: Mapping[str, Any]) -> bool:
     return delivery in {"UNREAD", "PENDING", "CLAIMED"} or _message_lifecycle(
         message
     ) in INBOX_LIFECYCLE_STATES
+
+
+def _event_projection_state(message: Mapping[str, Any]) -> str:
+    lifecycle = message.get("lifecycle")
+    lifecycle_map = lifecycle if isinstance(lifecycle, Mapping) else {}
+    explicit = str(lifecycle_map.get("projection_state") or "").strip().upper()
+    current = _message_lifecycle(message)
+    if explicit in PROJECTION_STATES and current in INBOX_LIFECYCLE_STATES:
+        return explicit
+    return current
+
+
+def _is_results_message(message: Mapping[str, Any]) -> bool:
+    return (
+        str(message.get("kind") or "").upper() == "RESULT"
+        or _event_projection_state(message) in RESULT_LIFECYCLE_STATES
+        or _event_projection_state(message) == "DECISION_NEEDED"
+    )
+
+
+def _event_context(message: Mapping[str, Any]) -> dict[str, Any]:
+    source = message.get("from") if isinstance(message.get("from"), Mapping) else {}
+    target = message.get("to") if isinstance(message.get("to"), Mapping) else {}
+    provenance = (
+        message.get("provenance")
+        if isinstance(message.get("provenance"), Mapping)
+        else {}
+    )
+    lifecycle = (
+        message.get("lifecycle")
+        if isinstance(message.get("lifecycle"), Mapping)
+        else {}
+    )
+    raw_artifacts = provenance.get("artifact_refs")
+    artifacts = (
+        [str(item).strip() for item in raw_artifacts if str(item).strip()]
+        if isinstance(raw_artifacts, (list, tuple))
+        else []
+    )
+    result_ref = str(lifecycle.get("result_ref") or "").strip()
+    if result_ref and result_ref not in artifacts:
+        artifacts.append(result_ref)
+    return {
+        "source_event_id": str(
+            message.get("in_reply_to") or message.get("message_id") or ""
+        ),
+        "session_anchor_ref": str(
+            message.get("recipient_anchor_ref")
+            or message.get("session_anchor_ref")
+            or ""
+        ),
+        "thread_id": str(message.get("thread_id") or ""),
+        "room_id": str(message.get("room_id") or ""),
+        "task_frame_ref": str(
+            provenance.get("task_frame_ref")
+            or source.get("task_frame_ref")
+            or target.get("task_frame_ref")
+            or ""
+        ),
+        "node_ref": str(
+            target.get("node_ref") or target.get("project_id") or ""
+        ),
+        "artifact_refs": artifacts,
+        "projection_state": _event_projection_state(message),
+    }
 
 
 def _instruction_provenance(source: Mapping[str, str], kind: str) -> dict[str, Any]:
@@ -519,6 +592,7 @@ class SessionBus:
             "in_reply_to": str(message.get("in_reply_to") or ""),
             "lifecycle_state": _message_lifecycle(message),
             "lifecycle": dict(message.get("lifecycle") or {}),
+            "event_context": _event_context(message),
             "updated_at": str(message.get("updated_at") or message["created_at"]),
         }
         if not headers_only:
@@ -550,6 +624,14 @@ class SessionBus:
             raise SessionBusError("BUS_BODY_TOO_LARGE", "body_text exceeds 32 KiB", 413)
         room_id = _text(payload.get("room_id"), "room_id", limit=80)
         thread_id = _text(payload.get("thread_id"), "thread_id", limit=80)
+        projection_state = _text(
+            payload.get("projection_state"), "projection_state", limit=32
+        ).upper()
+        if projection_state and projection_state not in PROJECTION_STATES:
+            raise SessionBusError(
+                "BUS_PROJECTION_STATE_INVALID",
+                f"unsupported projection state: {projection_state}",
+            )
         targets = resolve_direct_targets(host, to)
         delivered = [
             self._deliver(
@@ -562,6 +644,7 @@ class SessionBus:
                 body=body,
                 room_id=room_id,
                 thread_id=thread_id,
+                projection_state=projection_state,
             )
             for item in targets
         ]
@@ -586,6 +669,7 @@ class SessionBus:
         body: str,
         room_id: str = "",
         thread_id: str = "",
+        projection_state: str = "",
     ) -> dict[str, Any]:
         return self._deliver(
             host,
@@ -597,6 +681,7 @@ class SessionBus:
             body=body,
             room_id=room_id,
             thread_id=thread_id,
+            projection_state=projection_state,
         )
 
     def _deliver(
@@ -611,6 +696,7 @@ class SessionBus:
         body: str,
         room_id: str,
         thread_id: str,
+        projection_state: str,
     ) -> dict[str, Any]:
         terminal_id = str(terminal.get("terminal_id") or "").strip()
         recipient_anchor = _terminal_anchor(terminal) or str(
@@ -653,7 +739,14 @@ class SessionBus:
             "source_anchor_ref": source_anchor,
             "in_reply_to": "",
             "lifecycle_state": "QUEUED",
-            "lifecycle": {"queued_at": utc_now()},
+            "lifecycle": {
+                "queued_at": utc_now(),
+                **(
+                    {"projection_state": projection_state}
+                    if projection_state
+                    else {}
+                ),
+            },
             "updated_at": utc_now(),
             "provenance": _instruction_provenance(source, kind),
         }
@@ -828,6 +921,10 @@ class SessionBus:
         session_anchor_ref: str = "",
         thread_id: str = "",
         projection: str = "INBOX",
+        event_kind: str = "",
+        lifecycle_state: str = "",
+        task_frame_ref: str = "",
+        node_ref: str = "",
         headers_only: bool = False,
     ) -> dict[str, Any]:
         del host
@@ -840,10 +937,27 @@ class SessionBus:
         )
         wanted_room = _text(room_id, "room_id", limit=80)
         wanted_thread = _text(thread_id, "thread_id", limit=80)
+        wanted_kind = _text(event_kind, "event_kind", limit=32).upper()
+        wanted_state = _text(
+            lifecycle_state, "lifecycle_state", limit=32
+        ).upper()
+        wanted_task_frame = _text(
+            task_frame_ref, "task_frame_ref", limit=256
+        )
+        wanted_node = _text(node_ref, "node_ref", limit=160)
         view = _text(projection or "INBOX", "projection", limit=24).upper()
         if view not in {"INBOX", "ACTIVITY", "RESULTS"}:
             raise SessionBusError(
                 "BUS_PROJECTION_INVALID", f"unsupported projection: {view}"
+            )
+        if wanted_kind and wanted_kind not in KINDS:
+            raise SessionBusError(
+                "BUS_EVENT_KIND_INVALID", f"unsupported event kind: {wanted_kind}"
+            )
+        if wanted_state and wanted_state not in LIFECYCLE_STATES | PROJECTION_STATES:
+            raise SessionBusError(
+                "BUS_LIFECYCLE_STATE_INVALID",
+                f"unsupported lifecycle state: {wanted_state}",
             )
         if not any(
             (wanted_terminal, wanted_project, wanted_room, wanted_anchor, wanted_thread)
@@ -873,15 +987,28 @@ class SessionBus:
                     continue
                 if wanted_thread and str(message.get("thread_id") or "") != wanted_thread:
                     continue
+                context = _event_context(message)
+                if wanted_kind and str(message.get("kind") or "").upper() != wanted_kind:
+                    continue
+                if wanted_state and context["projection_state"] != wanted_state:
+                    continue
+                if wanted_task_frame and context["task_frame_ref"] != wanted_task_frame:
+                    continue
+                if wanted_node and context["node_ref"] != wanted_node:
+                    continue
                 if view == "INBOX" and not _is_inbox_message(message):
                     continue
-                if view == "RESULTS" and str(message.get("kind") or "").upper() != "RESULT":
+                if view == "RESULTS" and not _is_results_message(message):
                     continue
                 row = self._public_message(message, headers_only=headers_only)
                 row["terminal_id"] = stored_terminal
                 messages.append(row)
         messages.sort(
-            key=lambda item: str(item.get("updated_at") or item.get("created_at") or "")
+            key=lambda item: (
+                str(item.get("updated_at") or item.get("created_at") or ""),
+                str(item.get("created_at") or ""),
+                str(item.get("message_id") or ""),
+            )
         )
         return {
             "schema": BUS_SCHEMA,
@@ -1216,6 +1343,7 @@ def fanout_meeting_bus(
                     "body_text": body,
                     "room_id": room_id,
                     "thread_id": thread_id,
+                    "projection_state": payload.get("projection_state"),
                 },
             )
             deliveries.extend(list(posted.get("messages") or [posted]))

@@ -467,6 +467,103 @@ class SessionBusDurabilityTests(unittest.TestCase):
         self.assertEqual(1, len(activity["messages"]))
         self.assertEqual("DONE", activity["messages"][0]["lifecycle_state"])
 
+    def test_projection_rules_are_filterable_and_emit_normalized_context(self) -> None:
+        bus = SessionBus(database_path=self.db_path)
+        anchor_ref = "anchor_projection_rules"
+        task_frame_ref = "task-frame://projection-rules"
+        source = {
+            "project_id": "gcs",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "node_ref": "gcs",
+            "task_frame_ref": task_frame_ref,
+        }
+        decision = bus.post(
+            self.host,
+            {
+                "to": {
+                    "terminal_id": self.terminal_id,
+                    "session_anchor_ref": anchor_ref,
+                    "node_ref": "universe",
+                },
+                "from": source,
+                "kind": "NOTE",
+                "projection_state": "DECISION_NEEDED",
+                "body_text": "operator decision required",
+            },
+        )
+        completed = bus.post(
+            self.host,
+            {
+                "to": {
+                    "terminal_id": self.terminal_id,
+                    "session_anchor_ref": anchor_ref,
+                    "node_ref": "universe",
+                },
+                "from": source,
+                "kind": "INSTRUCTION",
+                "body_text": "completed without a reply event",
+            },
+        )
+        for state in ("ACCEPTED", "STARTED", "COMPLETED"):
+            bus.transition(
+                completed["message_id"],
+                state=state,
+                terminal_id=self.terminal_id,
+                session_anchor_ref=anchor_ref,
+                result_ref=(
+                    "artifact://projection/completed"
+                    if state == "COMPLETED"
+                    else ""
+                ),
+            )
+
+        restarted = SessionBus(database_path=self.db_path)
+        inbox = restarted.inbox(
+            self.host, session_anchor_ref=anchor_ref, projection="INBOX"
+        )
+        results = restarted.inbox(
+            self.host, session_anchor_ref=anchor_ref, projection="RESULTS"
+        )
+        decision_results = restarted.inbox(
+            self.host,
+            session_anchor_ref=anchor_ref,
+            projection="RESULTS",
+            event_kind="NOTE",
+            lifecycle_state="DECISION_NEEDED",
+            task_frame_ref=task_frame_ref,
+            node_ref="universe",
+        )
+        self.assertEqual([decision["message_id"]], [item["message_id"] for item in inbox["messages"]])
+        self.assertEqual(2, len(results["messages"]))
+        self.assertEqual([decision["message_id"]], [item["message_id"] for item in decision_results["messages"]])
+        context = next(
+            item["event_context"]
+            for item in results["messages"]
+            if item["message_id"] == completed["message_id"]
+        )
+        self.assertEqual(completed["message_id"], context["source_event_id"])
+        self.assertEqual(anchor_ref, context["session_anchor_ref"])
+        self.assertEqual(task_frame_ref, context["task_frame_ref"])
+        self.assertEqual("universe", context["node_ref"])
+        self.assertEqual(["artifact://projection/completed"], context["artifact_refs"])
+        activity = restarted.inbox(
+            self.host, session_anchor_ref=anchor_ref, projection="ACTIVITY"
+        )["messages"]
+        order = [
+            (item["updated_at"], item["created_at"], item["message_id"])
+            for item in activity
+        ]
+        self.assertEqual(sorted(order), order)
+        restarted.ack(decision["message_id"], self.terminal_id)
+        resolved_results = restarted.inbox(
+            self.host, session_anchor_ref=anchor_ref, projection="RESULTS"
+        )["messages"]
+        self.assertEqual(
+            [completed["message_id"]],
+            [item["message_id"] for item in resolved_results],
+        )
+
     def test_anchor_inbox_survives_terminal_detach_and_restart(self) -> None:
         bus_a = SessionBus(database_path=self.db_path)
         posted = bus_a.post(
