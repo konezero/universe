@@ -246,6 +246,38 @@ class Handler(BaseHTTPRequestHandler):
                 {"schema": API_SCHEMA, "status": "OK", "terminals": rows},
             )
             return
+        terminal_history = path.split("/")
+        if (
+            len(terminal_history) == 5
+            and terminal_history[1:3] == ["v1", "terminals"]
+            and terminal_history[4] == "history"
+        ):
+            query = parse_qs(parsed.query)
+            try:
+                before_raw = str((query.get("before_cursor") or [""])[0]).strip()
+                before_cursor = int(before_raw) if before_raw else None
+                limit = int((query.get("limit") or ["100"])[0])
+                payload = supervisor.host.history(
+                    terminal_history[3], before_cursor=before_cursor, limit=limit
+                )
+            except ValueError:
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": "TERMINAL_HISTORY_CURSOR_INVALID",
+                    },
+                )
+                return
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.NOT_FOUND,
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                )
+                return
+            self._send(HTTPStatus.OK, payload)
+            return
         attach_read = path.split("/")
         if (
             len(attach_read) == 7

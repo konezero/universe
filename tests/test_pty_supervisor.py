@@ -197,12 +197,19 @@ class PtySupervisorTests(unittest.TestCase):
         )
         terminal_id = created["terminal_id"]
         self.assertEqual(4242, created["pid"])
+        first.emit_output(terminal_id, b"history-before-universe-restart")
         del first
 
         second = SupervisedTerminalHost(state_path=state_path)
         listed = second.list_sessions()
         self.assertEqual(1, len(listed))
         self.assertEqual(terminal_id, listed[0]["terminal_id"])
+        history = second.history(terminal_id, limit=10)
+        replay = b"".join(
+            base64.b64decode(chunk["data_base64"])
+            for chunk in history["chunks"]
+        )
+        self.assertIn(b"history-before-universe-restart", replay)
         found = second.find_live(
             project_id="universe",
             mode="MASTER",

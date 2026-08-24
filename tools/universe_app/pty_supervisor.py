@@ -327,6 +327,17 @@ class SupervisedTerminalHost:
             raise TerminalHostError("TERMINAL_NOT_FOUND", "terminal session does not exist")
         return SupervisedSession(terminal)
 
+    def history(
+        self, terminal_id: str, *, before_cursor: int | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        query = {"limit": str(limit)}
+        if before_cursor is not None:
+            query["before_cursor"] = str(before_cursor)
+        return self._request(
+            "GET",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/history?{urlencode(query)}",
+        )
+
     def create(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request(
             "POST", "/v1/terminals", payload=kwargs, audit_source="UNIVERSE_TERMINAL_CREATE"
