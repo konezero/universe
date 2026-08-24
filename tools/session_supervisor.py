@@ -1029,6 +1029,10 @@ class SessionSupervisorStore:
                 ).fetchone()
             if identity_owner is not None:
                 session["session_id"] = str(identity_owner["session_id"])
+            identity_reused = (
+                identity_owner is not None
+                and requested_session_id != session["session_id"]
+            )
             existing = connection.execute(
                 "SELECT * FROM session_record WHERE session_id = ?",
                 (session["session_id"],),
@@ -1041,6 +1045,29 @@ class SessionSupervisorStore:
                         "session_id is already bound to a different lifetime kind",
                         status=409,
                     )
+                requested_location = {
+                    "project_id": session["project_id"],
+                    "node": session["node"],
+                    "mode": session["mode"],
+                    "anchor_ref": session["anchor_ref"],
+                }
+                requested_location_changed = any(
+                    (
+                        material.get("current_project_id") != session["project_id"],
+                        material["node"] != session["node"],
+                        material["mode"] != session["mode"],
+                        session["anchor_ref"] is not None
+                        and material.get("anchor_ref") != session["anchor_ref"],
+                    )
+                )
+                passive_location_preserved = (
+                    identity_reused and requested_location_changed
+                )
+                if passive_location_preserved:
+                    session["project_id"] = material.get("current_project_id")
+                    session["node"] = material["node"]
+                    session["mode"] = material["mode"]
+                    session["anchor_ref"] = material.get("anchor_ref")
                 provider_changed = (
                     material["provider"] != session["provider"]
                     or material["provider_session_ref"]
@@ -1171,8 +1198,9 @@ class SessionSupervisorStore:
                         "owned_process_exact": effective_state == "LIVE"
                         and material["state"] != "STOPPED",
                         "requested_session_id": requested_session_id,
-                        "identity_reused": requested_session_id
-                        != session["session_id"],
+                        "identity_reused": identity_reused,
+                        "passive_location_preserved": passive_location_preserved,
+                        "requested_location": requested_location,
                     },
                 )
                 row = connection.execute(

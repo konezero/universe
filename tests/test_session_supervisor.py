@@ -146,7 +146,7 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertEqual(2, len(moved["location_history"]))
         self.assertEqual(1, sum(item["is_current"] for item in moved["location_history"]))
 
-    def test_provider_identity_moves_one_canonical_session(self) -> None:
+    def test_provider_identity_reuse_preserves_canonical_session_location(self) -> None:
         first, created = self.store.register_session(self.session("session-origin"))
         moved_candidate = self.session("session-derived-location")
         moved_candidate.update(
@@ -163,10 +163,17 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertFalse(created_again)
         self.assertEqual(first["universe_session_id"], moved["universe_session_id"])
-        self.assertEqual("universe", moved["current_project_id"])
+        self.assertEqual("GCS", moved["current_project_id"])
         self.assertEqual("MASTER", moved["mode"])
         self.assertEqual("Universe Main Master", moved["alias"])
         self.assertEqual(1, len(self.store.list_sessions()))
+        self.assertEqual(1, len(moved["location_history"]))
+        events = self.store.list_events(session_id=first["session_id"])
+        self.assertTrue(events[0]["details"]["identity_reused"])
+        self.assertTrue(events[0]["details"]["passive_location_preserved"])
+        self.assertEqual(
+            "universe", events[0]["details"]["requested_location"]["project_id"]
+        )
 
     def test_initialize_deduplicates_legacy_current_provider_identity(self) -> None:
         first, _ = self.store.register_session(self.session("legacy-first"))

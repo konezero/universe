@@ -4771,7 +4771,51 @@ class UniverseLocalServiceTests(unittest.TestCase):
             rows=32,
         )
 
-    def test_live_terminal_and_inbox_follow_current_session_anchor_location(self) -> None:
+    def test_passive_provider_reobservation_preserves_session_anchor_location(self) -> None:
+        original, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_anchor_location_passive_001",
+                "node": "universe",
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-anchor-location-passive-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        reobserved, created = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_requested_master_passive_001",
+                "node": "universe",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-anchor-location-passive-001",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+
+        self.assertFalse(created)
+        self.assertEqual(original["session_id"], reobserved["session_id"])
+        self.assertEqual(original["session_anchor_ref"], reobserved["session_anchor_ref"])
+        self.assertEqual("CONDUCTOR", reobserved["mode"])
+        current_locations = [
+            item for item in reobserved["location_history"] if item["is_current"]
+        ]
+        self.assertEqual(["CONDUCTOR"], [item["mode"] for item in current_locations])
+        events = self.server.session_supervisor.list_events(
+            session_id=original["session_id"]
+        )
+        latest = events[0]
+        self.assertEqual("SESSION_REOBSERVED", latest["event_type"])
+        self.assertTrue(latest["details"]["identity_reused"])
+        self.assertTrue(latest["details"]["passive_location_preserved"])
+        self.assertEqual("MASTER", latest["details"]["requested_location"]["mode"])
+
+    def test_live_terminal_and_inbox_follow_explicit_session_anchor_location(self) -> None:
         original, _ = self.server.session_supervisor.register_session(
             {
                 "session_id": "session_anchor_location_001",
@@ -4815,20 +4859,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
             }
         )
 
-        relocated, created = self.server.session_supervisor.register_session(
-            {
-                "session_id": "session_requested_master_001",
-                "node": "universe",
-                "project_id": "universe",
-                "mode": "MASTER",
-                "provider": "CODEX",
-                "provider_session_ref": "codex-anchor-location-001",
-                "state": "DISCONNECTED",
-                "currentness": "CURRENT",
-            }
+        relocated = self.server.session_supervisor.bind_current_location(
+            original["session_id"],
+            project_id="universe",
+            node="universe",
+            mode="MASTER",
+            evidence_ref="universe://mode-change/test",
+            expected_version=original["row_version"],
         )
 
-        self.assertFalse(created)
         self.assertEqual(original["session_id"], relocated["session_id"])
         self.assertNotEqual(
             original["session_anchor_ref"], relocated["session_anchor_ref"]
@@ -5233,7 +5272,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             recovered["result"]["recovery"]["process_termination"],
         )
 
-    def test_attach_current_codex_thread_as_default_conductor_session(self) -> None:
+    def test_passive_attach_preserves_current_codex_thread_conductor_location(self) -> None:
         status, attached = attach_supervisor_session(
             endpoint=self.endpoint,
             token=self.token,
@@ -5272,7 +5311,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("NOT_REQUIRED", repeated["resident_runtime_reload"])
 
-        status, moved = attach_supervisor_session(
+        status, reobserved = attach_supervisor_session(
             endpoint=self.endpoint,
             token=self.token,
             node="universe",
@@ -5283,11 +5322,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(
-            attached["session"]["session_id"], moved["session"]["session_id"]
+            attached["session"]["session_id"], reobserved["session"]["session_id"]
         )
-        self.assertEqual("universe", moved["session"]["current_project_id"])
-        self.assertEqual("MASTER", moved["session"]["mode"])
-        self.assertEqual("Universe Main Master", moved["session"]["alias"])
+        self.assertEqual("CONDUCTOR", reobserved["session"]["current_project_id"])
+        self.assertEqual("CONDUCTOR", reobserved["session"]["mode"])
+        self.assertEqual("Universe Main Master", reobserved["session"]["alias"])
         status, all_sessions = self.request(
             "GET", "/v1/sessions?include_hidden=true", token=self.token
         )
