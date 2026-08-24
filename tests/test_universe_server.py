@@ -224,7 +224,9 @@ class UniverseWorkPreflightTests(unittest.TestCase):
             }
         )
         self.assertEqual("CROSS_SESSION_DELEGATION", delegated["queue_scope"])
-        with self.assertRaisesRegex(UniverseError, "both origin and target"):
+        with self.assertRaisesRegex(
+            UniverseError, "origin and an existing target Session Anchor"
+        ):
             normalize_conductor_delegation(
                 {
                     "project_id": "GCS",
@@ -232,7 +234,9 @@ class UniverseWorkPreflightTests(unittest.TestCase):
                     "idempotency_key": "cross-session-missing",
                 }
             )
-        with self.assertRaisesRegex(UniverseError, "both origin and target"):
+        with self.assertRaisesRegex(
+            UniverseError, "origin and an existing target Session Anchor"
+        ):
             normalize_conductor_delegation(
                 {
                     "project_id": "GCS",
@@ -2401,24 +2405,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
         ):
             catalog = self.server.provider_chat_catalog()
 
-        bound = [
-            room for room in catalog["rooms"] if room["binding"]["state"] == "BOUND"
+        observed = [
+            room
+            for room in catalog["rooms"]
+            if room["binding"]["state"] == "ANCHOR_OBSERVED"
         ]
-        self.assertEqual(3, len(bound))
+        self.assertEqual(2, len(observed))
         self.assertEqual(
-            {"CODEX", "CLAUDE", "GROK"}, {room["provider"] for room in bound}
+            {"CODEX", "CLAUDE"}, {room["provider"] for room in observed}
         )
         self.assertTrue(
             all(
                 room["binding"]["selection_scope"] == "UI_NAVIGATION_ONLY"
-                for room in bound
+                for room in observed
             )
         )
         self.assertTrue(
-            all(room["binding"]["session_anchor_ref"] for room in bound)
+            all(room["binding"]["session_anchor_ref"] for room in observed)
         )
         grok = next(room for room in catalog["rooms"] if room["provider"] == "GROK")
-        self.assertEqual("BOUND", grok["binding"]["state"])
+        self.assertEqual("INDEPENDENT", grok["binding"]["state"])
 
     def test_session_observatory_card_uses_anchor_observer_identity(self) -> None:
         session = {
@@ -3638,7 +3644,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "WAITING_FOR_TARGET_SESSION_RESULT", result["progress"]["step"]
         )
-        transport.deliver.assert_called_once_with(record)
+        transport.deliver.assert_called_once_with(
+            {
+                **record,
+                "request": {
+                    **record["request"],
+                    "target_session_action": "EXISTING",
+                },
+            }
+        )
         room_send.assert_not_called()
 
     def test_delegation_dispatch_rejects_legacy_record_without_session_lineage(
@@ -4087,10 +4101,22 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 },
             ]
 
-        with patch.object(
-            self.server.store,
-            "discover_provider_session_sources",
-            side_effect=discovered,
+        with (
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                side_effect=discovered,
+            ),
+            patch.object(
+                self.server,
+                "_project_anchor_observations",
+                return_value=[],
+            ),
+            patch.object(
+                self.server,
+                "list_all_project_anchor_sessions",
+                return_value=[],
+            ),
         ):
             status, first = self.request("POST", "/v1/session-observer/tail", {})
             self.assertEqual(HTTPStatus.OK, status)
@@ -4262,8 +4288,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="composer-action-button"', body)
             self.assertIn('id="project-master-actions"', body)
             self.assertIn('id="settings-dialog"', body)
-            self.assertIn('id="universe-provider-setting"', body)
-            self.assertIn('id="project-provider-settings"', body)
+            self.assertIn('id="provider-model-catalog"', body)
+            self.assertIn('id="refresh-provider-models-button"', body)
             self.assertIn('id="worker-binding-scope"', body)
             self.assertIn('id="worker-binding-settings"', body)
             self.assertIn('id="host-tool-settings"', body)
@@ -4283,7 +4309,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn('id="session-rail-show-hidden"', body)
             self.assertIn("work-spine-", body)
             self.assertIn('id="runtime-audit-grid"', body)
-            self.assertIn('id="legacy-executor-list"', body)
+            self.assertIn('id="session-event-list"', body)
         with urlopen(self.endpoint + "/app.js", timeout=5) as response:
             script = response.read().decode("utf-8")
             self.assertEqual(200, response.status)
@@ -4326,7 +4352,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "/v1/conductor-room/agent-session/permissions/",
                 script,
             )
-            self.assertIn("/provider-setting", script)
+            self.assertIn("/v1/settings/provider-models", script)
             self.assertIn("/master-session/prepare", script)
             self.assertIn("/v1/conductor-session/prepare", script)
             self.assertIn("prepareBody.project_id", script)
@@ -4336,7 +4362,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.assertIn("sessionConnectionText", script)
             self.assertIn("/v1/supervisor/sessions", script)
             self.assertIn("refreshSupervisorSessions", script)
-            self.assertIn("/v1/supervisor/legacy-executors", script)
+            self.assertIn("/v1/session-graph", script)
             self.assertNotIn(self.token, script)
         with urlopen(self.endpoint + "/styles.css", timeout=5) as response:
             styles = response.read().decode("utf-8")
@@ -4627,7 +4653,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("CLAUDE", switched["setting"]["provider"])
-        self.assertEqual("sonnet", switched["setting"]["model_ref"])
+        self.assertEqual(
+            "claude-sonnet-5", switched["setting"]["model_ref"]
+        )
 
         status, explicit = self.request(
             "POST",
@@ -9774,7 +9802,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertTrue(composition["specification"]["functional_nodes"])
         self.assertEqual(
-            {"SPECIFICATION", "DESIGN", "ARCHITECTURE", "DECISION", "CONTRACT"},
+            {"SPECIFICATION", "DESIGN", "ARCHITECTURE", "REFERENCE", "CONTRACT"},
             {document["role"] for document in composition["document_plan"]},
         )
         self.assertTrue(

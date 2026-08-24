@@ -6098,6 +6098,11 @@ class UniverseStore:
                     "PRAGMA table_info(project_connection)"
                 ).fetchall()
             }
+            if "metadata_json" not in project_connection_columns:
+                connection.execute(
+                    "ALTER TABLE project_connection "
+                    "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+                )
             if "attachment_json" not in project_connection_columns:
                 connection.execute(
                     "ALTER TABLE project_connection ADD COLUMN attachment_json TEXT"
