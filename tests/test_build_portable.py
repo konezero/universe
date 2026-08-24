@@ -23,6 +23,7 @@ class BuildPortableTests(unittest.TestCase):
             package = Path(result["package_dir"])
             self.assertTrue(package.is_dir())
             self.assertTrue((package / "tools" / "universe_server.py").is_file())
+            self.assertTrue((package / "tools" / "universe_session_inbox.py").is_file())
             self.assertTrue(
                 (
                     package

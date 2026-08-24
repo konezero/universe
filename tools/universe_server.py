@@ -20074,6 +20074,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 or self._create_provider_session_host
             ),
             action_store=self.store,
+            action_observer=self._observe_provider_session_action,
         )
         self.task_frame_lineage = store.task_frame_lineage
         self.session_anchor_transport = SessionAnchorTransport(
@@ -24345,6 +24346,50 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "providers": ["CODEX", "CLAUDE", "GROK"],
             "transcript_content": "EXCLUDED",
         }
+
+    def _observe_provider_session_action(
+        self, chat_key: str, action: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        operation = str(action.get("operation") or "").upper()
+        state = str(action.get("state") or "").upper()
+        if operation not in {"COMMIT", "PUSH"} or state not in {"COMPLETED", "FAILED"}:
+            return {"status": "SKIPPED"}
+        descriptor = self.resolve_provider_chat_session(chat_key)
+        anchor_ref = str(descriptor.get("current_anchor_ref") or "").strip()
+        if not anchor_ref or anchor_ref == "UNKNOWN":
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_ANCHOR_UNKNOWN",
+                "Provider action cannot be projected without a current Session Anchor",
+                HTTPStatus.CONFLICT,
+            )
+        details = action.get("details") if isinstance(action.get("details"), Mapping) else {}
+        commit_sha = str(details.get("commit_sha") or "").strip().lower()
+        action_id = str(action.get("action_id") or "provider-action").strip()
+        result_ref = f"git://commit/{commit_sha}" if commit_sha else f"provider-action://{action_id}"
+        project_id = str(descriptor.get("project_id") or "").strip()
+        mode = str(descriptor.get("mode") or "").upper()
+        provider = str(descriptor.get("provider") or "").upper()
+        node_ref = str(descriptor.get("node") or project_id).strip()
+        task_frame_ref = str(details.get("task_frame_ref") or "").strip()
+        summary = str(action.get("summary") or action.get("title") or operation).strip()
+        posted = self.session_bus.post(
+            self._session_anchor_terminal_host(),
+            {
+                "to": {"session_anchor_ref": anchor_ref, "project_id": project_id, "mode": mode, "provider": provider, "node_ref": node_ref},
+                "from": {"project_id": project_id, "mode": mode, "provider": provider, "node_ref": node_ref, "task_frame_ref": task_frame_ref},
+                "kind": "RESULT",
+                "body_text": f"{operation} {state}\n{summary}",
+                "thread_id": str(action.get("message_id") or action_id)[:80],
+            },
+        )
+        message_id = str(posted["message_id"])
+        self.session_bus.transition(message_id, state="ACCEPTED", session_anchor_ref=anchor_ref)
+        if state == "COMPLETED":
+            self.session_bus.transition(message_id, state="STARTED", session_anchor_ref=anchor_ref)
+        projected = self.session_bus.transition(
+            message_id, state=state, session_anchor_ref=anchor_ref, result_ref=result_ref
+        )
+        return {"status": "EVENT_PROJECTED", "message_id": message_id, "thread_id": projected["thread_id"], "result_ref": result_ref}
 
     def resolve_provider_chat_session(self, chat_key: str) -> dict[str, Any]:
         """Resolve one opaque browser key to an adapter-private provider target."""

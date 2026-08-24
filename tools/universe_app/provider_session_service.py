@@ -217,6 +217,9 @@ class ProviderSessionService:
         retained_permissions: int | None = None,
         permission_timeout_seconds: float = 600.0,
         action_store: ProviderActionStore | None = None,
+        action_observer: (
+            Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None
+        ) = None,
         repository_git_observer_factory: Callable[[Path], Any] | None = (
             GitTrace2RepositoryObserver
         ),
@@ -225,6 +228,7 @@ class ProviderSessionService:
         self.resolver = resolver
         self.host_factory = host_factory
         self.action_store = action_store
+        self.action_observer = action_observer
         self.events = ProviderSessionEventHub()
         self.retained_messages = max(16, int(retained_messages))
         self.retained_idempotency = max(
@@ -1043,6 +1047,18 @@ class ProviderSessionService:
                         "todo_id": todo_id,
                         "state": str(transition_todo.get("state") or "UNKNOWN"),
                     }
+        if action is not None and self.action_observer is not None:
+            try:
+                projection = self.action_observer(chat_key, action)
+            except Exception as error:  # noqa: BLE001 - projection failure stays visible
+                action["event_projection"] = {
+                    "status": "FAILED",
+                    "error_code": str(
+                        getattr(error, "code", type(error).__name__)
+                    ).upper()[:120],
+                }
+            else:
+                action["event_projection"] = dict(projection or {"status": "SKIPPED"})
         if action is not None and self.action_store is not None:
             action = dict(
                 self.action_store.record_provider_session_action(

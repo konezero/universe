@@ -38,7 +38,7 @@ class ProviderSessionUiContractTests(unittest.TestCase):
             )
         ]
         resume_slice = APP[
-            APP.index("async function resumeNodeModeSession") : APP.index(
+            APP.index("async function bindNodeModeSessionPty") : APP.index(
                 "async function startNewNodeModeSession"
             )
         ]
@@ -103,10 +103,6 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("PROVIDER_SESSION_ACTION", APP)
         self.assertIn("PROVIDER_SESSION_ACTION_DELETED", APP)
         self.assertIn("function workStatusNotificationText(workStatus)", APP)
-        self.assertIn("function renderGitActionCard(chatKey, action)", APP)
-        self.assertIn("function deleteProviderSessionAction(chatKey, action)", APP)
-        self.assertIn('/actions/${encodeURIComponent(action.action_id)}`', APP)
-        self.assertIn('{ method: "DELETE" }', APP)
         action_slice = APP[
             APP.index("function pendingActionItems") : APP.index(
                 "function finishRoomMessageRender"
@@ -114,7 +110,10 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         ]
         self.assertNotIn("governanceProposal", action_slice)
         self.assertNotIn("renderGovernanceProposalCard", APP)
-        self.assertIn("state.providerSessionPermissions", action_slice)
+        render_slice = action_slice[action_slice.index("function renderActionInbox") :]
+        self.assertNotIn("renderGitActionCard", render_slice)
+        self.assertNotIn("Recent activity", render_slice)
+        self.assertIn("state.providerSessionPermissions", APP)
         self.assertIn("function closeProviderSessionStream(chatKey)", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(

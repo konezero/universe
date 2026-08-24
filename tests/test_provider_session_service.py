@@ -241,6 +241,7 @@ class ProviderSessionServiceTests(unittest.TestCase):
         retained_permissions: int | None = None,
         repository_git_observer_factory: Callable[[Path], Any] | None = None,
         action_store: Any = None,
+        action_observer: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
     ) -> ProviderSessionService:
         return ProviderSessionService(
             resolver=self.resolver,
@@ -249,6 +250,7 @@ class ProviderSessionServiceTests(unittest.TestCase):
             retained_idempotency=retained_idempotency,
             retained_permissions=retained_permissions,
             action_store=action_store,
+            action_observer=action_observer,
             repository_git_observer_factory=repository_git_observer_factory,
             repository_git_poll_seconds=0.01,
         )
@@ -339,6 +341,30 @@ class ProviderSessionServiceTests(unittest.TestCase):
         public = json.dumps(statuses)
         self.assertNotIn("argv", public)
         self.assertNotIn("repository_root", public)
+
+    def test_terminal_git_action_records_event_projection(self) -> None:
+        observed: list[tuple[str, Mapping[str, Any]]] = []
+
+        def observe(chat_key: str, action: Mapping[str, Any]) -> Mapping[str, Any]:
+            observed.append((chat_key, dict(action)))
+            return {"status": "EVENT_PROJECTED", "message_id": "msg_result_001"}
+
+        self.service.close()
+        self.service = self._new_service(action_observer=observe)
+        self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-event-001",
+            "COMPLETED",
+            operation="COMMIT",
+            details={"source": "GIT_TRACE2", "commit_sha": "a" * 40},
+        )
+
+        self.assertEqual(CHAT_KEY, observed[0][0])
+        self.assertEqual("COMMIT", observed[0][1]["operation"])
+        self.assertEqual(
+            {"status": "EVENT_PROJECTED", "message_id": "msg_result_001"},
+            self.service.snapshot(CHAT_KEY)["actions"][0]["event_projection"],
+        )
 
     def test_explicit_git_todo_marker_starts_but_does_not_complete_todo(
         self,

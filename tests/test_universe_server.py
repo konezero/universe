@@ -7818,6 +7818,49 @@ class UniverseLocalServiceTests(unittest.TestCase):
             envelope["payload"]["messages"][0]["body"],
         )
 
+    def test_provider_git_action_projects_to_anchor_results(self) -> None:
+        anchor_ref = "anchor-provider-git-result-001"
+        self.server.resolve_provider_chat_session = Mock(
+            return_value={
+                "current_anchor_ref": anchor_ref,
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+            }
+        )
+
+        projected = self.server._observe_provider_session_action(
+            "provider_chat_0123456789abcdef01234567",
+            {
+                "action_id": "provider_action_0123456789abcdef01234567",
+                "message_id": "provider-message-git-result-001",
+                "operation": "COMMIT",
+                "state": "COMPLETED",
+                "summary": "abc1234 · Define projection contracts · 6 files",
+                "details": {
+                    "commit_sha": "a" * 40,
+                    "task_frame_ref": "task-frame://provider-git-result",
+                },
+            },
+        )
+
+        results = self.server.session_bus.inbox(
+            self.server._session_anchor_terminal_host(),
+            session_anchor_ref=anchor_ref,
+            projection="RESULTS",
+        )["messages"]
+        self.assertEqual("EVENT_PROJECTED", projected["status"])
+        self.assertEqual(1, len(results))
+        self.assertEqual("RESULT", results[0]["kind"])
+        self.assertEqual("COMPLETED", results[0]["lifecycle_state"])
+        self.assertEqual("provider-message-git-result-001", results[0]["thread_id"])
+        self.assertEqual("git://commit/" + "a" * 40, projected["result_ref"])
+        self.assertEqual(
+            ["git://commit/" + "a" * 40],
+            results[0]["event_context"]["artifact_refs"],
+        )
+
     def test_provider_session_action_can_be_deleted_by_one_api(self) -> None:
         action = {
             "schema": "universe.provider-session-action.v1",

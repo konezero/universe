@@ -25,7 +25,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
     def test_goal_plan_editor_preserves_revision_and_selection(self) -> None:
         self.assertIn('class="goal-plan-toolbar"', HTML)
         self.assertIn('id="edit-selected-goal"', HTML)
-        self.assertIn('state.selectedGoalId = state.goals[0]?.goal_id || null;', APP)
+        self.assertIn('state.selectedGoalId = contextualGoals[0]?.goal_id || null;', APP)
         self.assertIn(
             'revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision',
             APP,
@@ -675,7 +675,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("function finishRoomMessageRender", APP)
         self.assertNotIn('"Pending approvals"', APP)
         self.assertIn('"Active work"', APP)
-        self.assertIn('"Recent activity"', APP)
+        self.assertNotIn('"Recent activity"', APP)
+        self.assertIn('"No active work."', APP)
         self.assertIn("Cross-session delivery is internal automation state", APP)
         self.assertIn("delegations: []", APP)
         self.assertIn("history: []", APP)

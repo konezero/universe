@@ -4838,11 +4838,10 @@ function pendingActionItems() {
     return { delegations: [], activities: [] };
   }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
-    const cache = providerSessionRoomCacheFor(state.conversationTarget.chat_key);
     return {
       delegations: [],
       activeReply: activeProviderSessionReply(),
-      activities: [...(cache?.actions || [])].reverse(),
+      activities: [],
     };
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
@@ -4873,59 +4872,6 @@ function updateActionInboxBadge() {
     if (!badge) continue;
     badge.textContent = label;
     badge.classList.toggle("hidden", count === 0);
-  }
-}
-
-function renderGitActionCard(chatKey, action) {
-  const item = node("article", "action-inbox-card git-action-card");
-  item.append(
-    node("strong", "", `${action.operation || "GIT"} / ${action.state || "UNKNOWN"}`),
-    node("p", "git-action-summary", action.summary || action.title || "Git activity")
-  );
-  const details = action.details || {};
-  const detailRows = [
-    ["Commit", details.commit_sha],
-    ["Message", details.commit_message],
-    ["Branch", details.branch],
-    ["Remote", details.remote],
-    ["Changed files", Number.isInteger(details.changed_files) ? String(details.changed_files) : ""],
-    ["Observed", action.created_at],
-  ].filter(([, value]) => String(value || "").trim());
-  if (detailRows.length) {
-    const disclosure = node("details", "git-action-details");
-    disclosure.append(node("summary", "", "Details"));
-    for (const [label, value] of detailRows) {
-      const row = node("div", "git-action-detail-row");
-      row.append(node("span", "", label), node("code", "", String(value)));
-      disclosure.append(row);
-    }
-    item.append(disclosure);
-  }
-  const actions = node("div", "proposal-actions");
-  const remove = node("button", "secondary-button", "Delete");
-  remove.type = "button";
-  remove.addEventListener("click", () => deleteProviderSessionAction(chatKey, action));
-  actions.append(remove);
-  item.append(actions);
-  return item;
-}
-
-async function deleteProviderSessionAction(chatKey, action) {
-  try {
-    await api(
-      `/v1/provider-sessions/${encodeURIComponent(chatKey)}/actions/${encodeURIComponent(action.action_id)}`,
-      { method: "DELETE" }
-    );
-    const cache = providerSessionRoomCacheFor(chatKey);
-    if (cache) {
-      cache.actions = (cache.actions || []).filter(
-        (item) => item.action_id !== action.action_id
-      );
-    }
-    renderActionInbox();
-    toast("Action deleted");
-  } catch (error) {
-    toast(error.message, true);
   }
 }
 
@@ -5044,17 +4990,9 @@ function renderActionInbox() {
   );
   if (items.activeReply) activeWork.push(renderProviderReplyActionCard(items.activeReply));
   appendSection("Active work", activeWork);
-  const chatKey = String(state.conversationTarget.chat_key || "").trim();
-  const recentActivity = (items.history || []).map((delegation) =>
-    renderDelegationActionCard(delegation)
-  );
-  recentActivity.push(
-    ...items.activities.map((activity) => renderGitActionCard(chatKey, activity))
-  );
-  appendSection("Recent activity", recentActivity);
   if (!elements.actionInboxList.childElementCount) {
     elements.actionInboxList.append(
-      node("p", "empty-copy", "No active work or recent activity.")
+      node("p", "empty-copy", "No active work.")
     );
   }
 }
