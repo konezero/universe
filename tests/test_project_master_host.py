@@ -3535,6 +3535,107 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual({"operations": [], "targets": []}, frame["parent_instruction"]["mutation_scope"])
         self.assertNotIn("work_receipt", frame)
 
+    def test_instruction_authorized_source_review_preserves_policy_ref(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        coordinator = ProjectModeCoordinator(self.root, "GCS", "codex:session-001")
+        binding = {
+            "endpoint": "http://127.0.0.1:41992",
+            "token": "test-token",
+            "session_id": "project-master-session-001",
+            "frame_id": "current",
+            "anchor_id": "MASTER-CURRENT-001",
+        }
+        posts: list[dict[str, Any]] = []
+        invocations: list[dict[str, Any]] = []
+
+        def post(_endpoint, _token, path, payload):
+            posts.append({"path": path, "payload": payload})
+            if path == "/v1/task-frame/create":
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TASK_TURNS_DECLARED"},
+            }
+
+        def invoke(_args, payload):
+            invocations.append(dict(payload))
+            return {
+                "execution_proposal": {
+                    "proposal_id": "task_frame_proposal_reviewed_001",
+                    "plan_digest": "b" * 64,
+                }
+            }
+
+        policy_commit = "1" * 40
+        candidate_commit = "2" * 40
+        policy_ref = f"installed-runtime://policy@{policy_commit}"
+        candidate_ref = f"git:{self.root.as_posix()}@{candidate_commit}"
+        source_review_result = {
+            "schema": "ai-career.source-review-result.v1",
+            "status": "SOURCE_REVIEW_PERMITTED",
+            "policy_source": {
+                "ref": policy_ref,
+                "commit": policy_commit,
+                "kind": "INSTALLED_DISTRIBUTION",
+                "evidence_ref": "installed-runtime://manifest/verified",
+                "use": "REVIEWER_POLICY",
+            },
+            "candidate_source": {
+                "ref": candidate_ref,
+                "commit": candidate_commit,
+                "policy_activation": "FORBIDDEN",
+                "classification": "DATA_ONLY",
+            },
+            "review_mode": "STATIC_REVIEW",
+            "repository_write": False,
+            "authority_created": False,
+            "execution_assignment_created": False,
+            "candidate_execution": "FORBIDDEN",
+            "execution_environment": "NOT_APPLICABLE",
+            "test_status": "NOT_RUN_UNTRUSTED",
+            "reasons": [],
+        }
+
+        with patch.object(coordinator, "_ensure_runtime", return_value=binding), patch.object(
+            coordinator, "_post_runtime", side_effect=post
+        ), patch.object(coordinator, "_invoke", side_effect=invoke):
+            result = coordinator.create_instruction_authorized_task_frame(
+                proposal_reference={
+                    "proposal_id": "task_proposal_reference_only",
+                    "proposal_digest": "a" * 64,
+                    "request_ref": "universe://project-room/messages/reviewed-001",
+                },
+                task_frame={
+                    "frame_id": "instruction-reviewed-frame-001",
+                    "candidate_source_ref": candidate_ref,
+                    "source_review_result": source_review_result,
+                    "parent_actor_ref": "project-master:GCS",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "turns": [{
+                        "turn_id": "review",
+                        "role": "BOSS",
+                        "worker_slot_ref": "review-worker",
+                        "provider": "CLAUDE",
+                        "model": "opus",
+                        "reasoning_effort": "high",
+                    }],
+                    "instruction_id": "reviewed-001",
+                    "instruction_text": "Review the candidate read-only.",
+                    "constraints": ["NO_MUTATION"],
+                    "expected_output": {"result": "findings"},
+                },
+            )
+
+        self.assertEqual("INSTRUCTION_TASK_FRAME_READY", result["status"])
+        plan = invocations[0]["execution_plan"]
+        frame = posts[0]["payload"]["frame"]
+        self.assertEqual(policy_ref, plan["source_ref"])
+        self.assertEqual(policy_ref, frame["source_ref"])
+        self.assertEqual(candidate_ref, plan["candidate_source_ref"])
+        self.assertEqual(source_review_result, plan["source_review_result"])
+
     def test_approved_descendant_runs_boss_then_declared_child_turns(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)

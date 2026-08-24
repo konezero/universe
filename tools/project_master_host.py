@@ -827,7 +827,7 @@ class ProjectModeCoordinator:
             "origin_session_id": binding["session_id"],
             "origin_frame_id": binding["frame_id"],
             "task_summary_ref": instruction_ref,
-            "source_ref": "NONE",
+            "source_ref": normalized_frame["source_ref"],
             "candidate_source_ref": normalized_frame["candidate_source_ref"],
             "source_review_result": normalized_frame["source_review_result"],
             "parent_actor_ref": normalized_frame["parent_actor_ref"],
@@ -868,7 +868,7 @@ class ProjectModeCoordinator:
                     "origin_frame_id": binding["frame_id"],
                     "origin_governance_session_ref": "UNKNOWN",
                     "task_summary_ref": instruction_ref,
-                    "source_ref": "NONE",
+                    "source_ref": normalized_frame["source_ref"],
                     "execution_assignment_ref": instruction_assignment_ref,
                     "task_frame_execution_proposal": dict(execution_proposal),
                     # No approval artifact: task-frame-instruction-v2 derives
