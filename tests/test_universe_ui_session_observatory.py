@@ -139,7 +139,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("state.supervisorSessions", supervisor_slice)
-        self.assertIn("return supervised ? candidate", supervisor_slice)
+        self.assertIn("session?.universe_session_id", supervisor_slice)
+        self.assertIn("item?.universe_session_id || item?.session_id", supervisor_slice)
+        self.assertIn("supervised.universe_session_id || supervised.session_id", supervisor_slice)
         create_slice = TERM[
             TERM.index("async function createTerminalTab") : TERM.index(
                 "function refitActiveTerminal"

@@ -381,14 +381,19 @@ function terminalProviderFor(_coordinate, session) {
 }
 
 function terminalSupervisorSessionId(session) {
-  const candidate = String(
-    session?.session_id || session?.universe_session_id || ""
-  ).trim();
-  if (!candidate) return "";
+  const candidates = [session?.universe_session_id, session?.session_id]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (!candidates.length) return "";
   const supervised = (state.supervisorSessions || []).find(
-    (item) => String(item?.session_id || "").trim() === candidate
+    (item) =>
+      candidates.includes(
+        String(item?.universe_session_id || item?.session_id || "").trim()
+      )
   );
-  return supervised ? candidate : "";
+  return supervised
+    ? String(supervised.universe_session_id || supervised.session_id || "").trim()
+    : "";
 }
 
 function terminalResumeRef(coordinate, session) {
