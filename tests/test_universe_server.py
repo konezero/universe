@@ -7818,6 +7818,31 @@ class UniverseLocalServiceTests(unittest.TestCase):
             envelope["payload"]["messages"][0]["body"],
         )
 
+    def test_terminal_history_http_route_preserves_cursor_bounds(self) -> None:
+        self.server.terminal_host.history = Mock(
+            return_value={
+                "schema": "universe.terminal-output-history.v1",
+                "status": "TERMINAL_HISTORY_COLLECTED",
+                "terminal_id": "term-history-http-001",
+                "before_cursor": 20,
+                "next_before_cursor": 11,
+                "has_more": True,
+                "chunks": [],
+            }
+        )
+        status, result = self.request(
+            "GET",
+            "/v1/terminals/term-history-http-001/history?before_cursor=20&limit=10",
+            token=self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("TERMINAL_HISTORY_COLLECTED", result["status"])
+        self.server.terminal_host.history.assert_called_once_with(
+            "term-history-http-001",
+            before_cursor=20,
+            limit=10,
+        )
+
     def test_provider_git_action_projects_to_anchor_results(self) -> None:
         anchor_ref = "anchor-provider-git-result-001"
         self.server.resolve_provider_chat_session = Mock(

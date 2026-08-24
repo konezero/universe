@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -33,6 +34,12 @@ PROVIDER_TOOLS = {
     "CLAUDE": "claude",
 }
 SESSION_INBOX_CLI = Path(__file__).resolve().parents[1] / "universe_session_inbox.py"
+TERMINAL_HISTORY_MAX_BYTES = 4 * 1024 * 1024
+TERMINAL_HISTORY_CHUNK_BYTES = 32 * 1024
+TERMINAL_HISTORY_PAGE_LIMIT = 100
+TERMINAL_HISTORY_PAGE_MAX_BYTES = 256 * 1024
+TERMINAL_SNAPSHOT_ROWS = 100
+TERMINAL_SNAPSHOT_MAX_BYTES = 512 * 1024
 
 # Matches ANSI CSI (`ESC[...letter`) and OSC (`ESC]...BEL`/`ESC]...ESC\`)
 # sequences so terminal output can be checked as plain text.
@@ -69,7 +76,10 @@ class TerminalSession:
     backend: Any = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     subscribers: list = field(default_factory=list)
-    replay: deque = field(default_factory=lambda: deque(maxlen=80))
+    output_chunks: deque = field(default_factory=deque)
+    output_cursor: int = 0
+    output_bytes: int = 0
+    screen_snapshot: bytes = b""
     pump_stop: threading.Event = field(default_factory=threading.Event)
     pump_thread: Any = None
     exit_detail: str | None = None
@@ -442,6 +452,108 @@ class TerminalHost:
                 details=controls,
             )
 
+    @staticmethod
+    def _snapshot_from_chunks(chunks: deque) -> bytes:
+        data = b"".join(chunk for _cursor, chunk in chunks)
+        if not data:
+            return b""
+        marker = max(
+            data.rfind(value)
+            for value in (b"\x1b[2J", b"\x1b[3J", b"\x1b[?1049h")
+        )
+        if marker >= 0:
+            tail = data[marker:]
+        else:
+            tail = b"".join(data.splitlines(keepends=True)[-TERMINAL_SNAPSHOT_ROWS:])
+        if len(tail) > TERMINAL_SNAPSHOT_MAX_BYTES:
+            boundary = tail.find(b"\n", len(tail) - TERMINAL_SNAPSHOT_MAX_BYTES)
+            if boundary >= 0:
+                tail = tail[boundary + 1 :]
+        return b"\x1b[2J\x1b[H" + tail
+
+    @classmethod
+    def _record_output(cls, session: TerminalSession, data: bytes) -> None:
+        raw = bytes(data or b"")
+        for offset in range(0, len(raw), TERMINAL_HISTORY_CHUNK_BYTES):
+            chunk = raw[offset : offset + TERMINAL_HISTORY_CHUNK_BYTES]
+            session.output_cursor += 1
+            session.output_chunks.append((session.output_cursor, chunk))
+            session.output_bytes += len(chunk)
+        while (
+            session.output_bytes > TERMINAL_HISTORY_MAX_BYTES
+            and len(session.output_chunks) > 1
+        ):
+            _cursor, removed = session.output_chunks.popleft()
+            session.output_bytes -= len(removed)
+        session.screen_snapshot = cls._snapshot_from_chunks(session.output_chunks)
+
+    def terminal_snapshot(self, terminal_id: str) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        with session.lock:
+            snapshot = bytes(session.screen_snapshot)
+            cursor = session.output_cursor
+        return {
+            "schema": "universe.terminal-screen-snapshot.v1",
+            "status": "TERMINAL_SCREEN_SNAPSHOT_COLLECTED",
+            "terminal_id": session.terminal_id,
+            "cursor": cursor,
+            "cols": session.cols,
+            "rows": session.rows,
+            "data_base64": base64.b64encode(snapshot).decode("ascii"),
+        }
+
+    def history(
+        self,
+        terminal_id: str,
+        *,
+        before_cursor: int | None = None,
+        limit: int = TERMINAL_HISTORY_PAGE_LIMIT,
+    ) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        normalized_limit = max(1, min(TERMINAL_HISTORY_PAGE_LIMIT, int(limit)))
+        with session.lock:
+            rows = list(session.output_chunks)
+            latest_cursor = session.output_cursor
+            screen_snapshot = bytes(session.screen_snapshot)
+            upper = (
+                latest_cursor + 1
+                if before_cursor is None
+                else max(1, int(before_cursor))
+            )
+        eligible = [row for row in rows if row[0] < upper]
+        selected_reversed = []
+        selected_bytes = 0
+        for row in reversed(eligible):
+            if selected_reversed and (
+                len(selected_reversed) >= normalized_limit
+                or selected_bytes + len(row[1]) > TERMINAL_HISTORY_PAGE_MAX_BYTES
+            ):
+                break
+            selected_reversed.append(row)
+            selected_bytes += len(row[1])
+        selected = list(reversed(selected_reversed))
+        next_before = selected[0][0] if selected else upper
+        return {
+            "schema": "universe.terminal-output-history.v1",
+            "status": "TERMINAL_HISTORY_COLLECTED",
+            "terminal_id": session.terminal_id,
+            "latest_cursor": latest_cursor,
+            "screen_snapshot_base64": base64.b64encode(
+                screen_snapshot
+            ).decode("ascii"),
+            "before_cursor": upper,
+            "next_before_cursor": next_before,
+            "has_more": bool(selected and eligible[0][0] < selected[0][0]),
+            "chunks": [
+                {
+                    "cursor": cursor,
+                    "byte_count": len(chunk),
+                    "data_base64": base64.b64encode(chunk).decode("ascii"),
+                }
+                for cursor, chunk in selected
+            ],
+        }
+
     def emit_output(self, terminal_id: str, data: bytes) -> None:
         """Fan out display-only bytes without sending them to the CLI stdin."""
 
@@ -449,7 +561,7 @@ class TerminalHost:
         if session.state != "LIVE":
             raise TerminalHostError("TERMINAL_NOT_LIVE", "terminal is not live")
         with session.lock:
-            session.replay.append(bytes(data))
+            self._record_output(session, bytes(data))
             waiters = list(session.subscribers)
         for waiter in waiters:
             try:
@@ -567,7 +679,7 @@ class TerminalHost:
             tail = b""
         if tail:
             with session.lock:
-                session.replay.append(tail)
+                self._record_output(session, tail)
         self._mark_backend_exit(session)
 
     def _mark_backend_exit(
@@ -578,7 +690,7 @@ class TerminalHost:
         with session.lock:
             if session.state != "LIVE":
                 return
-            chunks = b"".join(session.replay)
+            chunks = b"".join(chunk for _cursor, chunk in session.output_chunks)
             diagnostic = chunks[-4096:].decode("utf-8", errors="replace").strip()
             session.state = "FAILED"
             session.exit_detail = diagnostic or detail or "CLI process exited"
@@ -624,15 +736,10 @@ class TerminalHost:
             if session.state != "LIVE":
                 waiter.put_nowait(None)
                 return waiter
-            # A browser can attach after the provider has already rendered a
-            # prompt or response (for example after a refresh or service
-            # restart).  Replay the bounded PTY tail before joining the live
-            # fan-out so xterm paints the existing screen without requiring a
-            # new keypress.  Clear the new emulator first; the PTY tail may
-            # contain cursor/color escapes but must not inherit stale cells.
-            replay = b"".join(session.replay)
-            if replay:
-                waiter.put_nowait(b"\x1b[2J\x1b[H" + replay)
+            # Initial attachment receives the current screen projection only.
+            # Immutable output chunks remain separately pageable by cursor.
+            if session.screen_snapshot:
+                waiter.put_nowait(bytes(session.screen_snapshot))
             session.subscribers.append(waiter)
         self._ensure_pump(session)
         return waiter
@@ -710,7 +817,7 @@ class TerminalHost:
                 elif len(channel_confirm_tail) > 4096:
                     channel_confirm_tail = channel_confirm_tail[-64:]
             with session.lock:
-                session.replay.append(chunk)
+                self._record_output(session, chunk)
                 waiters = list(session.subscribers)
             for waiter in waiters:
                 try:

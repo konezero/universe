@@ -28616,6 +28616,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if path in {"/", "/app.js", "/styles.css", "/terminals.js", "/xterm.min.js", "/xterm.min.css", "/xterm-addon-fit.min.js"}:
             self._send_static(path)
             return
+        terminal_history = re.fullmatch(r"/v1/terminals/([^/]+)/history", path)
+        if terminal_history is not None:
+            if not self._authorize():
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                before_raw = str((query.get("before_cursor") or [""])[0]).strip()
+                before_cursor = int(before_raw) if before_raw else None
+                limit = int((query.get("limit") or ["100"])[0])
+                payload = self.server.terminal_host.history(
+                    unquote(terminal_history.group(1)),
+                    before_cursor=before_cursor,
+                    limit=limit,
+                )
+            except ValueError:
+                self._send_error(
+                    UniverseError(
+                        "TERMINAL_HISTORY_CURSOR_INVALID",
+                        "before_cursor and limit must be integers",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                )
+                return
+            except TerminalHostError as error:
+                self._send_error(
+                    UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND)
+                )
+                return
+            self._send(HTTPStatus.OK, payload)
+            return
         if path.startswith("/v1/terminals/") and path.endswith("/stream"):
             if not self._authorize():
                 return

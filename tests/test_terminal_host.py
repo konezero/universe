@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import sys
 import tempfile
 import time
@@ -343,6 +344,52 @@ class TerminalHostTests(unittest.TestCase):
         self.assertIn(b"\x1b[2J\x1b[H", dumped)
         self.assertIn(b"old-chunk", dumped)
         host.close(created["terminal_id"])
+
+    def test_output_history_is_cursor_paged_and_snapshot_is_row_bounded(self) -> None:
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+        created = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            provider="CODEX",
+        )
+        terminal_id = created["terminal_id"]
+        for index in range(105):
+            host.emit_output(terminal_id, f"row-{index}\n".encode("utf-8"))
+
+        latest = host.history(terminal_id, limit=5)
+        self.assertEqual([101, 102, 103, 104, 105], [
+            chunk["cursor"] for chunk in latest["chunks"]
+        ])
+        self.assertTrue(latest["has_more"])
+        older = host.history(
+            terminal_id,
+            before_cursor=latest["next_before_cursor"],
+            limit=5,
+        )
+        self.assertEqual([96, 97, 98, 99, 100], [
+            chunk["cursor"] for chunk in older["chunks"]
+        ])
+        decoded = b"".join(
+            base64.b64decode(chunk["data_base64"]) for chunk in older["chunks"]
+        )
+        self.assertIn(b"row-99", decoded)
+
+        snapshot = base64.b64decode(
+            host.terminal_snapshot(terminal_id)["data_base64"]
+        )
+        self.assertTrue(snapshot.startswith(b"\x1b[2J\x1b[H"))
+        self.assertIn(b"row-104", snapshot)
+        self.assertNotIn(b"row-0\n", snapshot)
+
+        host.emit_output(terminal_id, b"x" * (10 * 32 * 1024))
+        bounded = host.history(terminal_id, limit=100)
+        self.assertLessEqual(
+            sum(chunk["byte_count"] for chunk in bounded["chunks"]),
+            256 * 1024,
+        )
+        self.assertEqual(8, len(bounded["chunks"]))
+        host.close(terminal_id)
 
     def test_durable_audit_distinguishes_control_close_and_backend_exit(self) -> None:
         database_path = Path(tempfile.mkdtemp(prefix="terminal-audit-")) / "audit.sqlite3"

@@ -59,6 +59,77 @@ function writeTerminalBytes(term, data) {
   term.write(String(data || ""));
 }
 
+function decodeTerminalHistoryChunk(encoded) {
+  const raw = window.atob(String(encoded || ""));
+  return Uint8Array.from(raw, (value) => value.charCodeAt(0));
+}
+
+function writeTerminalChunk(term, data) {
+  return new Promise((resolve) => {
+    try {
+      term.write(data, resolve);
+    } catch (_error) {
+      resolve();
+    }
+  });
+}
+
+async function loadOlderTerminalHistory(surface, session) {
+  if (!surface || surface.historyLoading || surface.historyExhausted) return;
+  surface.historyLoading = true;
+  const buffer = surface.term?.buffer?.active;
+  const distanceFromBottom = buffer
+    ? Math.max(0, buffer.baseY - buffer.viewportY)
+    : 0;
+  try {
+    const before = surface.historyBeforeCursor
+      ? "&before_cursor=" + encodeURIComponent(surface.historyBeforeCursor)
+      : "";
+    const payload = await api(
+      "/v1/terminals/" + encodeURIComponent(session.terminal_id) +
+      "/history?limit=100" + before
+    );
+    const chunks = payload.chunks || [];
+    if (!chunks.length) {
+      surface.historyExhausted = true;
+      return;
+    }
+    for (const chunk of chunks) {
+      surface.historyChunks.set(
+        Number(chunk.cursor),
+        decodeTerminalHistoryChunk(chunk.data_base64)
+      );
+    }
+    surface.historyBeforeCursor = payload.next_before_cursor;
+    surface.historyExhausted = !payload.has_more;
+    const ordered = [...surface.historyChunks.entries()]
+      .sort((left, right) => left[0] - right[0])
+      .map((entry) => entry[1]);
+    const snapshot = decodeTerminalHistoryChunk(payload.screen_snapshot_base64);
+    surface.rebuildingHistory = true;
+    try { surface.term.reset(); } catch (_error) { /* xterm not ready */ }
+    for (const chunk of ordered) await writeTerminalChunk(surface.term, chunk);
+    // A WebSocket attachment already paints the current screen snapshot. Use the
+    // API snapshot only when no immutable history chunk is available; appending it
+    // after the same latest chunks would duplicate the visible tail.
+    if (!ordered.length && snapshot.length) {
+      await writeTerminalChunk(surface.term, snapshot);
+    }
+    for (const chunk of surface.pendingLiveChunks.splice(0)) {
+      await writeTerminalChunk(surface.term, chunk);
+    }
+    const rebuilt = surface.term?.buffer?.active;
+    if (rebuilt) {
+      surface.term.scrollToLine(
+        Math.max(0, rebuilt.baseY - distanceFromBottom)
+      );
+    }
+  } finally {
+    surface.rebuildingHistory = false;
+    surface.historyLoading = false;
+  }
+}
+
 function renderTerminalDock() {
   const tabs = elements.terminalTabs;
   const stage = elements.terminalStage;
@@ -285,7 +356,14 @@ function ensureTerminalSurface(session) {
   );
   socket.binaryType = "arraybuffer";
   socket.addEventListener("message", (event) => {
-    writeTerminalBytes(term, event.data);
+    if (surface?.rebuildingHistory) {
+      const pending = event.data instanceof ArrayBuffer
+        ? new Uint8Array(event.data.slice(0))
+        : event.data;
+      surface.pendingLiveChunks.push(pending);
+    } else {
+      writeTerminalBytes(term, event.data);
+    }
     scheduleInitialLayout(240);
   });
   bindTerminalIme(term, socket);
@@ -349,7 +427,19 @@ function ensureTerminalSurface(session) {
     lastSentSizeKey: null,
     savedViewport: null,
     restoreSavedViewport: false,
+    historyBeforeCursor: null,
+    historyChunks: new Map(),
+    historyLoading: false,
+    historyExhausted: false,
+    rebuildingHistory: false,
+    pendingLiveChunks: [],
   };
+  term.onScroll((viewportY) => {
+    if (viewportY > 2 || surface.rebuildingHistory) return;
+    loadOlderTerminalHistory(surface, session).catch((error) =>
+      toast(error.message, true)
+    );
+  });
   state.terminalSurfaces[session.terminal_id] = surface;
   return surface;
 }
