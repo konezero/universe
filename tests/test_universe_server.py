@@ -7305,36 +7305,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
     def test_meeting_room_native_control_connects_routes_and_disconnects(self) -> None:
-        class FakeParticipantHosts:
-            def __init__(self) -> None:
-                self.ensure_calls: list[dict[str, Any]] = []
-                self.submitted: list[dict[str, Any]] = []
-                self.stopped: list[str] = []
-
-            def ensure(self, **values):
-                self.ensure_calls.append(dict(values))
-                return {
-                    "status": "STARTED",
-                    "provider": values["binding"]["provider"],
-                    "provider_session_ref": values["binding"][
-                        "provider_session_ref"
-                    ],
-                }
-
-            def submit(self, binding, event) -> bool:
-                self.submitted.append(
-                    {"binding": dict(binding), "event": dict(event)}
-                )
-                return True
-
-            def stop(self, binding_id: str) -> bool:
-                self.stopped.append(binding_id)
-                return True
-
-            def close(self) -> None:
-                return
-
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "room-pty-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-session-existing",
+                "session_anchor_ref": "MASTER-CURRENT-ROOM-PTY",
+                "state": "LIVE",
+            }
+        )
         room = self.server.multi_rooms.create_room(
             room_type="MEETING",
             title="Native review",
@@ -7347,12 +7330,27 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "slot_role": "MODEL",
                 "provider": "CLAUDE",
                 "provider_session_ref": "claude-session-existing",
+                "supervisor_session_id": supervised["session_id"],
+                "session_anchor_ref": supervised["session_anchor_ref"],
                 "display_name": "Claude reviewer",
             },
         )["binding"]
-        fake_hosts = FakeParticipantHosts()
+        terminal = {
+            "terminal_id": "term-room-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "supervisor_session_id": supervised["session_id"],
+            "state": "LIVE",
+            "created_at": "2026-08-24T00:00:00Z",
+        }
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = terminal
+        terminal_host.list_sessions.return_value = [terminal]
+        terminal_host.get.return_value = terminal
+        self.server.terminal_host = terminal_host
         self.server.room_participant_hosts.close()
-        self.server.room_participant_hosts = fake_hosts
+        self.server.room_participant_hosts = Mock()
 
         status, connected = self.request(
             "POST",
@@ -7362,9 +7360,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("ROOM_PARTICIPANT_CONTROL_CONNECTED", connected["status"])
-        self.assertEqual(self.project_root, fake_hosts.ensure_calls[0]["repository_root"])
-        self.assertEqual("GCS", fake_hosts.ensure_calls[0]["node"])
-        self.assertEqual("MASTER", fake_hosts.ensure_calls[0]["mode"])
+        self.assertEqual("term-room-001", connected["live_pty"]["terminal_id"])
+        self.server.room_participant_hosts.ensure.assert_not_called()
         self.assertEqual(
             "CONTROLLED",
             self.server.multi_rooms.participant_cursor(binding["binding_id"])[
@@ -7379,10 +7376,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(HTTPStatus.CREATED, status)
-        self.assertEqual(1, len(fake_hosts.submitted))
+        terminal_host.write.assert_called_once_with(
+            "term-room-001", b"Review this increment\r"
+        )
         self.assertEqual(
-            posted["message"]["room_event_id"],
-            fake_hosts.submitted[0]["event"]["room_event_id"],
+            "QUEUED", posted["delivery"]["participants"][0]["delivered"][0]["status"]
         )
 
         status, disconnected = self.request(
@@ -7395,9 +7393,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "ROOM_PARTICIPANT_CONTROL_DISCONNECTED", disconnected["status"]
         )
-        self.assertEqual([binding["binding_id"]], fake_hosts.stopped)
+        self.assertTrue(disconnected["pty_control_detached"])
+        self.assertFalse(disconnected["resident_host_stopped"])
+        terminal_host.close.assert_not_called()
         self.assertEqual(
             "DISCONNECTED",
+            self.server.multi_rooms.participant_cursor(binding["binding_id"])[
+                "participant_state"
+            ],
+        )
+
+        replacement = {**terminal, "terminal_id": "term-room-002"}
+        terminal_host.find_live.return_value = replacement
+        terminal_host.list_sessions.return_value = [replacement]
+        terminal_host.get.return_value = replacement
+        status, reconnected = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/bindings/{binding['binding_id']}/control",
+            {"action": "CONNECT"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("term-room-002", reconnected["live_pty"]["terminal_id"])
+
+        terminal_host.get.return_value = {**replacement, "state": "EXITED"}
+        status, exited_delivery = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/messages",
+            {"author_role": "USER", "body_text": "Do not route after exit"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual(
+            "PARTICIPANT_DELIVERY_BLOCKED",
+            exited_delivery["delivery"]["participants"][0]["status"],
+        )
+        self.assertEqual(1, terminal_host.write.call_count)
+
+    def test_meeting_room_native_control_fails_closed_without_exact_live_pty(self) -> None:
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "room-pty-missing",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-room-missing",
+                "session_anchor_ref": "MASTER-CURRENT-ROOM-MISSING",
+                "state": "LIVE",
+            }
+        )
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING", title="Missing PTY", host_role="MODEL", project_id="GCS"
+        )
+        binding = self.server.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-room-missing",
+                "supervisor_session_id": supervised["session_id"],
+                "session_anchor_ref": supervised["session_anchor_ref"],
+            },
+        )["binding"]
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.list_sessions.return_value = []
+        self.server.terminal_host = terminal_host
+
+        status, result = self.request(
+            "POST",
+            f"/v1/rooms/{room['room_id']}/bindings/{binding['binding_id']}/control",
+            {"action": "CONNECT"},
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("ROOM_PARTICIPANT_PTY_UNAVAILABLE", result["error_code"])
+        terminal_host.create.assert_not_called()
+        self.assertEqual(
+            "OBSERVED",
             self.server.multi_rooms.participant_cursor(binding["binding_id"])[
                 "participant_state"
             ],

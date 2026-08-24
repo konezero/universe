@@ -25651,6 +25651,168 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "bridge_line": bridge_line,
         }
 
+    def _resolve_room_participant_live_pty(
+        self,
+        *,
+        room: Mapping[str, Any],
+        binding: Mapping[str, Any],
+    ) -> dict[str, str]:
+        provider = str(binding.get("provider") or "").strip().upper()
+        provider_session_ref = str(
+            binding.get("provider_session_ref") or ""
+        ).strip()
+        supervisor_session_id = str(
+            binding.get("supervisor_session_id") or ""
+        ).strip()
+        session_anchor_ref = str(
+            binding.get("session_anchor_ref") or ""
+        ).strip()
+        if not all(
+            (
+                provider,
+                provider_session_ref,
+                supervisor_session_id,
+                session_anchor_ref,
+            )
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_REQUIRED",
+                (
+                    "provider, provider_session_ref, supervisor_session_id, and "
+                    "session_anchor_ref are required for exact PTY control"
+                ),
+                409,
+            )
+        try:
+            supervised = self.session_supervisor.get_session(supervisor_session_id)
+        except SessionSupervisorError as error:
+            raise MultiRoomError(error.code, str(error), error.status) from error
+        supervised_provider = str(supervised.get("provider") or "").upper()
+        supervised_ref = str(
+            supervised.get("provider_session_ref") or ""
+        ).strip()
+        supervised_anchor = str(
+            supervised.get("session_anchor_ref")
+            or supervised.get("anchor_ref")
+            or ""
+        ).strip()
+        if (
+            supervised_provider != provider
+            or supervised_ref != provider_session_ref
+            or supervised_anchor != session_anchor_ref
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_MISMATCH",
+                "room binding does not match the exact supervised Session Anchor",
+                409,
+            )
+        project_id = str(
+            supervised.get("current_project_id")
+            or supervised.get("project_id")
+            or supervised.get("node")
+            or room.get("project_id")
+            or ""
+        ).strip()
+        mode = str(supervised.get("mode") or "").strip().upper()
+        terminal = self._session_anchor_terminal_host().find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=supervisor_session_id,
+        )
+        if not isinstance(terminal, Mapping):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                "no live PTY exists for the exact room participant Session Anchor",
+                409,
+            )
+        terminal_anchor = str(
+            terminal.get("active_session_anchor_ref")
+            or terminal.get("session_anchor_ref")
+            or ""
+        ).strip()
+        if terminal_anchor != session_anchor_ref:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_MISMATCH",
+                "live PTY no longer belongs to the bound Session Anchor",
+                409,
+            )
+        return {
+            "terminal_id": str(terminal.get("terminal_id") or "").strip(),
+            "project_id": project_id,
+            "mode": mode,
+            "provider": provider,
+            "provider_session_ref": provider_session_ref,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
+
+    def _write_room_event_to_exact_pty(
+        self,
+        coordinate: Mapping[str, str],
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> bool:
+        terminal_id = str(coordinate.get("terminal_id") or "")
+        try:
+            source = self._session_anchor_terminal_host().get(terminal_id)
+            terminal = source.public() if hasattr(source, "public") else source
+        except (TerminalHostError, SessionSupervisorError) as error:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                str(error),
+                409,
+            ) from error
+        if not isinstance(terminal, Mapping) or any(
+            str(terminal.get(key) or "").strip().upper()
+            != str(coordinate.get(key) or "").strip().upper()
+            for key in (
+                "terminal_id",
+                "project_id",
+                "mode",
+                "provider",
+                "supervisor_session_id",
+            )
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_MISMATCH",
+                "live PTY coordinate changed after room connection",
+                409,
+            )
+        active_anchor = str(
+            terminal.get("active_session_anchor_ref")
+            or terminal.get("session_anchor_ref")
+            or ""
+        ).strip()
+        if (
+            str(terminal.get("state") or "").upper() != "LIVE"
+            or active_anchor != coordinate.get("session_anchor_ref")
+            or str(binding.get("provider_session_ref") or "")
+            != coordinate.get("provider_session_ref")
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                "exact room participant PTY is no longer live",
+                409,
+            )
+        message = event.get("message")
+        body = str(message.get("body_text") or "") if isinstance(message, Mapping) else ""
+        if not body:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_EVENT_BODY_REQUIRED",
+                "room event has no message body for PTY delivery",
+                409,
+            )
+        try:
+            self.terminal_host.write(terminal_id, (body + "\r").encode("utf-8"))
+        except (TerminalHostError, UnicodeError) as error:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                str(error),
+                409,
+            ) from error
+        return True
+
     def set_room_participant_control(
         self,
         room_id: str,
@@ -25686,18 +25848,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 409,
             )
         if action == "DISCONNECT":
-            self.multi_room_native_controls.unregister(binding_id)
-            stopped = self.room_participant_hosts.stop(binding_id)
+            detached = self.multi_room_native_controls.unregister(binding_id)
             self.room_participant_permissions.cancel_binding(binding_id)
-            cursor = self.multi_rooms.set_participant_state(
-                binding_id,
-                "DISCONNECTED",
-            )
+            cursor = self.multi_rooms.set_participant_state(binding_id, "DISCONNECTED")
             return {
                 "schema": API_SCHEMA,
                 "status": "ROOM_PARTICIPANT_CONTROL_DISCONNECTED",
                 "binding_id": binding_id,
-                "resident_host_stopped": stopped,
+                "pty_control_detached": detached,
+                "resident_host_stopped": False,
                 "cursor": cursor,
             }
         if action != "CONNECT":
@@ -25705,62 +25864,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "ROOM_PARTICIPANT_CONTROL_ACTION_INVALID",
                 "action must be CONNECT or DISCONNECT",
             )
-        provider = str(binding.get("provider") or "").strip().upper()
-        provider_session_ref = str(
-            binding.get("provider_session_ref") or ""
-        ).strip()
-        if not provider or not provider_session_ref:
-            raise MultiRoomError(
-                "ROOM_PARTICIPANT_SESSION_COORDINATE_REQUIRED",
-                "provider and provider_session_ref are required",
-                409,
-            )
-
-        project_id = room.get("project_id")
-        repository_root = Path(__file__).resolve().parents[1]
-        node = str(project_id or _node_tag_from_project_root(repository_root))
-        mode = "CONDUCTOR" if binding.get("slot_role") == "CONDUCTOR" else "MASTER"
-        supervisor_session_id = binding.get("supervisor_session_id")
-        if isinstance(project_id, str) and project_id:
-            repository_root = Path(self.store.get_project(project_id)["project_root"])
-        if isinstance(supervisor_session_id, str) and supervisor_session_id:
-            try:
-                supervised = self.session_supervisor.get_session(supervisor_session_id)
-            except SessionSupervisorError as error:
-                raise MultiRoomError(error.code, str(error), error.status) from error
-            node = str(supervised.get("node") or node)
-            mode = str(supervised.get("mode") or mode).upper()
-
-        try:
-            resident = self.room_participant_hosts.ensure(
-                binding=binding,
-                repository_root=repository_root,
-                node=node,
-                mode=mode,
-            )
-            try:
-                control = self.multi_room_native_controls.register(
-                    binding_id,
-                    provider=provider,
-                    provider_session_ref=provider_session_ref,
-                    send_input=self.room_participant_hosts.submit,
+        coordinate = self._resolve_room_participant_live_pty(
+            room=room,
+            binding=binding,
+        )
+        control = self.multi_room_native_controls.register(
+            binding_id,
+            provider=coordinate["provider"],
+            provider_session_ref=coordinate["provider_session_ref"],
+            send_input=(
+                lambda native_binding, event, exact=dict(coordinate): (
+                    self._write_room_event_to_exact_pty(
+                        exact,
+                        native_binding,
+                        event,
+                    )
                 )
-            except Exception:
-                self.room_participant_hosts.stop(binding_id)
-                raise
-        except MultiRoomError:
-            raise
-        except (OSError, ProjectMasterHostError) as error:
-            raise MultiRoomError(
-                "ROOM_PARTICIPANT_CONTROL_START_FAILED",
-                str(error),
-                409,
-            ) from error
+            ),
+        )
         return {
             "schema": API_SCHEMA,
             "status": "ROOM_PARTICIPANT_CONTROL_CONNECTED",
             "binding_id": binding_id,
-            "resident_host": resident,
+            "live_pty": coordinate,
             "native_control": control,
         }
 
