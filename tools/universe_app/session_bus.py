@@ -927,7 +927,6 @@ class SessionBus:
         node_ref: str = "",
         headers_only: bool = False,
     ) -> dict[str, Any]:
-        del host
         wanted_terminal = _text(terminal_id, "terminal_id", limit=80)
         wanted_project = _text(project_id, "project_id", limit=120)
         wanted_mode = _text(mode, "mode", limit=64).upper()
@@ -935,6 +934,24 @@ class SessionBus:
         wanted_anchor = _text(
             session_anchor_ref, "session_anchor_ref", limit=256
         )
+        coordinate_terminal_ids: set[str] | None = None
+        if (
+            not wanted_terminal
+            and not wanted_anchor
+            and any((wanted_project, wanted_mode, wanted_provider))
+        ):
+            matched_terminal_ids = {
+                str(item.get("terminal_id") or "")
+                for item in match_live_terminals(
+                    host,
+                    project_id=wanted_project,
+                    mode=wanted_mode,
+                    provider=wanted_provider,
+                )
+                if str(item.get("terminal_id") or "")
+            }
+            if matched_terminal_ids:
+                coordinate_terminal_ids = matched_terminal_ids
         wanted_room = _text(room_id, "room_id", limit=80)
         wanted_thread = _text(thread_id, "thread_id", limit=80)
         wanted_kind = _text(event_kind, "event_kind", limit=32).upper()
@@ -977,12 +994,16 @@ class SessionBus:
                     continue
                 if wanted_anchor and str(message.get("recipient_anchor_ref") or "") != wanted_anchor:
                     continue
-                if wanted_project and str(to.get("project_id") or "") != wanted_project:
-                    continue
-                if wanted_mode and str(to.get("mode") or "").upper() != wanted_mode:
-                    continue
-                if wanted_provider and wanted_provider != "AUTO" and str(to.get("provider") or "").upper() != wanted_provider:
-                    continue
+                if coordinate_terminal_ids is not None:
+                    if stored_terminal not in coordinate_terminal_ids:
+                        continue
+                else:
+                    if wanted_project and str(to.get("project_id") or "") != wanted_project:
+                        continue
+                    if wanted_mode and str(to.get("mode") or "").upper() != wanted_mode:
+                        continue
+                    if wanted_provider and wanted_provider != "AUTO" and str(to.get("provider") or "").upper() != wanted_provider:
+                        continue
                 if wanted_room and str(message.get("room_id") or "") != wanted_room:
                     continue
                 if wanted_thread and str(message.get("thread_id") or "") != wanted_thread:

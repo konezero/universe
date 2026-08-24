@@ -930,6 +930,17 @@ class MultiRoomStoreTests(unittest.TestCase):
         )
         self.assertEqual(effective_session_id, master["binding"]["supervisor_session_id"])
         self.assertEqual("MASTER", master["supervisor_session"]["mode"])
+        self.assertEqual(
+            master["supervisor_session"]["session_anchor_ref"],
+            master["binding"]["session_anchor_ref"],
+        )
+        self.assertEqual(
+            ["CONDUCTOR", "MASTER"],
+            [
+                location["mode"]
+                for location in master["supervisor_session"]["location_history"]
+            ],
+        )
 
     def test_inject_model_slot_skips_default_by_default(self) -> None:
         room = self.store.create_meeting_room(

@@ -34059,6 +34059,20 @@ def perform_session_ref_inject(
     # (when another session already owns this provider_session_ref). Use the
     # effective session_id from the returned session dict for all subsequent ops.
     effective_session_id = str(session.get("session_id") or session_id)
+    explicit_location = "node" in body or "mode" in body
+    if explicit_location and (
+        str(session.get("node") or "") != normalized_node
+        or str(session.get("mode") or "").upper() != normalized_mode
+    ):
+        session = session_supervisor.bind_current_location(
+            effective_session_id,
+            project_id=str(project_id or normalized_node),
+            node=normalized_node,
+            mode=normalized_mode,
+            anchor_ref=body.get("anchor_ref") or body.get("session_anchor_ref"),
+            evidence_ref="universe://session-ref-inject/explicit-location",
+            expected_version=session.get("row_version"),
+        )
     default_selection: Mapping[str, Any] | None = None
     if make_default and not bool(session.get("is_default")):
         # Don't steal the default pointer from a session that is currently LIVE.
@@ -34116,6 +34130,7 @@ def perform_session_ref_inject(
             "provider": normalized_provider,
             "provider_session_ref": normalized_ref or None,
             "supervisor_session_id": effective_session_id,
+            "session_anchor_ref": session.get("session_anchor_ref"),
             "display_name": display_name,
         }
     )

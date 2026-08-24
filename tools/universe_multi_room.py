@@ -726,6 +726,8 @@ class MultiRoomStore:
                 or value.get("session_ref"),
                 "supervisor_session_id": value.get("supervisor_session_id")
                 or value.get("session_id"),
+                "session_anchor_ref": value.get("session_anchor_ref")
+                or value.get("anchor_ref"),
                 "display_name": value.get("display_name"),
             },
         )
