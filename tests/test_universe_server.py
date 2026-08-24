@@ -3006,9 +3006,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.terminal_host.find_live = Mock(return_value=terminal)
         self.server.terminal_host.get = Mock(return_value=terminal)
         self.server.terminal_host.channel_state = Mock(return_value="READY")
-        self.server.terminal_host.push_channel = Mock(
-            return_value={"status": "QUEUED", "message_id": "msg-channel-001"}
-        )
+        def push_channel_result(
+            _terminal_id: str,
+            payload: Mapping[str, Any],
+            *,
+            on_result: Callable[[Mapping[str, Any]], None] | None = None,
+        ) -> dict[str, Any]:
+            if on_result is not None:
+                timer = threading.Timer(
+                    0.01,
+                    lambda: on_result(
+                        {
+                            "message_id": payload["message_id"],
+                            "body_text": "Created the requested project documents.",
+                            "outcome": "COMPLETED",
+                            "result_ref": "artifact://claude-channel-001",
+                        }
+                    ),
+                )
+                timer.daemon = True
+                timer.start()
+            return {"status": "QUEUED", "message_id": payload["message_id"]}
+
+        self.server.terminal_host.push_channel = Mock(side_effect=push_channel_result)
         self.server.terminal_host.write = Mock()
         posted = self.server.session_bus.deliver_to_terminal(
             self.server.terminal_host,
@@ -3039,6 +3059,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("Create the requested project documents.", payload["content"])
         self.assertEqual("UNIVERSE_UI", payload["meta"]["sender_id"])
         self.assertEqual(0, self.server.session_bus.unread_count(terminal["terminal_id"]))
+        deadline = time.monotonic() + 1.0
+        results: list[Mapping[str, Any]] = []
+        while time.monotonic() < deadline:
+            results = self.server.session_bus.inbox(
+                self.server.terminal_host,
+                session_anchor_ref="session-anchor-channel-001",
+                projection="RESULTS",
+            )["messages"]
+            if results:
+                break
+            time.sleep(0.01)
+        self.assertEqual(1, len(results))
+        self.assertEqual(
+            "Created the requested project documents.",
+            results[0]["body_text"],
+        )
+        self.assertEqual(posted["message_id"], results[0]["in_reply_to"])
 
     def test_claude_channel_pending_does_not_fall_back_to_pty(self) -> None:
         terminal = {
@@ -3213,6 +3250,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
             if on_accepted is not None:
                 on_accepted({"message_id": "provider-reply-001"})
+            if on_terminal is not None:
+                timer = threading.Timer(
+                    0.01,
+                    lambda: on_terminal(
+                        {
+                            "message_id": "provider-reply-001",
+                            "state": "COMPLETED",
+                            "body": "HOOK_DISPATCH_CONFIRMED",
+                        }
+                    ),
+                )
+                timer.daemon = True
+                timer.start()
             return {
                 "status": "PROVIDER_SESSION_INPUT_ACCEPTED",
                 "message": {"message_id": "provider-user-001"},
@@ -3252,6 +3302,97 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("DISPATCHED", message["dispatch_status"])
         self.server.provider_sessions.submit.assert_called_once()
         self.server.terminal_host.write.assert_not_called()
+        deadline = time.monotonic() + 1.0
+        results: list[Mapping[str, Any]] = []
+        recipient_anchor_ref = str(message["recipient_anchor_ref"])
+        while time.monotonic() < deadline:
+            results = self.server.session_bus.inbox(
+                self.server._session_anchor_terminal_host(),
+                session_anchor_ref=recipient_anchor_ref,
+                projection="RESULTS",
+            )["messages"]
+            if results:
+                break
+            time.sleep(0.01)
+        activity = self.server.session_bus.inbox(
+            self.server._session_anchor_terminal_host(),
+            terminal_id=terminal["terminal_id"],
+            projection="ACTIVITY",
+        )["messages"]
+        self.assertEqual(1, len(results), activity)
+        self.assertEqual("HOOK_DISPATCH_CONFIRMED", results[0]["body_text"])
+        self.assertEqual(message["thread_id"], results[0]["thread_id"])
+        self.assertEqual(message["message_id"], results[0]["in_reply_to"])
+
+    def test_session_bus_state_and_reply_http_routes_project_results(self) -> None:
+        terminal_id = "term-session-bus-result-http-001"
+        anchor_ref = "anchor-session-bus-result-http-001"
+        terminal = {
+            "terminal_id": terminal_id,
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "state": "LIVE",
+        }
+        host = Mock()
+        host.get.return_value = terminal
+        posted = self.server.session_bus.deliver_to_terminal(
+            host,
+            terminal=terminal,
+            to={
+                "terminal_id": terminal_id,
+                "session_anchor_ref": anchor_ref,
+            },
+            source={"provider": "UI"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="return an HTTP result",
+        )
+        self.server.session_bus.claim_instruction(
+            host,
+            terminal_id=terminal_id,
+            session_anchor_ref=anchor_ref,
+        )
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=terminal_id,
+            message_id=posted["message_id"],
+            session_anchor_ref=anchor_ref,
+        )
+
+        status, completed = self.request(
+            "POST",
+            f"/v1/session-bus/messages/{posted['message_id']}/state",
+            {
+                "state": "COMPLETED",
+                "terminal_id": terminal_id,
+                "session_anchor_ref": anchor_ref,
+            },
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("COMPLETED", completed["lifecycle_state"])
+        status, reply = self.request(
+            "POST",
+            f"/v1/session-bus/messages/{posted['message_id']}/reply",
+            {
+                "body_text": "HTTP durable result",
+                "terminal_id": terminal_id,
+                "session_anchor_ref": anchor_ref,
+                "result_ref": "artifact://result-001",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("REPLIED", reply["status"])
+        status, projected = self.request(
+            "GET",
+            "/v1/session-bus/inbox?session_anchor_ref="
+            + anchor_ref
+            + "&projection=RESULTS",
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("HTTP durable result", projected["messages"][0]["body_text"])
 
     def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

@@ -23728,10 +23728,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return payload
 
     def session_bus_unread(self) -> dict[str, Any]:
+        directory = self.session_bus.directory(self._session_anchor_terminal_host())
         return {
             "schema": "universe.session-bus.v1",
             "status": "OK",
-            "counts": self.session_bus.unread_map(),
+            "counts": {
+                str(item.get("terminal_id") or ""): int(item.get("unread") or 0)
+                for item in directory.get("terminals") or []
+                if str(item.get("terminal_id") or "")
+            },
         }
 
     def session_bus_inbox(self, query: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -23744,6 +23749,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 mode=str(raw.get("mode") or ""),
                 provider=str(raw.get("provider") or ""),
                 room_id=str(raw.get("room_id") or ""),
+                session_anchor_ref=str(raw.get("session_anchor_ref") or ""),
+                thread_id=str(raw.get("thread_id") or ""),
+                projection=str(raw.get("projection") or "INBOX"),
                 headers_only=str(raw.get("headers") or "") == "1",
             )
         except SessionBusError as error:
@@ -23862,6 +23870,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(error.code, error.detail, error.status) from error
         except TerminalHostError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def transition_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            return self.session_bus.transition(
+                message_id,
+                state=str(payload.get("state") or ""),
+                terminal_id=str(payload.get("terminal_id") or ""),
+                session_anchor_ref=str(payload.get("session_anchor_ref") or ""),
+                provider_message_id=str(payload.get("provider_message_id") or ""),
+                result_ref=str(payload.get("result_ref") or ""),
+                error_code=str(payload.get("error_code") or ""),
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def reply_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            return self.session_bus.reply(
+                message_id,
+                terminal_id=str(payload.get("terminal_id") or ""),
+                session_anchor_ref=str(payload.get("session_anchor_ref") or ""),
+                body_text=str(payload.get("body_text") or payload.get("text") or ""),
+                result_ref=str(payload.get("result_ref") or ""),
+                outcome=str(payload.get("outcome") or "COMPLETED"),
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
 
     def provider_chat_catalog(self) -> dict[str, Any]:
         """Join provider-owned chat metadata to optional Universe bindings.
@@ -26431,17 +26472,41 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "mode": mode,
                     },
                 }
+                channel_dispatch_ready = threading.Event()
+                channel_dispatch_started = {"value": False}
+
+                def observe_channel_result(result: Mapping[str, Any]) -> None:
+                    channel_dispatch_ready.wait(5.0)
+                    if not channel_dispatch_started["value"]:
+                        raise SessionBusError(
+                            "BUS_CHANNEL_DISPATCH_NOT_STARTED",
+                            "Claude Channel result arrived before dispatch completed",
+                            409,
+                        )
+                    self.session_bus.reply(
+                        message_id,
+                        terminal_id=terminal_id,
+                        session_anchor_ref=session_anchor_ref,
+                        body_text=str(result.get("body_text") or ""),
+                        result_ref=str(result.get("result_ref") or "")
+                        or f"claude-channel://{terminal_id}/{message_id}",
+                        outcome=str(result.get("outcome") or "COMPLETED"),
+                    )
                 try:
                     channel_result = self.terminal_host.push_channel(
                         terminal_id,
                         channel_payload,
+                        on_result=observe_channel_result,
                     )
                     completed = self.session_bus.complete_instruction_claim(
                         terminal_id=terminal_id,
                         message_id=message_id,
                         session_anchor_ref=session_anchor_ref,
                     )
+                    channel_dispatch_started["value"] = True
+                    channel_dispatch_ready.set()
                 except (SessionBusError, TerminalHostError, UnicodeError) as error:
+                    channel_dispatch_ready.set()
                     self.session_bus.release_instruction_claim(
                         terminal_id=terminal_id,
                         message_id=message_id,
@@ -26470,6 +26535,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         if native_chat_key:
             accepted_holder: dict[str, str] = {}
+            native_dispatch_ready = threading.Event()
+            native_dispatch_started = {"value": False}
 
             def observe_native_accept(reply: Mapping[str, Any]) -> None:
                 provider_message_id = str(reply.get("message_id") or "").strip()
@@ -26480,6 +26547,47 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         HTTPStatus.SERVICE_UNAVAILABLE,
                     )
                 accepted_holder["provider_message_id"] = provider_message_id
+
+            def observe_native_terminal(reply: Mapping[str, Any]) -> None:
+                native_dispatch_ready.wait(5.0)
+                if not native_dispatch_started["value"]:
+                    return
+                provider_state = str(reply.get("state") or "FAILED").upper()
+                outcome = "COMPLETED" if provider_state == "COMPLETED" else "FAILED"
+                body = str(reply.get("body") or "").strip()
+                if not body:
+                    body = str(
+                        reply.get("error_code")
+                        or "Provider turn completed without a result body."
+                    )
+                provider_message_id = str(reply.get("message_id") or "").strip()
+                result_ref = (
+                    f"provider-session://{native_chat_key}/{provider_message_id}"
+                    if provider_message_id
+                    else f"provider-session://{native_chat_key}"
+                )
+                try:
+                    self.session_bus.reply(
+                        str(claim["message_id"]),
+                        terminal_id=terminal_id,
+                        session_anchor_ref=session_anchor_ref,
+                        body_text=body,
+                        result_ref=result_ref,
+                        outcome=outcome,
+                    )
+                except SessionBusError as error:
+                    # Result delivery failures must remain observable on the
+                    # original event; never silently lose a provider turn.
+                    try:
+                        self.session_bus.transition(
+                            str(claim["message_id"]),
+                            state="FAILED",
+                            terminal_id=terminal_id,
+                            session_anchor_ref=session_anchor_ref,
+                            error_code=error.code,
+                        )
+                    except SessionBusError:
+                        pass
 
             try:
                 native_result = self.provider_sessions.submit(
@@ -26492,6 +26600,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "idempotency_key": "session-bus:" + str(claim["message_id"]),
                     },
                     on_accepted=observe_native_accept,
+                    on_terminal=observe_native_terminal,
                 )
                 # ``submit`` only returns after the native turn worker is
                 # started. A prior idempotent submission skips the callback,
@@ -26501,12 +26610,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     message_id=str(claim["message_id"]),
                     session_anchor_ref=session_anchor_ref,
                 )
+                native_dispatch_started["value"] = True
+                self.session_bus.transition(
+                    str(claim["message_id"]),
+                    state="STARTED",
+                    terminal_id=terminal_id,
+                    session_anchor_ref=session_anchor_ref,
+                    provider_message_id=accepted_holder.get("provider_message_id", ""),
+                )
+                native_dispatch_ready.set()
             except (
                 ProviderSessionError,
                 SessionBusError,
                 TerminalHostError,
                 UnicodeError,
             ) as error:
+                native_dispatch_ready.set()
                 self.session_bus.release_instruction_claim(
                     terminal_id=terminal_id,
                     message_id=str(claim.get("message_id") or ""),
@@ -29848,6 +29967,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self.server.ack_session_bus_message(
                         unquote(session_bus_ack.group(1)),
+                        self._read_json(),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_state = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/state", path
+        )
+        if session_bus_state is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.transition_session_bus_message(
+                        unquote(session_bus_state.group(1)),
+                        self._read_json(),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_reply = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/reply", path
+        )
+        if session_bus_reply is not None:
+            try:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.reply_session_bus_message(
+                        unquote(session_bus_reply.group(1)),
                         self._read_json(),
                     ),
                 )

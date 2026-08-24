@@ -24,10 +24,32 @@ from universe_app.terminal_host import TerminalHostError
 
 BUS_SCHEMA = "universe.session-bus.v1"
 MAX_BODY_BYTES = 32 * 1024
-MAX_INBOX = 32
-KINDS = frozenset({"NOTE", "INSTRUCTION"})
+KINDS = frozenset({"NOTE", "INSTRUCTION", "RESULT"})
 NOTIFY_MODES = frozenset({"NONE", "HEADER"})
 INSTRUCTION_DELIVERY_STATES = frozenset({"PENDING", "CLAIMED", "DISPATCHED"})
+LIFECYCLE_STATES = frozenset(
+    {
+        "QUEUED",
+        "ACCEPTED",
+        "STARTED",
+        "COMPLETED",
+        "FAILED",
+        "REPLIED",
+        "CANCELLED",
+        "DONE",
+    }
+)
+LIFECYCLE_TRANSITIONS = {
+    "QUEUED": frozenset({"ACCEPTED", "CANCELLED"}),
+    "ACCEPTED": frozenset({"QUEUED", "STARTED", "FAILED", "CANCELLED"}),
+    "STARTED": frozenset({"COMPLETED", "FAILED", "CANCELLED"}),
+    "COMPLETED": frozenset({"REPLIED", "DONE"}),
+    "FAILED": frozenset({"REPLIED", "DONE"}),
+    "REPLIED": frozenset({"DONE"}),
+    "CANCELLED": frozenset(),
+    "DONE": frozenset(),
+}
+INBOX_LIFECYCLE_STATES = frozenset({"QUEUED", "ACCEPTED"})
 
 
 class SessionBusError(ValueError):
@@ -58,7 +80,39 @@ def _coord(value: Any) -> dict[str, str]:
         "mode": _text(raw.get("mode"), "mode", limit=64).upper(),
         "provider": _text(raw.get("provider"), "provider", limit=64).upper(),
         "terminal_id": _text(raw.get("terminal_id"), "terminal_id", limit=80),
+        "session_anchor_ref": _text(
+            raw.get("session_anchor_ref"), "session_anchor_ref", limit=256
+        ),
     }
+
+
+def _terminal_anchor(terminal: Mapping[str, Any]) -> str:
+    return str(
+        terminal.get("active_session_anchor_ref")
+        or terminal.get("session_anchor_ref")
+        or ""
+    ).strip()
+
+
+def _message_lifecycle(message: Mapping[str, Any]) -> str:
+    explicit = str(message.get("lifecycle_state") or "").strip().upper()
+    if explicit:
+        return explicit
+    delivery = str(message.get("delivery_state") or "").strip().upper()
+    return {
+        "PENDING": "QUEUED",
+        "CLAIMED": "ACCEPTED",
+        "DISPATCHED": "STARTED",
+        "UNREAD": "QUEUED",
+        "READ": "DONE",
+    }.get(delivery, "QUEUED")
+
+
+def _is_inbox_message(message: Mapping[str, Any]) -> bool:
+    delivery = str(message.get("delivery_state") or "").strip().upper()
+    return delivery in {"UNREAD", "PENDING", "CLAIMED"} or _message_lifecycle(
+        message
+    ) in INBOX_LIFECYCLE_STATES
 
 
 def _instruction_provenance(source: Mapping[str, str], kind: str) -> dict[str, Any]:
@@ -96,6 +150,7 @@ def match_live_terminals(
     mode: str = "",
     provider: str = "",
     terminal_id: str = "",
+    session_anchor_ref: str = "",
 ) -> list[dict[str, Any]]:
     wanted_id = _text(terminal_id, "terminal_id", limit=80)
     if wanted_id:
@@ -107,6 +162,9 @@ def match_live_terminals(
     wanted_project = _text(project_id, "project_id", limit=120)
     wanted_mode = _text(mode, "mode", limit=64).upper()
     wanted_provider = _text(provider, "provider", limit=64).upper()
+    wanted_anchor = _text(
+        session_anchor_ref, "session_anchor_ref", limit=256
+    )
     rows = []
     for item in live_sessions(host):
         if wanted_project and str(item.get("project_id") or "") != wanted_project:
@@ -118,6 +176,8 @@ def match_live_terminals(
             and wanted_provider != "AUTO"
             and str(item.get("provider") or "").upper() != wanted_provider
         ):
+            continue
+        if wanted_anchor and _terminal_anchor(item) != wanted_anchor:
             continue
         rows.append(item)
     return rows
@@ -154,7 +214,19 @@ def resolve_direct_targets(host: Any, to: Mapping[str, str]) -> list[dict[str, A
         mode=to.get("mode") or "",
         provider=to.get("provider") or "",
         terminal_id=to.get("terminal_id") or "",
+        session_anchor_ref=to.get("session_anchor_ref") or "",
     )
+    if not rows and to.get("session_anchor_ref"):
+        return [
+            {
+                "terminal_id": "",
+                "project_id": to.get("project_id") or "",
+                "mode": to.get("mode") or "",
+                "provider": to.get("provider") or "",
+                "active_session_anchor_ref": to.get("session_anchor_ref") or "",
+                "state": "OFFLINE",
+            }
+        ]
     if not rows:
         raise SessionBusError(
             "BUS_TARGET_NOT_FOUND",
@@ -208,13 +280,44 @@ class SessionBus:
                     session_anchor_ref TEXT NOT NULL DEFAULT '',
                     provenance_json TEXT NOT NULL DEFAULT '{}',
                     claimed_at TEXT,
-                    dispatched_at TEXT
+                    dispatched_at TEXT,
+                    recipient_anchor_ref TEXT NOT NULL DEFAULT '',
+                    source_anchor_ref TEXT NOT NULL DEFAULT '',
+                    in_reply_to TEXT NOT NULL DEFAULT '',
+                    lifecycle_state TEXT NOT NULL DEFAULT 'QUEUED',
+                    lifecycle_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(session_bus_message)")
+            }
+            migrations = {
+                "recipient_anchor_ref": "TEXT NOT NULL DEFAULT ''",
+                "source_anchor_ref": "TEXT NOT NULL DEFAULT ''",
+                "in_reply_to": "TEXT NOT NULL DEFAULT ''",
+                "lifecycle_state": "TEXT NOT NULL DEFAULT 'QUEUED'",
+                "lifecycle_json": "TEXT NOT NULL DEFAULT '{}'",
+                "updated_at": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    conn.execute(
+                        f"ALTER TABLE session_bus_message ADD COLUMN {column} {definition}"
+                    )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sbm_terminal "
                 "ON session_bus_message (terminal_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sbm_recipient_anchor "
+                "ON session_bus_message (recipient_anchor_ref, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sbm_thread "
+                "ON session_bus_message (thread_id, created_at)"
             )
             conn.commit()
         finally:
@@ -233,11 +336,25 @@ class SessionBus:
             mid = message["message_id"]
             tid = message["_terminal_id"]
             self._messages[mid] = message
-            self._inbox.setdefault(tid, []).append(mid)
+            inbox_key = tid or (
+                "anchor:" + str(message.get("recipient_anchor_ref") or "")
+            )
+            self._inbox.setdefault(inbox_key, []).append(mid)
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
+        lifecycle = _json_mod.loads(d.get("lifecycle_json") or "{}")
+        lifecycle_state = str(d.get("lifecycle_state") or "").strip().upper()
+        # Rows created before the lifecycle columns were installed receive the
+        # SQLite migration default (QUEUED). Preserve their actual legacy
+        # delivery progress instead of silently rewinding them on hydration.
+        if not lifecycle and lifecycle_state == "QUEUED":
+            lifecycle_state = {
+                "CLAIMED": "ACCEPTED",
+                "DISPATCHED": "STARTED",
+                "READ": "DONE",
+            }.get(str(d.get("delivery_state") or "").upper(), lifecycle_state)
         msg: dict[str, Any] = {
             "message_id": d["message_id"],
             "_terminal_id": d["terminal_id"],
@@ -252,6 +369,12 @@ class SessionBus:
             "delivery_state": d["delivery_state"],
             "session_anchor_ref": d["session_anchor_ref"],
             "provenance": _json_mod.loads(d["provenance_json"]),
+            "recipient_anchor_ref": d.get("recipient_anchor_ref") or "",
+            "source_anchor_ref": d.get("source_anchor_ref") or "",
+            "in_reply_to": d.get("in_reply_to") or "",
+            "lifecycle_state": lifecycle_state,
+            "lifecycle": lifecycle,
+            "updated_at": d.get("updated_at") or d["created_at"],
         }
         if d.get("claimed_at"):
             msg["claimed_at"] = d["claimed_at"]
@@ -270,8 +393,10 @@ class SessionBus:
                     message_id, terminal_id, thread_id, room_id, kind,
                     from_json, to_json, body_text, bytes, created_at,
                     delivery_state, session_anchor_ref, provenance_json,
-                    claimed_at, dispatched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    claimed_at, dispatched_at, recipient_anchor_ref,
+                    source_anchor_ref, in_reply_to, lifecycle_state,
+                    lifecycle_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message["message_id"],
@@ -289,36 +414,24 @@ class SessionBus:
                     _json_mod.dumps(message.get("provenance") or {}),
                     message.get("claimed_at"),
                     message.get("dispatched_at"),
+                    message.get("recipient_anchor_ref") or "",
+                    message.get("source_anchor_ref") or "",
+                    message.get("in_reply_to") or "",
+                    _message_lifecycle(message),
+                    _json_mod.dumps(message.get("lifecycle") or {}),
+                    message.get("updated_at") or message["created_at"],
                 ),
             )
             conn.commit()
         finally:
             conn.close()
 
-    def _delete_message(self, message_id: str) -> None:
-        if self._database_path is None:
-            return
-        conn = self._db_connect()
-        try:
-            conn.execute(
-                "DELETE FROM session_bus_message WHERE message_id = ?",
-                (message_id,),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
     def drop_terminal(self, terminal_id: str) -> None:
+        """Detach a live delivery handle without deleting durable events."""
+
         tid = str(terminal_id or "").strip()
         if not tid:
             return
-        with self._lock:
-            ids = self._inbox.pop(tid, [])
-            remaining = {item for bucket in self._inbox.values() for item in bucket}
-            for message_id in ids:
-                if message_id not in remaining:
-                    self._messages.pop(message_id, None)
-                    self._delete_message(message_id)
 
     def unread_map(self) -> dict[str, int]:
         with self._lock:
@@ -326,13 +439,11 @@ class SessionBus:
                 terminal_id: sum(
                     1
                     for message_id in message_ids
-                    if (self._messages.get(message_id) or {}).get("delivery_state")
-                    != "DISPATCHED"
+                    if _is_inbox_message(self._messages.get(message_id) or {})
                 )
                 for terminal_id, message_ids in self._inbox.items()
                 if any(
-                    (self._messages.get(message_id) or {}).get("delivery_state")
-                    != "DISPATCHED"
+                    _is_inbox_message(self._messages.get(message_id) or {})
                     for message_id in message_ids
                 )
             }
@@ -343,21 +454,38 @@ class SessionBus:
             return sum(
                 1
                 for message_id in self._inbox.get(tid, [])
-                if (self._messages.get(message_id) or {}).get("delivery_state")
-                != "DISPATCHED"
+                if _is_inbox_message(self._messages.get(message_id) or {})
+            )
+
+    def unread_count_for_anchor(self, session_anchor_ref: str) -> int:
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return 0
+        with self._lock:
+            return sum(
+                1
+                for message in self._messages.values()
+                if str(message.get("recipient_anchor_ref") or "") == anchor
+                and _is_inbox_message(message)
             )
 
     def directory(self, host: Any) -> dict[str, Any]:
         counts = self.unread_map()
         terminals = []
         for item in live_sessions(host):
+            terminal_id = str(item.get("terminal_id") or "")
+            anchor_ref = _terminal_anchor(item)
             row = {
                 "project_id": item.get("project_id"),
                 "mode": item.get("mode"),
                 "provider": item.get("provider"),
-                "terminal_id": item.get("terminal_id"),
+                "terminal_id": terminal_id,
+                "session_anchor_ref": anchor_ref,
                 "pid": item.get("pid"),
-                "unread": int(counts.get(str(item.get("terminal_id") or ""), 0)),
+                "unread": max(
+                    int(counts.get(terminal_id, 0)),
+                    self.unread_count_for_anchor(anchor_ref),
+                ),
             }
             terminals.append(row)
         return {
@@ -386,6 +514,12 @@ class SessionBus:
             "delivery_state": str(message.get("delivery_state") or "UNREAD"),
             "session_anchor_ref": str(message.get("session_anchor_ref") or ""),
             "provenance": dict(message.get("provenance") or {}),
+            "recipient_anchor_ref": str(message.get("recipient_anchor_ref") or ""),
+            "source_anchor_ref": str(message.get("source_anchor_ref") or ""),
+            "in_reply_to": str(message.get("in_reply_to") or ""),
+            "lifecycle_state": _message_lifecycle(message),
+            "lifecycle": dict(message.get("lifecycle") or {}),
+            "updated_at": str(message.get("updated_at") or message["created_at"]),
         }
         if not headers_only:
             payload["body_text"] = body
@@ -479,12 +613,25 @@ class SessionBus:
         thread_id: str,
     ) -> dict[str, Any]:
         terminal_id = str(terminal.get("terminal_id") or "").strip()
-        if not terminal_id:
-            raise SessionBusError("BUS_TARGET_NOT_FOUND", "terminal id missing", 404)
+        recipient_anchor = _terminal_anchor(terminal) or str(
+            to.get("session_anchor_ref") or ""
+        ).strip()
+        if not terminal_id and not recipient_anchor:
+            raise SessionBusError(
+                "BUS_TARGET_NOT_FOUND", "terminal id or Session Anchor missing", 404
+            )
+        source_anchor = str(source.get("session_anchor_ref") or "").strip()
+        source_terminal_id = str(source.get("terminal_id") or "").strip()
+        if not source_anchor and source_terminal_id:
+            try:
+                source_anchor = _terminal_anchor(_public_session(host, source_terminal_id))
+            except (SessionBusError, TerminalHostError):
+                source_anchor = ""
         message_id = "msg_" + secrets.token_hex(8)
         resolved_thread = thread_id or message_id
         message = {
             "message_id": message_id,
+            "_terminal_id": terminal_id,
             "thread_id": resolved_thread,
             "room_id": room_id,
             "kind": kind,
@@ -495,29 +642,28 @@ class SessionBus:
                 "project_id": str(terminal.get("project_id") or to.get("project_id") or ""),
                 "mode": str(terminal.get("mode") or to.get("mode") or ""),
                 "provider": str(terminal.get("provider") or to.get("provider") or ""),
+                "session_anchor_ref": recipient_anchor,
             },
             "body_text": body,
             "bytes": len(body.encode("utf-8")),
             "created_at": utc_now(),
             "delivery_state": "PENDING" if kind == "INSTRUCTION" else "UNREAD",
-            "session_anchor_ref": "",
+            "session_anchor_ref": recipient_anchor,
+            "recipient_anchor_ref": recipient_anchor,
+            "source_anchor_ref": source_anchor,
+            "in_reply_to": "",
+            "lifecycle_state": "QUEUED",
+            "lifecycle": {"queued_at": utc_now()},
+            "updated_at": utc_now(),
             "provenance": _instruction_provenance(source, kind),
         }
+        inbox_key = terminal_id or ("anchor:" + recipient_anchor)
         with self._lock:
-            inbox = self._inbox.setdefault(terminal_id, [])
+            inbox = self._inbox.setdefault(inbox_key, [])
             inbox.append(message_id)
-            extra = len(inbox) - MAX_INBOX
-            if extra > 0:
-                dropped = inbox[:extra]
-                del inbox[:extra]
-                remaining = {item for bucket in self._inbox.values() for item in bucket}
-                for old_id in dropped:
-                    if old_id not in remaining:
-                        self._messages.pop(old_id, None)
-                        self._delete_message(old_id)
             self._messages[message_id] = message
         self._persist_message(terminal_id, message)
-        if notify == "HEADER":
+        if notify == "HEADER" and terminal_id:
             # A bus notification is display-only.  Never send the header back
             # through the provider's stdin: Claude may interpret it as a user
             # prompt (and it can trigger the same prompt-injection path as the
@@ -557,7 +703,14 @@ class SessionBus:
         )
         tid = _text(terminal_id, "terminal_id", required=True, limit=80)
         with self._lock:
-            for message_id in self._inbox.get(tid, []):
+            candidate_ids = list(self._inbox.get(tid, []))
+            candidate_ids.extend(
+                message_id
+                for message_id, item in self._messages.items()
+                if str(item.get("recipient_anchor_ref") or "") == anchor
+                and message_id not in candidate_ids
+            )
+            for message_id in candidate_ids:
                 message = self._messages.get(message_id)
                 if not isinstance(message, dict):
                     continue
@@ -565,9 +718,25 @@ class SessionBus:
                     continue
                 if message.get("delivery_state") != "PENDING":
                     continue
+                previous_tid = str(message.get("_terminal_id") or "")
                 message["delivery_state"] = "CLAIMED"
+                message["_terminal_id"] = tid
                 message["session_anchor_ref"] = anchor
+                message["recipient_anchor_ref"] = anchor
+                message["lifecycle_state"] = "ACCEPTED"
                 message["claimed_at"] = utc_now()
+                message["updated_at"] = message["claimed_at"]
+                message.setdefault("lifecycle", {})["accepted_at"] = message[
+                    "claimed_at"
+                ]
+                if message_id not in self._inbox.setdefault(tid, []):
+                    self._inbox[tid].append(message_id)
+                if previous_tid and previous_tid != tid:
+                    self._inbox[previous_tid] = [
+                        item
+                        for item in self._inbox.get(previous_tid, [])
+                        if item != message_id
+                    ]
                 self._persist_message(tid, message)
                 return dict(message)
         return None
@@ -591,7 +760,7 @@ class SessionBus:
         )
         with self._lock:
             message = self._messages.get(mid)
-            if not isinstance(message, dict) or mid not in self._inbox.get(tid, []):
+            if not isinstance(message, dict):
                 raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message is not in that inbox", 404)
             if (
                 message.get("kind") != "INSTRUCTION"
@@ -604,7 +773,12 @@ class SessionBus:
                     409,
                 )
             message["delivery_state"] = "DISPATCHED"
+            message["lifecycle_state"] = "STARTED"
             message["dispatched_at"] = utc_now()
+            message["updated_at"] = message["dispatched_at"]
+            message.setdefault("lifecycle", {})["started_at"] = message[
+                "dispatched_at"
+            ]
             self._persist_message(tid, message)
             return self._public_message(message, headers_only=False)
 
@@ -627,15 +801,19 @@ class SessionBus:
         )
         with self._lock:
             message = self._messages.get(mid)
-            if not isinstance(message, dict) or mid not in self._inbox.get(tid, []):
+            if not isinstance(message, dict):
                 return
             if (
                 message.get("delivery_state") == "CLAIMED"
                 and message.get("session_anchor_ref") == anchor
             ):
                 message["delivery_state"] = "PENDING"
-                message["session_anchor_ref"] = ""
+                message["lifecycle_state"] = "QUEUED"
                 message.pop("claimed_at", None)
+                message["updated_at"] = utc_now()
+                message.setdefault("lifecycle", {})["requeued_at"] = message[
+                    "updated_at"
+                ]
                 self._persist_message(tid, message)
 
     def inbox(
@@ -647,52 +825,68 @@ class SessionBus:
         mode: str = "",
         provider: str = "",
         room_id: str = "",
+        session_anchor_ref: str = "",
+        thread_id: str = "",
+        projection: str = "INBOX",
         headers_only: bool = False,
     ) -> dict[str, Any]:
-        targets = match_live_terminals(
-            host,
-            project_id=project_id,
-            mode=mode,
-            provider=provider,
-            terminal_id=terminal_id,
+        del host
+        wanted_terminal = _text(terminal_id, "terminal_id", limit=80)
+        wanted_project = _text(project_id, "project_id", limit=120)
+        wanted_mode = _text(mode, "mode", limit=64).upper()
+        wanted_provider = _text(provider, "provider", limit=64).upper()
+        wanted_anchor = _text(
+            session_anchor_ref, "session_anchor_ref", limit=256
         )
-        if not terminal_id and not project_id and not room_id:
-            raise SessionBusError("BUS_INBOX_TARGET_REQUIRED", "inbox requires terminal, coordinate, or room_id")
-        if terminal_id or (project_id and mode):
-            if not targets:
-                raise SessionBusError(
-                    "BUS_TARGET_NOT_FOUND",
-                    "no live terminal matches the inbox query",
-                    404,
-                )
-            if not terminal_id and len(targets) > 1:
-                raise SessionBusError(
-                    "BUS_TARGET_AMBIGUOUS",
-                    "inbox coordinate matches more than one live terminal",
-                    409,
-                )
         wanted_room = _text(room_id, "room_id", limit=80)
-        wanted_ids = {str(item.get("terminal_id") or "") for item in targets} if targets else None
+        wanted_thread = _text(thread_id, "thread_id", limit=80)
+        view = _text(projection or "INBOX", "projection", limit=24).upper()
+        if view not in {"INBOX", "ACTIVITY", "RESULTS"}:
+            raise SessionBusError(
+                "BUS_PROJECTION_INVALID", f"unsupported projection: {view}"
+            )
+        if not any(
+            (wanted_terminal, wanted_project, wanted_room, wanted_anchor, wanted_thread)
+        ):
+            raise SessionBusError(
+                "BUS_INBOX_TARGET_REQUIRED",
+                "inbox requires terminal, Session Anchor, coordinate, room_id, or thread_id",
+            )
         messages: list[dict[str, Any]] = []
         with self._lock:
-            if wanted_ids is not None:
-                scan = [(tid, list(self._inbox.get(tid, []))) for tid in wanted_ids]
-            else:
-                scan = [(tid, list(ids)) for tid, ids in self._inbox.items()]
-            for tid, ids in scan:
-                for message_id in ids:
-                    message = self._messages.get(message_id)
-                    if message is None:
-                        continue
-                    if wanted_room and str(message.get("room_id") or "") != wanted_room:
-                        continue
-                    row = self._public_message(message, headers_only=headers_only)
-                    row["terminal_id"] = tid
-                    messages.append(row)
-        messages.sort(key=lambda item: str(item.get("created_at") or ""))
+            scan = list(self._messages.values())
+            for message in scan:
+                to = message.get("to") if isinstance(message.get("to"), Mapping) else {}
+                stored_terminal = str(message.get("_terminal_id") or "")
+                lifecycle = _message_lifecycle(message)
+                if wanted_terminal and stored_terminal != wanted_terminal:
+                    continue
+                if wanted_anchor and str(message.get("recipient_anchor_ref") or "") != wanted_anchor:
+                    continue
+                if wanted_project and str(to.get("project_id") or "") != wanted_project:
+                    continue
+                if wanted_mode and str(to.get("mode") or "").upper() != wanted_mode:
+                    continue
+                if wanted_provider and wanted_provider != "AUTO" and str(to.get("provider") or "").upper() != wanted_provider:
+                    continue
+                if wanted_room and str(message.get("room_id") or "") != wanted_room:
+                    continue
+                if wanted_thread and str(message.get("thread_id") or "") != wanted_thread:
+                    continue
+                if view == "INBOX" and not _is_inbox_message(message):
+                    continue
+                if view == "RESULTS" and str(message.get("kind") or "").upper() != "RESULT":
+                    continue
+                row = self._public_message(message, headers_only=headers_only)
+                row["terminal_id"] = stored_terminal
+                messages.append(row)
+        messages.sort(
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or "")
+        )
         return {
             "schema": BUS_SCHEMA,
             "status": "OK",
+            "projection": view,
             "messages": messages,
         }
 
@@ -700,15 +894,236 @@ class SessionBus:
         mid = _text(message_id, "message_id", required=True, limit=80)
         tid = _text(terminal_id, "terminal_id", required=True, limit=80)
         with self._lock:
-            inbox = self._inbox.get(tid) or []
-            if mid not in inbox:
+            message = self._messages.get(mid)
+            if not isinstance(message, dict) or str(message.get("_terminal_id") or "") != tid:
                 raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message is not in that inbox", 404)
-            self._inbox[tid] = [item for item in inbox if item != mid]
-            remaining = {item for bucket in self._inbox.values() for item in bucket}
-            if mid not in remaining:
-                self._messages.pop(mid, None)
-                self._delete_message(mid)
-        return {"schema": BUS_SCHEMA, "status": "OK", "message_id": mid, "terminal_id": tid}
+            message["delivery_state"] = "READ"
+            message["lifecycle_state"] = "DONE"
+            message["updated_at"] = utc_now()
+            message.setdefault("lifecycle", {})["read_at"] = message["updated_at"]
+            message["lifecycle"]["done_at"] = message["updated_at"]
+            self._persist_message(tid, message)
+        return {
+            "schema": BUS_SCHEMA,
+            "status": "OK",
+            "message_id": mid,
+            "terminal_id": tid,
+            "lifecycle_state": "DONE",
+        }
+
+    def transition(
+        self,
+        message_id: str,
+        *,
+        state: str,
+        terminal_id: str = "",
+        session_anchor_ref: str = "",
+        provider_message_id: str = "",
+        result_ref: str = "",
+        error_code: str = "",
+    ) -> dict[str, Any]:
+        mid = _text(message_id, "message_id", required=True, limit=80)
+        next_state = _text(state, "state", required=True, limit=32).upper()
+        if next_state not in LIFECYCLE_STATES:
+            raise SessionBusError(
+                "BUS_LIFECYCLE_STATE_INVALID", f"unsupported state: {next_state}"
+            )
+        tid = _text(terminal_id, "terminal_id", limit=80)
+        anchor = _text(
+            session_anchor_ref, "session_anchor_ref", limit=256
+        )
+        with self._lock:
+            message = self._messages.get(mid)
+            if not isinstance(message, dict):
+                raise SessionBusError(
+                    "BUS_MESSAGE_NOT_FOUND", "message does not exist", 404
+                )
+            stored_tid = str(message.get("_terminal_id") or "")
+            stored_anchor = str(message.get("recipient_anchor_ref") or "")
+            anchor_matches = bool(anchor and stored_anchor and anchor == stored_anchor)
+            if tid and stored_tid and tid != stored_tid and not anchor_matches:
+                raise SessionBusError(
+                    "BUS_RECIPIENT_MISMATCH", "terminal does not own the message", 409
+                )
+            if tid and anchor_matches:
+                message["_terminal_id"] = tid
+                stored_tid = tid
+            if anchor and stored_anchor and anchor != stored_anchor:
+                raise SessionBusError(
+                    "BUS_RECIPIENT_MISMATCH",
+                    "Session Anchor does not own the message",
+                    409,
+                )
+            if not tid and not anchor:
+                raise SessionBusError(
+                    "BUS_RECIPIENT_REQUIRED",
+                    "terminal_id or session_anchor_ref is required",
+                )
+            current = _message_lifecycle(message)
+            if next_state != current and next_state not in LIFECYCLE_TRANSITIONS.get(
+                current, frozenset()
+            ):
+                raise SessionBusError(
+                    "BUS_LIFECYCLE_TRANSITION_INVALID",
+                    f"cannot transition {current} to {next_state}",
+                    409,
+                )
+            now = utc_now()
+            message["lifecycle_state"] = next_state
+            message["updated_at"] = now
+            message.setdefault("lifecycle", {})[
+                next_state.lower() + "_at"
+            ] = now
+            if provider_message_id:
+                message["lifecycle"]["provider_message_id"] = _text(
+                    provider_message_id, "provider_message_id", limit=160
+                )
+            if result_ref:
+                message["lifecycle"]["result_ref"] = _text(
+                    result_ref, "result_ref", limit=512
+                )
+            if error_code:
+                message["lifecycle"]["error_code"] = _text(
+                    error_code, "error_code", limit=160
+                )
+            message["delivery_state"] = {
+                "QUEUED": "PENDING",
+                "ACCEPTED": "CLAIMED",
+                "STARTED": "DISPATCHED",
+                "DONE": "READ",
+            }.get(next_state, next_state)
+            persist_tid = tid or stored_tid
+            self._persist_message(persist_tid, message)
+            return self._public_message(message, headers_only=False)
+
+    def reply(
+        self,
+        message_id: str,
+        *,
+        terminal_id: str = "",
+        session_anchor_ref: str = "",
+        body_text: str,
+        result_ref: str = "",
+        outcome: str = "COMPLETED",
+    ) -> dict[str, Any]:
+        mid = _text(message_id, "message_id", required=True, limit=80)
+        body = str(body_text or "").strip()
+        if not body:
+            raise SessionBusError("BUS_BODY_REQUIRED", "body_text is required")
+        if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+            raise SessionBusError(
+                "BUS_BODY_TOO_LARGE", "body_text exceeds 32 KiB", 413
+            )
+        terminal_state = _text(outcome, "outcome", required=True, limit=32).upper()
+        if terminal_state not in {"COMPLETED", "FAILED"}:
+            raise SessionBusError(
+                "BUS_RESULT_OUTCOME_INVALID", "outcome must be COMPLETED or FAILED"
+            )
+        with self._lock:
+            original = self._messages.get(mid)
+            if not isinstance(original, dict):
+                raise SessionBusError(
+                    "BUS_MESSAGE_NOT_FOUND", "message does not exist", 404
+                )
+            stored_tid = str(original.get("_terminal_id") or "")
+            stored_anchor = str(original.get("recipient_anchor_ref") or "")
+            anchor_matches = bool(
+                session_anchor_ref
+                and stored_anchor
+                and session_anchor_ref == stored_anchor
+            )
+            if (
+                terminal_id
+                and stored_tid
+                and terminal_id != stored_tid
+                and not anchor_matches
+            ):
+                raise SessionBusError(
+                    "BUS_RECIPIENT_MISMATCH", "terminal does not own the message", 409
+                )
+            if terminal_id and anchor_matches:
+                original["_terminal_id"] = terminal_id
+                stored_tid = terminal_id
+            if session_anchor_ref and stored_anchor and session_anchor_ref != stored_anchor:
+                raise SessionBusError(
+                    "BUS_RECIPIENT_MISMATCH",
+                    "Session Anchor does not own the message",
+                    409,
+                )
+            current = _message_lifecycle(original)
+            if current not in {"STARTED", "COMPLETED", "FAILED"}:
+                raise SessionBusError(
+                    "BUS_LIFECYCLE_TRANSITION_INVALID",
+                    f"cannot reply while message is {current}",
+                    409,
+                )
+            now = utc_now()
+            original["lifecycle_state"] = "REPLIED"
+            original["delivery_state"] = "REPLIED"
+            original["updated_at"] = now
+            lifecycle = original.setdefault("lifecycle", {})
+            lifecycle[terminal_state.lower() + "_at"] = lifecycle.get(
+                terminal_state.lower() + "_at", now
+            )
+            lifecycle["replied_at"] = now
+            if result_ref:
+                lifecycle["result_ref"] = _text(
+                    result_ref, "result_ref", limit=512
+                )
+            self._persist_message(stored_tid, original)
+
+            source = original.get("from") if isinstance(original.get("from"), Mapping) else {}
+            result_id = "msg_" + secrets.token_hex(8)
+            # A UI-originated instruction has no provider terminal of its own.
+            # Keep its result on the addressed Session Anchor so the operator
+            # can see it in the same durable thread. Provider-originated work
+            # still routes back to the explicit source coordinate.
+            recipient_tid = str(source.get("terminal_id") or stored_tid).strip()
+            recipient_anchor = str(
+                original.get("source_anchor_ref") or stored_anchor
+            ).strip()
+            thread_id = str(original.get("thread_id") or mid)
+            result = {
+                "message_id": result_id,
+                "_terminal_id": recipient_tid,
+                "thread_id": thread_id,
+                "room_id": str(original.get("room_id") or ""),
+                "kind": "RESULT",
+                "from": dict(original.get("to") or {}),
+                "to": {
+                    **dict(source),
+                    "terminal_id": recipient_tid,
+                    "session_anchor_ref": recipient_anchor,
+                },
+                "body_text": body,
+                "bytes": len(body.encode("utf-8")),
+                "created_at": now,
+                "delivery_state": "UNREAD",
+                "session_anchor_ref": recipient_anchor,
+                "recipient_anchor_ref": recipient_anchor,
+                "source_anchor_ref": stored_anchor,
+                "in_reply_to": mid,
+                "lifecycle_state": terminal_state,
+                "lifecycle": {
+                    terminal_state.lower() + "_at": now,
+                    "result_ref": result_ref,
+                },
+                "updated_at": now,
+                "provenance": {"kind": "SESSION_BUS_RESULT"},
+            }
+            inbox_key = recipient_tid or (
+                "anchor:" + recipient_anchor if recipient_anchor else "thread:" + thread_id
+            )
+            self._messages[result_id] = result
+            self._inbox.setdefault(inbox_key, []).append(result_id)
+            self._persist_message(recipient_tid, result)
+            return {
+                "schema": BUS_SCHEMA,
+                "status": "REPLIED",
+                "thread_id": thread_id,
+                "message": self._public_message(original, headers_only=False),
+                "result": self._public_message(result, headers_only=False),
+            }
 
 
 def _mailbox(host: Any, bus: SessionBus | None) -> SessionBus:

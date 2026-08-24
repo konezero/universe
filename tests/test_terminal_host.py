@@ -89,6 +89,9 @@ class TerminalHostTests(unittest.TestCase):
                 "UNIVERSE_EFFORT": "AUTO",
                 "UNIVERSE_SUPERVISOR_SESSION_ID": "",
                 "UNIVERSE_TERMINAL_ID": created["terminal_id"],
+                "UNIVERSE_SESSION_INBOX_CLI": str(
+                    ROOT / "tools" / "universe_session_inbox.py"
+                ),
             },
             spawned[0][5],
         )

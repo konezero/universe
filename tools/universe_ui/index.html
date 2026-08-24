@@ -719,6 +719,11 @@
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
     </div>
+    <div class="session-bus-tabs" role="tablist" aria-label="Session event projection">
+      <button class="secondary-button active" type="button" role="tab" aria-selected="true" data-session-bus-projection="INBOX">Inbox</button>
+      <button class="secondary-button" type="button" role="tab" aria-selected="false" data-session-bus-projection="ACTIVITY">Activity</button>
+      <button class="secondary-button" type="button" role="tab" aria-selected="false" data-session-bus-projection="RESULTS">Results</button>
+    </div>
     <div id="session-bus-messages" class="session-bus-messages"></div>
     <form id="session-bus-compose" class="session-bus-compose">
       <label>

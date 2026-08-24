@@ -32,6 +32,7 @@ PROVIDER_TOOLS = {
     "CODEX": "codex",
     "CLAUDE": "claude",
 }
+SESSION_INBOX_CLI = Path(__file__).resolve().parents[1] / "universe_session_inbox.py"
 
 # Matches ANSI CSI (`ESC[...letter`) and OSC (`ESC]...BEL`/`ESC]...ESC\`)
 # sequences so terminal output can be checked as plain text.
@@ -357,6 +358,7 @@ class TerminalHost:
             "UNIVERSE_EFFORT": selected_effort,
             "UNIVERSE_SUPERVISOR_SESSION_ID": supervisor,
             "UNIVERSE_TERMINAL_ID": terminal_id,
+            "UNIVERSE_SESSION_INBOX_CLI": str(SESSION_INBOX_CLI),
         }
         try:
             session.backend = self._spawn(
@@ -462,7 +464,13 @@ class TerminalHost:
                 except queue.Full:
                     pass
 
-    def push_channel(self, terminal_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def push_channel(
+        self,
+        terminal_id: str,
+        payload: Mapping[str, Any],
+        *,
+        on_result: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         session = self.get(terminal_id)
         broker = session.channel_broker
         if broker is None:
@@ -471,7 +479,7 @@ class TerminalHost:
                 "terminal has no Claude Code channel bridge",
             )
         try:
-            return broker.push(payload)
+            return broker.push(payload, on_result=on_result)
         except Exception as error:  # noqa: BLE001 - preserve terminal error contract
             raise TerminalHostError("TERMINAL_CHANNEL_UNAVAILABLE", str(error)) from error
 

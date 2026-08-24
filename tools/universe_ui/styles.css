@@ -6117,6 +6117,15 @@ body:not(.graph-mode) .conductor-panel {
   .app-shell.mockup-shell > .graph-workspace { grid-column: 1; grid-row: 2; }
   .goal-plan-workspace { padding: 14px 12px 174px; }
 }
+.session-bus-tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+.session-bus-tabs .active {
+  border-color: var(--amber);
+  color: var(--amber);
+}
 
 /* Mobile workspace tabs must be able to surface project-context data.
    Bench, Memory, and Future use the Inspector rather than graph canvas modes. */

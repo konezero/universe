@@ -22,7 +22,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 CHANNEL_SCHEMA = "universe.claude-channel.v1"
@@ -32,6 +32,7 @@ CHANNEL_TOKEN_HEADER = "X-Universe-Claude-Channel-Token"
 CHANNEL_EXCHANGE_PATH = "/v1/claude-channel/exchange"
 CHANNEL_PUSH_PATH = "/v1/claude-channel/push"
 CHANNEL_POLL_PATH = "/v1/claude-channel/poll"
+CHANNEL_RESULT_PATH = "/v1/claude-channel/result"
 TERMINAL_ID_ENVIRONMENT = "UNIVERSE_TERMINAL_ID"
 MAX_CONTENT_BYTES = 32 * 1024
 MAX_QUEUE = 64
@@ -221,6 +222,10 @@ class ClaudeChannelBroker:
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=MAX_QUEUE)
         self._seen: set[str] = set()
         self._seen_lock = threading.Lock()
+        self._result_handlers: dict[str, Callable[[Mapping[str, Any]], None]] = {}
+        self._message_anchors: dict[str, str] = {}
+        self._results: dict[str, dict[str, str]] = {}
+        self._result_lock = threading.Lock()
         self._server = ThreadingHTTPServer((host, port), self._handler_type())
         self._thread: threading.Thread | None = None
 
@@ -291,7 +296,12 @@ class ClaudeChannelBroker:
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, path)
 
-    def push(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def push(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        on_result: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         if self._stopped.is_set():
             raise ClaudeChannelError("CLAUDE_CHANNEL_STOPPED")
         if not self.registered:
@@ -317,6 +327,9 @@ class ClaudeChannelBroker:
             raise ClaudeChannelError("CLAUDE_CHANNEL_SENDER_INVALID")
         with self._seen_lock:
             if message_id in self._seen:
+                if on_result is not None:
+                    with self._result_lock:
+                        self._result_handlers.setdefault(message_id, on_result)
                 return {"status": "DUPLICATE", "message_id": message_id}
             self._seen.add(message_id)
         event = {
@@ -325,13 +338,64 @@ class ClaudeChannelBroker:
             "content": content,
             "meta": meta,
         }
+        with self._result_lock:
+            self._message_anchors[message_id] = anchor
+            if on_result is not None:
+                self._result_handlers[message_id] = on_result
         try:
             self._queue.put_nowait(event)
         except queue.Full as error:
             with self._seen_lock:
                 self._seen.discard(message_id)
+            with self._result_lock:
+                self._message_anchors.pop(message_id, None)
+                self._result_handlers.pop(message_id, None)
             raise ClaudeChannelError("CLAUDE_CHANNEL_QUEUE_FULL") from error
         return {"status": "QUEUED", "message_id": message_id}
+
+    def submit_result(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if self._stopped.is_set():
+            raise ClaudeChannelError("CLAUDE_CHANNEL_STOPPED")
+        message_id = _text(
+            payload.get("message_id"), "message_id", required=True, limit=80
+        )
+        body = str(payload.get("body_text") or "").strip()
+        if not body:
+            raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_BODY_REQUIRED")
+        if len(body.encode("utf-8")) > MAX_CONTENT_BYTES:
+            raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_BODY_TOO_LARGE")
+        outcome = _text(
+            payload.get("outcome") or "COMPLETED", "outcome", limit=32
+        ).upper()
+        if outcome not in {"COMPLETED", "FAILED"}:
+            raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_OUTCOME_INVALID")
+        result = {
+            "message_id": message_id,
+            "body_text": body,
+            "outcome": outcome,
+            "result_ref": _text(payload.get("result_ref"), "result_ref", limit=512),
+        }
+        with self._result_lock:
+            anchor = self._message_anchors.get(message_id)
+            if not anchor:
+                raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_MESSAGE_UNKNOWN")
+            existing = self._results.get(message_id)
+            if existing is not None:
+                if existing != result:
+                    raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_CONFLICT")
+                return {"status": "DUPLICATE", **result}
+            handler = self._result_handlers.get(message_id)
+            if handler is None:
+                raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_HANDLER_UNAVAILABLE")
+            try:
+                handler({**result, "session_anchor_ref": anchor})
+            except Exception as error:  # noqa: BLE001 - preserve broker boundary
+                raise ClaudeChannelError(
+                    "CLAUDE_CHANNEL_RESULT_REJECTED:" + str(error)
+                ) from error
+            self._results[message_id] = result
+            self._result_handlers.pop(message_id, None)
+        return {"status": "ACCEPTED", **result}
 
     def poll(self, *, timeout_seconds: float = 2.0) -> dict[str, Any]:
         if self._stopped.is_set():
@@ -387,6 +451,11 @@ class ClaudeChannelBroker:
                         else:
                             timeout = payload.get("timeout_seconds", 2.0)
                             result = broker.poll(timeout_seconds=float(timeout))
+                    elif path == CHANNEL_RESULT_PATH:
+                        if not broker.token.matches(token):
+                            result = {"status": "DENIED", "reason": "TOKEN_INVALID"}
+                        else:
+                            result = broker.submit_result(payload)
                     else:
                         self._send(404, {"status": "NOT_FOUND"})
                         return

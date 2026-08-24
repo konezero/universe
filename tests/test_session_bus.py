@@ -444,7 +444,7 @@ class SessionBusDurabilityTests(unittest.TestCase):
         self.assertEqual("CLAIMED", inbox["messages"][0]["delivery_state"])
         self.assertEqual("anchor_durable_test", inbox["messages"][0]["session_anchor_ref"])
 
-    def test_ack_removes_message_durably(self) -> None:
+    def test_ack_hides_inbox_but_preserves_activity_durably(self) -> None:
         bus_a = SessionBus(database_path=self.db_path)
         posted = bus_a.post(
             self.host,
@@ -459,6 +459,155 @@ class SessionBusDurabilityTests(unittest.TestCase):
         bus_b = SessionBus(database_path=self.db_path)
         inbox = bus_b.inbox(self.host, terminal_id=self.terminal_id)
         self.assertEqual(0, len(inbox["messages"]))
+        activity = bus_b.inbox(
+            self.host,
+            terminal_id=self.terminal_id,
+            projection="ACTIVITY",
+        )
+        self.assertEqual(1, len(activity["messages"]))
+        self.assertEqual("DONE", activity["messages"][0]["lifecycle_state"])
+
+    def test_anchor_inbox_survives_terminal_detach_and_restart(self) -> None:
+        bus_a = SessionBus(database_path=self.db_path)
+        posted = bus_a.post(
+            self.host,
+            {
+                "to": {
+                    "terminal_id": self.terminal_id,
+                    "session_anchor_ref": "anchor_target_durable",
+                },
+                "from": {"session_anchor_ref": "anchor_source_durable"},
+                "body_text": "survive the live terminal handle",
+            },
+        )
+        bus_a.drop_terminal(self.terminal_id)
+
+        bus_b = SessionBus(database_path=self.db_path)
+        inbox = bus_b.inbox(
+            self.host,
+            session_anchor_ref="anchor_target_durable",
+        )
+        self.assertEqual([posted["message_id"]], [item["message_id"] for item in inbox["messages"]])
+        self.assertEqual(
+            "survive the live terminal handle",
+            inbox["messages"][0]["body_text"],
+        )
+
+    def test_instruction_result_is_durable_event_in_same_thread(self) -> None:
+        bus = SessionBus(database_path=self.db_path)
+        posted = bus.post(
+            self.host,
+            {
+                "to": {
+                    "terminal_id": self.terminal_id,
+                    "session_anchor_ref": "anchor_worker",
+                },
+                "from": {
+                    "terminal_id": self.terminal_id,
+                    "session_anchor_ref": "anchor_conductor",
+                },
+                "kind": "INSTRUCTION",
+                "body_text": "perform durable work",
+                "thread_id": "thread_result_001",
+            },
+        )
+        claimed = bus.claim_instruction(
+            self.host,
+            terminal_id=self.terminal_id,
+            session_anchor_ref="anchor_worker",
+        )
+        self.assertEqual("ACCEPTED", claimed["lifecycle_state"])
+        started = bus.complete_instruction_claim(
+            terminal_id=self.terminal_id,
+            message_id=posted["message_id"],
+            session_anchor_ref="anchor_worker",
+        )
+        self.assertEqual("STARTED", started["lifecycle_state"])
+        completed = bus.transition(
+            posted["message_id"],
+            state="COMPLETED",
+            terminal_id=self.terminal_id,
+            session_anchor_ref="anchor_worker",
+            result_ref="provider-session://chat/message",
+        )
+        self.assertEqual("COMPLETED", completed["lifecycle_state"])
+        replied = bus.reply(
+            posted["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref="anchor_worker",
+            body_text="durable result body",
+            result_ref="provider-session://chat/message",
+        )
+        self.assertEqual("thread_result_001", replied["result"]["thread_id"])
+        self.assertEqual(posted["message_id"], replied["result"]["in_reply_to"])
+
+        bus_restarted = SessionBus(database_path=self.db_path)
+        activity = bus_restarted.inbox(
+            self.host,
+            session_anchor_ref="anchor_worker",
+            projection="ACTIVITY",
+        )
+        results = bus_restarted.inbox(
+            self.host,
+            session_anchor_ref="anchor_conductor",
+            projection="RESULTS",
+        )
+        self.assertEqual("REPLIED", activity["messages"][0]["lifecycle_state"])
+        self.assertEqual(1, len(results["messages"]))
+        self.assertEqual("RESULT", results["messages"][0]["kind"])
+        self.assertEqual("durable result body", results["messages"][0]["body_text"])
+
+    def test_provider_restart_rebinds_same_anchor_and_replies_after_service_restart(self) -> None:
+        bus_a = SessionBus(database_path=self.db_path)
+        posted = bus_a.post(
+            self.host,
+            {
+                "to": {
+                    "terminal_id": self.terminal_id,
+                    "session_anchor_ref": "anchor_restart_worker",
+                },
+                "from": {"provider": "UI"},
+                "kind": "INSTRUCTION",
+                "body_text": "survive provider and service restart",
+            },
+        )
+        bus_a.claim_instruction(
+            self.host,
+            terminal_id=self.terminal_id,
+            session_anchor_ref="anchor_restart_worker",
+        )
+        bus_a.complete_instruction_claim(
+            terminal_id=self.terminal_id,
+            message_id=posted["message_id"],
+            session_anchor_ref="anchor_restart_worker",
+        )
+        replacement = self.host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            provider="CODEX",
+        )
+
+        bus_b = SessionBus(database_path=self.db_path)
+        replied = bus_b.reply(
+            posted["message_id"],
+            terminal_id=replacement["terminal_id"],
+            session_anchor_ref="anchor_restart_worker",
+            body_text="restart-safe result",
+            result_ref="provider-session://replacement/result",
+        )
+        self.assertEqual("REPLIED", replied["status"])
+        results = SessionBus(database_path=self.db_path).inbox(
+            self.host,
+            session_anchor_ref="anchor_restart_worker",
+            projection="RESULTS",
+        )
+        self.assertEqual(1, len(results["messages"]))
+        self.assertEqual("restart-safe result", results["messages"][0]["body_text"])
+        self.assertEqual(
+            replacement["terminal_id"],
+            results["messages"][0]["terminal_id"],
+        )
 
     def test_thread_id_preserved_across_restart(self) -> None:
         bus_a = SessionBus(database_path=self.db_path)

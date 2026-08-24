@@ -85,6 +85,7 @@ const state = {
   selectedModeCoordinateKey: null,
   sessionBusUnread: {},
   pendingSessionBus: null,
+  sessionBusProjection: "INBOX",
   observatoryShowAll: false,
   /** Expanded (node|mode) groups so operators can pick an alternate 1:1 session. */
   observatoryExpandedCoords: {},
@@ -226,6 +227,7 @@ const elements = {
   sessionBusTitle: document.querySelector("#session-bus-title"),
   sessionBusSubtitle: document.querySelector("#session-bus-subtitle"),
   sessionBusMessages: document.querySelector("#session-bus-messages"),
+  sessionBusTabs: Array.from(document.querySelectorAll("[data-session-bus-projection]")),
   sessionBusCompose: document.querySelector("#session-bus-compose"),
   sessionBusBody: document.querySelector("#session-bus-body"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
@@ -2292,7 +2294,13 @@ function openNodeModeSessionActions(coordinate, session) {
 
 function sessionBusTarget(session, coordinate) {
   const terminalId = String(session?.terminal_id || "").trim();
-  if (terminalId) return { terminal_id: terminalId };
+  const anchorRef = sessionAnchorRef(session);
+  if (terminalId || anchorRef) {
+    return {
+      ...(terminalId ? { terminal_id: terminalId } : {}),
+      ...(anchorRef ? { session_anchor_ref: anchorRef } : {}),
+    };
+  }
   return {
     project_id: String(session?.project_id || coordinate?.project?.project_id || ""),
     mode: String(session?.mode || coordinate?.mode || "").toUpperCase(),
@@ -2304,19 +2312,26 @@ async function refreshSessionBusMessages() {
   const pending = state.pendingSessionBus;
   if (!pending || !elements.sessionBusMessages) return;
   const terminalId = String(pending.session?.terminal_id || "").trim();
-  const query = terminalId
-    ? "?terminal_id=" + encodeURIComponent(terminalId)
+  const anchorRef = sessionAnchorRef(pending.session);
+  const projection = String(state.sessionBusProjection || "INBOX").toUpperCase();
+  const coordinateQuery = anchorRef
+    ? "?session_anchor_ref=" + encodeURIComponent(anchorRef)
+    : terminalId
+      ? "?terminal_id=" + encodeURIComponent(terminalId)
     : "?project_id=" +
       encodeURIComponent(pending.session?.project_id || pending.coordinate?.project?.project_id || "") +
       "&mode=" +
       encodeURIComponent(pending.session?.mode || pending.coordinate?.mode || "") +
       "&provider=" +
       encodeURIComponent(pending.session?.provider || "");
-  const payload = await api("/v1/session-bus/inbox" + query);
+  const payload = await api(
+    "/v1/session-bus/inbox" + coordinateQuery + "&projection=" + encodeURIComponent(projection)
+  );
   const rows = payload.messages || [];
   elements.sessionBusMessages.replaceChildren();
   if (!rows.length) {
-    elements.sessionBusMessages.append(node("p", "session-bus-empty", "No unread bus messages"));
+    const emptyLabel = projection === "INBOX" ? "No inbox events" : `No ${projection.toLowerCase()} events`;
+    elements.sessionBusMessages.append(node("p", "session-bus-empty", emptyLabel));
     return;
   }
   for (const message of rows) {
@@ -2325,23 +2340,33 @@ async function refreshSessionBusMessages() {
     const heading = node(
       "header",
       "session-bus-item-head",
-      `${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
+      `${message.kind || "NOTE"} · ${message.lifecycle_state || message.delivery_state || "UNKNOWN"} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
     );
     const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
-    const ack = node("button", "secondary-button", "Ack");
-    ack.type = "button";
-    ack.addEventListener("click", () => {
-      ackSessionBusMessage(message.message_id, message.terminal_id || terminalId).catch((error) =>
-        toast(error.message, true)
-      );
-    });
-    item.append(heading, body, ack);
+    item.append(heading, body);
+    const messageTerminalId = String(message.terminal_id || terminalId).trim();
+    if (projection === "INBOX" && messageTerminalId) {
+      const ack = node("button", "secondary-button", "Ack");
+      ack.type = "button";
+      ack.addEventListener("click", () => {
+        ackSessionBusMessage(message.message_id, messageTerminalId).catch((error) =>
+          toast(error.message, true)
+        );
+      });
+      item.append(ack);
+    }
     elements.sessionBusMessages.append(item);
   }
 }
 
 async function openSessionBusInbox(coordinate, session) {
   state.pendingSessionBus = { coordinate, session };
+  state.sessionBusProjection = "INBOX";
+  for (const tab of elements.sessionBusTabs || []) {
+    const active = tab.dataset.sessionBusProjection === "INBOX";
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  }
   if (elements.sessionBusTitle) {
     elements.sessionBusTitle.textContent = sessionDisplayName(session);
   }
@@ -13105,6 +13130,17 @@ function bindEvents() {
   if (elements.sessionBusCompose) {
     elements.sessionBusCompose.addEventListener("submit", (event) => {
       sendSessionBusCompose(event).catch((error) => toast(error.message, true));
+    });
+  }
+  for (const tab of elements.sessionBusTabs || []) {
+    tab.addEventListener("click", () => {
+      state.sessionBusProjection = String(tab.dataset.sessionBusProjection || "INBOX").toUpperCase();
+      for (const peer of elements.sessionBusTabs || []) {
+        const active = peer === tab;
+        peer.classList.toggle("active", active);
+        peer.setAttribute("aria-selected", String(active));
+      }
+      refreshSessionBusMessages().catch((error) => toast(error.message, true));
     });
   }
   if (elements.sessionBusBody) {
