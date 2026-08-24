@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 import sys
 import tempfile
@@ -12,10 +11,13 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_file_index import (  # noqa: E402
     FileIndexError,
+    open_project_index_readonly,
+    project_index_path,
     require_mode_current_anchor,
     search_index,
     should_skip,
     sync_index,
+    sync_project_index_from_hook,
 )
 
 
@@ -88,6 +90,48 @@ class UniverseFileIndexTests(unittest.TestCase):
                     root, mode="MASTER", anchor_id="MASTER-CURRENT-OTHER"
                 )
             self.assertEqual("MODE_CURRENT_ANCHOR_MISMATCH", error.exception.error_code)
+
+    def test_project_owns_index_database_and_universe_reader_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            state = root / ".ai" / "runtime" / "state"
+            state.mkdir(parents=True)
+            runtime = sqlite3.connect(state / "project_runtime.sqlite3")
+            runtime.execute(
+                "CREATE TABLE mode_current_anchor (mode TEXT PRIMARY KEY, frame_id TEXT, anchor_id TEXT, state TEXT)"
+            )
+            runtime.execute(
+                "INSERT INTO mode_current_anchor VALUES ('MASTER', 'current', 'MASTER-CURRENT-1', 'CURRENT')"
+            )
+            runtime.commit()
+            runtime.close()
+
+            synced = sync_project_index_from_hook(
+                project_id="demo",
+                project_root=root,
+                mode="MASTER",
+                anchor_id="MASTER-CURRENT-1",
+            )
+            self.assertEqual("PROJECT_INDEX_HOOK_SYNCED", synced["status"])
+            index_path = project_index_path(root)
+            self.assertTrue(index_path.is_file())
+            moved_path = index_path.with_suffix(".closed-check")
+            index_path.replace(moved_path)
+            moved_path.replace(index_path)
+
+            reader = open_project_index_readonly(project_id="demo", project_root=root)
+            try:
+                self.assertEqual(1, reader.execute("PRAGMA query_only").fetchone()[0])
+                with self.assertRaises(sqlite3.OperationalError):
+                    reader.execute(
+                        "DELETE FROM project_file_index WHERE project_id = 'demo'"
+                    )
+            finally:
+                reader.close()
+            index_path.replace(moved_path)
+            moved_path.replace(index_path)
 
 
 if __name__ == "__main__":

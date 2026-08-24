@@ -11,6 +11,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from universe_project_index_hook import REQUEST_SCHEMA as INDEX_HOOK_SCHEMA
+from universe_project_index_hook import run as run_project_index_hook
+
 REQUEST_SCHEMA = "universe.local-query.request.v1"
 RESULT_SCHEMA = "universe.local-query.result.v1"
 
@@ -61,7 +64,7 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
     operation = str(request.get("operation") or "").strip().lower()
     mode = str(request.get("mode") or "").strip()
     anchor_id = str(request.get("anchor_id") or "").strip()
-    if not endpoint or not token or not project_id or not operation:
+    if not project_id or not operation:
         return {
             "schema": RESULT_SCHEMA,
             "status": "QUERY_BLOCKED",
@@ -83,9 +86,30 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         "node_ids": request.get("node_ids") or [],
     }
     if operation == "sync-index":
-        status, payload = _call(
-            endpoint, token, "POST", f"/v1/projects/{project_id}/file-index/sync", body
+        project_root = str(request.get("project_root") or "").strip()
+        if not project_root:
+            return {
+                "schema": RESULT_SCHEMA,
+                "status": "QUERY_BLOCKED",
+                "reasons": ["PROJECT_ROOT_REQUIRED"],
+            }
+        payload = run_project_index_hook(
+            {
+                "schema": INDEX_HOOK_SCHEMA,
+                "project_id": project_id,
+                "project_root": project_root,
+                "mode": mode,
+                "anchor_id": anchor_id,
+                "changed_paths": request.get("changed_paths"),
+            }
         )
+        status = 200
+    elif not endpoint or not token:
+        return {
+            "schema": RESULT_SCHEMA,
+            "status": "QUERY_BLOCKED",
+            "reasons": ["UNIVERSE_ENDPOINT_FIELDS_REQUIRED"],
+        }
     elif operation == "search":
         status, payload = _call(
             endpoint, token, "POST", f"/v1/projects/{project_id}/file-index/search", body

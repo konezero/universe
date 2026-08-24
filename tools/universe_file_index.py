@@ -18,6 +18,10 @@ MAX_FILE_BYTES = 1_048_576
 MAX_HITS = 50
 SYNC_STATE_SCHEMA = "universe.project-file-index-sync-state.v1"
 GRAPH_CANDIDATE_SCHEMA = "universe.project-file-graph-candidates.v1"
+PROJECT_INDEX_IDENTITY_SCHEMA = "universe.project-file-index-identity.v1"
+PROJECT_INDEX_RELATIVE_PATH = Path(
+    ".ai/runtime/state/project_file_index.sqlite3"
+)
 
 IMPLEMENTATION_SUFFIXES = {
     ".py", ".js", ".ts", ".tsx", ".rs", ".go", ".java", ".kt",
@@ -78,10 +82,17 @@ TEXT_SUFFIXES = {
 }
 
 DDL = """
+CREATE TABLE IF NOT EXISTS project_index_identity (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    schema TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS project_file_index (
-    project_id TEXT NOT NULL
-        REFERENCES project_connection(project_id)
-        ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
     relative_path TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL,
@@ -95,9 +106,7 @@ CREATE INDEX IF NOT EXISTS project_file_index_project_time
 ON project_file_index(project_id, indexed_at, relative_path);
 
 CREATE TABLE IF NOT EXISTS project_file_index_sync_state (
-    project_id TEXT PRIMARY KEY
-        REFERENCES project_connection(project_id)
-        ON DELETE CASCADE,
+    project_id TEXT PRIMARY KEY,
     state TEXT NOT NULL CHECK(state IN ('SUCCEEDED', 'FAILED', 'BLOCKED')),
     mode TEXT NOT NULL,
     anchor_id TEXT NOT NULL,
@@ -110,9 +119,7 @@ CREATE TABLE IF NOT EXISTS project_file_index_sync_state (
 );
 
 CREATE TABLE IF NOT EXISTS project_file_graph_candidate (
-    project_id TEXT NOT NULL
-        REFERENCES project_connection(project_id)
-        ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
     relative_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     candidate_kind TEXT NOT NULL,
@@ -136,8 +143,159 @@ class FileIndexError(Exception):
         super().__init__(detail)
 
 
+class ProjectIndexReadConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def project_index_path(project_root: Path) -> Path:
+    return project_root.resolve(strict=True) / PROJECT_INDEX_RELATIVE_PATH
+
+
+def initialize_project_index(
+    connection: sqlite3.Connection, *, project_id: str, project_root: Path
+) -> dict[str, str]:
+    root = project_root.resolve(strict=True)
+    normalized_id = project_id.strip()
+    if not normalized_id:
+        raise FileIndexError("PROJECT_ID_REQUIRED", "project_id is required")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(DDL)
+    row = connection.execute(
+        "SELECT schema, project_id, project_root FROM project_index_identity WHERE singleton = 1"
+    ).fetchone()
+    now = _now()
+    if row is None:
+        connection.execute(
+            """
+            INSERT INTO project_index_identity(
+                singleton, schema, project_id, project_root, created_at, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?)
+            """,
+            (PROJECT_INDEX_IDENTITY_SCHEMA, normalized_id, str(root), now, now),
+        )
+    elif (
+        str(row["schema"]) != PROJECT_INDEX_IDENTITY_SCHEMA
+        or str(row["project_id"]) != normalized_id
+        or Path(str(row["project_root"])).resolve() != root
+    ):
+        raise FileIndexError(
+            "PROJECT_INDEX_IDENTITY_MISMATCH",
+            "project index identity does not match the requested project",
+        )
+    else:
+        connection.execute(
+            "UPDATE project_index_identity SET updated_at = ? WHERE singleton = 1",
+            (now,),
+        )
+    return {
+        "schema": PROJECT_INDEX_IDENTITY_SCHEMA,
+        "project_id": normalized_id,
+        "project_root": str(root),
+        "database_path": str(project_index_path(root)),
+    }
+
+
+def open_project_index_readonly(
+    *, project_id: str, project_root: Path
+) -> sqlite3.Connection:
+    root = project_root.resolve(strict=True)
+    path = project_index_path(root)
+    if not path.is_file():
+        raise FileIndexError(
+            "PROJECT_INDEX_MISSING",
+            f"project file index is absent: {path}",
+        )
+    connection = sqlite3.connect(
+        f"file:{path.resolve().as_posix()}?mode=ro",
+        uri=True,
+        timeout=2,
+        factory=ProjectIndexReadConnection,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    try:
+        row = connection.execute(
+            "SELECT schema, project_id, project_root FROM project_index_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is None or (
+            str(row["schema"]) != PROJECT_INDEX_IDENTITY_SCHEMA
+            or str(row["project_id"]) != project_id.strip()
+            or Path(str(row["project_root"])).resolve() != root
+        ):
+            raise FileIndexError(
+                "PROJECT_INDEX_IDENTITY_MISMATCH",
+                "project index identity does not match the registered project",
+            )
+    except FileIndexError:
+        connection.close()
+        raise
+    except sqlite3.Error as error:
+        connection.close()
+        raise FileIndexError(
+            "PROJECT_INDEX_INVALID",
+            f"project file index schema cannot be read: {error}",
+        ) from error
+    return connection
+
+
+def sync_project_index_from_hook(
+    *,
+    project_id: str,
+    project_root: Path,
+    mode: str,
+    anchor_id: str,
+    changed_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    root = project_root.resolve(strict=True)
+    used = require_mode_current_anchor(root, mode=mode, anchor_id=anchor_id)
+    path = project_index_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    try:
+        with connection:
+            identity = initialize_project_index(
+                connection, project_id=project_id, project_root=root
+            )
+            index = (
+                sync_index_paths(
+                    connection,
+                    project_id=project_id.strip(),
+                    project_root=root,
+                    changed_paths=changed_paths,
+                )
+                if changed_paths is not None
+                else sync_index(
+                    connection, project_id=project_id.strip(), project_root=root
+                )
+            )
+            sync = record_sync_state(
+                connection,
+                project_id=project_id.strip(),
+                state="SUCCEEDED",
+                mode=used["mode"],
+                anchor_id=used["anchor_id"],
+                summary=index,
+            )
+    finally:
+        connection.close()
+    return {
+        "schema": SCHEMA,
+        "status": "PROJECT_INDEX_HOOK_SYNCED",
+        "identity": identity,
+        "index": index,
+        "sync": sync,
+    }
 
 
 def _normalize_relative(path: Path) -> str:
@@ -541,6 +699,97 @@ def sync_index(
     return {
         "schema": SCHEMA,
         "project_id": project_id,
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "removed": removed,
+        "indexed_at": indexed_at,
+        "graph_reconcile": graph_reconcile,
+    }
+
+
+def sync_index_paths(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    project_root: Path,
+    changed_paths: list[str],
+) -> dict[str, Any]:
+    root = project_root.resolve(strict=True)
+    indexed_at = _now()
+    normalized: set[str] = set()
+    for value in changed_paths:
+        raw = Path(str(value))
+        candidate = raw if raw.is_absolute() else root / raw
+        try:
+            relative = candidate.resolve(strict=False).relative_to(root)
+        except ValueError as error:
+            raise FileIndexError(
+                "FILE_INDEX_PATH_OUTSIDE_PROJECT",
+                f"changed path is outside the project root: {value}",
+            ) from error
+        key = _normalize_relative(relative)
+        if key and not should_skip(key):
+            normalized.add(key)
+
+    created = updated = unchanged = removed = 0
+    for key in sorted(normalized):
+        absolute = root / Path(key)
+        previous = connection.execute(
+            """
+            SELECT size_bytes, mtime_ns, sha256
+            FROM project_file_index
+            WHERE project_id = ? AND relative_path = ?
+            """,
+            (project_id, key),
+        ).fetchone()
+        if not absolute.is_file() or absolute.is_symlink():
+            if previous is not None:
+                connection.execute(
+                    "DELETE FROM project_file_index WHERE project_id = ? AND relative_path = ?",
+                    (project_id, key),
+                )
+                removed += 1
+            continue
+        stat = absolute.stat()
+        mtime_ns = getattr(
+            stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)
+        )
+        if (
+            previous is not None
+            and int(previous["size_bytes"]) == stat.st_size
+            and int(previous["mtime_ns"]) == mtime_ns
+        ):
+            unchanged += 1
+            continue
+        size, mtime_ns, digest, excerpt = file_fingerprint(absolute)
+        connection.execute(
+            """
+            INSERT INTO project_file_index(
+                project_id, relative_path, size_bytes, mtime_ns, sha256,
+                text_excerpt, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, relative_path) DO UPDATE SET
+                size_bytes = excluded.size_bytes,
+                mtime_ns = excluded.mtime_ns,
+                sha256 = excluded.sha256,
+                text_excerpt = excluded.text_excerpt,
+                indexed_at = excluded.indexed_at
+            """,
+            (project_id, key, size, mtime_ns, digest, excerpt, indexed_at),
+        )
+        if previous is None:
+            created += 1
+        else:
+            updated += 1
+    graph_reconcile = reconcile_graph_candidates(
+        connection, project_id=project_id, observed_at=indexed_at
+    )
+    return {
+        "schema": SCHEMA,
+        "project_id": project_id,
+        "scope": "HOOK_CHANGED_PATHS",
+        "changed_path_count": len(normalized),
         "created": created,
         "updated": updated,
         "unchanged": unchanged,

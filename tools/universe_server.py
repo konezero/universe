@@ -277,11 +277,10 @@ from universe_file_index import (
     coordinate_from_request,
     index_status,
     list_graph_candidates,
-    record_sync_state,
+    open_project_index_readonly,
+    project_index_path,
     require_mode_current_anchor,
-    resolve_mode_current_anchor,
     search_index,
-    sync_index,
 )
 
 API_SCHEMA = "universe.local-service.v1"
@@ -4688,7 +4687,6 @@ class UniverseStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path.expanduser().resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file_index_lock = threading.RLock()
         self.release_artifact_root = self.database_path.parent / "release-artifacts"
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
@@ -5316,57 +5314,6 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_memory_project_link
                 ON project_memory(project_id, link_state, node_ref, memory_id);
-
-                CREATE TABLE IF NOT EXISTS project_file_index (
-                    project_id TEXT NOT NULL
-                        REFERENCES project_connection(project_id)
-                        ON DELETE CASCADE,
-                    relative_path TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    mtime_ns INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    text_excerpt TEXT NOT NULL,
-                    indexed_at TEXT NOT NULL,
-                    PRIMARY KEY (project_id, relative_path)
-                );
-
-                CREATE INDEX IF NOT EXISTS project_file_index_project_time
-                ON project_file_index(project_id, indexed_at, relative_path);
-
-                CREATE TABLE IF NOT EXISTS project_file_index_sync_state (
-                    project_id TEXT PRIMARY KEY
-                        REFERENCES project_connection(project_id)
-                        ON DELETE CASCADE,
-                    state TEXT NOT NULL CHECK(state IN ('SUCCEEDED', 'FAILED', 'BLOCKED')),
-                    mode TEXT NOT NULL,
-                    anchor_id TEXT NOT NULL,
-                    generation INTEGER NOT NULL,
-                    last_attempt_at TEXT NOT NULL,
-                    last_success_at TEXT NOT NULL,
-                    error_code TEXT NOT NULL,
-                    error_detail TEXT NOT NULL,
-                    summary_json TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS project_file_graph_candidate (
-                    project_id TEXT NOT NULL
-                        REFERENCES project_connection(project_id)
-                        ON DELETE CASCADE,
-                    relative_path TEXT NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    candidate_kind TEXT NOT NULL,
-                    lifecycle_state TEXT NOT NULL
-                        CHECK(lifecycle_state IN ('CURRENT', 'REMOVED')),
-                    promotion_state TEXT NOT NULL
-                        CHECK(promotion_state IN ('USER_APPROVAL_REQUIRED')),
-                    first_observed_at TEXT NOT NULL,
-                    last_observed_at TEXT NOT NULL,
-                    removed_at TEXT NOT NULL,
-                    PRIMARY KEY (project_id, relative_path)
-                );
-
-                CREATE INDEX IF NOT EXISTS project_file_graph_candidate_project_state
-                ON project_file_graph_candidate(project_id, lifecycle_state, relative_path);
 
                 CREATE TABLE IF NOT EXISTS career_promotion_queue (
                     queue_id TEXT PRIMARY KEY,
@@ -10576,25 +10523,47 @@ class UniverseStore:
                 item["candidate_id"],
             ),
         )[: max(1, min(int(skill_limit), 20))]
-        with self._connection() as connection:
-            file_status = index_status(connection, project_id=project["project_id"])
-            file_search = (
-                search_index(
-                    connection,
-                    project_id=project["project_id"],
-                    query=query,
-                    limit=max(1, min(int(memory_limit), 20)),
+        try:
+            with open_project_index_readonly(
+                project_id=project["project_id"],
+                project_root=Path(project["project_root"]),
+            ) as connection:
+                file_status = index_status(
+                    connection, project_id=project["project_id"]
                 )
-                if query.strip()
-                else {
-                    "schema": "universe.project-file-search.v1",
-                    "project_id": project["project_id"],
-                    "query": query,
-                    "hits": [],
-                    "hit_count": 0,
-                    "scanned": False,
-                }
-            )
+                file_search = (
+                    search_index(
+                        connection,
+                        project_id=project["project_id"],
+                        query=query,
+                        limit=max(1, min(int(memory_limit), 20)),
+                    )
+                    if query.strip()
+                    else {
+                        "schema": "universe.project-file-search.v1",
+                        "project_id": project["project_id"],
+                        "query": query,
+                        "hits": [],
+                        "hit_count": 0,
+                        "scanned": False,
+                    }
+                )
+        except FileIndexError as error:
+            file_status = {
+                "schema": "universe.project-file-index.v1",
+                "project_id": project["project_id"],
+                "availability": "UNAVAILABLE",
+                "error_code": error.error_code,
+                "index_ref": str(project_index_path(Path(project["project_root"]))),
+            }
+            file_search = {
+                "schema": "universe.project-file-search.v1",
+                "project_id": project["project_id"],
+                "query": query,
+                "hits": [],
+                "hit_count": 0,
+                "scanned": False,
+            }
         material = {
             "schema": "universe.project-llm-retrieval-context.v1",
             "project_id": project["project_id"],
@@ -10647,44 +10616,10 @@ class UniverseStore:
         }
 
     def _sync_project_file_index_bound(self, bound: Mapping[str, str]) -> dict[str, Any]:
-        try:
-            with self._file_index_lock, self._connection() as connection:
-                index = sync_index(
-                    connection,
-                    project_id=bound["project_id"],
-                    project_root=Path(bound["project_root"]),
-                )
-                sync_state = record_sync_state(
-                    connection,
-                    project_id=bound["project_id"],
-                    state="SUCCEEDED",
-                    mode=bound["mode"],
-                    anchor_id=bound["anchor_id"],
-                    summary=index,
-                )
-        except (FileIndexError, OSError) as error:
-            error_code = getattr(error, "error_code", "FILE_INDEX_SYNC_FAILED")
-            detail = getattr(error, "detail", str(error))
-            with self._file_index_lock, self._connection() as connection:
-                record_sync_state(
-                    connection,
-                    project_id=bound["project_id"],
-                    state="FAILED",
-                    mode=bound["mode"],
-                    anchor_id=bound["anchor_id"],
-                    error_code=error_code,
-                    error_detail=detail,
-                )
-            raise UniverseError(error_code, detail) from error
-        return {
-            "schema": API_SCHEMA,
-            "status": "FILE_INDEX_SYNCED",
-            "project_id": bound["project_id"],
-            "mode": bound["mode"],
-            "anchor_id": bound["anchor_id"],
-            "index": index,
-            "sync": sync_state,
-        }
+        raise UniverseError(
+            "PROJECT_INDEX_HOOK_REQUIRED",
+            "the project-owned file index is writable only by its file-change hook",
+        )
 
     def sync_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         return self._sync_project_file_index_bound(
@@ -10695,42 +10630,23 @@ class UniverseStore:
         self, project_id: str, *, preferred_mode: str = "MASTER"
     ) -> dict[str, Any]:
         project = self.get_project(project_id)
-        try:
-            anchor = resolve_mode_current_anchor(
-                Path(project["project_root"]), preferred_mode=preferred_mode
-            )
-        except (FileIndexError, OSError) as error:
-            error_code = getattr(error, "error_code", "FILE_INDEX_SYNC_FAILED")
-            detail = getattr(error, "detail", str(error))
-            with self._file_index_lock, self._connection() as connection:
-                blocked = record_sync_state(
-                    connection,
-                    project_id=project["project_id"],
-                    state="BLOCKED",
-                    mode=preferred_mode,
-                    anchor_id="",
-                    error_code=error_code,
-                    error_detail=detail,
-                )
-            return {
-                "schema": API_SCHEMA,
-                "status": "FILE_INDEX_SYNC_BLOCKED",
-                "project_id": project["project_id"],
-                "sync": blocked,
-            }
-        return self._sync_project_file_index_bound(
-            {
-                "project_id": project["project_id"],
-                "project_root": project["project_root"],
-                **anchor,
-            }
-        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_INDEX_HOOK_REQUIRED",
+            "project_id": project["project_id"],
+            "preferred_mode": preferred_mode.strip().upper(),
+            "index_ref": str(project_index_path(Path(project["project_root"]))),
+            "universe_access": "READ_ONLY",
+        }
 
     def search_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         bound = self._require_project_anchor(project_id, payload)
         query = str(payload.get("query") or "")
         try:
-            with self._connection() as connection:
+            with open_project_index_readonly(
+                project_id=bound["project_id"],
+                project_root=Path(bound["project_root"]),
+            ) as connection:
                 search = search_index(
                     connection,
                     project_id=bound["project_id"],
@@ -10750,13 +10666,35 @@ class UniverseStore:
 
     def project_file_index_status(self, project_id: str) -> dict[str, Any]:
         project = self.get_project(project_id)
-        with self._connection() as connection:
-            status = index_status(connection, project_id=project["project_id"])
+        try:
+            with open_project_index_readonly(
+                project_id=project["project_id"],
+                project_root=Path(project["project_root"]),
+            ) as connection:
+                status = index_status(connection, project_id=project["project_id"])
+        except FileIndexError as error:
+            status = {
+                "schema": "universe.project-file-index.v1",
+                "project_id": project["project_id"],
+                "file_count": 0,
+                "indexed_at": "",
+                "graph_candidates": {
+                    "schema": "universe.project-file-graph-candidates.v1",
+                    "current_count": 0,
+                    "removed_count": 0,
+                    "projection_only": True,
+                },
+                "sync": None,
+                "availability": "UNAVAILABLE",
+                "error_code": error.error_code,
+                "index_ref": str(project_index_path(Path(project["project_root"]))),
+            }
         return {
             "schema": API_SCHEMA,
             "status": "FILE_INDEX_COLLECTED",
             "project_id": project["project_id"],
             "index": status,
+            "universe_access": "READ_ONLY",
         }
 
     def project_retrieval_context(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -15824,10 +15762,16 @@ class UniverseStore:
             "universe://",
             {"scope_kind": "UNIVERSE"},
         )
-        with self._connection() as connection:
-            file_candidates = list_graph_candidates(
-                connection, project_id=project_id, include_removed=True
-            )
+        try:
+            with open_project_index_readonly(
+                project_id=project_id,
+                project_root=Path(project["project_root"]),
+            ) as connection:
+                file_candidates = list_graph_candidates(
+                    connection, project_id=project_id, include_removed=True
+                )
+        except FileIndexError:
+            file_candidates = []
         for candidate in file_candidates:
             relative_path = str(candidate["relative_path"])
             source_ref = (
@@ -19967,8 +19911,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         memory_scheduler_clock: Any = None,
         memory_scheduler_poll_seconds: float = 30.0,
         auto_start_memory_scheduler: bool = True,
-        auto_start_file_index_sync: bool = False,
-        file_index_poll_seconds: float = 5.0,
         use_pty_supervisor: bool = False,
     ):
         self.store = store
@@ -20025,12 +19967,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             clock=memory_scheduler_clock,
         )
         self._auto_start_memory_scheduler = bool(auto_start_memory_scheduler)
-        self._auto_start_file_index_sync = bool(auto_start_file_index_sync)
-        self._file_index_poll_seconds = max(
-            0.05, min(float(file_index_poll_seconds), 300.0)
-        )
-        self._file_index_sync_stop = threading.Event()
-        self._file_index_sync_last_run: dict[str, Any] | None = None
         python_tool = self.host_profile.resolve("python")
         self.continuity_coordinator = (
             ProjectContinuityCoordinator(
@@ -20217,13 +20153,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         if self._auto_start_memory_scheduler:
             self._memory_scheduler_worker.start()
-        self._file_index_sync_worker = threading.Thread(
-            target=self._file_index_sync_loop,
-            name="universe-file-index-sync",
-            daemon=True,
-        )
-        if self._auto_start_file_index_sync:
-            self._file_index_sync_worker.start()
         self._supervisor_maintenance_stop = threading.Event()
         self._supervisor_maintenance_last_run: dict[str, Any] | None = None
         self._supervisor_maintenance_worker = threading.Thread(
@@ -20248,45 +20177,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
-
-    def run_file_index_sync_once(self) -> dict[str, Any]:
-        results: list[dict[str, Any]] = []
-        for project in self.store.list_projects():
-            if self._file_index_sync_stop.is_set():
-                break
-            try:
-                results.append(
-                    self.store.sync_project_file_index_current(project["project_id"])
-                )
-            except Exception as error:  # noqa: BLE001 - isolate projects
-                results.append(
-                    {
-                        "schema": API_SCHEMA,
-                        "status": "FILE_INDEX_SYNC_FAILED",
-                        "project_id": project.get("project_id"),
-                        "error": f"{type(error).__name__}: {error}",
-                    }
-                )
-        return {
-            "schema": "universe.file-index-sync-tick.v1",
-            "status": "FILE_INDEX_SYNC_TICK_COMPLETED",
-            "observed_at": utc_now(),
-            "results": results,
-        }
-
-    def _file_index_sync_loop(self) -> None:
-        while not self._file_index_sync_stop.is_set():
-            try:
-                self._file_index_sync_last_run = self.run_file_index_sync_once()
-            except Exception as error:  # noqa: BLE001 - preserve worker availability
-                self._file_index_sync_last_run = {
-                    "schema": "universe.file-index-sync-tick.v1",
-                    "status": "FILE_INDEX_SYNC_WORKER_ERROR",
-                    "observed_at": utc_now(),
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            if self._file_index_sync_stop.wait(self._file_index_poll_seconds):
-                break
 
     def resolve_todo_mutation_session(
         self,
@@ -28300,19 +28190,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     }
                 )
 
-        self._file_index_sync_stop.set()
-        if self._file_index_sync_worker.is_alive():
-            close_step(
-                "file_index_sync_worker",
-                lambda: self._file_index_sync_worker.join(timeout=5),
-            )
-            if self._file_index_sync_worker.is_alive():
-                self._shutdown_errors.append(
-                    {
-                        "component": "file_index_sync_worker",
-                        "error": "TimeoutError: file index sync did not stop before shutdown",
-                    }
-                )
         self._remote_access_resume_stop.set()
         if self._remote_access_resume_worker.is_alive():
             close_step(
@@ -33252,8 +33129,6 @@ def create_server(
     remote_connector_config_path: Path | None = None,
     directory_selector: Callable[[], str | None] | None = None,
     file_selector: Callable[[str], str | None] | None = None,
-    auto_start_file_index_sync: bool = False,
-    file_index_poll_seconds: float = 5.0,
     use_pty_supervisor: bool = False,
 ) -> UniverseHTTPServer:
     try:
@@ -33289,8 +33164,6 @@ def create_server(
         remote_connector_config_path=remote_connector_config_path,
         directory_selector=directory_selector,
         file_selector=file_selector,
-        auto_start_file_index_sync=auto_start_file_index_sync,
-        file_index_poll_seconds=file_index_poll_seconds,
         use_pty_supervisor=use_pty_supervisor,
     )
 
@@ -34603,7 +34476,6 @@ def main() -> int:
                 mode_contract=mode_contract,
                 auto_start_conductor_runtime=False,
                 service_state_path=args.state_file,
-                auto_start_file_index_sync=True,
                 use_pty_supervisor=True,
             )
             host, port = server.server_address[:2]

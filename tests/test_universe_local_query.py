@@ -5,7 +5,6 @@ import sqlite3
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from http import HTTPStatus
 from pathlib import Path
@@ -17,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_server import create_server, universe_mode_contract  # noqa: E402
 from host_profile import HostProfileStore  # noqa: E402
+from universe_file_index import sync_project_index_from_hook  # noqa: E402
 
 
 class UniverseLocalQueryApiTests(unittest.TestCase):
@@ -78,8 +78,6 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
             ),
             host_profile=HostProfileStore(temp_root / "host.json"),
             service_state_path=temp_root / "server.json",
-            auto_start_file_index_sync=True,
-            file_index_poll_seconds=0.05,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -119,16 +117,32 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_REQUEST, status)
         self.assertEqual("MODE_CURRENT_ANCHOR_REQUIRED", blocked["error_code"])
 
-        status, synced = self.request(
+        status, blocked_sync = self.request(
             "POST",
             "/v1/projects/GCS/file-index/sync",
             {"mode": "MASTER", "anchor_id": "MASTER-CURRENT-TEST"},
         )
-        self.assertEqual(HTTPStatus.OK, status)
-        self.assertEqual("FILE_INDEX_SYNCED", synced["status"])
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("PROJECT_INDEX_HOOK_REQUIRED", blocked_sync["error_code"])
+
+        synced = sync_project_index_from_hook(
+            project_id="GCS",
+            project_root=self.project_root,
+            mode="MASTER",
+            anchor_id="MASTER-CURRENT-TEST",
+        )
+        self.assertEqual("PROJECT_INDEX_HOOK_SYNCED", synced["status"])
         self.assertGreaterEqual(
             synced["index"]["created"] + synced["index"]["unchanged"], 1
         )
+        central = sqlite3.connect(self.server.store.database_path)
+        try:
+            central_index_tables = central.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'project_file_%'"
+            ).fetchall()
+        finally:
+            central.close()
+        self.assertEqual([], central_index_tables)
         self.assertGreaterEqual(synced["index"]["graph_reconcile"]["current_count"], 1)
         self.assertEqual(
             "USER_APPROVAL_REQUIRED",
@@ -173,6 +187,7 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
         status, index_state = self.request("GET", "/v1/projects/GCS/file-index")
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("SUCCEEDED", index_state["index"]["sync"]["state"])
+        self.assertEqual("READ_ONLY", index_state["universe_access"])
         self.assertGreaterEqual(
             index_state["index"]["graph_candidates"]["current_count"], 1
         )
@@ -188,47 +203,56 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
         self.assertTrue(candidate["projection_only"])
         self.assertEqual("USER_APPROVAL_REQUIRED", candidate["data"]["promotion_state"])
 
-    def test_background_sync_tracks_add_and_remove(self) -> None:
+    def test_project_hook_incrementally_tracks_add_and_remove(self) -> None:
+        sync_project_index_from_hook(
+            project_id="GCS",
+            project_root=self.project_root,
+            mode="MASTER",
+            anchor_id="MASTER-CURRENT-TEST",
+        )
         auto_file = self.project_root / "src" / "auto_worker.py"
         auto_file.write_text("class AutoIndexedSymbol:\n    pass\n", encoding="utf-8")
-
-        deadline = time.monotonic() + 5
-        found = None
-        while time.monotonic() < deadline:
-            status, candidate = self.request(
-                "POST",
-                "/v1/projects/GCS/file-index/search",
-                {
-                    "mode": "MASTER",
-                    "anchor_id": "MASTER-CURRENT-TEST",
-                    "query": "AutoIndexedSymbol",
-                },
-            )
-            if status == HTTPStatus.OK and candidate["search"]["hits"]:
-                found = candidate
-                break
-            time.sleep(0.05)
-        self.assertIsNotNone(found)
+        synced = sync_project_index_from_hook(
+            project_id="GCS",
+            project_root=self.project_root,
+            mode="MASTER",
+            anchor_id="MASTER-CURRENT-TEST",
+            changed_paths=["src/auto_worker.py"],
+        )
+        self.assertEqual("HOOK_CHANGED_PATHS", synced["index"]["scope"])
+        self.assertEqual(1, synced["index"]["created"])
+        status, found = self.request(
+            "POST",
+            "/v1/projects/GCS/file-index/search",
+            {
+                "mode": "MASTER",
+                "anchor_id": "MASTER-CURRENT-TEST",
+                "query": "AutoIndexedSymbol",
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("src/auto_worker.py", found["search"]["hits"][0]["relative_path"])
 
         (self.project_root / "src" / "broker.py").unlink()
-        removed = None
-        while time.monotonic() < deadline + 5:
-            status, graph = self.request("GET", "/v1/projects/GCS/semantic-graph")
-            if status == HTTPStatus.OK:
-                removed = next(
-                    (
-                        node
-                        for node in graph["nodes"]
-                        if node["entity_type"] == "IMPLEMENTATION_MODULE_CANDIDATE"
-                        and node["data"]["relative_path"] == "src/broker.py"
-                        and node["lifecycle_state"] == "REMOVED"
-                    ),
-                    None,
-                )
-                if removed is not None:
-                    break
-            time.sleep(0.05)
+        sync_project_index_from_hook(
+            project_id="GCS",
+            project_root=self.project_root,
+            mode="MASTER",
+            anchor_id="MASTER-CURRENT-TEST",
+            changed_paths=["src/broker.py"],
+        )
+        status, graph = self.request("GET", "/v1/projects/GCS/semantic-graph")
+        self.assertEqual(HTTPStatus.OK, status)
+        removed = next(
+            (
+                node
+                for node in graph["nodes"]
+                if node["entity_type"] == "IMPLEMENTATION_MODULE_CANDIDATE"
+                and node["data"]["relative_path"] == "src/broker.py"
+                and node["lifecycle_state"] == "REMOVED"
+            ),
+            None,
+        )
         self.assertIsNotNone(removed)
         self.assertEqual("USER_APPROVAL_REQUIRED", removed["data"]["promotion_state"])
 
