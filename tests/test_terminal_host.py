@@ -185,9 +185,14 @@ class TerminalHostTests(unittest.TestCase):
         host.close(created["terminal_id"])
 
     def test_resume_rejects_universe_internal_session_ids(self) -> None:
-        with self.assertRaises(TerminalHostError) as invalid:
-            resume_argv("CODEX", "session_123b6a5dac26bd0a91575526")
-        self.assertEqual("TERMINAL_RESUME_REF_INVALID", invalid.exception.code)
+        for internal_ref in (
+            "session_123b6a5dac26bd0a91575526",
+            "session-2",
+        ):
+            with self.subTest(internal_ref=internal_ref):
+                with self.assertRaises(TerminalHostError) as invalid:
+                    resume_argv("CODEX", internal_ref)
+                self.assertEqual("TERMINAL_RESUME_REF_INVALID", invalid.exception.code)
         self.assertEqual(
             ["resume", "vendor-thread"],
             resume_argv("CODEX", "codex-app-server:vendor-thread"),

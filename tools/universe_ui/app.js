@@ -2238,7 +2238,7 @@ async function attachProviderChatRoom(room, coordinate) {
   return providerSessionRoomForChatKey(key);
 }
 
-async function resumeNodeModeSession(coordinate, session) {
+async function bindNodeModeSessionPty(coordinate, session) {
   if (focusTerminalForSession(coordinate, session)) {
     expandConversationLayer();
     return;
@@ -2279,6 +2279,11 @@ function openNodeModeSessionActions(coordinate, session) {
   }
   if (elements.nodeSessionInbox) {
     elements.nodeSessionInbox.disabled = !String(session.terminal_id || "").trim();
+  }
+  if (elements.nodeSessionOpen) {
+    elements.nodeSessionOpen.textContent = session.terminal_id
+      ? "Open PTY"
+      : "PTY Binding";
   }
   if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
     elements.nodeSessionActionDialog.showModal();
@@ -13126,7 +13131,7 @@ function bindEvents() {
       const pending = state.pendingNodeSessionAction;
       if (!pending) return;
       elements.nodeSessionActionDialog?.close();
-      resumeNodeModeSession(pending.coordinate, pending.session).catch((error) =>
+      bindNodeModeSessionPty(pending.coordinate, pending.session).catch((error) =>
         toast(error.message, true)
       );
     });

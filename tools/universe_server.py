@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from core_release import CoreReleaseError, verify_release
@@ -890,6 +890,55 @@ def _vendor_identity_from_observer(observer_ref: str) -> tuple[str, str] | None:
             vendor_id = raw[len(prefix) :].strip()
             return (provider, vendor_id) if vendor_id else None
     return None
+
+
+def _verified_provider_identity_index(
+    sources: Iterable[Mapping[str, Any]],
+) -> tuple[
+    dict[tuple[str, str], Mapping[str, Any]],
+    dict[str, list[tuple[str, str]]],
+]:
+    provider_identities: dict[tuple[str, str], Mapping[str, Any]] = {}
+    exact_identities: dict[str, list[tuple[str, str]]] = {}
+    for source in sources:
+        provider = str(source.get("provider") or "").upper()
+        provider_session_id = str(source.get("provider_session_id") or "").strip()
+        if (
+            source.get("identity_state") != "VERIFIED"
+            or str(source.get("session_kind") or "CHAT").upper() == "WORKER"
+            or provider not in {"CODEX", "CLAUDE", "GROK"}
+            or not provider_session_id
+        ):
+            continue
+        identity = (provider, provider_session_id)
+        provider_identities.setdefault(identity, source)
+        exact_identities.setdefault(provider_session_id, []).append(identity)
+    return provider_identities, exact_identities
+
+
+def _resolve_verified_provider_identity(
+    observer_ref: Any,
+    provider_identities: Mapping[tuple[str, str], Mapping[str, Any]],
+    exact_identities: Mapping[str, list[tuple[str, str]]],
+) -> tuple[str, str] | None:
+    raw = str(observer_ref or "").strip()
+    if not raw or raw.upper() in {"UNKNOWN", "UNASSIGNED", "NONE"}:
+        return None
+    prefixed = (
+        ("claude-code:", "CLAUDE"),
+        ("grok-acp:", "GROK"),
+        ("grok-cli:", "GROK"),
+        ("codex-app-server:", "CODEX"),
+        ("codex-app:", "CODEX"),
+        ("codex:", "CODEX"),
+    )
+    lowered = raw.lower()
+    for prefix, provider in prefixed:
+        if lowered.startswith(prefix):
+            identity = (provider, raw[len(prefix) :].strip())
+            return identity if identity in provider_identities else None
+    exact = exact_identities.get(raw) or []
+    return exact[0] if len(exact) == 1 else None
 
 
 def _vendor_chat_key(provider: str, provider_session_id: str) -> str:
@@ -22962,41 +23011,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _project_anchor_observations(
         self, discovered: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        provider_identities: dict[tuple[str, str], dict[str, Any]] = {}
-        exact_identities: dict[str, list[tuple[str, str]]] = {}
-        for source in discovered:
-            provider = str(source.get("provider") or "").upper()
-            provider_session_id = str(
-                source.get("provider_session_id") or ""
-            ).strip()
-            if (
-                source.get("identity_state") != "VERIFIED"
-                or str(source.get("session_kind") or "CHAT").upper() == "WORKER"
-                or not provider_session_id
-            ):
-                continue
-            identity = (provider, provider_session_id)
-            provider_identities.setdefault(identity, source)
-            exact_identities.setdefault(provider_session_id, []).append(identity)
+        provider_identities, exact_identities = _verified_provider_identity_index(
+            discovered
+        )
 
         def resolve_observer(observer_ref: Any) -> tuple[str, str] | None:
-            raw = str(observer_ref or "").strip()
-            if not raw or raw.upper() in {"UNKNOWN", "UNASSIGNED", "NONE"}:
-                return None
-            prefixed = (
-                ("claude-code:", "CLAUDE"),
-                ("grok-acp:", "GROK"),
-                ("grok-cli:", "GROK"),
-                ("codex-app-server:", "CODEX"),
-                ("codex:", "CODEX"),
+            return _resolve_verified_provider_identity(
+                observer_ref, provider_identities, exact_identities
             )
-            lowered = raw.lower()
-            for prefix, provider in prefixed:
-                if lowered.startswith(prefix):
-                    identity = (provider, raw[len(prefix) :])
-                    return identity if identity in provider_identities else None
-            exact = exact_identities.get(raw) or []
-            return exact[0] if len(exact) == 1 else None
 
         candidates: list[dict[str, Any]] = []
         current_anchors: dict[tuple[str, str], dict[str, Any]] = {}
@@ -23443,6 +23465,110 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return projected
 
+    def _resolve_project_anchor_pty_binding(
+        self, *, project_id: str, mode: str, session_anchor_ref: str
+    ) -> dict[str, str]:
+        anchor_ref = str(session_anchor_ref or "").strip()
+        if not anchor_ref:
+            raise UniverseError(
+                "TERMINAL_PTY_BINDING_ANCHOR_REQUIRED",
+                "PTY Binding requires a Session Anchor",
+                HTTPStatus.BAD_REQUEST,
+            )
+        listed = self.list_project_anchor_sessions(project_id)
+        selected = next(
+            (
+                session
+                for session in listed.get("sessions") or []
+                if str(session.get("session_anchor_ref") or "") == anchor_ref
+                and str(session.get("mode") or "").upper() == mode
+            ),
+            None,
+        )
+        if selected is None:
+            raise UniverseError(
+                "TERMINAL_PTY_BINDING_ANCHOR_NOT_FOUND",
+                "Session Anchor is not available at the requested terminal coordinate",
+                HTTPStatus.NOT_FOUND,
+            )
+
+        supervisor_sessions = self.session_supervisor.list_sessions(include_hidden=True)
+        selected_session_ids = {
+            str(selected.get("session_id") or "").strip(),
+            str(selected.get("universe_session_id") or "").strip(),
+        } - {""}
+        for supervised in supervisor_sessions:
+            supervised_project = str(
+                supervised.get("current_project_id")
+                or supervised.get("node")
+                or ""
+            ).strip()
+            supervised_mode = str(supervised.get("mode") or "").upper()
+            supervised_id = str(
+                supervised.get("universe_session_id")
+                or supervised.get("session_id")
+                or ""
+            ).strip()
+            if (
+                supervised_project.casefold() != project_id.casefold()
+                or supervised_mode != mode
+                or supervised_id not in selected_session_ids
+            ):
+                continue
+            provider = str(supervised.get("provider") or "").upper()
+            provider_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            if provider in {"CODEX", "CLAUDE", "GROK"} and provider_ref:
+                vendor_identity = _vendor_identity_from_observer(provider_ref)
+                if vendor_identity is not None:
+                    provider, provider_ref = vendor_identity
+                return {
+                    "provider": provider,
+                    "provider_session_id": provider_ref,
+                    "supervisor_session_id": supervised_id,
+                }
+
+        sources: list[dict[str, Any]] = []
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            sources.extend(self.store.discover_provider_session_sources(provider))
+        for supervised in supervisor_sessions:
+            provider = str(supervised.get("provider") or "").upper()
+            provider_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            if provider in {"CODEX", "CLAUDE", "GROK"} and provider_ref:
+                vendor_identity = _vendor_identity_from_observer(provider_ref)
+                if vendor_identity is not None:
+                    provider, provider_ref = vendor_identity
+                sources.append(
+                    {
+                        "provider": provider,
+                        "provider_session_id": provider_ref,
+                        "session_kind": supervised.get("session_kind") or "CHAT",
+                        "identity_state": "VERIFIED",
+                    }
+                )
+        provider_identities, exact_identities = _verified_provider_identity_index(
+            sources
+        )
+        identity = _resolve_verified_provider_identity(
+            selected.get("observer_session_ref"),
+            provider_identities,
+            exact_identities,
+        )
+        if identity is None:
+            raise UniverseError(
+                "TERMINAL_PTY_BINDING_PROVIDER_SESSION_UNAVAILABLE",
+                "Session Anchor has no verified provider-owned session id for PTY Binding",
+                HTTPStatus.CONFLICT,
+            )
+        return {
+            "provider": identity[0],
+            "provider_session_id": identity[1],
+            "supervisor_session_id": "",
+        }
+
     def create_cli_terminal(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
         project_id = str(payload.get("project_id") or "").strip()
@@ -23452,6 +23578,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         model_ref = str(payload.get("model_ref") or "").strip()
         effort = str(payload.get("effort") or "AUTO").strip().upper() or "AUTO"
         resume_ref = str(payload.get("resume_session_ref") or "").strip()
+        pty_binding_anchor_ref = str(
+            payload.get("pty_binding_anchor_ref") or ""
+        ).strip()
         supervisor_session_id = str(
             payload.get("supervisor_session_id") or ""
         ).strip()
@@ -23501,6 +23630,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         HTTPStatus.CONFLICT,
                     )
             resume_ref = stored_ref
+        elif pty_binding_anchor_ref:
+            binding = self._resolve_project_anchor_pty_binding(
+                project_id=project_id,
+                mode=mode,
+                session_anchor_ref=pty_binding_anchor_ref,
+            )
+            binding_provider = binding["provider"]
+            if provider not in {"", "AUTO"} and provider != binding_provider:
+                raise UniverseError(
+                    "TERMINAL_RESUME_PROVIDER_MISMATCH",
+                    "Session Anchor provider does not match the terminal provider",
+                    HTTPStatus.CONFLICT,
+                )
+            provider = binding_provider
+            resume_ref = binding["provider_session_id"]
+            supervisor_session_id = binding["supervisor_session_id"]
         if not supervisor_session_id:
             supervisor_session_id = "session_" + secrets.token_hex(12)
         existing = self._session_anchor_terminal_host().find_live(

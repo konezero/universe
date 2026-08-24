@@ -4771,6 +4771,104 @@ class UniverseLocalServiceTests(unittest.TestCase):
             rows=32,
         )
 
+    def test_cli_terminal_pty_binding_resolves_verified_anchor_provider_ref(self) -> None:
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.create.return_value = {
+            "terminal_id": "term_anchor_binding",
+            "state": "LIVE",
+        }
+        self.server.terminal_host = terminal_host
+        anchor_sessions = {
+            "sessions": [
+                {
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "session_id": "codex:vendor-thread-123",
+                    "session_anchor_ref": "MASTER-CURRENT-PTY-BINDING",
+                    "observer_session_ref": "codex:vendor-thread-123",
+                }
+            ]
+        }
+        verified = [
+            {
+                "provider": "CODEX",
+                "provider_session_id": "vendor-thread-123",
+                "session_kind": "CHAT",
+                "identity_state": "VERIFIED",
+            }
+        ]
+        with (
+            patch.object(
+                self.server,
+                "list_project_anchor_sessions",
+                return_value=anchor_sessions,
+            ),
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                side_effect=lambda provider: verified if provider == "CODEX" else [],
+            ),
+        ):
+            created = self.server.create_cli_terminal(
+                {
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "cwd": str(self.project_root),
+                    "provider": "CODEX",
+                    "pty_binding_anchor_ref": "MASTER-CURRENT-PTY-BINDING",
+                }
+            )
+
+        self.assertEqual("CLI_TERMINAL_CREATED", created["status"])
+        call = terminal_host.create.call_args.kwargs
+        self.assertEqual("CODEX", call["provider"])
+        self.assertEqual("vendor-thread-123", call["resume_session_ref"])
+        self.assertRegex(call["supervisor_session_id"], r"^session_[0-9a-f]{24}$")
+
+    def test_cli_terminal_pty_binding_rejects_unverified_internal_observer(self) -> None:
+        terminal_host = Mock()
+        self.server.terminal_host = terminal_host
+        anchor_sessions = {
+            "sessions": [
+                {
+                    "project_id": "GCS",
+                    "mode": "CONDUCTOR",
+                    "session_id": "codex:session-2",
+                    "session_anchor_ref": "CONDUCTOR-CURRENT-PTY-BINDING",
+                    "observer_session_ref": "codex:session-2",
+                }
+            ]
+        }
+        with (
+            patch.object(
+                self.server,
+                "list_project_anchor_sessions",
+                return_value=anchor_sessions,
+            ),
+            patch.object(
+                self.server.store,
+                "discover_provider_session_sources",
+                return_value=[],
+            ),
+        ):
+            with self.assertRaises(UniverseError) as raised:
+                self.server.create_cli_terminal(
+                    {
+                        "project_id": "GCS",
+                        "mode": "CONDUCTOR",
+                        "cwd": str(self.project_root),
+                        "provider": "CODEX",
+                        "pty_binding_anchor_ref": "CONDUCTOR-CURRENT-PTY-BINDING",
+                    }
+                )
+
+        self.assertEqual(
+            "TERMINAL_PTY_BINDING_PROVIDER_SESSION_UNAVAILABLE",
+            raised.exception.code,
+        )
+        terminal_host.create.assert_not_called()
+
     def test_passive_provider_reobservation_preserves_session_anchor_location(self) -> None:
         original, _ = self.server.session_supervisor.register_session(
             {

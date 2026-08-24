@@ -765,7 +765,7 @@ def resume_argv(provider: str, resume_session_ref: str) -> list[str]:
     upper = ref.upper()
     if (
         not ref
-        or lowered.startswith(("session_", "session-anchor_", "session_anchor_", "term_", "pty:", "cli-terminal:"))
+        or lowered.startswith(("session_", "session-", "session-anchor_", "session_anchor_", "term_", "pty:", "cli-terminal:"))
         or upper.startswith(("UNIVERSE-", "MASTER-CURRENT-", "CONDUCTOR-CURRENT-"))
     ):
         raise TerminalHostError(

@@ -67,14 +67,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("function nodeModeSessionIsCurrent(session)", APP)
         self.assertIn("function vendorStreamStateForSession(session)", APP)
         self.assertIn("function startNewNodeModeSession(coordinate)", APP)
-        self.assertIn("function resumeNodeModeSession(coordinate, session)", APP)
+        self.assertIn("function bindNodeModeSessionPty(coordinate, session)", APP)
         self.assertIn("function openNodeModeSessionActions(coordinate, session)", APP)
         self.assertIn("function inspectNodeModeSession(coordinate, session)", APP)
         self.assertIn("function endNodeModePtySession(session)", APP)
         self.assertIn('id="node-session-action-dialog"', HTML)
         self.assertIn(">Inspector<", HTML)
         self.assertIn(">Inbox<", HTML)
-        self.assertIn(">Open session<", HTML)
+        self.assertIn(">PTY Binding<", HTML)
         self.assertIn(">End session<", HTML)
         self.assertIn("function openSessionBusInbox", APP)
         self.assertIn("/v1/session-bus/messages", APP)
@@ -131,6 +131,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("const tab = created.terminal || created;", TERM)
         self.assertNotIn("const session = created.terminal || created;", TERM)
         self.assertIn("resume_session_ref", TERM)
+        self.assertIn("pty_binding_anchor_ref", TERM)
         self.assertIn("supervisor_session_id", TERM)
         self.assertIn("function terminalSupervisorSessionId(session)", TERM)
         supervisor_slice = TERM[
@@ -157,6 +158,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertNotIn("session.session_id", resume_slice)
+        self.assertNotIn("session.observer_session_ref", resume_slice)
         self.assertIn("createTerminalTab(coordinate, session)", APP)
         mobile_session_nav = APP[
             APP.index('elements.mobileWorkTabs?.addEventListener("click"') : APP.index(
@@ -172,7 +174,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("session?.provider || session?.current_provider", TERM)
         self.assertIn('throw new Error("Choose a provider for this session")', TERM)
         self.assertIn("function observerProvider(session)", TERM)
-        self.assertIn("session.observer_session_ref", TERM)
+        self.assertIn("session?.observer_session_ref", TERM)
         self.assertNotIn("last_session_ref", TERM)
         self.assertNotIn("last_provider", TERM)
         self.assertIn("if (showTerminal) return;", APP)
@@ -246,8 +248,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("node-mode-session-card", CSS)
         self.assertIn("createTerminalTab(coordinate)", APP)
         self.assertIn("focusTerminalForSession(coordinate, session)", APP)
-        self.assertIn("resumeNodeModeSession(pending.coordinate, pending.session)", APP)
-        self.assertNotIn("await resumeNodeModeSession(coordinate, session)", APP)
+        self.assertIn("bindNodeModeSessionPty(pending.coordinate, pending.session)", APP)
+        self.assertNotIn("await bindNodeModeSessionPty(coordinate, session)", APP)
         self.assertIn("New session", APP)
         card_slice = APP[APP.index("function renderNodeModeSessionCards") : APP.index("function selectNodeModeNode")]
         self.assertNotIn("Delegate here", card_slice)

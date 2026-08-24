@@ -399,11 +399,7 @@ function terminalSupervisorSessionId(session) {
 function terminalResumeRef(coordinate, session) {
   if (!session) return "";
   const provider = terminalProviderFor(coordinate, session);
-  const raw = String(
-    session.provider_session_id ||
-      session.observer_session_ref ||
-      ""
-  ).trim();
+  const raw = String(session.provider_session_id || "").trim();
   const sessionProvider = String(session.provider || "").toUpperCase();
   if (sessionProvider && sessionProvider !== "AUTO" && sessionProvider !== provider) return "";
   if (/^grok-/i.test(raw) && provider !== "GROK") return "";
@@ -439,6 +435,7 @@ async function createTerminalTab(coordinate, session) {
       model_ref: String(coordinate?.modelRef || coordinate?.model_ref || "").trim(),
       effort: String(coordinate?.effort || "AUTO").toUpperCase(),
       supervisor_session_id: terminalSupervisorSessionId(session),
+      pty_binding_anchor_ref: String(session?.session_anchor_ref || "").trim(),
       resume_session_ref: terminalResumeRef(coordinate, session),
     },
   });
