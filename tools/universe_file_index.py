@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -14,22 +16,36 @@ SEARCH_SCHEMA = "universe.project-file-search.v1"
 MAX_EXCERPT_BYTES = 32_768
 MAX_FILE_BYTES = 1_048_576
 MAX_HITS = 50
+SYNC_STATE_SCHEMA = "universe.project-file-index-sync-state.v1"
+GRAPH_CANDIDATE_SCHEMA = "universe.project-file-graph-candidates.v1"
+
+IMPLEMENTATION_SUFFIXES = {
+    ".py", ".js", ".ts", ".tsx", ".rs", ".go", ".java", ".kt",
+    ".c", ".h", ".cpp", ".cs", ".sh", ".ps1", ".sql",
+}
 
 SKIP_DIR_NAMES = {
+    ".ai",
+    ".artifacts",
     ".git",
     ".hg",
-    ".svn",
     ".mypy_cache",
+    ".playwright-mcp",
     ".pytest_cache",
     ".ruff_cache",
+    ".svn",
+    ".venv",
     "__pycache__",
-    "node_modules",
-    "dist",
     "build",
+    "dist",
+    "htmlcov",
+    "node_modules",
+    "venv",
 }
 
 SKIP_RELATIVE_PREFIXES = (
     ".ai/runtime/tmp/",
+    ".ai/runtime/state/",
     ".ai/runtime/session_store/",
     ".ai/runtime/task_frames/",
     ".ai/runtime/release_db/",
@@ -77,6 +93,39 @@ CREATE TABLE IF NOT EXISTS project_file_index (
 
 CREATE INDEX IF NOT EXISTS project_file_index_project_time
 ON project_file_index(project_id, indexed_at, relative_path);
+
+CREATE TABLE IF NOT EXISTS project_file_index_sync_state (
+    project_id TEXT PRIMARY KEY
+        REFERENCES project_connection(project_id)
+        ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK(state IN ('SUCCEEDED', 'FAILED', 'BLOCKED')),
+    mode TEXT NOT NULL,
+    anchor_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    last_attempt_at TEXT NOT NULL,
+    last_success_at TEXT NOT NULL,
+    error_code TEXT NOT NULL,
+    error_detail TEXT NOT NULL,
+    summary_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_file_graph_candidate (
+    project_id TEXT NOT NULL
+        REFERENCES project_connection(project_id)
+        ON DELETE CASCADE,
+    relative_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    candidate_kind TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('CURRENT', 'REMOVED')),
+    promotion_state TEXT NOT NULL CHECK(promotion_state IN ('USER_APPROVAL_REQUIRED')),
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    removed_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, relative_path)
+);
+
+CREATE INDEX IF NOT EXISTS project_file_graph_candidate_project_state
+ON project_file_graph_candidate(project_id, lifecycle_state, relative_path);
 """
 
 
@@ -109,13 +158,29 @@ def should_skip(relative_path: str) -> bool:
 def iter_project_files(project_root: Path) -> list[Path]:
     root = project_root.resolve(strict=True)
     found: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = _normalize_relative(path.relative_to(root))
-        if should_skip(relative):
-            continue
-        found.append(Path(relative))
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    for current, directory_names, file_names in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        current_path = Path(current)
+        kept_directories: list[str] = []
+        for name in directory_names:
+            candidate = current_path / name
+            relative = _normalize_relative(candidate.relative_to(root))
+            if should_skip(relative + "/"):
+                continue
+            if os.path.islink(candidate) or is_junction(candidate):
+                continue
+            kept_directories.append(name)
+        directory_names[:] = kept_directories
+        for name in file_names:
+            path = current_path / name
+            relative = _normalize_relative(path.relative_to(root))
+            if should_skip(relative):
+                continue
+            if os.path.islink(path) or is_junction(path):
+                continue
+            found.append(Path(relative))
     return sorted(found)
 
 
@@ -135,11 +200,25 @@ def read_excerpt(path: Path) -> str:
 
 
 def file_fingerprint(path: Path) -> tuple[int, int, str, str]:
-    stat = path.stat()
+    before = path.stat()
     data = path.read_bytes()
+    after = path.stat()
+    before_mtime = getattr(before, "st_mtime_ns", int(before.st_mtime * 1_000_000_000))
+    after_mtime = getattr(after, "st_mtime_ns", int(after.st_mtime * 1_000_000_000))
+    if before.st_size != after.st_size or before_mtime != after_mtime:
+        raise FileIndexError(
+            "FILE_CHANGED_DURING_INDEX",
+            f"file changed while it was indexed: {path}",
+        )
     digest = hashlib.sha256(data).hexdigest()
-    excerpt = read_excerpt(path)
-    return stat.st_size, getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)), digest, excerpt
+    excerpt = ""
+    if (
+        path.suffix.lower() in TEXT_SUFFIXES
+        and 0 < len(data) <= MAX_FILE_BYTES
+        and b"\x00" not in data[:MAX_EXCERPT_BYTES]
+    ):
+        excerpt = data[:MAX_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    return after.st_size, after_mtime, digest, excerpt
 
 
 def require_mode_current_anchor(
@@ -181,6 +260,211 @@ def require_mode_current_anchor(
             f"requested {normalized_anchor} is not the Current Anchor for {normalized_mode}",
         )
     return {"mode": str(row[0]), "anchor_id": str(row[1]), "state": str(row[2])}
+
+
+def resolve_mode_current_anchor(
+    project_root: Path, *, preferred_mode: str = "MASTER"
+) -> dict[str, str]:
+    root = project_root.resolve(strict=True)
+    store = root / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+    if not store.is_file():
+        raise FileIndexError(
+            "MODE_CURRENT_ANCHOR_STORE_MISSING",
+            "project_runtime.sqlite3 is absent; automatic file indexing is blocked",
+        )
+    mode = preferred_mode.strip().upper()
+    connection = sqlite3.connect(f"file:{store.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT mode, anchor_id FROM mode_current_anchor WHERE mode = ?",
+            (mode,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise FileIndexError(
+            "MODE_CURRENT_ANCHOR_MISSING",
+            f"no Current Anchor exists for automatic {mode} file indexing",
+        )
+    return require_mode_current_anchor(root, mode=str(row[0]), anchor_id=str(row[1]))
+
+
+def record_sync_state(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    state: str,
+    mode: str,
+    anchor_id: str,
+    summary: Mapping[str, Any] | None = None,
+    error_code: str = "",
+    error_detail: str = "",
+) -> dict[str, Any]:
+    normalized_state = state.strip().upper()
+    if normalized_state not in {"SUCCEEDED", "FAILED", "BLOCKED"}:
+        raise FileIndexError("FILE_INDEX_SYNC_STATE_INVALID", "sync state is invalid")
+    now = _now()
+    existing = connection.execute(
+        "SELECT generation, last_success_at FROM project_file_index_sync_state WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    generation = int(existing["generation"]) if existing is not None else 0
+    last_success_at = str(existing["last_success_at"]) if existing is not None else ""
+    if normalized_state == "SUCCEEDED":
+        generation += 1
+        last_success_at = now
+    summary_json = json.dumps(
+        dict(summary or {}), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    connection.execute(
+        """
+        INSERT INTO project_file_index_sync_state(
+            project_id, state, mode, anchor_id, generation, last_attempt_at,
+            last_success_at, error_code, error_detail, summary_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET
+            state = excluded.state,
+            mode = excluded.mode,
+            anchor_id = excluded.anchor_id,
+            generation = excluded.generation,
+            last_attempt_at = excluded.last_attempt_at,
+            last_success_at = excluded.last_success_at,
+            error_code = excluded.error_code,
+            error_detail = excluded.error_detail,
+            summary_json = excluded.summary_json
+        """,
+        (
+            project_id,
+            normalized_state,
+            mode.strip().upper(),
+            anchor_id.strip(),
+            generation,
+            now,
+            last_success_at,
+            error_code.strip().upper(),
+            error_detail.strip()[:2000],
+            summary_json,
+        ),
+    )
+    return {
+        "schema": SYNC_STATE_SCHEMA,
+        "project_id": project_id,
+        "state": normalized_state,
+        "mode": mode.strip().upper(),
+        "anchor_id": anchor_id.strip(),
+        "generation": generation,
+        "last_attempt_at": now,
+        "last_success_at": last_success_at,
+        "error_code": error_code.strip().upper(),
+        "error_detail": error_detail.strip()[:2000],
+        "summary": dict(summary or {}),
+    }
+
+
+def reconcile_graph_candidates(
+    connection: sqlite3.Connection, *, project_id: str, observed_at: str
+) -> dict[str, Any]:
+    current = {
+        str(row["relative_path"]): str(row["sha256"])
+        for row in connection.execute(
+            "SELECT relative_path, sha256 FROM project_file_index WHERE project_id = ?",
+            (project_id,),
+        )
+        if Path(str(row["relative_path"])).suffix.lower() in IMPLEMENTATION_SUFFIXES
+    }
+    existing = {
+        str(row["relative_path"]): row
+        for row in connection.execute(
+            """
+            SELECT relative_path, sha256, lifecycle_state
+            FROM project_file_graph_candidate
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        )
+    }
+    created = updated = unchanged = removed = 0
+    for relative_path, digest in sorted(current.items()):
+        previous = existing.get(relative_path)
+        if previous is None:
+            created += 1
+        elif str(previous["sha256"]) != digest or str(previous["lifecycle_state"]) != "CURRENT":
+            updated += 1
+        else:
+            unchanged += 1
+        connection.execute(
+            """
+            INSERT INTO project_file_graph_candidate(
+                project_id, relative_path, sha256, candidate_kind,
+                lifecycle_state, promotion_state, first_observed_at,
+                last_observed_at, removed_at
+            ) VALUES (?, ?, ?, 'IMPLEMENTATION_MODULE', 'CURRENT',
+                      'USER_APPROVAL_REQUIRED', ?, ?, '')
+            ON CONFLICT(project_id, relative_path) DO UPDATE SET
+                sha256 = excluded.sha256,
+                candidate_kind = excluded.candidate_kind,
+                lifecycle_state = 'CURRENT',
+                promotion_state = 'USER_APPROVAL_REQUIRED',
+                last_observed_at = excluded.last_observed_at,
+                removed_at = ''
+            """,
+            (project_id, relative_path, digest, observed_at, observed_at),
+        )
+    for relative_path in sorted(set(existing) - set(current)):
+        previous = existing[relative_path]
+        if str(previous["lifecycle_state"]) == "REMOVED":
+            continue
+        connection.execute(
+            """
+            UPDATE project_file_graph_candidate
+            SET lifecycle_state = 'REMOVED', last_observed_at = ?, removed_at = ?
+            WHERE project_id = ? AND relative_path = ?
+            """,
+            (observed_at, observed_at, project_id, relative_path),
+        )
+        removed += 1
+    return {
+        "schema": GRAPH_CANDIDATE_SCHEMA,
+        "project_id": project_id,
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "removed": removed,
+        "current_count": len(current),
+        "observed_at": observed_at,
+        "projection_only": True,
+        "promotion_state": "USER_APPROVAL_REQUIRED",
+    }
+
+
+def list_graph_candidates(
+    connection: sqlite3.Connection, *, project_id: str, include_removed: bool = True
+) -> list[dict[str, Any]]:
+    where = "project_id = ?" if include_removed else "project_id = ? AND lifecycle_state = 'CURRENT'"
+    rows = connection.execute(
+        f"""
+        SELECT relative_path, sha256, candidate_kind, lifecycle_state,
+               promotion_state, first_observed_at, last_observed_at, removed_at
+        FROM project_file_graph_candidate
+        WHERE {where}
+        ORDER BY relative_path
+        """,
+        (project_id,),
+    ).fetchall()
+    return [
+        {
+            "relative_path": str(row["relative_path"]),
+            "sha256": str(row["sha256"]),
+            "candidate_kind": str(row["candidate_kind"]),
+            "lifecycle_state": str(row["lifecycle_state"]),
+            "promotion_state": str(row["promotion_state"]),
+            "first_observed_at": str(row["first_observed_at"]),
+            "last_observed_at": str(row["last_observed_at"]),
+            "removed_at": str(row["removed_at"]),
+            "projection_only": True,
+        }
+        for row in rows
+    ]
 
 
 def sync_index(
@@ -251,6 +535,9 @@ def sync_index(
             (project_id, stale),
         )
         removed += 1
+    graph_reconcile = reconcile_graph_candidates(
+        connection, project_id=project_id, observed_at=indexed_at
+    )
     return {
         "schema": SCHEMA,
         "project_id": project_id,
@@ -259,6 +546,7 @@ def sync_index(
         "unchanged": unchanged,
         "removed": removed,
         "indexed_at": indexed_at,
+        "graph_reconcile": graph_reconcile,
     }
 
 
@@ -298,6 +586,7 @@ def search_index(
                 "size_bytes": int(row["size_bytes"]),
                 "sha256": str(row["sha256"]),
                 "indexed_at": str(row["indexed_at"]),
+                "excerpt": excerpt[:2000],
                 "match": {
                     "path": path_hit,
                     "excerpt": excerpt_hit,
@@ -332,11 +621,51 @@ def index_status(connection: sqlite3.Connection, *, project_id: str) -> dict[str
         """,
         (project_id,),
     ).fetchone()
+    candidate = connection.execute(
+        """
+        SELECT
+            SUM(CASE WHEN lifecycle_state = 'CURRENT' THEN 1 ELSE 0 END) AS current_count,
+            SUM(CASE WHEN lifecycle_state = 'REMOVED' THEN 1 ELSE 0 END) AS removed_count
+        FROM project_file_graph_candidate
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()
+    sync = connection.execute(
+        """
+        SELECT state, mode, anchor_id, generation, last_attempt_at,
+               last_success_at, error_code, error_detail, summary_json
+        FROM project_file_index_sync_state
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()
+    sync_state = None
+    if sync is not None:
+        sync_state = {
+            "schema": SYNC_STATE_SCHEMA,
+            "state": str(sync["state"]),
+            "mode": str(sync["mode"]),
+            "anchor_id": str(sync["anchor_id"]),
+            "generation": int(sync["generation"]),
+            "last_attempt_at": str(sync["last_attempt_at"]),
+            "last_success_at": str(sync["last_success_at"]),
+            "error_code": str(sync["error_code"]),
+            "error_detail": str(sync["error_detail"]),
+            "summary": json.loads(str(sync["summary_json"] or "{}")),
+        }
     return {
         "schema": SCHEMA,
         "project_id": project_id,
         "file_count": int(row["file_count"] if row is not None else 0),
         "indexed_at": str(row["indexed_at"] or ""),
+        "graph_candidates": {
+            "schema": GRAPH_CANDIDATE_SCHEMA,
+            "current_count": int(candidate["current_count"] or 0),
+            "removed_count": int(candidate["removed_count"] or 0),
+            "projection_only": True,
+        },
+        "sync": sync_state,
     }
 
 

@@ -10465,6 +10465,17 @@ function goalProgress(goal) {
   return Math.round((todos.filter((todo) => todo.state === "DONE").length / todos.length) * 100);
 }
 
+function goalsForSelectedContext() {
+  const nodeRef = selectedNodeRef();
+  if (nodeRef && state.selectedProject) {
+    return state.goals.filter(
+      (goal) => goal.scope_kind === "NODE" && goal.node_ref === nodeRef
+    );
+  }
+  return state.goals.filter((goal) => (goal.scope_kind || "PROJECT") === "PROJECT");
+}
+
+
 async function refreshGoalPlan() {
   if (!state.selectedProject) {
     state.goals = [];
@@ -10482,8 +10493,9 @@ async function refreshGoalPlan() {
   state.unassignedTodos = (result.unassigned_todos || []).filter(
     (todo) => todo.state !== "DONE"
   );
-  if (!state.goals.some((goal) => goal.goal_id === state.selectedGoalId)) {
-    state.selectedGoalId = state.goals[0]?.goal_id || null;
+  const contextualGoals = goalsForSelectedContext();
+  if (!contextualGoals.some((goal) => goal.goal_id === state.selectedGoalId)) {
+    state.selectedGoalId = contextualGoals[0]?.goal_id || null;
   }
   renderGoalPlan();
 }
@@ -10634,7 +10646,7 @@ function openGoalEditor(goal) {
   elements.goalForm.elements.owner.value = goal.owner || "Project Master";
   elements.goalForm.elements.state.value = goal.state || "DESIGNING";
   prepareGoalHierarchyFields({
-    scopeKind: "PROJECT",
+    scopeKind: goal.scope_kind || "PROJECT",
     universeGoalId: goal.universe_goal_id || "",
   });
   elements.goalDialog.querySelector("h2").textContent = "Edit goal";
@@ -10648,6 +10660,7 @@ function renderGoalPlan() {
     syncPrimaryNavSelection("work");
   }
   const project = state.selectedProject;
+  const projectGoals = goalsForSelectedContext();
   elements.goalPlanTitle.textContent = "Goal Plan";
   if (elements.goalPlanBreadcrumb) {
     elements.goalPlanBreadcrumb.textContent = project
@@ -10658,16 +10671,16 @@ function renderGoalPlan() {
     ? "Universe Goal -> Project Goal -> Milestone / Phase -> Todo"
     : "Select a project to shape its delivery plan.";
   elements.addGoalButton.disabled = !project;
-  const todos = state.goals.flatMap((goal) => [
+  const todos = projectGoals.flatMap((goal) => [
     ...(goal.todos || []),
     ...(goal.milestones || []).flatMap((milestone) => milestone.todos || []),
   ]);
   const done = todos.filter((todo) => todo.state === "DONE").length;
   const progress = todos.length ? Math.round((done / todos.length) * 100) : 0;
-  const readyGoals = state.goals.filter((goal) => ["READY", "ACTIVE", "DONE"].includes(goal.state)).length;
-  const readiness = state.goals.length ? Math.round((readyGoals / state.goals.length) * 100) : 0;
-  const milestoneCount = state.goals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
-  const owner = state.goals[0]?.owner || "Project Master";
+  const readyGoals = projectGoals.filter((goal) => ["READY", "ACTIVE", "DONE"].includes(goal.state)).length;
+  const readiness = projectGoals.length ? Math.round((readyGoals / projectGoals.length) * 100) : 0;
+  const milestoneCount = projectGoals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
+  const owner = projectGoals[0]?.owner || "Project Master";
   elements.goalPlanSummary.replaceChildren();
   const needsYou = state.unassignedTodos.length + todos.filter((todo) => todo.state === "BLOCKED").length;
   for (const [label, value] of [
@@ -10688,7 +10701,7 @@ function renderGoalPlan() {
       elements.goalPlanList.append(renderUniverseGoalCard(universeGoal));
     }
   }
-  if (project && !state.goals.length) {
+  if (project && !projectGoals.length) {
     const empty = node("div", "goal-plan-empty");
     empty.append(
       node("strong", "", "No goals yet"),
@@ -10700,7 +10713,7 @@ function renderGoalPlan() {
     empty.append(add);
     elements.goalPlanList.append(empty);
   }
-  state.goals.forEach((goal, goalIndex) => {
+  projectGoals.forEach((goal, goalIndex) => {
     const card = node("article", "goal-card");
     card.tabIndex = 0;
     card.classList.toggle("selected", state.selectedGoalId === goal.goal_id);
@@ -10780,8 +10793,8 @@ function renderGoalPlan() {
     const row = planTodoRow(todo);
     const select = node("select", "goal-assign-select");
     select.append(new Option("Add to goal...", ""));
-    for (const goal of state.goals) select.append(new Option(goal.title, goal.goal_id));
-    select.disabled = !state.goals.length;
+    for (const goal of projectGoals) select.append(new Option(goal.title, goal.goal_id));
+    select.disabled = !projectGoals.length;
     select.addEventListener("change", async () => {
       const goalId = select.value;
       if (!goalId) return;
@@ -13378,13 +13391,15 @@ function prepareGoalHierarchyFields({ scopeKind = "UNIVERSE", universeGoalId = "
   if (!form) return;
   const scope = form.elements.scope_kind;
   const parent = form.elements.universe_goal_id;
-  scope.value = scopeKind;
+  const nodeOption = [...scope.options].find((option) => option.value === "NODE");
+  if (nodeOption) nodeOption.disabled = !selectedNodeRef();
+  scope.value = scopeKind === "NODE" && !selectedNodeRef() ? "PROJECT" : scopeKind;
   parent.replaceChildren(new Option("No global parent", ""));
   for (const goal of state.universeGoals || []) {
     parent.append(new Option(goal.title, goal.universe_goal_id));
   }
   parent.value = universeGoalId || "";
-  parent.disabled = scopeKind === "UNIVERSE";
+  parent.disabled = scope.value === "UNIVERSE";
 }
 
 function bindGoalPlanEvents() {
@@ -13395,7 +13410,7 @@ function bindGoalPlanEvents() {
     elements.goalDialog.querySelector("h2").textContent = "New goal";
     elements.goalDialog.querySelector('[type="submit"]').textContent = "Create goal";
     elements.goalForm.elements.owner.value = "Project Master";
-    prepareGoalHierarchyFields({ scopeKind: "UNIVERSE" });
+    prepareGoalHierarchyFields({ scopeKind: selectedNodeRef() ? "NODE" : "PROJECT" });
     elements.goalFormError.textContent = "";
     elements.goalDialog.showModal();
   });
@@ -13488,6 +13503,9 @@ function bindGoalPlanEvents() {
       const globalGoal = scopeKind === "UNIVERSE";
       if (goalId && globalGoal) throw new Error("Existing project goals stay in the selected project scope.");
       const parentGoalId = String(data.get("universe_goal_id") || "");
+      if (scopeKind === "NODE" && !selectedNodeRef()) {
+        throw new Error("Select a graph node before creating a Node goal.");
+      }
       await api(
         globalGoal
           ? "/v1/universe-goals"
@@ -13505,6 +13523,10 @@ function bindGoalPlanEvents() {
             : goalId
             ? state.goals.find((goal) => goal.goal_id === goalId)?.sort_order || 0
             : state.goals.length,
+          ...(!globalGoal ? {
+            scope_kind: scopeKind,
+            ...(scopeKind === "NODE" ? { node_ref: selectedNodeRef() } : {}),
+          } : {}),
           ...(!globalGoal && parentGoalId ? { universe_goal_id: parentGoalId } : {}),
           ...(goalId ? { revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision } : {}),
         },

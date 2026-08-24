@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http import HTTPStatus
 from pathlib import Path
@@ -77,6 +78,8 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
             ),
             host_profile=HostProfileStore(temp_root / "host.json"),
             service_state_path=temp_root / "server.json",
+            auto_start_file_index_sync=True,
+            file_index_poll_seconds=0.05,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -123,7 +126,14 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("FILE_INDEX_SYNCED", synced["status"])
-        self.assertGreaterEqual(synced["index"]["created"], 1)
+        self.assertGreaterEqual(
+            synced["index"]["created"] + synced["index"]["unchanged"], 1
+        )
+        self.assertGreaterEqual(synced["index"]["graph_reconcile"]["current_count"], 1)
+        self.assertEqual(
+            "USER_APPROVAL_REQUIRED",
+            synced["index"]["graph_reconcile"]["promotion_state"],
+        )
 
         status, found = self.request(
             "POST",
@@ -137,6 +147,7 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("FILE_SEARCH_COMPLETED", found["status"])
         self.assertEqual("src/broker.py", found["search"]["hits"][0]["relative_path"])
+        self.assertIn("BrokerClient", found["search"]["hits"][0]["excerpt"])
         self.assertEqual("MASTER-CURRENT-TEST", found["anchor_id"])
 
         status, retrieval = self.request(
@@ -154,6 +165,72 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
             "universe.project-llm-retrieval-context.v1",
             retrieval["retrieval"]["schema"],
         )
+        self.assertEqual(
+            "src/broker.py",
+            retrieval["retrieval"]["file_index"]["search"]["hits"][0]["relative_path"],
+        )
+
+        status, index_state = self.request("GET", "/v1/projects/GCS/file-index")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("SUCCEEDED", index_state["index"]["sync"]["state"])
+        self.assertGreaterEqual(
+            index_state["index"]["graph_candidates"]["current_count"], 1
+        )
+
+        status, graph = self.request("GET", "/v1/projects/GCS/semantic-graph")
+        self.assertEqual(HTTPStatus.OK, status)
+        candidate = next(
+            node
+            for node in graph["nodes"]
+            if node["entity_type"] == "IMPLEMENTATION_MODULE_CANDIDATE"
+            and node["data"]["relative_path"] == "src/broker.py"
+        )
+        self.assertTrue(candidate["projection_only"])
+        self.assertEqual("USER_APPROVAL_REQUIRED", candidate["data"]["promotion_state"])
+
+    def test_background_sync_tracks_add_and_remove(self) -> None:
+        auto_file = self.project_root / "src" / "auto_worker.py"
+        auto_file.write_text("class AutoIndexedSymbol:\n    pass\n", encoding="utf-8")
+
+        deadline = time.monotonic() + 5
+        found = None
+        while time.monotonic() < deadline:
+            status, candidate = self.request(
+                "POST",
+                "/v1/projects/GCS/file-index/search",
+                {
+                    "mode": "MASTER",
+                    "anchor_id": "MASTER-CURRENT-TEST",
+                    "query": "AutoIndexedSymbol",
+                },
+            )
+            if status == HTTPStatus.OK and candidate["search"]["hits"]:
+                found = candidate
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(found)
+        self.assertEqual("src/auto_worker.py", found["search"]["hits"][0]["relative_path"])
+
+        (self.project_root / "src" / "broker.py").unlink()
+        removed = None
+        while time.monotonic() < deadline + 5:
+            status, graph = self.request("GET", "/v1/projects/GCS/semantic-graph")
+            if status == HTTPStatus.OK:
+                removed = next(
+                    (
+                        node
+                        for node in graph["nodes"]
+                        if node["entity_type"] == "IMPLEMENTATION_MODULE_CANDIDATE"
+                        and node["data"]["relative_path"] == "src/broker.py"
+                        and node["lifecycle_state"] == "REMOVED"
+                    ),
+                    None,
+                )
+                if removed is not None:
+                    break
+            time.sleep(0.05)
+        self.assertIsNotNone(removed)
+        self.assertEqual("USER_APPROVAL_REQUIRED", removed["data"]["promotion_state"])
 
 
 if __name__ == "__main__":

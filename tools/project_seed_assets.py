@@ -230,9 +230,33 @@ def load_project_seed_assets(project_root: Path) -> dict[str, Any]:
 
 
 def project_seed_template() -> dict[str, Any]:
+    work_nodes = [
+        {"node_id": "project", "kind": "PROJECT", "title": "Project"},
+        {"node_id": "goal", "kind": "GOAL", "title": "Goal"},
+        {"node_id": "feature", "kind": "FEATURE", "title": "Feature"},
+        {"node_id": "architecture", "kind": "ARCHITECTURE", "title": "Architecture"},
+        {"node_id": "design", "kind": "DESIGN", "title": "Design"},
+        {"node_id": "implementation", "kind": "IMPLEMENTATION", "title": "Implementation"},
+        {"node_id": "test", "kind": "TEST", "title": "Test"},
+        {"node_id": "documentation", "kind": "DOCUMENTATION", "title": "Documentation"},
+    ]
+    work_edges = [
+        {"from_node": work_nodes[index - 1]["node_id"], "to_node": work_nodes[index]["node_id"], "kind": "DEPENDS_ON"}
+        for index in range(1, len(work_nodes))
+    ]
+    living_documents = [
+        {"document_id": "project", "title": "Project brief", "role": "SPECIFICATION", "skeleton_sections": ["Purpose", "Users", "Constraints", "Success measures"]},
+        {"document_id": "goal", "title": "Goal and outcomes", "role": "SPECIFICATION", "skeleton_sections": ["Outcome", "Acceptance", "Progress"]},
+        {"document_id": "feature", "title": "Feature map", "role": "SPECIFICATION", "skeleton_sections": ["Capabilities", "Flows", "Boundaries"]},
+        {"document_id": "architecture", "title": "Architecture", "role": "ARCHITECTURE", "skeleton_sections": ["Components", "Interfaces", "Data", "Decisions"]},
+        {"document_id": "design", "title": "Design", "role": "DESIGN", "skeleton_sections": ["User experience", "States", "Alternatives"]},
+        {"document_id": "implementation", "title": "Implementation plan", "role": "REFERENCE", "skeleton_sections": ["Modules", "Bindings", "Sequence", "Risks"]},
+        {"document_id": "test", "title": "Test and acceptance", "role": "CONTRACT", "skeleton_sections": ["Acceptance matrix", "Coverage", "Results"]},
+        {"document_id": "documentation", "title": "Documentation plan", "role": "REFERENCE", "skeleton_sections": ["Audience", "Guides", "Operations", "Changelog"]},
+    ]
     return {
         "schema": "universe.project-seed-template.v1",
-        "template_id": "project-seed-v1",
+        "template_id": "project-seed-v2",
         "asset_root": ASSET_ROOT.as_posix(),
         "asset_files": {key: value for key, value in ASSET_FILES.items()},
         "owner": "PROJECT_MASTER",
@@ -241,6 +265,16 @@ def project_seed_template() -> dict[str, Any]:
             "functional": "Capabilities, flows, and external boundaries.",
             "implementation": "Packages, modules, classes, services, adapters, and endpoints.",
             "bindings": "Many-to-many functional to implementation evidence links.",
+        },
+        "work_model": {
+            "schema": "universe.project-work-template.v1",
+            "template_id": "project-work-v1",
+            "scope_coordinates": ["project_id", "scope_kind", "node_ref"],
+            "nodes": work_nodes,
+            "edges": work_edges,
+            "living_documents": living_documents,
+            "collector_update_policy": "PROPOSAL_ONLY",
+            "effects": {"project_source_write": "NONE", "project_seed_write": "NONE"},
         },
     }
 

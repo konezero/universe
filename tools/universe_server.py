@@ -78,6 +78,22 @@ from project_seed_assets import (
     load_project_seed_assets,
     project_seed_template,
 )
+from project_work_model import (
+    WORK_SURFACE_SCHEMA,
+    backfill_template_instances,
+    ensure_schema as ensure_project_work_model_schema,
+    ensure_template_instance,
+    list_template_instances,
+)
+from project_rag_freshness import (
+    ProjectRagError,
+    STALE_AFTER_SECONDS,
+    canonical_source_ref,
+    freshness_metadata,
+    normalize_lineage_memory_event,
+    parse_timestamp as parse_rag_timestamp,
+    retrieval_state as rag_retrieval_state,
+)
 from project_seed_apply import build_project_seed_asset_approval
 from project_integration_catalog import (
     ProjectIntegrationCatalogError,
@@ -251,7 +267,10 @@ from universe_file_index import (
     FileIndexError,
     coordinate_from_request,
     index_status,
+    list_graph_candidates,
+    record_sync_state,
     require_mode_current_anchor,
+    resolve_mode_current_anchor,
     search_index,
     sync_index,
 )
@@ -1724,7 +1743,7 @@ def normalize_goal(project_id: str, value: Any, *, updating: bool = False) -> di
         value,
         field="goal",
         required=frozenset(required),
-        optional=frozenset({"goal_id", "universe_goal_id"}),
+        optional=frozenset({"goal_id", "universe_goal_id", "scope_kind", "node_ref"}),
     )
     title = _required_text(request["title"], "title")
     description = request["description"]
@@ -1736,8 +1755,20 @@ def normalize_goal(project_id: str, value: Any, *, updating: bool = False) -> di
     sort_order = request["sort_order"]
     if isinstance(sort_order, bool) or not isinstance(sort_order, int):
         raise UniverseError("GOAL_SORT_ORDER_INVALID", "sort_order must be an integer")
+    scope_kind = _required_text(request.get("scope_kind", "PROJECT"), "scope_kind").upper()
+    if scope_kind not in {"PROJECT", "NODE"}:
+        raise UniverseError("GOAL_SCOPE_INVALID", "scope_kind must be PROJECT or NODE")
+    node_ref = request.get("node_ref")
+    if scope_kind == "PROJECT":
+        if node_ref is not None:
+            raise UniverseError("GOAL_SCOPE_COORDINATE_INVALID", "PROJECT Goal cannot bind a node")
+        normalized_node = None
+    else:
+        normalized_node = _identifier(node_ref, "node_ref")
     normalized = {
         "project_id": _project_id(project_id),
+        "scope_kind": scope_kind,
+        "node_ref": normalized_node,
         "title": title,
         "description": description,
         "owner": _required_text(request["owner"], "owner"),
@@ -4253,30 +4284,13 @@ def build_fresh_project_composition(
         "implementation_workstreams": implementation_workstreams,
         "document_plan": [
             {
-                "document_id": "project-specification",
-                "role": "SPECIFICATION",
-                "title": "Project specification",
-            },
-            {
-                "document_id": "project-design",
-                "role": "DESIGN",
-                "title": "Project design direction",
-            },
-            {
-                "document_id": "project-architecture",
-                "role": "ARCHITECTURE",
-                "title": "Project architecture and implementation bindings",
-            },
-            {
-                "document_id": "project-decisions",
-                "role": "DECISION",
-                "title": "Selected technology and route decisions",
-            },
-            {
-                "document_id": "project-acceptance",
-                "role": "CONTRACT",
-                "title": "Acceptance and completion conditions",
-            },
+                "document_id": item["document_id"],
+                "role": item["role"],
+                "title": item["title"],
+                "skeleton_sections": item["skeleton_sections"],
+                "materialization_state": "SKELETON_READY",
+            }
+            for item in project_seed_template()["work_model"]["living_documents"]
         ],
         "risk_conditions": route["risk_patterns"],
         "selection_state": "USER_SELECTION_REQUIRED",
@@ -4665,6 +4679,7 @@ class UniverseStore:
     def __init__(self, database_path: Path):
         self.database_path = database_path.expanduser().resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file_index_lock = threading.RLock()
         self.release_artifact_root = self.database_path.parent / "release-artifacts"
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
@@ -4792,6 +4807,9 @@ class UniverseStore:
                     project_id TEXT NOT NULL
                         REFERENCES project_connection(project_id)
                         ON DELETE CASCADE,
+                    scope_kind TEXT NOT NULL DEFAULT 'PROJECT'
+                        CHECK(scope_kind IN ('PROJECT', 'NODE')),
+                    node_ref TEXT,
                     universe_goal_id TEXT
                         REFERENCES universe_goal(universe_goal_id)
                         ON DELETE SET NULL,
@@ -5214,6 +5232,41 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_file_index_project_time
                 ON project_file_index(project_id, indexed_at, relative_path);
+
+                CREATE TABLE IF NOT EXISTS project_file_index_sync_state (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    state TEXT NOT NULL CHECK(state IN ('SUCCEEDED', 'FAILED', 'BLOCKED')),
+                    mode TEXT NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    last_attempt_at TEXT NOT NULL,
+                    last_success_at TEXT NOT NULL,
+                    error_code TEXT NOT NULL,
+                    error_detail TEXT NOT NULL,
+                    summary_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS project_file_graph_candidate (
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    relative_path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    candidate_kind TEXT NOT NULL,
+                    lifecycle_state TEXT NOT NULL
+                        CHECK(lifecycle_state IN ('CURRENT', 'REMOVED')),
+                    promotion_state TEXT NOT NULL
+                        CHECK(promotion_state IN ('USER_APPROVAL_REQUIRED')),
+                    first_observed_at TEXT NOT NULL,
+                    last_observed_at TEXT NOT NULL,
+                    removed_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, relative_path)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_file_graph_candidate_project_state
+                ON project_file_graph_candidate(project_id, lifecycle_state, relative_path);
 
                 CREATE TABLE IF NOT EXISTS career_promotion_queue (
                     queue_id TEXT PRIMARY KEY,
@@ -5823,9 +5876,20 @@ class UniverseStore:
                     "ALTER TABLE project_goal ADD COLUMN universe_goal_id TEXT "
                     "REFERENCES universe_goal(universe_goal_id) ON DELETE SET NULL"
                 )
+            if "scope_kind" not in goal_columns:
+                connection.execute(
+                    "ALTER TABLE project_goal ADD COLUMN scope_kind TEXT "
+                    "NOT NULL DEFAULT 'PROJECT'"
+                )
+            if "node_ref" not in goal_columns:
+                connection.execute("ALTER TABLE project_goal ADD COLUMN node_ref TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS project_goal_universe_order "
                 "ON project_goal(universe_goal_id, sort_order, updated_at, goal_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS project_goal_scope_order "
+                "ON project_goal(project_id, scope_kind, node_ref, sort_order, goal_id)"
             )
             connection.execute(
                 """
@@ -6115,6 +6179,12 @@ class UniverseStore:
                         f"ALTER TABLE skill_run_observation "
                         f"ADD COLUMN {column} {definition}"
                     )
+            ensure_project_work_model_schema(connection)
+            backfill_template_instances(
+                connection,
+                template=project_seed_template()["work_model"],
+                now=utc_now(),
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO universe_identity(
@@ -7982,6 +8052,15 @@ class UniverseStore:
                     now,
                 ),
             )
+            ensure_template_instance(
+                connection,
+                project_id=project["project_id"],
+                scope_kind="PROJECT",
+                scope_ref=project["project_id"],
+                title=str(project["metadata"].get("display_name") or project["project_id"]),
+                template=project_seed_template()["work_model"],
+                now=now,
+            )
         return self.get_project(project["project_id"]), created
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -9127,22 +9206,131 @@ class UniverseStore:
             goals.append(goal)
         return goals
 
+    def _validate_goal_scope(self, goal: Mapping[str, Any]) -> None:
+        if goal["scope_kind"] != "NODE":
+            return
+        try:
+            seed = self.get_project_seed(str(goal["project_id"]))
+        except UniverseError as error:
+            if error.code == "PROJECT_SEED_NOT_FOUND":
+                raise UniverseError(
+                    "GOAL_NODE_PROJECT_SEED_REQUIRED",
+                    "NODE Goal requires a current Project Seed",
+                    HTTPStatus.CONFLICT,
+                ) from error
+            raise
+        known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
+        if str(goal["node_ref"]) not in known_nodes:
+            raise UniverseError(
+                "GOAL_NODE_UNKNOWN",
+                f"node_ref is not present in the current Project Seed: {goal['node_ref']}",
+                HTTPStatus.CONFLICT,
+            )
+
+    def project_work_surface(
+        self, project_id: str, *, node_ref: str | None = None
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_node = _identifier(node_ref, "node_ref") if node_ref else None
+        goals = self.list_project_goals(project["project_id"])
+        todos = [
+            item for item in self.list_todos()
+            if item.get("project_id") == project["project_id"]
+        ]
+        try:
+            seed = self.get_project_seed(project["project_id"])
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            seed = None
+        if normalized_node is not None:
+            if seed is None:
+                raise UniverseError(
+                    "WORK_SURFACE_PROJECT_SEED_REQUIRED",
+                    "node work surface requires a current Project Seed",
+                    HTTPStatus.CONFLICT,
+                )
+            known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
+            if normalized_node not in known_nodes:
+                raise UniverseError(
+                    "WORK_SURFACE_NODE_UNKNOWN",
+                    f"node_ref is not present in the current Project Seed: {normalized_node}",
+                    HTTPStatus.NOT_FOUND,
+                )
+        documents = list(seed.get("documents") or []) if seed is not None else []
+        project_documents = [item for item in documents if item.get("project_wide", False)]
+        node_documents = (
+            [item for item in documents if normalized_node in (item.get("node_ids") or [])]
+            if normalized_node is not None
+            else []
+        )
+        with self._connection() as connection:
+            templates = list_template_instances(
+                connection, project_id=project["project_id"]
+            )
+        return {
+            "schema": WORK_SURFACE_SCHEMA,
+            "project_id": project["project_id"],
+            "node_ref": normalized_node,
+            "project": {
+                "goals": [item for item in goals if item["scope_kind"] == "PROJECT"],
+                "todos": [item for item in todos if item["scope_kind"] == "PROJECT"],
+                "documents": project_documents,
+            },
+            "node": (
+                {
+                    "node_ref": normalized_node,
+                    "goals": [
+                        item for item in goals
+                        if item["scope_kind"] == "NODE" and item["node_ref"] == normalized_node
+                    ],
+                    "todos": [
+                        item for item in todos
+                        if item["scope_kind"] == "NODE" and item["node_ref"] == normalized_node
+                    ],
+                    "documents": node_documents,
+                }
+                if normalized_node is not None
+                else None
+            ),
+            "template_instances": templates,
+            "effects": {
+                "project_source_write": "NONE",
+                "project_seed_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+        }
+
     def create_goal(self, project_id: str, value: Any) -> dict[str, Any]:
         self.get_project(project_id)
         goal = normalize_goal(project_id, value)
+        self._validate_goal_scope(goal)
         if goal["universe_goal_id"] is not None:
             self.get_universe_goal(goal["universe_goal_id"])
         goal_id = goal.get("goal_id") or "goal_" + uuid.uuid4().hex
         now = utc_now()
         with self._connection() as connection:
             connection.execute(
-                "INSERT INTO project_goal(goal_id, project_id, universe_goal_id, title, description, owner, "
+                "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, "
                 "state, sort_order, revision, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 (
-                    goal_id, goal["project_id"], goal["universe_goal_id"], goal["title"], goal["description"],
+                    goal_id, goal["project_id"], goal["scope_kind"], goal["node_ref"],
+                    goal["universe_goal_id"], goal["title"], goal["description"],
                     goal["owner"], goal["state"], goal["sort_order"], now, now,
                 ),
+            )
+            ensure_template_instance(
+                connection,
+                project_id=goal["project_id"],
+                scope_kind="GOAL",
+                scope_ref=goal_id,
+                goal_id=goal_id,
+                node_ref=goal["node_ref"],
+                title=goal["title"],
+                template=project_seed_template()["work_model"],
+                now=now,
             )
         return self.get_goal(goal_id)
 
@@ -9158,23 +9346,42 @@ class UniverseStore:
 
     def update_goal(self, goal_id: str, value: Any) -> dict[str, Any]:
         current = self.get_goal(goal_id)
-        goal = normalize_goal(current["project_id"], value, updating=True)
+        body = dict(value) if isinstance(value, Mapping) else value
+        if isinstance(body, dict):
+            body.setdefault("scope_kind", current["scope_kind"])
+            if current["node_ref"] is not None:
+                body.setdefault("node_ref", current["node_ref"])
+        goal = normalize_goal(current["project_id"], body, updating=True)
+        self._validate_goal_scope(goal)
         if goal["universe_goal_id"] is not None:
             self.get_universe_goal(goal["universe_goal_id"])
         now = utc_now()
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE project_goal SET universe_goal_id = ?, title = ?, description = ?, owner = ?, state = ?, "
+                "UPDATE project_goal SET scope_kind = ?, node_ref = ?, universe_goal_id = ?, title = ?, description = ?, owner = ?, state = ?, "
                 "sort_order = ?, revision = revision + 1, updated_at = ? "
                 "WHERE goal_id = ? AND revision = ?",
                 (
-                    goal["universe_goal_id"], goal["title"], goal["description"], goal["owner"], goal["state"],
+                    goal["scope_kind"], goal["node_ref"], goal["universe_goal_id"],
+                    goal["title"], goal["description"], goal["owner"], goal["state"],
                     goal["sort_order"], now, current["goal_id"], goal["revision"],
                 ),
             )
-        if cursor.rowcount != 1:
-            raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed", HTTPStatus.CONFLICT)
+            if cursor.rowcount != 1:
+                raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed", HTTPStatus.CONFLICT)
+            ensure_template_instance(
+                connection,
+                project_id=goal["project_id"],
+                scope_kind="GOAL",
+                scope_ref=current["goal_id"],
+                goal_id=current["goal_id"],
+                node_ref=goal["node_ref"],
+                title=goal["title"],
+                template=project_seed_template()["work_model"],
+                now=now,
+            )
         return self.get_goal(goal_id)
+
 
     def create_milestone(self, goal_id: str, value: Any) -> dict[str, Any]:
         self.get_goal(goal_id)
@@ -9928,6 +10135,7 @@ class UniverseStore:
         """Retrieve trusted Memory and Bench skill evidence for an LLM turn."""
 
         project = self.get_project(project_id)
+        ingestion = self.sync_project_lineage_memories(project["project_id"])
         query_tokens = _retrieval_tokens(query)
         selected_nodes = {
             str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()
@@ -9936,6 +10144,9 @@ class UniverseStore:
         for memory in self.list_project_memories(
             project["project_id"], link_state="LINKED", limit=200
         ):
+            state = rag_retrieval_state(memory)
+            if state == "SUPERSEDED":
+                continue
             memory_tokens = _retrieval_tokens(
                 " ".join(
                     [
@@ -9949,6 +10160,9 @@ class UniverseStore:
             node_match = bool(
                 selected_nodes and str(memory.get("node_ref") or "") in selected_nodes
             )
+            if not shared and not node_match:
+                continue
+            freshness = freshness_metadata(memory.get("updated_at"))
             memory_hits.append(
                 {
                     "memory_id": memory["memory_id"],
@@ -9957,9 +10171,15 @@ class UniverseStore:
                     "node_ref": memory.get("node_ref"),
                     "graph": memory.get("graph"),
                     "origin_ref": memory.get("origin_ref"),
+                    "source_ref": memory.get("origin_ref"),
+                    "created_at": memory.get("created_at"),
+                    "updated_at": memory.get("updated_at"),
+                    "freshness": freshness,
+                    "retrieval_state": state,
                     "match": {
                         "shared_tokens": shared[:20],
                         "node_match": node_match,
+                        "relevance_score": len(shared),
                     },
                 }
             )
@@ -9967,6 +10187,8 @@ class UniverseStore:
             key=lambda item: (
                 -int(item["match"]["node_match"]),
                 -len(item["match"]["shared_tokens"]),
+                int(item["retrieval_state"] == "CONFLICTED"),
+                -parse_rag_timestamp(item["updated_at"]).timestamp(),
                 str(item["memory_id"]),
             )
         )
@@ -10001,6 +10223,8 @@ class UniverseStore:
                 str(observation["model_ref"]),
                 provider_ref,
             )
+            if not shared and not node_match:
+                continue
             candidate = grouped.setdefault(
                 key,
                 {
@@ -10041,13 +10265,44 @@ class UniverseStore:
                 item["candidate_id"],
             ),
         )[: max(1, min(int(skill_limit), 20))]
+        with self._connection() as connection:
+            file_status = index_status(connection, project_id=project["project_id"])
+            file_search = (
+                search_index(
+                    connection,
+                    project_id=project["project_id"],
+                    query=query,
+                    limit=max(1, min(int(memory_limit), 20)),
+                )
+                if query.strip()
+                else {
+                    "schema": "universe.project-file-search.v1",
+                    "project_id": project["project_id"],
+                    "query": query,
+                    "hits": [],
+                    "hit_count": 0,
+                    "scanned": False,
+                }
+            )
         material = {
             "schema": "universe.project-llm-retrieval-context.v1",
             "project_id": project["project_id"],
             "query_digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "file_index": {
+                "policy": "CURRENT_INDEX_PREFERRED",
+                "freshness": file_status,
+                "search": file_search,
+            },
             "memory": {
                 "policy": "LINKED_ONLY",
-                "ranking": "NODE_THEN_TOKEN_THEN_RECENT_BOUNDED",
+                "relevance_policy": "TOKEN_OR_EXPLICIT_NODE_MATCH_REQUIRED",
+                "ranking": "NODE_THEN_RELEVANCE_THEN_STATE_THEN_UPDATED_AT_DESC",
+                "freshness_policy": {
+                    "stale_after_seconds": STALE_AFTER_SECONDS,
+                    "superseded": "EXCLUDED",
+                    "conflicted": "INCLUDED_PENALIZED",
+                },
+                "ingestion": ingestion,
                 "hits": memory_hits[: max(1, min(int(memory_limit), 20))],
             },
             "bench": {
@@ -10080,14 +10335,36 @@ class UniverseStore:
             **used,
         }
 
-    def sync_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        bound = self._require_project_anchor(project_id, payload)
-        with self._connection() as connection:
-            index = sync_index(
-                connection,
-                project_id=bound["project_id"],
-                project_root=Path(bound["project_root"]),
-            )
+    def _sync_project_file_index_bound(self, bound: Mapping[str, str]) -> dict[str, Any]:
+        try:
+            with self._file_index_lock, self._connection() as connection:
+                index = sync_index(
+                    connection,
+                    project_id=bound["project_id"],
+                    project_root=Path(bound["project_root"]),
+                )
+                sync_state = record_sync_state(
+                    connection,
+                    project_id=bound["project_id"],
+                    state="SUCCEEDED",
+                    mode=bound["mode"],
+                    anchor_id=bound["anchor_id"],
+                    summary=index,
+                )
+        except (FileIndexError, OSError) as error:
+            error_code = getattr(error, "error_code", "FILE_INDEX_SYNC_FAILED")
+            detail = getattr(error, "detail", str(error))
+            with self._file_index_lock, self._connection() as connection:
+                record_sync_state(
+                    connection,
+                    project_id=bound["project_id"],
+                    state="FAILED",
+                    mode=bound["mode"],
+                    anchor_id=bound["anchor_id"],
+                    error_code=error_code,
+                    error_detail=detail,
+                )
+            raise UniverseError(error_code, detail) from error
         return {
             "schema": API_SCHEMA,
             "status": "FILE_INDEX_SYNCED",
@@ -10095,7 +10372,48 @@ class UniverseStore:
             "mode": bound["mode"],
             "anchor_id": bound["anchor_id"],
             "index": index,
+            "sync": sync_state,
         }
+
+    def sync_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return self._sync_project_file_index_bound(
+            self._require_project_anchor(project_id, payload)
+        )
+
+    def sync_project_file_index_current(
+        self, project_id: str, *, preferred_mode: str = "MASTER"
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        try:
+            anchor = resolve_mode_current_anchor(
+                Path(project["project_root"]), preferred_mode=preferred_mode
+            )
+        except (FileIndexError, OSError) as error:
+            error_code = getattr(error, "error_code", "FILE_INDEX_SYNC_FAILED")
+            detail = getattr(error, "detail", str(error))
+            with self._file_index_lock, self._connection() as connection:
+                blocked = record_sync_state(
+                    connection,
+                    project_id=project["project_id"],
+                    state="BLOCKED",
+                    mode=preferred_mode,
+                    anchor_id="",
+                    error_code=error_code,
+                    error_detail=detail,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "FILE_INDEX_SYNC_BLOCKED",
+                "project_id": project["project_id"],
+                "sync": blocked,
+            }
+        return self._sync_project_file_index_bound(
+            {
+                "project_id": project["project_id"],
+                "project_root": project["project_root"],
+                **anchor,
+            }
+        )
 
     def search_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         bound = self._require_project_anchor(project_id, payload)
@@ -12247,6 +12565,182 @@ class UniverseStore:
             item["updated_at"] = row["updated_at"]
             items.append(item)
         return items
+
+    def ingest_project_lineage_memory(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            event = normalize_lineage_memory_event(value)
+        except ProjectRagError as error:
+            raise UniverseError(error.code, error.detail) from error
+        if event["project_id"] != project["project_id"]:
+            raise UniverseError(
+                "LINEAGE_MEMORY_PROJECT_MISMATCH",
+                "producer-derived project_id does not match the target project",
+                HTTPStatus.CONFLICT,
+            )
+        source_digest = _json_sha256(event)
+        now = utc_now()
+        node_ref = event["node_ref"] or project["project_id"]
+        material = {
+            "schema": MEMORY_SCHEMA,
+            "project_id": project["project_id"],
+            "title": event["title"],
+            "body": event["summary"],
+            "state": "OBSERVED",
+            "link_state": "LINKED",
+            "node_ref": node_ref,
+            "graph": "functional",
+            "origin_ref": event["source_ref"],
+            "retrieval_state": event["retrieval_state"],
+            "lineage": {
+                "source_kind": event["source_kind"],
+                "event_id": event["event_id"],
+                "event_type": event["event_type"],
+                "source_digest": source_digest,
+                "observed_at": event["observed_at"],
+            },
+            "effects": {
+                "seed_write": "NONE",
+                "candidate": "NONE",
+                "queue_publication": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "RETRIEVAL_READY",
+        }
+        material["memory_digest"] = _json_sha256(material)
+        material["memory_id"] = "memory_" + material["memory_digest"][:24]
+        material["created_at"] = event["observed_at"]
+        material["updated_at"] = event["observed_at"]
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT project_id, memory_json, created_at, updated_at FROM project_memory "
+                "WHERE origin_ref = ? ORDER BY memory_id LIMIT 1",
+                (event["source_ref"],),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["project_id"]) != project["project_id"]:
+                    raise UniverseError(
+                        "LINEAGE_MEMORY_ATTRIBUTION_CONFLICT",
+                        "canonical source_ref is already attributed to another project",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored = json.loads(existing["memory_json"])
+                lineage = stored.get("lineage") if isinstance(stored.get("lineage"), Mapping) else {}
+                if lineage.get("source_digest") != source_digest:
+                    raise UniverseError(
+                        "LINEAGE_MEMORY_SOURCE_CONFLICT",
+                        "source_ref is already bound to different result material",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored["created_at"] = existing["created_at"]
+                stored["updated_at"] = existing["updated_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_memory(
+                    memory_id, project_id, title, body, state, link_state,
+                    node_ref, graph, origin_ref, memory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'LINKED', ?, 'functional', ?, ?, ?, ?)
+                """,
+                (
+                    material["memory_id"], project["project_id"], material["title"],
+                    material["body"], material["state"], material["node_ref"],
+                    material["origin_ref"], _canonical_json(material),
+                    material["created_at"], material["updated_at"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO semantic_collection_cursor(
+                    project_id, source_kind, last_event_id, last_event_type,
+                    source_digest, observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_event_type = excluded.last_event_type,
+                    source_digest = excluded.source_digest,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project["project_id"], event["source_kind"], event["event_id"],
+                    event["event_type"], source_digest, event["observed_at"], now,
+                ),
+            )
+        return material, True
+
+    def sync_project_lineage_memories(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        events: list[dict[str, Any]] = []
+        with self._connection() as connection:
+            room_rows = connection.execute(
+                "SELECT message_id, message_json, created_at FROM project_room_message "
+                "WHERE project_id = ? ORDER BY created_at, message_id",
+                (project["project_id"],),
+            ).fetchall()
+            delegation_rows = connection.execute(
+                "SELECT delegation_id, state, result_json, completed_at FROM conductor_delegation "
+                "WHERE project_id = ? AND state IN ('COMPLETED', 'FAILED') "
+                "ORDER BY completed_at, delegation_id",
+                (project["project_id"],),
+            ).fetchall()
+        for row in room_rows:
+            message = json.loads(row["message_json"])
+            if str(message.get("kind") or "").upper() != "RESULT":
+                continue
+            events.append({
+                "project_id": project["project_id"],
+                "producer_kind": "UNIVERSE_STORE",
+                "source_kind": "ROOM_RESULT",
+                "event_id": str(row["message_id"]),
+                "event_type": "RESULT_ATTACHED",
+                "title": f"Project Room result · {row['message_id']}",
+                "summary": str(message.get("body") or "")[:2000],
+                "source_ref": canonical_source_ref("ROOM_RESULT", str(row["message_id"])),
+                "observed_at": str(row["created_at"]),
+            })
+        for row in delegation_rows:
+            result = json.loads(row["result_json"])
+            summary = str(result.get("summary") or result.get("reason") or "").strip()
+            if not summary:
+                continue
+            events.append({
+                "project_id": project["project_id"],
+                "producer_kind": "UNIVERSE_STORE",
+                "source_kind": "CONDUCTOR_RESULT",
+                "event_id": str(row["delegation_id"]),
+                "event_type": str(row["state"]),
+                "title": f"Conductor result · {row['delegation_id']}",
+                "summary": summary[:2000],
+                "source_ref": canonical_source_ref("CONDUCTOR_RESULT", str(row["delegation_id"])),
+                "observed_at": str(row["completed_at"]),
+            })
+        created = replayed = failed = 0
+        diagnostics: list[dict[str, str]] = []
+        for event in events:
+            try:
+                _, was_created = self.ingest_project_lineage_memory(project["project_id"], event)
+                created += int(was_created)
+                replayed += int(not was_created)
+            except UniverseError as error:
+                failed += 1
+                diagnostics.append({"event_id": str(event["event_id"]), "error_code": error.code})
+        return {
+            "schema": "universe.project-lineage-memory-sync.v1",
+            "status": "COMPLETE" if failed == 0 else "PARTIAL",
+            "project_id": project["project_id"],
+            "last_event_id": str(events[-1]["event_id"]) if events else None,
+            "observed_count": len(events),
+            "created_count": created,
+            "replayed_count": replayed,
+            "failed_count": failed,
+            "diagnostics": diagnostics[:20],
+            "source_policy": "AUTHORITATIVE_TERMINAL_RESULTS_ONLY",
+            "notification_text": "EXCLUDED",
+        }
 
     def get_project_memory(self, project_id: str, memory_id: str) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -15019,6 +15513,31 @@ class UniverseStore:
             "universe://",
             {"scope_kind": "UNIVERSE"},
         )
+        with self._connection() as connection:
+            file_candidates = list_graph_candidates(
+                connection, project_id=project_id, include_removed=True
+            )
+        for candidate in file_candidates:
+            relative_path = str(candidate["relative_path"])
+            source_ref = (
+                f"universe://projects/{quote(project_id, safe='')}/file-index/candidates/"
+                f"{quote(relative_path, safe='')}"
+            )
+            candidate_node = add_node(
+                "IMPLEMENTATION_MODULE_CANDIDATE",
+                f"{project_id}:{relative_path}",
+                relative_path,
+                str(candidate["lifecycle_state"]),
+                "FILE_INDEX_GRAPH_RECONCILE",
+                source_ref,
+                candidate,
+            )
+            add_edge(
+                "PROJECT_HAS_IMPLEMENTATION_CANDIDATE",
+                project_node,
+                candidate_node,
+                source_ref,
+            )
         for cursor in self.list_semantic_collection_cursors(project_id, limit=100):
             source_kind = str(cursor.get("source_kind") or "UNKNOWN")
             cursor_node = add_node(
@@ -15297,6 +15816,7 @@ class UniverseStore:
         }
         universe_goal_nodes: dict[str, str] = {}
         goals = self.list_project_goals(project_id)
+        goal_nodes_by_node_ref: dict[str, list[str]] = {}
         assigned_todos: set[str] = set()
         for goal in goals:
             goal_id = str(goal["goal_id"])
@@ -15306,6 +15826,8 @@ class UniverseStore:
                 f"universe://goals/{goal_id}", goal,
             )
             add_edge("PROJECT_HAS_GOAL", project_node, goal_node, f"universe://goals/{goal_id}")
+            if goal.get("scope_kind") == "NODE" and goal.get("node_ref"):
+                goal_nodes_by_node_ref.setdefault(str(goal["node_ref"]), []).append(goal_node)
             universe_goal_id = goal.get("universe_goal_id")
             universe_goal = universe_goals.get(str(universe_goal_id)) if universe_goal_id else None
             if universe_goal is not None:
@@ -15421,6 +15943,13 @@ class UniverseStore:
                 )
                 functional_nodes[functional_id] = functional_node
                 add_edge("PROJECT_HAS_FUNCTIONAL_NODE", project_node, functional_node, seed_ref)
+                for scoped_goal_node in goal_nodes_by_node_ref.get(functional_id, []):
+                    add_edge(
+                        "FUNCTIONAL_NODE_HAS_GOAL",
+                        functional_node,
+                        scoped_goal_node,
+                        seed_ref,
+                    )
             for functional_edge in project_seed.get("edges") or []:
                 if not isinstance(functional_edge, Mapping):
                     continue
@@ -18580,6 +19109,8 @@ class UniverseStore:
             "schema": GOAL_SCHEMA,
             "goal_id": row["goal_id"],
             "project_id": row["project_id"],
+            "scope_kind": row["scope_kind"],
+            "node_ref": row["node_ref"],
             "universe_goal_id": row["universe_goal_id"],
             "title": row["title"],
             "description": row["description"],
@@ -19125,6 +19656,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         memory_scheduler_clock: Any = None,
         memory_scheduler_poll_seconds: float = 30.0,
         auto_start_memory_scheduler: bool = True,
+        auto_start_file_index_sync: bool = False,
+        file_index_poll_seconds: float = 5.0,
         use_pty_supervisor: bool = False,
     ):
         self.store = store
@@ -19181,6 +19714,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             clock=memory_scheduler_clock,
         )
         self._auto_start_memory_scheduler = bool(auto_start_memory_scheduler)
+        self._auto_start_file_index_sync = bool(auto_start_file_index_sync)
+        self._file_index_poll_seconds = max(
+            0.05, min(float(file_index_poll_seconds), 300.0)
+        )
+        self._file_index_sync_stop = threading.Event()
+        self._file_index_sync_last_run: dict[str, Any] | None = None
         python_tool = self.host_profile.resolve("python")
         self.continuity_coordinator = (
             ProjectContinuityCoordinator(
@@ -19367,6 +19906,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         if self._auto_start_memory_scheduler:
             self._memory_scheduler_worker.start()
+        self._file_index_sync_worker = threading.Thread(
+            target=self._file_index_sync_loop,
+            name="universe-file-index-sync",
+            daemon=True,
+        )
+        if self._auto_start_file_index_sync:
+            self._file_index_sync_worker.start()
         self._supervisor_maintenance_stop = threading.Event()
         self._supervisor_maintenance_last_run: dict[str, Any] | None = None
         self._supervisor_maintenance_worker = threading.Thread(
@@ -19391,6 +19937,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
+
+    def run_file_index_sync_once(self) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        for project in self.store.list_projects():
+            if self._file_index_sync_stop.is_set():
+                break
+            try:
+                results.append(
+                    self.store.sync_project_file_index_current(project["project_id"])
+                )
+            except Exception as error:  # noqa: BLE001 - isolate projects
+                results.append(
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FILE_INDEX_SYNC_FAILED",
+                        "project_id": project.get("project_id"),
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+        return {
+            "schema": "universe.file-index-sync-tick.v1",
+            "status": "FILE_INDEX_SYNC_TICK_COMPLETED",
+            "observed_at": utc_now(),
+            "results": results,
+        }
+
+    def _file_index_sync_loop(self) -> None:
+        while not self._file_index_sync_stop.is_set():
+            try:
+                self._file_index_sync_last_run = self.run_file_index_sync_once()
+            except Exception as error:  # noqa: BLE001 - preserve worker availability
+                self._file_index_sync_last_run = {
+                    "schema": "universe.file-index-sync-tick.v1",
+                    "status": "FILE_INDEX_SYNC_WORKER_ERROR",
+                    "observed_at": utc_now(),
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            if self._file_index_sync_stop.wait(self._file_index_poll_seconds):
+                break
 
     def resolve_todo_mutation_session(
         self,
@@ -27404,6 +27989,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     }
                 )
 
+        self._file_index_sync_stop.set()
+        if self._file_index_sync_worker.is_alive():
+            close_step(
+                "file_index_sync_worker",
+                lambda: self._file_index_sync_worker.join(timeout=5),
+            )
+            if self._file_index_sync_worker.is_alive():
+                self._shutdown_errors.append(
+                    {
+                        "component": "file_index_sync_worker",
+                        "error": "TimeoutError: file index sync did not stop before shutdown",
+                    }
+                )
         self._remote_access_resume_stop.set()
         if self._remote_access_resume_worker.is_alive():
             close_step(
@@ -28090,6 +28688,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "UNIVERSE_GOAL_PLAN_COLLECTED",
                         "goals": self.server.store.list_universe_goals(),
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_work_surface = re.fullmatch(r"/v1/projects/([^/]+)/work-surface", path)
+        if project_work_surface is not None:
+            try:
+                query = parse_qs(urlsplit(self.path).query)
+                node_ref = str(query.get("node_ref", [""])[0]).strip() or None
+                surface = self.server.store.project_work_surface(
+                    unquote(project_work_surface.group(1)), node_ref=node_ref
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_WORK_SURFACE_COLLECTED",
+                        "work_surface": surface,
                         "task_frame_created": False,
                         "execution_assignment_created": False,
                     },
@@ -32200,6 +32819,8 @@ def create_server(
     remote_connector_config_path: Path | None = None,
     directory_selector: Callable[[], str | None] | None = None,
     file_selector: Callable[[str], str | None] | None = None,
+    auto_start_file_index_sync: bool = False,
+    file_index_poll_seconds: float = 5.0,
     use_pty_supervisor: bool = False,
 ) -> UniverseHTTPServer:
     try:
@@ -32235,6 +32856,8 @@ def create_server(
         remote_connector_config_path=remote_connector_config_path,
         directory_selector=directory_selector,
         file_selector=file_selector,
+        auto_start_file_index_sync=auto_start_file_index_sync,
+        file_index_poll_seconds=file_index_poll_seconds,
         use_pty_supervisor=use_pty_supervisor,
     )
 
@@ -33547,6 +34170,7 @@ def main() -> int:
                 mode_contract=mode_contract,
                 auto_start_conductor_runtime=False,
                 service_state_path=args.state_file,
+                auto_start_file_index_sync=True,
                 use_pty_supervisor=True,
             )
             host, port = server.server_address[:2]
