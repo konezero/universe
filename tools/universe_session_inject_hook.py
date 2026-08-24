@@ -1170,6 +1170,7 @@ def repair_claude_compat_observer_stamps(
 def setup_provider_hooks(
     repo_root: Path,
     *,
+    project_id: str | None = None,
     global_: bool = False,
     providers: list[str] | None = None,
     python_exe: str | None = None,
@@ -1234,11 +1235,44 @@ def setup_provider_hooks(
                 results["CLAUDE"] = {"status": "ERROR", "detail": str(error)}
 
     repairs = repair_claude_compat_observer_stamps(repo_root, environment=environment)
+    try:
+        from universe_file_index import (
+            resolve_mode_current_anchor,
+            sync_project_index_from_hook,
+        )
+        from universe_project_index_git_hook import install_git_hooks
+
+        normalized_project_id = project_id or repo_root.resolve().name
+        project_index_git_hooks = install_git_hooks(
+            project_id=normalized_project_id,
+            project_root=repo_root,
+            mode="MASTER",
+            python_exe=Path(py),
+        )
+        anchor = resolve_mode_current_anchor(repo_root, preferred_mode="MASTER")
+        project_index_bootstrap = sync_project_index_from_hook(
+            project_id=normalized_project_id,
+            project_root=repo_root,
+            mode=anchor["mode"],
+            anchor_id=anchor["anchor_id"],
+        )
+    except Exception as error:  # noqa: BLE001 - setup remains best-effort
+        if "project_index_git_hooks" not in locals():
+            project_index_git_hooks = {
+                "status": "PROJECT_INDEX_GIT_HOOK_SETUP_FAILED",
+                "detail": f"{type(error).__name__}: {error}",
+            }
+        project_index_bootstrap = {
+            "status": "PROJECT_INDEX_BOOTSTRAP_DEFERRED",
+            "detail": f"{type(error).__name__}: {error}",
+        }
     return {
         "status": "SETUP_HOOKS_DONE",
         "global": global_,
         "providers": results,
         "repairs": repairs,
+        "project_index_git_hooks": project_index_git_hooks,
+        "project_index_bootstrap": project_index_bootstrap,
     }
 
 
@@ -1248,6 +1282,7 @@ def main(argv: list[str] | None = None) -> int:
     if raw and raw[0] == "setup-hooks":
         sub = argparse.ArgumentParser(description="Write SessionStart hook configs for Codex/Grok/Claude")
         sub.add_argument("--repo-root", type=Path, default=Path.cwd())
+        sub.add_argument("--project-id", default="")
         sub.add_argument("--global", dest="global_", action="store_true", help="Write to global home config dirs")
         sub.add_argument("--providers", nargs="+", default=["CODEX", "GROK", "CLAUDE"], metavar="PROVIDER")
         sub.add_argument("--python", dest="python_exe", default="")
@@ -1255,6 +1290,7 @@ def main(argv: list[str] | None = None) -> int:
         args = sub.parse_args(raw[1:])
         result = setup_provider_hooks(
             args.repo_root.expanduser().resolve(),
+            project_id=args.project_id or None,
             global_=args.global_,
             providers=args.providers,
             python_exe=args.python_exe or None,

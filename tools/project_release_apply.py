@@ -192,6 +192,12 @@ def apply_project_release_proposal(
             str(error),
         ) from error
 
+    project_index = _sync_project_index_after_release(
+        project_root=root,
+        project_id=normalized_proposal["project_id"],
+        changed=[*install_result["changed"], {"path": install_result["state_path"]}],
+    )
+
     material = {
         "project_id": normalized_proposal["project_id"],
         "proposal_id": normalized_proposal["proposal_id"],
@@ -208,7 +214,46 @@ def apply_project_release_proposal(
         "status": "PROJECT_RELEASE_APPLIED",
         **material,
         "receipt_digest": _digest(material),
+        "project_index": project_index,
     }
+
+
+def _sync_project_index_after_release(
+    *,
+    project_root: Path,
+    project_id: str,
+    changed: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Best-effort incremental handoff after the Release writer is complete."""
+    try:
+        from universe_file_index import (
+            resolve_mode_current_anchor,
+            sync_project_index_from_hook,
+        )
+
+        anchor = resolve_mode_current_anchor(project_root, preferred_mode="MASTER")
+        paths = [
+            str(item.get("path") or "").strip()
+            for item in changed
+            if str(item.get("path") or "").strip()
+        ]
+        result = sync_project_index_from_hook(
+            project_id=project_id,
+            project_root=project_root,
+            mode=anchor["mode"],
+            anchor_id=anchor["anchor_id"],
+            changed_paths=paths,
+        )
+        return {
+            "status": "PROJECT_INDEX_RELEASE_EVENT_SYNCED",
+            "changed_paths": paths,
+            "result": result,
+        }
+    except Exception as error:  # noqa: BLE001 - install remains authoritative
+        return {
+            "status": "PROJECT_INDEX_RELEASE_EVENT_DEFERRED",
+            "detail": f"{type(error).__name__}: {error}",
+        }
 
 
 def apply_project_release_plan(
@@ -281,6 +326,7 @@ def apply_project_release_plan(
             "proposal_id",
             "proposal_digest",
             "approval_evidence_ref",
+            "project_index",
         }
     }
     direct_material["instruction_ref"] = normalized_instruction_ref
@@ -289,6 +335,7 @@ def apply_project_release_plan(
         "status": "PROJECT_RUNTIME_LIFECYCLE_APPLIED",
         **direct_material,
         "receipt_digest": _digest(direct_material),
+        "project_index": legacy_receipt["project_index"],
     }
 
 

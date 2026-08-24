@@ -45,8 +45,20 @@ Each project owns this database:
 `universe_project_index_hook.py` is the writer. A normalized file-change hook
 passes `changed_paths` and only those rows are fingerprinted, inserted,
 updated, or removed. An omitted `changed_paths` performs the initial full
-bootstrap. `.git`, dependency caches, and Runtime tmp/session/task-frame
-stores are skipped.
+bootstrap. The explicit "Setup CLI Hooks" flow installs project-local
+`post-commit`, `post-checkout`, `post-merge`, and `post-rewrite` hooks and
+performs that bootstrap once a Mode Current Anchor exists. Existing unrelated
+Git hooks are reported as conflicts and are never overwritten.
+
+Committed project files and allowlisted `.ai` text surfaces are indexed. The
+allowlist covers agent, Core, distribution, governance, memory, Skill,
+template, Universe, project-instance, reference-runtime, and Runtime-tool
+directories. A non-Git writer such as Release installation hands its exact
+changed-path receipt to the same incremental writer after the write completes.
+`.git`, dependency caches, Runtime tmp/state/session/task-frame/Release DB
+stores, and SQLite WAL/SHM files are skipped. Runtime databases require
+separate row/cursor collectors; raw database files are never treated as text
+index input.
 
 The database seals its schema, canonical project root, and project ID in
 `project_index_identity`. Universe verifies that identity and opens it with

@@ -25,6 +25,19 @@ class UniverseFileIndexTests(unittest.TestCase):
     def test_skips_runtime_tmp_and_git(self) -> None:
         self.assertTrue(should_skip(".git/HEAD"))
         self.assertTrue(should_skip(".ai/runtime/tmp/foo.json"))
+        self.assertTrue(should_skip(".ai/runtime/state/project_runtime.sqlite3"))
+        self.assertTrue(should_skip(".ai/runtime/session_store/session.sqlite3"))
+        self.assertTrue(should_skip(".ai/runtime/task_frames/frame.sqlite3-wal"))
+        self.assertTrue(should_skip(".ai/runtime/release_db/release.sqlite3"))
+        self.assertTrue(should_skip(".ai/inbox/MASTER/message.json"))
+        self.assertFalse(should_skip(".ai/skills/common/example/SKILL.md"))
+        self.assertFalse(should_skip(".ai/core/README.md"))
+        self.assertFalse(
+            should_skip(".ai/runtime/reference_runtime/contracts/frame.md")
+        )
+        self.assertFalse(
+            should_skip(".ai/runtime/project_instance/boot_command_entry.md")
+        )
         self.assertTrue(should_skip("src/__pycache__/mod.pyc"))
         self.assertFalse(should_skip("src/app.py"))
 

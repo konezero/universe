@@ -29,7 +29,6 @@ IMPLEMENTATION_SUFFIXES = {
 }
 
 SKIP_DIR_NAMES = {
-    ".ai",
     ".artifacts",
     ".git",
     ".hg",
@@ -46,6 +45,21 @@ SKIP_DIR_NAMES = {
     "node_modules",
     "venv",
 }
+
+AI_TEXT_INDEX_PREFIXES = (
+    ".ai/adapters/",
+    ".ai/agents/",
+    ".ai/core/",
+    ".ai/distribution/",
+    ".ai/governance/",
+    ".ai/memory/",
+    ".ai/skills/",
+    ".ai/templates/",
+    ".ai/universe/",
+    ".ai/runtime/project_instance/",
+    ".ai/runtime/reference_runtime/",
+    ".ai/runtime/tools/",
+)
 
 SKIP_RELATIVE_PREFIXES = (
     ".ai/runtime/tmp/",
@@ -307,6 +321,19 @@ def _normalize_relative(path: Path) -> str:
 
 def should_skip(relative_path: str) -> bool:
     normalized = _normalize_relative(Path(relative_path))
+    if normalized == ".ai":
+        return False
+    if normalized.startswith(".ai/"):
+        allowed = any(
+            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+            for prefix in AI_TEXT_INDEX_PREFIXES
+        )
+        ancestor = any(
+            prefix.startswith(normalized.rstrip("/") + "/")
+            for prefix in AI_TEXT_INDEX_PREFIXES
+        )
+        if not allowed and not ancestor:
+            return True
     parts = normalized.split("/")
     if any(part in SKIP_DIR_NAMES for part in parts):
         return True

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -208,6 +209,10 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertEqual("FRESH_INSTALL", receipt["operation"])
         self.assertIn("changed_count", receipt)
         self.assertGreater(receipt["changed_count"], 0)
+        self.assertEqual(
+            "PROJECT_INDEX_RELEASE_EVENT_DEFERRED",
+            receipt["project_index"]["status"],
+        )
         state_file = (
             self.project
             / ".ai"
@@ -244,6 +249,51 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertNotIn("proposal_id", receipt)
         self.assertNotIn("proposal_digest", receipt)
         self.assertNotIn("approval_evidence_ref", receipt)
+
+    def test_release_event_indexes_changed_ai_text_when_anchor_exists(self) -> None:
+        state = self.project / ".ai" / "runtime" / "state"
+        state.mkdir(parents=True)
+        connection = sqlite3.connect(state / "project_runtime.sqlite3")
+        connection.execute(
+            "CREATE TABLE mode_current_anchor (mode TEXT PRIMARY KEY, frame_id TEXT, anchor_id TEXT, state TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO mode_current_anchor VALUES ('MASTER', 'current', 'MASTER-CURRENT-1', 'CURRENT')"
+        )
+        connection.commit()
+        connection.close()
+        proposal = self._proposal()
+        approval = build_project_release_approval(
+            project_id="demo",
+            proposal=proposal,
+            evidence_ref="universe://approval/demo",
+        )
+
+        receipt = apply_project_release_proposal(
+            project_root=self.project,
+            project_id="demo",
+            proposal=proposal,
+            approval=approval,
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+
+        self.assertEqual(
+            "PROJECT_INDEX_RELEASE_EVENT_SYNCED",
+            receipt["project_index"]["status"],
+        )
+        index = sqlite3.connect(
+            self.project / ".ai" / "runtime" / "state" / "project_file_index.sqlite3"
+        )
+        try:
+            row = index.execute(
+                "SELECT text_excerpt FROM project_file_index WHERE relative_path = ?",
+                (".ai/core/CORE_SURFACE_REGISTRY.md",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIn("# Core", row[0])
+        finally:
+            index.close()
 
     def test_collision_blocks_apply_for_unmanaged_modified_file(self) -> None:
         proposal = self._proposal()
