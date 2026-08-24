@@ -646,7 +646,7 @@ class ProjectModeCoordinator:
             "mutation_scope": normalized_frame["mutation_scope"],
             "fallback_reason": "NONE",
             "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
-            "turns": normalized_frame["turns"],
+            "turns": self._runtime_execution_turns(normalized_frame["turns"]),
         }
         proposal_result = self._invoke(
             (
@@ -838,7 +838,7 @@ class ProjectModeCoordinator:
             "mutation_scope": normalized_frame["mutation_scope"],
             "fallback_reason": "NONE",
             "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
-            "turns": normalized_frame["turns"],
+            "turns": self._runtime_execution_turns(normalized_frame["turns"]),
         }
         proposal_result = self._invoke(
             (
@@ -1600,6 +1600,22 @@ class ProjectModeCoordinator:
         return dict(output)
 
     @staticmethod
+    def _runtime_execution_turns(
+        turns: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Preserve Host metadata while projecting semantic workers to Runtime Sub roles."""
+
+        projected: list[dict[str, Any]] = []
+        for turn in turns:
+            runtime_turn = dict(turn)
+            runtime_turn["role"] = (
+                "BOSS" if str(turn.get("role") or "").strip().upper() == "BOSS"
+                else "SUB_REVIEWER"
+            )
+            projected.append(runtime_turn)
+        return projected
+
+    @staticmethod
     def _sequential_declared_turns(turns: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Project semantic Host roles into the Runtime's Boss/Sub topology."""
 
@@ -1628,7 +1644,7 @@ class ProjectModeCoordinator:
                     raise ProjectMasterHostError(
                         "DESCENDANT_TASK_FRAME_BOSS_TOPOLOGY_INVALID"
                     )
-                runtime_role = role
+                runtime_role = "SUB_REVIEWER"
                 inputs = [previous_turn_id]
             declared.append(
                 {

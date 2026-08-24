@@ -3964,12 +3964,30 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            ["BOSS", "IMPLEMENTER", "SECURITY_REVIEWER", "QA_REVIEWER"],
+            ["BOSS", "SUB_REVIEWER", "SUB_REVIEWER", "SUB_REVIEWER"],
             [turn["role"] for turn in declared],
         )
         self.assertEqual(
             [[], ["boss"], ["implement"], ["security"]],
             [turn["input_turn_ids"] for turn in declared],
+        )
+        execution_turns = ProjectModeCoordinator._runtime_execution_turns(
+            [
+                {"turn_id": "boss", "role": "BOSS", "provider": "CLAUDE"},
+                {
+                    "turn_id": "security",
+                    "role": "SECURITY_REVIEWER",
+                    "provider": "CLAUDE",
+                },
+            ]
+        )
+        self.assertEqual(
+            ["BOSS", "SUB_REVIEWER"],
+            [turn["role"] for turn in execution_turns],
+        )
+        self.assertEqual(
+            ["CLAUDE", "CLAUDE"],
+            [turn["provider"] for turn in execution_turns],
         )
     def test_approved_descendant_rejects_target_outside_primary_roots(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
