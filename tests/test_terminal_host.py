@@ -391,6 +391,53 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(8, len(bounded["chunks"]))
         host.close(terminal_id)
 
+    def test_screen_snapshot_tracks_split_unicode_and_fullscreen_cursor_updates(self) -> None:
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+        created = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            provider="CODEX",
+        )
+        terminal_id = created["terminal_id"]
+        host.emit_output(terminal_id, b"shell history\r\n")
+        host.emit_output(terminal_id, b"\x1b[?1049h\x1b[2J\x1b[H")
+        host.emit_output(terminal_id, b"\x1b(B\x1bPignored-control\x1b\\")
+        encoded = "상태: 대기".encode("utf-8")
+        host.emit_output(terminal_id, b"\x1b[32m" + encoded[:1])
+        host.emit_output(terminal_id, encoded[1:] + b"\x1b[0m")
+        host.emit_output(terminal_id, b"\x1b[2;5H\x1b[31mREADY\x1b[0m")
+        host.emit_output(terminal_id, b"\x1b[1;1HOK")
+
+        snapshot = base64.b64decode(
+            host.terminal_snapshot(terminal_id)["data_base64"]
+        ).decode("utf-8")
+        self.assertTrue(snapshot.startswith("\x1b[2J\x1b[H"))
+        self.assertIn("OK태: 대기", snapshot)
+        self.assertIn("    READY", snapshot)
+        self.assertNotIn("shell history", snapshot)
+        self.assertNotIn("ignored-control", snapshot)
+        self.assertTrue(snapshot.endswith("\x1b[1;3H"))
+        late = host.subscribe(terminal_id)
+        self.assertEqual(snapshot.encode("utf-8"), late.get(timeout=0.2))
+        host.unsubscribe(terminal_id, late)
+
+        history = b"".join(
+            base64.b64decode(chunk["data_base64"])
+            for chunk in host.history(terminal_id, limit=100)["chunks"]
+        )
+        self.assertIn(b"shell history", history)
+        self.assertIn(b"\x1b[?1049h", history)
+        self.assertIn(encoded, history)
+
+        host.emit_output(terminal_id, b"\x1b[?1049l")
+        restored = base64.b64decode(
+            host.terminal_snapshot(terminal_id)["data_base64"]
+        ).decode("utf-8")
+        self.assertIn("shell history", restored)
+        self.assertNotIn("READY", restored)
+        host.close(terminal_id)
+
     def test_durable_audit_distinguishes_control_close_and_backend_exit(self) -> None:
         database_path = Path(tempfile.mkdtemp(prefix="terminal-audit-")) / "audit.sqlite3"
         pty = FakePty()

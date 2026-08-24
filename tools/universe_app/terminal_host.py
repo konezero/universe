@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import json
 import os
 import queue
@@ -12,6 +13,7 @@ import secrets
 import uuid
 import threading
 import time
+import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from collections.abc import Callable, Mapping
@@ -38,8 +40,6 @@ TERMINAL_HISTORY_MAX_BYTES = 4 * 1024 * 1024
 TERMINAL_HISTORY_CHUNK_BYTES = 32 * 1024
 TERMINAL_HISTORY_PAGE_LIMIT = 100
 TERMINAL_HISTORY_PAGE_MAX_BYTES = 256 * 1024
-TERMINAL_SNAPSHOT_ROWS = 100
-TERMINAL_SNAPSHOT_MAX_BYTES = 512 * 1024
 
 # Matches ANSI CSI (`ESC[...letter`) and OSC (`ESC]...BEL`/`ESC]...ESC\`)
 # sequences so terminal output can be checked as plain text.
@@ -49,6 +49,257 @@ _ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07
 # space, so after stripping escapes the words land back to back with no
 # separator at all - hence no `\s*` between "local" and "development" below.
 _DEV_CHANNEL_PROMPT_RE = re.compile(rb"localdevelopment", re.IGNORECASE)
+
+
+class TerminalScreenProjection:
+    """Small VT screen model used only to create bounded reconnect snapshots."""
+
+    def __init__(self, cols: int, rows: int) -> None:
+        self.cols = max(1, int(cols))
+        self.rows = max(1, int(rows))
+        self.grid = self._blank_grid()
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.saved_cursor = (0, 0)
+        self._main_state: tuple[list[list[str]], int, int] | None = None
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._escape_mode = ""
+        self._escape_buffer = ""
+
+    def _blank_grid(self) -> list[list[str]]:
+        return [[" "] * self.cols for _ in range(self.rows)]
+
+    def _scroll_up(self, count: int = 1) -> None:
+        for _index in range(max(1, count)):
+            self.grid.pop(0)
+            self.grid.append([" "] * self.cols)
+
+    def _scroll_down(self, count: int = 1) -> None:
+        for _index in range(max(1, count)):
+            self.grid.pop()
+            self.grid.insert(0, [" "] * self.cols)
+
+    def _linefeed(self) -> None:
+        if self.cursor_y >= self.rows - 1:
+            self._scroll_up()
+        else:
+            self.cursor_y += 1
+
+    def _put(self, char: str) -> None:
+        if not char or ord(char) < 0x20:
+            return
+        if unicodedata.combining(char):
+            if self.cursor_x > 0:
+                self.grid[self.cursor_y][self.cursor_x - 1] += char
+            return
+        width = 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        if self.cursor_x >= self.cols or (width == 2 and self.cursor_x == self.cols - 1):
+            self.cursor_x = 0
+            self._linefeed()
+        row = self.grid[self.cursor_y]
+        if row[self.cursor_x] == "" and self.cursor_x > 0:
+            row[self.cursor_x - 1] = " "
+        if self.cursor_x + 1 < self.cols and row[self.cursor_x + 1] == "":
+            row[self.cursor_x + 1] = " "
+        row[self.cursor_x] = char
+        if width == 2 and self.cursor_x + 1 < self.cols:
+            self.grid[self.cursor_y][self.cursor_x + 1] = ""
+        self.cursor_x += width
+
+    @staticmethod
+    def _params(raw: str) -> tuple[bool, list[int]]:
+        private = raw.startswith("?")
+        body = raw[1:] if private else raw
+        values = []
+        for token in body.split(";") if body else []:
+            try:
+                values.append(int(token or "0"))
+            except ValueError:
+                values.append(0)
+        return private, values
+
+    @staticmethod
+    def _value(values: list[int], index: int, default: int = 1) -> int:
+        if index >= len(values) or values[index] == 0:
+            return default
+        return values[index]
+
+    def _clear_display(self, mode: int) -> None:
+        if mode in {2, 3}:
+            self.grid = self._blank_grid()
+            return
+        if mode == 1:
+            for row in range(self.cursor_y):
+                self.grid[row] = [" "] * self.cols
+            self.grid[self.cursor_y][: self.cursor_x + 1] = [" "] * (self.cursor_x + 1)
+            return
+        self.grid[self.cursor_y][self.cursor_x :] = [" "] * (self.cols - self.cursor_x)
+        for row in range(self.cursor_y + 1, self.rows):
+            self.grid[row] = [" "] * self.cols
+
+    def _clear_line(self, mode: int) -> None:
+        if mode == 2:
+            self.grid[self.cursor_y] = [" "] * self.cols
+        elif mode == 1:
+            self.grid[self.cursor_y][: self.cursor_x + 1] = [" "] * (self.cursor_x + 1)
+        else:
+            self.grid[self.cursor_y][self.cursor_x :] = [" "] * (self.cols - self.cursor_x)
+
+    def _alternate_screen(self, enabled: bool) -> None:
+        if enabled:
+            if self._main_state is None:
+                self._main_state = ([row[:] for row in self.grid], self.cursor_x, self.cursor_y)
+            self.grid = self._blank_grid()
+            self.cursor_x = 0
+            self.cursor_y = 0
+        elif self._main_state is not None:
+            self.grid, self.cursor_x, self.cursor_y = self._main_state
+            self._main_state = None
+
+    def _csi(self, raw: str, final: str) -> None:
+        private, values = self._params(raw)
+        amount = self._value(values, 0)
+        if final in {"H", "f"}:
+            self.cursor_y = min(self.rows - 1, self._value(values, 0) - 1)
+            self.cursor_x = min(self.cols - 1, self._value(values, 1) - 1)
+        elif final == "A":
+            self.cursor_y = max(0, self.cursor_y - amount)
+        elif final == "B":
+            self.cursor_y = min(self.rows - 1, self.cursor_y + amount)
+        elif final == "C":
+            self.cursor_x = min(self.cols - 1, self.cursor_x + amount)
+        elif final == "D":
+            self.cursor_x = max(0, self.cursor_x - amount)
+        elif final == "E":
+            self.cursor_y = min(self.rows - 1, self.cursor_y + amount)
+            self.cursor_x = 0
+        elif final == "F":
+            self.cursor_y = max(0, self.cursor_y - amount)
+            self.cursor_x = 0
+        elif final == "G":
+            self.cursor_x = min(self.cols - 1, amount - 1)
+        elif final == "d":
+            self.cursor_y = min(self.rows - 1, amount - 1)
+        elif final == "J":
+            self._clear_display(values[0] if values else 0)
+        elif final == "K":
+            self._clear_line(values[0] if values else 0)
+        elif final == "s":
+            self.saved_cursor = (self.cursor_x, self.cursor_y)
+        elif final == "u":
+            self.cursor_x, self.cursor_y = self.saved_cursor
+        elif final == "@":
+            row = self.grid[self.cursor_y]
+            row[self.cursor_x : self.cursor_x] = [" "] * amount
+            del row[self.cols :]
+        elif final == "P":
+            row = self.grid[self.cursor_y]
+            del row[self.cursor_x : self.cursor_x + amount]
+            row.extend([" "] * (self.cols - len(row)))
+        elif final == "X":
+            end = min(self.cols, self.cursor_x + amount)
+            self.grid[self.cursor_y][self.cursor_x : end] = [" "] * (end - self.cursor_x)
+        elif final == "L":
+            for _index in range(amount):
+                self.grid.insert(self.cursor_y, [" "] * self.cols)
+                self.grid.pop()
+        elif final == "M":
+            for _index in range(amount):
+                self.grid.pop(self.cursor_y)
+                self.grid.append([" "] * self.cols)
+        elif final == "S":
+            self._scroll_up(amount)
+        elif final == "T":
+            self._scroll_down(amount)
+        elif private and 1049 in values and final in {"h", "l"}:
+            self._alternate_screen(final == "h")
+
+    def _plain(self, char: str) -> None:
+        if char == "\r":
+            self.cursor_x = 0
+        elif char == "\n":
+            self._linefeed()
+        elif char == "\b":
+            self.cursor_x = max(0, self.cursor_x - 1)
+        elif char == "\t":
+            self.cursor_x = min(self.cols - 1, ((self.cursor_x // 8) + 1) * 8)
+        elif ord(char) >= 0x20:
+            self._put(char)
+
+    def feed(self, data: bytes) -> None:
+        for char in self._decoder.decode(bytes(data or b""), final=False):
+            if self._escape_mode == "STRING":
+                if char == "\x07":
+                    self._escape_mode = ""
+                    self._escape_buffer = ""
+                elif self._escape_buffer.endswith("\x1b") and char == "\\":
+                    self._escape_mode = ""
+                    self._escape_buffer = ""
+                else:
+                    self._escape_buffer = (self._escape_buffer + char)[-2:]
+                continue
+            if self._escape_mode == "ESC_INTERMEDIATE":
+                self._escape_mode = ""
+                self._escape_buffer = ""
+                continue
+            if self._escape_mode == "CSI":
+                if "@" <= char <= "~":
+                    self._csi(self._escape_buffer, char)
+                    self._escape_mode = ""
+                    self._escape_buffer = ""
+                else:
+                    self._escape_buffer += char
+                continue
+            if self._escape_mode == "ESC":
+                self._escape_mode = ""
+                if char == "[":
+                    self._escape_mode = "CSI"
+                    self._escape_buffer = ""
+                elif char in {"]", "P", "X", "^", "_"}:
+                    self._escape_mode = "STRING"
+                    self._escape_buffer = ""
+                elif char in {"(", ")", "*", "+", "-", ".", "/", "#", "%"}:
+                    self._escape_mode = "ESC_INTERMEDIATE"
+                    self._escape_buffer = char
+                elif char == "7":
+                    self.saved_cursor = (self.cursor_x, self.cursor_y)
+                elif char == "8":
+                    self.cursor_x, self.cursor_y = self.saved_cursor
+                elif char == "D":
+                    self._linefeed()
+                elif char == "M":
+                    if self.cursor_y == 0:
+                        self._scroll_down()
+                    else:
+                        self.cursor_y -= 1
+                elif char == "c":
+                    self.grid = self._blank_grid()
+                    self.cursor_x = 0
+                    self.cursor_y = 0
+                continue
+            if char == "\x1b":
+                self._escape_mode = "ESC"
+            else:
+                self._plain(char)
+
+    def resize(self, cols: int, rows: int) -> None:
+        new_cols = max(1, int(cols))
+        new_rows = max(1, int(rows))
+        resized = [row[:new_cols] + [" "] * max(0, new_cols - len(row)) for row in self.grid[:new_rows]]
+        resized.extend([[" "] * new_cols for _index in range(new_rows - len(resized))])
+        self.cols = new_cols
+        self.rows = new_rows
+        self.grid = resized
+        self.cursor_x = min(self.cursor_x, self.cols - 1)
+        self.cursor_y = min(self.cursor_y, self.rows - 1)
+
+    def snapshot(self) -> bytes:
+        last_row = max(
+            [self.cursor_y] + [index for index, row in enumerate(self.grid) if "".join(row).rstrip()]
+        )
+        body = "\r\n".join("".join(row).rstrip() for row in self.grid[: last_row + 1])
+        cursor = f"\x1b[{self.cursor_y + 1};{self.cursor_x + 1}H"
+        return ("\x1b[2J\x1b[H" + body + cursor).encode("utf-8")
 
 
 class TerminalHostError(ValueError):
@@ -80,6 +331,7 @@ class TerminalSession:
     output_cursor: int = 0
     output_bytes: int = 0
     screen_snapshot: bytes = b""
+    screen_projection: TerminalScreenProjection | None = None
     pump_stop: threading.Event = field(default_factory=threading.Event)
     pump_thread: Any = None
     exit_detail: str | None = None
@@ -452,24 +704,6 @@ class TerminalHost:
                 details=controls,
             )
 
-    @staticmethod
-    def _snapshot_from_chunks(chunks: deque) -> bytes:
-        data = b"".join(chunk for _cursor, chunk in chunks)
-        if not data:
-            return b""
-        marker = max(
-            data.rfind(value)
-            for value in (b"\x1b[2J", b"\x1b[3J", b"\x1b[?1049h")
-        )
-        if marker >= 0:
-            tail = data[marker:]
-        else:
-            tail = b"".join(data.splitlines(keepends=True)[-TERMINAL_SNAPSHOT_ROWS:])
-        if len(tail) > TERMINAL_SNAPSHOT_MAX_BYTES:
-            boundary = tail.find(b"\n", len(tail) - TERMINAL_SNAPSHOT_MAX_BYTES)
-            if boundary >= 0:
-                tail = tail[boundary + 1 :]
-        return b"\x1b[2J\x1b[H" + tail
 
     @classmethod
     def _record_output(cls, session: TerminalSession, data: bytes) -> None:
@@ -485,20 +719,25 @@ class TerminalHost:
         ):
             _cursor, removed = session.output_chunks.popleft()
             session.output_bytes -= len(removed)
-        session.screen_snapshot = cls._snapshot_from_chunks(session.output_chunks)
+        if session.screen_projection is None:
+            session.screen_projection = TerminalScreenProjection(session.cols, session.rows)
+        session.screen_projection.feed(raw)
+        session.screen_snapshot = session.screen_projection.snapshot()
 
     def terminal_snapshot(self, terminal_id: str) -> dict[str, Any]:
         session = self.get(terminal_id)
         with session.lock:
             snapshot = bytes(session.screen_snapshot)
             cursor = session.output_cursor
+            cols = session.cols
+            rows = session.rows
         return {
             "schema": "universe.terminal-screen-snapshot.v1",
             "status": "TERMINAL_SCREEN_SNAPSHOT_COLLECTED",
             "terminal_id": session.terminal_id,
             "cursor": cursor,
-            "cols": session.cols,
-            "rows": session.rows,
+            "cols": cols,
+            "rows": rows,
             "data_base64": base64.b64encode(snapshot).decode("ascii"),
         }
 
@@ -604,12 +843,18 @@ class TerminalHost:
 
     def resize(self, terminal_id: str, cols: int, rows: int) -> None:
         session = self.get(terminal_id)
-        session.cols = max(80, int(cols or session.cols))
-        session.rows = max(24, int(rows or session.rows))
-        backend = session.backend
+        with session.lock:
+            session.cols = max(80, int(cols or session.cols))
+            session.rows = max(24, int(rows or session.rows))
+            if session.screen_projection is not None:
+                session.screen_projection.resize(session.cols, session.rows)
+                session.screen_snapshot = session.screen_projection.snapshot()
+            backend = session.backend
+            current_cols = session.cols
+            current_rows = session.rows
         resizer = getattr(backend, "resize", None)
         if callable(resizer):
-            resizer(session.cols, session.rows)
+            resizer(current_cols, current_rows)
 
     def read(self, terminal_id: str, timeout: float = 0.2) -> bytes:
         session = self.get(terminal_id)
