@@ -2860,7 +2860,9 @@ class SessionSupervisorStore:
             "execution_assignment": "UNASSIGNED",
         }
 
-    def sweep_stale_live_sessions(self) -> dict[str, Any]:
+    def sweep_stale_live_sessions(
+        self, *, live_session_anchors: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Demote LIVE/STARTING sessions that have no living process.
 
         - OWNED lease + PID gone / PID reused / process exited → DISCONNECTED
@@ -2873,8 +2875,58 @@ class SessionSupervisorStore:
         now = utc_now()
         demoted: list[dict[str, Any]] = []
         kept_live = 0
+        pty_kept_live = 0
         unknown_probe = 0
+        restored_live: list[dict[str, Any]] = []
+        normalized_live_anchors = {
+            str(session_id).strip(): str(anchor_ref).strip()
+            for session_id, anchor_ref in (live_session_anchors or {}).items()
+            if str(session_id).strip() and str(anchor_ref).strip()
+        }
         with self._connection(immediate=True) as connection:
+            for session_id, anchor_ref in normalized_live_anchors.items():
+                row = connection.execute(
+                    "SELECT * FROM session_record WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or str(row["state"]) == "STOPPED"
+                    or str(row["session_anchor_ref"] or "") != anchor_ref
+                ):
+                    continue
+                prior_state = str(row["state"])
+                if prior_state in {"LIVE", "STARTING"}:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET state = 'LIVE', row_version = row_version + 1, updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (now, session_id),
+                )
+                self._event(
+                    connection,
+                    session_id=session_id,
+                    event_type="SESSION_RESTORED_BY_LIVE_PTY",
+                    prior_state=prior_state,
+                    state="LIVE",
+                    details={
+                        "session_anchor_ref": anchor_ref,
+                        "host_liveness_source": "PTY_SUPERVISOR",
+                        "currentness_changed": False,
+                        "authority_created": False,
+                    },
+                )
+                restored_live.append(
+                    {
+                        "session_id": session_id,
+                        "session_anchor_ref": anchor_ref,
+                        "prior_state": prior_state,
+                        "state": "LIVE",
+                    }
+                )
             rows = connection.execute(
                 """
                 SELECT * FROM session_record
@@ -2891,6 +2943,13 @@ class SessionSupervisorStore:
                 ).fetchone()
                 reason = None
                 observation: dict[str, Any] | None = None
+                if (
+                    normalized_live_anchors.get(session_id)
+                    == str(row["session_anchor_ref"] or "")
+                ):
+                    kept_live += 1
+                    pty_kept_live += 1
+                    continue
                 if lease is None or str(lease["lease_state"]) != "OWNED":
                     reason = (
                         "NO_PROCESS_LEASE"
@@ -2961,6 +3020,9 @@ class SessionSupervisorStore:
             "demoted_count": len(demoted),
             "kept_live_count": kept_live,
             "unknown_probe_count": unknown_probe,
+            "restored_live_count": len(restored_live),
+            "restored_live": restored_live,
+            "pty_kept_live_count": pty_kept_live,
             "demoted": demoted,
         }
 

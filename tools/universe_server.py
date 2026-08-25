@@ -20263,6 +20263,63 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
 
+    def _is_current_live_pty_session(self, session: Mapping[str, Any]) -> bool:
+        """Verify currentness through the Mode Anchor and exact live PTY join."""
+
+        provider = str(session.get("provider") or "").upper()
+        provider_ref = str(session.get("provider_session_ref") or "").strip()
+        provider_identity = _vendor_identity_from_observer(provider_ref)
+        if (
+            provider_identity is None
+            and provider in {"CODEX", "CLAUDE", "GROK"}
+            and provider_ref
+        ):
+            provider_identity = (provider, provider_ref)
+        project_id = str(
+            session.get("current_project_id") or session.get("node") or ""
+        ).strip()
+        mode = str(session.get("mode") or "").upper()
+        session_id = str(session.get("session_id") or "").strip()
+        if provider_identity is None or not project_id or not mode or not session_id:
+            return False
+        try:
+            anchor_sessions = self.list_project_anchor_sessions(project_id).get(
+                "sessions", []
+            )
+        except UniverseError:
+            return False
+        for anchor_session in anchor_sessions:
+            if (
+                str(anchor_session.get("mode") or "").upper() != mode
+                or str(anchor_session.get("currentness") or "").upper()
+                != "CURRENT"
+                or _vendor_identity_from_observer(
+                    str(anchor_session.get("observer_session_ref") or "")
+                )
+                != provider_identity
+            ):
+                continue
+            binding = anchor_session.get("pty_binding")
+            if not isinstance(binding, Mapping) or binding.get("status") != "BOUND":
+                continue
+            terminal_id = str(binding.get("terminal_id") or "").strip()
+            if not terminal_id:
+                continue
+            try:
+                source = self._session_anchor_terminal_host().get(terminal_id)
+            except TerminalHostError:
+                continue
+            terminal = source.public() if hasattr(source, "public") else source
+            if not isinstance(terminal, Mapping):
+                continue
+            if (
+                str(terminal.get("state") or "").upper() == "LIVE"
+                and str(terminal.get("supervisor_session_id") or "")
+                == session_id
+            ):
+                return True
+        return False
+
     def resolve_todo_mutation_session(
         self,
         request: Mapping[str, Any],
@@ -20274,7 +20331,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and str(session.get("provider_session_ref") or "")
             == request["provider_session_ref"]
         ]
-        current = [session for session in matching if session.get("currentness") == "CURRENT"]
+        current = [
+            session
+            for session in matching
+            if session.get("currentness") == "CURRENT"
+            or self._is_current_live_pty_session(session)
+        ]
         if not current:
             raise UniverseError(
                 "TODO_MUTATION_SESSION_NOT_CURRENT",
@@ -22699,6 +22761,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "edges": sorted(edges.values(), key=lambda item: item["id"]),
         }
 
+    def _live_pty_session_anchors(self) -> dict[str, str]:
+        """Return only exact live PTY-to-Session-Anchor bindings.
+
+        PTY liveness may restore Supervisor host state, but it never selects a
+        default session or changes currentness, Authority, or Assignment.
+        """
+
+        try:
+            terminals = self._session_anchor_terminal_host().list_sessions()
+        except TerminalHostError:
+            return {}
+        bindings: dict[str, str] = {}
+        for terminal in terminals:
+            if str(terminal.get("state") or "").upper() != "LIVE":
+                continue
+            session_id = str(
+                terminal.get("supervisor_session_id") or ""
+            ).strip()
+            anchor_ref = str(
+                terminal.get("active_session_anchor_ref") or ""
+            ).strip()
+            if session_id and anchor_ref:
+                bindings[session_id] = anchor_ref
+        return bindings
+
+    def _sweep_stale_live_sessions(self) -> dict[str, Any]:
+        return self.session_supervisor.sweep_stale_live_sessions(
+            live_session_anchors=self._live_pty_session_anchors()
+        )
+
     def runtime_audit(self) -> dict[str, Any]:
         continuity: list[dict[str, Any]] = []
         if self.continuity_coordinator is not None:
@@ -22715,7 +22807,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
         # Drop zombie LIVE rows (dead PID / no owned lease) before Observatory reads.
         try:
-            live_sweep = self.session_supervisor.sweep_stale_live_sessions()
+            live_sweep = self._sweep_stale_live_sessions()
         except SessionSupervisorError as error:
             live_sweep = {
                 "status": "LIVE_SESSION_SWEEP_FAILED",
@@ -23490,6 +23582,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if not terminals:
             return sessions
         bound: dict[str, Mapping[str, Any]] = {}
+        bound_by_provider_session: dict[tuple[str, str], Mapping[str, Any]] = {}
         anchor_pending: list[Mapping[str, Any]] = []
         for terminal in terminals:
             anchor_ref = str(terminal.get("active_session_anchor_ref") or "").strip()
@@ -23497,16 +23590,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 bound.setdefault(anchor_ref, terminal)
             else:
                 anchor_pending.append(terminal)
+            supervisor_id = str(
+                terminal.get("supervisor_session_id") or ""
+            ).strip()
+            if not supervisor_id:
+                continue
+            try:
+                supervised = self.session_supervisor.get_session(supervisor_id)
+            except SessionSupervisorError:
+                continue
+            provider = str(supervised.get("provider") or "").upper()
+            provider_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            identity = _vendor_identity_from_observer(provider_ref)
+            if identity is None and provider in {"CODEX", "CLAUDE", "GROK"} and provider_ref:
+                identity = (provider, provider_ref)
+            if identity is not None:
+                bound_by_provider_session.setdefault(identity, terminal)
 
         joined: list[dict[str, Any]] = []
-        matched: set[str] = set()
+        matched_terminal_ids: set[str] = set()
         for session in sessions:
             anchor_ref = str(session.get("session_anchor_ref") or "").strip()
             terminal = bound.get(anchor_ref) if anchor_ref else None
+            if terminal is None and str(session.get("currentness") or "").upper() == "CURRENT":
+                observer_identity = _vendor_identity_from_observer(
+                    str(session.get("observer_session_ref") or "")
+                )
+                if observer_identity is not None:
+                    terminal = bound_by_provider_session.pop(observer_identity, None)
             if terminal is None:
                 joined.append(session)
                 continue
-            matched.add(anchor_ref)
+            matched_terminal_ids.add(str(terminal.get("terminal_id") or ""))
             record = dict(session)
             record["pty_binding"] = _public_pty_binding(
                 self._pty_binding_material(terminal, "BOUND")
@@ -23516,10 +23633,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             joined.append(record)
 
         for anchor_ref, terminal in bound.items():
-            if anchor_ref in matched:
+            if str(terminal.get("terminal_id") or "") in matched_terminal_ids:
                 continue
             joined.append(self._pty_anchor_session(project_id, terminal, anchor_ref))
         for terminal in anchor_pending:
+            if str(terminal.get("terminal_id") or "") in matched_terminal_ids:
+                continue
             joined.append(self._pty_anchor_session(project_id, terminal, ""))
         return joined
 
@@ -29220,7 +29339,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if path == "/v1/supervisor/sessions":
             query = parse_qs(urlsplit(self.path).query)
             try:
-                sweep = self.server.session_supervisor.sweep_stale_live_sessions()
+                sweep = self.server._sweep_stale_live_sessions()
             except SessionSupervisorError as error:
                 sweep = {
                     "status": "LIVE_SESSION_SWEEP_FAILED",
@@ -30901,7 +31020,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     keep_states = frozenset({"LIVE", "STARTING"})
                 # Always sweep zombie LIVE first so dead PIDs can be purged.
                 try:
-                    sweep = self.server.session_supervisor.sweep_stale_live_sessions()
+                    sweep = self.server._sweep_stale_live_sessions()
                 except SessionSupervisorError as error:
                     sweep = {
                         "status": "LIVE_SESSION_SWEEP_FAILED",

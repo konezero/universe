@@ -44,6 +44,62 @@ class LiveSessionSweepTests(unittest.TestCase):
         again = self.store.get_session("session_test_nolease")
         self.assertEqual("DISCONNECTED", again["state"])
 
+    def test_exact_live_pty_binding_preserves_session_without_lease(self) -> None:
+        registered, _ = self.store.register_session(
+            {
+                "session_id": "session_test_live_pty",
+                "node": "demo",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        sweep = self.store.sweep_stale_live_sessions(
+            live_session_anchors={
+                registered["session_id"]: registered["session_anchor_ref"]
+            }
+        )
+
+        self.assertEqual(0, sweep["demoted_count"])
+        self.assertEqual(1, sweep["kept_live_count"])
+        self.assertEqual(1, sweep["pty_kept_live_count"])
+        again = self.store.get_session(registered["session_id"])
+        self.assertEqual("LIVE", again["state"])
+        self.assertEqual("CURRENT", again["currentness"])
+
+    def test_exact_live_pty_binding_restores_only_matching_anchor(self) -> None:
+        registered, _ = self.store.register_session(
+            {
+                "session_id": "session_test_restore_pty",
+                "node": "demo",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "state": "DISCONNECTED",
+                "currentness": "STALE",
+            }
+        )
+
+        mismatch = self.store.sweep_stale_live_sessions(
+            live_session_anchors={registered["session_id"]: "wrong-anchor"}
+        )
+        self.assertEqual(0, mismatch["restored_live_count"])
+        self.assertEqual(
+            "DISCONNECTED", self.store.get_session(registered["session_id"])["state"]
+        )
+
+        restored = self.store.sweep_stale_live_sessions(
+            live_session_anchors={
+                registered["session_id"]: registered["session_anchor_ref"]
+            }
+        )
+        self.assertEqual(1, restored["restored_live_count"])
+        self.assertEqual(1, restored["pty_kept_live_count"])
+        again = self.store.get_session(registered["session_id"])
+        self.assertEqual("LIVE", again["state"])
+        self.assertEqual("STALE", again["currentness"])
+
     def test_live_with_dead_pid_is_demoted(self) -> None:
         def observer(pid: int, created_at: str):
             return {

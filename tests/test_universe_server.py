@@ -1042,6 +1042,65 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         self.assertEqual("TODO_MUTATION_RECEIPT_CONFLICT", caught.exception.code)
 
+    def test_todo_mutation_accepts_exact_current_anchor_live_pty(self) -> None:
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "todo-current-pty-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "todo-current-pty-provider",
+                "state": "LIVE",
+                "currentness": "STALE",
+            }
+        )
+        terminal = {
+            "terminal_id": "term_todo_current_pty",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": session["session_id"],
+            "active_session_anchor_ref": session["session_anchor_ref"],
+        }
+        terminal_host = Mock()
+        terminal_host.get.return_value = terminal
+        self.server.terminal_host = terminal_host
+        anchor_projection = {
+            "sessions": [
+                {
+                    "mode": "MASTER",
+                    "currentness": "CURRENT",
+                    "observer_session_ref": "claude-code:todo-current-pty-provider",
+                    "pty_binding": {
+                        "status": "BOUND",
+                        "terminal_id": terminal["terminal_id"],
+                    },
+                }
+            ]
+        }
+        request = {
+            "provider": "CLAUDE",
+            "provider_session_ref": "todo-current-pty-provider",
+            "session_id": session["session_id"],
+            "session_anchor_ref": session["session_anchor_ref"],
+        }
+
+        with patch.object(
+            self.server, "list_project_anchor_sessions", return_value=anchor_projection
+        ):
+            resolved = self.server.resolve_todo_mutation_session(request)
+            self.assertEqual(session["session_id"], resolved["session_id"])
+
+            terminal_host.get.return_value = {
+                **terminal,
+                "supervisor_session_id": "another-session",
+            }
+            with self.assertRaises(UniverseError) as caught:
+                self.server.resolve_todo_mutation_session(request)
+        self.assertEqual("TODO_MUTATION_SESSION_NOT_CURRENT", caught.exception.code)
+
     def test_todo_mutation_gateway_rejects_wrong_anchor_and_expired_receipt(self) -> None:
         session, _ = self.server.session_supervisor.register_session(
             {
@@ -5104,6 +5163,47 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(latest["details"]["identity_reused"])
         self.assertTrue(latest["details"]["passive_location_preserved"])
         self.assertEqual("MASTER", latest["details"]["requested_location"]["mode"])
+
+    def test_supervisor_session_sweep_uses_exact_live_pty_binding(self) -> None:
+        registered, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_live_pty_sweep_001",
+                "node": "universe",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "state": "DISCONNECTED",
+                "currentness": "STALE",
+            }
+        )
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = [
+            {
+                "terminal_id": "term_live_pty_sweep_001",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "state": "LIVE",
+                "supervisor_session_id": registered["session_id"],
+                "active_session_anchor_ref": registered["session_anchor_ref"],
+            }
+        ]
+        self.server.terminal_host = terminal_host
+
+        status, payload = self.request(
+            "GET", "/v1/supervisor/sessions?include_hidden=true", token=self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, payload["live_session_sweep"]["restored_live_count"])
+        self.assertEqual(1, payload["live_session_sweep"]["pty_kept_live_count"])
+        session = next(
+            item
+            for item in payload["sessions"]
+            if item["universe_session_id"] == registered["session_id"]
+        )
+        self.assertEqual("LIVE", session["state"])
+        self.assertEqual("STALE", session["currentness"])
 
     def test_live_terminal_and_inbox_follow_explicit_session_anchor_location(self) -> None:
         original, _ = self.server.session_supervisor.register_session(

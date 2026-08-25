@@ -134,6 +134,56 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         )
         self.assertEqual(pending["currentness_source"], "PTY_LIVENESS")
 
+    def test_verified_provider_identity_joins_current_anchor_to_live_pty(self) -> None:
+        server = _ProjectionServer(
+            terminals=[_terminal()], sessions=_bound_session()
+        )
+        current = _anchor_record(
+            observer_session_ref="claude-code:vendor-ref"
+        )
+
+        joined = server._join_live_pty_bindings(PROJECT, [current])
+
+        self.assertEqual(len(joined), 1, "one provider session must render one card")
+        only = joined[0]
+        self.assertEqual(only["session_anchor_ref"], CURRENT_ANCHOR)
+        self.assertEqual(only["currentness"], "CURRENT")
+        self.assertEqual(only["state"], "LIVE")
+        self.assertEqual(only["pty_binding"]["terminal_id"], "term_bound")
+
+    def test_shared_provider_identity_only_joins_the_current_record(self) -> None:
+        """A PAST/BEYOND record must not fan out onto the same live PTY."""
+
+        server = _ProjectionServer(
+            terminals=[_terminal()], sessions=_bound_session()
+        )
+        current = _anchor_record(
+            observer_session_ref="claude-code:vendor-ref"
+        )
+        past = _anchor_record(
+            session_id="claude-code-past",
+            session_anchor_ref="session_anchor_past",
+            temporality="PAST",
+            currentness="PAST",
+            currentness_source="SESSION_STORE",
+            state="READY",
+            observer_session_ref="claude-code:vendor-ref",
+        )
+
+        joined = server._join_live_pty_bindings(PROJECT, [current, past])
+
+        self.assertEqual(len(joined), 2)
+        live_records = [item for item in joined if item["state"] == "LIVE"]
+        self.assertEqual(
+            len(live_records),
+            1,
+            "only the CURRENT record may borrow the live PTY binding",
+        )
+        self.assertEqual(live_records[0]["session_anchor_ref"], CURRENT_ANCHOR)
+        stale = next(item for item in joined if item["session_anchor_ref"] == "session_anchor_past")
+        self.assertNotEqual(stale["state"], "LIVE")
+        self.assertEqual(stale["pty_binding"]["status"], "UNBOUND")
+
     def test_live_binding_does_not_borrow_a_different_current_anchor(self) -> None:
         server = _ProjectionServer(
             terminals=[_terminal()], sessions=_bound_session()
