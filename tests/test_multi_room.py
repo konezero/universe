@@ -115,6 +115,66 @@ class MultiRoomStoreTests(unittest.TestCase):
         self.assertEqual(1, len(messages))
         self.assertEqual("USER", messages[0]["author_role"])
 
+    def test_meeting_room_artifacts_are_revisioned_and_evidence_backed(self) -> None:
+        created = self.store.create_meeting_room(
+            {"title": "Specification workshop", "topic": "compare two paths"}
+        )
+        room_id = created["room"]["room_id"]
+        source = self.store.post_message(
+            room_id,
+            {"author_role": "USER", "body_text": "Draft the terminal path"},
+        )
+        cursor = self.store.hub.cursor()
+
+        artifact = self.store.create_artifact(
+            room_id,
+            {
+                "artifact_type": "SPECIFICATION",
+                "title": "Terminal path A",
+                "body_text": "Use the existing bounded PTY stream.",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/pty", "docs/meeting-room.md"],
+                "source_message_id": source["message_id"],
+            },
+        )
+        self.assertEqual(1, artifact["current_revision"])
+        self.assertEqual("USER_SELECTION_REQUIRED", artifact["promotion_state"])
+        self.assertEqual("UNASSIGNED", artifact["authority"])
+        self.assertEqual(2, len(artifact["evidence_refs"]))
+
+        revised = self.store.revise_artifact(
+            room_id,
+            artifact["artifact_id"],
+            {
+                "expected_revision": 1,
+                "body_text": "Use the existing bounded PTY stream with reconnect.",
+                "state": "REVIEW",
+                "author_role": "CONDUCTOR",
+            },
+        )
+        self.assertEqual(2, revised["current_revision"])
+        self.assertEqual(2, len(revised["revisions"]))
+        self.assertEqual(artifact["evidence_refs"], revised["evidence_refs"])
+        self.assertEqual(1, len(self.store.room_snapshot(room_id)["artifacts"]))
+
+        events = self.store.hub.wait(
+            room_id, after_event_id=cursor, timeout_seconds=0.1
+        )
+        self.assertEqual("ROOM_ARTIFACT_CREATED", events[0]["payload"]["type"])
+        self.assertEqual("ROOM_ARTIFACT_REVISED", events[1]["payload"]["type"])
+
+        with self.assertRaises(MultiRoomError) as conflict:
+            self.store.revise_artifact(
+                room_id,
+                artifact["artifact_id"],
+                {
+                    "expected_revision": 1,
+                    "body_text": "stale rewrite",
+                    "author_role": "USER",
+                },
+            )
+        self.assertEqual("ROOM_ARTIFACT_REVISION_CONFLICT", conflict.exception.code)
+
     def test_round_robin_meeting_is_bounded_and_incremental(self) -> None:
         created = self.store.create_meeting_room(
             {

@@ -28,9 +28,15 @@ ROOM_DURABLE_EVENT_SCHEMA = "universe.chat-room-durable-event.v1"
 ROOM_CURSOR_SCHEMA = "universe.chat-room-cursor.v1"
 MEETING_COORDINATOR_SCHEMA = "universe.meeting-coordinator.v1"
 MEETING_SUMMARY_SCHEMA = "universe.meeting-summary.v1"
+ROOM_ARTIFACT_SCHEMA = "universe.chat-room-artifact.v1"
+ROOM_ARTIFACT_REVISION_SCHEMA = "universe.chat-room-artifact-revision.v1"
 
 ROOM_TYPES = frozenset({"PROJECT", "BOSS", "MEETING"})
 ROOM_STATES = frozenset({"OPEN", "CLOSED"})
+ROOM_ARTIFACT_TYPES = frozenset(
+    {"PROPOSAL", "SPECIFICATION", "COMPARISON", "DECISION_CANDIDATE"}
+)
+ROOM_ARTIFACT_STATES = frozenset({"DRAFT", "REVIEW", "CANDIDATE", "ARCHIVED"})
 MESSAGE_KINDS = frozenset(
     {
         "MESSAGE",
@@ -247,6 +253,44 @@ class MultiRoomStore:
 
                 CREATE INDEX IF NOT EXISTS chat_room_message_room_time
                 ON chat_room_message(room_id, created_at, message_id);
+
+                CREATE TABLE IF NOT EXISTS chat_room_artifact (
+                    artifact_id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL
+                        REFERENCES chat_room(room_id) ON DELETE CASCADE,
+                    artifact_type TEXT NOT NULL
+                        CHECK(artifact_type IN (
+                            'PROPOSAL', 'SPECIFICATION', 'COMPARISON',
+                            'DECISION_CANDIDATE'
+                        )),
+                    title TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('DRAFT', 'REVIEW', 'CANDIDATE', 'ARCHIVED')),
+                    current_revision INTEGER NOT NULL,
+                    created_by_role TEXT NOT NULL,
+                    created_by_binding_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS chat_room_artifact_room_time
+                ON chat_room_artifact(room_id, updated_at, artifact_id);
+
+                CREATE TABLE IF NOT EXISTS chat_room_artifact_revision (
+                    artifact_id TEXT NOT NULL
+                        REFERENCES chat_room_artifact(artifact_id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    author_role TEXT NOT NULL,
+                    author_binding_id TEXT,
+                    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                    source_message_id TEXT,
+                    content_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(artifact_id, revision)
+                );
 
                 CREATE TABLE IF NOT EXISTS chat_room_control_event (
                     event_id TEXT PRIMARY KEY,
@@ -1002,6 +1046,302 @@ class MultiRoomStore:
             },
         )
         return message
+
+    def _artifact_write_context(
+        self,
+        room: Mapping[str, Any],
+        value: Mapping[str, Any],
+        connection: sqlite3.Connection,
+    ) -> tuple[str, str | None]:
+        if room["state"] != "OPEN":
+            raise MultiRoomError("ROOM_CLOSED", "cannot write artifacts in a closed room", 409)
+        if room["room_type"] != "MEETING":
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_UNSUPPORTED",
+                "Room-native specification artifacts are currently limited to MEETING rooms",
+                409,
+            )
+        author_role = _text(
+            value.get("author_role") or value.get("role") or "USER",
+            "author_role",
+        ).upper()
+        if author_role not in WRITE_ROLES["MEETING"]:
+            raise MultiRoomError(
+                "ROOM_WRITE_FORBIDDEN",
+                f"role {author_role} cannot write artifacts in MEETING rooms",
+                403,
+            )
+        author_binding_id = _optional_text(
+            value.get("author_binding_id"), "author_binding_id", limit=80
+        )
+        if author_binding_id is not None:
+            binding = connection.execute(
+                "SELECT binding_id FROM chat_room_session WHERE binding_id = ? AND room_id = ?",
+                (author_binding_id, room["room_id"]),
+            ).fetchone()
+            if binding is None:
+                raise MultiRoomError(
+                    "AUTHOR_BINDING_INVALID",
+                    "author binding does not belong to the room",
+                    409,
+                )
+        return author_role, author_binding_id
+
+    def _artifact_evidence_refs(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_EVIDENCE_INVALID",
+                "evidence_refs must be an array",
+            )
+        if len(value) > 50:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_EVIDENCE_INVALID",
+                "evidence_refs exceeds 50 entries",
+            )
+        refs: list[str] = []
+        for item in value:
+            ref = _text(item, "evidence_ref", limit=512)
+            if ref not in refs:
+                refs.append(ref)
+        return refs
+
+    def _artifact_source_message(
+        self,
+        connection: sqlite3.Connection,
+        room_id: str,
+        value: Any,
+    ) -> str | None:
+        source_message_id = _optional_text(value, "source_message_id", limit=80)
+        if source_message_id is None:
+            return None
+        message = connection.execute(
+            "SELECT message_id FROM chat_room_message WHERE message_id = ? AND room_id = ?",
+            (source_message_id, room_id),
+        ).fetchone()
+        if message is None:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_SOURCE_INVALID",
+                "source message does not belong to the room",
+                409,
+            )
+        return source_message_id
+
+    def create_artifact(
+        self, room_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        artifact_type = _text(value.get("artifact_type"), "artifact_type", limit=64).upper()
+        if artifact_type not in ROOM_ARTIFACT_TYPES:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_TYPE_INVALID",
+                f"unsupported artifact_type: {artifact_type}",
+            )
+        title = _text(value.get("title"), "title", limit=300)
+        body_text = _text(value.get("body_text") or value.get("body"), "body_text", limit=100000)
+        state = _text(value.get("state") or "DRAFT", "state", limit=32).upper()
+        if state not in ROOM_ARTIFACT_STATES:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_STATE_INVALID", f"unsupported artifact state: {state}"
+            )
+        evidence_refs = self._artifact_evidence_refs(value.get("evidence_refs"))
+        artifact_id = "room_art_" + secrets.token_hex(12)
+        now = utc_now()
+        with self._connect() as connection:
+            author_role, author_binding_id = self._artifact_write_context(
+                room, value, connection
+            )
+            source_message_id = self._artifact_source_message(
+                connection, room["room_id"], value.get("source_message_id")
+            )
+            content_digest = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO chat_room_artifact(
+                    artifact_id, room_id, artifact_type, title, state,
+                    current_revision, created_by_role, created_by_binding_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id, room["room_id"], artifact_type, title, state,
+                    author_role, author_binding_id, now, now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO chat_room_artifact_revision(
+                    artifact_id, revision, title, state, body_text, author_role,
+                    author_binding_id, evidence_refs_json, source_message_id,
+                    content_digest, created_at
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id, title, state, body_text, author_role,
+                    author_binding_id,
+                    json.dumps(evidence_refs, ensure_ascii=False, separators=(",", ":")),
+                    source_message_id, content_digest, now,
+                ),
+            )
+            connection.commit()
+        artifact = self.get_artifact(room["room_id"], artifact_id)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_ARTIFACT_CREATED", "artifact": artifact}
+        )
+        return artifact
+
+    def revise_artifact(
+        self,
+        room_id: str,
+        artifact_id: str,
+        value: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        aid = _text(artifact_id, "artifact_id", limit=80)
+        if isinstance(value.get("expected_revision"), bool):
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_REVISION_REQUIRED", "expected_revision must be an integer"
+            )
+        try:
+            expected_revision = int(value.get("expected_revision"))
+        except (TypeError, ValueError):
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_REVISION_REQUIRED", "expected_revision must be an integer"
+            ) from None
+        body_text = _text(value.get("body_text") or value.get("body"), "body_text", limit=100000)
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT artifact.*, revision.evidence_refs_json
+                FROM chat_room_artifact artifact
+                JOIN chat_room_artifact_revision revision
+                  ON revision.artifact_id = artifact.artifact_id
+                 AND revision.revision = artifact.current_revision
+                WHERE artifact.artifact_id = ? AND artifact.room_id = ?
+                """,
+                (aid, room["room_id"]),
+            ).fetchone()
+            if current is None:
+                raise MultiRoomError("ROOM_ARTIFACT_NOT_FOUND", "artifact not found", 404)
+            if int(current["current_revision"]) != expected_revision:
+                raise MultiRoomError(
+                    "ROOM_ARTIFACT_REVISION_CONFLICT",
+                    "expected_revision does not match the current artifact revision",
+                    409,
+                )
+            author_role, author_binding_id = self._artifact_write_context(
+                room, value, connection
+            )
+            title = _text(value.get("title") or current["title"], "title", limit=300)
+            state = _text(value.get("state") or current["state"], "state", limit=32).upper()
+            if state not in ROOM_ARTIFACT_STATES:
+                raise MultiRoomError(
+                    "ROOM_ARTIFACT_STATE_INVALID",
+                    f"unsupported artifact state: {state}",
+                )
+            if "evidence_refs" in value:
+                evidence_refs = self._artifact_evidence_refs(value.get("evidence_refs"))
+            else:
+                evidence_refs = json.loads(current["evidence_refs_json"] or "[]")
+            source_message_id = self._artifact_source_message(
+                connection, room["room_id"], value.get("source_message_id")
+            )
+            revision = expected_revision + 1
+            now = utc_now()
+            content_digest = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+            updated = connection.execute(
+                """
+                UPDATE chat_room_artifact
+                SET title = ?, state = ?, current_revision = ?, updated_at = ?
+                WHERE artifact_id = ? AND room_id = ? AND current_revision = ?
+                """,
+                (title, state, revision, now, aid, room["room_id"], expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise MultiRoomError(
+                    "ROOM_ARTIFACT_REVISION_CONFLICT",
+                    "artifact revision changed while the update was being applied",
+                    409,
+                )
+            connection.execute(
+                """
+                INSERT INTO chat_room_artifact_revision(
+                    artifact_id, revision, title, state, body_text, author_role,
+                    author_binding_id, evidence_refs_json, source_message_id,
+                    content_digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    aid, revision, title, state, body_text, author_role,
+                    author_binding_id,
+                    json.dumps(evidence_refs, ensure_ascii=False, separators=(",", ":")),
+                    source_message_id, content_digest, now,
+                ),
+            )
+            connection.commit()
+        artifact = self.get_artifact(room["room_id"], aid)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_ARTIFACT_REVISED", "artifact": artifact}
+        )
+        return artifact
+
+    def get_artifact(self, room_id: str, artifact_id: str) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        aid = _text(artifact_id, "artifact_id", limit=80)
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT artifact.*, revision.body_text, revision.author_role,
+                       revision.author_binding_id AS revision_author_binding_id,
+                       revision.evidence_refs_json, revision.source_message_id,
+                       revision.content_digest,
+                       revision.created_at AS revision_created_at
+                FROM chat_room_artifact artifact
+                JOIN chat_room_artifact_revision revision
+                  ON revision.artifact_id = artifact.artifact_id
+                 AND revision.revision = artifact.current_revision
+                WHERE artifact.artifact_id = ? AND artifact.room_id = ?
+                """,
+                (aid, rid),
+            ).fetchone()
+            if current is None:
+                raise MultiRoomError("ROOM_ARTIFACT_NOT_FOUND", "artifact not found", 404)
+            rows = connection.execute(
+                """
+                SELECT * FROM chat_room_artifact_revision
+                WHERE artifact_id = ? ORDER BY revision ASC
+                """,
+                (aid,),
+            ).fetchall()
+        artifact = self._artifact_row(current)
+        artifact["revisions"] = [self._artifact_revision_row(row) for row in rows]
+        return artifact
+
+    def list_artifacts(
+        self, room_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        rid = _text(room_id, "room_id", limit=80)
+        cap = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT artifact.*, revision.body_text, revision.author_role,
+                       revision.author_binding_id AS revision_author_binding_id,
+                       revision.evidence_refs_json, revision.source_message_id,
+                       revision.content_digest,
+                       revision.created_at AS revision_created_at
+                FROM chat_room_artifact artifact
+                JOIN chat_room_artifact_revision revision
+                  ON revision.artifact_id = artifact.artifact_id
+                 AND revision.revision = artifact.current_revision
+                WHERE artifact.room_id = ?
+                ORDER BY artifact.updated_at ASC, artifact.artifact_id ASC
+                LIMIT ?
+                """,
+                (rid, cap),
+            ).fetchall()
+        return [self._artifact_row(row) for row in rows]
 
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1812,6 +2152,7 @@ class MultiRoomStore:
         room = self.get_room(room_id)
         bindings = self.list_bindings(room_id)
         messages = self.list_messages(room_id, limit=200)
+        artifacts = self.list_artifacts(room_id, limit=200)
         events = self.list_room_events(room_id, limit=200)
         participant_cursors = [
             self.participant_cursor(binding["binding_id"]) for binding in bindings
@@ -1827,6 +2168,7 @@ class MultiRoomStore:
             "room": room,
             "bindings": bindings,
             "messages": messages,
+            "artifacts": artifacts,
             "events": events,
             "participant_cursors": participant_cursors,
             "bridge_line": bridge,
@@ -1871,6 +2213,52 @@ class MultiRoomStore:
             "metadata": meta,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    def _artifact_revision_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            evidence_refs = []
+        return {
+            "schema": ROOM_ARTIFACT_REVISION_SCHEMA,
+            "artifact_id": row["artifact_id"],
+            "revision": int(row["revision"]),
+            "title": row["title"],
+            "state": row["state"],
+            "body_text": row["body_text"],
+            "author_role": row["author_role"],
+            "author_binding_id": row["author_binding_id"],
+            "evidence_refs": evidence_refs,
+            "source_message_id": row["source_message_id"],
+            "content_digest": row["content_digest"],
+            "created_at": row["created_at"],
+        }
+
+    def _artifact_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            evidence_refs = []
+        return {
+            "schema": ROOM_ARTIFACT_SCHEMA,
+            "artifact_id": row["artifact_id"],
+            "room_id": row["room_id"],
+            "artifact_type": row["artifact_type"],
+            "title": row["title"],
+            "state": row["state"],
+            "current_revision": int(row["current_revision"]),
+            "body_text": row["body_text"],
+            "author_role": row["author_role"],
+            "author_binding_id": row["revision_author_binding_id"],
+            "evidence_refs": evidence_refs,
+            "source_message_id": row["source_message_id"],
+            "content_digest": row["content_digest"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "revision_created_at": row["revision_created_at"],
+            "promotion_state": "USER_SELECTION_REQUIRED",
+            "authority": "UNASSIGNED",
         }
 
     def _binding_row(self, row: sqlite3.Row) -> dict[str, Any]:

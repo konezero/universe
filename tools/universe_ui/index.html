@@ -560,6 +560,28 @@
               Message (role enforced server-side)
               <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>
             </label>
+            <label for="multi-room-artifact-type">
+              Room artifact (meeting rooms)
+              <select id="multi-room-artifact-type">
+                <option value="SPECIFICATION">SPECIFICATION</option>
+                <option value="PROPOSAL">PROPOSAL</option>
+                <option value="COMPARISON">COMPARISON</option>
+                <option value="DECISION_CANDIDATE">DECISION_CANDIDATE</option>
+              </select>
+            </label>
+            <label for="multi-room-artifact-title">
+              Artifact title
+              <input id="multi-room-artifact-title" type="text" placeholder="Specification title" autocomplete="off" />
+            </label>
+            <label for="multi-room-artifact-evidence">
+              Evidence refs (one per line)
+              <textarea id="multi-room-artifact-evidence" rows="2" placeholder="universe://... or repository evidence ref"></textarea>
+            </label>
+            <div class="remote-access-actions">
+              <button id="create-room-artifact-button" type="button" class="secondary-button">
+                Create artifact from Message
+              </button>
+            </div>
             <div class="remote-access-actions">
               <button id="post-room-message-button" type="button" class="primary-button">
                 Post as USER

@@ -16647,6 +16647,71 @@ class UniverseStore:
                     add_edge("ROOM_MESSAGE_DERIVES_BENCH_OBSERVATION", message_node, bench_node, message_ref)
                     add_edge("PROJECT_HAS_BENCH_OBSERVATION", project_node, bench_node, message_ref)
 
+            # Room-native artifacts are explicit, revisioned candidates. Keep the
+            # body outside the semantic graph while preserving evidence links and
+            # revision lineage. Nothing here adopts a Feature Node or Expected Path.
+            for artifact in self.multi_rooms.list_artifacts(room_id, limit=200):
+                artifact_id = str(artifact.get("artifact_id") or "")
+                if not artifact_id:
+                    continue
+                artifact_ref = f"{source_ref}/artifacts/{artifact_id}"
+                artifact_node = add_node(
+                    "ROOM_ARTIFACT",
+                    artifact_id,
+                    str(artifact.get("title") or artifact_id),
+                    str(artifact.get("state") or "DRAFT"),
+                    "MULTI_ROOM_ARTIFACT",
+                    artifact_ref,
+                    {
+                        key: artifact.get(key)
+                        for key in (
+                            "artifact_id", "room_id", "artifact_type", "state",
+                            "current_revision", "content_digest", "evidence_refs",
+                            "source_message_id", "created_at", "updated_at",
+                            "promotion_state", "authority",
+                        )
+                        if artifact.get(key) is not None
+                    }
+                    | {"body_in_graph": False},
+                )
+                add_edge("CHAT_ROOM_HAS_ARTIFACT", room_node, artifact_node, artifact_ref)
+                detailed = self.multi_rooms.get_artifact(room_id, artifact_id)
+                for revision in detailed.get("revisions") or []:
+                    revision_number = int(revision.get("revision") or 0)
+                    revision_ref = f"{artifact_ref}/revisions/{revision_number}"
+                    revision_node = add_node(
+                        "ROOM_ARTIFACT_REVISION",
+                        f"{artifact_id}:{revision_number}",
+                        f"{artifact.get('artifact_type')} revision {revision_number}",
+                        str(revision.get("state") or "DRAFT"),
+                        "MULTI_ROOM_ARTIFACT_REVISION",
+                        revision_ref,
+                        {
+                            key: revision.get(key)
+                            for key in (
+                                "artifact_id", "revision", "state", "author_role",
+                                "author_binding_id", "evidence_refs", "source_message_id",
+                                "content_digest", "created_at",
+                            )
+                            if revision.get(key) is not None
+                        }
+                        | {"body_in_graph": False},
+                    )
+                    add_edge(
+                        "ROOM_ARTIFACT_HAS_REVISION",
+                        artifact_node,
+                        revision_node,
+                        revision_ref,
+                    )
+                    source_message_id = str(revision.get("source_message_id") or "")
+                    if source_message_id and source_message_id in multi_message_nodes:
+                        add_edge(
+                            "ROOM_ARTIFACT_REVISION_REFS_MESSAGE",
+                            revision_node,
+                            multi_message_nodes[source_message_id],
+                            revision_ref,
+                        )
+
             # BOSS-room Worker reports are results, not transcript messages.
             # Project their structured, non-secret envelope independently so a
             # graph consumer can distinguish a result from discussion text.
@@ -29674,6 +29739,37 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except MultiRoomError as error:
                 self._send_multi_room_error(error)
             return
+        room_artifacts = re.fullmatch(r"/v1/rooms/([^/]+)/artifacts$", path)
+        if room_artifacts is not None:
+            try:
+                room_id = unquote(room_artifacts.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOM_ARTIFACTS_COLLECTED",
+                        "room_id": room_id,
+                        "artifacts": self.server.multi_rooms.list_artifacts(room_id),
+                    },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        room_artifact = re.fullmatch(
+            r"/v1/rooms/([^/]+)/artifacts/([^/]+)$", path
+        )
+        if room_artifact is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.multi_rooms.get_artifact(
+                        unquote(room_artifact.group(1)),
+                        unquote(room_artifact.group(2)),
+                    ),
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
         room_events = re.fullmatch(r"/v1/rooms/([^/]+)/events$", path)
         if room_events is not None:
             try:
@@ -31297,6 +31393,44 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         unquote(room_attach.group(1)), body or {}
                     )
                     self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_artifact_revision_post = re.fullmatch(
+                r"/v1/rooms/([^/]+)/artifacts/([^/]+)/revisions$", path
+            )
+            if room_artifact_revision_post is not None:
+                try:
+                    artifact = self.server.multi_rooms.revise_artifact(
+                        unquote(room_artifact_revision_post.group(1)),
+                        unquote(room_artifact_revision_post.group(2)),
+                        body or {},
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_ARTIFACT_REVISED",
+                            "artifact": artifact,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_artifact_post = re.fullmatch(r"/v1/rooms/([^/]+)/artifacts$", path)
+            if room_artifact_post is not None:
+                try:
+                    artifact = self.server.multi_rooms.create_artifact(
+                        unquote(room_artifact_post.group(1)), body or {}
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_ARTIFACT_RECORDED",
+                            "artifact": artifact,
+                        },
+                    )
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
                 return

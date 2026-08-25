@@ -354,6 +354,10 @@ const elements = {
   multiRoomList: document.querySelector("#multi-room-list"),
   multiRoomDetail: document.querySelector("#multi-room-detail"),
   multiRoomMessage: document.querySelector("#multi-room-message"),
+  multiRoomArtifactType: document.querySelector("#multi-room-artifact-type"),
+  multiRoomArtifactTitle: document.querySelector("#multi-room-artifact-title"),
+  multiRoomArtifactEvidence: document.querySelector("#multi-room-artifact-evidence"),
+  createRoomArtifact: document.querySelector("#create-room-artifact-button"),
   refreshRooms: document.querySelector("#refresh-rooms-button"),
   createMeetingRoom: document.querySelector("#create-meeting-room-button"),
   postRoomMessage: document.querySelector("#post-room-message-button"),
@@ -6600,6 +6604,26 @@ function renderActiveMultiRoom() {
   for (const permission of pendingPermissions) {
     permissionList.append(renderPermissionCard(permission));
   }
+  const artifactList = node("div", "remote-access-list");
+  const artifacts = snap.artifacts || [];
+  if (room.room_type === "MEETING" && !artifacts.length) {
+    artifactList.append(node("p", "empty-copy", "No room artifacts yet"));
+  }
+  for (const artifact of artifacts) {
+    const row = node("article", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${artifact.artifact_type} · ${artifact.title}`),
+      node(
+        "small",
+        "",
+        `${artifact.state} · revision ${artifact.current_revision} · evidence ${(artifact.evidence_refs || []).length}`
+      ),
+      node("small", "", artifact.body_text || "")
+    );
+    row.append(copy);
+    artifactList.append(row);
+  }
   const transcript = node("pre", "remote-access-endpoint");
   transcript.textContent = (snap.messages || [])
     .slice(-5)
@@ -6609,6 +6633,7 @@ function renderActiveMultiRoom() {
     summary,
     participantList,
     permissionList,
+    artifactList,
     transcript
   );
 }
@@ -6641,6 +6666,7 @@ function openMultiRoomStream(roomId) {
       room: payload.room,
       bindings: payload.bindings || [],
       messages: payload.messages || [],
+      artifacts: payload.artifacts || [],
       events: payload.events || [],
       participant_cursors: payload.participant_cursors || [],
       bridge_line: payload.bridge_line || "",
@@ -6736,6 +6762,37 @@ async function createMeetingRoomThin() {
   });
   await refreshMultiRooms();
   toast("Meeting room created");
+}
+
+async function createActiveRoomArtifact() {
+  const snapshot = state.activeMultiRoomSnapshot;
+  if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
+  if (snapshot.room.room_type !== "MEETING") {
+    throw new Error("Room artifacts are currently available in meeting rooms");
+  }
+  const title = elements.multiRoomArtifactTitle?.value?.trim() || "";
+  const bodyText = elements.multiRoomMessage?.value?.trim() || "";
+  if (!title) throw new Error("Artifact title required");
+  if (!bodyText) throw new Error("Artifact body required in Message");
+  const evidenceRefs = (elements.multiRoomArtifactEvidence?.value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  await api(`/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/artifacts`, {
+    method: "POST",
+    body: {
+      artifact_type: elements.multiRoomArtifactType?.value || "SPECIFICATION",
+      title,
+      body_text: bodyText,
+      author_role: "USER",
+      evidence_refs: evidenceRefs,
+    },
+  });
+  elements.multiRoomArtifactTitle.value = "";
+  elements.multiRoomArtifactEvidence.value = "";
+  elements.multiRoomMessage.value = "";
+  await openMultiRoom(snapshot.room.room_id);
+  toast("Room artifact created");
 }
 
 async function postActiveRoomAsUser() {
@@ -13379,6 +13436,13 @@ function bindEvents() {
   if (elements.createMeetingRoom) {
     elements.createMeetingRoom.addEventListener("click", () => {
       createMeetingRoomThin().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.createRoomArtifact) {
+    elements.createRoomArtifact.addEventListener("click", () => {
+      createActiveRoomArtifact().catch((error) => {
         elements.settingsError.textContent = error.message;
       });
     });

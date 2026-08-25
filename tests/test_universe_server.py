@@ -1621,6 +1621,63 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("ROOM_MESSAGE_DERIVES_DECISION", edge_types)
         self.assertIn("ROOM_MESSAGE_DERIVES_DOCUMENT_CANDIDATE", edge_types)
 
+    def test_semantic_graph_projects_room_artifact_revisions_without_body(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Artifact graph",
+            host_role="CONDUCTOR",
+            project_id="GCS",
+        )
+        source = self.server.multi_rooms.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "private artifact source"},
+        )
+        artifact = self.server.multi_rooms.create_artifact(
+            room["room_id"],
+            {
+                "artifact_type": "COMPARISON",
+                "title": "Two paths",
+                "body_text": "private comparison body",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/comparison"],
+                "source_message_id": source["message_id"],
+            },
+        )
+        self.server.multi_rooms.revise_artifact(
+            room["room_id"],
+            artifact["artifact_id"],
+            {
+                "expected_revision": 1,
+                "body_text": "private revised body",
+                "author_role": "CONDUCTOR",
+            },
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        artifact_nodes = [
+            node for node in graph["nodes"]
+            if node["entity_type"] == "ROOM_ARTIFACT"
+            and node["data"].get("artifact_id") == artifact["artifact_id"]
+        ]
+        revision_nodes = [
+            node for node in graph["nodes"]
+            if node["entity_type"] == "ROOM_ARTIFACT_REVISION"
+            and node["data"].get("artifact_id") == artifact["artifact_id"]
+        ]
+        self.assertEqual(1, len(artifact_nodes))
+        self.assertEqual(2, len(revision_nodes))
+        self.assertEqual(
+            "USER_SELECTION_REQUIRED",
+            artifact_nodes[0]["data"]["promotion_state"],
+        )
+        self.assertNotIn("private comparison body", json.dumps(graph))
+        self.assertNotIn("private revised body", json.dumps(graph))
+        edge_types = {edge["edge_type"] for edge in graph["edges"]}
+        self.assertIn("CHAT_ROOM_HAS_ARTIFACT", edge_types)
+        self.assertIn("ROOM_ARTIFACT_HAS_REVISION", edge_types)
+        self.assertIn("ROOM_ARTIFACT_REVISION_REFS_MESSAGE", edge_types)
+
     def test_multi_room_rejects_unknown_explicit_message_kind(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         room = self.server.multi_rooms.create_room(
@@ -7361,6 +7418,50 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
         self.assertEqual("partial answer", events[0]["payload"]["delta"])
+
+    def test_meeting_room_artifact_http_create_revise_and_collect(self) -> None:
+        created = self.server.multi_rooms.create_meeting_room(
+            {"title": "HTTP artifact room", "topic": "specification"}
+        )
+        room_id = created["room"]["room_id"]
+
+        status, recorded = self.request(
+            "POST",
+            f"/v1/rooms/{room_id}/artifacts",
+            {
+                "artifact_type": "SPECIFICATION",
+                "title": "Path A",
+                "body_text": "First specification",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/path-a"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("ROOM_ARTIFACT_RECORDED", recorded["status"])
+        artifact = recorded["artifact"]
+
+        status, revised = self.request(
+            "POST",
+            f"/v1/rooms/{room_id}/artifacts/{artifact['artifact_id']}/revisions",
+            {
+                "expected_revision": 1,
+                "body_text": "Second specification",
+                "state": "CANDIDATE",
+                "author_role": "CONDUCTOR",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("ROOM_ARTIFACT_REVISED", revised["status"])
+        self.assertEqual(2, revised["artifact"]["current_revision"])
+
+        status, collected = self.request(
+            "GET", f"/v1/rooms/{room_id}/artifacts", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("ROOM_ARTIFACTS_COLLECTED", collected["status"])
+        self.assertEqual(1, len(collected["artifacts"]))
 
     def test_multi_room_http_fans_out_one_event_and_records_native_result(
         self,
