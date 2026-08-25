@@ -10,6 +10,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_ANCHOR = "session_anchor_test"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.terminal_host import (  # noqa: E402
@@ -55,7 +56,7 @@ class TerminalHostTests(unittest.TestCase):
             environment=None,
         ) -> FakePty:
             spawned.append(
-                (executable, cwd, cols, rows, list(argv or []), dict(environment or {}))
+                (executable, cwd, cols, rows, (argv if isinstance(argv, str) else list(argv or [])), dict(environment or {}))
             )
             return FakePty()
 
@@ -63,7 +64,7 @@ class TerminalHostTests(unittest.TestCase):
         created = host.create(
             project_id="GCS",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="GROK",
         )
         self.assertEqual("GCS", created["project_id"])
@@ -86,6 +87,10 @@ class TerminalHostTests(unittest.TestCase):
                 "UNIVERSE_PROJECT_ID": "GCS",
                 "UNIVERSE_MODE": "MASTER",
                 "UNIVERSE_PROVIDER": "GROK",
+                # The managed shell tells the SessionStart hook it is running
+                # inside a Supervisor-owned cmd bound to this exact Anchor.
+                "UNIVERSE_MANAGED_SHELL": "1",
+                "UNIVERSE_SESSION_ANCHOR_REF": TEST_ANCHOR,
                 "UNIVERSE_MODEL_REF": "",
                 "UNIVERSE_EFFORT": "AUTO",
                 "UNIVERSE_SUPERVISOR_SESSION_ID": "",
@@ -100,12 +105,12 @@ class TerminalHostTests(unittest.TestCase):
     def test_missing_coordinate_is_rejected(self) -> None:
         host = TerminalHost(spawn=lambda *_args: FakePty())
         with self.assertRaises(TerminalHostError):
-            host.create(project_id="", mode="MASTER", cwd=str(ROOT))
+            host.create(project_id="", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR)
 
     def test_resize_keeps_a_usable_cli_box(self) -> None:
         pty = FakePty()
         host = TerminalHost(spawn=lambda *_args: pty)
-        created = host.create(project_id="GCS", mode="MASTER", cwd=str(ROOT), provider="GROK")
+        created = host.create(project_id="GCS", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR, provider="GROK")
         host.resize(created["terminal_id"], 20, 8)
         session = host.get(created["terminal_id"])
         self.assertGreaterEqual(session.cols, 80)
@@ -167,7 +172,7 @@ class TerminalHostTests(unittest.TestCase):
         spawned: list[tuple] = []
 
         def spawn(executable, cwd, cols, rows, argv=None, environment=None):
-            spawned.append((executable, cwd, cols, rows, list(argv or []), dict(environment or {})))
+            spawned.append((executable, cwd, cols, rows, (argv if isinstance(argv, str) else list(argv or [])), dict(environment or {})))
             return FakePty()
 
         host = TerminalHost(spawn=spawn)
@@ -176,15 +181,20 @@ class TerminalHostTests(unittest.TestCase):
             return_value=uuid.UUID("12345678-1234-4678-9234-567812345678"),
         ), patch("universe_app.terminal_host.ensure_local_channel_server_registered"):
             created = host.create(
-                project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CLAUDE"
+                project_id="universe", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR, provider="CLAUDE"
             )
-        argv = spawned[0][4]
-        self.assertIn("--session-id", argv)
-        self.assertEqual("12345678-1234-4678-9234-567812345678", argv[argv.index("--session-id") + 1])
-        self.assertNotIn("--resume", argv)
-        self.assertEqual(
-            ["--dangerously-load-development-channels", "server:universe_channel"],
-            argv[-2:],
+        cmdline = spawned[0][4]
+        self.assertIsInstance(
+            cmdline, str, "the managed shell needs a raw command line, not argv"
+        )
+        self.assertTrue(cmdline.startswith("/d /q /s /k "), cmdline)
+        self.assertIn("--session-id 12345678-1234-4678-9234-567812345678", cmdline)
+        self.assertNotIn("--resume", cmdline)
+        self.assertTrue(
+            cmdline.rstrip('"').endswith(
+                "--dangerously-load-development-channels server:universe_channel"
+            ),
+            cmdline,
         )
         host.close(created["terminal_id"])
 
@@ -217,7 +227,7 @@ class TerminalHostTests(unittest.TestCase):
 
         host = TerminalHost(spawn=lambda *_args, **_kwargs: ExitedPty())
         created = host.create(
-            project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CODEX"
+            project_id="universe", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR, provider="CODEX"
         )
         listed = host.list_sessions()
         self.assertEqual("FAILED", listed[0]["state"])
@@ -234,7 +244,7 @@ class TerminalHostTests(unittest.TestCase):
 
         def spawn(executable, cwd, cols, rows, argv=None, environment=None):
             spawned.append(
-                (executable, cwd, cols, rows, list(argv or []), dict(environment or {}))
+                (executable, cwd, cols, rows, (argv if isinstance(argv, str) else list(argv or [])), dict(environment or {}))
             )
             return FakePty()
 
@@ -242,21 +252,21 @@ class TerminalHostTests(unittest.TestCase):
         host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="GROK",
             resume_session_ref="01a00fe6-afff-7bc0-a75a-fe9e1569b3bf",
         )
-        self.assertEqual(
-            ["--resume", "01a00fe6-afff-7bc0-a75a-fe9e1569b3bf"],
-            spawned[0][4],
-        )
+        cmdline = spawned[0][4]
+        self.assertIsInstance(cmdline, str)
+        self.assertTrue(cmdline.startswith("/d /q /s /k "), cmdline)
+        self.assertIn("--resume 01a00fe6-afff-7bc0-a75a-fe9e1569b3bf", cmdline)
 
     def test_find_live_reuses_the_same_coordinate(self) -> None:
         host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
         first = host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="GROK",
             supervisor_session_id="session_a",
         )
@@ -292,7 +302,7 @@ class TerminalHostTests(unittest.TestCase):
 
         pty = FeedingPty()
         host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
-        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), provider="GROK")
+        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR, provider="GROK")
         first = host.subscribe(created["terminal_id"])
         second = host.subscribe(created["terminal_id"])
         pty.pending.append(b"hello-both")
@@ -325,7 +335,7 @@ class TerminalHostTests(unittest.TestCase):
                 return b""
 
         host = TerminalHost(spawn=lambda *_args, **_kwargs: FeedingPty())
-        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), provider="GROK")
+        created = host.create(project_id="universe", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR, provider="GROK")
         first = host.subscribe(created["terminal_id"])
         deadline = time.time() + 1
         seen = b""
@@ -350,7 +360,7 @@ class TerminalHostTests(unittest.TestCase):
         created = host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="CODEX",
         )
         terminal_id = created["terminal_id"]
@@ -396,7 +406,7 @@ class TerminalHostTests(unittest.TestCase):
         created = host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="CODEX",
         )
         terminal_id = created["terminal_id"]
@@ -448,7 +458,7 @@ class TerminalHostTests(unittest.TestCase):
         created = host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="CODEX",
             supervisor_session_id="session_master_1",
             audit_context={"source": "TEST_CREATE", "request_id": "req-create"},
@@ -489,7 +499,7 @@ class TerminalHostTests(unittest.TestCase):
             audit_database_path=database_path,
         )
         exited = exited_host.create(
-            project_id="universe", mode="MASTER", cwd=str(ROOT), provider="CODEX"
+            project_id="universe", mode="MASTER", cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR, provider="CODEX"
         )
         exited_host.list_sessions()
         exit_events = exited_host.audit_events(terminal_id=exited["terminal_id"])

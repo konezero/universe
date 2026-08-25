@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import re
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+from universe_server import (  # noqa: E402
+    UniverseHTTPServer,
+    _public_pty_binding,
+)
+
+APP = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
+
+PROJECT = "universe"
+BOUND_ANCHOR = "session_anchor_bound"
+CURRENT_ANCHOR = "MASTER-CURRENT-DIFFERENT"
+
+
+class _ProjectionServer:
+    """Borrow the projection methods under test without a live service."""
+
+    _pty_binding_material = UniverseHTTPServer._pty_binding_material
+    _pty_anchor_session = UniverseHTTPServer._pty_anchor_session
+    _join_live_pty_bindings = UniverseHTTPServer._join_live_pty_bindings
+    list_git_work_history = UniverseHTTPServer.list_git_work_history
+
+    def __init__(self, terminals=(), sessions=None, events=()):
+        self._terminals = list(terminals)
+        self._sessions = dict(sessions or {})
+        self._events = list(events)
+        self.session_supervisor = SimpleNamespace(get_session=self._get_session)
+
+    def _get_session(self, session_id):
+        return self._sessions[session_id]
+
+    def _session_anchor_terminal_host(self):
+        return SimpleNamespace(list_sessions=lambda: list(self._terminals))
+
+    def list_events(self, project_id, limit=200):
+        return list(self._events)
+
+
+def _terminal(**overrides):
+    terminal = {
+        "terminal_id": "term_bound",
+        "state": "LIVE",
+        "project_id": PROJECT,
+        "mode": "MASTER",
+        "provider": "CLAUDE",
+        "pid": 4242,
+        "created_at": "2026-08-25T00:00:00Z",
+        "supervisor_session_id": "session_bound",
+        "active_session_anchor_ref": BOUND_ANCHOR,
+    }
+    terminal.update(overrides)
+    return terminal
+
+
+def _bound_session():
+    return {
+        "session_bound": {
+            "provider": "CLAUDE",
+            "provider_session_ref": "vendor-ref",
+            "last_seen_at": "2026-08-25T01:00:00Z",
+            "mode": "MASTER",
+        }
+    }
+
+
+def _anchor_record(**overrides):
+    record = {
+        "mode": "MASTER",
+        "session_id": "codex:other",
+        "session_anchor_ref": CURRENT_ANCHOR,
+        "temporality": "CURRENT",
+        "currentness": "CURRENT",
+        "currentness_source": "MODE_CURRENT_ANCHOR",
+        "state": "CURRENT",
+        "active_ing": False,
+        "last_seen_at": "2026-08-21T02:48:05+00:00",
+        "pty_binding": dict(_public_pty_binding(None)),
+    }
+    record.update(overrides)
+    return record
+
+
+class AnchorPtyProjectionTests(unittest.TestCase):
+    """A verified binding is one record; liveness never implies authority."""
+
+    def test_verified_binding_collapses_into_one_live_record(self) -> None:
+        server = _ProjectionServer(
+            terminals=[_terminal()], sessions=_bound_session()
+        )
+        record = _anchor_record(session_anchor_ref=BOUND_ANCHOR)
+        joined = server._join_live_pty_bindings(PROJECT, [record])
+
+        self.assertEqual(len(joined), 1, "one binding must not render two cards")
+        only = joined[0]
+        self.assertEqual(only["currentness"], "CURRENT")
+        self.assertEqual(only["state"], "LIVE")
+        self.assertTrue(only["active_ing"])
+        self.assertEqual(only["pty_binding"]["status"], "BOUND")
+        self.assertEqual(only["pty_binding"]["terminal_id"], "term_bound")
+        self.assertEqual(only["pty_binding"]["pid"], 4242)
+
+    def test_live_pty_without_anchor_reports_anchor_pending(self) -> None:
+        server = _ProjectionServer(
+            terminals=[
+                _terminal(
+                    terminal_id="term_pending",
+                    supervisor_session_id="",
+                    active_session_anchor_ref=None,
+                )
+            ]
+        )
+        joined = server._join_live_pty_bindings(PROJECT, [])
+
+        self.assertEqual(len(joined), 1)
+        pending = joined[0]
+        self.assertEqual(pending["pty_binding"]["status"], "ANCHOR_PENDING")
+        self.assertEqual(pending["pty_binding"]["terminal_id"], "term_pending")
+        self.assertEqual(pending["state"], "LIVE")
+        self.assertNotEqual(
+            pending["currentness"],
+            "CURRENT",
+            "an unbound live PTY must never imply Anchor currentness",
+        )
+        self.assertEqual(pending["currentness_source"], "PTY_LIVENESS")
+
+    def test_live_binding_does_not_borrow_a_different_current_anchor(self) -> None:
+        server = _ProjectionServer(
+            terminals=[_terminal()], sessions=_bound_session()
+        )
+        joined = server._join_live_pty_bindings(PROJECT, [_anchor_record()])
+
+        self.assertEqual(len(joined), 2, "distinct Anchors stay distinct records")
+        by_anchor = {item["session_anchor_ref"]: item for item in joined}
+        current = by_anchor[CURRENT_ANCHOR]
+        live = by_anchor[BOUND_ANCHOR]
+
+        self.assertEqual(current["currentness"], "CURRENT")
+        self.assertEqual(
+            current["pty_binding"]["status"],
+            "UNBOUND",
+            "the Mode Current Anchor must not claim another terminal's PTY",
+        )
+        self.assertEqual(live["state"], "LIVE")
+        self.assertEqual(live["pty_binding"]["status"], "BOUND")
+        self.assertEqual(live["currentness"], "NOT_CURRENT")
+        self.assertEqual(live["currentness_source"], "PTY_LIVENESS")
+
+    def test_records_without_a_live_pty_stay_unbound(self) -> None:
+        server = _ProjectionServer(terminals=[])
+        joined = server._join_live_pty_bindings(PROJECT, [_anchor_record()])
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(joined[0]["pty_binding"]["status"], "UNBOUND")
+
+    def test_only_live_terminals_in_this_project_are_joined(self) -> None:
+        server = _ProjectionServer(
+            terminals=[
+                _terminal(terminal_id="term_exited", state="EXITED"),
+                _terminal(terminal_id="term_other", project_id="other-project"),
+            ],
+            sessions=_bound_session(),
+        )
+        joined = server._join_live_pty_bindings(
+            PROJECT, [_anchor_record(session_anchor_ref=BOUND_ANCHOR)]
+        )
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(joined[0]["pty_binding"]["status"], "UNBOUND")
+
+
+class GitWorkHistoryTests(unittest.TestCase):
+    """COMMIT/PUSH history carries exact Anchor and terminal attribution."""
+
+    def _events(self):
+        return [
+            {
+                "event_id": "git_work_exact",
+                "event_type": "GIT_WORK_STATUS",
+                "created_at": "2026-08-25T01:10:00Z",
+                "payload": {
+                    "operation": "COMMIT",
+                    "state": "COMPLETED",
+                    "exit_code": 0,
+                    "short_sha": "abc1234",
+                    "branch": "main",
+                    "session_anchor_ref": BOUND_ANCHOR,
+                    "terminal_id": "term_bound",
+                },
+            },
+            {
+                "event_id": "git_work_unattributed",
+                "event_type": "GIT_WORK_STATUS",
+                "created_at": "2026-08-25T01:05:00Z",
+                "payload": {
+                    "operation": "PUSH",
+                    "state": "FAILED",
+                    "exit_code": 1,
+                    "remote": "origin",
+                },
+            },
+            {
+                "event_id": "unrelated",
+                "event_type": "TEST_WORK_STATUS",
+                "created_at": "2026-08-25T01:00:00Z",
+                "payload": {"tier": "fast"},
+            },
+        ]
+
+    def test_history_reports_exact_and_unattributed_entries(self) -> None:
+        server = _ProjectionServer(events=self._events())
+        entries = server.list_git_work_history(PROJECT)["entries"]
+
+        self.assertEqual(len(entries), 2, "only COMMIT/PUSH milestones are history")
+        exact = entries[0]
+        self.assertEqual(exact["operation"], "COMMIT")
+        self.assertEqual(exact["attribution"], "EXACT")
+        self.assertEqual(exact["session_anchor_ref"], BOUND_ANCHOR)
+        self.assertEqual(exact["terminal_id"], "term_bound")
+
+        unattributed = entries[1]
+        self.assertEqual(unattributed["operation"], "PUSH")
+        self.assertEqual(unattributed["attribution"], "UNATTRIBUTED")
+        self.assertIsNone(unattributed["session_anchor_ref"])
+        self.assertIsNone(unattributed["terminal_id"])
+
+    def test_history_filters_to_one_session_anchor(self) -> None:
+        server = _ProjectionServer(events=self._events())
+        result = server.list_git_work_history(
+            PROJECT, session_anchor_ref=BOUND_ANCHOR
+        )
+        self.assertEqual(
+            [item["event_id"] for item in result["entries"]], ["git_work_exact"]
+        )
+        self.assertEqual(result["session_anchor_ref"], BOUND_ANCHOR)
+
+
+class ActionInboxUiContractTests(unittest.TestCase):
+    """PTY-header Actions separates Active / History / Approvals."""
+
+    def test_actions_dialog_renders_three_sections(self) -> None:
+        render = APP[
+            APP.index("function renderActionInbox()") : APP.index(
+                "async function openActionInbox()"
+            )
+        ]
+        labels = re.findall(r"appendSection\(\s*\"([A-Za-z ]+)\"", render)
+        self.assertEqual(labels, ["Active work", "History", "Approvals"])
+
+    def test_actions_title_never_interpolates_a_missing_coordinate(self) -> None:
+        self.assertNotIn(
+            "${state.conversationTarget.alias || state.conversationTarget.projectId}"
+            " actions",
+            APP,
+        )
+        title = APP[
+            APP.index("function actionInboxTitle()") : APP.index(
+                "function actionInboxApprovals()"
+            )
+        ]
+        self.assertIn('value !== "null"', title)
+        self.assertIn('value !== "undefined"', title)
+        self.assertIn('return label ? `${label} actions` : "Actions";', title)
+
+    def test_history_is_read_from_the_authoritative_git_endpoint(self) -> None:
+        loader = APP[
+            APP.index("async function loadActionInboxHistory()") : APP.index(
+                "function renderGitHistoryActionCard("
+            )
+        ]
+        self.assertIn("/git-work-history", loader)
+        self.assertIn("session_anchor_ref=", loader)
+        card = APP[
+            APP.index("function renderGitHistoryActionCard(") : APP.index(
+                "function renderApprovalActionCard("
+            )
+        ]
+        self.assertIn('entry.attribution === "EXACT"', card)
+        self.assertIn("entry.terminal_id", card)
+        self.assertIn("UNATTRIBUTED", card)
+
+
+if __name__ == "__main__":
+    unittest.main()

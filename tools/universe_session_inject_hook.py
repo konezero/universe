@@ -485,7 +485,155 @@ def resolve_mode(
         text = str(candidate or "").strip().upper()
         if text and text not in {"UNKNOWN", "NONE"}:
             return text
-    return "MASTER"
+    # An unresolved Mode stays unresolved.  Defaulting to MASTER here observed
+    # a live CONDUCTOR PTY as MASTER and then patched the Mode Current Anchor
+    # from that guess.  With a supervisor session the server owns the
+    # coordinate; without one the caller must state the Mode.
+    return ""
+
+
+def _native_attach_observation(
+    terminal_id: str, environment: Mapping[str, str]
+) -> dict[str, Any] | None:
+    """Observe the managed shell with Windows-native inspection.
+
+    psutil is absent on the service and test interpreters, so this native path
+    is what actually runs; the psutil branch below is a fallback only.
+    """
+
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from universe_app.windows_process import (
+            child_pids,
+            native_probes,
+            parent_pid,
+            process_name,
+            process_start_time,
+        )
+    except ImportError:
+        return None
+    if native_probes() is None:
+        return None
+    try:
+        # Report every ancestor cmd.exe, nearest first, each paired with the
+        # descendant that runs directly under it.  Selecting the nearest here
+        # would be wrong: a provider that launches SessionStart through an
+        # inner `cmd /c` puts a transient hook shell between this process and
+        # the Supervisor-owned one, and reporting that transient pair makes the
+        # server reject a perfectly healthy CLI.  Only the Supervisor knows
+        # which cmd it owns, so the choice belongs to it.
+        candidates: list[dict[str, Any]] = []
+        descendant = os.getpid()
+        ancestor = parent_pid(descendant)
+        while ancestor is not None:
+            if process_name(ancestor).lower() == "cmd.exe":
+                shell_started = process_start_time(ancestor)
+                descendant_started = process_start_time(descendant)
+                if shell_started is not None:
+                    candidates.append(
+                        {
+                            "shell_pid": int(ancestor),
+                            "shell_started_at": float(shell_started),
+                            "cli_pid": int(descendant),
+                            "cli_started_at": (
+                                float(descendant_started)
+                                if descendant_started is not None
+                                else 0.0
+                            ),
+                        }
+                    )
+            descendant = ancestor
+            ancestor = parent_pid(ancestor)
+        if not candidates:
+            return {
+                "schema": "universe.managed-shell-attach-evidence.v1",
+                "terminal_id": terminal_id,
+                "status": "SHELL_NOT_FOUND",
+            }
+        observation = {
+            "schema": "universe.managed-shell-attach-evidence.v1",
+            "terminal_id": terminal_id,
+            "status": "OBSERVED",
+            "shell_candidates": candidates,
+            "session_anchor_ref": str(
+                environment.get("UNIVERSE_SESSION_ANCHOR_REF") or ""
+            ).strip(),
+            "inspection_source": "WINDOWS_NATIVE",
+        }
+        # The nearest pair is carried only so a single-cmd Host keeps working
+        # with an older consumer.  The server selects by identity and must not
+        # fall back to these when candidates are present.
+        observation.update(
+            {
+                "shell_pid": candidates[0]["shell_pid"],
+                "shell_started_at": candidates[0]["shell_started_at"],
+                "cli_pid": candidates[0]["cli_pid"],
+                "cli_started_at": candidates[0]["cli_started_at"],
+            }
+        )
+        return observation
+    except Exception:  # noqa: BLE001 - observation must never block boot
+        return None
+
+
+def observe_managed_shell_attach(
+    environment: Mapping[str, str],
+) -> dict[str, Any] | None:
+    """Observe the managed cmd shell this hook is running inside.
+
+    The PID is paired with the process start time because Windows reuses PIDs;
+    a bare PID would let an unrelated process inherit a terminal's lifecycle.
+    Returns None when this hook was not launched by a managed shell.
+    """
+
+    terminal_id = str(environment.get("UNIVERSE_TERMINAL_ID") or "").strip()
+    if not terminal_id or str(environment.get("UNIVERSE_MANAGED_SHELL") or "") != "1":
+        return None
+    native = _native_attach_observation(terminal_id, environment)
+    if native is not None:
+        return native
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return {
+            "schema": "universe.managed-shell-attach-evidence.v1",
+            "terminal_id": terminal_id,
+            "status": "SHELL_IDENTITY_UNAVAILABLE",
+            "detail": "process inspection capability is unavailable",
+        }
+    try:
+        # Walk to the managed cmd shell, remembering the direct child of that
+        # shell on the way.  That child is this terminal's CLI; sealing its
+        # identity stops an arbitrary sibling from being taken as the provider.
+        cli = psutil.Process()
+        parent = cli.parent()
+        while parent is not None and parent.name().lower() != "cmd.exe":
+            cli = parent
+            parent = parent.parent()
+        if parent is None:
+            return {
+                "schema": "universe.managed-shell-attach-evidence.v1",
+                "terminal_id": terminal_id,
+                "status": "SHELL_NOT_FOUND",
+            }
+        return {
+            "schema": "universe.managed-shell-attach-evidence.v1",
+            "terminal_id": terminal_id,
+            "status": "OBSERVED",
+            "shell_pid": int(parent.pid),
+            "shell_started_at": float(parent.create_time()),
+            "cli_pid": int(cli.pid),
+            "cli_started_at": float(cli.create_time()),
+            "session_anchor_ref": str(
+                environment.get("UNIVERSE_SESSION_ANCHOR_REF") or ""
+            ).strip(),
+        }
+    except Exception:  # noqa: BLE001 - observation must never block boot
+        return {
+            "schema": "universe.managed-shell-attach-evidence.v1",
+            "terminal_id": terminal_id,
+            "status": "SHELL_IDENTITY_UNAVAILABLE",
+        }
 
 
 def load_server_connection(
@@ -813,6 +961,9 @@ def run_hook(
         "authority": "UNASSIGNED",
         "execution_assignment": "UNASSIGNED",
     }
+    managed_shell_attach = observe_managed_shell_attach(env)
+    if managed_shell_attach is not None:
+        observation["managed_shell_attach"] = managed_shell_attach
     observation_path = write_observation(repo_root, observation)
     session_md_status = (
         "DEPRECATED_ANCHOR_DB_ONLY" if args.update_session_md else "NOT_REQUESTED"
@@ -836,8 +987,6 @@ def run_hook(
 
     inject_body = {
         "project_id": project_id,
-        "node": node,
-        "mode": mode,
         "room_type": room_type,
         "slot_role": slot_role,
         "provider": provider,
@@ -858,6 +1007,14 @@ def run_hook(
             else ""
         ),
     }
+    # Only state node/mode when this Host actually resolved them.  With a
+    # supervisor_session_id the server-owned coordinates are authoritative, so
+    # an unresolved Mode must not be sent at all rather than sent as a guess.
+    if mode:
+        inject_body["node"] = node
+        inject_body["mode"] = mode
+    if managed_shell_attach is not None:
+        inject_body["managed_shell_attach"] = managed_shell_attach
     if session_ref:
         inject_body["provider_session_ref"] = session_ref
     if supervisor_session_id:
@@ -1175,6 +1332,7 @@ def setup_provider_hooks(
     providers: list[str] | None = None,
     python_exe: str | None = None,
     script_path: str | None = None,
+    mode: str | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Write SessionStart hook configs for Codex and/or Grok (and Claude).
@@ -1243,13 +1401,20 @@ def setup_provider_hooks(
         from universe_project_index_git_hook import install_git_hooks
 
         normalized_project_id = project_id or repo_root.resolve().name
+        # Resolve the Anchor first and take its Mode.  Hardcoding MASTER here
+        # picked the wrong Anchor for a CONDUCTOR session and then wrote git
+        # hooks under a Mode nobody asked for.  A caller-supplied Mode is only
+        # a lookup preference; the store's own Mode is authoritative.
+        preferred_mode = str(mode or "").strip().upper() or "MASTER"
+        anchor = resolve_mode_current_anchor(
+            repo_root, preferred_mode=preferred_mode
+        )
         project_index_git_hooks = install_git_hooks(
             project_id=normalized_project_id,
             project_root=repo_root,
-            mode="MASTER",
+            mode=anchor["mode"],
             python_exe=Path(py),
         )
-        anchor = resolve_mode_current_anchor(repo_root, preferred_mode="MASTER")
         project_index_bootstrap = sync_project_index_from_hook(
             project_id=normalized_project_id,
             project_root=repo_root,

@@ -1111,6 +1111,34 @@ def _chat_key_for_observer(observer_ref: str) -> tuple[str, str | None]:
     return identity[0], _vendor_chat_key(identity[0], identity[1])
 
 
+PTY_BINDING_UNBOUND: dict[str, Any] = {
+    "status": "UNBOUND",
+    "terminal_id": None,
+    "pty_state": None,
+    "pid": None,
+    "provider": None,
+}
+
+
+def _public_pty_binding(binding: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Render the PTY side of one session record.
+
+    Liveness and binding are observations about a terminal.  They never imply
+    Authority, Execution Assignment, or Mode Current Anchor currentness, so
+    this projection stays separate from the currentness fields.
+    """
+
+    if not isinstance(binding, Mapping):
+        return dict(PTY_BINDING_UNBOUND)
+    return {
+        "status": str(binding.get("status") or "UNBOUND").upper(),
+        "terminal_id": str(binding.get("terminal_id") or "") or None,
+        "pty_state": str(binding.get("pty_state") or "") or None,
+        "pid": binding.get("pid"),
+        "provider": str(binding.get("provider") or "") or None,
+    }
+
+
 def _public_anchor_session(
     *,
     project_id: str,
@@ -1128,6 +1156,7 @@ def _public_anchor_session(
     chat_key: str | None,
     store_present: bool,
     observer_session_ref: str = "",
+    pty_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     universe_id = session_id if str(session_id).startswith("UNIVERSE-") else None
     observer = str(observer_session_ref or "").strip()
@@ -1153,6 +1182,7 @@ def _public_anchor_session(
         "last_seen_at": last_seen_at or None,
         "chat_key": chat_key,
         "store_present": store_present,
+        "pty_binding": _public_pty_binding(pty_binding),
     }
 
 
@@ -23360,6 +23390,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             )
 
+        sessions = self._join_live_pty_bindings(project_id, sessions)
         sessions.sort(
             key=lambda item: str(item.get("last_seen_at") or ""),
             reverse=True,
@@ -23376,6 +23407,121 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project_id,
             "sessions": sessions,
         }
+
+    def _pty_binding_material(
+        self, terminal: Mapping[str, Any], status: str
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "terminal_id": terminal.get("terminal_id"),
+            "pty_state": terminal.get("state"),
+            "pid": terminal.get("pid"),
+            "provider": terminal.get("provider"),
+        }
+
+    def _pty_anchor_session(
+        self,
+        project_id: str,
+        terminal: Mapping[str, Any],
+        anchor_ref: str,
+    ) -> dict[str, Any]:
+        """Project one live PTY the Anchor and session store do not cover.
+
+        The record reports the terminal that is observably alive and the
+        Supervisor session it is bound to.  It never borrows Mode Current
+        Anchor currentness, Authority, or Execution Assignment from that
+        liveness.
+        """
+
+        supervisor_id = str(terminal.get("supervisor_session_id") or "").strip()
+        session: Mapping[str, Any] = {}
+        if supervisor_id:
+            try:
+                session = self.session_supervisor.get_session(supervisor_id)
+            except SessionSupervisorError:
+                session = {}
+        provider = str(
+            terminal.get("provider") or session.get("provider") or "UNKNOWN"
+        ).upper()
+        observer = str(session.get("provider_session_ref") or "")
+        _observer_provider, chat_key = _chat_key_for_observer(observer)
+        anchor_pending = not anchor_ref
+        return _public_anchor_session(
+            project_id=project_id,
+            mode=str(terminal.get("mode") or session.get("mode") or "").upper(),
+            session_id=supervisor_id or str(terminal.get("terminal_id") or ""),
+            provider=provider,
+            session_anchor_ref=anchor_ref,
+            current_anchor_ref=anchor_ref,
+            origin_anchor_ref=anchor_ref,
+            temporality="SESSION",
+            currentness="UNKNOWN" if anchor_pending else "NOT_CURRENT",
+            currentness_source="PTY_LIVENESS",
+            state="LIVE",
+            last_seen_at=str(
+                session.get("last_seen_at") or terminal.get("created_at") or ""
+            ),
+            chat_key=chat_key,
+            store_present=False,
+            observer_session_ref=observer,
+            pty_binding=self._pty_binding_material(
+                terminal,
+                "ANCHOR_PENDING" if anchor_pending else "BOUND",
+            ),
+        )
+
+    def _join_live_pty_bindings(
+        self, project_id: str, sessions: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Collapse a verified PTY binding and its session into one record.
+
+        A live PTY whose active Session Anchor matches an Anchor record renders
+        as that single record in a LIVE state instead of a separate live PTY
+        card beside an offline Anchor card.  A live PTY without a verified
+        Session Anchor renders ANCHOR_PENDING and must not imply a binding.
+        """
+
+        terminals = [
+            terminal
+            for terminal in self._session_anchor_terminal_host().list_sessions()
+            if str(terminal.get("state") or "").upper() == "LIVE"
+            and str(terminal.get("project_id") or "") == str(project_id or "")
+        ]
+        if not terminals:
+            return sessions
+        bound: dict[str, Mapping[str, Any]] = {}
+        anchor_pending: list[Mapping[str, Any]] = []
+        for terminal in terminals:
+            anchor_ref = str(terminal.get("active_session_anchor_ref") or "").strip()
+            if anchor_ref:
+                bound.setdefault(anchor_ref, terminal)
+            else:
+                anchor_pending.append(terminal)
+
+        joined: list[dict[str, Any]] = []
+        matched: set[str] = set()
+        for session in sessions:
+            anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+            terminal = bound.get(anchor_ref) if anchor_ref else None
+            if terminal is None:
+                joined.append(session)
+                continue
+            matched.add(anchor_ref)
+            record = dict(session)
+            record["pty_binding"] = _public_pty_binding(
+                self._pty_binding_material(terminal, "BOUND")
+            )
+            record["state"] = "LIVE"
+            record["active_ing"] = True
+            joined.append(record)
+
+        for anchor_ref, terminal in bound.items():
+            if anchor_ref in matched:
+                continue
+            joined.append(self._pty_anchor_session(project_id, terminal, anchor_ref))
+        for terminal in anchor_pending:
+            joined.append(self._pty_anchor_session(project_id, terminal, ""))
+        return joined
 
     def list_all_project_anchor_sessions(self) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
@@ -23654,6 +23800,38 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             supervisor_session_id = binding["supervisor_session_id"]
         if not supervisor_session_id:
             supervisor_session_id = "session_" + secrets.token_hex(12)
+        # Anchor-before-spawn: the Supervisor resolves (or creates) the Session
+        # Anchor first, so the PTY attaches to an existing opaque Anchor rather
+        # than inventing a coordinate once it is already running.
+        spawn_anchor_ref = str(pty_binding_anchor_ref or "").strip()
+        if not spawn_anchor_ref:
+            try:
+                supervised = self.session_supervisor.get_session(
+                    supervisor_session_id
+                )
+            except SessionSupervisorError:
+                supervised, _created = self.session_supervisor.register_session(
+                    {
+                        "session_id": supervisor_session_id,
+                        "node": project_id,
+                        "mode": mode,
+                        "provider": provider if provider not in {"", "AUTO"} else "UNKNOWN",
+                        "provider_session_ref": None,
+                        "alias": f"{project_id} {mode}",
+                        "state": "STARTING",
+                        "currentness": "UNKNOWN",
+                        "bounded_summary": "Supervisor Anchor resolved before PTY spawn",
+                    }
+                )
+            spawn_anchor_ref = str(
+                (supervised or {}).get("session_anchor_ref") or ""
+            ).strip()
+        if not spawn_anchor_ref:
+            raise UniverseError(
+                "TERMINAL_ANCHOR_REQUIRED",
+                "Supervisor could not resolve a Session Anchor before spawn",
+                HTTPStatus.CONFLICT,
+            )
         existing = self._session_anchor_terminal_host().find_live(
             project_id=project_id,
             mode=mode,
@@ -23675,6 +23853,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 model_ref=model_ref,
                 effort=effort,
                 supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=spawn_anchor_ref,
                 resume_session_ref=resume_ref,
                 cols=int(payload.get("cols") or 120),
                 rows=int(payload.get("rows") or 32),
@@ -26386,6 +26565,89 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._resolve_project_master_delegation(event)
         self.publish_project_room_changed(project_id)
 
+    def _git_work_attribution(self, provider_session_ref: str) -> tuple[str, str]:
+        """Resolve the exact Session Anchor and terminal for a Git milestone.
+
+        Attribution is only emitted when the provider coordinate resolves to
+        exactly one supervised session.  An ambiguous or absent coordinate
+        stays unattributed rather than guessing an Anchor or a terminal.
+        """
+
+        reference = str(provider_session_ref or "").strip()
+        if not reference:
+            return "", ""
+        matches = [
+            session
+            for session in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(session.get("provider_session_ref") or "") == reference
+        ]
+        if len(matches) != 1:
+            return "", ""
+        anchor_ref = str(matches[0].get("session_anchor_ref") or "").strip()
+        supervisor_id = str(matches[0].get("session_id") or "").strip()
+        terminal_id = ""
+        if supervisor_id:
+            for terminal in self._session_anchor_terminal_host().list_sessions():
+                if str(terminal.get("supervisor_session_id") or "") == supervisor_id:
+                    terminal_id = str(terminal.get("terminal_id") or "").strip()
+                    break
+        return anchor_ref, terminal_id
+
+    def list_git_work_history(
+        self,
+        project_id: str,
+        *,
+        session_anchor_ref: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List authoritative COMMIT/PUSH milestones for one project.
+
+        Entries come from recorded `GIT_WORK_STATUS` observations only.  An
+        entry without exact Anchor attribution is reported as UNATTRIBUTED
+        instead of being joined to the requested Anchor by proximity.
+        """
+
+        wanted = str(session_anchor_ref or "").strip()
+        entries: list[dict[str, Any]] = []
+        for event in self.list_events(project_id, limit=500):
+            if str(event.get("event_type") or "") != "GIT_WORK_STATUS":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            operation = str(payload.get("operation") or "").upper()
+            if operation not in {"COMMIT", "PUSH"}:
+                continue
+            anchor_ref = str(payload.get("session_anchor_ref") or "").strip()
+            if wanted and anchor_ref != wanted:
+                continue
+            entries.append(
+                {
+                    "schema": "universe.git-work-history-entry.v1",
+                    "event_id": str(event.get("event_id") or ""),
+                    "created_at": event.get("created_at"),
+                    "operation": operation,
+                    "state": str(payload.get("state") or "OBSERVED").upper(),
+                    "exit_code": payload.get("exit_code"),
+                    "commit_sha": payload.get("commit_sha"),
+                    "short_sha": payload.get("short_sha"),
+                    "branch": payload.get("branch"),
+                    "remote": payload.get("remote"),
+                    "session_anchor_ref": anchor_ref or None,
+                    "terminal_id": str(payload.get("terminal_id") or "") or None,
+                    "attribution": "EXACT" if anchor_ref else "UNATTRIBUTED",
+                }
+            )
+            if len(entries) >= max(1, int(limit)):
+                break
+        return {
+            "schema": "universe.git-work-history.v1",
+            "status": "GIT_WORK_HISTORY_COLLECTED",
+            "project_id": project_id,
+            "session_anchor_ref": wanted or None,
+            "entries": entries,
+        }
+
     def _record_project_master_work_statuses(self, event: Mapping[str, Any]) -> None:
         """Persist redacted provider Git milestones as idempotent graph inputs."""
 
@@ -26396,6 +26658,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if not project_id or not message_id or not isinstance(raw_statuses, list):
             return
         session_digest = _json_sha256(provider_session_ref) if provider_session_ref else "UNKNOWN"
+        anchor_ref, terminal_id = self._git_work_attribution(provider_session_ref)
         for raw in raw_statuses:
             if not isinstance(raw, Mapping):
                 continue
@@ -26422,6 +26685,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = raw.get(key)
                 if isinstance(value, str) and value.strip():
                     payload[key] = value.strip()
+            if anchor_ref:
+                payload["session_anchor_ref"] = anchor_ref
+            if terminal_id:
+                payload["terminal_id"] = terminal_id
             event_id = "git_work_" + _json_sha256(
                 {"project_id": project_id, **payload}
             )[:24]
@@ -29943,6 +30210,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self.server.list_project_anchor_sessions(project_id),
                 )
                 return
+            if suffix == "/git-work-history":
+                query_map = parse_qs(urlsplit(self.path).query)
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.list_git_work_history(
+                        project_id,
+                        session_anchor_ref=(
+                            query_map.get("session_anchor_ref") or [""]
+                        )[0],
+                    ),
+                )
+                return
             if suffix == "/work-loop":
                 self._send(
                     HTTPStatus.OK,
@@ -30799,6 +31078,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         session_supervisor=self.server.session_supervisor,
                         multi_rooms=self.server.multi_rooms,
                         body=body or {},
+                        terminal_host=self.server.terminal_host,
                     )
                     hook_observation = self.server.record_session_hook_observation(
                         body or {}, result
@@ -33023,6 +33303,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/work-loop",
             "/semantic-graph",
             "/anchor-sessions",
+            "/git-work-history",
             "/experience-matches",
             "/experience-patterns/auto",
             "/experience-pattern-proposals",
@@ -33939,12 +34220,65 @@ def supervisor_session_id_for(
     return "session_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
+def _record_managed_shell_attachment(
+    *,
+    terminal_host: Any,
+    body: Mapping[str, Any],
+    session: Mapping[str, Any],
+    effective_session_id: str,
+) -> dict[str, Any] | None:
+    """Bind one SessionStart attach receipt to its exact managed terminal.
+
+    The receipt is only accepted when the terminal it names is owned by this
+    supervised session and carries the same Session Anchor.  A receipt that
+    points anywhere else is recorded as a mismatch, never applied.
+    """
+
+    attach = body.get("managed_shell_attach")
+    if terminal_host is None or not isinstance(attach, Mapping):
+        return None
+    terminal_id = str(attach.get("terminal_id") or "").strip()
+    if not terminal_id:
+        return {"status": "ATTACH_TERMINAL_REQUIRED"}
+    try:
+        terminal = terminal_host.get(terminal_id)
+    except Exception:  # noqa: BLE001 - an unknown terminal is a mismatch
+        return {"status": "ATTACH_TERMINAL_UNKNOWN", "terminal_id": terminal_id}
+    public = terminal.public() if hasattr(terminal, "public") else terminal
+    if str(public.get("supervisor_session_id") or "") != effective_session_id:
+        return {
+            "status": "ATTACH_SESSION_MISMATCH",
+            "terminal_id": terminal_id,
+        }
+    claimed_anchor = str(attach.get("session_anchor_ref") or "").strip()
+    terminal_anchor = str(public.get("session_anchor_ref") or "").strip()
+    # Anchor-first: require the receipt to state its Anchor.  The previous
+    # truthy guard let an omitted Anchor pass, which is exactly the case a
+    # forged or misrouted receipt produces.
+    if not claimed_anchor:
+        return {"status": "ATTACH_ANCHOR_REQUIRED", "terminal_id": terminal_id}
+    if not terminal_anchor or claimed_anchor != terminal_anchor:
+        return {"status": "ATTACH_ANCHOR_MISMATCH", "terminal_id": terminal_id}
+    session_anchor = str(session.get("session_anchor_ref") or "").strip()
+    if session_anchor and terminal_anchor != session_anchor:
+        return {"status": "ATTACH_ANCHOR_MISMATCH", "terminal_id": terminal_id}
+    try:
+        return terminal_host.record_managed_attach(terminal_id, attach)
+    except Exception as error:  # noqa: BLE001 - report, never fail the inject
+        return {
+            "status": "ATTACH_REJECTED",
+            "terminal_id": terminal_id,
+            "detail": f"{type(error).__name__}: {error}",
+        }
+
+
 def perform_session_ref_inject(
     *,
     session_supervisor: SessionSupervisorStore,
     multi_rooms: MultiRoomStore,
     body: Mapping[str, Any],
     environment: Mapping[str, str] | None = None,
+    terminal_host: Any = None,
 ) -> dict[str, Any]:
     """Harness boot inject: Supervisor register (+ optional default) then room attach.
 
@@ -34004,10 +34338,26 @@ def perform_session_ref_inject(
             room_type = str(room.get("room_type") or room_type).upper()
         except MultiRoomError:
             room = None
-    normalized_node = str(body.get("node") or project_id or "CONDUCTOR").strip()
+    # Server-owned coordinates win when an explicit supervisor session is named
+    # and the caller did not state node/mode.  A SessionStart hook must not be
+    # able to relabel a live CONDUCTOR session as MASTER by omission.
+    stored_session: Mapping[str, Any] = {}
+    if explicit_session_id:
+        try:
+            stored_session = session_supervisor.get_session(explicit_session_id) or {}
+        except SessionSupervisorError:
+            stored_session = {}
+    normalized_node = str(
+        body.get("node") or stored_session.get("node") or project_id or "CONDUCTOR"
+    ).strip()
     if not normalized_node:
         normalized_node = "CONDUCTOR"
-    normalized_mode = str(body.get("mode") or "MASTER").strip().upper() or "MASTER"
+    normalized_mode = (
+        str(body.get("mode") or stored_session.get("mode") or "MASTER")
+        .strip()
+        .upper()
+        or "MASTER"
+    )
 
     session_id = explicit_session_id or supervisor_session_id_for(
         node=normalized_node,
@@ -34064,6 +34414,21 @@ def perform_session_ref_inject(
     # (when another session already owns this provider_session_ref). Use the
     # effective session_id from the returned session dict for all subsequent ops.
     effective_session_id = str(session.get("session_id") or session_id)
+    # An explicit supervisor coordinate names the session to bind.  If the
+    # provider identity is already owned by a different session, that is a
+    # collision, not a redirect: relocating the owner would move a session the
+    # caller never named.  Require an explicit handoff instead.
+    if (
+        explicit_session_id
+        and effective_session_id != explicit_session_id
+        and not bool(body.get("allow_identity_handoff"))
+    ):
+        raise UniverseError(
+            "SESSION_IDENTITY_OWNER_CONFLICT",
+            "provider identity is owned by a different supervised session; "
+            "explicit handoff is required",
+            HTTPStatus.CONFLICT,
+        )
     explicit_location = "node" in body or "mode" in body
     if explicit_location and (
         str(session.get("node") or "") != normalized_node
@@ -34195,10 +34560,17 @@ def perform_session_ref_inject(
                 "observation": "FAILED",
                 "detail": f"{type(error).__name__}:{error}",
             }
+    managed_shell_attachment = _record_managed_shell_attachment(
+        terminal_host=terminal_host,
+        body=body,
+        session=session,
+        effective_session_id=effective_session_id,
+    )
     return {
         **room_result,
         "schema": API_SCHEMA,
         "status": "SESSION_REF_INJECTED",
+        "managed_shell_attachment": managed_shell_attachment,
         "supervisor_session": session,
         "supervisor_session_created": created,
         "provider_session_ref_source": ref_source,

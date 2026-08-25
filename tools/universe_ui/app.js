@@ -58,6 +58,8 @@ const state = {
   projectPermissions: [],
   governanceProposals: [],
   governanceProposalInbox: [],
+  /** COMMIT/PUSH milestones for the selected Actions target. */
+  gitWorkHistory: [],
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
@@ -4960,19 +4962,107 @@ function renderProviderReplyActionCard(reply) {
   return item;
 }
 
+function actionInboxTitle() {
+  const target = state.conversationTarget || {};
+  if (target.kind === "UNIVERSE_CONDUCTOR") return "Universe actions";
+  if (target.kind === "SESSION_DELEGATION") return "Delegation actions";
+  // A redacted provider-session target can arrive without an alias or a
+  // project id.  Fall back through the remaining coordinates instead of
+  // interpolating a missing value into the heading.
+  const label = [target.alias, target.projectId, target.node, target.mode]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .find((value) => value && value !== "null" && value !== "undefined");
+  return label ? `${label} actions` : "Actions";
+}
+
+function actionInboxApprovals() {
+  // Approvals are this session's own pending permission prompts.  Governance
+  // Proposals stay out of the Actions surface; it is not a generic work queue.
+  return pendingConversationPermissions();
+}
+
+function actionInboxHistory() {
+  return Array.isArray(state.gitWorkHistory) ? state.gitWorkHistory : [];
+}
+
+async function loadActionInboxHistory() {
+  const target = state.conversationTarget || {};
+  const projectId = target.projectId || target.node;
+  if (!projectId) {
+    state.gitWorkHistory = [];
+    return;
+  }
+  const anchorRef = target.session_anchor_ref || target.current_anchor_ref || "";
+  const query = anchorRef
+    ? `?session_anchor_ref=${encodeURIComponent(anchorRef)}`
+    : "";
+  try {
+    const payload = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/git-work-history${query}`
+    );
+    state.gitWorkHistory = Array.isArray(payload.entries) ? payload.entries : [];
+  } catch (error) {
+    // History is observational.  A failed read must not break the dialog.
+    state.gitWorkHistory = [];
+  }
+}
+
+function renderGitHistoryActionCard(entry) {
+  const item = node("article", "action-inbox-card git-history-action-card");
+  const operation = String(entry.operation || "GIT").toUpperCase();
+  const stateValue = String(entry.state || "OBSERVED").toUpperCase();
+  item.dataset.state = stateValue;
+  item.append(node("strong", "", `${operation} · ${stateValue}`));
+  const detail = [entry.short_sha || entry.commit_sha, entry.branch, entry.remote]
+    .filter(Boolean)
+    .join(" · ");
+  if (detail) item.append(node("p", "action-inbox-card-detail", detail));
+  item.append(
+    node(
+      "small",
+      "action-inbox-card-attribution",
+      entry.attribution === "EXACT"
+        ? `${entry.session_anchor_ref} · ${entry.terminal_id || "terminal UNKNOWN"}`
+        : "UNATTRIBUTED · no exact Session Anchor recorded"
+    )
+  );
+  if (entry.created_at) {
+    item.append(node("small", "action-inbox-card-time", entry.created_at));
+  }
+  return item;
+}
+
+function renderApprovalActionCard(permission) {
+  const item = node("article", "action-inbox-card approval-action-card");
+  item.dataset.state = String(permission.state || "PENDING").toUpperCase();
+  item.append(
+    node(
+      "strong",
+      "",
+      `${permission.provider || "UNKNOWN"} / APPROVAL REQUIRED`
+    )
+  );
+  if (permission.title) {
+    item.append(node("p", "action-inbox-card-detail", permission.title));
+  }
+  item.append(
+    node(
+      "small",
+      "action-inbox-card-attribution",
+      String(permission.state || "PENDING").toUpperCase()
+    )
+  );
+  return item;
+}
+
 function renderActionInbox() {
   updateActionInboxBadge();
   if (!elements.actionInboxList) return;
   const items = pendingActionItems();
   elements.actionInboxList.replaceChildren();
-  const title = state.conversationTarget.kind === "UNIVERSE_CONDUCTOR"
-    ? "Universe actions"
-    : state.conversationTarget.kind === "SESSION_DELEGATION"
-      ? "Delegation actions"
-    : state.conversationTarget.kind === "PROVIDER_SESSION"
-      ? `${state.conversationTarget.alias || state.conversationTarget.projectId} actions`
-      : `${state.conversationTarget.projectId} actions`;
-  if (elements.actionInboxTitle) elements.actionInboxTitle.textContent = title;
+  if (elements.actionInboxTitle) {
+    elements.actionInboxTitle.textContent = actionInboxTitle();
+  }
 
   const appendSection = (label, cards) => {
     if (!cards.length) return;
@@ -4990,6 +5080,14 @@ function renderActionInbox() {
   );
   if (items.activeReply) activeWork.push(renderProviderReplyActionCard(items.activeReply));
   appendSection("Active work", activeWork);
+  appendSection(
+    "History",
+    actionInboxHistory().map((entry) => renderGitHistoryActionCard(entry))
+  );
+  appendSection(
+    "Approvals",
+    actionInboxApprovals().map((proposal) => renderApprovalActionCard(proposal))
+  );
   if (!elements.actionInboxList.childElementCount) {
     elements.actionInboxList.append(
       node("p", "empty-copy", "No active work.")
@@ -4997,11 +5095,13 @@ function renderActionInbox() {
   }
 }
 
-function openActionInbox() {
+async function openActionInbox() {
   renderActionInbox();
   if (elements.actionInboxDialog && !elements.actionInboxDialog.open) {
     elements.actionInboxDialog.showModal();
   }
+  await loadActionInboxHistory();
+  renderActionInbox();
 }
 
 function finishRoomMessageRender(previousScrollTop, stickToBottom = false) {

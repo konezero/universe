@@ -371,6 +371,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, result)
             return
         if path == "/v1/terminals":
+            # Anchor-before-spawn: this Supervisor owns the terminal, so it
+            # resolves the Session Anchor itself when the caller did not supply
+            # one.  The PTY never invents its own coordinate after starting.
+            spawn_anchor_ref = str(body.get("session_anchor_ref") or "").strip()
+            if not spawn_anchor_ref:
+                spawn_anchor_ref = "session_anchor_" + secrets.token_hex(12)
             try:
                 created = supervisor.host.create(
                     project_id=str(body.get("project_id") or ""),
@@ -382,6 +388,7 @@ class Handler(BaseHTTPRequestHandler):
                     supervisor_session_id=str(
                         body.get("supervisor_session_id") or ""
                     ),
+                    session_anchor_ref=spawn_anchor_ref,
                     resume_session_ref=str(body.get("resume_session_ref") or ""),
                     cols=int(body.get("cols") or 120),
                     rows=int(body.get("rows") or 32),

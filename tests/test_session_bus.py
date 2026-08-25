@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+def _test_anchor(name: str) -> str:
+    """Distinct Session Anchor per terminal; anchors are not shared."""
+    return f"session_anchor_{name}"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.session_bus import (  # noqa: E402
@@ -53,13 +56,13 @@ class SessionBusTests(unittest.TestCase):
         self.universe = self.host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=_test_anchor("t1"),
             provider="GROK",
         )
         self.gcs = self.host.create(
             project_id="gcs",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=_test_anchor("t2"),
             provider="CODEX",
         )
 
@@ -252,7 +255,7 @@ class SessionBusTests(unittest.TestCase):
         grok2 = self.host.create(
             project_id="universe",
             mode="CONDUCTOR",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=_test_anchor("t3"),
             provider="CLAUDE",
         )
         result = fanout_meeting_bus(
@@ -305,7 +308,7 @@ class SessionBusHttpTests(unittest.TestCase):
         created = host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=_test_anchor("t4"),
             provider="GROK",
         )
         self.terminal_id = created["terminal_id"]
@@ -391,7 +394,7 @@ class SessionBusDurabilityTests(unittest.TestCase):
         self.terminal = self.host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref="anchor_target_durable",
             provider="GROK",
         )
         self.terminal_id = self.terminal["terminal_id"]
@@ -470,6 +473,14 @@ class SessionBusDurabilityTests(unittest.TestCase):
     def test_projection_rules_are_filterable_and_emit_normalized_context(self) -> None:
         bus = SessionBus(database_path=self.db_path)
         anchor_ref = "anchor_projection_rules"
+        terminal = self.host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            session_anchor_ref=anchor_ref,
+            provider="GROK",
+        )
+        self.terminal_id = terminal["terminal_id"]
         task_frame_ref = "task-frame://projection-rules"
         source = {
             "project_id": "gcs",
@@ -681,7 +692,7 @@ class SessionBusDurabilityTests(unittest.TestCase):
         replacement = self.host.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=_test_anchor("t6"),
             provider="CODEX",
         )
 

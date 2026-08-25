@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_ANCHOR = "session_anchor_test"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from claude_channel_broker import (  # noqa: E402
@@ -234,7 +235,7 @@ class ClaudeChannelTerminalHostTests(unittest.TestCase):
             created = host.create(
                 project_id="universe",
                 mode="CONDUCTOR",
-                cwd=str(ROOT),
+                cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
                 provider="CLAUDE",
                 supervisor_session_id="supervisor_channel_003",
             )

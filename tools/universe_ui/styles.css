@@ -4079,6 +4079,33 @@ body {
   font-size: 10px;
 }
 
+.action-inbox-card-detail {
+  margin: 6px 0 4px;
+  color: var(--text);
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.action-inbox-card-attribution,
+.action-inbox-card-time {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  word-break: break-all;
+}
+
+.git-history-action-card[data-state="COMPLETED"] {
+  border-left-color: var(--green);
+}
+
+.git-history-action-card[data-state="FAILED"] {
+  border-left-color: var(--red);
+}
+
+.approval-action-card {
+  border-left-color: var(--amber);
+}
+
 .delegation-action-summary {
   margin: 8px 0;
   color: var(--text);

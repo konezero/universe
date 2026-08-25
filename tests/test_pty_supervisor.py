@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_ANCHOR = "session_anchor_test"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.pty_supervisor import (  # noqa: E402
@@ -191,7 +192,7 @@ class PtySupervisorTests(unittest.TestCase):
         created = first.create(
             project_id="universe",
             mode="MASTER",
-            cwd=str(ROOT),
+            cwd=str(ROOT), session_anchor_ref=TEST_ANCHOR,
             provider="GROK",
             supervisor_session_id="session_master_1",
         )

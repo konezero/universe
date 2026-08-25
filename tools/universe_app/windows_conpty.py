@@ -18,7 +18,7 @@ class WindowsConPTY:
         cwd: str,
         cols: int,
         rows: int,
-        argv: list[str] | None = None,
+        argv: "list[str] | str | None" = None,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         import winpty
@@ -49,11 +49,13 @@ class WindowsConPTY:
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env_block = "\0".join(f"{k}={v}" for k, v in env.items()) + "\0"
-        args = list(argv or [])
         exe = str(Path(executable))
         kwargs: dict[str, Any] = {"cwd": str(Path(cwd)), "env": env_block}
-        if args:
-            kwargs["cmdline"] = " " + subprocess.list2cmdline(args)
+        # A raw string is preserved verbatim: list2cmdline would escape its
+        # quotes into \" and cmd would read the whole thing as a program name.
+        line = _managed_cmdline(argv)
+        if line.strip():
+            kwargs["cmdline"] = " " + line
         # Also temporarily remove from os.environ in case the PTY backend
         # ignores the explicit env block and the child inherits the process env.
         _saved: dict[str, str] = {}
@@ -152,6 +154,14 @@ class WindowsConPTY:
                 time.sleep(0.05)
         with self._lock:
             self._output_event.set()
+
+
+def _managed_cmdline(argv: "list[str] | str | None") -> str:
+    """Return the argument line for a spawn, preserving a raw string exactly."""
+
+    if isinstance(argv, str):
+        return argv
+    return subprocess.list2cmdline(list(argv or []))
 
 
 def spawn_fallback_process(executable: str, cwd: str, cols: int, rows: int) -> Any:

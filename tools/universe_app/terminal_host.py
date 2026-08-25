@@ -22,6 +22,42 @@ from pathlib import Path
 from typing import Any
 
 from host_profile import resolve_host_tool
+from universe_app.managed_shell import (
+    CLI_STARTING,
+    DEFAULT_INTERRUPT_GRACE_SECONDS,
+    HOOK_TIMEOUT,
+    PROCESS_INSPECTION_UNAVAILABLE,
+    PTY_RESPONSIVENESS_UNKNOWN,
+    AttachEvidence,
+    ManagedShell,
+    ProcessIdentity,
+    ShellObservation,
+    host_process_probes,
+    managed_shell_cmdline,
+    observe_process_tree,
+    plan_hook_timeout_recovery,
+)
+
+
+MANAGED_SAMPLE_INTERVAL_SECONDS = 5.0
+
+
+def resolve_shell_identity(pid: int | None) -> ProcessIdentity | None:
+    """Pair a spawned shell PID with its OS start time.
+
+    Returns None when the Host cannot inspect processes, so the caller reports
+    PROCESS_INSPECTION_UNAVAILABLE instead of trusting a bare PID.
+    """
+
+    if not (isinstance(pid, int) and pid > 0):
+        return None
+    probes = host_process_probes()
+    if probes is None:
+        return None
+    started = probes["start_time_of"](pid)
+    if started is None:
+        return None
+    return ProcessIdentity(pid=pid, started_at=float(started))
 from claude_channel_broker import (
     ClaudeChannelBroker,
     MCP_SERVER_NAME,
@@ -336,6 +372,8 @@ class TerminalSession:
     pump_thread: Any = None
     exit_detail: str | None = None
     channel_broker: ClaudeChannelBroker | None = None
+    session_anchor_ref: str = ""
+    managed_shell: Any = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -347,6 +385,12 @@ class TerminalSession:
             "model_ref": self.model_ref,
             "effort": self.effort,
             "supervisor_session_id": self.supervisor_session_id,
+            "session_anchor_ref": self.session_anchor_ref,
+            "lifecycle_state": (
+                self.managed_shell.last_state
+                if getattr(self.managed_shell, "last_state", "")
+                else ""
+            ),
             "cwd": self.cwd,
             "executable": Path(self.executable).name,
             "state": self.state,
@@ -496,6 +540,8 @@ class TerminalHost:
     ) -> None:
         from universe_app.session_bus import SessionBus
 
+        # How often the per-terminal pump samples its owned process tree.
+        self._managed_sample_interval = MANAGED_SAMPLE_INTERVAL_SECONDS
         self._spawn = spawn or spawn_conpty
         self._lock = threading.Lock()
         self._sessions: dict[str, TerminalSession] = {}
@@ -544,6 +590,7 @@ class TerminalHost:
         model_ref: str = "",
         effort: str = "AUTO",
         supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
         resume_session_ref: str = "",
         cols: int = 120,
         rows: int = 32,
@@ -560,6 +607,14 @@ class TerminalHost:
         root = Path(workdir).expanduser()
         if not root.is_dir():
             raise TerminalHostError("TERMINAL_CWD_INVALID", "cwd must be a directory")
+        # Anchor-before-spawn: the Supervisor resolves the Session Anchor first,
+        # so the PTY is only ever an attachment to an existing opaque Anchor.
+        anchor_ref = str(session_anchor_ref or "").strip()
+        if not anchor_ref:
+            raise TerminalHostError(
+                "TERMINAL_ANCHOR_REQUIRED",
+                "a resolved Session Anchor is required before spawning a terminal",
+            )
         selected = str(provider or "AUTO").strip().upper()
         executable = resolve_cli_executable(selected)
         resolved_provider = selected if selected != "AUTO" else infer_provider(executable)
@@ -611,6 +666,12 @@ class TerminalHost:
             cols=max(80, int(cols or 120)),
             rows=max(24, int(rows or 32)),
             channel_broker=channel_broker,
+            session_anchor_ref=anchor_ref,
+        )
+        session.managed_shell = ManagedShell(
+            terminal_id=terminal_id,
+            session_anchor_ref=anchor_ref,
+            provider=resolved_provider,
         )
         child_environment = {
             "UNIVERSE_PROJECT_ID": project,
@@ -622,22 +683,49 @@ class TerminalHost:
             "UNIVERSE_TERMINAL_ID": terminal_id,
             "UNIVERSE_SESSION_INBOX_CLI": str(SESSION_INBOX_CLI),
         }
+        # One managed path per terminal: the Supervisor owns a headless cmd.exe
+        # ConPTY and the provider CLI runs inside it.  There is no second
+        # launcher and no separate handshake path.
+        # ComSpec is the Host's own record of its command processor; the tool
+        # registry does not carry cmd.exe.
+        shell_executable = os.environ.get("ComSpec") or "cmd.exe"
+        # startup_argv returns CLI flags only; the executable is passed
+        # separately, so the whole flag list belongs in the hosted command.
+        # A raw command line, not an argv list: the /s form cannot survive a
+        # second round of quoting (see managed_shell_cmdline).
+        shell_argv = managed_shell_cmdline([executable, *argv])
+        child_environment["UNIVERSE_MANAGED_SHELL"] = "1"
+        child_environment["UNIVERSE_SESSION_ANCHOR_REF"] = anchor_ref
         try:
             session.backend = self._spawn(
-                executable,
+                shell_executable,
                 session.cwd,
                 session.cols,
                 session.rows,
-                argv,
+                shell_argv,
                 child_environment,
             )
         except Exception as error:  # noqa: BLE001 - surface spawn failure
             if channel_broker is not None:
                 channel_broker.close()
+            session.managed_shell.record_failure_evidence(
+                "CLI_START_FAILED", {"detail": str(error)}
+            )
             raise TerminalHostError(
                 "TERMINAL_SPAWN_FAILED",
                 str(error) or "failed to start CLI",
             ) from error
+        # The CLI is requested, not yet attached.  Only a SessionStart hook
+        # receipt correlated to this shell can advance it past CLI_STARTING.
+        # Seal the exact cmd process this terminal owns.  Without a bound shell
+        # identity every attach receipt is rejected as a mismatch and the whole
+        # lifecycle is inert.
+        session.managed_shell.bind_shell_identity(
+            resolve_shell_identity(session.live_pid())
+        )
+        session.managed_shell.record_cli_launch(at=time.time())
+        if session.managed_shell.shell is not None:
+            session.managed_shell.last_state = CLI_STARTING
         session.state = "LIVE"
         with self._lock:
             self._sessions[terminal_id] = session
@@ -646,6 +734,285 @@ class TerminalHost:
             "TERMINAL_CREATED", terminal=created, context=audit_context
         )
         return created
+
+    def record_managed_attach(
+        self, terminal_id: str, evidence: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Correlate one SessionStart attach receipt with its managed shell.
+
+        Correlation is by (pid, start time) identity.  A receipt that names a
+        different terminal, or a shell this Supervisor does not own, is
+        rejected rather than trusted by recency.
+        """
+
+        session = self.get(terminal_id)
+        shell = session.managed_shell
+        if shell is None:
+            raise TerminalHostError(
+                "TERMINAL_NOT_MANAGED", "terminal has no managed shell"
+            )
+        if str(evidence.get("status") or "") != "OBSERVED":
+            shell.record_failure_evidence(
+                "ATTACH_EVIDENCE_UNUSABLE", dict(evidence)
+            )
+            return {"status": "ATTACH_EVIDENCE_UNUSABLE", "terminal_id": terminal_id}
+        claimed_anchor = str(evidence.get("session_anchor_ref") or "").strip()
+        terminal_anchor = str(session.session_anchor_ref or "").strip()
+        if not claimed_anchor:
+            shell.record_failure_evidence("ATTACH_ANCHOR_REQUIRED", dict(evidence))
+            return {"status": "ATTACH_ANCHOR_REQUIRED", "terminal_id": terminal_id}
+        if claimed_anchor != terminal_anchor or claimed_anchor != str(
+            shell.session_anchor_ref or ""
+        ).strip():
+            shell.record_failure_evidence("ATTACH_ANCHOR_MISMATCH", dict(evidence))
+            return {"status": "ATTACH_ANCHOR_MISMATCH", "terminal_id": terminal_id}
+        selected = self._select_managed_shell_candidate(shell, evidence)
+        if selected is None:
+            # No reported ancestor cmd is the shell this Supervisor owns.  The
+            # receipt describes some other process tree, so it is rejected
+            # rather than resolved by proximity or recency.
+            shell.record_failure_evidence(
+                "ATTACH_SHELL_NOT_MATCHED",
+                {
+                    "candidates": list(evidence.get("shell_candidates") or []),
+                    "owned_shell": shell.shell.as_dict() if shell.shell else None,
+                },
+            )
+            return {
+                "status": "ATTACH_SHELL_NOT_MATCHED",
+                "terminal_id": terminal_id,
+            }
+        cli_pid = selected.get("cli_pid")
+        cli_started_at = selected.get("cli_started_at")
+        attach = AttachEvidence(
+            terminal_id=str(evidence.get("terminal_id") or ""),
+            shell=ProcessIdentity(
+                pid=int(selected.get("shell_pid") or 0),
+                started_at=float(selected.get("shell_started_at") or 0.0),
+            ),
+            cli=(
+                ProcessIdentity(
+                    pid=int(cli_pid), started_at=float(cli_started_at or 0.0)
+                )
+                if isinstance(cli_pid, int) and cli_pid > 0
+                else None
+            ),
+            provider=session.provider,
+            session_anchor_ref=str(evidence.get("session_anchor_ref") or ""),
+        )
+        shell.record_attach_evidence(attach)
+        return {
+            "status": "MANAGED_SHELL_ATTACHED",
+            "terminal_id": terminal_id,
+            "session_anchor_ref": session.session_anchor_ref,
+        }
+
+    @staticmethod
+    def _select_managed_shell_candidate(
+        shell: Any, evidence: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Pick the reported candidate that is this Supervisor's own shell.
+
+        A provider may run SessionStart through an inner ``cmd /c``, so the
+        hook can see several ancestor shells.  Selection is by exact
+        (pid, start time) identity against the shell this terminal spawned --
+        never the nearest ancestor and never the most recent, either of which
+        would seal a transient hook shell and its python child instead of the
+        managed shell and the provider CLI.
+        """
+
+        owned = getattr(shell, "shell", None)
+        if owned is None:
+            return None
+        reported = evidence.get("shell_candidates")
+        if not isinstance(reported, (list, tuple)) or not reported:
+            # A single-cmd Host (or an older hook) reports one flat pair.
+            reported = [
+                {
+                    "shell_pid": evidence.get("shell_pid"),
+                    "shell_started_at": evidence.get("shell_started_at"),
+                    "cli_pid": evidence.get("cli_pid"),
+                    "cli_started_at": evidence.get("cli_started_at"),
+                }
+            ]
+        for candidate in reported:
+            if not isinstance(candidate, Mapping):
+                continue
+            try:
+                identity = ProcessIdentity(
+                    pid=int(candidate.get("shell_pid") or 0),
+                    started_at=float(candidate.get("shell_started_at") or 0.0),
+                )
+            except (TypeError, ValueError):
+                continue
+            if identity.matches(owned):
+                return dict(candidate)
+        return None
+
+    def observe_managed_state(
+        self,
+        terminal_id: str,
+        observation: Any,
+        *,
+        now: float | None = None,
+    ) -> str:
+        """Evaluate one managed shell from an owned process-tree sample."""
+
+        session = self.get(terminal_id)
+        shell = session.managed_shell
+        if shell is None:
+            raise TerminalHostError(
+                "TERMINAL_NOT_MANAGED", "terminal has no managed shell"
+            )
+        return shell.evaluate(observation, now=time.time() if now is None else now)
+
+    def sample_managed_shell(
+        self,
+        terminal_id: str,
+        *,
+        probes: Mapping[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Sample one owned process tree and record the resulting state.
+
+        A Host that cannot inspect processes yields
+        PROCESS_INSPECTION_UNAVAILABLE rather than silent non-operation.
+        """
+
+        session = self.get(terminal_id)
+        shell = session.managed_shell
+        if shell is None:
+            raise TerminalHostError(
+                "TERMINAL_NOT_MANAGED", "terminal has no managed shell"
+            )
+        resolved = probes if probes is not None else host_process_probes()
+        shell_previous_state = shell.last_state
+        if resolved is None:
+            state = shell.evaluate(
+                ShellObservation(shell_alive=False, inspection_available=False),
+                now=time.time() if now is None else now,
+            )
+            if state != shell_previous_state:
+                self.record_audit_event(
+                    "TERMINAL_MANAGED_STATE",
+                    terminal=session.public(),
+                    context={
+                        "lifecycle_state": state,
+                        "previous_state": shell_previous_state,
+                    },
+                )
+            return {"terminal_id": terminal_id, "state": state, "recovery": []}
+        observation = observe_process_tree(
+            shell.shell,
+            is_alive=resolved["is_alive"],
+            children_of=resolved["children_of"],
+            start_time_of=resolved["start_time_of"],
+            pty_responsive=self._pty_responsive(session),
+        )
+        previous_state = shell.last_state
+        state = shell.evaluate(observation, now=time.time() if now is None else now)
+        if not observation.cli_children and shell.grace_deadline is not None:
+            # The CLI honoured the interrupt.  Close the grace window here as
+            # well as in recovery, because once the CLI is gone the state is no
+            # longer HOOK_TIMEOUT and recovery does not run again.
+            shell.grace_deadline = None
+        if state != previous_state:
+            # Periodic sampling runs every few seconds per terminal.  Auditing
+            # each sample would fill the durable trail with unchanged rows, so
+            # only transitions are recorded.
+            self.record_audit_event(
+                "TERMINAL_MANAGED_STATE",
+                terminal=session.public(),
+                context={"lifecycle_state": state, "previous_state": previous_state},
+            )
+        recovery: list[dict[str, Any]] = []
+        if state == HOOK_TIMEOUT:
+            recovery = self._run_hook_timeout_recovery(
+                session, shell, observation, now=time.time() if now is None else now
+            )
+        return {
+            "terminal_id": terminal_id,
+            "state": state,
+            "recovery": recovery,
+            "inspection_source": resolved.get("source", "UNKNOWN"),
+        }
+
+    @staticmethod
+    def _pty_responsive(session: TerminalSession) -> str:
+        """Report PTY responsiveness as UNKNOWN.
+
+        The only I/O signal available here is the pump's own read loop, and it
+        cannot support a responsiveness claim: the sample runs before the read,
+        so a hung read stops sampling altogether, while an ordinary timed-out
+        read returns constantly and would keep any freshness stamp warm.  Both
+        directions are unfalsifiable, so this reports UNKNOWN instead of
+        inventing an answer.  A defensible out-of-band heartbeat would replace
+        this; until then PTY_UNRESPONSIVE is never derived.
+        """
+
+        return PTY_RESPONSIVENESS_UNKNOWN
+
+    def _run_hook_timeout_recovery(
+        self,
+        session: TerminalSession,
+        shell: Any,
+        observation: Any,
+        *,
+        now: float,
+        grace_seconds: float = DEFAULT_INTERRUPT_GRACE_SECONDS,
+    ) -> list[dict[str, Any]]:
+        """Execute the bounded recovery for exactly one terminal.
+
+        The grace window is a deadline carried on the shell, not a sleep: this
+        returns immediately and the terminal is only closed on a later sample
+        once the window has expired with the CLI still running.
+        """
+
+        performed: list[dict[str, Any]] = []
+        for action in plan_hook_timeout_recovery(
+            shell, observation, grace_seconds=grace_seconds, now=now
+        ):
+            if action.terminal_id != session.terminal_id:
+                # Recovery is per-terminal by construction; never widen it.
+                continue
+            if action.step == "START_GRACE":
+                shell.grace_deadline = now + grace_seconds
+            elif action.step == "GRACE_SATISFIED":
+                shell.grace_deadline = None
+            elif action.step == "RECORD_FAILURE_EVIDENCE":
+                shell.record_failure_evidence(
+                    "HOOK_TIMEOUT",
+                    {
+                        "shell": shell.shell.as_dict() if shell.shell else None,
+                        "cli_children": [
+                            child.as_dict() for child in observation.cli_children
+                        ],
+                    },
+                )
+            elif action.step == "INTERRUPT_CLI":
+                # History is preserved: interrupt the CLI in place rather than
+                # discarding the terminal's scrollback.
+                try:
+                    self.write(session.terminal_id, b"")
+                except TerminalHostError:
+                    pass
+            elif action.step == "CLOSE_SHELL_PTY":
+                self.close(
+                    session.terminal_id,
+                    audit_context={"reason": "MANAGED_HOOK_TIMEOUT_RECOVERY"},
+                )
+            performed.append({"step": action.step, "target_pid": action.target_pid})
+        steps = [item["step"] for item in performed]
+        # Sampling revisits an open grace window every few seconds.  Those
+        # passes do nothing but wait, so they must not each write a durable
+        # recovery row; the opening pass and any terminal action still do.
+        if steps and steps != ["GRACE"]:
+            self.record_audit_event(
+                "TERMINAL_HOOK_TIMEOUT_RECOVERY",
+                terminal=session.public(),
+                context={"steps": steps},
+            )
+        return performed
 
     def close(
         self, terminal_id: str, *, audit_context: Mapping[str, Any] | None = None
@@ -668,7 +1035,12 @@ class TerminalHost:
             except Exception:
                 pass
         if session.pump_thread is not None:
-            session.pump_thread.join(timeout=1)
+            # Grace expiry closes the terminal from inside its own pump thread.
+            # A thread cannot join itself, and the resulting RuntimeError would
+            # abort cleanup, so skip only the join and still drop the handle.
+            # pump_stop is already set and the loop exits on state != LIVE.
+            if session.pump_thread is not threading.current_thread():
+                session.pump_thread.join(timeout=1)
             session.pump_thread = None
         with self._lock:
             self._sessions.pop(session.terminal_id, None)
@@ -1023,10 +1395,21 @@ class TerminalHost:
         # (rather than guessing a delay) and confirm it the moment it renders.
         awaiting_channel_confirm = session.channel_broker is not None
         channel_confirm_tail = b""
+        next_managed_sample = time.time() + self._managed_sample_interval
         while not session.pump_stop.is_set() and session.state == "LIVE":
             backend = session.backend
             if backend is None:
                 break
+            # Periodic managed-shell sampling rides this loop rather than a
+            # separate scheduler: it is already the per-terminal lifecycle
+            # thread, so state and bounded recovery stay scoped to one PTY.
+            now = time.time()
+            if session.managed_shell is not None and now >= next_managed_sample:
+                next_managed_sample = now + self._managed_sample_interval
+                try:
+                    self.sample_managed_shell(session.terminal_id, now=now)
+                except Exception:  # noqa: BLE001 - sampling never kills a PTY
+                    pass
             try:
                 chunk = backend.read(0.2)
             except Exception as error:
@@ -1220,7 +1603,7 @@ def spawn_conpty(
     cwd: str,
     cols: int,
     rows: int,
-    argv: list[str] | None = None,
+    argv: "list[str] | str | None" = None,
     environment: Mapping[str, str] | None = None,
 ) -> Any:
     if os.name == "nt":
@@ -1231,7 +1614,10 @@ def spawn_conpty(
             cwd,
             cols,
             rows,
-            argv=argv or [],
+            # Preserve a raw command line exactly.  ``argv or []`` would turn
+            # an empty string into a list and hide the distinction between the
+            # two spawn shapes.
+            argv=[] if argv is None else argv,
             environment=environment,
         )
     raise TerminalHostError("PTY_UNSUPPORTED", "this Host does not expose a PTY")
