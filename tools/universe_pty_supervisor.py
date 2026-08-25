@@ -409,6 +409,26 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if (
+            path.startswith("/v1/terminals/")
+            and path.endswith("/managed-attach")
+            and path.count("/") == 4
+        ):
+            terminal_id = path.split("/")[3]
+            try:
+                result = supervisor.host.record_managed_attach(terminal_id, body)
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                    },
+                )
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+            return
         if path.startswith("/v1/terminals/") and path.endswith("/attach") and path.count("/") == 4:
             terminal_id = path.split("/")[3]
             try:

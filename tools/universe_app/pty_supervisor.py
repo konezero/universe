@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -352,6 +353,16 @@ class SupervisedTerminalHost:
             "DELETE",
             f"/v1/terminals/{quote(terminal_id, safe='')}",
             audit_source="UNIVERSE_TERMINAL_DELETE",
+        )
+
+    def record_managed_attach(
+        self, terminal_id: str, evidence: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/managed-attach",
+            payload=dict(evidence),
+            audit_source="UNIVERSE_SESSION_START",
         )
 
     def write(self, terminal_id: str, data: bytes) -> None:

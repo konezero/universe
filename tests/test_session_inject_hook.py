@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_session_inject_hook import (  # noqa: E402
+    _claude_settings_hook,
+    _supervisor_identity_observation,
     main,
     provider_hook_stdout,
     resolve_mode,
@@ -554,6 +556,64 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("WRITTEN", result["providers"]["CODEX"]["status"])
         self.assertIn("--quiet", config)
 
+    def test_supervisor_identity_file_supplies_owned_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_path = Path(tmp) / "managed-shell.json"
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.managed-shell-identity.v1",
+                        "terminal_id": "term_owned",
+                        "session_anchor_ref": "session_anchor_owned",
+                        "shell_pid": 4242,
+                        "shell_started_at": 123.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "universe_session_inject_hook._native_attach_observation",
+                return_value={
+                    "status": "OBSERVED",
+                    "shell_candidates": [
+                        {
+                            "shell_pid": 4242,
+                            "shell_started_at": 123.5,
+                            "cli_pid": 4343,
+                            "cli_started_at": 124.5,
+                        }
+                    ],
+                },
+            ):
+                observed = _supervisor_identity_observation(
+                    "term_owned",
+                    {
+                        "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(identity_path),
+                        "UNIVERSE_SESSION_ANCHOR_REF": "session_anchor_owned",
+                    },
+                )
+        self.assertIsNotNone(observed)
+        self.assertEqual(
+            "SUPERVISOR_IDENTITY_FILE+WINDOWS_NATIVE",
+            observed["inspection_source"],
+        )
+        self.assertEqual(4242, observed["shell_candidates"][0]["shell_pid"])
+        self.assertEqual(4343, observed["shell_candidates"][0]["cli_pid"])
+
+    def test_claude_hook_quotes_windows_script_path_for_shell(self) -> None:
+        payload = _claude_settings_hook(
+            r"C:\workspace\universe\tools\universe_session_inject_hook.py"
+        )
+        command = payload["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertEqual(
+            "python -c \"import runpy; "
+            "runpy.run_path('C:/workspace/universe/tools/"
+            "universe_session_inject_hook.py', run_name='__main__')\" "
+            "--repo-root . --provider CLAUDE --from-stdin --trigger session_start",
+            command,
+        )
+        self.assertNotIn("\\", command)
+
     def test_setup_writes_project_claude_and_grok_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -572,6 +632,10 @@ class SessionInjectHookTests(unittest.TestCase):
             self.assertTrue(grok_hook.is_file())
             self.assertIn("--provider GROK", grok_hook.read_text(encoding="utf-8"))
             self.assertIn("--provider CLAUDE", claude_hook.read_text(encoding="utf-8"))
+            self.assertIn(
+                "python -m tools.universe_session_inject_hook",
+                claude_hook.read_text(encoding="utf-8"),
+            )
             again = setup_provider_hooks(
                 root,
                 global_=False,

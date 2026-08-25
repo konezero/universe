@@ -35,6 +35,7 @@ class _ProjectionServer:
         self._sessions = dict(sessions or {})
         self._events = list(events)
         self.session_supervisor = SimpleNamespace(get_session=self._get_session)
+        self.store = SimpleNamespace(list_events=self.list_events)
 
     def _get_session(self, session_id):
         return self._sessions[session_id]

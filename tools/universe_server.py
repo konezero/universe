@@ -26609,7 +26609,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         wanted = str(session_anchor_ref or "").strip()
         entries: list[dict[str, Any]] = []
-        for event in self.list_events(project_id, limit=500):
+        for event in self.store.list_events(project_id, limit=500):
             if str(event.get("event_type") or "") != "GIT_WORK_STATUS":
                 continue
             payload = event.get("payload")

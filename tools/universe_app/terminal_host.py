@@ -338,6 +338,45 @@ class TerminalScreenProjection:
         return ("\x1b[2J\x1b[H" + body + cursor).encode("utf-8")
 
 
+MANAGED_SHELL_IDENTITY_SCHEMA = "universe.managed-shell-identity.v1"
+
+
+def managed_shell_identity_path(root: Path, terminal_id: str) -> Path:
+    return (
+        root.resolve()
+        / ".ai"
+        / "runtime"
+        / "tmp"
+        / "managed-shells"
+        / f"{terminal_id}.json"
+    )
+
+
+def write_managed_shell_identity(path: Path, session: Any) -> None:
+    shell = getattr(getattr(session, "managed_shell", None), "shell", None)
+    if shell is None:
+        return
+    payload = {
+        "schema": MANAGED_SHELL_IDENTITY_SCHEMA,
+        "terminal_id": session.terminal_id,
+        "session_anchor_ref": session.session_anchor_ref,
+        "shell_pid": shell.pid,
+        "shell_started_at": shell.started_at,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        staged.write_text(
+            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(staged, path)
+    finally:
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class TerminalHostError(ValueError):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
@@ -673,6 +712,7 @@ class TerminalHost:
             session_anchor_ref=anchor_ref,
             provider=resolved_provider,
         )
+        shell_identity_path = managed_shell_identity_path(root, terminal_id)
         child_environment = {
             "UNIVERSE_PROJECT_ID": project,
             "UNIVERSE_MODE": requested_mode,
@@ -681,6 +721,7 @@ class TerminalHost:
             "UNIVERSE_EFFORT": selected_effort,
             "UNIVERSE_SUPERVISOR_SESSION_ID": supervisor,
             "UNIVERSE_TERMINAL_ID": terminal_id,
+            "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(shell_identity_path),
             "UNIVERSE_SESSION_INBOX_CLI": str(SESSION_INBOX_CLI),
         }
         # One managed path per terminal: the Supervisor owns a headless cmd.exe
@@ -723,6 +764,7 @@ class TerminalHost:
         session.managed_shell.bind_shell_identity(
             resolve_shell_identity(session.live_pid())
         )
+        write_managed_shell_identity(shell_identity_path, session)
         session.managed_shell.record_cli_launch(at=time.time())
         if session.managed_shell.shell is not None:
             session.managed_shell.last_state = CLI_STARTING
@@ -784,6 +826,20 @@ class TerminalHost:
             }
         cli_pid = selected.get("cli_pid")
         cli_started_at = selected.get("cli_started_at")
+        if not (isinstance(cli_pid, int) and cli_pid > 0):
+            probes = host_process_probes()
+            if probes is not None:
+                observed = observe_process_tree(
+                    shell.shell,
+                    is_alive=probes["is_alive"],
+                    children_of=probes["children_of"],
+                    start_time_of=probes["start_time_of"],
+                    pty_responsive=self._pty_responsive(session),
+                )
+                if len(observed.cli_children) == 1:
+                    cli = observed.cli_children[0]
+                    cli_pid = cli.pid
+                    cli_started_at = cli.started_at
         attach = AttachEvidence(
             terminal_id=str(evidence.get("terminal_id") or ""),
             shell=ProcessIdentity(
@@ -1050,6 +1106,12 @@ class TerminalHost:
             closer()
         if session.channel_broker is not None:
             session.channel_broker.close()
+        try:
+            managed_shell_identity_path(
+                Path(session.cwd), session.terminal_id
+            ).unlink(missing_ok=True)
+        except OSError:
+            pass
         self.record_audit_event(
             "TERMINAL_CLOSED", terminal=terminal, context=audit_context
         )

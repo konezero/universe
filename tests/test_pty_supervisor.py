@@ -135,6 +135,28 @@ class PtySupervisorTests(unittest.TestCase):
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
+    def test_managed_attach_route_forwards_to_terminal_host(self) -> None:
+        evidence = {
+            "status": "OBSERVED",
+            "terminal_id": "term_owned",
+            "session_anchor_ref": TEST_ANCHOR,
+            "shell_pid": 4242,
+            "shell_started_at": 123.5,
+        }
+        with patch.object(
+            self.server.supervisor.host,
+            "record_managed_attach",
+            return_value={"status": "MANAGED_SHELL_ATTACHED"},
+        ) as record:
+            status, payload = self.request(
+                "POST",
+                "/v1/terminals/term_owned/managed-attach",
+                evidence,
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("MANAGED_SHELL_ATTACHED", payload["status"])
+        record.assert_called_once_with("term_owned", evidence)
+
     def test_create_list_and_read_survives_client_disconnect_model(self) -> None:
         status, created = self.request(
             "POST",

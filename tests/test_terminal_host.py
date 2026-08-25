@@ -14,6 +14,7 @@ TEST_ANCHOR = "session_anchor_test"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.terminal_host import (  # noqa: E402
+    ProcessIdentity,
     TerminalHost,
     TerminalHostError,
     resolve_cli_executable,
@@ -95,12 +96,48 @@ class TerminalHostTests(unittest.TestCase):
                 "UNIVERSE_EFFORT": "AUTO",
                 "UNIVERSE_SUPERVISOR_SESSION_ID": "",
                 "UNIVERSE_TERMINAL_ID": created["terminal_id"],
+                "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(
+                    ROOT
+                    / ".ai"
+                    / "runtime"
+                    / "tmp"
+                    / "managed-shells"
+                    / f"{created['terminal_id']}.json"
+                ),
                 "UNIVERSE_SESSION_INBOX_CLI": str(
                     ROOT / "tools" / "universe_session_inbox.py"
                 ),
             },
             spawned[0][5],
         )
+
+    def test_managed_shell_identity_file_is_written_and_cleaned(self) -> None:
+        spawned_environment: dict[str, str] = {}
+
+        def spawn(_executable, _cwd, _cols, _rows, argv=None, environment=None):
+            del argv
+            spawned_environment.update(environment or {})
+            return FakePty()
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(spawn=spawn)
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref=TEST_ANCHOR,
+                provider="GROK",
+            )
+            identity_path = Path(
+                spawned_environment["UNIVERSE_MANAGED_SHELL_IDENTITY_FILE"]
+            )
+            self.assertTrue(identity_path.is_file())
+            self.assertIn("\"shell_pid\": 4242", identity_path.read_text())
+            host.close(created["terminal_id"])
+            self.assertFalse(identity_path.exists())
 
     def test_missing_coordinate_is_rejected(self) -> None:
         host = TerminalHost(spawn=lambda *_args: FakePty())

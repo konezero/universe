@@ -18,6 +18,7 @@ import os
 import socket
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -492,6 +493,82 @@ def resolve_mode(
     return ""
 
 
+def _supervisor_identity_observation(
+    terminal_id: str, environment: Mapping[str, str]
+) -> dict[str, Any] | None:
+    path_text = str(
+        environment.get("UNIVERSE_MANAGED_SHELL_IDENTITY_FILE") or ""
+    ).strip()
+    if not path_text:
+        return None
+    expected_anchor = str(
+        environment.get("UNIVERSE_SESSION_ANCHOR_REF") or ""
+    ).strip()
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        try:
+            payload = json.loads(Path(path_text).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            time.sleep(0.05)
+            continue
+        if (
+            str(payload.get("schema") or "")
+            != "universe.managed-shell-identity.v1"
+            or str(payload.get("terminal_id") or "") != terminal_id
+            or str(payload.get("session_anchor_ref") or "") != expected_anchor
+        ):
+            return None
+        try:
+            shell_pid = int(payload.get("shell_pid") or 0)
+            shell_started_at = float(payload.get("shell_started_at") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if shell_pid <= 0 or shell_started_at <= 0:
+            return None
+        candidate = {
+            "shell_pid": shell_pid,
+            "shell_started_at": shell_started_at,
+            "cli_pid": None,
+            "cli_started_at": None,
+        }
+        inspection_source = "SUPERVISOR_IDENTITY_FILE"
+        native = _native_attach_observation(terminal_id, environment)
+        if isinstance(native, Mapping) and native.get("status") == "OBSERVED":
+            for reported in native.get("shell_candidates") or []:
+                if not isinstance(reported, Mapping):
+                    continue
+                try:
+                    reported_pid = int(reported.get("shell_pid") or 0)
+                    reported_started_at = float(
+                        reported.get("shell_started_at") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    reported_pid == shell_pid
+                    and abs(reported_started_at - shell_started_at) <= 0.5
+                ):
+                    candidate["cli_pid"] = reported.get("cli_pid")
+                    candidate["cli_started_at"] = reported.get("cli_started_at")
+                    inspection_source = (
+                        "SUPERVISOR_IDENTITY_FILE+WINDOWS_NATIVE"
+                    )
+                    break
+        return {
+            "schema": "universe.managed-shell-attach-evidence.v1",
+            "terminal_id": terminal_id,
+            "status": "OBSERVED",
+            "shell_candidates": [candidate],
+            "shell_pid": shell_pid,
+            "shell_started_at": shell_started_at,
+            "cli_pid": candidate["cli_pid"],
+            "cli_started_at": candidate["cli_started_at"],
+            "session_anchor_ref": expected_anchor,
+            "inspection_source": inspection_source,
+        }
+    return None
+
+
 def _native_attach_observation(
     terminal_id: str, environment: Mapping[str, str]
 ) -> dict[str, Any] | None:
@@ -589,6 +666,9 @@ def observe_managed_shell_attach(
     terminal_id = str(environment.get("UNIVERSE_TERMINAL_ID") or "").strip()
     if not terminal_id or str(environment.get("UNIVERSE_MANAGED_SHELL") or "") != "1":
         return None
+    supervisor = _supervisor_identity_observation(terminal_id, environment)
+    if supervisor is not None:
+        return supervisor
     native = _native_attach_observation(terminal_id, environment)
     if native is not None:
         return native
@@ -1164,7 +1244,15 @@ def _grok_hook_payload(python_exe: str, script_path: str) -> dict[str, Any]:
     }
 
 
-def _claude_settings_hook(script_path: str) -> dict[str, Any]:
+def _claude_settings_hook(
+    script_path: str, *, project: bool = False
+) -> dict[str, Any]:
+    normalized_script = Path(script_path).as_posix()
+    target = (
+        "-m tools.universe_session_inject_hook"
+        if project
+        else f'-c "import runpy; runpy.run_path({normalized_script!r}, run_name=\'__main__\')"'
+    )
     return {
         "hooks": {
             "SessionStart": [
@@ -1172,7 +1260,7 @@ def _claude_settings_hook(script_path: str) -> dict[str, Any]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"python {script_path} --repo-root . --provider CLAUDE --from-stdin --trigger session_start",
+                            "command": f"python {target} --repo-root . --provider CLAUDE --from-stdin --trigger session_start",
                         }
                     ]
                 }
@@ -1193,12 +1281,18 @@ def _merge_claude_settings(path: Path, hook_entry: dict[str, Any]) -> str:
     hooks = existing.setdefault("hooks", {})
     starts = hooks.setdefault("SessionStart", [])
     new_cmd = hook_entry["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    script_marker = "universe_session_inject_hook.py"
+    script_markers = (
+        "universe_session_inject_hook.py",
+        "tools.universe_session_inject_hook",
+    )
+
+    def is_universe_hook(command: object) -> bool:
+        return any(marker in str(command or "") for marker in script_markers)
     updated = False
     for block in starts:
         for hook in block.get("hooks") or []:
             command = str(hook.get("command") or "")
-            if script_marker not in command:
+            if not is_universe_hook(command):
                 continue
             if command != new_cmd:
                 hook["command"] = new_cmd
@@ -1208,7 +1302,7 @@ def _merge_claude_settings(path: Path, hook_entry: dict[str, Any]) -> str:
         path.write_text(_json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return "UPDATED"
     if any(
-        script_marker in (h.get("command") or "")
+        is_universe_hook(h.get("command"))
         for block in starts
         for h in (block.get("hooks") or [])
     ):
@@ -1374,7 +1468,7 @@ def setup_provider_hooks(
             results["CLAUDE_PROJECT"] = {
                 "status": _merge_claude_settings(
                     repo_root / ".claude" / "settings.json",
-                    _claude_settings_hook(sp),
+                    _claude_settings_hook(sp, project=True),
                 ),
                 "path": str((repo_root / ".claude" / "settings.json")),
             }

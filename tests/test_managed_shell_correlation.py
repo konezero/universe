@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -180,6 +181,50 @@ class SimpleCmdCorrelationTests(unittest.TestCase):
         assert shell.attach_evidence is not None
         self.assertEqual(shell.attach_evidence.shell.pid, OUTER_CMD.pid)
         self.assertIsNotNone(shell.attach_evidence.cli)
+
+    def test_identity_only_receipt_seals_single_owned_child(self) -> None:
+        shell = _owned_shell()
+        host = _host(shell)
+        identity_only = {
+            "schema": "universe.managed-shell-attach-evidence.v1",
+            "terminal_id": TERMINAL,
+            "status": "OBSERVED",
+            "session_anchor_ref": ANCHOR,
+            "shell_candidates": [
+                {
+                    "shell_pid": OUTER_CMD.pid,
+                    "shell_started_at": OUTER_CMD.started_at,
+                    "cli_pid": None,
+                    "cli_started_at": None,
+                }
+            ],
+        }
+        probes = {
+            "is_alive": lambda pid: pid in {OUTER_CMD.pid, PROVIDER.pid},
+            "children_of": lambda pid: (PROVIDER,) if pid == OUTER_CMD.pid else (),
+            "start_time_of": lambda pid: {
+                OUTER_CMD.pid: OUTER_CMD.started_at,
+                PROVIDER.pid: PROVIDER.started_at,
+            }.get(pid),
+            "source": "TEST",
+        }
+        with mock.patch(
+            "universe_app.terminal_host.host_process_probes", return_value=probes
+        ):
+            result = host.record_managed_attach(TERMINAL, identity_only)
+
+        self.assertEqual("MANAGED_SHELL_ATTACHED", result["status"])
+        assert shell.attach_evidence is not None
+        self.assertEqual(PROVIDER, shell.attach_evidence.cli)
+        self.assertEqual(
+            CLI_RUNNING,
+            shell.evaluate(
+                ShellObservation(
+                    shell_alive=True, shell=OUTER_CMD, cli_children=(PROVIDER,)
+                ),
+                now=5.0,
+            ),
+        )
 
     def test_flat_legacy_evidence_without_candidates_still_works(self) -> None:
         shell = _owned_shell()
