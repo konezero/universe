@@ -906,19 +906,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "source": "GIT_TRACE2",
             "evidence_ref": "git://commit/" + "a" * 40,
         }
-        status, started = self.request(
+        status, raw_blocked = self.request(
             "POST", f"/v1/todos/{todo_id}/actions", started_action
         )
-        self.assertEqual(200, status)
+        self.assertEqual(409, status)
+        self.assertEqual(
+            "TODO_ACTION_MUTATION_RECEIPT_REQUIRED", raw_blocked["error_code"]
+        )
+
+        started = self.server.store.apply_todo_action(todo_id, started_action)
         self.assertEqual("TODO_ACTION_APPLIED", started["status"])
         self.assertEqual("IN_PROGRESS", started["todo"]["state"])
-        self.assertFalse(started["task_frame_created"])
-        self.assertFalse(started["execution_assignment_created"])
 
-        status, repeated = self.request(
-            "POST", f"/v1/todos/{todo_id}/actions", started_action
-        )
-        self.assertEqual(200, status)
+        repeated = self.server.store.apply_todo_action(todo_id, started_action)
         self.assertEqual("TODO_ACTION_ALREADY_APPLIED", repeated["status"])
 
         completed_action = {
@@ -927,22 +927,17 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "source": "TEST_HOOK",
             "evidence_ref": "test-run://validation-run-001",
         }
-        status, blocked = self.request(
-            "POST", f"/v1/todos/{todo_id}/actions", completed_action
-        )
-        self.assertEqual(409, status)
+        with self.assertRaises(UniverseError) as blocked:
+            self.server.store.apply_todo_action(todo_id, completed_action)
         self.assertEqual(
-            "TODO_COMPLETION_VALIDATION_REQUIRED", blocked["error_code"]
+            "TODO_COMPLETION_VALIDATION_REQUIRED", blocked.exception.code
         )
 
         completed_action["validation"] = {
             "status": "PASSED",
             "evidence_ref": "test-run://validation-run-001/passed",
         }
-        status, completed = self.request(
-            "POST", f"/v1/todos/{todo_id}/actions", completed_action
-        )
-        self.assertEqual(200, status)
+        completed = self.server.store.apply_todo_action(todo_id, completed_action)
         self.assertEqual("DONE", completed["todo"]["state"])
         self.assertIn("result_fanout", completed)
 
@@ -981,7 +976,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         gateway = TodoMutationGateway(self.endpoint, self.token)
         todo = {
-            "scope_kind": "UNIVERSE",
+            "scope_kind": "PROJECT",
+            "project_id": "GCS",
             "title": "Use one receipt path",
             "detail": "Mode and source_kind are not mutation authority.",
             "priority": "P1",
@@ -1041,6 +1037,51 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 todo={**todo, "title": "Conflicting replay"},
             )
         self.assertEqual("TODO_MUTATION_RECEIPT_CONFLICT", caught.exception.code)
+
+        completed_action = {
+            "action_id": "guarded-completion-001",
+            "outcome": "COMPLETED",
+            "source": "CODEX_DESKTOP",
+            "evidence_ref": "git://commit/" + "a" * 40,
+            "validation": {
+                "status": "PASSED",
+                "evidence_ref": "test-run://guarded-completion/pass",
+            },
+        }
+        action_coordinates = {
+            "provider": "CODEX",
+            "provider_session_ref": "todo-attached-provider-ref",
+            "session_id": attached["session_id"],
+            "session_anchor_ref": attached["session_anchor_ref"],
+            "instruction_ref": "conversation://test/attached-todo-complete",
+            "todo_id": attached_result["todo"]["todo_id"],
+            "action": completed_action,
+        }
+        guarded_action = gateway.apply_action(**action_coordinates)
+        self.assertEqual("TODO_ACTION_MUTATION_APPLIED", guarded_action["status"])
+        self.assertEqual("CONSUMED", guarded_action["receipt"]["status"])
+        self.assertEqual("DONE", guarded_action["todo"]["state"])
+        self.assertFalse(guarded_action["replayed"])
+        self.assertNotIn(
+            "todo-attached-provider-ref", json.dumps(guarded_action)
+        )
+
+        guarded_replay = gateway.apply_action(**action_coordinates)
+        self.assertTrue(guarded_replay["replayed"])
+        self.assertEqual("DONE", guarded_replay["todo"]["state"])
+        with self.assertRaises(TodoMutationGatewayError) as action_conflict:
+            gateway.apply_action(
+                **{
+                    **action_coordinates,
+                    "action": {
+                        **completed_action,
+                        "evidence_ref": "git://commit/" + "b" * 40,
+                    },
+                }
+            )
+        self.assertEqual(
+            "TODO_ACTION_MUTATION_RECEIPT_CONFLICT", action_conflict.exception.code
+        )
 
     def test_todo_mutation_accepts_exact_current_anchor_live_pty(self) -> None:
         session, _ = self.server.session_supervisor.register_session(

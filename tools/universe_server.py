@@ -1815,6 +1815,140 @@ def normalize_todo_mutation_request(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_todo_action_payload(todo_id: Any, value: Any) -> dict[str, Any]:
+    normalized_todo_id = _identifier(todo_id, "todo_id")
+    request = _exact_object_fields(
+        value,
+        field="todo action",
+        required=frozenset({"action_id", "outcome", "source", "evidence_ref"}),
+        optional=frozenset({"validation"}),
+    )
+    action_id = _required_text(request["action_id"], "action_id")
+    if len(action_id) > 160:
+        raise UniverseError("TODO_ACTION_ID_INVALID", "action_id is too long")
+    outcome = _required_text(request["outcome"], "outcome").upper()
+    desired_state = {
+        "STARTED": "IN_PROGRESS",
+        "COMPLETED": "DONE",
+        "FAILED": "BLOCKED",
+        "REOPENED": "READY",
+    }.get(outcome)
+    if desired_state is None:
+        raise UniverseError(
+            "TODO_ACTION_OUTCOME_INVALID",
+            "outcome must be STARTED, COMPLETED, FAILED, or REOPENED",
+        )
+    source = _required_text(request["source"], "source").upper()
+    if len(source) > 80:
+        raise UniverseError("TODO_ACTION_SOURCE_INVALID", "source is too long")
+    evidence_ref = _required_text(request["evidence_ref"], "evidence_ref")
+    if len(evidence_ref) > 1000:
+        raise UniverseError("TODO_ACTION_EVIDENCE_INVALID", "evidence_ref is too long")
+    validation_value = request.get("validation")
+    if validation_value is None:
+        validation: dict[str, str] = {}
+    else:
+        if not isinstance(validation_value, Mapping) or set(validation_value) != {
+            "status",
+            "evidence_ref",
+        }:
+            raise UniverseError(
+                "TODO_ACTION_VALIDATION_INVALID",
+                "validation must contain only status and evidence_ref",
+            )
+        validation = {
+            "status": _required_text(
+                validation_value["status"], "validation.status"
+            ).upper(),
+            "evidence_ref": _required_text(
+                validation_value["evidence_ref"], "validation.evidence_ref"
+            ),
+        }
+    if outcome == "COMPLETED" and validation.get("status") != "PASSED":
+        raise UniverseError(
+            "TODO_COMPLETION_VALIDATION_REQUIRED",
+            "COMPLETED requires validation.status PASSED and validation evidence",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        "todo_id": normalized_todo_id,
+        "action_id": action_id,
+        "outcome": outcome,
+        "source": source,
+        "evidence_ref": evidence_ref,
+        "validation": validation,
+        "state": desired_state,
+    }
+
+
+def normalize_todo_action_mutation_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="todo_action_mutation_request",
+        required=frozenset(
+            {
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "instruction_ref",
+                "todo_id",
+                "action",
+            }
+        ),
+        optional=frozenset({"schema", "ttl_seconds"}),
+    )
+    provider = _required_text(request["provider"], "provider").upper()
+    if provider not in TODO_MUTATION_PROVIDERS:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_INVALID",
+            "provider must be CODEX, CLAUDE, or GROK",
+        )
+    provider_session_ref = _required_text(
+        request["provider_session_ref"], "provider_session_ref"
+    )
+    if len(provider_session_ref) > 1000:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_SESSION_REF_INVALID",
+            "provider_session_ref is too long",
+        )
+    instruction_ref = _required_text(request["instruction_ref"], "instruction_ref")
+    if len(instruction_ref) > 512:
+        raise UniverseError(
+            "TODO_MUTATION_INSTRUCTION_REF_INVALID",
+            "instruction_ref is too long",
+        )
+    ttl_seconds = request.get("ttl_seconds", TODO_MUTATION_RECEIPT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds < 1
+        or ttl_seconds > TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "TODO_MUTATION_TTL_INVALID",
+            f"ttl_seconds must be between 1 and {TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS}",
+        )
+    normalized_todo_id = _identifier(request["todo_id"], "todo_id")
+    action = normalize_todo_action_payload(normalized_todo_id, request["action"])
+    normalized_action = {
+        key: action[key]
+        for key in ("action_id", "outcome", "source", "evidence_ref", "validation")
+    }
+    return {
+        "provider": provider,
+        "provider_session_ref": provider_session_ref,
+        "session_id": _identifier(request["session_id"], "session_id"),
+        "session_anchor_ref": _required_text(
+            request["session_anchor_ref"], "session_anchor_ref"
+        ),
+        "instruction_ref": instruction_ref,
+        "todo_id": normalized_todo_id,
+        "action": normalized_action,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
 def _optional_identifier(value: Any, field: str) -> str | None:
     if value is None or value == "":
         return None
@@ -4988,6 +5122,27 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS todo_mutation_receipt_status_expiry
                 ON todo_mutation_receipt(status, expires_at, receipt_id);
+
+
+
+                CREATE TABLE IF NOT EXISTS todo_action_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    instruction_ref TEXT NOT NULL,
+                    todo_id TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PREPARED', 'CONSUMED')),
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(session_id, instruction_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS todo_action_mutation_receipt_status_expiry
+                ON todo_action_mutation_receipt(status, expires_at, receipt_id);
 
                 CREATE TABLE IF NOT EXISTS skill_registry_snapshot (
                     snapshot_id TEXT PRIMARY KEY,
@@ -9858,6 +10013,196 @@ class UniverseStore:
                 (todo_id,),
             ).fetchone()
         return self._todo_mutation_receipt_row(receipt), self._todo_row(todo_row), False
+
+
+    @staticmethod
+    def _todo_action_mutation_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": "universe.todo-action-mutation-receipt.v1",
+            "receipt_id": row["receipt_id"],
+            "session_id": row["session_id"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "provider": row["provider"],
+            "provider_session_ref_hash": row["provider_session_ref_hash"],
+            "instruction_ref": row["instruction_ref"],
+            "todo_id": row["todo_id"],
+            "payload_sha256": row["payload_sha256"],
+            "status": row["status"],
+            "prepared_at": row["prepared_at"],
+            "expires_at": row["expires_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    def _bound_todo_action_mutation(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], str, str]:
+        action = normalize_todo_action_payload(request["todo_id"], request["action"])
+        payload_sha256 = _json_sha256(action)
+        provider_ref_hash = hashlib.sha256(
+            str(request["provider_session_ref"]).encode("utf-8")
+        ).hexdigest()
+        return action, payload_sha256, provider_ref_hash
+
+    def prepare_todo_action_mutation_receipt(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        _, payload_sha256, provider_ref_hash = self._bound_todo_action_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=int(request["ttl_seconds"]))
+        ).isoformat().replace("+00:00", "Z")
+        receipt_id = "todo_action_receipt_" + _json_sha256(
+            {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+            }
+        )[:24]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM todo_action_mutation_receipt WHERE session_id = ? AND instruction_ref = ?",
+                (request["session_id"], request["instruction_ref"]),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["todo_id"],
+                    payload_sha256,
+                )
+                actual = (
+                    existing["session_anchor_ref"],
+                    existing["provider"],
+                    existing["provider_session_ref_hash"],
+                    existing["todo_id"],
+                    existing["payload_sha256"],
+                )
+                if actual != expected:
+                    raise UniverseError(
+                        "TODO_ACTION_MUTATION_RECEIPT_CONFLICT",
+                        "instruction_ref is already bound to different Todo action material",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "PREPARED" and datetime.fromisoformat(
+                    str(existing["expires_at"]).replace("Z", "+00:00")
+                ) <= now_datetime:
+                    connection.execute(
+                        "UPDATE todo_action_mutation_receipt SET prepared_at = ?, expires_at = ? WHERE receipt_id = ?",
+                        (now, expires_at, existing["receipt_id"]),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                        (existing["receipt_id"],),
+                    ).fetchone()
+                return self._todo_action_mutation_receipt_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO todo_action_mutation_receipt(
+                    receipt_id, session_id, session_anchor_ref, provider,
+                    provider_session_ref_hash, instruction_ref, todo_id,
+                    payload_sha256, status, prepared_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL)
+                """,
+                (
+                    receipt_id,
+                    request["session_id"],
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["instruction_ref"],
+                    request["todo_id"],
+                    payload_sha256,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        return self._todo_action_mutation_receipt_row(row), True
+
+    def consume_todo_action_mutation_receipt(
+        self, receipt_id: str, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        normalized_receipt_id = _identifier(receipt_id, "receipt_id")
+        action, payload_sha256, provider_ref_hash = self._bound_todo_action_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        with self._connection() as connection:
+            receipt = connection.execute(
+                "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                (normalized_receipt_id,),
+            ).fetchone()
+        if receipt is None:
+            raise UniverseError(
+                "TODO_ACTION_MUTATION_RECEIPT_NOT_FOUND",
+                "Todo action mutation receipt does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        expected = (
+            request["session_id"],
+            request["session_anchor_ref"],
+            request["provider"],
+            provider_ref_hash,
+            request["instruction_ref"],
+            request["todo_id"],
+            payload_sha256,
+        )
+        actual = (
+            receipt["session_id"],
+            receipt["session_anchor_ref"],
+            receipt["provider"],
+            receipt["provider_session_ref_hash"],
+            receipt["instruction_ref"],
+            receipt["todo_id"],
+            receipt["payload_sha256"],
+        )
+        if actual != expected:
+            raise UniverseError(
+                "TODO_ACTION_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                "receipt is not bound to this session, Anchor, instruction, Todo, and action",
+                HTTPStatus.CONFLICT,
+            )
+        if receipt["status"] == "PREPARED" and datetime.fromisoformat(
+            str(receipt["expires_at"]).replace("Z", "+00:00")
+        ) <= now_datetime:
+            raise UniverseError(
+                "TODO_ACTION_MUTATION_RECEIPT_EXPIRED",
+                "Todo action mutation receipt expired before consumption",
+                HTTPStatus.CONFLICT,
+            )
+        replayed = receipt["status"] == "CONSUMED"
+        result = self.apply_todo_action(request["todo_id"], request["action"])
+        if not replayed:
+            now = now_datetime.isoformat().replace("+00:00", "Z")
+            with self._connection() as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE todo_action_mutation_receipt
+                    SET status = 'CONSUMED', consumed_at = ?
+                    WHERE receipt_id = ? AND status = 'PREPARED'
+                    """,
+                    (now, normalized_receipt_id),
+                )
+                if updated.rowcount != 1:
+                    current = connection.execute(
+                        "SELECT status FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                        (normalized_receipt_id,),
+                    ).fetchone()
+                    if current is None or current["status"] != "CONSUMED":
+                        raise UniverseError(
+                            "TODO_ACTION_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                            "Todo action mutation receipt changed during consumption",
+                            HTTPStatus.CONFLICT,
+                        )
+                    replayed = True
+                receipt = connection.execute(
+                    "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                    (normalized_receipt_id,),
+                ).fetchone()
+        return self._todo_action_mutation_receipt_row(receipt), result, replayed
 
     def list_todos(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -14983,72 +15328,11 @@ class UniverseStore:
         return queued, True
 
     def apply_todo_action(self, todo_id: str, value: Any) -> dict[str, Any]:
-        normalized_todo_id = _identifier(todo_id, "todo_id")
-        request = _exact_object_fields(
-            value,
-            field="todo action",
-            required=frozenset({"action_id", "outcome", "source", "evidence_ref"}),
-            optional=frozenset({"validation"}),
-        )
-        action_id = _required_text(request["action_id"], "action_id")
-        if len(action_id) > 160:
-            raise UniverseError("TODO_ACTION_ID_INVALID", "action_id is too long")
-        outcome = _required_text(request["outcome"], "outcome").upper()
-        desired_state = {
-            "STARTED": "IN_PROGRESS",
-            "COMPLETED": "DONE",
-            "FAILED": "BLOCKED",
-            "REOPENED": "READY",
-        }.get(outcome)
-        if desired_state is None:
-            raise UniverseError(
-                "TODO_ACTION_OUTCOME_INVALID",
-                "outcome must be STARTED, COMPLETED, FAILED, or REOPENED",
-            )
-        source = _required_text(request["source"], "source").upper()
-        if len(source) > 80:
-            raise UniverseError("TODO_ACTION_SOURCE_INVALID", "source is too long")
-        evidence_ref = _required_text(request["evidence_ref"], "evidence_ref")
-        if len(evidence_ref) > 1000:
-            raise UniverseError(
-                "TODO_ACTION_EVIDENCE_INVALID", "evidence_ref is too long"
-            )
-        validation_value = request.get("validation")
-        if validation_value is None:
-            validation: dict[str, str] = {}
-        else:
-            if not isinstance(validation_value, Mapping) or set(validation_value) != {
-                "status",
-                "evidence_ref",
-            }:
-                raise UniverseError(
-                    "TODO_ACTION_VALIDATION_INVALID",
-                    "validation must contain only status and evidence_ref",
-                )
-            validation = {
-                "status": _required_text(
-                    validation_value["status"], "validation.status"
-                ).upper(),
-                "evidence_ref": _required_text(
-                    validation_value["evidence_ref"], "validation.evidence_ref"
-                ),
-            }
-        if outcome == "COMPLETED" and validation.get("status") != "PASSED":
-            raise UniverseError(
-                "TODO_COMPLETION_VALIDATION_REQUIRED",
-                "COMPLETED requires validation.status PASSED and validation evidence",
-                HTTPStatus.CONFLICT,
-            )
-
-        event_payload = {
-            "todo_id": normalized_todo_id,
-            "action_id": action_id,
-            "outcome": outcome,
-            "source": source,
-            "evidence_ref": evidence_ref,
-            "validation": validation,
-            "state": desired_state,
-        }
+        event_payload = normalize_todo_action_payload(todo_id, value)
+        normalized_todo_id = event_payload["todo_id"]
+        action_id = event_payload["action_id"]
+        outcome = event_payload["outcome"]
+        desired_state = event_payload["state"]
         event_id = "todo-action-" + _json_sha256(event_payload)[:32]
         payload_json = json.dumps(
             event_payload, sort_keys=True, separators=(",", ":")
@@ -32081,19 +32365,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 r"/v1/todos/([^/]+)/actions", path
             )
             if todo_action_match is not None:
-                result = self.server.store.apply_todo_action(
-                    unquote(todo_action_match.group(1)), body
+                raise UniverseError(
+                    "TODO_ACTION_MUTATION_RECEIPT_REQUIRED",
+                    "Todo actions require the current Session Anchor prepare/consume route",
+                    HTTPStatus.CONFLICT,
                 )
-                self._send(
-                    HTTPStatus.OK,
-                    {
-                        "schema": API_SCHEMA,
-                        **result,
-                        "task_frame_created": False,
-                        "execution_assignment_created": False,
-                    },
-                )
-                return
             if path == "/v1/universe-goals":
                 goal = self.server.store.create_universe_goal(body)
                 self._send(
@@ -32195,6 +32471,47 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "result": self.server.store.run_skill_resolution_fallback(
                             unquote(skill_fallback.group(1)), body
                         ),
+                    },
+                )
+                return
+
+            if path == "/v1/todo-action-mutation-receipts":
+                request = normalize_todo_action_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, created = self.server.store.prepare_todo_action_mutation_receipt(
+                    request
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_ACTION_MUTATION_RECEIPT_PREPARED",
+                        "receipt": receipt,
+                    },
+                )
+                return
+            todo_action_mutation_consume = re.fullmatch(
+                r"/v1/todo-action-mutation-receipts/([^/]+)/consume", path
+            )
+            if todo_action_mutation_consume is not None:
+                request = normalize_todo_action_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, result, replayed = (
+                    self.server.store.consume_todo_action_mutation_receipt(
+                        unquote(todo_action_mutation_consume.group(1)), request
+                    )
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_ACTION_MUTATION_APPLIED",
+                        "receipt": receipt,
+                        "action": result,
+                        "todo": result["todo"],
+                        "replayed": replayed,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
                     },
                 )
                 return
