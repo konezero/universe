@@ -7472,7 +7472,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "finding_type": "CROSS_FEATURE_DEPENDENCY",
                 "summary": "The meeting room depends on graph projection",
                 "detail_text": "Detailed source material",
-                "author_role": "USER",
+                "author_role": "CONDUCTOR",
                 "evidence_refs": ["universe://evidence/meeting-graph"],
                 "feature_refs": ["feature://meeting-room", "feature://graph"],
             },
@@ -7481,6 +7481,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("ROOM_FINDING_RECORDED", recorded["status"])
         self.assertEqual("UNASSIGNED", recorded["finding"]["authority"])
+        self.assertEqual("USER", recorded["finding"]["reporter_role"])
+        status, resolved = self.request(
+            "POST",
+            f"/v1/rooms/{room_id}/findings/{recorded['finding']['finding_id']}/state",
+            {"state": "RESOLVED", "author_role": "CONDUCTOR"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("ROOM_FINDING_STATE_CHANGED", resolved["status"])
+        self.assertEqual("RESOLVED", resolved["finding"]["resolution_state"])
 
         status, collected = self.request(
             "GET", f"/v1/rooms/{room_id}/findings", None, self.token
@@ -7510,6 +7520,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("ROOM_ARTIFACT_RECORDED", recorded["status"])
+        self.assertEqual("USER", recorded["artifact"]["author_role"])
         artifact = recorded["artifact"]
 
         status, revised = self.request(
@@ -7526,6 +7537,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("ROOM_ARTIFACT_REVISED", revised["status"])
         self.assertEqual(2, revised["artifact"]["current_revision"])
+        self.assertEqual("USER", revised["artifact"]["author_role"])
 
         status, collected = self.request(
             "GET", f"/v1/rooms/{room_id}/artifacts", None, self.token

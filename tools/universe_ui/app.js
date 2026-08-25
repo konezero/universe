@@ -6632,6 +6632,14 @@ function renderActiveMultiRoom() {
       node("small", "", finding.requested_owner_role ? `owner ${finding.requested_owner_role}` : finding.detail_text || "")
     );
     row.append(copy);
+    if (room.room_type === "MEETING" && snap.user_may_write && finding.state !== "RESOLVED") {
+      const resolve = node("button", "secondary-button compact-action", "Resolve");
+      resolve.type = "button";
+      resolve.addEventListener("click", () =>
+        setActiveRoomFindingState(finding.finding_id, "RESOLVED")
+      );
+      row.append(resolve);
+    }
     findingList.append(row);
   }
   const artifactList = node("div", "remote-access-list");
@@ -6717,13 +6725,14 @@ function openMultiRoomStream(roomId) {
   source.addEventListener("snapshot", (event) => {
     if (state.activeMultiRoomId !== roomId) return;
     const payload = JSON.parse(event.data);
+    const previous = state.activeMultiRoomSnapshot;
     state.activeMultiRoomSnapshot = {
       status: "ROOM_SNAPSHOT",
       room: payload.room,
       bindings: payload.bindings || [],
       messages: payload.messages || [],
-      artifacts: payload.artifacts || [],
-      findings: payload.findings || [],
+      artifacts: payload.artifacts ?? previous?.artifacts ?? [],
+      findings: payload.findings ?? previous?.findings ?? [],
       events: payload.events || [],
       participant_cursors: payload.participant_cursors || [],
       bridge_line: payload.bridge_line || "",
@@ -6754,6 +6763,12 @@ function openMultiRoomStream(roomId) {
         );
       }
       state.activeMultiRoomSnapshot = snapshot;
+      renderActiveMultiRoom();
+      return;
+    }
+    if (payload.type === "PARTICIPANT_RESET") {
+      const bindingId = payload.binding_id || "provider";
+      state.multiRoomLiveOutput[bindingId] = "";
       renderActiveMultiRoom();
       return;
     }
@@ -6821,6 +6836,17 @@ async function createMeetingRoomThin() {
   toast("Meeting room created");
 }
 
+async function setActiveRoomFindingState(findingId, findingState) {
+  const snapshot = state.activeMultiRoomSnapshot;
+  if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
+  await api(
+    `/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/findings/${encodeURIComponent(findingId)}/state`,
+    { method: "POST", body: { state: findingState } }
+  );
+  await openMultiRoom(snapshot.room.room_id);
+  toast(`Finding ${findingState.toLowerCase()}`);
+}
+
 async function recordActiveRoomFinding() {
   const snapshot = state.activeMultiRoomSnapshot;
   if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
@@ -6854,6 +6880,7 @@ async function recordActiveRoomFinding() {
   });
   elements.multiRoomFindingSummary.value = "";
   elements.multiRoomFindingFeatures.value = "";
+  elements.multiRoomArtifactEvidence.value = "";
   elements.multiRoomMessage.value = "";
   await openMultiRoom(snapshot.room.room_id);
   toast("Room finding recorded");

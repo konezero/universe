@@ -224,12 +224,27 @@ class MultiRoomStoreTests(unittest.TestCase):
         self.assertEqual(2, len(dependency["feature_refs"]))
         self.assertEqual("OWNER_ACTION_REQUIRED", escalation["resolution_state"])
         self.assertEqual("UNASSIGNED", escalation["authority"])
+        resolved = self.store.update_finding_state(
+            room_id,
+            escalation["finding_id"],
+            {"state": "RESOLVED", "author_role": "USER"},
+        )
+        self.assertEqual("RESOLVED", resolved["state"])
+        self.assertEqual("RESOLVED", resolved["resolution_state"])
         self.assertEqual(3, len(self.store.room_snapshot(room_id)["findings"]))
         events = self.store.hub.wait(
             room_id, after_event_id=cursor, timeout_seconds=0.1
         )
-        self.assertEqual(3, len(events))
-        self.assertTrue(all(event["payload"]["type"] == "ROOM_FINDING_RECORDED" for event in events))
+        self.assertEqual(4, len(events))
+        self.assertEqual(
+            [
+                "ROOM_FINDING_RECORDED",
+                "ROOM_FINDING_RECORDED",
+                "ROOM_FINDING_RECORDED",
+                "ROOM_FINDING_STATE_CHANGED",
+            ],
+            [event["payload"]["type"] for event in events],
+        )
 
         with self.assertRaises(MultiRoomError) as missing_source:
             self.store.record_finding(

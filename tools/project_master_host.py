@@ -5482,6 +5482,12 @@ class RoomParticipantConversationWorker:
             accept_once()
             observe("DELTA", delta=str(delta))
 
+        def observe_reset() -> None:
+            accept_once()
+            observe("RESET")
+
+        observe_delta.reset = observe_reset  # type: ignore[attr-defined]
+
         provider_message = {
             "schema": "universe.native-room-input.v1",
             "message_id": room_event_id,

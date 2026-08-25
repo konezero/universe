@@ -951,6 +951,9 @@ class GrokAcpSession:
 
         def reset_message() -> None:
             parts.clear()
+            reset_callback = getattr(on_delta, "reset", None)
+            if callable(reset_callback):
+                reset_callback()
 
         self._active_delta = receive
         self._active_message_reset = reset_message

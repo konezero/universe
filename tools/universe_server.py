@@ -27795,6 +27795,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     },
                 )
                 return
+            if event_type == "RESET":
+                self.multi_rooms.hub.publish(
+                    room_id,
+                    {
+                        "type": "PARTICIPANT_RESET",
+                        "binding_id": binding_id,
+                        "room_event_id": room_event_id,
+                    },
+                )
+                return
             if event_type == "DELTA":
                 self.multi_rooms.hub.publish(
                     room_id,
@@ -31475,8 +31485,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             room_finding_post = re.fullmatch(r"/v1/rooms/([^/]+)/findings$", path)
             if room_finding_post is not None:
                 try:
+                    finding_body = dict(body or {})
+                    finding_body["author_role"] = "USER"
                     finding = self.server.multi_rooms.record_finding(
-                        unquote(room_finding_post.group(1)), body or {}
+                        unquote(room_finding_post.group(1)), finding_body
                     )
                     self._send(
                         HTTPStatus.CREATED,
@@ -31489,15 +31501,40 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
                 return
+            room_finding_state_post = re.fullmatch(
+                r"/v1/rooms/([^/]+)/findings/([^/]+)/state$", path
+            )
+            if room_finding_state_post is not None:
+                try:
+                    finding_body = dict(body or {})
+                    finding_body["author_role"] = "USER"
+                    finding = self.server.multi_rooms.update_finding_state(
+                        unquote(room_finding_state_post.group(1)),
+                        unquote(room_finding_state_post.group(2)),
+                        finding_body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_FINDING_STATE_CHANGED",
+                            "finding": finding,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
             room_artifact_revision_post = re.fullmatch(
                 r"/v1/rooms/([^/]+)/artifacts/([^/]+)/revisions$", path
             )
             if room_artifact_revision_post is not None:
                 try:
+                    revision_body = dict(body or {})
+                    revision_body["author_role"] = "USER"
                     artifact = self.server.multi_rooms.revise_artifact(
                         unquote(room_artifact_revision_post.group(1)),
                         unquote(room_artifact_revision_post.group(2)),
-                        body or {},
+                        revision_body,
                     )
                     self._send(
                         HTTPStatus.CREATED,
@@ -31513,8 +31550,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             room_artifact_post = re.fullmatch(r"/v1/rooms/([^/]+)/artifacts$", path)
             if room_artifact_post is not None:
                 try:
+                    artifact_body = dict(body or {})
+                    artifact_body["author_role"] = "USER"
                     artifact = self.server.multi_rooms.create_artifact(
-                        unquote(room_artifact_post.group(1)), body or {}
+                        unquote(room_artifact_post.group(1)), artifact_body
                     )
                     self._send(
                         HTTPStatus.CREATED,

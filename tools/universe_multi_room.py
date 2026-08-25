@@ -1522,6 +1522,49 @@ class MultiRoomStore:
             ).fetchall()
         return [self._finding_row(row) for row in rows]
 
+    def update_finding_state(
+        self, room_id: str, finding_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        fid = _text(finding_id, "finding_id", limit=80)
+        requested_state = _text(value.get("state"), "state", limit=32).upper()
+        if requested_state not in ROOM_FINDING_STATES:
+            raise MultiRoomError(
+                "ROOM_FINDING_STATE_INVALID",
+                f"unsupported finding state: {requested_state}",
+            )
+        allowed = {
+            "OPEN": {"OPEN", "ACKNOWLEDGED", "RESOLVED"},
+            "ACKNOWLEDGED": {"ACKNOWLEDGED", "RESOLVED"},
+            "RESOLVED": {"RESOLVED"},
+        }
+        with self._connect() as connection:
+            self._artifact_write_context(room, value, connection)
+            row = connection.execute(
+                "SELECT state FROM chat_room_finding WHERE room_id = ? AND finding_id = ?",
+                (room["room_id"], fid),
+            ).fetchone()
+            if row is None:
+                raise MultiRoomError("ROOM_FINDING_NOT_FOUND", "finding not found", 404)
+            current_state = str(row["state"])
+            if requested_state not in allowed[current_state]:
+                raise MultiRoomError(
+                    "ROOM_FINDING_STATE_TRANSITION_INVALID",
+                    f"cannot transition finding from {current_state} to {requested_state}",
+                    409,
+                )
+            if requested_state != current_state:
+                connection.execute(
+                    "UPDATE chat_room_finding SET state = ?, updated_at = ? WHERE room_id = ? AND finding_id = ?",
+                    (requested_state, utc_now(), room["room_id"], fid),
+                )
+                connection.commit()
+        finding = self.get_finding(room["room_id"], fid)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_FINDING_STATE_CHANGED", "finding": finding}
+        )
+        return finding
+
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute(
@@ -2424,7 +2467,11 @@ class MultiRoomStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "resolution_state": (
-                "OWNER_ACTION_REQUIRED"
+                "RESOLVED"
+                if row["state"] == "RESOLVED"
+                else "ACKNOWLEDGED"
+                if row["state"] == "ACKNOWLEDGED"
+                else "OWNER_ACTION_REQUIRED"
                 if finding_type == "ESCALATION_REQUEST"
                 else "REVIEW_REQUIRED"
             ),

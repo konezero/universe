@@ -571,11 +571,22 @@ class AgentSessionGatewayTests(unittest.TestCase):
                 session_observer=lambda _session_id: None,
             )
             deltas: list[str] = []
-            answer = session.prompt("Question", deltas.append)
+            resets: list[str] = []
+
+            def receive(delta: str) -> None:
+                deltas.append(delta)
+
+            def reset() -> None:
+                resets.append("RESET")
+                deltas.clear()
+
+            receive.reset = reset  # type: ignore[attr-defined]
+            answer = session.prompt("Question", receive)
             session.close()
 
         self.assertEqual('{"value":"final"}', answer)
-        self.assertEqual(["Planning", '{"value":"final"}'], deltas)
+        self.assertEqual(['{"value":"final"}'], deltas)
+        self.assertEqual(["RESET"], resets)
 
     def test_grok_bootstraps_once_and_passes_effort(self) -> None:
         with patch(
