@@ -116,6 +116,7 @@ const state = {
   activeMultiRoomId: null,
   activeMultiRoomSnapshot: null,
   multiRoomTargetBindingIds: [],
+  multiRoomArtifactDraft: null,
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -6506,7 +6507,11 @@ async function refreshMultiRooms() {
 async function openMultiRoom(roomId) {
   state.activeMultiRoomId = roomId;
   state.multiRoomTargetBindingIds = [];
+  state.multiRoomArtifactDraft = null;
   state.multiRoomLiveOutput = {};
+  if (elements.createRoomArtifact) {
+    elements.createRoomArtifact.textContent = "Create artifact from Message";
+  }
   const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
   state.activeMultiRoomSnapshot = snap;
   renderActiveMultiRoom();
@@ -6622,7 +6627,7 @@ function renderActiveMultiRoom() {
       node(
         "small",
         "",
-        `${finding.state} | evidence ${(finding.evidence_refs || []).length} | features ${(finding.feature_refs || []).length}`
+        `${finding.resolution_state} | evidence ${(finding.evidence_refs || []).length} | features ${(finding.feature_refs || []).length}`
       ),
       node("small", "", finding.requested_owner_role ? `owner ${finding.requested_owner_role}` : finding.detail_text || "")
     );
@@ -6647,6 +6652,31 @@ function renderActiveMultiRoom() {
       node("small", "", artifact.body_text || "")
     );
     row.append(copy);
+    if (room.room_type === "MEETING" && snap.user_may_write) {
+      const revise = node(
+        "button",
+        "secondary-button compact-action",
+        "Revise"
+      );
+      revise.type = "button";
+      revise.addEventListener("click", () => {
+        state.multiRoomArtifactDraft = {
+          artifactId: artifact.artifact_id,
+          expectedRevision: artifact.current_revision,
+          state: artifact.state,
+        };
+        elements.multiRoomArtifactType.value = artifact.artifact_type;
+        elements.multiRoomArtifactTitle.value = artifact.title;
+        elements.multiRoomArtifactEvidence.value = (
+          artifact.evidence_refs || []
+        ).join("\n");
+        elements.multiRoomMessage.value = artifact.body_text || "";
+        elements.createRoomArtifact.textContent =
+          `Save revision ${artifact.current_revision + 1}`;
+        toast("Artifact revision loaded");
+      });
+      row.append(revise);
+    }
     artifactList.append(row);
   }
   const transcript = node("pre", "remote-access-endpoint");
@@ -6843,23 +6873,36 @@ async function createActiveRoomArtifact() {
     .split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean);
-  await api(`/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/artifacts`, {
-    method: "POST",
-    body: {
-      artifact_type: elements.multiRoomArtifactType?.value || "SPECIFICATION",
-      title,
-      body_text: bodyText,
-      author_role: "USER",
-      evidence_refs: evidenceRefs,
-    },
-  });
+  const draft = state.multiRoomArtifactDraft;
+  const endpoint = draft
+    ? `/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/artifacts/${encodeURIComponent(draft.artifactId)}/revisions`
+    : `/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/artifacts`;
+  const body = draft
+    ? {
+        expected_revision: draft.expectedRevision,
+        title,
+        body_text: bodyText,
+        state: draft.state,
+        author_role: "USER",
+        evidence_refs: evidenceRefs,
+      }
+    : {
+        artifact_type:
+          elements.multiRoomArtifactType?.value || "SPECIFICATION",
+        title,
+        body_text: bodyText,
+        author_role: "USER",
+        evidence_refs: evidenceRefs,
+      };
+  await api(endpoint, { method: "POST", body });
+  state.multiRoomArtifactDraft = null;
   elements.multiRoomArtifactTitle.value = "";
   elements.multiRoomArtifactEvidence.value = "";
   elements.multiRoomMessage.value = "";
+  elements.createRoomArtifact.textContent = "Create artifact from Message";
   await openMultiRoom(snapshot.room.room_id);
-  toast("Room artifact created");
+  toast(draft ? "Room artifact revised" : "Room artifact created");
 }
-
 async function postActiveRoomAsUser() {
   if (!state.activeMultiRoomId) {
     throw new Error("Open a room first");
