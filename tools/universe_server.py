@@ -16647,6 +16647,66 @@ class UniverseStore:
                     add_edge("ROOM_MESSAGE_DERIVES_BENCH_OBSERVATION", message_node, bench_node, message_ref)
                     add_edge("PROJECT_HAS_BENCH_OBSERVATION", project_node, bench_node, message_ref)
 
+            # Structured findings expose research, cross-feature boundaries,
+            # and escalation requests without interpreting chat or creating authority.
+            for finding in self.multi_rooms.list_findings(room_id, limit=200):
+                finding_id = str(finding.get("finding_id") or "")
+                if not finding_id:
+                    continue
+                finding_ref = f"{source_ref}/findings/{finding_id}"
+                entity_type = {
+                    "RAG_FINDING": "ROOM_RAG_FINDING",
+                    "CROSS_FEATURE_DEPENDENCY": "ROOM_CROSS_FEATURE_DEPENDENCY",
+                    "ESCALATION_REQUEST": "ROOM_ESCALATION_REQUEST",
+                }.get(str(finding.get("finding_type") or ""), "ROOM_FINDING")
+                finding_node = add_node(
+                    entity_type,
+                    finding_id,
+                    str(finding.get("summary") or finding_id),
+                    str(finding.get("state") or "OPEN"),
+                    "MULTI_ROOM_FINDING",
+                    finding_ref,
+                    {
+                        key: finding.get(key)
+                        for key in (
+                            "finding_id", "room_id", "finding_type", "summary",
+                            "reporter_role", "reporter_binding_id", "evidence_refs",
+                            "feature_refs", "requested_owner_role", "source_message_id",
+                            "content_digest", "state", "resolution_state", "authority",
+                            "created_at", "updated_at",
+                        )
+                        if finding.get(key) is not None
+                    }
+                    | {"detail_in_graph": False},
+                )
+                add_edge("CHAT_ROOM_HAS_FINDING", room_node, finding_node, finding_ref)
+                add_edge("PROJECT_HAS_ROOM_FINDING", project_node, finding_node, finding_ref)
+                source_message_id = str(finding.get("source_message_id") or "")
+                if source_message_id and source_message_id in multi_message_nodes:
+                    add_edge(
+                        "ROOM_FINDING_REFS_MESSAGE",
+                        finding_node,
+                        multi_message_nodes[source_message_id],
+                        finding_ref,
+                    )
+                for feature_ref in finding.get("feature_refs") or []:
+                    feature_ref_text = str(feature_ref)
+                    feature_node = add_node(
+                        "FEATURE_REFERENCE",
+                        feature_ref_text,
+                        feature_ref_text,
+                        "REFERENCED",
+                        "MULTI_ROOM_FINDING",
+                        finding_ref,
+                        {"feature_ref": feature_ref_text},
+                    )
+                    add_edge(
+                        "ROOM_FINDING_REFS_FEATURE",
+                        finding_node,
+                        feature_node,
+                        finding_ref,
+                    )
+
             # Room-native artifacts are explicit, revisioned candidates. Keep the
             # body outside the semantic graph while preserving evidence links and
             # revision lineage. Nothing here adopts a Feature Node or Expected Path.
@@ -29739,6 +29799,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except MultiRoomError as error:
                 self._send_multi_room_error(error)
             return
+        room_findings = re.fullmatch(r"/v1/rooms/([^/]+)/findings$", path)
+        if room_findings is not None:
+            try:
+                room_id = unquote(room_findings.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOM_FINDINGS_COLLECTED",
+                        "room_id": room_id,
+                        "findings": self.server.multi_rooms.list_findings(room_id),
+                    },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
         room_artifacts = re.fullmatch(r"/v1/rooms/([^/]+)/artifacts$", path)
         if room_artifacts is not None:
             try:
@@ -31393,6 +31469,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         unquote(room_attach.group(1)), body or {}
                     )
                     self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_finding_post = re.fullmatch(r"/v1/rooms/([^/]+)/findings$", path)
+            if room_finding_post is not None:
+                try:
+                    finding = self.server.multi_rooms.record_finding(
+                        unquote(room_finding_post.group(1)), body or {}
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_FINDING_RECORDED",
+                            "finding": finding,
+                        },
+                    )
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
                 return
@@ -33947,6 +34040,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 "room": snapshot["room"],
                 "bindings": snapshot["bindings"],
                 "messages": snapshot["messages"],
+                "artifacts": snapshot["artifacts"],
+                "findings": snapshot["findings"],
                 "events": snapshot["events"],
                 "participant_cursors": snapshot["participant_cursors"],
                 "bridge_line": snapshot["bridge_line"],

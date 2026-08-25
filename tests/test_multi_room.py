@@ -175,6 +175,73 @@ class MultiRoomStoreTests(unittest.TestCase):
             )
         self.assertEqual("ROOM_ARTIFACT_REVISION_CONFLICT", conflict.exception.code)
 
+    def test_meeting_room_findings_require_sources_and_preserve_boundaries(self) -> None:
+        created = self.store.create_meeting_room(
+            {"title": "Finding workshop", "topic": "research and dependencies"}
+        )
+        room_id = created["room"]["room_id"]
+        source = self.store.post_message(
+            room_id,
+            {"author_role": "USER", "body_text": "Compare the room and graph planes"},
+        )
+        cursor = self.store.hub.cursor()
+
+        rag = self.store.record_finding(
+            room_id,
+            {
+                "finding_type": "RAG_FINDING",
+                "summary": "Room messages already expose stable evidence refs",
+                "detail_text": "Private source excerpt stays in the finding detail.",
+                "author_role": "MODEL",
+                "evidence_refs": ["docs/multi-room-chat-architecture.md#retrieval"],
+                "feature_refs": ["feature://meeting-room"],
+                "source_message_id": source["message_id"],
+            },
+        )
+        dependency = self.store.record_finding(
+            room_id,
+            {
+                "finding_type": "CROSS_FEATURE_DEPENDENCY",
+                "summary": "Meeting artifacts depend on graph projection",
+                "author_role": "CONDUCTOR",
+                "evidence_refs": ["universe://evidence/graph-contract"],
+                "feature_refs": ["feature://meeting-room", "feature://graph"],
+            },
+        )
+        escalation = self.store.record_finding(
+            room_id,
+            {
+                "finding_type": "ESCALATION_REQUEST",
+                "summary": "Master must decide whether graph scope expands",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/dependency"],
+                "feature_refs": ["feature://graph"],
+                "requested_owner_role": "MASTER",
+            },
+        )
+
+        self.assertEqual("REVIEW_REQUIRED", rag["resolution_state"])
+        self.assertEqual(2, len(dependency["feature_refs"]))
+        self.assertEqual("OWNER_ACTION_REQUIRED", escalation["resolution_state"])
+        self.assertEqual("UNASSIGNED", escalation["authority"])
+        self.assertEqual(3, len(self.store.room_snapshot(room_id)["findings"]))
+        events = self.store.hub.wait(
+            room_id, after_event_id=cursor, timeout_seconds=0.1
+        )
+        self.assertEqual(3, len(events))
+        self.assertTrue(all(event["payload"]["type"] == "ROOM_FINDING_RECORDED" for event in events))
+
+        with self.assertRaises(MultiRoomError) as missing_source:
+            self.store.record_finding(
+                room_id,
+                {
+                    "finding_type": "RAG_FINDING",
+                    "summary": "Unsourced claim",
+                    "author_role": "USER",
+                },
+            )
+        self.assertEqual("ROOM_FINDING_EVIDENCE_REQUIRED", missing_source.exception.code)
+
     def test_round_robin_meeting_is_bounded_and_incremental(self) -> None:
         created = self.store.create_meeting_room(
             {

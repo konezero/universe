@@ -1621,6 +1621,47 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("ROOM_MESSAGE_DERIVES_DECISION", edge_types)
         self.assertIn("ROOM_MESSAGE_DERIVES_DOCUMENT_CANDIDATE", edge_types)
 
+    def test_semantic_graph_projects_room_findings_without_private_detail(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        room = self.server.multi_rooms.create_room(
+            room_type="MEETING",
+            title="Finding graph",
+            host_role="CONDUCTOR",
+            project_id="GCS",
+        )
+        source = self.server.multi_rooms.post_message(
+            room["room_id"],
+            {"author_role": "USER", "body_text": "source message"},
+        )
+        finding = self.server.multi_rooms.record_finding(
+            room["room_id"],
+            {
+                "finding_type": "ESCALATION_REQUEST",
+                "summary": "Master review required",
+                "detail_text": "private escalation detail",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/escalation"],
+                "feature_refs": ["feature://meeting-room"],
+                "requested_owner_role": "MASTER",
+                "source_message_id": source["message_id"],
+            },
+        )
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        nodes = [
+            node for node in graph["nodes"]
+            if node["entity_type"] == "ROOM_ESCALATION_REQUEST"
+            and node["data"].get("finding_id") == finding["finding_id"]
+        ]
+        self.assertEqual(1, len(nodes))
+        self.assertEqual("OWNER_ACTION_REQUIRED", nodes[0]["data"]["resolution_state"])
+        self.assertTrue(nodes[0]["data"]["detail_in_graph"] is False)
+        self.assertNotIn("private escalation detail", json.dumps(graph))
+        edge_types = {edge["edge_type"] for edge in graph["edges"]}
+        self.assertIn("CHAT_ROOM_HAS_FINDING", edge_types)
+        self.assertIn("ROOM_FINDING_REFS_MESSAGE", edge_types)
+        self.assertIn("ROOM_FINDING_REFS_FEATURE", edge_types)
+
     def test_semantic_graph_projects_room_artifact_revisions_without_body(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         room = self.server.multi_rooms.create_room(
@@ -7418,6 +7459,36 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
         self.assertEqual("partial answer", events[0]["payload"]["delta"])
+
+    def test_meeting_room_finding_http_records_and_collects_source_links(self) -> None:
+        created = self.server.multi_rooms.create_meeting_room(
+            {"title": "HTTP finding room", "topic": "research"}
+        )
+        room_id = created["room"]["room_id"]
+        status, recorded = self.request(
+            "POST",
+            f"/v1/rooms/{room_id}/findings",
+            {
+                "finding_type": "CROSS_FEATURE_DEPENDENCY",
+                "summary": "The meeting room depends on graph projection",
+                "detail_text": "Detailed source material",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/meeting-graph"],
+                "feature_refs": ["feature://meeting-room", "feature://graph"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("ROOM_FINDING_RECORDED", recorded["status"])
+        self.assertEqual("UNASSIGNED", recorded["finding"]["authority"])
+
+        status, collected = self.request(
+            "GET", f"/v1/rooms/{room_id}/findings", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("ROOM_FINDINGS_COLLECTED", collected["status"])
+        self.assertEqual(1, len(collected["findings"]))
+        self.assertEqual(2, len(collected["findings"][0]["feature_refs"]))
 
     def test_meeting_room_artifact_http_create_revise_and_collect(self) -> None:
         created = self.server.multi_rooms.create_meeting_room(

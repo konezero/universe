@@ -560,6 +560,36 @@
               Message (role enforced server-side)
               <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>
             </label>
+            <label for="multi-room-finding-type">
+              Structured finding (meeting rooms)
+              <select id="multi-room-finding-type">
+                <option value="RAG_FINDING">RAG_FINDING</option>
+                <option value="CROSS_FEATURE_DEPENDENCY">CROSS_FEATURE_DEPENDENCY</option>
+                <option value="ESCALATION_REQUEST">ESCALATION_REQUEST</option>
+              </select>
+            </label>
+            <label for="multi-room-finding-summary">
+              Finding summary
+              <input id="multi-room-finding-summary" type="text" placeholder="Source-linked finding" autocomplete="off" />
+            </label>
+            <label for="multi-room-finding-features">
+              Feature refs (one per line)
+              <textarea id="multi-room-finding-features" rows="2" placeholder="feature://source and feature://target"></textarea>
+            </label>
+            <label for="multi-room-finding-owner">
+              Escalation owner
+              <select id="multi-room-finding-owner">
+                <option value="">Not an escalation</option>
+                <option value="CONDUCTOR">CONDUCTOR</option>
+                <option value="MASTER">MASTER</option>
+                <option value="BOSS">BOSS</option>
+              </select>
+            </label>
+            <div class="remote-access-actions">
+              <button id="record-room-finding-button" type="button" class="secondary-button">
+                Record finding from Message
+              </button>
+            </div>
             <label for="multi-room-artifact-type">
               Room artifact (meeting rooms)
               <select id="multi-room-artifact-type">

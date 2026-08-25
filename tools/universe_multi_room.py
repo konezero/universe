@@ -30,6 +30,7 @@ MEETING_COORDINATOR_SCHEMA = "universe.meeting-coordinator.v1"
 MEETING_SUMMARY_SCHEMA = "universe.meeting-summary.v1"
 ROOM_ARTIFACT_SCHEMA = "universe.chat-room-artifact.v1"
 ROOM_ARTIFACT_REVISION_SCHEMA = "universe.chat-room-artifact-revision.v1"
+ROOM_FINDING_SCHEMA = "universe.chat-room-finding.v1"
 
 ROOM_TYPES = frozenset({"PROJECT", "BOSS", "MEETING"})
 ROOM_STATES = frozenset({"OPEN", "CLOSED"})
@@ -37,6 +38,10 @@ ROOM_ARTIFACT_TYPES = frozenset(
     {"PROPOSAL", "SPECIFICATION", "COMPARISON", "DECISION_CANDIDATE"}
 )
 ROOM_ARTIFACT_STATES = frozenset({"DRAFT", "REVIEW", "CANDIDATE", "ARCHIVED"})
+ROOM_FINDING_TYPES = frozenset(
+    {"RAG_FINDING", "CROSS_FEATURE_DEPENDENCY", "ESCALATION_REQUEST"}
+)
+ROOM_FINDING_STATES = frozenset({"OPEN", "ACKNOWLEDGED", "RESOLVED"})
 MESSAGE_KINDS = frozenset(
     {
         "MESSAGE",
@@ -291,6 +296,33 @@ class MultiRoomStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(artifact_id, revision)
                 );
+
+                CREATE TABLE IF NOT EXISTS chat_room_finding (
+                    finding_id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL
+                        REFERENCES chat_room(room_id) ON DELETE CASCADE,
+                    finding_type TEXT NOT NULL
+                        CHECK(finding_type IN (
+                            'RAG_FINDING', 'CROSS_FEATURE_DEPENDENCY',
+                            'ESCALATION_REQUEST'
+                        )),
+                    summary TEXT NOT NULL,
+                    detail_text TEXT NOT NULL,
+                    reporter_role TEXT NOT NULL,
+                    reporter_binding_id TEXT,
+                    evidence_refs_json TEXT NOT NULL,
+                    feature_refs_json TEXT NOT NULL,
+                    requested_owner_role TEXT,
+                    source_message_id TEXT,
+                    content_digest TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('OPEN', 'ACKNOWLEDGED', 'RESOLVED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS chat_room_finding_room_time
+                ON chat_room_finding(room_id, created_at, finding_id);
 
                 CREATE TABLE IF NOT EXISTS chat_room_control_event (
                     event_id TEXT PRIMARY KEY,
@@ -1343,6 +1375,153 @@ class MultiRoomStore:
             ).fetchall()
         return [self._artifact_row(row) for row in rows]
 
+    def _finding_refs(
+        self,
+        value: Any,
+        *,
+        field: str,
+        error_code: str,
+        limit: int,
+    ) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise MultiRoomError(error_code, f"{field} must be an array")
+        if len(value) > limit:
+            raise MultiRoomError(error_code, f"{field} exceeds {limit} entries")
+        refs: list[str] = []
+        for item in value:
+            ref = _text(item, field[:-1] if field.endswith("s") else field, limit=512)
+            if ref not in refs:
+                refs.append(ref)
+        return refs
+
+    def record_finding(
+        self, room_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        finding_type = _text(
+            value.get("finding_type") or value.get("kind"),
+            "finding_type",
+            limit=64,
+        ).upper()
+        if finding_type not in ROOM_FINDING_TYPES:
+            raise MultiRoomError(
+                "ROOM_FINDING_TYPE_INVALID",
+                f"unsupported finding_type: {finding_type}",
+            )
+        summary = _text(value.get("summary"), "summary", limit=500)
+        detail_text = _optional_text(
+            value.get("detail_text") or value.get("detail"),
+            "detail_text",
+            limit=20000,
+        ) or ""
+        evidence_refs = self._finding_refs(
+            value.get("evidence_refs"),
+            field="evidence_refs",
+            error_code="ROOM_FINDING_EVIDENCE_INVALID",
+            limit=50,
+        )
+        if not evidence_refs:
+            raise MultiRoomError(
+                "ROOM_FINDING_EVIDENCE_REQUIRED",
+                "structured room findings require at least one evidence reference",
+            )
+        feature_refs = self._finding_refs(
+            value.get("feature_refs"),
+            field="feature_refs",
+            error_code="ROOM_FINDING_FEATURE_REFS_INVALID",
+            limit=20,
+        )
+        if finding_type == "CROSS_FEATURE_DEPENDENCY" and len(feature_refs) < 2:
+            raise MultiRoomError(
+                "ROOM_FINDING_FEATURE_REFS_REQUIRED",
+                "cross-feature dependencies require at least two feature_refs",
+            )
+        requested_owner_role = _optional_text(
+            value.get("requested_owner_role"), "requested_owner_role", limit=64
+        )
+        if requested_owner_role is not None:
+            requested_owner_role = requested_owner_role.upper()
+            if requested_owner_role not in MEMBER_ROLES:
+                raise MultiRoomError(
+                    "ROOM_FINDING_OWNER_INVALID",
+                    f"unsupported requested_owner_role: {requested_owner_role}",
+                )
+        if finding_type == "ESCALATION_REQUEST" and requested_owner_role is None:
+            raise MultiRoomError(
+                "ROOM_FINDING_OWNER_REQUIRED",
+                "escalation requests require requested_owner_role",
+            )
+        state = _text(value.get("state") or "OPEN", "state", limit=32).upper()
+        if state not in ROOM_FINDING_STATES:
+            raise MultiRoomError(
+                "ROOM_FINDING_STATE_INVALID", f"unsupported finding state: {state}"
+            )
+        finding_id = "room_find_" + secrets.token_hex(12)
+        now = utc_now()
+        with self._connect() as connection:
+            reporter_role, reporter_binding_id = self._artifact_write_context(
+                room, value, connection
+            )
+            source_message_id = self._artifact_source_message(
+                connection, room["room_id"], value.get("source_message_id")
+            )
+            content_digest = hashlib.sha256(detail_text.encode("utf-8")).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO chat_room_finding(
+                    finding_id, room_id, finding_type, summary, detail_text,
+                    reporter_role, reporter_binding_id, evidence_refs_json,
+                    feature_refs_json, requested_owner_role, source_message_id,
+                    content_digest, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    finding_id, room["room_id"], finding_type, summary, detail_text,
+                    reporter_role, reporter_binding_id,
+                    json.dumps(evidence_refs, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(feature_refs, ensure_ascii=False, separators=(",", ":")),
+                    requested_owner_role, source_message_id, content_digest,
+                    state, now, now,
+                ),
+            )
+            connection.commit()
+        finding = self.get_finding(room["room_id"], finding_id)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_FINDING_RECORDED", "finding": finding}
+        )
+        return finding
+
+    def get_finding(self, room_id: str, finding_id: str) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        fid = _text(finding_id, "finding_id", limit=80)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_room_finding WHERE room_id = ? AND finding_id = ?",
+                (rid, fid),
+            ).fetchone()
+        if row is None:
+            raise MultiRoomError("ROOM_FINDING_NOT_FOUND", "finding not found", 404)
+        return self._finding_row(row)
+
+    def list_findings(
+        self, room_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        rid = _text(room_id, "room_id", limit=80)
+        cap = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM chat_room_finding
+                WHERE room_id = ?
+                ORDER BY created_at ASC, finding_id ASC
+                LIMIT ?
+                """,
+                (rid, cap),
+            ).fetchall()
+        return [self._finding_row(row) for row in rows]
+
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute(
@@ -2153,6 +2332,7 @@ class MultiRoomStore:
         bindings = self.list_bindings(room_id)
         messages = self.list_messages(room_id, limit=200)
         artifacts = self.list_artifacts(room_id, limit=200)
+        findings = self.list_findings(room_id, limit=200)
         events = self.list_room_events(room_id, limit=200)
         participant_cursors = [
             self.participant_cursor(binding["binding_id"]) for binding in bindings
@@ -2169,6 +2349,7 @@ class MultiRoomStore:
             "bindings": bindings,
             "messages": messages,
             "artifacts": artifacts,
+            "findings": findings,
             "events": events,
             "participant_cursors": participant_cursors,
             "bridge_line": bridge,
@@ -2213,6 +2394,41 @@ class MultiRoomStore:
             "metadata": meta,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    def _finding_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            evidence_refs = []
+        try:
+            feature_refs = json.loads(row["feature_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            feature_refs = []
+        finding_type = str(row["finding_type"])
+        return {
+            "schema": ROOM_FINDING_SCHEMA,
+            "finding_id": row["finding_id"],
+            "room_id": row["room_id"],
+            "finding_type": finding_type,
+            "summary": row["summary"],
+            "detail_text": row["detail_text"],
+            "reporter_role": row["reporter_role"],
+            "reporter_binding_id": row["reporter_binding_id"],
+            "evidence_refs": evidence_refs,
+            "feature_refs": feature_refs,
+            "requested_owner_role": row["requested_owner_role"],
+            "source_message_id": row["source_message_id"],
+            "content_digest": row["content_digest"],
+            "state": row["state"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "resolution_state": (
+                "OWNER_ACTION_REQUIRED"
+                if finding_type == "ESCALATION_REQUEST"
+                else "REVIEW_REQUIRED"
+            ),
+            "authority": "UNASSIGNED",
         }
 
     def _artifact_revision_row(self, row: sqlite3.Row) -> dict[str, Any]:

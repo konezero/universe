@@ -358,6 +358,11 @@ const elements = {
   multiRoomArtifactTitle: document.querySelector("#multi-room-artifact-title"),
   multiRoomArtifactEvidence: document.querySelector("#multi-room-artifact-evidence"),
   createRoomArtifact: document.querySelector("#create-room-artifact-button"),
+  multiRoomFindingType: document.querySelector("#multi-room-finding-type"),
+  multiRoomFindingSummary: document.querySelector("#multi-room-finding-summary"),
+  multiRoomFindingFeatures: document.querySelector("#multi-room-finding-features"),
+  multiRoomFindingOwner: document.querySelector("#multi-room-finding-owner"),
+  recordRoomFinding: document.querySelector("#record-room-finding-button"),
   refreshRooms: document.querySelector("#refresh-rooms-button"),
   createMeetingRoom: document.querySelector("#create-meeting-room-button"),
   postRoomMessage: document.querySelector("#post-room-message-button"),
@@ -6604,6 +6609,26 @@ function renderActiveMultiRoom() {
   for (const permission of pendingPermissions) {
     permissionList.append(renderPermissionCard(permission));
   }
+  const findingList = node("div", "remote-access-list");
+  const findings = snap.findings || [];
+  if (room.room_type === "MEETING" && !findings.length) {
+    findingList.append(node("p", "empty-copy", "No structured findings yet"));
+  }
+  for (const finding of findings) {
+    const row = node("article", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${finding.finding_type} | ${finding.summary}`),
+      node(
+        "small",
+        "",
+        `${finding.state} | evidence ${(finding.evidence_refs || []).length} | features ${(finding.feature_refs || []).length}`
+      ),
+      node("small", "", finding.requested_owner_role ? `owner ${finding.requested_owner_role}` : finding.detail_text || "")
+    );
+    row.append(copy);
+    findingList.append(row);
+  }
   const artifactList = node("div", "remote-access-list");
   const artifacts = snap.artifacts || [];
   if (room.room_type === "MEETING" && !artifacts.length) {
@@ -6633,6 +6658,7 @@ function renderActiveMultiRoom() {
     summary,
     participantList,
     permissionList,
+    findingList,
     artifactList,
     transcript
   );
@@ -6667,6 +6693,7 @@ function openMultiRoomStream(roomId) {
       bindings: payload.bindings || [],
       messages: payload.messages || [],
       artifacts: payload.artifacts || [],
+      findings: payload.findings || [],
       events: payload.events || [],
       participant_cursors: payload.participant_cursors || [],
       bridge_line: payload.bridge_line || "",
@@ -6762,6 +6789,44 @@ async function createMeetingRoomThin() {
   });
   await refreshMultiRooms();
   toast("Meeting room created");
+}
+
+async function recordActiveRoomFinding() {
+  const snapshot = state.activeMultiRoomSnapshot;
+  if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
+  if (snapshot.room.room_type !== "MEETING") {
+    throw new Error("Structured findings are currently available in meeting rooms");
+  }
+  const summary = elements.multiRoomFindingSummary?.value?.trim() || "";
+  const detailText = elements.multiRoomMessage?.value?.trim() || "";
+  if (!summary) throw new Error("Finding summary required");
+  const evidenceRefs = (elements.multiRoomArtifactEvidence?.value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const featureRefs = (elements.multiRoomFindingFeatures?.value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const findingType = elements.multiRoomFindingType?.value || "RAG_FINDING";
+  const requestedOwnerRole = elements.multiRoomFindingOwner?.value || "";
+  await api(`/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/findings`, {
+    method: "POST",
+    body: {
+      finding_type: findingType,
+      summary,
+      detail_text: detailText,
+      author_role: "USER",
+      evidence_refs: evidenceRefs,
+      feature_refs: featureRefs,
+      ...(requestedOwnerRole ? { requested_owner_role: requestedOwnerRole } : {}),
+    },
+  });
+  elements.multiRoomFindingSummary.value = "";
+  elements.multiRoomFindingFeatures.value = "";
+  elements.multiRoomMessage.value = "";
+  await openMultiRoom(snapshot.room.room_id);
+  toast("Room finding recorded");
 }
 
 async function createActiveRoomArtifact() {
@@ -13436,6 +13501,13 @@ function bindEvents() {
   if (elements.createMeetingRoom) {
     elements.createMeetingRoom.addEventListener("click", () => {
       createMeetingRoomThin().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.recordRoomFinding) {
+    elements.recordRoomFinding.addEventListener("click", () => {
+      recordActiveRoomFinding().catch((error) => {
         elements.settingsError.textContent = error.message;
       });
     });
