@@ -17,7 +17,7 @@ import threading
 import time
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from universe_app.terminal_host import TerminalHostError
 
@@ -316,8 +316,14 @@ def resolve_direct_targets(host: Any, to: Mapping[str, str]) -> list[dict[str, A
 
 
 class SessionBus:
-    def __init__(self, database_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        database_path: Path | str | None = None,
+        *,
+        result_observer: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
+        self.result_observer = result_observer
         self._messages: dict[str, dict[str, Any]] = {}
         self._inbox: dict[str, list[str]] = {}
         self._database_path: Path | None = (
@@ -1265,13 +1271,17 @@ class SessionBus:
             self._messages[result_id] = result
             self._inbox.setdefault(inbox_key, []).append(result_id)
             self._persist_message(recipient_tid, result)
-            return {
+            packet = {
                 "schema": BUS_SCHEMA,
                 "status": "REPLIED",
                 "thread_id": thread_id,
                 "message": self._public_message(original, headers_only=False),
                 "result": self._public_message(result, headers_only=False),
             }
+        observer = self.result_observer
+        if callable(observer):
+            observer(packet)
+        return packet
 
 
 def _mailbox(host: Any, bus: SessionBus | None) -> SessionBus:

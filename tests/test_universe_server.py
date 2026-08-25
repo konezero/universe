@@ -7471,6 +7471,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "mode": "MASTER",
             "provider": "CLAUDE",
             "supervisor_session_id": supervised["session_id"],
+            "active_session_anchor_ref": supervised["session_anchor_ref"],
             "state": "LIVE",
             "created_at": "2026-08-24T00:00:00Z",
         }
@@ -7478,6 +7479,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         terminal_host.find_live.return_value = terminal
         terminal_host.list_sessions.return_value = [terminal]
         terminal_host.get.return_value = terminal
+        terminal_host.channel_state.return_value = "PENDING"
         self.server.terminal_host = terminal_host
         self.server.room_participant_hosts.close()
         self.server.room_participant_hosts = Mock()
@@ -7506,11 +7508,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.token,
         )
         self.assertEqual(HTTPStatus.CREATED, status)
-        terminal_host.write.assert_called_once_with(
-            "term-room-001", b"Review this increment\r"
+        terminal_host.write.assert_not_called()
+        inbox = self.server.session_bus.inbox(
+            terminal_host,
+            terminal_id="term-room-001",
+            room_id=room["room_id"],
+        )
+        self.assertEqual(1, len(inbox["messages"]))
+        instruction = inbox["messages"][0]
+        self.assertEqual("Review this increment", instruction["body_text"])
+        self.assertEqual(room["room_id"], instruction["room_id"])
+        self.server.session_bus.transition(
+            instruction["message_id"],
+            state="ACCEPTED",
+            terminal_id="term-room-001",
+            session_anchor_ref=supervised["session_anchor_ref"],
+        )
+        self.server.session_bus.transition(
+            instruction["message_id"],
+            state="STARTED",
+            terminal_id="term-room-001",
+            session_anchor_ref=supervised["session_anchor_ref"],
+        )
+        self.server.session_bus.reply(
+            instruction["message_id"],
+            terminal_id="term-room-001",
+            session_anchor_ref=supervised["session_anchor_ref"],
+            body_text="Session Bus answer",
         )
         self.assertEqual(
-            "QUEUED", posted["delivery"]["participants"][0]["delivered"][0]["status"]
+            ["Review this increment", "Session Bus answer"],
+            [
+                message["body_text"]
+                for message in self.server.multi_rooms.list_messages(room["room_id"])
+            ],
+        )
+        self.assertEqual(
+            "DEFERRED", posted["delivery"]["participants"][0]["delivered"][0]["status"]
         )
 
         status, disconnected = self.request(
@@ -7558,7 +7592,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "PARTICIPANT_DELIVERY_BLOCKED",
             exited_delivery["delivery"]["participants"][0]["status"],
         )
-        self.assertEqual(1, terminal_host.write.call_count)
+        self.assertEqual(0, terminal_host.write.call_count)
 
     def test_meeting_room_native_control_fails_closed_without_exact_live_pty(self) -> None:
         supervised, _ = self.server.session_supervisor.register_session(

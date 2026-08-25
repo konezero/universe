@@ -115,6 +115,7 @@ const state = {
   multiRooms: [],
   activeMultiRoomId: null,
   activeMultiRoomSnapshot: null,
+  multiRoomTargetBindingIds: [],
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -6495,6 +6496,7 @@ async function refreshMultiRooms() {
 
 async function openMultiRoom(roomId) {
   state.activeMultiRoomId = roomId;
+  state.multiRoomTargetBindingIds = [];
   state.multiRoomLiveOutput = {};
   const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
   state.activeMultiRoomSnapshot = snap;
@@ -6510,6 +6512,12 @@ function renderActiveMultiRoom() {
     cursors.map((cursor) => [cursor.binding_id, cursor])
   );
   const room = snap.room || {};
+  const targetCount = state.multiRoomTargetBindingIds.length;
+  if (elements.postRoomMessage) {
+    elements.postRoomMessage.textContent = targetCount
+      ? `Post to ${targetCount} participant${targetCount === 1 ? "" : "s"}`
+      : "Post to room";
+  }
   const summary = node("div", "remote-access-copy");
   summary.append(
     node("strong", "", room.title || room.room_type || "Room"),
@@ -6547,12 +6555,29 @@ function renderActiveMultiRoom() {
       binding.slot_role !== "USER" &&
       !dedicatedProjectMaster &&
       Boolean(binding.provider && binding.provider_session_ref);
+    if (room.room_type === "MEETING" && controllable) {
+      const selected = state.multiRoomTargetBindingIds.includes(binding.binding_id);
+      const target = node(
+        "button",
+        "secondary-button compact-action",
+        selected ? "Targeted" : "Target"
+      );
+      target.type = "button";
+      target.setAttribute("aria-pressed", selected ? "true" : "false");
+      target.addEventListener("click", () => {
+        state.multiRoomTargetBindingIds = selected
+          ? state.multiRoomTargetBindingIds.filter((item) => item !== binding.binding_id)
+          : [...state.multiRoomTargetBindingIds, binding.binding_id];
+        renderActiveMultiRoom();
+      });
+      row.append(target);
+    }
     if (controllable) {
       const connected = ["CONTROLLED", "LIVE"].includes(participantState);
       const control = node(
         "button",
         "secondary-button compact-action",
-        connected ? "Disconnect" : "Connect native"
+        connected ? "Disconnect" : "Connect session"
       );
       control.type = "button";
       control.addEventListener("click", () => {
@@ -6719,9 +6744,14 @@ async function postActiveRoomAsUser() {
   }
   const text = elements.multiRoomMessage?.value?.trim() || "";
   if (!text) throw new Error("Message required");
+  const targetBindingIds = [...state.multiRoomTargetBindingIds];
   await api(`/v1/rooms/${encodeURIComponent(state.activeMultiRoomId)}/messages`, {
     method: "POST",
-    body: { author_role: "USER", body_text: text },
+    body: {
+      author_role: "USER",
+      body_text: text,
+      ...(targetBindingIds.length ? { target_binding_ids: targetBindingIds } : {}),
+    },
   });
   elements.multiRoomMessage.value = "";
   await openMultiRoom(state.activeMultiRoomId);

@@ -20020,7 +20020,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.terminal_host = SupervisedTerminalHost()
         else:
             self.terminal_host = TerminalHost(database_path=store.database_path)
-        self.session_bus = SessionBus(database_path=store.database_path)
+        self.session_bus = SessionBus(
+            database_path=store.database_path,
+            result_observer=self._observe_session_bus_result,
+        )
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
@@ -24166,6 +24169,49 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             except (SessionSupervisorError, TerminalHostError, UniverseError):
                 continue
 
+    def _observe_session_bus_result(self, packet: Mapping[str, Any]) -> None:
+        original = packet.get("message")
+        result = packet.get("result")
+        if not isinstance(original, Mapping) or not isinstance(result, Mapping):
+            return
+        room_id = str(original.get("room_id") or "").strip()
+        if not room_id:
+            return
+        target = original.get("to")
+        target = target if isinstance(target, Mapping) else {}
+        provider = str(target.get("provider") or "").strip().upper()
+        session_anchor_ref = str(
+            original.get("recipient_anchor_ref")
+            or target.get("session_anchor_ref")
+            or ""
+        ).strip()
+        matches = [
+            binding
+            for binding in self.multi_rooms.list_bindings(room_id, active_only=True)
+            if str(binding.get("provider") or "").upper() == provider
+            and str(binding.get("session_anchor_ref") or "") == session_anchor_ref
+        ]
+        if len(matches) != 1:
+            raise SessionBusError(
+                "BUS_ROOM_RESULT_BINDING_UNRESOLVED",
+                "Session Bus result does not resolve to one exact Room participant",
+                409,
+            )
+        binding = matches[0]
+        message = self.multi_rooms.post_message(
+            room_id,
+            {
+                "author_role": binding.get("slot_role") or "MODEL",
+                "author_binding_id": binding["binding_id"],
+                "body_text": result.get("body_text"),
+                "provider_event_id": result.get("message_id"),
+                "correlation_id": original.get("thread_id"),
+                "idempotency_key": "session-bus-result:"
+                + str(result.get("message_id") or ""),
+            },
+        )
+        self._observe_multi_room_collection(message)
+
     def ack_session_bus_message(
         self, message_id: str, value: Mapping[str, Any] | None
     ) -> dict[str, Any]:
@@ -26050,12 +26096,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "session_anchor_ref": session_anchor_ref,
         }
 
-    def _write_room_event_to_exact_pty(
+    def _queue_room_event_for_exact_session(
         self,
         coordinate: Mapping[str, str],
         binding: Mapping[str, Any],
         event: Mapping[str, Any],
-    ) -> bool:
+    ) -> Mapping[str, Any]:
         terminal_id = str(coordinate.get("terminal_id") or "")
         try:
             source = self._session_anchor_terminal_host().get(terminal_id)
@@ -26107,14 +26153,41 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 409,
             )
         try:
-            self.terminal_host.write(terminal_id, (body + "\r").encode("utf-8"))
-        except (TerminalHostError, UnicodeError) as error:
+            posted = self.session_bus.post(
+                self._session_anchor_terminal_host(),
+                {
+                    "to": {
+                        "terminal_id": terminal_id,
+                        "project_id": coordinate.get("project_id"),
+                        "mode": coordinate.get("mode"),
+                        "provider": coordinate.get("provider"),
+                        "session_anchor_ref": coordinate.get("session_anchor_ref"),
+                    },
+                    "from": {
+                        "project_id": coordinate.get("project_id"),
+                        "mode": "MEETING",
+                        "provider": "UNIVERSE",
+                    },
+                    "kind": "INSTRUCTION",
+                    "notify": "HEADER",
+                    "body_text": body,
+                    "room_id": binding.get("room_id"),
+                    "thread_id": message.get("message_id")
+                    or event.get("room_event_id"),
+                },
+            )
+            dispatches = self._dispatch_live_posted_session_instructions(posted)
+        except (SessionBusError, TerminalHostError) as error:
             raise MultiRoomError(
-                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                "ROOM_PARTICIPANT_SESSION_BUS_UNAVAILABLE",
                 str(error),
                 409,
             ) from error
-        return True
+        return {
+            "status": "DEFERRED",
+            "session_bus_message_id": posted.get("message_id"),
+            "dispatches": dispatches,
+        }
 
     def set_room_participant_control(
         self,
@@ -26177,7 +26250,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             provider_session_ref=coordinate["provider_session_ref"],
             send_input=(
                 lambda native_binding, event, exact=dict(coordinate): (
-                    self._write_room_event_to_exact_pty(
+                    self._queue_room_event_for_exact_session(
                         exact,
                         native_binding,
                         event,
@@ -26185,12 +26258,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             ),
         )
+        delivery = self.multi_room_delivery.deliver_binding(binding_id)
         return {
             "schema": API_SCHEMA,
             "status": "ROOM_PARTICIPANT_CONTROL_CONNECTED",
             "binding_id": binding_id,
             "live_pty": coordinate,
             "native_control": control,
+            "pending_delivery": delivery,
         }
 
     def multi_room_snapshot(self, room_id: str) -> dict[str, Any]:

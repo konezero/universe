@@ -350,6 +350,61 @@ class MultiRoomStoreTests(unittest.TestCase):
         self.assertEqual(2, codex_result["cursor"]["delivery_sequence"])
         self.assertEqual(2, claude_result["cursor"]["delivery_sequence"])
 
+    def test_targeted_message_delivers_only_to_selected_participants(self) -> None:
+        room = self.store.create_meeting_room(
+            {
+                "title": "Targeted",
+                "models": [
+                    {"provider": "CODEX", "display_name": "Codex"},
+                    {"provider": "CLAUDE", "display_name": "Claude"},
+                ],
+            }
+        )["room"]
+        codex, claude = [
+            binding
+            for binding in self.store.list_bindings(room["room_id"])
+            if binding["slot_role"] == "MODEL"
+        ]
+        self.store.set_participant_state(codex["binding_id"], "LIVE")
+        self.store.set_participant_state(claude["binding_id"], "LIVE")
+        message = self.store.post_message(
+            room["room_id"],
+            {
+                "author_role": "USER",
+                "body_text": "Claude only",
+                "target_binding_ids": [claude["binding_id"]],
+            },
+        )
+        delivered_to: list[str] = []
+        coordinator = MultiRoomDeliveryCoordinator(
+            self.store,
+            lambda binding, _event: (
+                delivered_to.append(binding["binding_id"])
+                or {"status": "ACCEPTED"}
+            ),
+        )
+
+        codex_result = coordinator.deliver_binding(codex["binding_id"])
+        claude_result = coordinator.deliver_binding(claude["binding_id"])
+
+        self.assertEqual([claude["binding_id"]], message["target_binding_ids"])
+        self.assertEqual([], codex_result["delivered"])
+        self.assertEqual(
+            [message["room_event_id"]],
+            [item["room_event_id"] for item in claude_result["delivered"]],
+        )
+        self.assertEqual([claude["binding_id"]], delivered_to)
+        with self.assertRaises(MultiRoomError) as context:
+            self.store.post_message(
+                room["room_id"],
+                {
+                    "author_role": "USER",
+                    "body_text": "Missing target",
+                    "target_binding_ids": ["bind_missing"],
+                },
+            )
+        self.assertEqual("TARGET_BINDING_INVALID", context.exception.code)
+
     def test_uncertain_delivery_blocks_retry_until_explicit_resolution(self) -> None:
         room = self.store.create_meeting_room(
             {

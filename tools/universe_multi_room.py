@@ -842,6 +842,24 @@ class MultiRoomStore:
         correlation_id = _optional_text(
             value.get("correlation_id"), "correlation_id", limit=256
         )
+        target_binding_ids_raw = value.get("target_binding_ids")
+        target_binding_ids: list[str] | None = None
+        if target_binding_ids_raw is not None:
+            if not isinstance(target_binding_ids_raw, list):
+                raise MultiRoomError(
+                    "TARGET_BINDINGS_INVALID",
+                    "target_binding_ids must be an array",
+                )
+            target_binding_ids = []
+            for item in target_binding_ids_raw:
+                binding_id = _text(item, "target_binding_id", limit=80)
+                if binding_id not in target_binding_ids:
+                    target_binding_ids.append(binding_id)
+            if not target_binding_ids:
+                raise MultiRoomError(
+                    "TARGET_BINDINGS_REQUIRED",
+                    "target_binding_ids must contain at least one binding",
+                )
         message_id = "msg_" + secrets.token_hex(12)
         room_event_id = "room_evt_" + secrets.token_hex(12)
         now = utc_now()
@@ -867,6 +885,20 @@ class MultiRoomStore:
                     raise MultiRoomError(
                         "AUTHOR_BINDING_INVALID",
                         "author binding does not belong to the room",
+                        409,
+                    )
+            for target_binding_id in target_binding_ids or []:
+                target_binding = connection.execute(
+                    """
+                    SELECT binding_id FROM chat_room_session
+                    WHERE binding_id = ? AND room_id = ? AND state = 'ACTIVE'
+                    """,
+                    (target_binding_id, room["room_id"]),
+                ).fetchone()
+                if target_binding is None:
+                    raise MultiRoomError(
+                        "TARGET_BINDING_INVALID",
+                        "target binding is not an active participant in the room",
                         409,
                     )
             if provider_event_id is not None:
@@ -902,6 +934,7 @@ class MultiRoomStore:
                 "author_binding_id": author_binding_id,
                 "provider_event_id": provider_event_id,
                 "correlation_id": correlation_id,
+                "target_binding_ids": target_binding_ids,
                 "body_text": body_text,
                 "created_at": now,
             }
@@ -1089,6 +1122,18 @@ class MultiRoomStore:
         with self._connect() as connection:
             for event in events:
                 if event.get("origin_binding_id") == cursor["binding_id"]:
+                    continue
+                message = event.get("message")
+                target_binding_ids = (
+                    message.get("target_binding_ids")
+                    if isinstance(message, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(target_binding_ids, list)
+                    and target_binding_ids
+                    and cursor["binding_id"] not in target_binding_ids
+                ):
                     continue
                 prior = connection.execute(
                     """
@@ -2051,11 +2096,16 @@ class MultiRoomNativeControlRegistry:
                 "native provider control rejected the incremental event",
                 409,
             )
+        transport = dict(accepted) if isinstance(accepted, Mapping) else {}
+        status = str(transport.get("status") or "QUEUED").upper()
+        if status not in DELIVERY_STATES:
+            status = "QUEUED"
         return {
-            "status": "QUEUED",
+            "status": status,
             "binding_id": bid,
             "room_event_id": event.get("room_event_id"),
             "control_ref": control["control_ref"],
+            "transport": transport,
         }
 
     def close(self) -> None:
