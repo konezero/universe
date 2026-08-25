@@ -903,6 +903,7 @@ class GrokAcpSession:
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
         self._active_delta: Callable[[str], None] | None = None
+        self._active_message_reset: Callable[[], None] | None = None
         self._bootstrap_pending = True
         self._git_trace2 = GitTrace2Observer(cwd)
         environment = self._git_trace2.environment(environment)
@@ -948,7 +949,11 @@ class GrokAcpSession:
             parts.append(delta)
             on_delta(delta)
 
+        def reset_message() -> None:
+            parts.clear()
+
         self._active_delta = receive
+        self._active_message_reset = reset_message
         prompt_text = text
         if self._bootstrap_pending:
             prompt_text = f"{self.system_prompt}\n\n{text}"
@@ -969,6 +974,7 @@ class GrokAcpSession:
             )
         finally:
             self._active_delta = None
+            self._active_message_reset = None
         if not isinstance(result, Mapping):
             raise AgentSessionError("GROK_ACP_PROMPT_RESULT_INVALID")
         output = "".join(parts).strip()
@@ -1073,7 +1079,12 @@ class GrokAcpSession:
         update = params.get("update")
         if not isinstance(update, Mapping):
             return
-        if update.get("sessionUpdate") != "agent_message_chunk":
+        update_type = update.get("sessionUpdate")
+        if update_type == "tool_call":
+            if self._active_message_reset is not None:
+                self._active_message_reset()
+            return
+        if update_type != "agent_message_chunk":
             return
         content = update.get("content")
         if isinstance(content, Mapping):

@@ -519,6 +519,64 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("GROK", selected[0]["provider"])
         self.assertTrue(transport.closed)
 
+    def test_grok_returns_only_the_post_tool_assistant_message(self) -> None:
+        class MultiMessageTransport(FakeJsonRpcTransport):
+            def request(
+                self,
+                method: str,
+                params: Mapping[str, Any],
+                *,
+                timeout_seconds: float = 300,
+            ) -> Any:
+                if method != "session/prompt":
+                    return super().request(
+                        method, params, timeout_seconds=timeout_seconds
+                    )
+                self.requests.append((method, dict(params)))
+                for update in (
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "Planning"},
+                    },
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-001",
+                        "title": "Read",
+                    },
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": '{"value":"final"}',
+                        },
+                    },
+                ):
+                    self.notification_handler(
+                        "session/update",
+                        {"sessionId": params["sessionId"], "update": update},
+                    )
+                return {"stopReason": "end_turn"}
+
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            MultiMessageTransport,
+        ):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-session-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            deltas: list[str] = []
+            answer = session.prompt("Question", deltas.append)
+            session.close()
+
+        self.assertEqual('{"value":"final"}', answer)
+        self.assertEqual(["Planning", '{"value":"final"}'], deltas)
+
     def test_grok_bootstraps_once_and_passes_effort(self) -> None:
         with patch(
             "agent_session_gateway.JsonRpcStdioProcess",
