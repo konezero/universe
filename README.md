@@ -16,6 +16,37 @@ is a separate governance and validation foundation that Universe consumes for
 trusted rules, Seeds, and release/runtime lifecycle. Career is not the project
 UI or the project data store.
 
+## Core Product Loop
+
+Universe begins with a **Feature Node**, not a Todo. When a user describes a
+possible capability, the Conductor may open a user-visible **Meeting Room** and
+bring together relevant persistent sessions, Masters, Bosses, Workers, and
+research-oriented models. They use the room to retrieve evidence, expose
+cross-feature dependencies, negotiate scope or escalation, and co-author
+reviewable documents. The room is a general collaboration surface; automatic
+round-robin debate is only one optional facilitation policy.
+
+A meeting may produce several detailed implementation specifications. Those
+alternatives are the Feature Node's **Expected Paths**: candidate future branches
+that remain proposals until the user adopts one. Adoption preserves the selected
+specification and its evidence, after which Universe may derive Goals and Todos
+through the normal governed execution path. A Todo is therefore work *inside* an
+adopted Feature Node path; it does not create or precede the Feature Node.
+
+```text
+User intent
+  -> Feature Node
+       -> Meeting Room: people + agents + retrieval + documents
+            -> Expected Path A (detailed implementation specification)
+            -> Expected Path B (detailed implementation specification)
+            -> Expected Path N (detailed implementation specification)
+                 -> user adoption
+                      -> Goals -> Todos -> governed execution
+```
+
+Meeting participation, document creation, and path proposals do not by themselves
+create execution authority.
+
 ## The Universe Today
 
 The repository currently focuses on:

@@ -22,9 +22,14 @@ instruct and coordinate. Users speak instructions primarily to the Master; in Bo
 rooms they **observe only**. Boss rooms produce durable turns and boss-distilled
 artifacts (bench/files) that become **decision evidence**.
 
-A separate **Meeting room** type lets the Conductor host multi-model debate,
-created via Skill, with the user able to interrupt mid-meeting. Meeting output is
-summary/candidate material (bench-class), not automatic execution authority.
+A separate **Meeting Room** is a user-visible, persistent collaboration space.
+The Conductor can convene relevant agents, while Masters, Bosses, Workers, and
+research-oriented models can request information, coordinate feature boundaries,
+escalate scope or authority questions, and co-author documents. The user may
+observe, intervene, redirect, or adopt an outcome. Automated multi-model debate is
+only one optional facilitation policy; it is not the room's defining behavior.
+Meeting output remains proposal material and never creates execution authority by
+itself.
 
 The normative live transport and observation rules are fixed in
 `docs/live-session-room-routing.md`. Provider sessions retain their own context;
@@ -78,18 +83,40 @@ Master → attach Boss room → re-instruct / re-scope
 User instructions → Master (Project room), not Boss room write path
 ```
 
-### 2.3 Meeting room (multi-model debate)
+### 2.3 Meeting Room (collaboration and specification)
 
 | Field | Rule |
 |-------|------|
-| **Cardinality** | Many concurrent |
-| **Purpose** | Mix models for discussion; not the default TF execution path |
-| **Host (주최자)** | **Conductor** |
-| **Participants** | Multiple model slots + optional others |
-| **User** | **May intervene mid-meeting** |
-| **Creation** | **Skill-driven** (e.g. `meeting-room.create`) preferred over Master-only TF factory |
-| **Output** | Summary / decision **candidate** artifacts (bench-class); **no** Execution Guard authority from meeting alone |
-| **Handoff** | Adopted outcomes may open Project-room direction or Task Frames via normal Master path |
+| **Cardinality** | Many concurrent; may be attached to a Feature Node, Task Frame, or ad-hoc inquiry |
+| **Purpose** | Shared requests, research, coordination, escalation, decision support, and document co-authoring |
+| **Host / facilitator** | **Conductor** by default; facilitation does not imply execution authority |
+| **Participants** | User plus invited Conductor, Master, Boss, Worker, and model sessions |
+| **User** | Full visible participant; may observe, intervene, redirect, request revision, or adopt a candidate outcome |
+| **Interaction** | Free participant messaging and targeted requests first; round-robin or other automated discussion is optional |
+| **Retrieval** | Invited research models may retrieve RAG evidence and return source-linked findings to the room |
+| **Coordination** | Participants may expose cross-feature dependencies and request scope or authority escalation through the proper owner |
+| **Documents** | Participants may co-author versioned proposal, specification, comparison, and decision-candidate artifacts |
+| **Creation** | User, Conductor, or a governed workflow may open or attach a room without requiring a Task Frame |
+| **Output** | Evidence-linked candidate artifacts; **no** execution authority from meeting participation or completion alone |
+| **Handoff** | User-adopted outcomes may become Feature Node Expected Paths or enter the normal Master/Task Frame route |
+
+Meeting Rooms provide the collaboration layer for Universe's core future-path
+loop:
+
+```text
+User describes a capability
+  -> Feature Node records the intent
+       -> Meeting Room gathers sessions, evidence, and documents
+            -> multiple detailed implementation specifications
+                 -> Expected Path candidates on the feature graph
+                      -> explicit user adoption
+                           -> Goals and Todos for the adopted path
+```
+
+The detailed specifications are the predictions. They are alternative future
+implementation paths, not automatically selected plans. Todos belong to the
+adopted path and must not be used as a substitute for the Feature Node or the
+pre-adoption candidate set.
 
 ### 2.4 Work progress dashboard (observation UI)
 
