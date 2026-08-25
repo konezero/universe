@@ -1175,7 +1175,24 @@ class ProjectModeCoordinator:
                     raise ProjectMasterHostError(
                         "DESCENDANT_TASK_FRAME_CHILD_RESULT_INVALID"
                     )
-                child_results.append({"turn_id": turn_id, "status": terminal_status})
+                child_results.append(
+                    {
+                        "turn_id": turn_id,
+                        "role": role,
+                        "status": terminal_status,
+                        "result": {
+                            key: child_payload[key]
+                            for key in (
+                                "outcome",
+                                "summary",
+                                "evidence_refs",
+                                "validation",
+                                "mutation_evidence_refs",
+                            )
+                            if key in child_payload
+                        },
+                    }
+                )
         except ProjectMasterHostError as error:
             self._recover_captured_boss_claim(
                 boss_request=boss_request,

@@ -7665,8 +7665,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         terminal_host.get.return_value = terminal
         terminal_host.channel_state.return_value = "PENDING"
         self.server.terminal_host = terminal_host
-        self.server.room_participant_hosts.close()
-        self.server.room_participant_hosts = Mock()
+        self.assertFalse(hasattr(self.server, "room_participant_hosts"))
+        self.assertIsNone(self.server.room_participant_permission_resolver)
 
         status, connected = self.request(
             "POST",
@@ -7677,7 +7677,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("ROOM_PARTICIPANT_CONTROL_CONNECTED", connected["status"])
         self.assertEqual("term-room-001", connected["live_pty"]["terminal_id"])
-        self.server.room_participant_hosts.ensure.assert_not_called()
         self.assertEqual(
             "CONTROLLED",
             self.server.multi_rooms.participant_cursor(binding["binding_id"])[
@@ -8072,8 +8071,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             },
         )["binding"]
         participant_hosts = PermissionParticipantHosts()
-        self.server.room_participant_hosts.close()
-        self.server.room_participant_hosts = participant_hosts
+        self.server.room_participant_permission_resolver = (
+            participant_hosts.resolve_permission
+        )
         self.server._observe_room_participant_permission(
             binding,
             {
@@ -8833,6 +8833,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "project_id": "GCS",
             "primary_proposal_id": proposal["proposal_id"],
             "task_frame_id": "instruction-frame-001",
+            "boss_turn_id": "boss-review",
+            "child_results": [
+                {
+                    "turn_id": "independent-review",
+                    "role": "SUB_REVIEWER",
+                    "status": "TURN_COMPLETED",
+                    "result": {
+                        "outcome": "SUCCEEDED",
+                        "summary": "Independent review passed with no findings.",
+                        "evidence_refs": ["review://receipt-001"],
+                        "validation": [
+                            {
+                                "plane": "independent-review",
+                                "state": "PASS",
+                                "evidence_refs": ["review://receipt-001"],
+                            }
+                        ],
+                    },
+                }
+            ],
             "repository_write": False,
         }
         client.run_instruction_authorized_task_frame.return_value = {
@@ -8865,6 +8885,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("CLOSED", run_result["task_frame_room"]["room"]["state"])
         self.assertFalse(run_result["task_frame_room"]["user_may_write"])
+        room_messages = self.server.multi_rooms.list_messages(
+            run_result["task_frame_room"]["room"]["room_id"]
+        )
+        terminal_message = next(
+            message
+            for message in room_messages
+            if message["provider_event_id"]
+            == "task-frame-result:instruction-frame-001"
+        )
+        visible_result = json.loads(terminal_message["body_text"])
+        self.assertEqual(
+            "Independent review passed with no findings.",
+            visible_result["child_results"][0]["result"]["summary"],
+        )
+        self.assertEqual(
+            "STRUCTURED_SUMMARY_ONLY", visible_result["redaction_state"]
+        )
         run_forwarded = (
             client.run_instruction_authorized_task_frame.call_args.kwargs
         )

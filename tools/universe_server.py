@@ -127,7 +127,6 @@ from project_master_host import (
     ProjectTaskProposalAdapter,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
-    ResidentRoomParticipantHostManager,
     normalize_session_action,
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
@@ -20107,7 +20106,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         conductor_delegation_executor: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
-        room_participant_provider_factory: Any = None,
+        room_participant_permission_resolver: Callable[[str, str, str], bool] | None = None,
         provider_session_host_factory: Any = None,
         host_profile: HostProfileStore | None = None,
         provider_model_catalog: ProviderModelCatalogStore | None = None,
@@ -20225,10 +20224,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.room_participant_permissions = RoomParticipantPermissionRegistry()
         self._room_permission_resolution_lock = threading.RLock()
-        self.room_participant_hosts = ResidentRoomParticipantHostManager(
-            room_event_observer=self._observe_native_room_event,
-            permission_observer=self._observe_room_participant_permission,
-            provider_factory=room_participant_provider_factory,
+        self.room_participant_permission_resolver = (
+            room_participant_permission_resolver
         )
         self.provider_sessions = ProviderSessionService(
             resolver=lambda chat_key: self.resolve_provider_chat_session(chat_key),
@@ -21557,10 +21554,60 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except MultiRoomError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
+    @staticmethod
+    def _safe_task_frame_child_results(
+        host_result: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Keep only bounded, user-visible Task Frame result fields."""
+
+        raw_children = host_result.get("child_results")
+        if not isinstance(raw_children, list):
+            return []
+        safe_children: list[dict[str, Any]] = []
+        for item in raw_children[:32]:
+            if not isinstance(item, Mapping):
+                continue
+            child = {
+                key: str(item.get(key))[:256]
+                for key in ("turn_id", "role", "status")
+                if item.get(key) is not None
+            }
+            raw_result = item.get("result")
+            if isinstance(raw_result, Mapping):
+                result: dict[str, Any] = {}
+                for key, limit in (("outcome", 64), ("summary", 4000)):
+                    value = raw_result.get(key)
+                    if isinstance(value, str) and value.strip():
+                        result[key] = value.strip()[:limit]
+                evidence_refs = raw_result.get("evidence_refs")
+                if isinstance(evidence_refs, list):
+                    result["evidence_refs"] = [
+                        str(value)[:512]
+                        for value in evidence_refs[:32]
+                        if isinstance(value, str) and value.strip()
+                    ]
+                validation = raw_result.get("validation")
+                if isinstance(validation, list):
+                    result["validation"] = [
+                        {
+                            key: entry.get(key)
+                            for key in ("plane", "state", "evidence_refs")
+                            if entry.get(key) is not None
+                        }
+                        for entry in validation[:32]
+                        if isinstance(entry, Mapping)
+                    ]
+                child["result"] = result
+            safe_children.append(child)
+        return safe_children
+
     def _complete_task_frame_room(
-        self, project_id: str, task_frame_id: str
+        self,
+        project_id: str,
+        task_frame_id: str,
+        host_result: Mapping[str, Any],
     ) -> dict[str, Any] | None:
-        """Close the ephemeral Task Frame Room after its terminal result."""
+        """Project the terminal result, then close the ephemeral Task Frame Room."""
 
         try:
             rooms = self.multi_rooms.list_rooms(
@@ -21572,6 +21619,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             if room is None:
                 return None
+            visible_result = {
+                "schema": "universe.task-frame-room-result.v1",
+                "task_frame_id": task_frame_id,
+                "status": host_result.get("status"),
+                "boss_turn_id": host_result.get("boss_turn_id"),
+                "child_results": self._safe_task_frame_child_results(host_result),
+                "redaction_state": "STRUCTURED_SUMMARY_ONLY",
+            }
+            message = self.multi_rooms.post_message(
+                room["room_id"],
+                {
+                    "author_role": "BOSS",
+                    "kind": "MESSAGE",
+                    "body_text": json.dumps(
+                        visible_result, ensure_ascii=False, indent=2
+                    ),
+                    "provider_event_id": f"task-frame-result:{task_frame_id}",
+                    "correlation_id": task_frame_id,
+                    "idempotency_key": f"task-frame-result:{task_frame_id}",
+                },
+            )
+            self._observe_multi_room_collection(message)
             closed = self.multi_rooms.close_room(room["room_id"])
             return self.multi_rooms.room_snapshot(closed["room_id"])
         except MultiRoomError as error:
@@ -21591,16 +21660,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "boss_turn_id": host_result.get("boss_turn_id"),
                 }
             )[:24]
-            child_results = host_result.get("child_results")
-            safe_children = [
-                {
-                    key: item.get(key)
-                    for key in ("turn_id", "status")
-                    if item.get(key) is not None
-                }
-                for item in child_results
-                if isinstance(item, Mapping)
-            ] if isinstance(child_results, list) else []
+            safe_children = self._safe_task_frame_child_results(host_result)
             result, created = self.task_frame_lineage.attach_result(
                 result_ref=result_ref,
                 frame_ref=task_frame_id,
@@ -21679,7 +21739,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         task_frame_result = self._record_task_frame_terminal_result(frame_id, host_result)
         task_frame_room = self._complete_task_frame_room(
-            project["project_id"], frame_id
+            project["project_id"], frame_id, host_result
         )
         self.publish_project_room_changed(project["project_id"])
         return {
@@ -21789,7 +21849,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         task_frame_result = self._record_task_frame_terminal_result(frame_id, host_result)
         task_frame_room = self._complete_task_frame_room(
-            project["project_id"], frame_id
+            project["project_id"], frame_id, host_result
         )
         self.publish_project_room_changed(project["project_id"])
         return {
@@ -27694,7 +27754,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     request_id,
                     option_id,
                 )
-            if not self.room_participant_hosts.resolve_permission(
+            resolver = self.room_participant_permission_resolver
+            if resolver is None or not resolver(
                 binding_id,
                 request_id,
                 option_id,
@@ -29288,10 +29349,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         close_step(
             "provider_sessions",
             self.provider_sessions.close,
-        )
-        close_step(
-            "room_participant_hosts",
-            self.room_participant_hosts.close,
         )
         if self.project_master_hosts is not None:
             close_step("project_master_hosts", self.project_master_hosts.close)
@@ -34366,7 +34423,7 @@ def create_server(
     conductor_delegation_executor: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
-    room_participant_provider_factory: Any = None,
+    room_participant_permission_resolver: Callable[[str, str, str], bool] | None = None,
     provider_session_host_factory: Any = None,
     host_profile: HostProfileStore | None = None,
     provider_model_catalog: ProviderModelCatalogStore | None = None,
@@ -34401,7 +34458,7 @@ def create_server(
         conductor_delegation_executor=conductor_delegation_executor,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
-        room_participant_provider_factory=room_participant_provider_factory,
+        room_participant_permission_resolver=room_participant_permission_resolver,
         provider_session_host_factory=provider_session_host_factory,
         host_profile=host_profile,
         provider_model_catalog=provider_model_catalog,

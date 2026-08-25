@@ -3796,6 +3796,15 @@ class ProjectMasterHostTests(unittest.TestCase):
             dispatches[1]["output_contract"]["schema"],
         )
         self.assertEqual("submit_boss_allocations", operations[1]["operation"])
+        self.assertEqual("IMPLEMENTER", result["child_results"][0]["role"])
+        self.assertEqual(
+            "Implemented and verified.",
+            result["child_results"][0]["result"]["summary"],
+        )
+        self.assertEqual(
+            ["result://implementation"],
+            result["child_results"][0]["result"]["evidence_refs"],
+        )
 
     def test_boss_allocations_fail_closed_on_missing_or_reviewer_mutation(self) -> None:
         target = str(self.root / "tools" / "app.py")
