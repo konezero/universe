@@ -58,6 +58,128 @@ CLAUDE_FORBIDDEN_PERMISSION_MODES = frozenset(
     {"acceptEdits", "auto", "bypassPermissions", "dontAsk"}
 )
 PLATFORM_APPROVAL_EVIDENCE_SCHEMA = "ai-career.platform-approval-evidence.v1"
+PROVIDER_QUOTA_SNAPSHOT_SCHEMA = "universe.provider-quota-snapshot.v1"
+
+
+def _unknown_quota_snapshot(provider: str, source: str) -> dict[str, Any]:
+    return {
+        "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+        "provider": provider,
+        "source": source,
+        "state": "UNKNOWN",
+        "windows": [],
+    }
+
+
+def _quota_state(windows: list[dict[str, Any]], reached: Any = None) -> str:
+    if reached not in {None, "", False}:
+        return "EXHAUSTED"
+    percents = [
+        value
+        for window in windows
+        if isinstance((value := window.get("used_percent")), (int, float))
+        and not isinstance(value, bool)
+    ]
+    if not percents:
+        return "UNKNOWN"
+    if any(value >= 100 for value in percents):
+        return "EXHAUSTED"
+    if any(value >= 80 for value in percents):
+        return "WARNING"
+    return "AVAILABLE"
+
+
+def _codex_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return _unknown_quota_snapshot("CODEX", source)
+    snapshot = value.get("rateLimits")
+    if not isinstance(snapshot, Mapping):
+        snapshot = value
+    windows: list[dict[str, Any]] = []
+    for name in ("primary", "secondary"):
+        item = snapshot.get(name)
+        if not isinstance(item, Mapping):
+            continue
+        used = item.get("usedPercent")
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            continue
+        window = {"name": name.upper(), "used_percent": used}
+        for source_key, target_key in (
+            ("windowDurationMins", "window_minutes"),
+            ("resetsAt", "resets_at"),
+        ):
+            field_value = item.get(source_key)
+            if isinstance(field_value, (int, float)) and not isinstance(field_value, bool):
+                window[target_key] = field_value
+        windows.append(window)
+    reached = snapshot.get("rateLimitReachedType")
+    return {
+        "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+        "provider": "CODEX",
+        "source": source,
+        "state": _quota_state(windows, reached),
+        "windows": windows,
+        "rate_limit_reached_type": reached,
+    }
+
+
+def _grok_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return _unknown_quota_snapshot("GROK", source)
+    snapshot = value.get("config")
+    if not isinstance(snapshot, Mapping):
+        snapshot = value
+    usage = snapshot.get("usage")
+    limit = snapshot.get("monthlyLimit") or snapshot.get("monthly_limit")
+    total = usage.get("totalUsed") if isinstance(usage, Mapping) else None
+    if total is None:
+        total = snapshot.get("used")
+
+    def amount(item: Any) -> float | None:
+        if isinstance(item, Mapping):
+            item = item.get("val")
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            return float(item)
+        return None
+
+    limit_value = amount(limit)
+    total_value = amount(total)
+    used_percent = snapshot.get("creditUsagePercent")
+    if used_percent is None:
+        used_percent = snapshot.get("credit_usage_percent")
+    if not isinstance(used_percent, (int, float)) or isinstance(used_percent, bool):
+        used_percent = (
+            total_value / limit_value * 100
+            if limit_value is not None and limit_value > 0 and total_value is not None
+            else None
+        )
+    windows: list[dict[str, Any]] = []
+    if used_percent is not None:
+        window: dict[str, Any] = {
+            "name": "CREDITS",
+            "used_percent": float(used_percent),
+        }
+        period = snapshot.get("currentPeriod") or snapshot.get("current_period")
+        reset: Any = None
+        if isinstance(period, Mapping):
+            period_type = period.get("type")
+            if isinstance(period_type, str) and period_type:
+                window["name"] = period_type.upper()
+            reset = period.get("end")
+        if reset is None:
+            reset = snapshot.get("billingPeriodEnd") or snapshot.get(
+                "billing_period_end"
+            )
+        if isinstance(reset, str) and reset:
+            window["resets_at"] = reset
+        windows.append(window)
+    return {
+        "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+        "provider": "GROK",
+        "source": source,
+        "state": _quota_state(windows),
+        "windows": windows,
+    }
 
 
 class AgentSessionError(RuntimeError):
@@ -1050,6 +1172,7 @@ class GrokAcpSession:
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
+        self._quota_snapshot = _unknown_quota_snapshot("GROK", "_x.ai/billing")
         self._active_delta: Callable[[str], None] | None = None
         self._active_message_reset: Callable[[], None] | None = None
         self._bootstrap_pending = True
@@ -1137,6 +1260,80 @@ class GrokAcpSession:
     def drain_work_statuses(self) -> list[dict[str, Any]]:
         return self._git_trace2.drain_work_statuses()
 
+    def runtime_observation(self) -> dict[str, Any]:
+        quota = dict(self._quota_snapshot)
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "GROK",
+            "session_ref": self.session_ref,
+            "state": "READY",
+            "quota_state": quota.get("state", "UNKNOWN"),
+            "usage": {},
+            "quota": quota,
+        }
+
+    def _refresh_quota(self) -> None:
+        source = "_x.ai/billing"
+        try:
+            value = self._transport.request(
+                "_x.ai/billing", {}, timeout_seconds=12
+            )
+        except AgentSessionError:
+            value = self._read_local_billing_log()
+            source = "grok-cli-local-billing-log"
+        if not isinstance(value, Mapping):
+            fallback = self._read_local_billing_log()
+            if isinstance(fallback, Mapping):
+                value = fallback
+                source = "grok-cli-local-billing-log"
+        self._quota_snapshot = _grok_quota_snapshot(value, source=source)
+
+    @staticmethod
+    def _read_local_billing_log() -> Mapping[str, Any] | None:
+        profile = os.environ.get("USERPROFILE")
+        if not profile:
+            return None
+        path = Path(profile) / ".grok" / "logs" / "unified.jsonl"
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 262_144), os.SEEK_SET)
+                data = handle.read()
+        except OSError:
+            return None
+        for raw_line in reversed(data.splitlines()):
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            candidates = [
+                record,
+                record.get("ctx"),
+                record.get("billing"),
+                record.get("data"),
+                record.get("payload"),
+            ]
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                payload = candidate.get("config")
+                if not isinstance(payload, Mapping):
+                    payload = candidate
+                if any(
+                    key in payload
+                    for key in (
+                        "monthlyLimit",
+                        "monthly_limit",
+                        "creditUsagePercent",
+                        "credit_usage_percent",
+                    )
+                ):
+                    return candidate
+        return None
+
     def close(self) -> None:
         self._transport.close()
         self._git_trace2.close()
@@ -1189,6 +1386,7 @@ class GrokAcpSession:
             {"methodId": "cached_token", "_meta": {"headless": True}},
             timeout_seconds=30,
         )
+        self._refresh_quota()
         capabilities = result.get("agentCapabilities")
         can_load = isinstance(capabilities, Mapping) and bool(
             capabilities.get("loadSession")
@@ -1311,6 +1509,9 @@ class CodexAppServerSession:
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
+        self._quota_snapshot = _unknown_quota_snapshot(
+            "CODEX", "account/rateLimits/read"
+        )
         self.ephemeral = bool(ephemeral)
         self.response_timeout_seconds = _positive_timeout_seconds(
             response_timeout_seconds, "CODEX_RESPONSE_TIMEOUT_INVALID"
@@ -1420,6 +1621,29 @@ class CodexAppServerSession:
     def drain_work_statuses(self) -> list[dict[str, Any]]:
         return self._git_trace2.drain_work_statuses()
 
+    def runtime_observation(self) -> dict[str, Any]:
+        quota = dict(self._quota_snapshot)
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "CODEX",
+            "session_ref": self.session_ref,
+            "state": "READY",
+            "quota_state": quota.get("state", "UNKNOWN"),
+            "usage": {},
+            "quota": quota,
+        }
+
+    def _refresh_quota(self) -> None:
+        try:
+            value = self._transport.request(
+                "account/rateLimits/read", {}, timeout_seconds=12
+            )
+        except AgentSessionError:
+            return
+        self._quota_snapshot = _codex_quota_snapshot(
+            value, source="account/rateLimits/read"
+        )
+
     def close(self) -> None:
         self._transport.close()
         self._git_trace2.close()
@@ -1474,6 +1698,7 @@ class CodexAppServerSession:
         if not isinstance(result, Mapping):
             raise AgentSessionError("CODEX_APP_INITIALIZE_INVALID")
         self._transport.notify("initialized")
+        self._refresh_quota()
         if self.session_id and not self.ephemeral:
             try:
                 session_result = self._transport.request(
@@ -1515,6 +1740,11 @@ class CodexAppServerSession:
         self.session_observer(session_id)
 
     def _handle_notification(self, method: str, params: Mapping[str, Any]) -> None:
+        if method == "account/rateLimits/updated":
+            self._quota_snapshot = _codex_quota_snapshot(
+                params, source="account/rateLimits/updated"
+            )
+            return
         if method == "item/agentMessage/delta" and self._active_delta is not None:
             delta = params.get("delta")
             if isinstance(delta, str) and delta:

@@ -60,6 +60,16 @@ class FakeJsonRpcTransport:
                     "authMethods": [{"id": "cached_token"}],
                     "agentCapabilities": {"loadSession": True},
                 }
+            if method == "_x.ai/billing":
+                return {
+                    "config": {
+                        "creditUsagePercent": 25,
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2026-09-01T00:00:00Z",
+                        },
+                    }
+                }
             if method in {"authenticate", "session/load"}:
                 if method == "session/load":
                     if params["sessionId"] == "grok-load-empty":
@@ -80,6 +90,21 @@ class FakeJsonRpcTransport:
                     },
                 )
                 return {"stopReason": "end_turn"}
+        if method == "account/rateLimits/read":
+            return {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 25,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1788220800,
+                    },
+                    "secondary": {
+                        "usedPercent": 70,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1788739200,
+                    },
+                }
+            }
         if method == "initialize":
             return {"serverInfo": {"name": "codex"}}
         if method == "thread/resume":
@@ -581,6 +606,9 @@ class AgentSessionGatewayTests(unittest.TestCase):
             )
             deltas: list[str] = []
             answer = session.prompt("Question", deltas.append)
+            observation = session.runtime_observation()
+            self.assertEqual("AVAILABLE", observation["quota_state"])
+            self.assertEqual(25.0, observation["quota"]["windows"][0]["used_percent"])
             permission = session._handle_request(
                 "session/request_permission",
                 {
@@ -621,6 +649,36 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("allow-once", permission["outcome"]["optionId"])
         self.assertEqual("GROK", selected[0]["provider"])
         self.assertTrue(transport.closed)
+
+    def test_grok_local_billing_fallback_reads_official_log_shape(self) -> None:
+        profile = self.root / "profile"
+        log_dir = profile / ".grok" / "logs"
+        log_dir.mkdir(parents=True)
+        payload = {
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "config": {
+                    "creditUsagePercent": 91.5,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2026-09-01T00:00:00Z",
+                    },
+                }
+            },
+        }
+        (log_dir / "unified.jsonl").write_text(
+            json.dumps(payload) + "\n", encoding="utf-8"
+        )
+
+        with patch.dict(
+            "agent_session_gateway.os.environ",
+            {"USERPROFILE": str(profile)},
+            clear=False,
+        ):
+            observed = GrokAcpSession._read_local_billing_log()
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(91.5, observed["config"]["creditUsagePercent"])
 
     def test_grok_returns_only_the_post_tool_assistant_message(self) -> None:
         class MultiMessageTransport(FakeJsonRpcTransport):
@@ -845,6 +903,9 @@ class AgentSessionGatewayTests(unittest.TestCase):
             )
             deltas: list[str] = []
             answer = session.prompt("Question", deltas.append)
+            observation = session.runtime_observation()
+            self.assertEqual("AVAILABLE", observation["quota_state"])
+            self.assertEqual(70, observation["quota"]["windows"][1]["used_percent"])
             decision = session._handle_request(
                 "item/commandExecution/requestApproval",
                 {

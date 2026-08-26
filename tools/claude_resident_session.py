@@ -425,6 +425,7 @@ class ClaudeResidentSession:
         self._turn_id: str | None = None
         # Observability for rate-limit telemetry; never used to auto-allow.
         self.last_rate_limit_status: str | None = None
+        self.last_rate_limit_info: dict[str, Any] = {}
         self.unknown_rate_limit_statuses: list[str] = []
 
     # -- shared contract ------------------------------------------------
@@ -499,6 +500,31 @@ class ClaudeResidentSession:
                 value = result.get(source_key)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     usage[target_key] = value
+        windows: list[dict[str, Any]] = []
+        utilization = self.last_rate_limit_info.get("utilization")
+        if isinstance(utilization, (int, float)) and not isinstance(utilization, bool):
+            used_percent = float(utilization)
+            if 0 <= used_percent <= 1:
+                used_percent *= 100
+            window: dict[str, Any] = {
+                "name": str(
+                    self.last_rate_limit_info.get("rateLimitType") or "RATE_LIMIT"
+                ).upper(),
+                "used_percent": used_percent,
+            }
+            reset = self.last_rate_limit_info.get("resetsAt")
+            if reset is None:
+                reset = self.last_rate_limit_info.get("resetAt")
+            if isinstance(reset, (str, int, float)) and not isinstance(reset, bool):
+                window["resets_at"] = reset
+            windows.append(window)
+        quota = {
+            "schema": "universe.provider-quota-snapshot.v1",
+            "provider": "CLAUDE",
+            "source": "rate_limit_event",
+            "state": quota_state,
+            "windows": windows,
+        }
         return {
             "schema": "universe.provider-runtime-observation.v1",
             "provider": self.provider,
@@ -507,6 +533,7 @@ class ClaudeResidentSession:
             "quota_state": quota_state,
             "rate_limit_status": self.last_rate_limit_status or "UNKNOWN",
             "usage": usage,
+            "quota": quota,
         }
 
     def supervisor_process_identity(
@@ -790,6 +817,20 @@ class ClaudeResidentSession:
         """Classify one ``rate_limit_event`` into allowed / spent / unknown."""
 
         info = event.get("rate_limit_info")
+        self.last_rate_limit_info = {
+            key: value
+            for key in (
+                "status",
+                "rateLimitType",
+                "utilization",
+                "surpassedThreshold",
+                "resetsAt",
+                "resetAt",
+            )
+            if isinstance(info, Mapping)
+            and (value := info.get(key)) is not None
+            and isinstance(value, (str, int, float, bool))
+        }
         status = str(info.get("status") or "").strip() if isinstance(info, Mapping) else ""
         if status in RATE_LIMIT_ALLOWED_STATUSES:
             self.last_rate_limit_status = status

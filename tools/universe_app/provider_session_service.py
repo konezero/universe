@@ -1350,6 +1350,34 @@ class ProviderSessionService:
                     for key, item in usage.items()
                     if isinstance(item, (int, float)) and not isinstance(item, bool)
                 }
+            quota = observation.get("quota")
+            if isinstance(quota, Mapping):
+                public_quota = {
+                    key: quota[key]
+                    for key in ("schema", "provider", "source", "state")
+                    if isinstance(quota.get(key), str)
+                }
+                windows = quota.get("windows")
+                if isinstance(windows, list):
+                    public_windows: list[dict[str, Any]] = []
+                    for window in windows[:4]:
+                        if not isinstance(window, Mapping):
+                            continue
+                        public_window = {
+                            key: window[key]
+                            for key in (
+                                "name",
+                                "used_percent",
+                                "window_minutes",
+                                "resets_at",
+                            )
+                            if isinstance(window.get(key), (str, int, float))
+                            and not isinstance(window.get(key), bool)
+                        }
+                        if public_window:
+                            public_windows.append(public_window)
+                    public_quota["windows"] = public_windows
+                public_observation["quota"] = public_quota
             public["runtime_observation"] = public_observation
         return _json_copy(public)
 

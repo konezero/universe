@@ -75,6 +75,22 @@ class FakeProviderHost:
                 "quota_state": "AVAILABLE",
                 "rate_limit_status": "allowed",
                 "usage": {"input_tokens": 10, "private": "drop-me"},
+                "quota": {
+                    "schema": "universe.provider-quota-snapshot.v1",
+                    "provider": "CODEX",
+                    "source": "account/rateLimits/read",
+                    "state": "AVAILABLE",
+                    "secret": "drop-me",
+                    "windows": [
+                        {
+                            "name": "PRIMARY",
+                            "used_percent": 25,
+                            "window_minutes": 300,
+                            "resets_at": 1788220800,
+                            "secret": "drop-me",
+                        }
+                    ],
+                },
             },
         }
 
@@ -294,6 +310,23 @@ class ProviderSessionServiceTests(unittest.TestCase):
         self.assertEqual(
             {"input_tokens": 10},
             snapshot["connection"]["runtime_observation"]["usage"],
+        )
+        self.assertEqual(
+            {
+                "schema": "universe.provider-quota-snapshot.v1",
+                "provider": "CODEX",
+                "source": "account/rateLimits/read",
+                "state": "AVAILABLE",
+                "windows": [
+                    {
+                        "name": "PRIMARY",
+                        "used_percent": 25,
+                        "window_minutes": 300,
+                        "resets_at": 1788220800,
+                    }
+                ],
+            },
+            snapshot["connection"]["runtime_observation"]["quota"],
         )
         self.assertFalse(snapshot["room_queue_used"])
 

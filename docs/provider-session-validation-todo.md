@@ -18,6 +18,22 @@ Reference commits: `7533c1e` through `503e873`
 These surfaces report evidence and suggested configuration only. They do not
 grant a platform permission, Runtime Assignment, or Provider entitlement.
 
+### First-party quota observation paths
+
+- Codex App Server reads `account/rateLimits/read` after initialization and
+  consumes `account/rateLimits/updated` notifications.
+- Grok ACP reads the logical `x.ai/billing` extension through its
+  `_x.ai/billing` ACP wire name; if unavailable, Universe may inspect only the
+  final 256 KiB of the official local Grok CLI billing log.
+- Claude preserves the bounded scalar fields from resident `rate_limit_event`
+  telemetry, including utilization, rate-limit type, and reset time when sent.
+- All three project to `universe.provider-quota-snapshot.v1` with normalized
+  `AVAILABLE / WARNING / EXHAUSTED / UNKNOWN` state and quota windows.
+
+The observation path is read-only. It does not scrape browser cookies, poll an
+undocumented Claude OAuth endpoint, infer entitlement from authentication, or
+terminate/rebind a resident Provider session.
+
 ## P1 - Grok bounded-session CLI probe
 
 - [ ] Run a real Grok CLI bounded Worker session after provider quota resets.
