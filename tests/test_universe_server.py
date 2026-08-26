@@ -7569,6 +7569,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         second_path = second_payload["expected_path"]
 
+        status, goal_before_adoption = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goals",
+            {"expected_feature_revision": 3},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("FEATURE_PATH_ADOPTION_REQUIRED", goal_before_adoption["error_code"])
+
         status, adopted = self.request(
             "POST",
             f"/v1/feature-nodes/{feature['feature_id']}/adoptions",
@@ -7646,12 +7655,57 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status)
         self.assertEqual("FEATURE_PATH_ALREADY_ADOPTED", rejected["error_code"])
 
+        status, materialized = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goals",
+            {"expected_feature_revision": 4},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("FEATURE_GOAL_MATERIALIZED", materialized["status"])
+        self.assertEqual("DESIGNING", materialized["goal"]["state"])
+        self.assertEqual("UNASSIGNED", materialized["goal"]["owner"])
+        self.assertTrue(materialized["goal_created"])
+        self.assertEqual(second_path["expected_path_id"], materialized["derivation"]["expected_path_id"])
+        self.assertEqual(second_path["artifact_revision"], materialized["derivation"]["artifact_revision"])
+        self.assertEqual(second_path["specification_digest"], materialized["derivation"]["specification_digest"])
+        self.assertFalse(materialized["todo_created"])
+        self.assertFalse(materialized["milestone_created"])
+        self.assertFalse(materialized["task_frame_created"])
+        self.assertFalse(materialized["authority_created"])
+        self.assertFalse(materialized["execution_assignment_created"])
+
+        status, replayed_goal = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goals",
+            {"expected_feature_revision": 4},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FEATURE_GOAL_REPLAYED", replayed_goal["status"])
+        self.assertFalse(replayed_goal["goal_created"])
+        self.assertEqual(materialized["goal"]["goal_id"], replayed_goal["goal"]["goal_id"])
+        self.assertEqual(1, len(self.server.store.list_project_goals("GCS")))
+        self.assertEqual([], [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"])
+
+        status, feature_after_goal = self.request(
+            "GET", f"/v1/feature-nodes/{feature['feature_id']}", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            materialized["goal"]["goal_id"],
+            feature_after_goal["feature"]["goal_derivation"]["goal_id"],
+        )
+
         graph = self.server.store.semantic_project_graph("GCS")
         node_types = {node["entity_type"] for node in graph["nodes"]}
         edge_types = {edge["edge_type"] for edge in graph["edges"]}
         self.assertIn("FEATURE_NODE", node_types)
         self.assertIn("EXPECTED_PATH", node_types)
+        self.assertIn("GOAL", node_types)
         self.assertIn("FEATURE_NODE_ADOPTS_EXPECTED_PATH", edge_types)
+        self.assertIn("FEATURE_NODE_DERIVES_GOAL", edge_types)
+        self.assertIn("EXPECTED_PATH_DERIVES_GOAL", edge_types)
         expected_nodes = [node for node in graph["nodes"] if node["entity_type"] == "EXPECTED_PATH"]
         self.assertTrue(all("body_text" not in node["data"] for node in expected_nodes))
 

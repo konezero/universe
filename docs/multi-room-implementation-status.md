@@ -78,6 +78,7 @@ Database: **same Universe SQLite** (`universe.sqlite3` / service DB). Tables:
 | Turn-boundary cancellation and per-room single flight | **Done** |
 | Durable meeting summary | **Done** (`MEETING_SUMMARY` control event) |
 | Live provider completion adapter / HTTP Feature run endpoint | **Done** — verified opaque provider sessions feed the bounded coordinator; completed per-model outputs become revision-pinned SPECIFICATION / Expected Path candidates |
+| Explicit adopted-path Goal materialization | **Done** — USER action creates one idempotent DESIGNING Goal with revision/digest provenance; no Todo, milestone, Task Frame, authority, or assignment |
 
 ### S4 — Boss room
 

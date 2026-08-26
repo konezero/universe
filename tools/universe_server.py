@@ -456,6 +456,7 @@ TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
 FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
 EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v1"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
+FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
@@ -5155,6 +5156,21 @@ class UniverseStore:
                     evidence_refs_json TEXT NOT NULL,
                     adopted_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS feature_goal_derivation (
+                    derivation_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL UNIQUE REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE REFERENCES feature_path_adoption(adoption_id) ON DELETE CASCADE,
+                    expected_path_id TEXT NOT NULL UNIQUE REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE RESTRICT,
+                    artifact_revision INTEGER NOT NULL,
+                    specification_digest TEXT NOT NULL,
+                    created_by_role TEXT NOT NULL CHECK(created_by_role = 'USER'),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_goal_derivation_goal
+                ON feature_goal_derivation(goal_id, feature_id);
 
                 CREATE TABLE IF NOT EXISTS todo_mutation_receipt (
                     receipt_id TEXT PRIMARY KEY,
@@ -10319,6 +10335,21 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _feature_goal_derivation_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_GOAL_DERIVATION_SCHEMA,
+            "derivation_id": str(row["derivation_id"]),
+            "feature_id": str(row["feature_id"]),
+            "adoption_id": str(row["adoption_id"]),
+            "expected_path_id": str(row["expected_path_id"]),
+            "goal_id": str(row["goal_id"]),
+            "artifact_revision": int(row["artifact_revision"]),
+            "specification_digest": str(row["specification_digest"]),
+            "created_by_role": str(row["created_by_role"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
     def _feature_refs(value: Any, field: str) -> list[str]:
         refs = _string_array(value if value is not None else [], field)
         if len(refs) > 50:
@@ -10413,9 +10444,21 @@ class UniverseStore:
             adoption = connection.execute(
                 "SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)
             ).fetchone()
+            derivation = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE feature_id = ?", (fid,)
+            ).fetchone()
         result = self._feature_row(row)
         result["expected_paths"] = [self._expected_path_row(path) for path in paths]
         result["adoption"] = self._adoption_row(adoption) if adoption is not None else None
+        result["goal_derivation"] = (
+            self._feature_goal_derivation_row(derivation)
+            if derivation is not None
+            else None
+        )
+        if result["goal_derivation"] is not None:
+            result["goal_derivation"]["goal"] = self.get_goal(
+                result["goal_derivation"]["goal_id"]
+            )
         return result
 
     def create_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -10542,6 +10585,172 @@ class UniverseStore:
             )
             adoption = connection.execute("SELECT * FROM feature_path_adoption WHERE adoption_id = ?", (adoption_id,)).fetchone()
         return self._adoption_row(adoption), True
+
+    def materialize_feature_goal(
+        self, feature_id: str, value: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_goal_materialization",
+            required=frozenset({"expected_feature_revision", "created_by_role"}),
+        )
+        fid = _identifier(feature_id, "feature_id")
+        role = _identifier(request["created_by_role"], "created_by_role").upper()
+        if role != "USER":
+            raise UniverseError(
+                "FEATURE_GOAL_USER_ACTION_REQUIRED",
+                "only USER may materialize a Goal from an adopted Expected Path",
+                HTTPStatus.FORBIDDEN,
+            )
+        expected_revision = request["expected_feature_revision"]
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise UniverseError(
+                "FEATURE_REVISION_INVALID",
+                "expected_feature_revision must be a positive integer",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            feature = connection.execute(
+                "SELECT * FROM feature_node WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if feature is None:
+                raise UniverseError(
+                    "FEATURE_NODE_NOT_FOUND",
+                    "Feature Node does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if feature["state"] != "ADOPTED":
+                raise UniverseError(
+                    "FEATURE_PATH_ADOPTION_REQUIRED",
+                    "Feature Node requires an explicit USER Expected Path adoption before Goal materialization",
+                    HTTPStatus.CONFLICT,
+                )
+            if int(feature["revision"]) != expected_revision:
+                raise UniverseError(
+                    "FEATURE_REVISION_CONFLICT",
+                    "Feature Node revision changed before Goal materialization",
+                    HTTPStatus.CONFLICT,
+                )
+            adoption = connection.execute(
+                "SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if adoption is None:
+                raise UniverseError(
+                    "FEATURE_PATH_ADOPTION_REQUIRED",
+                    "Feature Node has no adopted Expected Path",
+                    HTTPStatus.CONFLICT,
+                )
+            path = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE expected_path_id = ?",
+                (adoption["expected_path_id"],),
+            ).fetchone()
+            if path is None or path["state"] != "ADOPTED":
+                raise UniverseError(
+                    "FEATURE_ADOPTED_PATH_INVALID",
+                    "Feature adoption no longer resolves to an adopted Expected Path",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if existing is not None:
+                goal_row = connection.execute(
+                    "SELECT * FROM project_goal WHERE goal_id = ?", (existing["goal_id"],)
+                ).fetchone()
+                if goal_row is None:
+                    raise UniverseError(
+                        "FEATURE_GOAL_PROVENANCE_INVALID",
+                        "Feature Goal provenance no longer resolves to a Goal",
+                        HTTPStatus.CONFLICT,
+                    )
+                return (
+                    self._feature_goal_derivation_row(existing),
+                    self._goal_row(goal_row),
+                    False,
+                )
+            goal_id = "goal_" + _json_sha256(
+                {
+                    "feature_id": fid,
+                    "adoption_id": adoption["adoption_id"],
+                    "expected_path_id": path["expected_path_id"],
+                    "specification_digest": path["specification_digest"],
+                }
+            )[:24]
+            title = _required_text(feature["title"], "title")[:160]
+            description = "\n".join(
+                (
+                    f"Feature intent: {feature['intent_text']}",
+                    f"Adopted Expected Path: {path['title']}",
+                    f"Path summary: {path['summary']}",
+                    (
+                        "Specification provenance: "
+                        f"revision {path['artifact_revision']} · sha256 {path['specification_digest']}"
+                    ),
+                    f"Source: universe://feature-nodes/{fid}/expected-paths/{path['expected_path_id']}",
+                )
+            )[:4000]
+            next_sort_order = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sort_order), -10) + 10 FROM project_goal WHERE project_id = ?",
+                    (feature["project_id"],),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, state, sort_order, revision, created_at, updated_at) VALUES (?, ?, 'PROJECT', NULL, NULL, ?, ?, 'UNASSIGNED', 'DESIGNING', ?, 1, ?, ?)",
+                (
+                    goal_id,
+                    feature["project_id"],
+                    title,
+                    description,
+                    next_sort_order,
+                    now,
+                    now,
+                ),
+            )
+            ensure_template_instance(
+                connection,
+                project_id=str(feature["project_id"]),
+                scope_kind="GOAL",
+                scope_ref=goal_id,
+                goal_id=goal_id,
+                node_ref=None,
+                title=title,
+                template=project_seed_template()["work_model"],
+                now=now,
+            )
+            derivation_id = "feature_goal_" + _json_sha256(
+                {"feature_id": fid, "goal_id": goal_id}
+            )[:24]
+            connection.execute(
+                "INSERT INTO feature_goal_derivation(derivation_id, feature_id, adoption_id, expected_path_id, goal_id, artifact_revision, specification_digest, created_by_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'USER', ?)",
+                (
+                    derivation_id,
+                    fid,
+                    adoption["adoption_id"],
+                    path["expected_path_id"],
+                    goal_id,
+                    path["artifact_revision"],
+                    path["specification_digest"],
+                    now,
+                ),
+            )
+            derivation = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE derivation_id = ?",
+                (derivation_id,),
+            ).fetchone()
+            goal_row = connection.execute(
+                "SELECT * FROM project_goal WHERE goal_id = ?", (goal_id,)
+            ).fetchone()
+        return (
+            self._feature_goal_derivation_row(derivation),
+            self._goal_row(goal_row),
+            True,
+        )
 
     def list_todos(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -16778,6 +16987,7 @@ class UniverseStore:
         universe_goal_nodes: dict[str, str] = {}
         goals = self.list_project_goals(project_id)
         goal_nodes_by_node_ref: dict[str, list[str]] = {}
+        goal_nodes_by_id: dict[str, str] = {}
         assigned_todos: set[str] = set()
         for goal in goals:
             goal_id = str(goal["goal_id"])
@@ -16786,6 +16996,7 @@ class UniverseStore:
                 str(goal.get("state") or "UNKNOWN"), "PROJECT_GOAL",
                 f"universe://goals/{goal_id}", goal,
             )
+            goal_nodes_by_id[goal_id] = goal_node
             add_edge("PROJECT_HAS_GOAL", project_node, goal_node, f"universe://goals/{goal_id}")
             if goal.get("scope_kind") == "NODE" and goal.get("node_ref"):
                 goal_nodes_by_node_ref.setdefault(str(goal["node_ref"]), []).append(goal_node)
@@ -17498,6 +17709,25 @@ class UniverseStore:
                     path_nodes[str(adoption["expected_path_id"])],
                     f"{feature_ref}/adoption",
                 )
+            derivation = detailed_feature.get("goal_derivation")
+            if derivation:
+                goal_node = goal_nodes_by_id.get(str(derivation["goal_id"]))
+                path_node = path_nodes.get(str(derivation["expected_path_id"]))
+                derivation_ref = f"{feature_ref}/goal-derivation"
+                if goal_node is not None:
+                    add_edge(
+                        "FEATURE_NODE_DERIVES_GOAL",
+                        feature_node,
+                        goal_node,
+                        derivation_ref,
+                    )
+                    if path_node is not None:
+                        add_edge(
+                            "EXPECTED_PATH_DERIVES_GOAL",
+                            path_node,
+                            goal_node,
+                            derivation_ref,
+                        )
 
         room_message_nodes: dict[str, str] = {}
         room_message_parents: list[tuple[str, str]] = []
@@ -33231,6 +33461,30 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {"schema": API_SCHEMA, "status": "EXPECTED_PATH_ADOPTED" if created else "EXPECTED_PATH_ADOPTION_REPLAYED", "adoption": adoption, "feature": feature},
+                )
+                return
+            feature_goals = re.fullmatch(r"/v1/feature-nodes/([^/]+)/goals", path)
+            if feature_goals is not None:
+                derivation, goal, created = self.server.store.materialize_feature_goal(
+                    unquote(feature_goals.group(1)),
+                    {**body, "created_by_role": "USER"},
+                )
+                feature = self.server.store.get_feature_node(unquote(feature_goals.group(1)))
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_GOAL_MATERIALIZED" if created else "FEATURE_GOAL_REPLAYED",
+                        "feature": feature,
+                        "derivation": derivation,
+                        "goal": goal,
+                        "goal_created": created,
+                        "todo_created": False,
+                        "milestone_created": False,
+                        "task_frame_created": False,
+                        "authority_created": False,
+                        "execution_assignment_created": False,
+                    },
                 )
                 return
             todo_action_match = re.fullmatch(

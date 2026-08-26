@@ -738,6 +738,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("async function createFeatureForActiveMeeting", APP)
         self.assertIn("async function addArtifactAsExpectedPath", APP)
         self.assertIn("async function adoptExpectedPath", APP)
+        self.assertIn("async function materializeFeatureGoal", APP)
         self.assertIn("async function attachMeetingProviderSession", APP)
         self.assertIn("async function runActiveFeatureMeeting", APP)
         self.assertIn("async function cancelActiveFeatureMeeting", APP)
@@ -755,8 +756,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         ]
         self.assertIn("expected_feature_revision: feature.revision", feature_slice)
         self.assertIn("path.artifact_revision", APP)
-        self.assertIn("No Goal, Todo, Task Frame, authority, or assignment", APP)
-        self.assertNotIn('/goals', feature_slice)
+        self.assertIn("Goal creation requires an adopted path and an explicit USER action", APP)
+        self.assertIn('/goals', feature_slice)
+        self.assertIn('Create Goal', feature_slice)
         self.assertNotIn('/todos', feature_slice)
         self.assertIn(".meeting-feature-controls", CSS)
 

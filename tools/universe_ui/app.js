@@ -6742,6 +6742,26 @@ async function adoptExpectedPath(expectedPathId) {
   toast("Expected Path adopted");
 }
 
+async function materializeFeatureGoal() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature || feature.state !== "ADOPTED") {
+    throw new Error("Adopt an Expected Path first");
+  }
+  if (!window.confirm("Create one DESIGNING Goal from this adopted path?")) return;
+  const result = await api(
+    `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/goals`,
+    {
+      method: "POST",
+      body: { expected_feature_revision: feature.revision },
+    }
+  );
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast(`Goal created · ${result.goal.title}`);
+}
+
 function renderMeetingFeaturePanel(room) {
   const panel = node("section", "feature-path-list");
   if (room.room_type !== "MEETING") return panel;
@@ -6796,7 +6816,11 @@ function renderMeetingFeaturePanel(room) {
   if (elements.meetingRunStatus) {
     elements.meetingRunStatus.textContent = state.multiRoomMeetingRunBusy
       ? `Meeting ${state.multiRoomMeetingRunId} is running · stop applies at a turn boundary`
-      : `${verifiedModels.length} verified model session(s) attached · candidates remain unadopted`;
+      : feature?.state === "ADOPTED"
+        ? feature.goal_derivation
+          ? "Adopted path has a provenance-bound DESIGNING Goal"
+          : "Adopted path is ready for explicit Goal creation"
+        : `${verifiedModels.length} verified model session(s) attached · candidates remain unadopted`;
   }
   if (!feature) {
     panel.append(node("p", "empty-copy", "Create a Feature Node to turn room specifications into comparable Expected Paths."));
@@ -6834,7 +6858,32 @@ function renderMeetingFeaturePanel(room) {
     }
     panel.append(row);
   }
-  panel.append(node("small", "settings-help", "No Goal, Todo, Task Frame, authority, or assignment is created by this surface."));
+  if (feature.state === "ADOPTED") {
+    const derivation = feature.goal_derivation;
+    const goalRow = node("article", "remote-access-row feature-path-card");
+    const goalCopy = node("div", "remote-access-copy");
+    if (derivation?.goal) {
+      goalCopy.append(
+        node("strong", "", `GOAL · ${derivation.goal.title}`),
+        node("small", "", `${derivation.goal.state} · owner ${derivation.goal.owner}`),
+        node("small", "", `Pinned to specification revision ${derivation.artifact_revision} · sha256 ${String(derivation.specification_digest || "").slice(0, 16)}…`)
+      );
+    } else {
+      goalCopy.append(
+        node("strong", "", "Adopted path is ready for Goal planning"),
+        node("small", "", "Goal creation is an explicit USER action and remains non-executable.")
+      );
+      const createGoal = node("button", "primary-button compact-action", "Create Goal");
+      createGoal.type = "button";
+      createGoal.addEventListener("click", () => {
+        materializeFeatureGoal().catch((error) => toast(error.message, true));
+      });
+      goalRow.append(createGoal);
+    }
+    goalRow.prepend(goalCopy);
+    panel.append(goalRow);
+  }
+  panel.append(node("small", "settings-help", "Goal creation requires an adopted path and an explicit USER action. No Todo, milestone, Task Frame, authority, or assignment is created."));
   return panel;
 }
 

@@ -249,8 +249,9 @@ The durable planning order is now represented directly by the local runtime:
 3. `POST /v1/feature-nodes/{feature_id}/expected-paths` pins a room `SPECIFICATION` artifact to its exact revision and content digest.
 4. At least two candidate paths must exist before `POST /v1/feature-nodes/{feature_id}/adoptions` accepts an explicit USER selection.
 5. Adoption marks one path `ADOPTED` and the remaining candidates `NOT_SELECTED`; it does not create a Goal, Todo, Task Frame, authority, or execution assignment.
+6. A separate explicit USER `POST /v1/feature-nodes/{feature_id}/goals` action materializes exactly one idempotent `DESIGNING` project Goal. Its provenance pins the adoption, Expected Path, specification revision, and digest; its owner remains `UNASSIGNED`, and it creates no Todo, milestone, Task Frame, authority, or execution assignment.
 
-Read routes are `GET /v1/projects/{project_id}/feature-nodes` and `GET /v1/feature-nodes/{feature_id}`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, their Meeting Room and specification links, and the adopted edge without embedding specification bodies.
+Read routes are `GET /v1/projects/{project_id}/feature-nodes` and `GET /v1/feature-nodes/{feature_id}`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, their Meeting Room and specification links, the adopted edge, and provenance edges from the Feature and adopted path to the derived Goal without embedding specification bodies.
 
 ## 9. Non-goals (program-level)
 
