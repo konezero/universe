@@ -21553,6 +21553,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 bridge_registrar=self.store.register_master_bridge,
                 session_supervisor=self.session_supervisor,
                 continuity_coordinator=self.continuity_coordinator,
+                terminal_host=self.terminal_host,
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
                 model_resolver=self._resolve_project_master_model,

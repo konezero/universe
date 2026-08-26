@@ -26,6 +26,7 @@ _TICKS_PER_SECOND = 10_000_000
 _TH32CS_SNAPPROCESS = 0x00000002
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_TERMINATE = 0x0001
 _SYNCHRONIZE = 0x00100000
 _WAIT_TIMEOUT = 0x00000102
 _MAX_PATH = 260
@@ -74,6 +75,9 @@ def _kernel32() -> Any:
 
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
 
     kernel32.GetProcessTimes.restype = wintypes.BOOL
     kernel32.GetProcessTimes.argtypes = [
@@ -154,6 +158,38 @@ def process_is_alive(pid: int) -> bool:
         return False
     try:
         return kernel32.WaitForSingleObject(wintypes.HANDLE(handle), 0) == _WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def terminate_process_instance(
+    pid: int,
+    expected_started_at: float,
+    *,
+    tolerance: float = 0.5,
+) -> bool:
+    """Terminate only the exact PID/start-time instance owned by the Supervisor."""
+
+    if not native_inspection_available() or not (isinstance(pid, int) and pid > 0):
+        return False
+    observed = process_start_time(pid)
+    if observed is None or abs(float(observed) - float(expected_started_at)) > tolerance:
+        return False
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(
+        _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        wintypes.DWORD(pid),
+    )
+    if not handle:
+        return False
+    try:
+        # Re-read after opening the kill-capable handle.  This closes the PID
+        # reuse window between the first observation and TerminateProcess.
+        current = process_start_time(pid)
+        if current is None or abs(float(current) - float(expected_started_at)) > tolerance:
+            return False
+        return bool(kernel32.TerminateProcess(wintypes.HANDLE(handle), 0))
     finally:
         kernel32.CloseHandle(wintypes.HANDLE(handle))
 

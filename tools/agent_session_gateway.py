@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess  # nosec B404
 import tempfile
@@ -586,6 +589,61 @@ def build_platform_approval_evidence(
     }
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def _supervised_json_lines(waiter: queue.Queue) -> Any:
+    buffer = ""
+    while True:
+        chunk = waiter.get()
+        if chunk is None:
+            break
+        buffer += bytes(chunk).decode("utf-8", errors="replace")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            cleaned = _ANSI_ESCAPE.sub("", line).strip("\r ")
+            opening = cleaned.find("{")
+            if opening >= 0:
+                yield cleaned[opening:]
+    cleaned = _ANSI_ESCAPE.sub("", buffer).strip("\r ")
+    opening = cleaned.find("{")
+    if opening >= 0:
+        yield cleaned[opening:]
+
+
+def _supervised_process_identity(
+    terminal_host: Any,
+    terminal_id: str,
+    *,
+    endpoint: str,
+    handshake_token: str,
+) -> dict[str, Any]:
+    terminal = terminal_host.get(terminal_id)
+    payload = getattr(terminal, "payload", terminal)
+    if not isinstance(payload, Mapping) or str(payload.get("state") or "") != "LIVE":
+        raise AgentSessionError("AGENT_PROCESS_NOT_ALIVE")
+    shell = payload.get("shell_process")
+    if not isinstance(shell, Mapping):
+        raise AgentSessionError("AGENT_SUPERVISED_SHELL_IDENTITY_UNAVAILABLE")
+    pid = int(shell.get("pid") or 0)
+    started_at = float(shell.get("started_at") or 0.0)
+    if pid <= 0 or started_at <= 0:
+        raise AgentSessionError("AGENT_SUPERVISED_SHELL_IDENTITY_INVALID")
+    cmd = os.environ.get("ComSpec") or "cmd.exe"
+    return {
+        "pid": pid,
+        "process_created_at": datetime.fromtimestamp(
+            started_at, timezone.utc
+        ).isoformat().replace("+00:00", "Z"),
+        "executable": cmd,
+        "command": [cmd, f"supervised-terminal:{terminal_id}"],
+        "endpoint": str(endpoint),
+        "handshake_fingerprint": hashlib.sha256(
+            handshake_token.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 class JsonRpcStdioProcess:
     def __init__(
         self,
@@ -596,24 +654,56 @@ class JsonRpcStdioProcess:
         environment: Mapping[str, str],
         request_handler: Callable[[str, Mapping[str, Any]], Any],
         notification_handler: Callable[[str, Mapping[str, Any]], None],
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        provider: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self._executable = executable.expanduser().resolve()
         self._arguments = tuple(arguments)
-        self._process = open_native_cli(
-            NativeCliRequest(
-                executable=self._executable,
-                arguments=self._arguments,
-                cwd=cwd,
-                timeout_seconds=300,
-                output_encoding="utf-8",
-                environment={
+        self._terminal_host = terminal_host
+        self._terminal_id = ""
+        self._terminal_waiter: queue.Queue | None = None
+        self._process = None
+        if terminal_host is None:
+            self._process = open_native_cli(
+                NativeCliRequest(
+                    executable=self._executable,
+                    arguments=self._arguments,
+                    cwd=cwd,
+                    timeout_seconds=300,
+                    output_encoding="utf-8",
+                    environment={
+                        str(key): str(value) for key, value in environment.items()
+                    },
+                )
+            )
+        else:
+            terminal = terminal_host.create(
+                project_id=project_id,
+                mode=mode,
+                cwd=str(cwd),
+                provider=provider,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
+                launch_profile="SUPERVISED_STDIO",
+                provider_arguments=list(self._arguments),
+                provider_environment={
                     str(key): str(value) for key, value in environment.items()
                 },
+                cols=240,
+                rows=40,
             )
-        )
+            self._terminal_id = str(terminal.get("terminal_id") or "")
+            if not self._terminal_id:
+                raise AgentSessionError("AGENT_SUPERVISED_TERMINAL_ID_MISSING")
+            self._terminal_waiter = terminal_host.subscribe(self._terminal_id)
         self._request_handler = request_handler
         self._notification_handler = notification_handler
         self._write_lock = threading.Lock()
+        self._sent_lines: deque[str] = deque(maxlen=256)
         self._pending_lock = threading.Lock()
         self._pending: dict[int, _PendingResponse] = {}
         self._next_id = 1
@@ -630,7 +720,8 @@ class JsonRpcStdioProcess:
             daemon=True,
         )
         self._reader.start()
-        self._stderr_reader.start()
+        if self._process is not None:
+            self._stderr_reader.start()
 
     def request(
         self,
@@ -675,7 +766,15 @@ class JsonRpcStdioProcess:
         if self._closed.is_set():
             return
         self._closed.set()
-        if self._process.poll() is None:
+        if self._terminal_host is not None and self._terminal_id:
+            waiter = self._terminal_waiter
+            if waiter is not None:
+                self._terminal_host.unsubscribe(self._terminal_id, waiter)
+            try:
+                self._terminal_host.close(self._terminal_id)
+            except Exception:
+                pass
+        elif self._process is not None and self._process.poll() is None:
             self._process.terminate()
             try:
                 self._process.wait(timeout=3)
@@ -689,12 +788,20 @@ class JsonRpcStdioProcess:
             item.error = {"message": "agent process closed"}
             item.event.set()
         self._reader.join(timeout=1)
-        self._stderr_reader.join(timeout=1)
+        if self._process is not None:
+            self._stderr_reader.join(timeout=1)
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
     ) -> dict[str, Any]:
-        if self._process.poll() is not None:
+        if self._terminal_host is not None:
+            return _supervised_process_identity(
+                self._terminal_host,
+                self._terminal_id,
+                endpoint=endpoint,
+                handshake_token=handshake_token,
+            )
+        if self._process is None or self._process.poll() is not None:
             raise AgentSessionError("AGENT_PROCESS_NOT_ALIVE")
         return launched_process_identity(
             self._process,
@@ -705,27 +812,53 @@ class JsonRpcStdioProcess:
         )
 
     def _send(self, message: Mapping[str, Any]) -> None:
-        if self._closed.is_set() or self._process.poll() is not None:
+        if self._closed.is_set():
             raise AgentSessionError("AGENT_PROCESS_UNAVAILABLE" + self._stderr_detail())
-        stdin = self._process.stdin
-        if stdin is None:
-            raise AgentSessionError("AGENT_PROCESS_STDIN_UNAVAILABLE")
         encoded = json.dumps(
             message,
             ensure_ascii=False,
             separators=(",", ":"),
         )
         with self._write_lock:
+            if self._terminal_host is not None:
+                self._sent_lines.append(encoded)
+                # ConPTY input is terminal input, not a pipe: carriage return
+                # is the Enter key that submits one JSON line to the hosted CLI.
+                self._terminal_host.write(
+                    self._terminal_id, (encoded + "\r").encode("utf-8")
+                )
+                return
+            if self._process is None or self._process.poll() is not None:
+                raise AgentSessionError(
+                    "AGENT_PROCESS_UNAVAILABLE" + self._stderr_detail()
+                )
+            stdin = self._process.stdin
+            if stdin is None:
+                raise AgentSessionError("AGENT_PROCESS_STDIN_UNAVAILABLE")
             stdin.write(encoded + "\n")
             stdin.flush()
 
     def _read_stdout(self) -> None:
-        stdout = self._process.stdout
-        if stdout is None:
-            self._closed.set()
-            return
+        if self._terminal_host is not None:
+            waiter = self._terminal_waiter
+            if waiter is None:
+                self._closed.set()
+                return
+            stdout = _supervised_json_lines(waiter)
+        else:
+            if self._process is None or self._process.stdout is None:
+                self._closed.set()
+                return
+            stdout = self._process.stdout
         try:
             for line in stdout:
+                if self._terminal_host is not None:
+                    try:
+                        self._sent_lines.remove(line)
+                    except ValueError:
+                        pass
+                    else:
+                        continue
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
@@ -767,6 +900,8 @@ class JsonRpcStdioProcess:
                 item.event.set()
 
     def _read_stderr(self) -> None:
+        if self._process is None:
+            return
         stderr = self._process.stderr
         if stderr is None:
             return
@@ -885,9 +1020,22 @@ class GrokAcpSession:
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         response_timeout_seconds: float = 300,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": mode,
+            "provider": "GROK",
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         # An ephemeral session is bounded: it never resumes a stored session
         # and never reports its id back, so nothing can be resumed later.
         self.ephemeral = bool(ephemeral)
@@ -922,6 +1070,7 @@ class GrokAcpSession:
             environment=environment,
             request_handler=self._handle_request,
             notification_handler=self._handle_notification,
+            **self._supervisor_transport,
         )
         try:
             self._initialize()
@@ -1138,10 +1287,23 @@ class CodexAppServerSession:
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         response_timeout_seconds: float = 300,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.session_id = session_id
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": mode,
+            "provider": "CODEX",
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.model = _text(model, "model")
         self.effort = _text(effort, "effort").upper()
         if self.effort not in PROVIDER_EFFORTS:
@@ -1163,10 +1325,12 @@ class CodexAppServerSession:
         environment = self._git_trace2.environment(environment)
         transport_arguments = ["app-server"]
         if self.model.casefold() not in {"auto", "default"}:
-            transport_arguments.extend(("-c", f"model={json.dumps(self.model)}"))
+            # Config values are already one argv item. Literal quotes are not
+            # needed by Codex and cannot safely cross the managed cmd /s path.
+            transport_arguments.extend(("-c", f"model={self.model}"))
         if self.effort != "AUTO":
             transport_arguments.extend(
-                ("-c", f"model_reasoning_effort={json.dumps(self.effort.lower())}")
+                ("-c", f"model_reasoning_effort={self.effort.lower()}")
             )
         transport_arguments.extend(("--listen", "stdio://"))
         self._transport = JsonRpcStdioProcess(
@@ -1176,6 +1340,7 @@ class CodexAppServerSession:
             environment=environment,
             request_handler=self._handle_request,
             notification_handler=self._handle_notification,
+            **self._supervisor_transport,
         )
         try:
             self._initialize()
@@ -1547,6 +1712,7 @@ class ClaudeCodeSession:
             _json_object(json_schema) if json_schema is not None else None
         )
         self.native_runner = native_runner
+        self.last_result_observation: dict[str, Any] = {}
 
     @property
     def session_ref(self) -> str:
@@ -1612,27 +1778,66 @@ class ClaudeCodeSession:
             )
         finally:
             prompt_path.unlink(missing_ok=True)
-        if result.status != "COMPLETED" or result.return_code != 0:
-            detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:500]
-            raise AgentSessionError(f"CLAUDE_CODE_FAILED:{detail or result.status}")
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as error:
+            self.last_result_observation = self._result_observation(result, None)
+            if result.status != "COMPLETED" or result.return_code != 0:
+                raise AgentSessionError(
+                    "CLAUDE_CODE_RESULT_FAILED:"
+                    + json.dumps(
+                        self.last_result_observation,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ) from error
             raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID") from error
-        if not isinstance(payload, Mapping) or payload.get("is_error") is True:
+        if not isinstance(payload, Mapping):
+            self.last_result_observation = self._result_observation(result, None)
             raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID")
+        self.last_result_observation = self._result_observation(result, payload)
         if self.json_schema is not None:
             structured_output = payload.get("structured_output")
-            if not isinstance(structured_output, Mapping):
+            if isinstance(structured_output, Mapping):
+                output = json.dumps(
+                    _json_object(structured_output),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            elif (
+                result.status != "COMPLETED"
+                or result.return_code != 0
+                or payload.get("is_error") is True
+            ):
+                raise AgentSessionError(
+                    "CLAUDE_CODE_RESULT_FAILED:"
+                    + json.dumps(
+                        self.last_result_observation,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
                 raise AgentSessionError("CLAUDE_CODE_STRUCTURED_OUTPUT_MISSING")
-            output = json.dumps(
-                _json_object(structured_output),
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
         else:
+            if (
+                result.status != "COMPLETED"
+                or result.return_code != 0
+                or payload.get("is_error") is True
+            ):
+                raise AgentSessionError(
+                    "CLAUDE_CODE_RESULT_FAILED:"
+                    + json.dumps(
+                        self.last_result_observation,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             output = payload.get("result")
             if not isinstance(output, str) or not output.strip():
                 raise AgentSessionError("CLAUDE_CODE_RESPONSE_MISSING")
@@ -1643,6 +1848,36 @@ class ClaudeCodeSession:
                 self.session_observer(self.session_id)
         on_delta(output)
         return output.strip()
+
+    @staticmethod
+    def _result_observation(
+        result: NativeCliResult, payload: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        observation: dict[str, Any] = {
+            "native_status": result.status,
+            "return_code": result.return_code,
+            "stdout_sha256": hashlib.sha256(
+                result.stdout.encode("utf-8")
+            ).hexdigest(),
+            "stdout_truncated": result.stdout_truncated,
+            "stderr_sha256": hashlib.sha256(
+                result.stderr.encode("utf-8")
+            ).hexdigest(),
+            "stderr_truncated": result.stderr_truncated,
+            "payload_parsed": payload is not None,
+            "structured_output_present": bool(
+                payload is not None
+                and isinstance(payload.get("structured_output"), Mapping)
+            ),
+        }
+        if payload is not None:
+            for key in ("is_error", "stop_reason", "session_id", "num_turns"):
+                value = payload.get(key)
+                if isinstance(value, (str, int, bool)) and not isinstance(
+                    value, float
+                ):
+                    observation[key] = value
+        return observation
 
     def drain_work_statuses(self) -> list[dict[str, Any]]:
         return self._git_trace2.drain_work_statuses()

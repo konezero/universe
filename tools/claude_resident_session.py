@@ -5,14 +5,15 @@ gives Claude the same shape: one long-lived ``claude -p`` process per session
 whose stdin/stdout stay open for the life of the session, instead of
 re-executing the CLI for every message.
 
-The process is started through the Windows native CLI contract
-(``open_native_cli``): no shell, no ``.bat``/``cmd /c``, separate
-stdin/stdout/stderr pipes, and ``CREATE_NO_WINDOW`` so no console window
-appears.
+Server-owned processes use the PTY Supervisor's single launch path:
+a headless managed ``cmd`` owns the long-lived provider CLI and its exact
+PID/start-time identity. Tests and explicitly standalone callers retain the
+Windows native CLI transport as a compatibility fallback.
 """
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import queue
 import subprocess  # nosec B404
@@ -22,7 +23,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
-from agent_session_gateway import GitTrace2Observer
+from agent_session_gateway import (
+    GitTrace2Observer,
+    _supervised_json_lines,
+    _supervised_process_identity,
+)
 from process_identity import launched_process_identity
 from windows_native_cli import NativeCliRequest, open_native_cli
 
@@ -113,24 +118,53 @@ class ClaudeStreamProcess:
         environment: Mapping[str, str],
         event_handler: Callable[[Mapping[str, Any]], None],
         opener: Callable[..., subprocess.Popen[str]] | None = None,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self._executable = executable.expanduser().resolve()
         self._arguments = tuple(arguments)
-        request = NativeCliRequest(
-            executable=self._executable,
-            arguments=self._arguments,
-            cwd=cwd,
-            timeout_seconds=300,
-            output_encoding="utf-8",
-            environment={str(k): str(v) for k, v in environment.items()},
-        )
-        self._process = (
-            open_native_cli(request)
-            if opener is None
-            else open_native_cli(request, opener=opener)
-        )
+        self._terminal_host = terminal_host
+        self._terminal_id = ""
+        self._terminal_waiter: queue.Queue | None = None
+        self._process = None
+        if terminal_host is None:
+            request = NativeCliRequest(
+                executable=self._executable,
+                arguments=self._arguments,
+                cwd=cwd,
+                timeout_seconds=300,
+                output_encoding="utf-8",
+                environment={str(k): str(v) for k, v in environment.items()},
+            )
+            self._process = (
+                open_native_cli(request)
+                if opener is None
+                else open_native_cli(request, opener=opener)
+            )
+        else:
+            terminal = terminal_host.create(
+                project_id=project_id,
+                mode=mode,
+                cwd=str(cwd),
+                provider="CLAUDE",
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
+                launch_profile="SUPERVISED_STDIO",
+                provider_arguments=list(self._arguments),
+                provider_environment={str(k): str(v) for k, v in environment.items()},
+                cols=240,
+                rows=40,
+            )
+            self._terminal_id = str(terminal.get("terminal_id") or "")
+            if not self._terminal_id:
+                raise ClaudeResidentError("CLAUDE_SUPERVISED_TERMINAL_ID_MISSING")
+            self._terminal_waiter = terminal_host.subscribe(self._terminal_id)
         self._event_handler = event_handler
         self._write_lock = threading.Lock()
+        self._sent_lines: deque[str] = deque(maxlen=256)
         self._stderr: queue.Queue[str] = queue.Queue(maxsize=100)
         self._closed = threading.Event()
         self._reader = threading.Thread(
@@ -144,11 +178,20 @@ class ClaudeStreamProcess:
             daemon=True,
         )
         self._reader.start()
-        self._stderr_reader.start()
+        if self._process is not None:
+            self._stderr_reader.start()
 
     @property
     def alive(self) -> bool:
-        return not self._closed.is_set() and self._process.poll() is None
+        if self._closed.is_set():
+            return False
+        if self._terminal_host is not None:
+            try:
+                terminal = self._terminal_host.get(self._terminal_id)
+            except Exception:
+                return False
+            return str(getattr(terminal, "state", "")) == "LIVE"
+        return self._process is not None and self._process.poll() is None
 
     def send_user_message(self, text: str) -> None:
         """Write one JSONL user message to the resident process stdin."""
@@ -177,7 +220,15 @@ class ClaudeStreamProcess:
         if self._closed.is_set():
             return
         self._closed.set()
-        if self._process.poll() is None:
+        if self._terminal_host is not None and self._terminal_id:
+            waiter = self._terminal_waiter
+            if waiter is not None:
+                self._terminal_host.unsubscribe(self._terminal_id, waiter)
+            try:
+                self._terminal_host.close(self._terminal_id)
+            except Exception:
+                pass
+        elif self._process is not None and self._process.poll() is None:
             self._process.terminate()
             try:
                 self._process.wait(timeout=3)
@@ -185,12 +236,20 @@ class ClaudeStreamProcess:
                 self._process.kill()
                 self._process.wait(timeout=3)
         self._reader.join(timeout=1)
-        self._stderr_reader.join(timeout=1)
+        if self._process is not None:
+            self._stderr_reader.join(timeout=1)
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
     ) -> dict[str, Any]:
-        if self._process.poll() is not None:
+        if self._terminal_host is not None:
+            return _supervised_process_identity(
+                self._terminal_host,
+                self._terminal_id,
+                endpoint=endpoint,
+                handshake_token=handshake_token,
+            )
+        if self._process is None or self._process.poll() is not None:
             raise ClaudeResidentError("CLAUDE_PROCESS_NOT_ALIVE")
         return launched_process_identity(
             self._process,
@@ -201,29 +260,56 @@ class ClaudeStreamProcess:
         )
 
     def _send(self, message: Mapping[str, Any]) -> None:
-        if self._closed.is_set() or self._process.poll() is not None:
+        if self._closed.is_set():
             raise ClaudeResidentError(
                 "CLAUDE_PROCESS_UNAVAILABLE" + self.stderr_detail()
             )
-        stdin = self._process.stdin
-        if stdin is None:
-            raise ClaudeResidentError("CLAUDE_PROCESS_STDIN_UNAVAILABLE")
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         with self._write_lock:
+            if self._terminal_host is not None:
+                self._sent_lines.append(encoded)
+                # ConPTY input is terminal input, not a pipe: carriage return
+                # is the Enter key that submits one JSON line to the hosted CLI.
+                self._terminal_host.write(
+                    self._terminal_id, (encoded + "\r").encode("utf-8")
+                )
+                return
+            if self._process is None or self._process.poll() is not None:
+                raise ClaudeResidentError(
+                    "CLAUDE_PROCESS_UNAVAILABLE" + self.stderr_detail()
+                )
+            stdin = self._process.stdin
+            if stdin is None:
+                raise ClaudeResidentError("CLAUDE_PROCESS_STDIN_UNAVAILABLE")
             stdin.write(encoded + "\n")
             stdin.flush()
 
     def _read_stdout(self) -> None:
-        stdout = self._process.stdout
-        if stdout is None:
-            self._closed.set()
-            self._event_handler({"type": "__stream_closed__"})
-            return
+        if self._terminal_host is not None:
+            waiter = self._terminal_waiter
+            if waiter is None:
+                self._closed.set()
+                self._event_handler({"type": "__stream_closed__"})
+                return
+            stdout = _supervised_json_lines(waiter)
+        else:
+            if self._process is None or self._process.stdout is None:
+                self._closed.set()
+                self._event_handler({"type": "__stream_closed__"})
+                return
+            stdout = self._process.stdout
         try:
             for line in stdout:
                 line = line.strip()
                 if not line:
                     continue
+                if self._terminal_host is not None:
+                    try:
+                        self._sent_lines.remove(line)
+                    except ValueError:
+                        pass
+                    else:
+                        continue
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
@@ -236,6 +322,8 @@ class ClaudeStreamProcess:
             self._event_handler({"type": "__stream_closed__"})
 
     def _read_stderr(self) -> None:
+        if self._process is None:
+            return
         stderr = self._process.stderr
         if stderr is None:
             return
@@ -277,8 +365,20 @@ class ClaudeResidentSession:
         permission_ready: Callable[[], bool] | None = None,
         permission_failure: Callable[[], None] | None = None,
         process_factory: Callable[..., ClaudeStreamProcess] | None = None,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.permission_mcp_config = permission_mcp_config
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": mode,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.permission_bridge = permission_bridge
         # Blocks until the MCP permission server has registered. A turn must
         # not start before the approval path exists.
@@ -428,13 +528,16 @@ class ClaudeResidentSession:
         self._turn_error = None
         self._set_state(SESSION_CONNECTING)
         try:
-            self._process = self._process_factory(
-                executable=self.executable,
-                arguments=self._arguments(),
-                cwd=self.cwd,
-                environment=self.environment,
-                event_handler=self._handle_event,
-            )
+            process_arguments: dict[str, Any] = {
+                "executable": self.executable,
+                "arguments": self._arguments(),
+                "cwd": self.cwd,
+                "environment": self.environment,
+                "event_handler": self._handle_event,
+            }
+            if self._supervisor_transport["terminal_host"] is not None:
+                process_arguments.update(self._supervisor_transport)
+            self._process = self._process_factory(**process_arguments)
         except Exception:
             self._abort_permission_path()
             self._set_state(SESSION_FAILED)

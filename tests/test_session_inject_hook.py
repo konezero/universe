@@ -600,6 +600,50 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual(4242, observed["shell_candidates"][0]["shell_pid"])
         self.assertEqual(4343, observed["shell_candidates"][0]["cli_pid"])
 
+    def test_supervisor_identity_finds_claude_beside_console_pipe_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_path = Path(tmp) / "managed-shell.json"
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.managed-shell-identity.v1",
+                        "terminal_id": "term_pipe",
+                        "session_anchor_ref": "session_anchor_pipe",
+                        "shell_pid": 4242,
+                        "shell_started_at": 123.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "universe_session_inject_hook._native_attach_observation",
+                return_value={"status": "SHELL_NOT_FOUND"},
+            ), mock.patch(
+                "universe_app.windows_process.child_pids",
+                side_effect=lambda pid: [4300, 4343] if pid == 4242 else [],
+            ), mock.patch(
+                "universe_app.windows_process.process_name",
+                side_effect=lambda pid: "claude.exe" if pid == 4343 else "more.com",
+            ), mock.patch(
+                "universe_app.windows_process.process_start_time",
+                return_value=124.5,
+            ):
+                observed = _supervisor_identity_observation(
+                    "term_pipe",
+                    {
+                        "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(identity_path),
+                        "UNIVERSE_SESSION_ANCHOR_REF": "session_anchor_pipe",
+                        "UNIVERSE_PROVIDER": "CLAUDE",
+                    },
+                )
+        self.assertIsNotNone(observed)
+        self.assertEqual(
+            "SUPERVISOR_IDENTITY_FILE+WINDOWS_DESCENDANT",
+            observed["inspection_source"],
+        )
+        self.assertEqual(4343, observed["shell_candidates"][0]["cli_pid"])
+        self.assertEqual(124.5, observed["shell_candidates"][0]["cli_started_at"])
+
     def test_claude_hook_quotes_windows_script_path_for_shell(self) -> None:
         payload = _claude_settings_hook(
             r"C:\workspace\universe\tools\universe_session_inject_hook.py"

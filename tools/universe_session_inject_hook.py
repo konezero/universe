@@ -554,6 +554,44 @@ def _supervisor_identity_observation(
                         "SUPERVISOR_IDENTITY_FILE+WINDOWS_NATIVE"
                     )
                     break
+        if candidate["cli_pid"] is None:
+            # A console-to-pipe bridge (Claude uses `more | claude`) makes the
+            # provider a sibling of the bridge instead of the single direct
+            # child inferred from the hook's ancestor chain. Starting from the
+            # exact Supervisor-owned shell identity, seal the one descendant
+            # whose executable matches the requested provider.
+            try:
+                from universe_app.windows_process import (
+                    child_pids,
+                    process_name,
+                    process_start_time,
+                )
+
+                expected_name = {
+                    "CLAUDE": "claude.exe",
+                    "CODEX": "codex.exe",
+                    "GROK": "grok.exe",
+                }.get(str(environment.get("UNIVERSE_PROVIDER") or "").upper())
+                descendants = list(child_pids(shell_pid))
+                matches: list[tuple[int, float]] = []
+                seen: set[int] = set()
+                while descendants:
+                    descendant_pid = int(descendants.pop(0))
+                    if descendant_pid in seen:
+                        continue
+                    seen.add(descendant_pid)
+                    descendants.extend(child_pids(descendant_pid))
+                    if expected_name and process_name(descendant_pid).lower() == expected_name:
+                        started_at = process_start_time(descendant_pid)
+                        if started_at is not None:
+                            matches.append((descendant_pid, float(started_at)))
+                if len(matches) == 1:
+                    candidate["cli_pid"], candidate["cli_started_at"] = matches[0]
+                    inspection_source = (
+                        "SUPERVISOR_IDENTITY_FILE+WINDOWS_DESCENDANT"
+                    )
+            except Exception:
+                pass
         return {
             "schema": "universe.managed-shell-attach-evidence.v1",
             "terminal_id": terminal_id,

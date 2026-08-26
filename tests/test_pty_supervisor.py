@@ -25,7 +25,7 @@ from universe_app.pty_supervisor import (  # noqa: E402
     spawn_supervisor,
 )
 from universe_app.terminal_host import TerminalHost  # noqa: E402
-from universe_pty_supervisor import Server  # noqa: E402
+from universe_pty_supervisor import PtySupervisor, Server  # noqa: E402
 
 
 class FakePty:
@@ -69,8 +69,30 @@ class PtySupervisorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.server.shutdown()
+        self.server.supervisor.close()
         self.server.server_close()
         self.audit_dir.cleanup()
+
+    def test_supervisor_polls_orphan_reclaim_without_ui_clients(self) -> None:
+        observed = threading.Event()
+
+        class FakeHost:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def reclaim_orphaned_managed_shells(self):
+                self.calls += 1
+                if self.calls >= 2:
+                    observed.set()
+                return []
+
+        host = FakeHost()
+        supervisor = PtySupervisor(host=host, reclaim_poll_seconds=0.01)
+        try:
+            self.assertTrue(observed.wait(timeout=1.0))
+            self.assertGreaterEqual(host.calls, 2)
+        finally:
+            supervisor.close()
 
     def test_spawn_supervisor_hides_its_windows_console(self) -> None:
         script = ROOT / "tools" / "universe_pty_supervisor.py"

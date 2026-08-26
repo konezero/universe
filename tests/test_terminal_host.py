@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import sys
 import tempfile
 import time
@@ -14,6 +15,7 @@ TEST_ANCHOR = "session_anchor_test"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.terminal_host import (  # noqa: E402
+    MANAGED_SHELL_IDENTITY_MISSING,
     ProcessIdentity,
     TerminalHost,
     TerminalHostError,
@@ -137,6 +139,192 @@ class TerminalHostTests(unittest.TestCase):
             self.assertTrue(identity_path.is_file())
             self.assertIn("\"shell_pid\": 4242", identity_path.read_text())
             host.close(created["terminal_id"])
+            self.assertFalse(identity_path.exists())
+
+    def test_supervised_stdio_uses_one_managed_cmd_and_provider_protocol(self) -> None:
+        captured: dict[str, object] = {}
+
+        def spawn(executable, cwd, cols, rows, argv, environment):
+            captured.update(
+                executable=executable,
+                cwd=cwd,
+                cols=cols,
+                rows=rows,
+                argv=argv,
+                environment=dict(environment),
+            )
+            return FakePty()
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable",
+            return_value="claude.exe",
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(spawn=spawn)
+            created = host.create(
+                project_id="universe",
+                mode="CONDUCTOR",
+                cwd=tmp,
+                session_anchor_ref=TEST_ANCHOR,
+                provider="CLAUDE",
+                supervisor_session_id="session-owned",
+                launch_profile="SUPERVISED_STDIO",
+                provider_arguments=[
+                    "-p",
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                ],
+                provider_environment={
+                    "PROVIDER_TEST": "present",
+                    "UNIVERSE_MODE": "MUST_NOT_OVERRIDE",
+                },
+            )
+            try:
+                self.assertEqual("SUPERVISED_STDIO", created["launch_profile"])
+                self.assertEqual("cmd.exe", Path(str(captured["executable"])).name)
+                self.assertIn("more | claude.exe -p", str(captured["argv"]))
+                environment = captured["environment"]
+                self.assertEqual("present", environment["PROVIDER_TEST"])
+                self.assertEqual("CONDUCTOR", environment["UNIVERSE_MODE"])
+                self.assertEqual(
+                    {"pid": 4242, "started_at": 123.5},
+                    created["shell_process"],
+                )
+                self.assertTrue(Path(created["managed_shell_identity_file"]).is_file())
+            finally:
+                host.close(created["terminal_id"])
+
+    def test_managed_shell_polling_starts_without_ui_subscription(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(spawn=lambda *_a, **_k: FakePty())
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref=TEST_ANCHOR,
+                provider="GROK",
+                supervisor_session_id="session-owned",
+            )
+            session = host.get(created["terminal_id"])
+            self.assertIsNotNone(session.pump_thread)
+            self.assertTrue(session.pump_thread.is_alive())
+            host.close(created["terminal_id"])
+
+    def test_missing_identity_file_is_polled_and_reclaimed(self) -> None:
+        pty = FakePty()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(spawn=lambda *_a, **_k: pty)
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref=TEST_ANCHOR,
+                provider="GROK",
+                supervisor_session_id="session-owned",
+            )
+            session = host.get(created["terminal_id"])
+            identity_path = Path(session.managed_shell_identity_file)
+            identity_path.unlink()
+            result = host.poll_managed_shell(
+                created["terminal_id"],
+                probes={
+                    "is_alive": lambda _pid: True,
+                    "children_of": lambda _pid: [],
+                    "start_time_of": lambda _pid: 123.5,
+                    "source": "TEST",
+                },
+            )
+            self.assertEqual(MANAGED_SHELL_IDENTITY_MISSING, result["state"])
+            self.assertTrue(result["reclaimed"])
+            self.assertTrue(pty.closed)
+            with self.assertRaises(TerminalHostError):
+                host.get(created["terminal_id"])
+
+    def test_supervisor_reclaims_exact_orphan_from_identity_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = TerminalHost(audit_database_path=root / "audit.sqlite3")
+            identity_path = root / "managed-shell.json"
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.managed-shell-identity.v1",
+                        "terminal_id": "term-orphan",
+                        "session_anchor_ref": TEST_ANCHOR,
+                        "shell_pid": 5151,
+                        "shell_started_at": 123.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            host.record_audit_event(
+                "TERMINAL_CREATED",
+                terminal={
+                    "terminal_id": "term-orphan",
+                    "pid": 5151,
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "provider": "CLAUDE",
+                    "supervisor_session_id": "session-owned",
+                },
+                details={"managed_shell_identity_file": str(identity_path)},
+            )
+            terminated: list[tuple[int, float]] = []
+            result = host.reclaim_orphaned_managed_shells(
+                start_time_of=lambda pid: 123.5 if pid == 5151 else None,
+                terminate_instance=lambda pid, started: (
+                    terminated.append((pid, started)) or True
+                ),
+            )
+            self.assertEqual([(5151, 123.5)], terminated)
+            self.assertEqual("TERMINAL_ORPHAN_RECLAIMED", result[0]["status"])
+            self.assertFalse(identity_path.exists())
+            self.assertEqual(
+                "TERMINAL_ORPHAN_RECLAIMED",
+                host.audit_events(terminal_id="term-orphan")[0]["event_type"],
+            )
+
+    def test_pid_reuse_never_terminates_an_unrelated_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = TerminalHost(audit_database_path=root / "audit.sqlite3")
+            identity_path = root / "managed-shell.json"
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.managed-shell-identity.v1",
+                        "terminal_id": "term-stale",
+                        "session_anchor_ref": TEST_ANCHOR,
+                        "shell_pid": 5151,
+                        "shell_started_at": 123.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            host.record_audit_event(
+                "TERMINAL_CREATED",
+                terminal={"terminal_id": "term-stale", "pid": 5151},
+                details={"managed_shell_identity_file": str(identity_path)},
+            )
+            terminated: list[int] = []
+            result = host.reclaim_orphaned_managed_shells(
+                start_time_of=lambda _pid: 999.0,
+                terminate_instance=lambda pid, _started: (
+                    terminated.append(pid) or True
+                ),
+            )
+            self.assertEqual([], terminated)
+            self.assertEqual("STALE_IDENTITY_REMOVED", result[0]["status"])
             self.assertFalse(identity_path.exists())
 
     def test_missing_coordinate_is_rejected(self) -> None:

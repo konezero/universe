@@ -458,6 +458,109 @@ class AgentSessionGatewayTests(unittest.TestCase):
             json.loads(arguments[arguments.index("--json-schema") + 1]),
         )
 
+    def test_claude_structured_session_salvages_valid_output_from_tool_use_exit(
+        self,
+    ) -> None:
+        schema = {
+            "type": "object",
+            "required": ["value"],
+            "properties": {"value": {"type": "string"}},
+        }
+
+        def runner(_request):
+            return NativeCliResult(
+                contract="test",
+                status="FAILED",
+                return_code=1,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "structured_output": {"value": "recovered"},
+                        "session_id": "ephemeral-tool-use-session",
+                        "is_error": True,
+                        "stop_reason": "tool_use",
+                        "num_turns": 2,
+                    }
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            json_schema=schema,
+            native_runner=runner,
+        )
+
+        self.assertEqual(
+            '{"value":"recovered"}',
+            session.prompt("Question", lambda _delta: None),
+        )
+        self.assertEqual("FAILED", session.last_result_observation["native_status"])
+        self.assertEqual(1, session.last_result_observation["return_code"])
+        self.assertEqual("tool_use", session.last_result_observation["stop_reason"])
+        self.assertTrue(session.last_result_observation["structured_output_present"])
+
+    def test_claude_structured_failure_preserves_bounded_result_observation(
+        self,
+    ) -> None:
+        schema = {"type": "object", "properties": {}}
+
+        def runner(_request):
+            return NativeCliResult(
+                contract="test",
+                status="FAILED",
+                return_code=1,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "result": "sensitive prose must not enter the error",
+                        "session_id": "failed-structured-session",
+                        "is_error": True,
+                        "stop_reason": "tool_use",
+                        "num_turns": 2,
+                    }
+                ),
+                stderr="private stderr",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            json_schema=schema,
+            native_runner=runner,
+        )
+
+        with self.assertRaisesRegex(
+            AgentSessionError,
+            r"^CLAUDE_CODE_RESULT_FAILED:",
+        ) as captured:
+            session.prompt("Question", lambda _delta: None)
+
+        self.assertNotIn("sensitive prose", str(captured.exception))
+        self.assertNotIn("private stderr", str(captured.exception))
+        self.assertEqual(
+            "failed-structured-session",
+            session.last_result_observation["session_id"],
+        )
+        self.assertFalse(session.last_result_observation["structured_output_present"])
+
     def test_grok_runs_as_acp_session_and_forwards_permission(self) -> None:
         selected: list[dict[str, Any]] = []
         sessions: list[str] = []
@@ -802,7 +905,8 @@ class AgentSessionGatewayTests(unittest.TestCase):
             session.close()
 
         transport = FakeJsonRpcTransport.instances[0]
-        self.assertIn('model_reasoning_effort="max"', transport.arguments)
+        self.assertIn("model_reasoning_effort=max", transport.arguments)
+        self.assertNotIn('model_reasoning_effort="max"', transport.arguments)
         started = next(
             params for method, params in transport.requests if method == "thread/start"
         )

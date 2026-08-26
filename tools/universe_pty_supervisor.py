@@ -16,7 +16,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, unquote, urlsplit
 
 TOOLS = Path(__file__).resolve().parent
@@ -70,10 +70,39 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 class PtySupervisor:
-    def __init__(self, host: TerminalHost | None = None) -> None:
+    def __init__(
+        self,
+        host: TerminalHost | None = None,
+        *,
+        reclaim_poll_seconds: float = 5.0,
+    ) -> None:
         self.host = host or TerminalHost()
         self._lock = threading.Lock()
         self._attaches: dict[str, tuple[str, queue.Queue]] = {}
+        self._reclaim_poll_seconds = max(0.1, float(reclaim_poll_seconds))
+        self._monitor_stop = threading.Event()
+        # A previous Supervisor cannot hand its ConPTY handles to this process.
+        # Reclaim only exact PID/start-time cmd instances described by its
+        # owned identity files before accepting new terminals.
+        self.host.reclaim_orphaned_managed_shells()
+        self._monitor = threading.Thread(
+            target=self._monitor_orphaned_shells,
+            name="universe-pty-supervisor-reclaimer",
+            daemon=True,
+        )
+        self._monitor.start()
+
+    def _monitor_orphaned_shells(self) -> None:
+        while not self._monitor_stop.wait(self._reclaim_poll_seconds):
+            try:
+                self.host.reclaim_orphaned_managed_shells()
+            except Exception:  # noqa: BLE001 - monitor must remain resident
+                continue
+
+    def close(self) -> None:
+        self._monitor_stop.set()
+        if self._monitor is not threading.current_thread():
+            self._monitor.join(timeout=max(1.0, self._reclaim_poll_seconds * 2))
 
     def public_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         row = dict(payload)
@@ -390,6 +419,13 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     session_anchor_ref=spawn_anchor_ref,
                     resume_session_ref=str(body.get("resume_session_ref") or ""),
+                    launch_profile=str(body.get("launch_profile") or "INTERACTIVE"),
+                    provider_arguments=tuple(body.get("provider_arguments") or ()),
+                    provider_environment=(
+                        dict(body.get("provider_environment") or {})
+                        if isinstance(body.get("provider_environment"), Mapping)
+                        else {}
+                    ),
                     cols=int(body.get("cols") or 120),
                     rows=int(body.get("rows") or 32),
                     audit_context=self._audit_context("PTY_SUPERVISOR_CREATE"),
@@ -567,6 +603,7 @@ def main() -> int:
             context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
             details={"pid": os.getpid()},
         )
+        server.supervisor.close()
         server.server_close()
     return 0
 

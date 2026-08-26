@@ -19,15 +19,19 @@ from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from host_profile import resolve_host_tool
 from universe_app.managed_shell import (
+    CLI_START_FAILED,
     CLI_STARTING,
     DEFAULT_INTERRUPT_GRACE_SECONDS,
     HOOK_TIMEOUT,
     PROCESS_INSPECTION_UNAVAILABLE,
     PTY_RESPONSIVENESS_UNKNOWN,
+    PTY_UNRESPONSIVE,
+    SHELL_EXITED,
+    SHELL_IDLE,
     AttachEvidence,
     ManagedShell,
     ProcessIdentity,
@@ -339,6 +343,20 @@ class TerminalScreenProjection:
 
 
 MANAGED_SHELL_IDENTITY_SCHEMA = "universe.managed-shell-identity.v1"
+MANAGED_SHELL_IDENTITY_MISSING = "MANAGED_SHELL_IDENTITY_MISSING"
+MANAGED_SHELL_IDENTITY_INVALID = "MANAGED_SHELL_IDENTITY_INVALID"
+MANAGED_SHELL_IDENTITY_MISMATCH = "MANAGED_SHELL_IDENTITY_MISMATCH"
+MANAGED_SHELL_RECLAIM_STATES = frozenset(
+    {
+        MANAGED_SHELL_IDENTITY_MISSING,
+        MANAGED_SHELL_IDENTITY_INVALID,
+        MANAGED_SHELL_IDENTITY_MISMATCH,
+        CLI_START_FAILED,
+        SHELL_IDLE,
+        PTY_UNRESPONSIVE,
+        SHELL_EXITED,
+    }
+)
 
 
 def managed_shell_identity_path(root: Path, terminal_id: str) -> Path:
@@ -362,6 +380,11 @@ def write_managed_shell_identity(path: Path, session: Any) -> None:
         "session_anchor_ref": session.session_anchor_ref,
         "shell_pid": shell.pid,
         "shell_started_at": shell.started_at,
+        "supervisor_session_id": session.supervisor_session_id,
+        "project_id": session.project_id,
+        "mode": session.mode,
+        "provider": session.provider,
+        "cwd": session.cwd,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
@@ -396,6 +419,7 @@ class TerminalSession:
     created_at: str
     model_ref: str = ""
     effort: str = "AUTO"
+    launch_profile: str = "INTERACTIVE"
     state: str = "STARTING"
     cols: int = 120
     rows: int = 32
@@ -413,6 +437,7 @@ class TerminalSession:
     channel_broker: ClaudeChannelBroker | None = None
     session_anchor_ref: str = ""
     managed_shell: Any = None
+    managed_shell_identity_file: str = ""
 
     def public(self) -> dict[str, Any]:
         return {
@@ -423,8 +448,15 @@ class TerminalSession:
             "provider": self.provider,
             "model_ref": self.model_ref,
             "effort": self.effort,
+            "launch_profile": self.launch_profile,
             "supervisor_session_id": self.supervisor_session_id,
             "session_anchor_ref": self.session_anchor_ref,
+            "managed_shell_identity_file": self.managed_shell_identity_file,
+            "shell_process": (
+                self.managed_shell.shell.as_dict()
+                if getattr(self.managed_shell, "shell", None) is not None
+                else None
+            ),
             "lifecycle_state": (
                 self.managed_shell.last_state
                 if getattr(self.managed_shell, "last_state", "")
@@ -611,6 +643,119 @@ class TerminalHost:
             event_type=event_type, terminal=terminal, context=context, details=details
         )
 
+    def reclaim_orphaned_managed_shells(
+        self,
+        *,
+        start_time_of: Callable[[int], float | None] | None = None,
+        terminate_instance: Callable[[int, float], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Reclaim exact cmd instances left by an earlier Supervisor process."""
+
+        if start_time_of is None or terminate_instance is None:
+            from universe_app.windows_process import (
+                process_start_time,
+                terminate_process_instance,
+            )
+
+            start_time_of = start_time_of or process_start_time
+            terminate_instance = terminate_instance or terminate_process_instance
+        with self._lock:
+            active_terminal_ids = set(self._sessions)
+        events = self.audit.list(limit=1000)
+        latest: dict[str, str] = {}
+        created: dict[str, Mapping[str, Any]] = {}
+        for event in events:
+            terminal_id = str(event.get("terminal_id") or "").strip()
+            if not terminal_id:
+                continue
+            latest.setdefault(terminal_id, str(event.get("event_type") or ""))
+            if (
+                terminal_id not in created
+                and str(event.get("event_type") or "") == "TERMINAL_CREATED"
+            ):
+                created[terminal_id] = event
+        results: list[dict[str, Any]] = []
+        terminal_states = {"TERMINAL_CLOSED", "TERMINAL_ORPHAN_RECLAIMED"}
+        for terminal_id, event in created.items():
+            if terminal_id in active_terminal_ids or latest.get(terminal_id) in terminal_states:
+                continue
+            details = event.get("details")
+            path_text = str(
+                details.get("managed_shell_identity_file")
+                if isinstance(details, Mapping)
+                else ""
+            ).strip()
+            if not path_text:
+                continue
+            path = Path(path_text)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                results.append(
+                    {"terminal_id": terminal_id, "status": "INVALID_IDENTITY_REMOVED"}
+                )
+                continue
+            try:
+                pid = int(payload.get("shell_pid") or 0)
+                started_at = float(payload.get("shell_started_at") or 0.0)
+            except (AttributeError, TypeError, ValueError):
+                pid, started_at = 0, 0.0
+            identity_matches = (
+                isinstance(payload, Mapping)
+                and payload.get("schema") == MANAGED_SHELL_IDENTITY_SCHEMA
+                and str(payload.get("terminal_id") or "") == terminal_id
+                and pid > 0
+                and started_at > 0
+            )
+            observed = start_time_of(pid) if identity_matches else None
+            exact_live_instance = (
+                observed is not None and abs(float(observed) - started_at) <= 0.5
+            )
+            if exact_live_instance:
+                reclaimed = bool(terminate_instance(pid, started_at))
+                status = (
+                    "TERMINAL_ORPHAN_RECLAIMED"
+                    if reclaimed
+                    else "TERMINAL_ORPHAN_RECLAIM_FAILED"
+                )
+                if reclaimed:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            else:
+                status = "STALE_IDENTITY_REMOVED"
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            result = {
+                "terminal_id": terminal_id,
+                "status": status,
+                "pid": pid or None,
+            }
+            results.append(result)
+            self.record_audit_event(
+                status,
+                terminal={
+                    "terminal_id": terminal_id,
+                    "pid": pid or None,
+                    "project_id": event.get("project_id"),
+                    "mode": event.get("mode"),
+                    "provider": event.get("provider"),
+                    "supervisor_session_id": event.get("supervisor_session_id"),
+                },
+                context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
+                details={"identity_file": path_text},
+            )
+        return results
+
     def get(self, terminal_id: str) -> TerminalSession:
         with self._lock:
             session = self._sessions.get(str(terminal_id or "").strip())
@@ -631,6 +776,9 @@ class TerminalHost:
         supervisor_session_id: str = "",
         session_anchor_ref: str = "",
         resume_session_ref: str = "",
+        launch_profile: str = "INTERACTIVE",
+        provider_arguments: Sequence[str] = (),
+        provider_environment: Mapping[str, str] | None = None,
         cols: int = 120,
         rows: int = 32,
         audit_context: Mapping[str, Any] | None = None,
@@ -661,8 +809,14 @@ class TerminalHost:
         selected_effort = str(effort or "AUTO").strip().upper() or "AUTO"
         supervisor = str(supervisor_session_id or "").strip()
         terminal_id = "term_" + secrets.token_hex(8)
+        profile = str(launch_profile or "INTERACTIVE").strip().upper()
+        if profile not in {"INTERACTIVE", "SUPERVISED_STDIO"}:
+            raise TerminalHostError(
+                "TERMINAL_LAUNCH_PROFILE_INVALID",
+                "launch_profile must be INTERACTIVE or SUPERVISED_STDIO",
+            )
         channel_broker: ClaudeChannelBroker | None = None
-        if resolved_provider == "CLAUDE":
+        if resolved_provider == "CLAUDE" and profile == "INTERACTIVE":
             # The --channels allowlist Claude Code checks at startup only
             # recognizes MCP servers that are persistently registered
             # (enterprise/user/project/local scope) - a one-off --mcp-config
@@ -680,17 +834,29 @@ class TerminalHost:
             ).start()
         fresh_claude_session_id = (
             str(uuid.uuid4())
-            if resolved_provider == "CLAUDE" and not str(resume_session_ref or "").strip()
+            if (
+                resolved_provider == "CLAUDE"
+                and profile == "INTERACTIVE"
+                and not str(resume_session_ref or "").strip()
+            )
             else ""
         )
-        argv = startup_argv(
-            resolved_provider,
-            resume_session_ref,
-            model_ref=selected_model,
-            effort=selected_effort,
-            claude_session_id=fresh_claude_session_id,
-            claude_channel_enabled=channel_broker is not None,
-        )
+        if profile == "SUPERVISED_STDIO":
+            argv = [str(argument) for argument in provider_arguments]
+            if not argv or any(not argument for argument in argv):
+                raise TerminalHostError(
+                    "TERMINAL_PROVIDER_ARGUMENTS_REQUIRED",
+                    "SUPERVISED_STDIO requires a non-empty provider argument list",
+                )
+        else:
+            argv = startup_argv(
+                resolved_provider,
+                resume_session_ref,
+                model_ref=selected_model,
+                effort=selected_effort,
+                claude_session_id=fresh_claude_session_id,
+                claude_channel_enabled=channel_broker is not None,
+            )
         session = TerminalSession(
             terminal_id=terminal_id,
             project_id=project,
@@ -702,6 +868,7 @@ class TerminalHost:
             created_at=_now(),
             model_ref=selected_model,
             effort=selected_effort,
+            launch_profile=profile,
             cols=max(80, int(cols or 120)),
             rows=max(24, int(rows or 32)),
             channel_broker=channel_broker,
@@ -713,6 +880,7 @@ class TerminalHost:
             provider=resolved_provider,
         )
         shell_identity_path = managed_shell_identity_path(root, terminal_id)
+        session.managed_shell_identity_file = str(shell_identity_path)
         child_environment = {
             "UNIVERSE_PROJECT_ID": project,
             "UNIVERSE_MODE": requested_mode,
@@ -724,6 +892,13 @@ class TerminalHost:
             "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(shell_identity_path),
             "UNIVERSE_SESSION_INBOX_CLI": str(SESSION_INBOX_CLI),
         }
+        reserved_environment = frozenset(child_environment)
+        for key, value in dict(provider_environment or {}).items():
+            normalized_key = str(key)
+            if normalized_key in reserved_environment:
+                continue
+            child_environment[normalized_key] = str(value)
+        # Provider-specific environment is an overlay; Supervisor coordinates win.
         # One managed path per terminal: the Supervisor owns a headless cmd.exe
         # ConPTY and the provider CLI runs inside it.  There is no second
         # launcher and no separate handshake path.
@@ -734,7 +909,12 @@ class TerminalHost:
         # separately, so the whole flag list belongs in the hosted command.
         # A raw command line, not an argv list: the /s form cannot survive a
         # second round of quoting (see managed_shell_cmdline).
-        shell_argv = managed_shell_cmdline([executable, *argv])
+        shell_argv = managed_shell_cmdline(
+            [executable, *argv],
+            pipe_console_input=(
+                profile == "SUPERVISED_STDIO" and resolved_provider == "CLAUDE"
+            ),
+        )
         child_environment["UNIVERSE_MANAGED_SHELL"] = "1"
         child_environment["UNIVERSE_SESSION_ANCHOR_REF"] = anchor_ref
         try:
@@ -773,8 +953,15 @@ class TerminalHost:
             self._sessions[terminal_id] = session
         created = session.public()
         self.record_audit_event(
-            "TERMINAL_CREATED", terminal=created, context=audit_context
+            "TERMINAL_CREATED",
+            terminal=created,
+            context=audit_context,
+            details={"managed_shell_identity_file": str(shell_identity_path)},
         )
+        # The Supervisor must drain and monitor every managed shell even
+        # when no UI client subscribes.  Lifecycle polling therefore
+        # starts with ownership, not with presentation attachment.
+        self._ensure_pump(session)
         return created
 
     def record_managed_attach(
@@ -941,6 +1128,35 @@ class TerminalHost:
             raise TerminalHostError(
                 "TERMINAL_NOT_MANAGED", "terminal has no managed shell"
             )
+        identity_state = self._managed_shell_identity_state(session)
+        if identity_state not in {"VERIFIED", "NOT_CONFIGURED"}:
+            previous_state = shell.last_state
+            shell.last_state = identity_state
+            shell.record_failure_evidence(
+                identity_state,
+                {
+                    "identity_file": getattr(
+                        session, "managed_shell_identity_file", ""
+                    )
+                },
+            )
+            if identity_state != previous_state:
+                self.record_audit_event(
+                    "TERMINAL_MANAGED_STATE",
+                    terminal=session.public(),
+                    context={
+                        "lifecycle_state": identity_state,
+                        "previous_state": previous_state,
+                    },
+                )
+            return {
+                "terminal_id": terminal_id,
+                "state": identity_state,
+                "recovery": [],
+                "identity_file": getattr(
+                    session, "managed_shell_identity_file", ""
+                ),
+            }
         resolved = probes if probes is not None else host_process_probes()
         shell_previous_state = shell.last_state
         if resolved is None:
@@ -992,6 +1208,67 @@ class TerminalHost:
             "recovery": recovery,
             "inspection_source": resolved.get("source", "UNKNOWN"),
         }
+
+    @staticmethod
+    def _managed_shell_identity_state(session: TerminalSession) -> str:
+        path_text = str(
+            getattr(session, "managed_shell_identity_file", "") or ""
+        ).strip()
+        if not path_text:
+            # Test doubles and legacy imported rows can omit the file;
+            # every newly created managed terminal sets it before spawn.
+            return "NOT_CONFIGURED"
+        try:
+            payload = json.loads(Path(path_text).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return MANAGED_SHELL_IDENTITY_MISSING
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return MANAGED_SHELL_IDENTITY_INVALID
+        shell = getattr(session.managed_shell, "shell", None)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema") != MANAGED_SHELL_IDENTITY_SCHEMA
+            or str(payload.get("terminal_id") or "") != session.terminal_id
+            or str(payload.get("session_anchor_ref") or "")
+            != session.session_anchor_ref
+            or str(payload.get("supervisor_session_id") or "")
+            != session.supervisor_session_id
+            or shell is None
+        ):
+            return MANAGED_SHELL_IDENTITY_MISMATCH
+        try:
+            recorded = ProcessIdentity(
+                pid=int(payload.get("shell_pid") or 0),
+                started_at=float(payload.get("shell_started_at") or 0.0),
+            )
+        except (TypeError, ValueError):
+            return MANAGED_SHELL_IDENTITY_INVALID
+        return "VERIFIED" if recorded.matches(shell) else MANAGED_SHELL_IDENTITY_MISMATCH
+
+    def poll_managed_shell(
+        self,
+        terminal_id: str,
+        *,
+        probes: Mapping[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        result = self.sample_managed_shell(
+            terminal_id, probes=probes, now=now
+        )
+        state = str(result.get("state") or "")
+        if state not in MANAGED_SHELL_RECLAIM_STATES:
+            result["reclaimed"] = False
+            return result
+        try:
+            closed = self.close(
+                terminal_id,
+                audit_context={"reason": f"MANAGED_SHELL_RECLAIM:{state}"},
+            )
+        except TerminalHostError:
+            closed = {"status": "TERMINAL_ALREADY_RECLAIMED"}
+        result["reclaimed"] = True
+        result["reclaim_result"] = closed
+        return result
 
     @staticmethod
     def _pty_responsive(session: TerminalSession) -> str:
@@ -1107,9 +1384,15 @@ class TerminalHost:
         if session.channel_broker is not None:
             session.channel_broker.close()
         try:
-            managed_shell_identity_path(
-                Path(session.cwd), session.terminal_id
-            ).unlink(missing_ok=True)
+            identity_path = str(
+                getattr(session, "managed_shell_identity_file", "") or ""
+            ).strip()
+            if identity_path:
+                Path(identity_path).unlink(missing_ok=True)
+            elif getattr(session, "cwd", ""):
+                managed_shell_identity_path(
+                    Path(session.cwd), session.terminal_id
+                ).unlink(missing_ok=True)
         except OSError:
             pass
         self.record_audit_event(
@@ -1469,7 +1752,13 @@ class TerminalHost:
             if session.managed_shell is not None and now >= next_managed_sample:
                 next_managed_sample = now + self._managed_sample_interval
                 try:
-                    self.sample_managed_shell(session.terminal_id, now=now)
+                    # poll_managed_shell wraps sample_managed_shell with
+                    # terminal-scoped reclaim for terminal states.
+                    sampled = self.poll_managed_shell(
+                        session.terminal_id, now=now
+                    )
+                    if sampled.get("reclaimed"):
+                        break
                 except Exception:  # noqa: BLE001 - sampling never kills a PTY
                     pass
             try:

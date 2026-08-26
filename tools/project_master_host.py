@@ -3213,9 +3213,24 @@ class ProjectMasterSessionStore:
                 node=self.session_node,
                 mode=self.requested_mode,
             )
+            with self._connection() as connection:
+                owned_row = connection.execute(
+                    "SELECT value FROM host_metadata WHERE key = ?",
+                    ("supervisor_session_id:PROJECT_MASTER",),
+                ).fetchone()
+            owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
             selected = next(
-                (session for session in sessions if session["is_default"]), None
+                (
+                    session
+                    for session in sessions
+                    if owned_id and str(session.get("session_id") or "") == owned_id
+                ),
+                None,
             )
+            if selected is None:
+                selected = next(
+                    (session for session in sessions if session["is_default"]), None
+                )
             if selected is not None and selected["provider_session_ref"]:
                 return {
                     "provider": str(selected["provider"]),
@@ -3256,11 +3271,64 @@ class ProjectMasterSessionStore:
         provider: str,
         *,
         new_session: bool = False,
+        owner_key: str = "",
     ) -> dict[str, Any] | None:
         """Create the persistent Mode-session slot before its processes start."""
         if self.session_supervisor is None:
             return None
         normalized_provider = _provider(provider)
+        normalized_owner = str(owner_key or "").strip().upper()
+        if normalized_owner:
+            metadata_key = f"supervisor_session_id:{normalized_owner}"
+            existing_id = ""
+            if not new_session:
+                with self._connection() as connection:
+                    row = connection.execute(
+                        "SELECT value FROM host_metadata WHERE key = ?",
+                        (metadata_key,),
+                    ).fetchone()
+                existing_id = str(row["value"] or "") if row is not None else ""
+            if existing_id:
+                try:
+                    existing = self.session_supervisor.get_session(existing_id)
+                except SessionSupervisorError:
+                    existing = None
+                if (
+                    isinstance(existing, Mapping)
+                    and str(existing.get("node") or "") == self.session_node
+                    and str(existing.get("mode") or "").upper()
+                    == self.requested_mode
+                    and str(existing.get("provider") or "").upper()
+                    in {"", normalized_provider}
+                ):
+                    return dict(existing)
+            supervisor_session_id = "session_" + secrets.token_hex(12)
+            session, _ = self.session_supervisor.register_session(
+                {
+                    "session_id": supervisor_session_id,
+                    "node": self.session_node,
+                    "mode": self.requested_mode,
+                    "provider": normalized_provider,
+                    "provider_session_ref": None,
+                    "state": "REGISTERED",
+                    "currentness": "UNKNOWN",
+                    "activity_state": "BOOTSTRAPPING",
+                    "location_evidence_ref": (
+                        "universe://owned-mode-session/"
+                        f"{normalized_owner}/{self.session_node}/{self.requested_mode}"
+                    ),
+                }
+            )
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO host_metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (metadata_key, supervisor_session_id),
+                )
+            return session
         if new_session:
             supervisor_session_id = "session_" + secrets.token_hex(12)
             session, _ = self.session_supervisor.register_session(
@@ -3363,10 +3431,25 @@ class ProjectMasterSessionStore:
                 node=self.session_node,
                 mode=self.requested_mode,
             )
+            with self._connection() as connection:
+                owned_row = connection.execute(
+                    "SELECT value FROM host_metadata WHERE key = ?",
+                    ("supervisor_session_id:PROJECT_MASTER",),
+                ).fetchone()
+            owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
             selected = next(
-                (session for session in sessions if session["is_default"]),
+                (
+                    session
+                    for session in sessions
+                    if owned_id and str(session.get("session_id") or "") == owned_id
+                ),
                 None,
             )
+            if selected is None:
+                selected = next(
+                    (session for session in sessions if session["is_default"]),
+                    None,
+                )
             if selected is not None:
                 supervisor_session_id = str(selected["session_id"])
                 if (
@@ -3397,7 +3480,7 @@ class ProjectMasterSessionStore:
                     }
                 )
             supervisor_session_id = str(candidate["session_id"])
-            if not candidate["is_default"]:
+            if not owned_id and not candidate["is_default"]:
                 self.session_supervisor.set_default(
                     supervisor_session_id,
                     expected_pointer_version=candidate["default_pointer_version"],
@@ -3455,7 +3538,13 @@ class ProjectMasterSessionStore:
         if candidate is None:
             raise ProjectMasterHostError("MODE_SESSION_SUPERVISOR_SESSION_UNAVAILABLE")
         supervisor_session_id = str(candidate["session_id"])
-        if not candidate["is_default"]:
+        with self._connection() as connection:
+            owned_row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = ?",
+                ("supervisor_session_id:PROJECT_MASTER",),
+            ).fetchone()
+        owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
+        if not owned_id and not candidate["is_default"]:
             self.session_supervisor.set_default(
                 supervisor_session_id,
                 expected_pointer_version=candidate["default_pointer_version"],
@@ -3495,17 +3584,29 @@ class ProjectMasterSessionStore:
     def observe_current_anchor(self, anchor_ref: str) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
+        sessions = self.session_supervisor.list_sessions(
+            node=self.session_node,
+            mode=self.requested_mode,
+        )
+        with self._connection() as connection:
+            owned_row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = ?",
+                ("supervisor_session_id:PROJECT_MASTER",),
+            ).fetchone()
+        owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
         selected = next(
             (
                 session
-                for session in self.session_supervisor.list_sessions(
-                    node=self.session_node,
-                    mode=self.requested_mode,
-                )
-                if session["is_default"]
+                for session in sessions
+                if owned_id and str(session.get("session_id") or "") == owned_id
             ),
             None,
         )
+        if selected is None:
+            selected = next(
+                (session for session in sessions if session["is_default"]),
+                None,
+            )
         if selected is None:
             raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
         if selected.get("anchor_ref") == anchor_ref:
@@ -4037,8 +4138,18 @@ class GrokProjectMasterRuntime:
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": requested_mode,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.project_id = _text(project_id, "project_id")
         self.store = store
         self.native_runner = native_runner
@@ -4179,6 +4290,7 @@ class GrokProjectMasterRuntime:
                 response_timeout_seconds=self.response_timeout_seconds,
                 permission_requester=self._permission_requester,
                 session_observer=observe_session,
+                **self._supervisor_transport,
             )
         )
         return self._gateway
@@ -4248,8 +4360,18 @@ class CodexProjectMasterRuntime:
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": requested_mode,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.project_id = _text(project_id, "project_id")
         self.store = store
         self.native_runner = native_runner
@@ -4410,6 +4532,7 @@ class CodexProjectMasterRuntime:
                 session_id=self.session_id,
                 permission_requester=self._permission_requester,
                 session_observer=observe_session,
+                **self._supervisor_transport,
             )
         )
         return self._gateway
@@ -4481,6 +4604,9 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         super().__init__(
             project_root,
@@ -4492,6 +4618,9 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             requested_mode=requested_mode,
             actor_label=actor_label,
             new_session=new_session,
+            terminal_host=terminal_host,
+            supervisor_session_id=supervisor_session_id,
+            session_anchor_ref=session_anchor_ref,
         )
         self.session_id = None if new_session else store.session_ref_for("CLAUDE")
         self.max_turns = max(1, int(max_turns))
@@ -4636,6 +4765,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
                 permission_bridge=bridge,
                 permission_ready=broker.wait_for_registration,
                 permission_failure=broker.close,
+                **self._supervisor_transport,
             )
         except Exception:
             if broker is not None:
@@ -6515,6 +6645,7 @@ class ResidentProjectMasterHostManager:
         bridge_registrar: BridgeRegistrar,
         session_supervisor: SessionSupervisorStore | None = None,
         continuity_coordinator: ContinuitySaver | None = None,
+        terminal_host: Any | None = None,
         provider_factory: Callable[
             [Path, str, ProjectMasterSessionStore], MasterProvider
         ]
@@ -6534,6 +6665,7 @@ class ResidentProjectMasterHostManager:
         self.bridge_registrar = bridge_registrar
         self.session_supervisor = session_supervisor
         self.continuity_coordinator = continuity_coordinator
+        self.terminal_host = terminal_host
         self.provider_factory = provider_factory
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.model_resolver = model_resolver or (lambda _project_id, _provider: "")
@@ -6667,6 +6799,39 @@ class ResidentProjectMasterHostManager:
 
             credential_env = _managed_credential_env(project_id)
             os.environ[credential_env] = secrets.token_urlsafe(32)
+            # Reserve the Project Master's own durable Supervisor coordinate
+            # before any provider process starts. Never borrow the Mode default:
+            # that may belong to the interactive Conductor or another client.
+            if self.provider_factory is None:
+                supervisor_session = store.ensure_supervisor_session(
+                    selected_provider,
+                    new_session=force_new_session,
+                    owner_key="PROJECT_MASTER",
+                )
+            else:
+                # Injected adapters own their test/integration lifecycle and
+                # retain the historical Mode-default reservation contract.
+                supervisor_session = store.ensure_supervisor_session(
+                    selected_provider,
+                    new_session=force_new_session,
+                )
+            supervisor_session_id = (
+                str(supervisor_session.get("session_id") or "")
+                if isinstance(supervisor_session, Mapping)
+                else ""
+            )
+            session_anchor_ref = (
+                str(supervisor_session.get("session_anchor_ref") or "")
+                if isinstance(supervisor_session, Mapping)
+                else ""
+            )
+            if self.terminal_host is not None and (
+                not supervisor_session_id or not session_anchor_ref
+            ):
+                os.environ.pop(credential_env, None)
+                raise ProjectMasterHostError(
+                    "PROJECT_MASTER_SUPERVISOR_COORDINATE_UNAVAILABLE"
+                )
             provider = (
                 self.provider_factory(project_root, project_id, store)
                 if self.provider_factory is not None
@@ -6678,15 +6843,15 @@ class ResidentProjectMasterHostManager:
                     model=selected_model,
                     effort=selected_effort,
                     new_session=force_new_session,
+                    terminal_host=self.terminal_host,
+                    supervisor_session_id=supervisor_session_id,
+                    session_anchor_ref=session_anchor_ref,
                 )
             )
             try:
                 # A fresh Project has no provider coordinate yet. Reserve only
                 # the persistent node/mode slot; the provider hook replaces
                 # the UNKNOWN binding with its exact vendor session later.
-                store.ensure_supervisor_session(
-                    selected_provider, new_session=force_new_session
-                )
                 bind_permission = getattr(provider, "set_permission_requester", None)
                 if callable(bind_permission):
                     bind_permission(self._permission_before_worker)
@@ -6765,6 +6930,7 @@ class ResidentProjectMasterHostManager:
                 thread=thread,
                 governance_context_key=governance_context_key,
                 session_supervisor=self.session_supervisor,
+                supervisor_session_id=supervisor_session_id or None,
             )
             try:
                 lease = self._register_provider_process_lease(
@@ -6772,6 +6938,7 @@ class ResidentProjectMasterHostManager:
                     provider=provider,
                     endpoint=endpoint,
                     handshake_token=os.environ[credential_env],
+                    supervisor_session_id=supervisor_session_id,
                 )
                 if lease is not None:
                     handle.supervisor_session_id = lease["supervisor_session_id"]
@@ -6880,11 +7047,16 @@ class ResidentProjectMasterHostManager:
             )
         ):
             return True
+        if not handle.supervisor_session_id:
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_SUPERVISOR_SESSION_UNAVAILABLE"
+            )
         lease = self._register_provider_process_lease(
             project_id=handle.project_id,
             provider=handle.worker.provider,
             endpoint=handle.endpoint,
             handshake_token=handshake_token,
+            supervisor_session_id=handle.supervisor_session_id,
         )
         if lease is None:
             return True
@@ -6928,6 +7100,7 @@ class ResidentProjectMasterHostManager:
         provider: MasterProvider,
         endpoint: str,
         handshake_token: str,
+        supervisor_session_id: str,
     ) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
@@ -6942,27 +7115,28 @@ class ResidentProjectMasterHostManager:
             )
         try:
             self.session_supervisor.sweep_stale_live_sessions()
-            sessions = self.session_supervisor.list_sessions(
-                node=project_id, mode="MASTER"
-            )
-            selected = next(
-                (item for item in sessions if item.get("is_default")),
-                None,
-            )
-            if not isinstance(selected, Mapping):
-                raise ProjectMasterHostError(
-                    "PROJECT_MASTER_SUPERVISOR_SESSION_UNAVAILABLE"
-                )
-            supervisor_session_id = _text(
-                selected.get("session_id"),
+            normalized_supervisor_session_id = _text(
+                supervisor_session_id,
                 "supervisor_session_id",
             )
+            selected = self.session_supervisor.get_session(
+                normalized_supervisor_session_id
+            )
+            if (
+                str(selected.get("node") or "") != project_id
+                or str(selected.get("mode") or "").upper() != "MASTER"
+            ):
+                raise ProjectMasterHostError(
+                    "PROJECT_MASTER_SUPERVISOR_SESSION_MISMATCH"
+                )
             identity = resolver(endpoint, handshake_token)
             if not isinstance(identity, Mapping):
                 raise ProjectMasterHostError(
                     "PROJECT_MASTER_PROCESS_IDENTITY_INVALID"
                 )
-            current = self.session_supervisor.get_session(supervisor_session_id)
+            current = self.session_supervisor.get_session(
+                normalized_supervisor_session_id
+            )
             lease = current.get("process_lease")
             expected_version = (
                 int(lease.get("lease_version", 0))
@@ -6970,7 +7144,7 @@ class ResidentProjectMasterHostManager:
                 else 0
             )
             acquired = self.session_supervisor.acquire_lease(
-                supervisor_session_id,
+                normalized_supervisor_session_id,
                 dict(identity),
                 expected_lease_version=expected_version,
                 stop_capability=handshake_token,
@@ -6988,7 +7162,7 @@ class ResidentProjectMasterHostManager:
                 "PROJECT_MASTER_PROCESS_LEASE_IDENTITY_MISSING"
             )
         return {
-            "supervisor_session_id": supervisor_session_id,
+            "supervisor_session_id": normalized_supervisor_session_id,
             "lease_token": _text(acquired.get("lease_token"), "lease_token"),
             "lease_version": int(acquired_lease["lease_version"]),
             "process_identity": dict(identity),
@@ -7472,6 +7646,9 @@ class ResidentProjectMasterHostManager:
         model: str = "",
         effort: str = "AUTO",
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> MasterProvider:
         if provider == "GROK":
             return GrokProjectMasterRuntime(
@@ -7481,6 +7658,9 @@ class ResidentProjectMasterHostManager:
                 model=model,
                 effort=effort,
                 new_session=new_session,
+                terminal_host=terminal_host,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
             )
         if provider == "CODEX":
             return CodexProjectMasterRuntime(
@@ -7490,6 +7670,9 @@ class ResidentProjectMasterHostManager:
                 model=model,
                 effort=effort,
                 new_session=new_session,
+                terminal_host=terminal_host,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
             )
         if provider == "CLAUDE":
             return ClaudeProjectMasterRuntime(
@@ -7499,6 +7682,9 @@ class ResidentProjectMasterHostManager:
                 model=model,
                 effort=effort,
                 new_session=new_session,
+                terminal_host=terminal_host,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
             )
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 

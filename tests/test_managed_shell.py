@@ -96,6 +96,16 @@ class ManagedShellCmdlineTests(unittest.TestCase):
         self.assertTrue(line.startswith("/d /q /s /k "), line)
         self.assertIn("claude.exe --flag value", line)
 
+    def test_stream_protocol_can_receive_console_input_through_one_cmd(self) -> None:
+        line = managed_shell_cmdline(
+            ["claude.exe", "--input-format", "stream-json"],
+            pipe_console_input=True,
+        )
+        self.assertEqual(
+            '/d /q /s /k "more | claude.exe --input-format stream-json"',
+            line,
+        )
+
     def test_shell_is_persistent_not_single_shot(self) -> None:
         # /c would tear the shell down with the CLI, collapsing SHELL_IDLE and
         # CLI_START_FAILED into SHELL_EXITED.

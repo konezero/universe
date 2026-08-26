@@ -463,7 +463,9 @@ def quote_windows_argument(value: str) -> str:
     return "".join(quoted)
 
 
-def managed_shell_cmdline(command: Sequence[str]) -> str:
+def managed_shell_cmdline(
+    command: Sequence[str], *, pipe_console_input: bool = False
+) -> str:
     """Build the raw cmd.exe argument line that hosts one provider CLI.
 
     This is the only managed launch builder.  An argv-list variant existed and
@@ -498,6 +500,11 @@ def managed_shell_cmdline(command: Sequence[str]) -> str:
             "MANAGED_SHELL_COMMAND_REQUIRED", "a CLI command is required"
         )
     joined = " ".join(quote_windows_argument(part) for part in parts)
+    if pipe_console_input:
+        # Claude stream-json refuses a TTY stdin. Windows' built-in MORE is a
+        # transparent console-to-pipe bridge inside the one Supervisor-owned
+        # cmd; it is not a second launcher or ownership path.
+        joined = f"more | {joined}"
     return f'/d /q /s /k "{joined}"'
 
 
