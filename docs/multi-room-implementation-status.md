@@ -77,7 +77,7 @@ Database: **same Universe SQLite** (`universe.sqlite3` / service DB). Tables:
 | Delta-only provider input | **Done**; full transcript forwarding is forbidden |
 | Turn-boundary cancellation and per-room single flight | **Done** |
 | Durable meeting summary | **Done** (`MEETING_SUMMARY` control event) |
-| Live native-provider completion adapter / HTTP run endpoint | **Not wired**; current native control returns queue acceptance, not a synchronous final result |
+| Live provider completion adapter / HTTP Feature run endpoint | **Done** — verified opaque provider sessions feed the bounded coordinator; completed per-model outputs become revision-pinned SPECIFICATION / Expected Path candidates |
 
 ### S4 — Boss room
 

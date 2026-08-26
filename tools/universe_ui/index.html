@@ -580,6 +580,27 @@
                   <button id="create-meeting-feature-button" type="button" class="secondary-button">Create Feature Node</button>
                   <small class="settings-help">The active Meeting Room is linked automatically.</small>
                 </div>
+                <label class="meeting-feature-wide" for="meeting-provider-session-select">
+                  Attached provider sessions
+                  <select id="meeting-provider-session-select"><option value="">Choose an attached project session</option></select>
+                </label>
+                <div class="remote-access-actions meeting-feature-wide">
+                  <button id="attach-meeting-provider-button" type="button" class="secondary-button">Attach as meeting model</button>
+                  <small class="settings-help">Uses an opaque verified provider chat key; at least two sessions are required.</small>
+                </div>
+                <label class="meeting-feature-wide" for="meeting-run-prompt">
+                  Meeting direction
+                  <textarea id="meeting-run-prompt" rows="2" placeholder="Optional comparison focus or constraints"></textarea>
+                </label>
+                <label for="meeting-run-turns">
+                  Bounded turns
+                  <input id="meeting-run-turns" type="number" min="2" max="24" value="4" />
+                </label>
+                <div class="remote-access-actions">
+                  <button id="start-meeting-run-button" type="button" class="primary-button">Generate Expected Paths</button>
+                  <button id="cancel-meeting-run-button" type="button" class="secondary-button" disabled>Stop after current turn</button>
+                </div>
+                <small id="meeting-run-status" class="settings-help meeting-feature-wide">Attach two provider sessions to begin.</small>
                 <label class="meeting-feature-wide" for="meeting-expected-path-summary">
                   Candidate summary override
                   <input id="meeting-expected-path-summary" type="text" maxlength="500" placeholder="Optional; otherwise uses the specification body" autocomplete="off" />

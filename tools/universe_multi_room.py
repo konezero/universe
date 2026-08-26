@@ -647,11 +647,14 @@ class MultiRoomStore:
             "session_anchor_ref",
             limit=256,
         )
-        binding_metadata = (
-            {"session_anchor_ref": session_anchor_ref}
-            if session_anchor_ref is not None
-            else {}
+        binding_metadata: dict[str, Any] = {}
+        if session_anchor_ref is not None:
+            binding_metadata["session_anchor_ref"] = session_anchor_ref
+        provider_chat_key = _optional_text(
+            value.get("provider_chat_key"), "provider_chat_key", limit=160
         )
+        if provider_chat_key is not None:
+            binding_metadata["provider_chat_key"] = provider_chat_key
         resume_pending_delivery = value.get("resume_pending_delivery") is True
         participant_state = str(value.get("participant_state") or "OBSERVED").upper()
         if participant_state not in PARTICIPANT_STATES:
@@ -2826,6 +2829,7 @@ class MultiRoomMeetingCoordinator:
         max_turns: int = 6,
         run_id: str | None = None,
         cancel_check: Callable[[Mapping[str, Any]], bool] | None = None,
+        binding_ids: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         rid = _text(room_id, "room_id", limit=80)
         with self._run_lock:
@@ -2843,6 +2847,7 @@ class MultiRoomMeetingCoordinator:
                 max_turns=max_turns,
                 run_id=run_id,
                 cancel_check=cancel_check,
+                binding_ids=binding_ids,
             )
         finally:
             with self._run_lock:
@@ -2856,6 +2861,7 @@ class MultiRoomMeetingCoordinator:
         max_turns: int,
         run_id: str | None,
         cancel_check: Callable[[Mapping[str, Any]], bool] | None,
+        binding_ids: list[str] | tuple[str, ...] | None,
     ) -> dict[str, Any]:
         room = self.store.get_room(room_id)
         if room["room_type"] != "MEETING":
@@ -2885,11 +2891,20 @@ class MultiRoomMeetingCoordinator:
                 "MEETING_CANCEL_CHECK_INVALID",
                 "cancel_check must be callable",
             )
+        selected_binding_ids = (
+            None
+            if binding_ids is None
+            else {_text(item, "binding_id", limit=80) for item in binding_ids}
+        )
         models = sorted(
             (
                 binding
                 for binding in self.store.list_bindings(room["room_id"])
                 if binding["slot_role"] == "MODEL"
+                and (
+                    selected_binding_ids is None
+                    or binding["binding_id"] in selected_binding_ids
+                )
             ),
             key=lambda item: (item.get("created_at") or "", item["binding_id"]),
         )

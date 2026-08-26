@@ -120,6 +120,8 @@ const state = {
   multiRoomFeatures: [],
   activeMultiRoomFeatureId: null,
   multiRoomFeatureCreateKey: null,
+  multiRoomMeetingRunId: null,
+  multiRoomMeetingRunBusy: false,
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -369,6 +371,13 @@ const elements = {
   meetingExpectedPathSummary: document.querySelector("#meeting-expected-path-summary"),
   meetingFeatureRationale: document.querySelector("#meeting-feature-rationale"),
   createMeetingFeature: document.querySelector("#create-meeting-feature-button"),
+  meetingProviderSession: document.querySelector("#meeting-provider-session-select"),
+  attachMeetingProvider: document.querySelector("#attach-meeting-provider-button"),
+  meetingRunPrompt: document.querySelector("#meeting-run-prompt"),
+  meetingRunTurns: document.querySelector("#meeting-run-turns"),
+  startMeetingRun: document.querySelector("#start-meeting-run-button"),
+  cancelMeetingRun: document.querySelector("#cancel-meeting-run-button"),
+  meetingRunStatus: document.querySelector("#meeting-run-status"),
   multiRoomFindingType: document.querySelector("#multi-room-finding-type"),
   multiRoomFindingSummary: document.querySelector("#multi-room-finding-summary"),
   multiRoomFindingFeatures: document.querySelector("#multi-room-finding-features"),
@@ -6592,6 +6601,92 @@ async function createFeatureForActiveMeeting() {
   toast("Feature Node created");
 }
 
+
+function availableMeetingProviderSessions(room) {
+  const attached = new Set(
+    (state.activeMultiRoomSnapshot?.bindings || [])
+      .map((binding) => binding.metadata?.provider_chat_key)
+      .filter(Boolean)
+  );
+  return (state.providerChatRooms || []).filter((providerRoom) => {
+    const binding = providerRoom.binding || {};
+    const projectId = binding.current_project_id || binding.node || null;
+    return (
+      providerRoom.session_kind !== "WORKER" &&
+      ["BOUND", "ANCHOR_OBSERVED"].includes(String(binding.state || "").toUpperCase()) &&
+      projectId === room.project_id &&
+      !attached.has(providerRoom.chat_key)
+    );
+  });
+}
+
+async function attachMeetingProviderSession() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const chatKey = elements.meetingProviderSession?.value || "";
+  if (!room || room.room_type !== "MEETING") throw new Error("Open a Meeting Room first");
+  if (!chatKey) throw new Error("Choose a provider session to attach");
+  await api(`/v1/rooms/${encodeURIComponent(room.room_id)}/provider-sessions`, {
+    method: "POST",
+    body: { chat_key: chatKey },
+  });
+  state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+  renderActiveMultiRoom();
+  toast("Provider session attached to Meeting Room");
+}
+
+async function runActiveFeatureMeeting() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature) throw new Error("Select a Feature in a Meeting Room first");
+  const modelCount = (state.activeMultiRoomSnapshot?.bindings || []).filter(
+    (binding) =>
+      binding.slot_role === "MODEL" &&
+      binding.provider_session_ref &&
+      binding.metadata?.provider_chat_key
+  ).length;
+  if (modelCount < 2) throw new Error("Attach at least two verified provider sessions");
+  const maxTurns = Number(elements.meetingRunTurns?.value || modelCount * 2);
+  if (!Number.isInteger(maxTurns) || maxTurns < 2 || maxTurns > 24) {
+    throw new Error("Bounded turns must be between 2 and 24");
+  }
+  const runId = `feature-meeting-${feature.feature_id}-${crypto.randomUUID()}`;
+  state.multiRoomMeetingRunId = runId;
+  state.multiRoomMeetingRunBusy = true;
+  renderActiveMultiRoom();
+  try {
+    const result = await api(
+      `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/meeting-runs`,
+      {
+        method: "POST",
+        body: {
+          run_id: runId,
+          max_turns: maxTurns,
+          prompt: elements.meetingRunPrompt?.value.trim() || "",
+        },
+      }
+    );
+    state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+    await refreshActiveRoomFeatures({ render: false });
+    await refreshFeatureSemanticGraph(room.project_id);
+    toast(`${result.candidates?.length || 0} Expected Path candidates generated`);
+    return result;
+  } finally {
+    state.multiRoomMeetingRunBusy = false;
+    renderActiveMultiRoom();
+  }
+}
+
+async function cancelActiveFeatureMeeting() {
+  const feature = activeMeetingFeature();
+  const runId = state.multiRoomMeetingRunId;
+  if (!feature || !runId || !state.multiRoomMeetingRunBusy) return;
+  await api(
+    `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/meeting-runs/${encodeURIComponent(runId)}/cancel`,
+    { method: "POST", body: { reason: "user stop" } }
+  );
+  toast("Meeting will stop after the current provider turn");
+}
+
 async function addArtifactAsExpectedPath(artifact) {
   const room = state.activeMultiRoomSnapshot?.room;
   const feature = activeMeetingFeature();
@@ -6667,6 +6762,42 @@ function renderMeetingFeaturePanel(room) {
       elements.meetingFeatureSelect.append(option);
     }
   }
+  const availableSessions = availableMeetingProviderSessions(room);
+  if (elements.meetingProviderSession) {
+    elements.meetingProviderSession.replaceChildren();
+    const empty = node("option", "", availableSessions.length ? "Choose a project session" : "No unattached project sessions");
+    empty.value = "";
+    elements.meetingProviderSession.append(empty);
+    for (const providerRoom of availableSessions) {
+      const option = node(
+        "option",
+        "",
+        `${providerRoom.provider} · ${providerRoom.display_name || providerRoom.workspace_name || "Session"}`
+      );
+      option.value = providerRoom.chat_key;
+      elements.meetingProviderSession.append(option);
+    }
+  }
+  const verifiedModels = (state.activeMultiRoomSnapshot?.bindings || []).filter(
+    (binding) =>
+      binding.slot_role === "MODEL" &&
+      binding.provider_session_ref &&
+      binding.metadata?.provider_chat_key
+  );
+  if (elements.attachMeetingProvider) {
+    elements.attachMeetingProvider.disabled = !availableSessions.length || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.startMeetingRun) {
+    elements.startMeetingRun.disabled = !feature || feature.state === "ADOPTED" || verifiedModels.length < 2 || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.cancelMeetingRun) {
+    elements.cancelMeetingRun.disabled = !state.multiRoomMeetingRunBusy;
+  }
+  if (elements.meetingRunStatus) {
+    elements.meetingRunStatus.textContent = state.multiRoomMeetingRunBusy
+      ? `Meeting ${state.multiRoomMeetingRunId} is running · stop applies at a turn boundary`
+      : `${verifiedModels.length} verified model session(s) attached · candidates remain unadopted`;
+  }
   if (!feature) {
     panel.append(node("p", "empty-copy", "Create a Feature Node to turn room specifications into comparable Expected Paths."));
     return panel;
@@ -6714,6 +6845,8 @@ async function openMultiRoom(roomId) {
   state.multiRoomFeatures = [];
   state.activeMultiRoomFeatureId = null;
   state.multiRoomFeatureCreateKey = null;
+  state.multiRoomMeetingRunId = null;
+  state.multiRoomMeetingRunBusy = false;
   state.multiRoomLiveOutput = {};
   if (elements.createRoomArtifact) {
     elements.createRoomArtifact.textContent = "Create artifact from Message";
@@ -7055,12 +7188,9 @@ async function createMeetingRoomThin() {
     body: {
       room_type: "MEETING",
       title: "Meeting",
-      topic: "function-first debate",
+      topic: "Feature specification collaboration",
       project_id: project,
-      models: [
-        { provider: "GROK", display_name: "Grok" },
-        { provider: "CLAUDE", display_name: "Claude" },
-      ],
+      models: [],
     },
   });
   await refreshMultiRooms();
@@ -13827,6 +13957,30 @@ function bindEvents() {
   if (elements.createMeetingFeature) {
     elements.createMeetingFeature.addEventListener("click", () => {
       createFeatureForActiveMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.attachMeetingProvider) {
+    elements.attachMeetingProvider.addEventListener("click", () => {
+      attachMeetingProviderSession().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.startMeetingRun) {
+    elements.startMeetingRun.addEventListener("click", () => {
+      runActiveFeatureMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.cancelMeetingRun) {
+    elements.cancelMeetingRun.addEventListener("click", () => {
+      cancelActiveFeatureMeeting().catch((error) => {
         elements.settingsError.textContent = error.message;
         toast(error.message, true);
       });

@@ -200,6 +200,7 @@ from universe_rendezvous_client import (
 from universe_multi_room import (
     MultiRoomDeliveryCoordinator,
     MultiRoomError,
+    MultiRoomMeetingCoordinator,
     MultiRoomNativeControlRegistry,
     MultiRoomStore,
 )
@@ -20923,6 +20924,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.multi_rooms,
             self.multi_room_native_controls.send_input,
         )
+        self._meeting_provider_timeout_seconds = 600.0
+        self.multi_room_meetings = MultiRoomMeetingCoordinator(
+            self.multi_rooms,
+            self._invoke_multi_room_meeting_provider,
+        )
         self.conductor_permissions = ConductorPermissionBridge()
         # Register all local manifest-defined Node trees without product names.
         try:
@@ -27133,6 +27139,358 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return snapshot
 
+
+    def attach_meeting_provider_session(
+        self, room_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        chat_key = _required_text(request.get("chat_key"), "chat_key")
+        room = self.multi_rooms.get_room(room_id)
+        if room.get("room_type") != "MEETING":
+            raise UniverseError(
+                "MEETING_ROOM_TYPE_INVALID",
+                "provider sessions may be attached here only to a MEETING room",
+                HTTPStatus.CONFLICT,
+            )
+        descriptor = self.resolve_provider_chat_session(chat_key)
+        if descriptor.get("project_id") != room.get("project_id"):
+            raise UniverseError(
+                "MEETING_PROVIDER_PROJECT_MISMATCH",
+                "provider session must belong to the Meeting Room project",
+                HTTPStatus.CONFLICT,
+            )
+        catalog_room = next(
+            (
+                item
+                for item in self.provider_chat_catalog().get("rooms", [])
+                if item.get("chat_key") == chat_key
+            ),
+            None,
+        )
+        catalog_binding = (
+            catalog_room.get("binding")
+            if isinstance(catalog_room, Mapping)
+            and isinstance(catalog_room.get("binding"), Mapping)
+            else {}
+        )
+        existing = next(
+            (
+                item
+                for item in self.multi_rooms.list_bindings(room["room_id"])
+                if item.get("slot_role") == "MODEL"
+                and item.get("provider") == descriptor.get("provider")
+                and item.get("provider_session_ref")
+                == descriptor.get("provider_session_ref")
+            ),
+            None,
+        )
+        if existing is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "MEETING_PROVIDER_SESSION_ALREADY_ATTACHED",
+                "binding": existing,
+            }
+        attached = self.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": descriptor.get("provider"),
+                "provider_session_ref": descriptor.get("provider_session_ref"),
+                "supervisor_session_id": catalog_binding.get("universe_session_id"),
+                "session_anchor_ref": descriptor.get("origin_session_anchor_ref"),
+                "provider_chat_key": chat_key,
+                "display_name": (
+                    catalog_room.get("display_name")
+                    if isinstance(catalog_room, Mapping)
+                    else descriptor.get("alias")
+                )
+                or descriptor.get("alias")
+                or descriptor.get("provider"),
+            },
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEETING_PROVIDER_SESSION_ATTACHED",
+            "binding": attached["binding"],
+        }
+
+    def _invoke_multi_room_meeting_provider(
+        self,
+        binding: Mapping[str, Any],
+        turn: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = binding.get("metadata")
+        chat_key = str(
+            metadata.get("provider_chat_key")
+            if isinstance(metadata, Mapping)
+            else ""
+        ).strip()
+        if not chat_key:
+            raise ProviderSessionError(
+                "MEETING_PROVIDER_CHAT_REQUIRED",
+                "Meeting model binding has no verified provider chat key",
+                HTTPStatus.CONFLICT,
+            )
+        descriptor = self.resolve_provider_chat_session(chat_key)
+        if (
+            str(descriptor.get("provider") or "").upper()
+            != str(binding.get("provider") or "").upper()
+            or descriptor.get("provider_session_ref")
+            != binding.get("provider_session_ref")
+        ):
+            raise ProviderSessionError(
+                "MEETING_PROVIDER_IDENTITY_MISMATCH",
+                "Meeting model binding no longer matches the provider session",
+                HTTPStatus.CONFLICT,
+            )
+        delta = turn.get("delta")
+        delta_body = str(
+            delta.get("body_text") if isinstance(delta, Mapping) else ""
+        ).strip()
+        if not delta_body:
+            raise ProviderSessionError(
+                "MEETING_PROVIDER_DELTA_REQUIRED",
+                "Meeting turn has no incremental delta",
+            )
+        prompt = (
+            "You are participating in a bounded Universe Feature Meeting. "
+            "Use only the incoming delta below, do not assume execution authority, "
+            "and return a self-contained candidate implementation specification "
+            "that another reviewer can compare with alternatives. Include outcome, "
+            "architecture, key flow, constraints, risks, and validation.\n\n"
+            f"Incoming delta:\n{delta_body}"
+        )[:12000]
+        terminal: dict[str, Any] = {}
+        finished = threading.Event()
+
+        def on_terminal(message: Mapping[str, Any]) -> None:
+            terminal.update(dict(message))
+            finished.set()
+
+        accepted = self.provider_sessions.submit(
+            chat_key,
+            {
+                "body": prompt,
+                "idempotency_key": (
+                    f"feature-meeting:{turn.get('run_id')}:"
+                    f"{turn.get('turn_number')}:{binding.get('binding_id')}"
+                ),
+            },
+            on_terminal=on_terminal,
+        )
+        if not finished.wait(self._meeting_provider_timeout_seconds):
+            self.provider_sessions.cancel(chat_key)
+            return {
+                "status": "FAILED",
+                "reason": "MEETING_PROVIDER_TIMEOUT",
+                "provider_event_id": accepted.get("reply", {}).get("message_id"),
+            }
+        terminal_state = str(terminal.get("state") or "FAILED").upper()
+        if terminal_state != "COMPLETED":
+            return {
+                "status": terminal_state,
+                "reason": terminal.get("error_code") or terminal_state,
+                "provider_event_id": terminal.get("message_id"),
+            }
+        return {
+            "status": "COMPLETED",
+            "body_text": str(terminal.get("body") or ""),
+            "provider_event_id": terminal.get("message_id"),
+        }
+
+    def run_feature_meeting(self, feature_id: str, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        feature = self.store.get_feature_node(feature_id)
+        if feature.get("state") == "ADOPTED":
+            raise UniverseError(
+                "FEATURE_ALREADY_ADOPTED",
+                "adopted Feature Node cannot run new specification meetings",
+                HTTPStatus.CONFLICT,
+            )
+        room_id = str(feature.get("meeting_room_id") or "").strip()
+        if not room_id:
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_REQUIRED",
+                "Feature Node must be linked to a Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        bindings = [
+            item
+            for item in self.multi_rooms.list_bindings(room_id)
+            if item.get("slot_role") == "MODEL"
+            and item.get("provider")
+            and item.get("provider_session_ref")
+            and isinstance(item.get("metadata"), Mapping)
+            and str(item["metadata"].get("provider_chat_key") or "").strip()
+        ]
+        if len(bindings) < 2:
+            raise UniverseError(
+                "FEATURE_MEETING_MODELS_REQUIRED",
+                "Feature specification meeting requires at least two attached provider sessions",
+                HTTPStatus.CONFLICT,
+            )
+        raw_turns = request.get("max_turns", len(bindings) * 2)
+        if isinstance(raw_turns, bool):
+            raise UniverseError("MEETING_TURN_LIMIT_INVALID", "max_turns must be an integer")
+        try:
+            max_turns = int(raw_turns)
+        except (TypeError, ValueError) as error:
+            raise UniverseError(
+                "MEETING_TURN_LIMIT_INVALID", "max_turns must be an integer"
+            ) from error
+        run_id = _required_text(
+            request.get("run_id") or "feature_meeting_" + secrets.token_hex(12),
+            "run_id",
+        )
+        user_prompt = str(request.get("prompt") or "").strip()
+        prompt = (
+            f"Feature: {feature['title']}\n"
+            f"Intent: {feature['intent_text']}\n\n"
+            "Produce alternative, detailed implementation specifications. "
+            "Every turn must remain a self-contained candidate and must not create "
+            "Goals, Todos, Task Frames, authority, or execution assignments."
+        )
+        if user_prompt:
+            prompt += f"\n\nUser direction:\n{user_prompt}"
+        try:
+            summary = self.multi_room_meetings.run(
+                room_id,
+                prompt=prompt,
+                max_turns=max_turns,
+                run_id=run_id,
+                binding_ids=[str(item["binding_id"]) for item in bindings],
+            )
+        except MultiRoomError as error:
+            raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        candidates: list[dict[str, Any]] = []
+        if summary.get("status") == "COMPLETED":
+            messages = {
+                str(item.get("room_event_id") or ""): item
+                for item in self.multi_rooms.list_messages(room_id, limit=500)
+            }
+            latest_by_binding: dict[str, Mapping[str, Any]] = {}
+            for turn in summary.get("turns", []):
+                if turn.get("status") == "COMPLETED" and turn.get("output_event_id"):
+                    latest_by_binding[str(turn["binding_id"])] = turn
+            binding_by_id = {str(item["binding_id"]): item for item in bindings}
+            for binding_id in summary.get("participant_order", []):
+                turn = latest_by_binding.get(str(binding_id))
+                message = messages.get(str((turn or {}).get("output_event_id") or ""))
+                binding = binding_by_id.get(str(binding_id))
+                if message is None or binding is None:
+                    continue
+                body_text = str(message.get("body_text") or "").strip()
+                if not body_text:
+                    continue
+                title = (
+                    f"{feature['title']} · "
+                    f"{binding.get('display_name') or binding.get('provider')} path"
+                )
+                evidence_refs = [
+                    f"universe://chat-rooms/{room_id}/messages/{message['message_id']}",
+                    f"universe://feature-nodes/{feature['feature_id']}/meeting-runs/{run_id}",
+                ]
+                try:
+                    artifact = self.multi_rooms.create_artifact(
+                        room_id,
+                        {
+                            "artifact_type": "SPECIFICATION",
+                            "title": title,
+                            "body_text": body_text,
+                            "state": "CANDIDATE",
+                            "author_role": "MODEL",
+                            "author_binding_id": binding_id,
+                            "source_message_id": message["message_id"],
+                            "evidence_refs": evidence_refs,
+                        },
+                    )
+                    expected_path, _ = self.store.create_feature_expected_path(
+                        feature["feature_id"],
+                        {
+                            "room_id": room_id,
+                            "artifact_id": artifact["artifact_id"],
+                            "title": title,
+                            "summary": " ".join(body_text.split())[:500],
+                            "evidence_refs": evidence_refs,
+                        },
+                    )
+                except MultiRoomError as error:
+                    raise UniverseError(
+                        error.code, str(error), HTTPStatus(error.status)
+                    ) from error
+                candidates.append(
+                    {"artifact": artifact, "expected_path": expected_path}
+                )
+        self.multi_rooms.record_control_event(
+            room_id,
+            "FEATURE_MEETING_RESULT",
+            {
+                "run_id": run_id,
+                "feature_id": feature["feature_id"],
+                "meeting_status": summary.get("status"),
+                "candidate_count": len(candidates),
+                "expected_path_ids": [
+                    item["expected_path"]["expected_path_id"] for item in candidates
+                ],
+                "authority": "UNASSIGNED",
+                "execution_assignment": "UNASSIGNED",
+            },
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "FEATURE_MEETING_COMPLETED"
+                if summary.get("status") == "COMPLETED"
+                else "FEATURE_MEETING_STOPPED"
+            ),
+            "feature": self.store.get_feature_node(feature["feature_id"]),
+            "meeting": summary,
+            "candidates": candidates,
+            "goal_created": False,
+            "todo_created": False,
+            "task_frame_created": False,
+            "authority_created": False,
+            "execution_assignment_created": False,
+        }
+
+    def cancel_feature_meeting(
+        self, feature_id: str, run_id: str, value: Any
+    ) -> dict[str, Any]:
+        feature = self.store.get_feature_node(feature_id)
+        if not feature.get("meeting_room_id"):
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_REQUIRED",
+                "Feature Node must be linked to a Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        request = value if isinstance(value, Mapping) else {}
+        result = self.multi_room_meetings.cancel(
+            run_id, reason=str(request.get("reason") or "user stop")
+        )
+        return {"schema": API_SCHEMA, **result, "feature_id": feature["feature_id"]}
+
+    def feature_meeting_summary(
+        self, feature_id: str, run_id: str
+    ) -> dict[str, Any]:
+        feature = self.store.get_feature_node(feature_id)
+        room_id = str(feature.get("meeting_room_id") or "").strip()
+        if not room_id:
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_REQUIRED",
+                "Feature Node must be linked to a Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            summary = self.multi_room_meetings.summary(room_id, run_id)
+        except MultiRoomError as error:
+            raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "FEATURE_MEETING_SUMMARY_COLLECTED",
+            "feature_id": feature["feature_id"],
+            "meeting": summary,
+        }
+
     def send_project_room_message(
         self,
         project_id: str,
@@ -30730,6 +31088,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        feature_meeting_summary = re.fullmatch(
+            r"/v1/feature-nodes/([^/]+)/meeting-runs/([^/]+)", path
+        )
+        if feature_meeting_summary is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.feature_meeting_summary(
+                        unquote(feature_meeting_summary.group(1)),
+                        unquote(feature_meeting_summary.group(2)),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
         if feature_detail is not None:
             try:
@@ -32190,6 +32563,55 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
+                return
+            meeting_provider_attach = re.fullmatch(
+                r"/v1/rooms/([^/]+)/provider-sessions$", path
+            )
+            if meeting_provider_attach is not None:
+                try:
+                    self._send(
+                        HTTPStatus.CREATED,
+                        self.server.attach_meeting_provider_session(
+                            unquote(meeting_provider_attach.group(1)), body or {}
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except (MultiRoomError, ProviderSessionError) as error:
+                    if isinstance(error, MultiRoomError):
+                        self._send_multi_room_error(error)
+                    else:
+                        self._send_provider_session_error(error)
+                return
+            feature_meeting_cancel = re.fullmatch(
+                r"/v1/feature-nodes/([^/]+)/meeting-runs/([^/]+)/cancel$", path
+            )
+            if feature_meeting_cancel is not None:
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.cancel_feature_meeting(
+                            unquote(feature_meeting_cancel.group(1)),
+                            unquote(feature_meeting_cancel.group(2)),
+                            body or {},
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                return
+            feature_meeting_run = re.fullmatch(
+                r"/v1/feature-nodes/([^/]+)/meeting-runs$", path
+            )
+            if feature_meeting_run is not None:
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.run_feature_meeting(
+                            unquote(feature_meeting_run.group(1)), body or {}
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
                 return
             provider_chat_attach = re.fullmatch(
                 r"/v1/session-observer/chat-rooms/([^/]+)/attach$", path

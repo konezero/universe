@@ -7655,6 +7655,214 @@ class UniverseLocalServiceTests(unittest.TestCase):
         expected_nodes = [node for node in graph["nodes"] if node["entity_type"] == "EXPECTED_PATH"]
         self.assertTrue(all("body_text" not in node["data"] for node in expected_nodes))
 
+    def test_feature_meeting_run_materializes_last_specification_per_model(self) -> None:
+        self.server.store.register_project(self.registration())
+        created = self.server.multi_rooms.create_meeting_room(
+            {
+                "title": "Automated feature meeting",
+                "topic": "Generate alternatives",
+                "project_id": "GCS",
+            }
+        )
+        room_id = created["room"]["room_id"]
+        for model in (
+            {
+                "provider": "CODEX",
+                "provider_session_ref": "codex-meeting-session",
+                "provider_chat_key": "codex-chat-key",
+                "display_name": "Codex",
+            },
+            {
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-meeting-session",
+                "provider_chat_key": "claude-chat-key",
+                "display_name": "Claude",
+            },
+            {
+                "provider": "GROK",
+                "provider_session_ref": "legacy-placeholder-session",
+                "display_name": "Unverified placeholder",
+            },
+        ):
+            self.server.multi_rooms.attach_session(
+                room_id, {"slot_role": "MODEL", **model}
+            )
+        status, feature_payload = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-nodes",
+            {
+                "idempotency_key": "automated-feature-meeting-v1",
+                "title": "Automated path generation",
+                "intent_text": "Agents debate and leave reviewable specifications.",
+                "meeting_room_id": room_id,
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        feature_id = feature_payload["feature"]["feature_id"]
+        seen: list[dict[str, object]] = []
+
+        def invoke(binding, turn):
+            seen.append(
+                {
+                    "binding_id": binding["binding_id"],
+                    "turn_number": turn["turn_number"],
+                    "delta": turn["delta"]["body_text"],
+                }
+            )
+            return {
+                "status": "COMPLETED",
+                "body_text": (
+                    f"Specification {binding['display_name']} final turn "
+                    f"{turn['turn_number']}"
+                ),
+                "provider_event_id": f"provider-{turn['turn_number']}",
+            }
+
+        self.server.multi_room_meetings.invoke_provider = invoke
+        status, result = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature_id}/meeting-runs",
+            {
+                "run_id": "feature-meeting-http-1",
+                "max_turns": 4,
+                "prompt": "Compare event-first and artifact-first designs.",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FEATURE_MEETING_COMPLETED", result["status"])
+        self.assertEqual(4, result["meeting"]["turn_count"])
+        self.assertEqual(2, len(result["candidates"]))
+        self.assertEqual(2, len(result["feature"]["expected_paths"]))
+        self.assertTrue(all(item["expected_path"]["state"] == "CANDIDATE" for item in result["candidates"]))
+        self.assertFalse(result["goal_created"])
+        self.assertFalse(result["todo_created"])
+        self.assertFalse(result["task_frame_created"])
+        self.assertFalse(result["authority_created"])
+        self.assertFalse(result["execution_assignment_created"])
+        self.assertEqual(4, len(seen))
+        self.assertIn("Feature: Automated path generation", str(seen[0]["delta"]))
+        artifact_bodies = {
+            item["artifact"]["body_text"] for item in result["candidates"]
+        }
+        self.assertEqual(2, len(artifact_bodies))
+        self.assertTrue(any("Specification Codex final turn" in item for item in artifact_bodies))
+        self.assertTrue(any("Specification Claude final turn" in item for item in artifact_bodies))
+        self.assertEqual(
+            {"2", "3"},
+            {item.rsplit(" ", 1)[-1] for item in artifact_bodies},
+        )
+        self.assertTrue(
+            all(item["artifact"]["current_revision"] == 1 for item in result["candidates"])
+        )
+        self.assertEqual([], self.server.store.list_project_goals("GCS"))
+        self.assertEqual(
+            [],
+            [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"],
+        )
+
+        status, summary = self.request(
+            "GET",
+            f"/v1/feature-nodes/{feature_id}/meeting-runs/feature-meeting-http-1",
+            None,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FEATURE_MEETING_SUMMARY_COLLECTED", summary["status"])
+        self.assertEqual("COMPLETED", summary["meeting"]["status"])
+
+    def test_meeting_provider_session_attach_uses_opaque_verified_chat_key(self) -> None:
+        self.server.store.register_project(self.registration())
+        room_id = self.server.multi_rooms.create_meeting_room(
+            {"title": "Attach providers", "project_id": "GCS"}
+        )["room"]["room_id"]
+        catalog_room = {
+            "chat_key": "provider_chat_attach_1",
+            "provider": "CODEX",
+            "display_name": "Codex design session",
+            "binding": {
+                "state": "BOUND",
+                "current_project_id": "GCS",
+                "universe_session_id": "session-supervisor-1",
+            },
+        }
+        descriptor = {
+            "provider": "CODEX",
+            "provider_session_ref": "private-provider-ref-1",
+            "project_id": "GCS",
+            "origin_session_anchor_ref": "anchor-provider-1",
+            "alias": "GCS MASTER",
+        }
+        with patch.object(
+            self.server, "resolve_provider_chat_session", return_value=descriptor
+        ), patch.object(
+            self.server,
+            "provider_chat_catalog",
+            return_value={"rooms": [catalog_room]},
+        ):
+            status, attached = self.request(
+                "POST",
+                f"/v1/rooms/{room_id}/provider-sessions",
+                {"chat_key": "provider_chat_attach_1"},
+                self.token,
+            )
+            replay_status, replay = self.request(
+                "POST",
+                f"/v1/rooms/{room_id}/provider-sessions",
+                {"chat_key": "provider_chat_attach_1"},
+                self.token,
+            )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("MEETING_PROVIDER_SESSION_ATTACHED", attached["status"])
+        self.assertEqual("MODEL", attached["binding"]["slot_role"])
+        self.assertEqual("provider_chat_attach_1", attached["binding"]["metadata"]["provider_chat_key"])
+        self.assertEqual("private-provider-ref-1", attached["binding"]["provider_session_ref"])
+        self.assertEqual(HTTPStatus.CREATED, replay_status)
+        self.assertEqual("MEETING_PROVIDER_SESSION_ALREADY_ATTACHED", replay["status"])
+
+    def test_meeting_provider_adapter_waits_for_verified_terminal_result(self) -> None:
+        terminal_body = "Self-contained verified specification"
+
+        def submit(chat_key, value, *, on_accepted=None, on_terminal=None):
+            self.assertEqual("provider_chat_verified", chat_key)
+            self.assertIn("Incoming delta", value["body"])
+            self.assertIsNone(on_accepted)
+            self.assertIsNotNone(on_terminal)
+            on_terminal(
+                {
+                    "message_id": "provider-reply-1",
+                    "state": "COMPLETED",
+                    "body": terminal_body,
+                }
+            )
+            return {"reply": {"message_id": "provider-reply-1"}}
+
+        with patch.object(
+            self.server,
+            "resolve_provider_chat_session",
+            return_value={
+                "provider": "CODEX",
+                "provider_session_ref": "provider-session-1",
+            },
+        ), patch.object(self.server.provider_sessions, "submit", side_effect=submit):
+            result = self.server._invoke_multi_room_meeting_provider(
+                {
+                    "binding_id": "bind-provider-1",
+                    "provider": "CODEX",
+                    "provider_session_ref": "provider-session-1",
+                    "metadata": {"provider_chat_key": "provider_chat_verified"},
+                },
+                {
+                    "run_id": "meeting-adapter-1",
+                    "turn_number": 0,
+                    "delta": {"body_text": "Feature intent"},
+                },
+            )
+        self.assertEqual("COMPLETED", result["status"])
+        self.assertEqual(terminal_body, result["body_text"])
+        self.assertEqual("provider-reply-1", result["provider_event_id"])
+
     def test_meeting_room_finding_http_records_and_collects_source_links(self) -> None:
         created = self.server.multi_rooms.create_meeting_room(
             {"title": "HTTP finding room", "topic": "research"}
