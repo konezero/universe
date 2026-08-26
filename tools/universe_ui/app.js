@@ -6845,6 +6845,31 @@ async function applyGoalWorkPlan() {
   toast(`Created ${result.application.created_items.milestone_count} milestone(s) and ${result.application.created_items.todo_count} Todo(s)`);
 }
 
+async function deliverGoalWorkPlanToMaster() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  const application = feature?.goal_derivation?.work_plans?.application;
+  if (!room || !goal || !application) throw new Error("Apply a Work Plan first");
+  if (!window.confirm("Pin this applied Goal Work Plan in a receipt and deliver it to Project Master?")) return;
+  const proposed = await api(`/v1/projects/${encodeURIComponent(room.project_id)}/master-handoffs`, {
+    method: "POST",
+    body: {
+      source: {
+        kind: "GOAL_WORK_PLAN",
+        application_id: application.application_id,
+      },
+      purpose: `Execute adopted Goal Work Plan for ${goal.goal_id}`,
+    },
+  });
+  const handoff = proposed.handoff;
+  const delivered = await api(
+    `/v1/projects/${encodeURIComponent(room.project_id)}/master-handoffs/${encodeURIComponent(handoff.handoff_id)}/deliver`,
+    { method: "POST", body: { approval: "DELIVER" } }
+  );
+  toast(`Goal receipt ${delivered.handoff.handoff_id} queued for Project Master`);
+}
+
 function renderMeetingFeaturePanel(room) {
   const panel = node("section", "feature-path-list");
   if (room.room_type !== "MEETING") return panel;
@@ -6993,6 +7018,11 @@ function renderMeetingFeaturePanel(room) {
       if (workPlans.application) {
         const created = workPlans.application.created_items || {};
         goalCopy.append(node("small", "", `APPLIED · ${created.milestone_count || 0} PLANNED milestone(s) · ${created.todo_count || 0} BACKLOG Todo(s)`));
+        const deliver = node("button", "primary-button compact-action", "Send to Master");
+        deliver.type = "button";
+        deliver.title = "Pin this applied Work Plan in a durable handoff receipt";
+        deliver.addEventListener("click", () => deliverGoalWorkPlanToMaster().catch((error) => toast(error.message, true)));
+        goalRow.append(deliver);
       }
     } else {
       goalCopy.append(
@@ -7009,7 +7039,7 @@ function renderMeetingFeaturePanel(room) {
     goalRow.prepend(goalCopy);
     panel.append(goalRow);
   }
-  panel.append(node("small", "settings-help", "Goal creation and Work Plan adoption are explicit USER actions. Applying an adopted plan creates only PLANNED Milestones and BACKLOG Todos; it never creates a Task Frame, authority, or assignment."));
+  panel.append(node("small", "settings-help", "Goal creation and Work Plan adoption are explicit USER actions. Applying an adopted plan creates only PLANNED Milestones and BACKLOG Todos. Send to Master pins that applied plan in a durable handoff receipt; it still creates no Task Frame, authority, or assignment."));
   return panel;
 }
 

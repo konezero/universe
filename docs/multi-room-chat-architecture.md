@@ -254,6 +254,7 @@ The durable planning order is now represented directly by the local runtime:
 8. Candidate generation creates no Milestone or Todo. `POST /v1/goals/{goal_id}/work-plan-adoptions` requires an explicit USER rationale and at least two alternatives, then marks exactly one plan `ADOPTED`.
 9. A separate explicit USER `POST /v1/goals/{goal_id}/work-plan-applications` atomically creates deterministic `PLANNED` Milestones and `BACKLOG` Todos. Replay is idempotent and creates no duplicates.
 10. Planning never creates a Task Frame, authority, execution assignment, or `READY`/`IN_PROGRESS` work. Those remain later governed transitions.
+11. An applied Work Plan may enter the existing Project Master handoff route as `GOAL_WORK_PLAN`. The durable handoff pins the Goal, USER adoption, USER application, applied plan, and exact generated Todo coordinates before delivery. Delivery still creates no Task Frame, authority, assignment, or Todo state transition; those are the next governed execution-loop boundary.
 
 Read routes are `GET /v1/projects/{project_id}/feature-nodes`, `GET /v1/feature-nodes/{feature_id}`, and `GET /v1/goals/{goal_id}/work-plans`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, `GOAL_WORK_PLAN`, adoption and provenance edges without embedding specification or full Work Plan bodies.
 

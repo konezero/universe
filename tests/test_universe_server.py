@@ -7829,6 +7829,51 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertFalse(apply_replay["todo_created"])
         self.assertEqual(2, len([todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"]))
 
+        status, handoff_result = self.request(
+            "POST",
+            "/v1/projects/GCS/master-handoffs",
+            {
+                "source": {
+                    "kind": "GOAL_WORK_PLAN",
+                    "application_id": applied["application"]["application_id"],
+                },
+                "purpose": "Execute the adopted Goal Work Plan.",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        handoff = handoff_result["handoff"]
+        self.assertEqual("PROPOSAL_ONLY", handoff["delivery_state"])
+        self.assertEqual("GOAL_WORK_PLAN", handoff["source"]["kind"])
+        self.assertEqual(goal_id, handoff["source"]["goal"]["goal_id"])
+        self.assertEqual(
+            applied["application"]["application_id"],
+            handoff["source"]["application"]["application_id"],
+        )
+        self.assertEqual(
+            selected["work_plan_id"], handoff["source"]["work_plan"]["work_plan_id"]
+        )
+        self.assertEqual(
+            applied["application"]["created_items"]["todo_ids"],
+            [todo["todo_id"] for todo in handoff["source"]["todos"]],
+        )
+        self.assertTrue(all(value == "NONE" for value in handoff["effects"].values()))
+
+        status, repeated_handoff = self.request(
+            "POST",
+            "/v1/projects/GCS/master-handoffs",
+            {
+                "source": {
+                    "kind": "GOAL_WORK_PLAN",
+                    "application_id": applied["application"]["application_id"],
+                },
+                "purpose": "Execute the adopted Goal Work Plan.",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(handoff["handoff_id"], repeated_handoff["handoff"]["handoff_id"])
+
         status, work_plan_surface = self.request(
             "GET", f"/v1/goals/{goal_id}/work-plans", None, self.token
         )
@@ -11428,6 +11473,31 @@ class UniverseLocalServiceTests(unittest.TestCase):
             if path.is_file()
         }
         self.assertEqual(before, after)
+
+    def test_goal_work_plan_master_handoff_requires_application_reference(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, missing = self.request(
+            "POST",
+            "/v1/projects/GCS/master-handoffs",
+            {"source": {"kind": "GOAL_WORK_PLAN", "adoption_id": "wrong-ref"}},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("MASTER_HANDOFF_SOURCE_REFERENCE_INVALID", missing["error_code"])
+
+        status, unknown = self.request(
+            "POST",
+            "/v1/projects/GCS/master-handoffs",
+            {
+                "source": {
+                    "kind": "GOAL_WORK_PLAN",
+                    "application_id": "work_plan_application_missing",
+                }
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("MASTER_HANDOFF_SOURCE_NOT_FOUND", unknown["error_code"])
 
     def test_experience_case_contains_only_recorded_observations(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

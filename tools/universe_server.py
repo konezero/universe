@@ -3196,20 +3196,26 @@ def normalize_master_handoff_proposal_request(value: Any) -> dict[str, Any]:
     source = _exact_object_fields(
         request["source"],
         field="master_handoff_proposal_request.source",
-        required=frozenset({"kind", "adoption_id"}),
+        required=frozenset({"kind"}),
+        optional=frozenset({"adoption_id", "application_id"}),
     )
     kind = _identifier(source["kind"], "source.kind").upper()
-    if kind not in {"FRESH_PROJECT_COMPOSITION", "SKILL_PLAN"}:
+    if kind not in {"FRESH_PROJECT_COMPOSITION", "SKILL_PLAN", "GOAL_WORK_PLAN"}:
         raise UniverseError(
             "MASTER_HANDOFF_SOURCE_INVALID",
-            "source.kind must be FRESH_PROJECT_COMPOSITION or SKILL_PLAN",
+            "source.kind must be FRESH_PROJECT_COMPOSITION, SKILL_PLAN, or GOAL_WORK_PLAN",
         )
-    normalized: dict[str, Any] = {
-        "source": {
-            "kind": kind,
-            "adoption_id": _identifier(source["adoption_id"], "source.adoption_id"),
-        }
-    }
+    expected_ref = "application_id" if kind == "GOAL_WORK_PLAN" else "adoption_id"
+    unexpected_ref = "adoption_id" if kind == "GOAL_WORK_PLAN" else "application_id"
+    if expected_ref not in source or unexpected_ref in source:
+        raise UniverseError(
+            "MASTER_HANDOFF_SOURCE_REFERENCE_INVALID",
+            f"{kind} requires only source.{expected_ref}",
+        )
+    normalized: dict[str, Any] = {"source": {"kind": kind}}
+    normalized["source"][expected_ref] = _identifier(
+        source[expected_ref], f"source.{expected_ref}"
+    )
     if "purpose" in request:
         normalized["purpose"] = _required_text(request["purpose"], "purpose")
     return normalized
@@ -13216,8 +13222,67 @@ class UniverseStore:
                 "adoption": adoption,
                 "composition": composition,
             }
-        adoption = self._get_skill_plan_adoption(project_id, source["adoption_id"])
-        return {"kind": source["kind"], "adoption": adoption}
+        if source["kind"] == "SKILL_PLAN":
+            adoption = self._get_skill_plan_adoption(project_id, source["adoption_id"])
+            return {"kind": source["kind"], "adoption": adoption}
+        application_id = source["application_id"]
+        with self._connection() as connection:
+            application_row = connection.execute(
+                "SELECT * FROM goal_work_plan_application WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        if application_row is None:
+            raise UniverseError(
+                "MASTER_HANDOFF_SOURCE_NOT_FOUND",
+                "Goal Work Plan application does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        application = self._goal_work_plan_application_row(application_row)
+        surface = self.goal_work_plan_surface(application["goal_id"])
+        goal = surface["goal"]
+        if goal["project_id"] != project_id:
+            raise UniverseError(
+                "MASTER_HANDOFF_PROJECT_MISMATCH",
+                "Goal Work Plan application belongs to another Project",
+                HTTPStatus.CONFLICT,
+            )
+        adoption = surface["adoption"]
+        if (
+            surface["application"] is None
+            or surface["application"]["application_id"] != application_id
+            or adoption is None
+        ):
+            raise UniverseError(
+                "MASTER_HANDOFF_GOAL_WORK_PLAN_INCOMPLETE",
+                "Goal Work Plan application has incomplete adoption provenance",
+                HTTPStatus.CONFLICT,
+            )
+        work_plan = next(
+            (
+                candidate
+                for candidate in surface["candidates"]
+                if candidate["work_plan_id"] == application["work_plan_id"]
+            ),
+            None,
+        )
+        if work_plan is None or work_plan["state"] != "APPLIED":
+            raise UniverseError(
+                "MASTER_HANDOFF_GOAL_WORK_PLAN_INCOMPLETE",
+                "applied Work Plan candidate is unavailable",
+                HTTPStatus.CONFLICT,
+            )
+        todos = [
+            self.get_todo(todo_id)
+            for todo_id in application["created_items"]["todo_ids"]
+        ]
+        return {
+            "kind": source["kind"],
+            "goal": goal,
+            "adoption": adoption,
+            "application": application,
+            "work_plan": work_plan,
+            "todos": todos,
+        }
 
     def create_master_handoff(
         self, project_id: str, value: Any
@@ -13225,6 +13290,10 @@ class UniverseStore:
         project = self.get_project(project_id)
         request = normalize_master_handoff_proposal_request(value)
         source = self._master_handoff_source(project["project_id"], request["source"])
+        source_ref = request["source"].get("adoption_id") or request["source"].get(
+            "application_id"
+        )
+        assert isinstance(source_ref, str)
         material: dict[str, Any] = {
             "schema": PROJECT_MASTER_HANDOFF_SCHEMA,
             "project_id": project["project_id"],
@@ -13254,7 +13323,7 @@ class UniverseStore:
                 (
                     project["project_id"],
                     request["source"]["kind"],
-                    request["source"]["adoption_id"],
+                    source_ref,
                 ),
             ).fetchone()
             if existing is not None:
@@ -13279,7 +13348,7 @@ class UniverseStore:
                     material["handoff_id"],
                     project["project_id"],
                     request["source"]["kind"],
-                    request["source"]["adoption_id"],
+                    source_ref,
                     material["handoff_digest"],
                     _canonical_json(material),
                     "PROPOSAL_ONLY",
