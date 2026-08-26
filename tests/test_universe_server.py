@@ -9502,6 +9502,81 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertNotIn("approval_evidence_ref", run_forwarded)
 
+    def test_closed_boss_room_history_projects_task_frame_timeline(self) -> None:
+        self.server.runtime_host.repository_root = self.project_root
+        frames_root = self.project_root / ".ai" / "runtime" / "task_frames"
+        frames_root.mkdir(parents=True, exist_ok=True)
+        frame_id = "history-frame-001"
+        frame_db = frames_root / "history.sqlite3"
+        connection = sqlite3.connect(frame_db)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE task_frame_context (
+                    singleton INTEGER PRIMARY KEY, frame_id TEXT NOT NULL, task_state TEXT NOT NULL
+                );
+                CREATE TABLE task_journal (
+                    event_ordinal INTEGER PRIMARY KEY, event_type TEXT NOT NULL,
+                    turn_id TEXT NOT NULL, details_json TEXT NOT NULL, observed_at TEXT NOT NULL
+                );
+                CREATE TABLE boss_allocations (
+                    allocation_ordinal INTEGER PRIMARY KEY, turn_id TEXT NOT NULL,
+                    task_text TEXT NOT NULL, recorded_at TEXT NOT NULL
+                );
+                CREATE TABLE task_turns (
+                    turn_ordinal INTEGER PRIMARY KEY, turn_id TEXT NOT NULL, role TEXT NOT NULL,
+                    state TEXT NOT NULL, result_json TEXT NOT NULL, review_decision TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL, completed_at TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO task_frame_context VALUES (1, ?, 'COMPLETED')", (frame_id,)
+            )
+            connection.execute(
+                "INSERT INTO task_journal VALUES (1, 'TURN_CLAIMED', 'review', '{}', '2026-08-26T00:00:00Z')"
+            )
+            connection.execute(
+                "INSERT INTO boss_allocations VALUES (1, 'review', 'Review the implementation.', '2026-08-26T00:00:01Z')"
+            )
+            connection.execute(
+                "INSERT INTO task_turns VALUES (1, 'review', 'QA_REVIEWER', 'COMPLETED', ?, '', '', '2026-08-26T00:00:02Z', '2026-08-26T00:00:00Z')",
+                (json.dumps({"outcome": "SUCCEEDED", "summary": "Review passed."}),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        room = self.server.multi_rooms.create_boss_room(
+            project_id="GCS", task_frame_id=frame_id
+        )
+        self.server.multi_rooms.close_room(room["room_id"])
+
+        open_status, open_rooms = self.request("GET", "/v1/rooms", None, self.token)
+        history_status, all_rooms = self.request(
+            "GET", "/v1/rooms?state=ALL", None, self.token
+        )
+        snapshot_status, snapshot = self.request(
+            "GET", f"/v1/rooms/{room['room_id']}", None, self.token
+        )
+
+        self.assertEqual(HTTPStatus.OK, open_status)
+        self.assertEqual(HTTPStatus.OK, history_status)
+        self.assertEqual(HTTPStatus.OK, snapshot_status)
+        self.assertNotIn(room["room_id"], {item["room_id"] for item in open_rooms["rooms"]})
+        self.assertIn(room["room_id"], {item["room_id"] for item in all_rooms["rooms"]})
+        timeline = snapshot["task_frame_timeline"]
+        self.assertEqual("TASK_FRAME_TIMELINE_AVAILABLE", timeline["status"])
+        self.assertEqual("COMPLETED", timeline["task_state"])
+        self.assertEqual(
+            {"LIFECYCLE", "ALLOCATION", "RESULT"},
+            {entry["entry_kind"] for entry in timeline["entries"]},
+        )
+        self.assertIn(
+            "Review passed.",
+            [entry["body_text"] for entry in timeline["entries"]],
+        )
+
     def test_conductor_approval_uses_durable_governance_decision(self) -> None:
         proposal = self.create_task_proposal_fixture()
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

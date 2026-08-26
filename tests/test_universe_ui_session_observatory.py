@@ -771,6 +771,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn('/todos', feature_slice)
         self.assertIn(".meeting-feature-controls", CSS)
 
+    def test_boss_room_history_and_task_frame_conversation_are_visible(self) -> None:
+        self.assertIn('<small>Rooms</small>', HTML)
+        self.assertIn('api("/v1/rooms?state=ALL")', APP)
+        self.assertIn('multiRoomStateFilter: "OPEN"', APP)
+        self.assertIn('function renderTaskFrameTimeline', APP)
+        self.assertIn('source.addEventListener("task-frame"', APP)
+        self.assertIn('snap.task_frame_timeline', APP)
+        self.assertIn('.task-frame-timeline', CSS)
+
     def test_semantic_project_graph_is_separate_from_session_graph(self) -> None:
         self.assertIn('/semantic-graph', APP)
         self.assertIn('function buildSemanticProjectGraph', APP)

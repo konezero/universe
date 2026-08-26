@@ -27693,11 +27693,184 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "pending_delivery": delivery,
         }
 
+    def _task_frame_room_timeline(
+        self, task_frame_id: str, project_id: str = ""
+    ) -> dict[str, Any]:
+        """Project one Task Frame journal as a bounded operator conversation."""
+
+        frame_id = str(task_frame_id or "").strip()
+        unavailable = {
+            "schema": "universe.task-frame-room-timeline.v1",
+            "status": "TASK_FRAME_TIMELINE_UNAVAILABLE",
+            "task_frame_id": frame_id,
+            "task_state": "UNKNOWN",
+            "entries": [],
+        }
+        if not frame_id:
+            return unavailable
+        repository_roots = [self.runtime_host.repository_root]
+        if project_id:
+            try:
+                project = self.store.get_project(project_id)
+                project_root = Path(str(project.get("project_root") or "")).resolve()
+                if project_root not in repository_roots:
+                    repository_roots.append(project_root)
+            except (OSError, UniverseError):
+                pass
+        paths: list[Path] = []
+        try:
+            for repository_root in repository_roots:
+                frames_root = repository_root / ".ai" / "runtime" / "task_frames"
+                if frames_root.is_dir():
+                    paths.extend(frames_root.glob("*.sqlite3"))
+            paths.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        except OSError:
+            return unavailable
+        for database_path in paths:
+            try:
+                connection = sqlite3.connect(
+                    f"file:{database_path.as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=0.25,
+                )
+                connection.row_factory = sqlite3.Row
+                try:
+                    tables = {
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    if "task_frame_context" not in tables:
+                        continue
+                    context = connection.execute(
+                        "SELECT frame_id, task_state FROM task_frame_context WHERE singleton = 1"
+                    ).fetchone()
+                    if context is None or str(context["frame_id"]) != frame_id:
+                        continue
+                    entries: list[dict[str, Any]] = []
+                    if "task_journal" in tables:
+                        for row in connection.execute(
+                            "SELECT event_ordinal, event_type, turn_id, details_json, observed_at "
+                            "FROM task_journal ORDER BY event_ordinal"
+                        ):
+                            try:
+                                details = json.loads(str(row["details_json"] or "{}"))
+                            except (TypeError, json.JSONDecodeError):
+                                details = {}
+                            safe_detail: list[str] = []
+                            if isinstance(details, Mapping):
+                                for key in (
+                                    "status",
+                                    "reason",
+                                    "failure_code",
+                                    "failure_reason",
+                                    "review_decision",
+                                ):
+                                    value = details.get(key)
+                                    if value not in (None, "", []):
+                                        safe_detail.append(f"{key}: {str(value)[:2000]}")
+                                turn_ids = details.get("turn_ids")
+                                if isinstance(turn_ids, list):
+                                    safe_detail.append(
+                                        "turns: " + ", ".join(str(value) for value in turn_ids[:32])
+                                    )
+                            event_type = str(row["event_type"])
+                            entries.append(
+                                {
+                                    "entry_id": f"journal:{row['event_ordinal']}",
+                                    "entry_kind": "LIFECYCLE",
+                                    "author_role": "SYSTEM",
+                                    "turn_id": str(row["turn_id"] or ""),
+                                    "title": event_type.replace("_", " ").title(),
+                                    "body_text": "\n".join(safe_detail),
+                                    "state": event_type,
+                                    "observed_at": str(row["observed_at"]),
+                                    "sort_ordinal": int(row["event_ordinal"]) * 10,
+                                }
+                            )
+                    if "boss_allocations" in tables:
+                        for row in connection.execute(
+                            "SELECT allocation_ordinal, turn_id, task_text, recorded_at "
+                            "FROM boss_allocations ORDER BY allocation_ordinal"
+                        ):
+                            entries.append(
+                                {
+                                    "entry_id": f"allocation:{row['allocation_ordinal']}",
+                                    "entry_kind": "ALLOCATION",
+                                    "author_role": "BOSS",
+                                    "turn_id": str(row["turn_id"]),
+                                    "title": f"Assigned {row['turn_id']}",
+                                    "body_text": str(row["task_text"] or "")[:12000],
+                                    "state": "ALLOCATED",
+                                    "observed_at": str(row["recorded_at"]),
+                                    "sort_ordinal": int(row["allocation_ordinal"]) * 10 + 5,
+                                }
+                            )
+                    if "task_turns" in tables:
+                        for row in connection.execute(
+                            "SELECT turn_ordinal, turn_id, role, state, result_json, "
+                            "review_decision, claimed_at, completed_at, created_at "
+                            "FROM task_turns ORDER BY turn_ordinal"
+                        ):
+                            try:
+                                result = json.loads(str(row["result_json"] or "{}"))
+                            except (TypeError, json.JSONDecodeError):
+                                result = {}
+                            summary = result.get("summary") if isinstance(result, Mapping) else None
+                            outcome = result.get("outcome") if isinstance(result, Mapping) else None
+                            if not isinstance(summary, str) or not summary.strip():
+                                continue
+                            role = str(row["role"] or "WORKER")
+                            entries.append(
+                                {
+                                    "entry_id": f"result:{row['turn_ordinal']}",
+                                    "entry_kind": "RESULT",
+                                    "author_role": role,
+                                    "turn_id": str(row["turn_id"]),
+                                    "title": f"{role.replace('_', ' ').title()} result",
+                                    "body_text": summary.strip()[:24000],
+                                    "state": str(row["state"]),
+                                    "outcome": str(outcome or row["review_decision"] or ""),
+                                    "observed_at": str(
+                                        row["completed_at"] or row["claimed_at"] or row["created_at"]
+                                    ),
+                                    "sort_ordinal": int(row["turn_ordinal"]) * 10 + 9,
+                                }
+                            )
+                    entries.sort(
+                        key=lambda item: (
+                            str(item.get("observed_at") or ""),
+                            int(item.get("sort_ordinal") or 0),
+                            str(item.get("entry_id") or ""),
+                        )
+                    )
+                    for item in entries:
+                        item.pop("sort_ordinal", None)
+                    return {
+                        "schema": "universe.task-frame-room-timeline.v1",
+                        "status": "TASK_FRAME_TIMELINE_AVAILABLE",
+                        "task_frame_id": frame_id,
+                        "task_state": str(context["task_state"] or "UNKNOWN"),
+                        "entries": entries[-400:],
+                    }
+                finally:
+                    connection.close()
+            except (OSError, sqlite3.Error):
+                continue
+        return unavailable
+
     def multi_room_snapshot(self, room_id: str) -> dict[str, Any]:
         snapshot = self.multi_rooms.room_snapshot(room_id)
         snapshot["permissions"] = self.room_participant_permissions.list_requests(
             room_id
         )
+        room = snapshot.get("room")
+        if isinstance(room, Mapping) and room.get("room_type") == "BOSS":
+            snapshot["task_frame_timeline"] = self._task_frame_room_timeline(
+                str(room.get("task_frame_id") or ""),
+                str(room.get("project_id") or ""),
+            )
         return snapshot
 
 
@@ -31472,9 +31645,14 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 query_map = parse_qs(urlsplit(self.path).query)
                 project_id = (query_map.get("project_id") or [None])[0]
                 room_type = (query_map.get("room_type") or [None])[0]
+                requested_state = str(
+                    (query_map.get("state") or ["OPEN"])[0] or "OPEN"
+                ).upper()
+                room_state = None if requested_state == "ALL" else requested_state
                 rooms = self.server.multi_rooms.list_rooms(
                     project_id=project_id or None,
                     room_type=room_type or None,
+                    state=room_state,
                 )
                 self._send(
                     HTTPStatus.OK,
@@ -35996,6 +36174,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 "participant_cursors": snapshot["participant_cursors"],
                 "bridge_line": snapshot["bridge_line"],
                 "permissions": snapshot["permissions"],
+                "task_frame_timeline": snapshot.get("task_frame_timeline"),
             },
         )
         cursor = self.server.multi_rooms.hub.cursor()
@@ -36007,7 +36186,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     timeout_seconds=15.0,
                 )
                 if not events:
-                    write_event("ping", {"type": "PING", "at": utc_now()})
+                    room = snapshot.get("room")
+                    if isinstance(room, Mapping) and room.get("room_type") == "BOSS":
+                        write_event(
+                            "task-frame",
+                            self.server._task_frame_room_timeline(
+                                str(room.get("task_frame_id") or ""),
+                                str(room.get("project_id") or ""),
+                            ),
+                        )
+                    else:
+                        write_event("ping", {"type": "PING", "at": utc_now()})
                     continue
                 for event in events:
                     cursor = max(cursor, int(event["event_id"]))

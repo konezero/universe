@@ -2827,7 +2827,18 @@ dialog label {
 }
 .danger-action { color: var(--ws-coral, #ff7c68); border-color: rgba(255,124,104,.4); }
 .danger-action:disabled { opacity: .38; pointer-events: none; }
-.multi-room-list-header { display: flex; justify-content: flex-end; padding: 4px 0 6px; }
+.multi-room-list-header { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0 6px; }
+.room-state-tabs { display: flex; gap: 6px; }
+.room-state-tabs .selected { border-color: var(--blue); color: var(--blue); }
+.task-frame-timeline,
+.room-message-transcript { display: grid; gap: 8px; margin-top: 12px; }
+.task-frame-timeline-heading,
+.task-frame-entry-meta { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.task-frame-entry { padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: color-mix(in srgb, var(--surface) 88%, transparent); }
+.task-frame-entry.allocation { border-left: 3px solid var(--blue); }
+.task-frame-entry.result { border-left: 3px solid var(--green); }
+.task-frame-entry.lifecycle { opacity: .78; }
+.task-frame-entry-body { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; font: inherit; color: var(--text); }
 
 .wizard-handoff-actions {
   display: flex;

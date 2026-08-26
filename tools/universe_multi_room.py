@@ -578,21 +578,29 @@ class MultiRoomStore:
         *,
         project_id: str | None = None,
         room_type: str | None = None,
-        state: str = "OPEN",
+        state: str | None = "OPEN",
     ) -> list[dict[str, Any]]:
-        clauses = ["state = ?"]
-        params: list[Any] = [state if state in ROOM_STATES else "OPEN"]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state if state in ROOM_STATES else "OPEN")
         if project_id:
             clauses.append("project_id = ?")
             params.append(project_id)
         if room_type:
             clauses.append("room_type = ?")
             params.append(room_type.upper())
+        where_sql = (
+            " WHERE " + " AND ".join(f"r.{clause}" for clause in clauses)
+            if clauses
+            else ""
+        )
         sql = (
             "SELECT r.*, COUNT(b.binding_id) AS participant_count"
             " FROM chat_room r"
             " LEFT JOIN chat_room_session b ON b.room_id = r.room_id AND b.state = 'ACTIVE'"
-            " WHERE " + " AND ".join(f"r.{c}" for c in clauses)
+            + where_sql
             + " GROUP BY r.room_id"
             + " ORDER BY r.created_at DESC, r.room_id DESC"
         )

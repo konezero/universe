@@ -62,6 +62,27 @@ class MultiRoomStoreTests(unittest.TestCase):
             snap["bindings"][0]["session_anchor_ref"],
         )
 
+    def test_room_listing_can_include_open_and_closed_states(self) -> None:
+        open_room = self.store.create_boss_room(
+            project_id="proj_demo", task_frame_id="tf_open"
+        )
+        closed_room = self.store.create_boss_room(
+            project_id="proj_demo", task_frame_id="tf_closed"
+        )
+        self.store.close_room(closed_room["room_id"])
+
+        self.assertEqual(
+            [open_room["room_id"]],
+            [room["room_id"] for room in self.store.list_rooms(room_type="BOSS")],
+        )
+        self.assertEqual(
+            {open_room["room_id"], closed_room["room_id"]},
+            {
+                room["room_id"]
+                for room in self.store.list_rooms(room_type="BOSS", state=None)
+            },
+        )
+
     def test_boss_room_user_cannot_write(self) -> None:
         room = self.store.create_boss_room(
             project_id="proj_demo",

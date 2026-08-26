@@ -113,6 +113,7 @@ const state = {
   /** Last delivery mode observed for each opaque provider chat key. */
   providerLiveDelivery: {},
   multiRooms: [],
+  multiRoomStateFilter: "OPEN",
   activeMultiRoomId: null,
   activeMultiRoomSnapshot: null,
   multiRoomTargetBindingIds: [],
@@ -6464,19 +6465,33 @@ function startRendezvousRefreshTimer() {
 
 async function refreshMultiRooms() {
   if (!elements.multiRoomList) return;
-  const data = await api("/v1/rooms");
+  const data = await api("/v1/rooms?state=ALL");
   state.multiRooms = data.rooms || [];
+  const stateFilter = state.multiRoomStateFilter || "OPEN";
   const showAll = state.multiRoomShowAll || false;
-  const emptyMeeting = state.multiRooms.filter(
-    (r) => r.room_type === "MEETING" && (r.participant_count || 0) === 0
+  const stateRooms = state.multiRooms.filter((room) => room.state === stateFilter);
+  const emptyMeeting = stateRooms.filter(
+    (room) => room.room_type === "MEETING" && (room.participant_count || 0) === 0
   );
   const visible = showAll
-    ? state.multiRooms
-    : state.multiRooms.filter(
-        (r) => r.room_type !== "MEETING" || (r.participant_count || 0) > 0
+    ? stateRooms
+    : stateRooms.filter(
+        (room) => room.room_type !== "MEETING" || (room.participant_count || 0) > 0
       );
   elements.multiRoomList.replaceChildren();
   const header = node("div", "multi-room-list-header");
+  const stateTabs = node("div", "room-state-tabs");
+  for (const [value, label] of [["OPEN", "Live"], ["CLOSED", "History"]]) {
+    const tab = node("button", "secondary-button compact-action", label);
+    tab.type = "button";
+    tab.classList.toggle("selected", stateFilter === value);
+    tab.setAttribute("aria-pressed", stateFilter === value ? "true" : "false");
+    tab.addEventListener("click", () => {
+      state.multiRoomStateFilter = value;
+      refreshMultiRooms().catch(() => {});
+    });
+    stateTabs.append(tab);
+  }
   const toggle = node("button", "secondary-button compact-action");
   toggle.type = "button";
   toggle.textContent = showAll
@@ -6487,10 +6502,12 @@ async function refreshMultiRooms() {
     state.multiRoomShowAll = !showAll;
     refreshMultiRooms().catch(() => {});
   });
-  header.append(toggle);
+  header.append(stateTabs, toggle);
   elements.multiRoomList.append(header);
   if (!visible.length) {
-    elements.multiRoomList.append(node("p", "empty-copy", showAll ? "No rooms yet" : "No active rooms"));
+    elements.multiRoomList.append(
+      node("p", "empty-copy", stateFilter === "CLOSED" ? "No room history yet" : "No active rooms")
+    );
     return;
   }
   for (const room of visible) {
@@ -7018,6 +7035,35 @@ async function openMultiRoom(roomId) {
   openMultiRoomStream(roomId);
 }
 
+function renderTaskFrameTimeline(timeline) {
+  const panel = node("section", "task-frame-timeline");
+  const entries = timeline?.entries || [];
+  const heading = node("div", "task-frame-timeline-heading");
+  heading.append(
+    node("strong", "", "Task Frame collaboration"),
+    node("small", "", `${timeline?.task_state || "UNKNOWN"} · ${entries.length} events`)
+  );
+  panel.append(heading);
+  if (!entries.length) {
+    panel.append(node("p", "empty-copy", "No Task Frame conversation evidence yet"));
+    return panel;
+  }
+  for (const entry of entries) {
+    const item = node("article", `task-frame-entry ${String(entry.entry_kind || "lifecycle").toLowerCase()}`);
+    const meta = node("div", "task-frame-entry-meta");
+    meta.append(
+      node("strong", "", `${entry.author_role || "SYSTEM"} · ${entry.title || entry.state || "Event"}`),
+      node("small", "", [entry.turn_id, entry.state, entry.outcome, entry.observed_at]
+        .filter(Boolean)
+        .join(" · "))
+    );
+    item.append(meta);
+    if (entry.body_text) item.append(node("pre", "task-frame-entry-body", entry.body_text));
+    panel.append(item);
+  }
+  return panel;
+}
+
 function renderActiveMultiRoom() {
   const snap = state.activeMultiRoomSnapshot;
   if (!snap || !elements.multiRoomDetail) return;
@@ -7210,20 +7256,24 @@ function renderActiveMultiRoom() {
     }
     artifactList.append(row);
   }
-  const transcript = node("pre", "remote-access-endpoint");
-  transcript.textContent = (snap.messages || [])
-    .slice(-5)
-    .map((message) => `${message.author_role}: ${message.body_text}`)
-    .join("\n");
-  elements.multiRoomDetail.replaceChildren(
-    summary,
-    participantList,
-    permissionList,
-    featurePanel,
-    findingList,
-    artifactList,
-    transcript
-  );
+  const transcript = node("section", "room-message-transcript");
+  transcript.append(node("strong", "", "Room messages"));
+  const messages = snap.messages || [];
+  if (!messages.length) transcript.append(node("p", "empty-copy", "No room messages yet"));
+  for (const message of messages) {
+    const item = node("article", "task-frame-entry message");
+    item.append(
+      node("strong", "", message.author_role || "ROOM"),
+      node("pre", "task-frame-entry-body", message.body_text || "")
+    );
+    transcript.append(item);
+  }
+  const detail = [summary, participantList, permissionList];
+  if (room.room_type === "BOSS") {
+    detail.push(renderTaskFrameTimeline(snap.task_frame_timeline));
+  }
+  detail.push(featurePanel, findingList, artifactList, transcript);
+  elements.multiRoomDetail.replaceChildren(...detail);
 }
 
 async function setRoomParticipantControl(roomId, bindingId, action) {
@@ -7262,9 +7312,18 @@ function openMultiRoomStream(roomId) {
       bridge_line: payload.bridge_line || "",
       permissions:
         payload.permissions || state.activeMultiRoomSnapshot?.permissions || [],
+      task_frame_timeline:
+        payload.task_frame_timeline || state.activeMultiRoomSnapshot?.task_frame_timeline,
       write_roles: state.activeMultiRoomSnapshot?.write_roles || [],
       user_may_write: state.activeMultiRoomSnapshot?.user_may_write || false,
     };
+    renderActiveMultiRoom();
+  });
+  source.addEventListener("task-frame", (event) => {
+    if (state.activeMultiRoomId !== roomId) return;
+    const timeline = JSON.parse(event.data);
+    if (!state.activeMultiRoomSnapshot) return;
+    state.activeMultiRoomSnapshot.task_frame_timeline = timeline;
     renderActiveMultiRoom();
   });
   source.addEventListener("room", (event) => {
