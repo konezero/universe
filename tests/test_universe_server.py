@@ -449,7 +449,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIsNone(payload["file"])
 
     def create_task_proposal_fixture(
-        self, *, scope: JsonObject | None = None
+        self,
+        *,
+        scope: JsonObject | None = None,
+        request_ref: str = "universe://project-room/messages/request-001",
     ) -> JsonObject:
         database_path = (
             self.project_root
@@ -468,7 +471,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "repository_ref": str(self.project_root),
             "task_summary": "Implement the rendezvous endpoint",
             "boundary": "tools and tests only",
-            "request_ref": "universe://project-room/messages/request-001",
+            "request_ref": request_ref,
             "scope": scope or {"operations": ["MODIFY"], "roots": ["tools", "tests"]},
             "source_ref": "git:" + "b" * 40,
             "created_at": "2026-08-03T00:00:00Z",
@@ -7845,6 +7848,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         handoff = handoff_result["handoff"]
         self.assertEqual("PROPOSAL_ONLY", handoff["delivery_state"])
         self.assertEqual("GOAL_WORK_PLAN", handoff["source"]["kind"])
+        self.assertEqual(
+            "universe://projects/GCS/goal-work-plan-applications/"
+            + applied["application"]["application_id"],
+            handoff["instruction_ref"],
+        )
         self.assertEqual(goal_id, handoff["source"]["goal"]["goal_id"])
         self.assertEqual(
             applied["application"]["application_id"],
@@ -7873,6 +7881,114 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(handoff["handoff_id"], repeated_handoff["handoff"]["handoff_id"])
+
+        proposal = self.create_task_proposal_fixture(
+            request_ref=handoff["instruction_ref"]
+        )
+        frame_request = {
+            "handoff_digest": handoff["handoff_digest"],
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "task_frame": {"frame_id": "goal-plan-frame-001"},
+        }
+        status, not_delivered = self.request(
+            "POST",
+            f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}"
+            "/instruction-task-frame",
+            frame_request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("MASTER_HANDOFF_DELIVERY_REQUIRED", not_delivered["error_code"])
+
+        with self.server.store._connection() as connection:
+            connection.execute(
+                """
+                UPDATE project_master_handoff
+                SET delivery_state = 'QUEUED_FOR_MASTER',
+                    room_message_id = 'room_0123456789abcdef0123456789abcdef',
+                    delivered_at = ?
+                WHERE handoff_id = ?
+                """,
+                ("2026-08-27T00:00:00Z", handoff["handoff_id"]),
+            )
+        proposal_database = (
+            self.project_root
+            / ".ai"
+            / "runtime"
+            / "task_frames"
+            / "task-proposals.sqlite3"
+        )
+        connection = sqlite3.connect(proposal_database)
+        try:
+            wrong_lineage = {**proposal, "request_ref": "universe://wrong-handoff"}
+            connection.execute(
+                "UPDATE proposal SET proposal_json = ? WHERE proposal_id = ?",
+                (
+                    json.dumps(wrong_lineage, sort_keys=True, separators=(",", ":")),
+                    proposal["proposal_id"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        status, wrong_proposal = self.request(
+            "POST",
+            f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}"
+            "/instruction-task-frame",
+            frame_request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "MASTER_HANDOFF_PROPOSAL_LINEAGE_MISMATCH",
+            wrong_proposal["error_code"],
+        )
+        connection = sqlite3.connect(proposal_database)
+        try:
+            connection.execute(
+                "UPDATE proposal SET proposal_json = ? WHERE proposal_id = ?",
+                (
+                    json.dumps(proposal, sort_keys=True, separators=(",", ":")),
+                    proposal["proposal_id"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        created_frame = {
+            "schema": "universe.local-service.v1",
+            "status": "INSTRUCTION_TASK_FRAME_CREATED",
+            "task_frame": {"task_frame_id": "goal-plan-frame-001"},
+        }
+        with patch.object(
+            self.server,
+            "create_instruction_authorized_task_frame",
+            return_value=created_frame,
+        ) as create_frame:
+            status, bound = self.request(
+                "POST",
+                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}"
+                "/instruction-task-frame",
+                frame_request,
+                self.token,
+            )
+            replay_status, replay_binding = self.request(
+                "POST",
+                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}"
+                "/instruction-task-frame",
+                frame_request,
+                self.token,
+            )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("GOAL_HANDOFF_TASK_FRAME_BOUND", bound["status"])
+        self.assertEqual("goal-plan-frame-001", bound["binding"]["task_frame_id"])
+        self.assertEqual(handoff["instruction_ref"], bound["binding"]["instruction_ref"])
+        self.assertEqual(HTTPStatus.OK, replay_status)
+        self.assertEqual(
+            "GOAL_HANDOFF_TASK_FRAME_ALREADY_BOUND", replay_binding["status"]
+        )
+        create_frame.assert_called_once()
 
         status, work_plan_surface = self.request(
             "GET", f"/v1/goals/{goal_id}/work-plans", None, self.token

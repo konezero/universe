@@ -393,6 +393,9 @@ FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA = (
 FRESH_PROJECT_REFINEMENT_RUN_SCHEMA = "universe.fresh-project-refinement-run.v1"
 PLANNING_RUNTIME_BINDING_SCHEMA = "universe.planning-runtime-binding.v1"
 PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
+PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA = (
+    "universe.project-master-handoff-task-frame-binding.v1"
+)
 PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA = (
     "universe.project-skill-plan-master-application.v1"
 )
@@ -3236,6 +3239,26 @@ def normalize_master_handoff_delivery_request(value: Any) -> dict[str, Any]:
     return {"approval": "DELIVER"}
 
 
+def normalize_master_handoff_task_frame_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_handoff_task_frame_request",
+        required=frozenset(
+            {"handoff_digest", "proposal_id", "proposal_digest", "task_frame"}
+        ),
+    )
+    if not isinstance(request["task_frame"], Mapping):
+        raise UniverseError(
+            "MASTER_HANDOFF_TASK_FRAME_INVALID", "task_frame must be an object"
+        )
+    return {
+        "handoff_digest": _sha256(request["handoff_digest"], "handoff_digest"),
+        "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
+        "proposal_digest": _sha256(request["proposal_digest"], "proposal_digest"),
+        "task_frame": dict(request["task_frame"]),
+    }
+
+
 def normalize_experience_case_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -5626,6 +5649,26 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_master_handoff_project_time
                 ON project_master_handoff(project_id, created_at, handoff_id);
+
+                CREATE TABLE IF NOT EXISTS project_master_handoff_task_frame (
+                    handoff_id TEXT PRIMARY KEY
+                        REFERENCES project_master_handoff(handoff_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    instruction_ref TEXT NOT NULL,
+                    proposal_id TEXT NOT NULL,
+                    proposal_digest TEXT NOT NULL,
+                    task_frame_id TEXT NOT NULL UNIQUE,
+                    binding_digest TEXT NOT NULL UNIQUE,
+                    bound_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_master_handoff_task_frame_project
+                ON project_master_handoff_task_frame(
+                    project_id, bound_at, handoff_id
+                );
 
                 CREATE TABLE IF NOT EXISTS project_skill_plan_master_application (
                     handoff_id TEXT PRIMARY KEY
@@ -13308,6 +13351,13 @@ class UniverseStore:
             },
             "next_operation": "USER_APPROVAL_REQUIRED_FOR_MASTER_DELIVERY",
         }
+        if request["source"]["kind"] == "GOAL_WORK_PLAN":
+            material["instruction_ref"] = (
+                "universe://projects/"
+                + quote(project["project_id"], safe="")
+                + "/goal-work-plan-applications/"
+                + quote(source_ref, safe="")
+            )
         if "purpose" in request:
             material["purpose"] = request["purpose"]
         material["handoff_digest"] = _json_sha256(material)
@@ -13377,6 +13427,96 @@ class UniverseStore:
                 HTTPStatus.NOT_FOUND,
             )
         return self._master_handoff_row(row)
+
+    def get_master_handoff_task_frame_binding(
+        self, project_id: str, handoff_id: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        normalized_handoff = _identifier(handoff_id, "handoff_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM project_master_handoff_task_frame
+                WHERE project_id = ? AND handoff_id = ?
+                """,
+                (project["project_id"], normalized_handoff),
+            ).fetchone()
+        return None if row is None else self._master_handoff_task_frame_binding_row(row)
+
+    def record_master_handoff_task_frame_binding(
+        self,
+        *,
+        project_id: str,
+        handoff_id: str,
+        instruction_ref: str,
+        proposal_id: str,
+        proposal_digest: str,
+        task_frame_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        material = {
+            "schema": PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA,
+            "project_id": project["project_id"],
+            "handoff_id": _identifier(handoff_id, "handoff_id"),
+            "instruction_ref": _required_text(instruction_ref, "instruction_ref"),
+            "proposal_id": _identifier(proposal_id, "proposal_id"),
+            "proposal_digest": _sha256(proposal_digest, "proposal_digest"),
+            "task_frame_id": _identifier(task_frame_id, "task_frame_id"),
+        }
+        binding_digest = _json_sha256(material)
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM project_master_handoff_task_frame WHERE handoff_id = ?",
+                (material["handoff_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = self._master_handoff_task_frame_binding_row(existing)
+                if current["binding_digest"] != binding_digest:
+                    raise UniverseError(
+                        "MASTER_HANDOFF_TASK_FRAME_BINDING_CONFLICT",
+                        "Master handoff is already bound to another proposal or Task Frame",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            bound_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO project_master_handoff_task_frame(
+                    handoff_id, project_id, instruction_ref, proposal_id,
+                    proposal_digest, task_frame_id, binding_digest, bound_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["handoff_id"],
+                    material["project_id"],
+                    material["instruction_ref"],
+                    material["proposal_id"],
+                    material["proposal_digest"],
+                    material["task_frame_id"],
+                    binding_digest,
+                    bound_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM project_master_handoff_task_frame WHERE handoff_id = ?",
+                (material["handoff_id"],),
+            ).fetchone()
+        assert row is not None
+        return self._master_handoff_task_frame_binding_row(row), True
+
+    @staticmethod
+    def _master_handoff_task_frame_binding_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA,
+            "project_id": str(row["project_id"]),
+            "handoff_id": str(row["handoff_id"]),
+            "instruction_ref": str(row["instruction_ref"]),
+            "proposal_id": str(row["proposal_id"]),
+            "proposal_digest": str(row["proposal_digest"]),
+            "task_frame_id": str(row["task_frame_id"]),
+            "binding_digest": str(row["binding_digest"]),
+            "bound_at": str(row["bound_at"]),
+        }
 
     def list_master_handoffs(
         self, project_id: str, *, limit: int = 100
@@ -22752,6 +22892,131 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "task_frame": dict(host_result),
             "task_frame_room": task_frame_room,
         }
+
+    def create_goal_handoff_instruction_task_frame(
+        self, project_id: str, handoff_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Bind one delivered Goal handoff to its exact Master proposal and frame."""
+
+        request = normalize_master_handoff_task_frame_request(value)
+        project = self.store.get_project(project_id)
+        handoff = self.store.get_master_handoff(project["project_id"], handoff_id)
+        if handoff.get("source", {}).get("kind") != "GOAL_WORK_PLAN":
+            raise UniverseError(
+                "MASTER_HANDOFF_GOAL_WORK_PLAN_REQUIRED",
+                "only a GOAL_WORK_PLAN handoff may use this transition",
+                HTTPStatus.CONFLICT,
+            )
+        if handoff["handoff_digest"] != request["handoff_digest"]:
+            raise UniverseError(
+                "MASTER_HANDOFF_DIGEST_MISMATCH",
+                "handoff digest does not match the durable receipt",
+                HTTPStatus.CONFLICT,
+            )
+        instruction_ref = handoff.get("instruction_ref")
+        if not isinstance(instruction_ref, str) or not instruction_ref.strip():
+            raise UniverseError(
+                "MASTER_HANDOFF_INSTRUCTION_REF_UNAVAILABLE",
+                "Goal handoff has no exact parent instruction reference",
+                HTTPStatus.CONFLICT,
+            )
+        if handoff["delivery_state"] == "PROPOSAL_ONLY" or not handoff.get(
+            "room_message_id"
+        ):
+            raise UniverseError(
+                "MASTER_HANDOFF_DELIVERY_REQUIRED",
+                "deliver the Goal handoff to Project Master before binding a proposal",
+                HTTPStatus.CONFLICT,
+            )
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == request["proposal_id"]
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "Project Master governance Proposal does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        if proposal.get("proposal_digest") != request["proposal_digest"]:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH",
+                "proposal digest does not match the Master proposal",
+                HTTPStatus.CONFLICT,
+            )
+        if proposal.get("request_ref") != instruction_ref:
+            raise UniverseError(
+                "MASTER_HANDOFF_PROPOSAL_LINEAGE_MISMATCH",
+                "Master proposal does not cite the exact Goal handoff instruction_ref",
+                HTTPStatus.CONFLICT,
+            )
+        frame_id = _identifier(
+            request["task_frame"].get("frame_id"), "task_frame.frame_id"
+        )
+        existing = self.store.get_master_handoff_task_frame_binding(
+            project["project_id"], handoff["handoff_id"]
+        )
+        if existing is not None:
+            if (
+                existing["instruction_ref"] != instruction_ref
+                or existing["proposal_id"] != proposal["proposal_id"]
+                or existing["proposal_digest"] != proposal["proposal_digest"]
+                or existing["task_frame_id"] != frame_id
+            ):
+                raise UniverseError(
+                    "MASTER_HANDOFF_TASK_FRAME_BINDING_CONFLICT",
+                    "Master handoff is already bound to another proposal or Task Frame",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "GOAL_HANDOFF_TASK_FRAME_ALREADY_BOUND",
+                "project_id": project["project_id"],
+                "handoff": handoff,
+                "proposal": proposal,
+                "binding": existing,
+                "task_frame": None,
+            }, False
+        created_frame = self.create_instruction_authorized_task_frame(
+            project["project_id"],
+            proposal["proposal_id"],
+            {
+                "proposal_digest": proposal["proposal_digest"],
+                "task_frame": request["task_frame"],
+            },
+        )
+        host_frame = created_frame.get("task_frame")
+        if not isinstance(host_frame, Mapping) or host_frame.get(
+            "task_frame_id"
+        ) != frame_id:
+            raise UniverseError(
+                "MASTER_HANDOFF_TASK_FRAME_RECEIPT_INVALID",
+                "Project Master returned a different Task Frame coordinate",
+                HTTPStatus.CONFLICT,
+            )
+        binding, bound = self.store.record_master_handoff_task_frame_binding(
+            project_id=project["project_id"],
+            handoff_id=handoff["handoff_id"],
+            instruction_ref=instruction_ref,
+            proposal_id=proposal["proposal_id"],
+            proposal_digest=proposal["proposal_digest"],
+            task_frame_id=frame_id,
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_HANDOFF_TASK_FRAME_BOUND",
+            "project_id": project["project_id"],
+            "handoff": handoff,
+            "proposal": proposal,
+            "binding": binding,
+            "task_frame": created_frame,
+        }, bound
 
     def _ensure_task_frame_room(
         self,
@@ -34749,6 +35014,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     result,
                 )
                 return
+            handoff_frame_parts = self._goal_handoff_task_frame_path(path)
+            if handoff_frame_parts is not None:
+                result, created = self.server.create_goal_handoff_instruction_task_frame(
+                    handoff_frame_parts[0], handoff_frame_parts[1], body
+                )
+                self._send(HTTPStatus.CREATED if created else HTTPStatus.OK, result)
+                return
             conductor_permission_id = self._conductor_permission_path(path)
             if conductor_permission_id is not None:
                 permission, changed = self.server.resolve_conductor_permission(
@@ -36174,6 +36446,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not handoff_id or "/" in handoff_id:
             return None
         return unquote(project_id), "/deliver", unquote(handoff_id)
+
+    @staticmethod
+    def _goal_handoff_task_frame_path(path: str) -> tuple[str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/master-handoffs/"
+        suffix = "/instruction-task-frame"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        project_id, remainder = path[len(prefix) :].split(marker, 1)
+        handoff_id = remainder[: -len(suffix)]
+        if (
+            not project_id
+            or "/" in project_id
+            or not handoff_id
+            or "/" in handoff_id
+        ):
+            return None
+        return unquote(project_id), unquote(handoff_id)
 
     def _not_found(self) -> None:
         self._send(
