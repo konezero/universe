@@ -457,6 +457,9 @@ FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
 EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v1"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
+GOAL_WORK_PLAN_SCHEMA = "universe.goal-work-plan.v1"
+GOAL_WORK_PLAN_ADOPTION_SCHEMA = "universe.goal-work-plan-adoption.v1"
+GOAL_WORK_PLAN_APPLICATION_SCHEMA = "universe.goal-work-plan-application.v1"
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
@@ -2158,6 +2161,60 @@ def normalize_milestone(goal_id: str, value: Any, *, updating: bool = False) -> 
             )
         normalized["revision"] = revision
     return normalized
+
+
+def normalize_goal_work_plan(value: Any) -> dict[str, Any]:
+    plan = _exact_object_fields(
+        value,
+        field="goal_work_plan",
+        required=frozenset({"title", "summary", "milestones"}),
+        optional=frozenset({"schema"}),
+    )
+    if "schema" in plan and plan["schema"] != GOAL_WORK_PLAN_SCHEMA:
+        raise UniverseError("GOAL_WORK_PLAN_SCHEMA_INVALID", "work plan schema is unsupported")
+    title = _required_text(plan["title"], "goal_work_plan.title")
+    summary = _required_text(plan["summary"], "goal_work_plan.summary")
+    if len(title) > 160 or len(summary) > 1000:
+        raise UniverseError("GOAL_WORK_PLAN_TEXT_INVALID", "work plan title or summary is too long")
+    raw_milestones = plan["milestones"]
+    if not isinstance(raw_milestones, list) or not 1 <= len(raw_milestones) <= 6:
+        raise UniverseError("GOAL_WORK_PLAN_MILESTONES_INVALID", "work plan requires 1 to 6 milestones")
+    milestones: list[dict[str, Any]] = []
+    todo_count = 0
+    for milestone_index, raw_milestone in enumerate(raw_milestones):
+        milestone = _exact_object_fields(
+            raw_milestone,
+            field=f"goal_work_plan.milestones[{milestone_index}]",
+            required=frozenset({"title", "description", "todos"}),
+        )
+        milestone_title = _required_text(milestone["title"], "milestone.title")
+        milestone_description = _required_text(milestone["description"], "milestone.description")
+        if len(milestone_title) > 160 or len(milestone_description) > 4000:
+            raise UniverseError("GOAL_WORK_PLAN_MILESTONE_TEXT_INVALID", "work plan milestone text is too long")
+        raw_todos = milestone["todos"]
+        if not isinstance(raw_todos, list) or not 1 <= len(raw_todos) <= 8:
+            raise UniverseError("GOAL_WORK_PLAN_TODOS_INVALID", "each work plan milestone requires 1 to 8 Todos")
+        todos: list[dict[str, str]] = []
+        for todo_index, raw_todo in enumerate(raw_todos):
+            todo = _exact_object_fields(
+                raw_todo,
+                field=f"goal_work_plan.milestones[{milestone_index}].todos[{todo_index}]",
+                required=frozenset({"title", "detail", "acceptance", "priority"}),
+            )
+            todo_title = _required_text(todo["title"], "todo.title")
+            detail = _required_text(todo["detail"], "todo.detail")
+            acceptance = _required_text(todo["acceptance"], "todo.acceptance")
+            priority = _required_text(todo["priority"], "todo.priority").upper()
+            if len(todo_title) > 160 or len(detail) > 3000 or len(acceptance) > 1000:
+                raise UniverseError("GOAL_WORK_PLAN_TODO_TEXT_INVALID", "work plan Todo text is too long")
+            if priority != "AUTO" and priority not in TODO_PRIORITIES:
+                raise UniverseError("GOAL_WORK_PLAN_PRIORITY_INVALID", "work plan priority must be AUTO or P0 through P3")
+            todos.append({"title": todo_title, "detail": detail, "acceptance": acceptance, "priority": priority})
+            todo_count += 1
+        milestones.append({"title": milestone_title, "description": milestone_description, "todos": todos})
+    if todo_count > 24:
+        raise UniverseError("GOAL_WORK_PLAN_TOO_LARGE", "work plan may contain at most 24 Todos")
+    return {"schema": GOAL_WORK_PLAN_SCHEMA, "title": title, "summary": summary, "milestones": milestones}
 
 
 def _array(value: Any, field: str) -> list[Any]:
@@ -5171,6 +5228,44 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS feature_goal_derivation_goal
                 ON feature_goal_derivation(goal_id, feature_id);
+
+                CREATE TABLE IF NOT EXISTS goal_work_plan_candidate (
+                    work_plan_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    feature_id TEXT NOT NULL REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    room_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    author_binding_id TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('CANDIDATE', 'ADOPTED', 'NOT_SELECTED', 'APPLIED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(goal_id, run_id, author_binding_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_work_plan_candidate_goal
+                ON goal_work_plan_candidate(goal_id, created_at, work_plan_id);
+
+                CREATE TABLE IF NOT EXISTS goal_work_plan_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    work_plan_id TEXT NOT NULL UNIQUE REFERENCES goal_work_plan_candidate(work_plan_id) ON DELETE CASCADE,
+                    adopted_by_role TEXT NOT NULL CHECK(adopted_by_role = 'USER'),
+                    rationale TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS goal_work_plan_application (
+                    application_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE REFERENCES goal_work_plan_adoption(adoption_id) ON DELETE CASCADE,
+                    work_plan_id TEXT NOT NULL UNIQUE REFERENCES goal_work_plan_candidate(work_plan_id) ON DELETE CASCADE,
+                    applied_by_role TEXT NOT NULL CHECK(applied_by_role = 'USER'),
+                    created_items_json TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS todo_mutation_receipt (
                     receipt_id TEXT PRIMARY KEY,
@@ -10350,6 +10445,49 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _goal_work_plan_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_WORK_PLAN_SCHEMA,
+            "work_plan_id": str(row["work_plan_id"]),
+            "goal_id": str(row["goal_id"]),
+            "feature_id": str(row["feature_id"]),
+            "room_id": str(row["room_id"]),
+            "run_id": str(row["run_id"]),
+            "source_message_id": str(row["source_message_id"]),
+            "author_binding_id": str(row["author_binding_id"]),
+            "plan_digest": str(row["plan_digest"]),
+            "plan": json.loads(row["plan_json"]),
+            "state": str(row["state"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _goal_work_plan_adoption_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_WORK_PLAN_ADOPTION_SCHEMA,
+            "adoption_id": str(row["adoption_id"]),
+            "goal_id": str(row["goal_id"]),
+            "work_plan_id": str(row["work_plan_id"]),
+            "adopted_by_role": str(row["adopted_by_role"]),
+            "rationale": str(row["rationale"]),
+            "adopted_at": str(row["adopted_at"]),
+        }
+
+    @staticmethod
+    def _goal_work_plan_application_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_WORK_PLAN_APPLICATION_SCHEMA,
+            "application_id": str(row["application_id"]),
+            "goal_id": str(row["goal_id"]),
+            "adoption_id": str(row["adoption_id"]),
+            "work_plan_id": str(row["work_plan_id"]),
+            "applied_by_role": str(row["applied_by_role"]),
+            "created_items": json.loads(row["created_items_json"]),
+            "applied_at": str(row["applied_at"]),
+        }
+
+    @staticmethod
     def _feature_refs(value: Any, field: str) -> list[str]:
         refs = _string_array(value if value is not None else [], field)
         if len(refs) > 50:
@@ -10457,6 +10595,9 @@ class UniverseStore:
         )
         if result["goal_derivation"] is not None:
             result["goal_derivation"]["goal"] = self.get_goal(
+                result["goal_derivation"]["goal_id"]
+            )
+            result["goal_derivation"]["work_plans"] = self.goal_work_plan_surface(
                 result["goal_derivation"]["goal_id"]
             )
         return result
@@ -10751,6 +10892,158 @@ class UniverseStore:
             self._goal_row(goal_row),
             True,
         )
+
+    def goal_work_plan_surface(self, goal_id: str) -> dict[str, Any]:
+        goal = self.get_goal(goal_id)
+        with self._connection() as connection:
+            derivation = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+            candidates = connection.execute(
+                "SELECT * FROM goal_work_plan_candidate WHERE goal_id = ? ORDER BY created_at, work_plan_id",
+                (goal["goal_id"],),
+            ).fetchall()
+            adoption = connection.execute(
+                "SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+            application = connection.execute(
+                "SELECT * FROM goal_work_plan_application WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_WORK_PLANS_COLLECTED",
+            "goal": goal,
+            "feature_goal_derivation": self._feature_goal_derivation_row(derivation) if derivation is not None else None,
+            "candidates": [self._goal_work_plan_row(row) for row in candidates],
+            "adoption": self._goal_work_plan_adoption_row(adoption) if adoption is not None else None,
+            "application": self._goal_work_plan_application_row(application) if application is not None else None,
+        }
+
+    def record_goal_work_plan_candidate(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        goal = self.get_goal(goal_id)
+        request = _exact_object_fields(
+            value,
+            field="goal_work_plan_candidate",
+            required=frozenset({"feature_id", "room_id", "run_id", "source_message_id", "author_binding_id", "plan"}),
+        )
+        plan = normalize_goal_work_plan(request["plan"])
+        feature_id = _identifier(request["feature_id"], "feature_id")
+        room_id = _identifier(request["room_id"], "room_id")
+        run_id = _identifier(request["run_id"], "run_id")
+        message_id = _identifier(request["source_message_id"], "source_message_id")
+        binding_id = _identifier(request["author_binding_id"], "author_binding_id")
+        surface = self.goal_work_plan_surface(goal["goal_id"])
+        derivation = surface["feature_goal_derivation"]
+        if derivation is None or derivation["feature_id"] != feature_id:
+            raise UniverseError("GOAL_FEATURE_PROVENANCE_REQUIRED", "Goal is not provenance-bound to this Feature", HTTPStatus.CONFLICT)
+        feature = self.get_feature_node(feature_id)
+        if feature.get("meeting_room_id") != room_id:
+            raise UniverseError("GOAL_WORK_PLAN_ROOM_MISMATCH", "Work Plan must come from the Feature Meeting Room", HTTPStatus.CONFLICT)
+        message = self.multi_rooms.get_message(message_id)
+        if message.get("room_id") != room_id:
+            raise UniverseError("GOAL_WORK_PLAN_MESSAGE_MISMATCH", "Work Plan source message must belong to the Feature Meeting Room", HTTPStatus.CONFLICT)
+        binding = next((item for item in self.multi_rooms.list_bindings(room_id) if item["binding_id"] == binding_id), None)
+        if binding is None:
+            raise UniverseError("GOAL_WORK_PLAN_BINDING_MISMATCH", "Work Plan author binding must belong to the Feature Meeting Room", HTTPStatus.CONFLICT)
+        if message.get("author_role") != "MODEL" or message.get("author_binding_id") != binding_id:
+            raise UniverseError("GOAL_WORK_PLAN_MESSAGE_AUTHOR_MISMATCH", "Work Plan source message must be authored by the recorded MODEL binding", HTTPStatus.CONFLICT)
+        metadata = binding.get("metadata") if isinstance(binding.get("metadata"), Mapping) else {}
+        if not binding.get("provider_session_ref") or not str(metadata.get("provider_chat_key") or "").strip():
+            raise UniverseError("GOAL_WORK_PLAN_BINDING_UNVERIFIED", "Work Plan author binding must retain verified provider session provenance", HTTPStatus.CONFLICT)
+        plan_digest = _json_sha256(plan)
+        work_plan_id = "work_plan_" + _json_sha256({"goal_id": goal["goal_id"], "run_id": run_id, "binding_id": binding_id})[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM goal_work_plan_candidate WHERE goal_id = ? AND run_id = ? AND author_binding_id = ?",
+                (goal["goal_id"], run_id, binding_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["plan_digest"] != plan_digest or existing["source_message_id"] != message_id:
+                    raise UniverseError("GOAL_WORK_PLAN_CANDIDATE_CONFLICT", "candidate replay contains different Work Plan material", HTTPStatus.CONFLICT)
+                return self._goal_work_plan_row(existing), False
+            connection.execute(
+                "INSERT INTO goal_work_plan_candidate(work_plan_id, goal_id, feature_id, room_id, run_id, source_message_id, author_binding_id, plan_digest, plan_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CANDIDATE', ?, ?)",
+                (work_plan_id, goal["goal_id"], feature_id, room_id, run_id, message_id, binding_id, plan_digest, _canonical_json(plan), now, now),
+            )
+            row = connection.execute("SELECT * FROM goal_work_plan_candidate WHERE work_plan_id = ?", (work_plan_id,)).fetchone()
+        return self._goal_work_plan_row(row), True
+
+    def adopt_goal_work_plan(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="goal_work_plan_adoption",
+            required=frozenset({"work_plan_id", "expected_goal_revision", "rationale", "adopted_by_role"}),
+        )
+        gid = _identifier(goal_id, "goal_id")
+        work_plan_id = _identifier(request["work_plan_id"], "work_plan_id")
+        if _identifier(request["adopted_by_role"], "adopted_by_role").upper() != "USER":
+            raise UniverseError("GOAL_WORK_PLAN_USER_ADOPTION_REQUIRED", "only USER may adopt a Goal Work Plan", HTTPStatus.FORBIDDEN)
+        expected_revision = request["expected_goal_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("GOAL_REVISION_INVALID", "expected_goal_revision must be a positive integer")
+        rationale = _required_text(request["rationale"], "rationale")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute("SELECT * FROM project_goal WHERE goal_id = ?", (gid,)).fetchone()
+            if goal is None: raise UniverseError("GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND)
+            if goal["state"] != "DESIGNING": raise UniverseError("GOAL_WORK_PLAN_GOAL_STATE_INVALID", "Work Plan adoption requires a DESIGNING Goal", HTTPStatus.CONFLICT)
+            if int(goal["revision"]) != expected_revision: raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed before Work Plan adoption", HTTPStatus.CONFLICT)
+            existing = connection.execute("SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (gid,)).fetchone()
+            if existing is not None:
+                if existing["work_plan_id"] != work_plan_id or existing["rationale"] != rationale:
+                    raise UniverseError("GOAL_WORK_PLAN_ALREADY_ADOPTED", "Goal already adopted different Work Plan material", HTTPStatus.CONFLICT)
+                return self._goal_work_plan_adoption_row(existing), False
+            candidates = connection.execute("SELECT * FROM goal_work_plan_candidate WHERE goal_id = ? AND state = 'CANDIDATE'", (gid,)).fetchall()
+            if len(candidates) < 2: raise UniverseError("GOAL_WORK_PLAN_ALTERNATIVES_REQUIRED", "at least two Work Plan candidates are required", HTTPStatus.CONFLICT)
+            if not any(row["work_plan_id"] == work_plan_id for row in candidates): raise UniverseError("GOAL_WORK_PLAN_NOT_CANDIDATE", "selected Work Plan is not a candidate", HTTPStatus.CONFLICT)
+            adoption_id = "work_plan_adoption_" + _json_sha256({"goal_id": gid, "work_plan_id": work_plan_id})[:24]
+            connection.execute("INSERT INTO goal_work_plan_adoption(adoption_id, goal_id, work_plan_id, adopted_by_role, rationale, adopted_at) VALUES (?, ?, ?, 'USER', ?, ?)", (adoption_id, gid, work_plan_id, rationale, now))
+            connection.execute("UPDATE goal_work_plan_candidate SET state = CASE WHEN work_plan_id = ? THEN 'ADOPTED' ELSE 'NOT_SELECTED' END, updated_at = ? WHERE goal_id = ? AND state = 'CANDIDATE'", (work_plan_id, now, gid))
+            row = connection.execute("SELECT * FROM goal_work_plan_adoption WHERE adoption_id = ?", (adoption_id,)).fetchone()
+        return self._goal_work_plan_adoption_row(row), True
+
+    def apply_goal_work_plan(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(value, field="goal_work_plan_application", required=frozenset({"expected_goal_revision", "applied_by_role"}))
+        gid = _identifier(goal_id, "goal_id")
+        if _identifier(request["applied_by_role"], "applied_by_role").upper() != "USER":
+            raise UniverseError("GOAL_WORK_PLAN_USER_APPLY_REQUIRED", "only USER may apply an adopted Goal Work Plan", HTTPStatus.FORBIDDEN)
+        expected_revision = request["expected_goal_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("GOAL_REVISION_INVALID", "expected_goal_revision must be a positive integer")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute("SELECT * FROM project_goal WHERE goal_id = ?", (gid,)).fetchone()
+            if goal is None: raise UniverseError("GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND)
+            if goal["state"] != "DESIGNING": raise UniverseError("GOAL_WORK_PLAN_GOAL_STATE_INVALID", "Work Plan application requires a DESIGNING Goal", HTTPStatus.CONFLICT)
+            if int(goal["revision"]) != expected_revision: raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed before Work Plan application", HTTPStatus.CONFLICT)
+            existing = connection.execute("SELECT * FROM goal_work_plan_application WHERE goal_id = ?", (gid,)).fetchone()
+            if existing is not None: return self._goal_work_plan_application_row(existing), False
+            adoption = connection.execute("SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (gid,)).fetchone()
+            if adoption is None: raise UniverseError("GOAL_WORK_PLAN_ADOPTION_REQUIRED", "adopt a Work Plan before applying it", HTTPStatus.CONFLICT)
+            candidate = connection.execute("SELECT * FROM goal_work_plan_candidate WHERE work_plan_id = ? AND state = 'ADOPTED'", (adoption["work_plan_id"],)).fetchone()
+            if candidate is None: raise UniverseError("GOAL_WORK_PLAN_ADOPTION_INVALID", "adopted Work Plan is unavailable", HTTPStatus.CONFLICT)
+            plan = normalize_goal_work_plan(json.loads(candidate["plan_json"]))
+            milestone_ids=[]; todo_ids=[]
+            for mi, milestone in enumerate(plan["milestones"]):
+                milestone_id="milestone_"+_json_sha256({"work_plan_id":candidate["work_plan_id"],"milestone":mi})[:24]
+                connection.execute("INSERT INTO project_milestone(milestone_id, goal_id, title, description, state, sort_order, revision, created_at, updated_at) VALUES (?, ?, ?, ?, 'PLANNED', ?, 1, ?, ?)", (milestone_id,gid,milestone["title"],milestone["description"],mi*10,now,now))
+                milestone_ids.append(milestone_id)
+                for ti, item in enumerate(milestone["todos"]):
+                    todo_id="todo_"+_json_sha256({"work_plan_id":candidate["work_plan_id"],"milestone":mi,"todo":ti})[:24]
+                    todo={"scope_kind":"PROJECT","project_id":goal["project_id"],"node_ref":None,"universe_goal_id":goal["universe_goal_id"],"goal_id":gid,"milestone_id":milestone_id,"title":item["title"],"detail":f"{item['detail']}\n\nAcceptance: {item['acceptance']}","priority":item["priority"],"state":"BACKLOG","source_kind":"USER","sort_order":ti*10}
+                    if todo["priority"] == "AUTO": todo["priority"] = infer_todo_priority(todo)["priority"]
+                    self._insert_todo(connection,todo_id,todo,now)
+                    todo_ids.append(todo_id)
+            created_items={"milestone_ids":milestone_ids,"todo_ids":todo_ids,"milestone_count":len(milestone_ids),"todo_count":len(todo_ids)}
+            application_id="work_plan_application_"+_json_sha256({"goal_id":gid,"work_plan_id":candidate["work_plan_id"]})[:24]
+            connection.execute("INSERT INTO goal_work_plan_application(application_id, goal_id, adoption_id, work_plan_id, applied_by_role, created_items_json, applied_at) VALUES (?, ?, ?, ?, 'USER', ?, ?)", (application_id,gid,adoption["adoption_id"],candidate["work_plan_id"],_canonical_json(created_items),now))
+            connection.execute("UPDATE goal_work_plan_candidate SET state = 'APPLIED', updated_at = ? WHERE work_plan_id = ?", (now,candidate["work_plan_id"]))
+            row=connection.execute("SELECT * FROM goal_work_plan_application WHERE application_id = ?",(application_id,)).fetchone()
+        return self._goal_work_plan_application_row(row), True
 
     def list_todos(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -17728,6 +18021,44 @@ class UniverseStore:
                             goal_node,
                             derivation_ref,
                         )
+
+            if derivation:
+                goal_id = str(derivation["goal_id"])
+                goal_node = goal_nodes_by_id.get(goal_id)
+                work_plan_surface = detailed_feature.get("goal_derivation", {}).get("work_plans") or {}
+                adopted_work_plan_id = str((work_plan_surface.get("adoption") or {}).get("work_plan_id") or "")
+                for work_plan in work_plan_surface.get("candidates") or []:
+                    work_plan_id = str(work_plan["work_plan_id"])
+                    plan = work_plan.get("plan") or {}
+                    milestone_count = len(plan.get("milestones") or [])
+                    todo_count = sum(len(item.get("todos") or []) for item in plan.get("milestones") or [])
+                    work_plan_ref = f"universe://goals/{goal_id}/work-plans/{work_plan_id}"
+                    work_plan_node = add_node(
+                        "GOAL_WORK_PLAN", work_plan_id, str(plan.get("title") or "Work Plan"),
+                        str(work_plan["state"]), "GOAL_WORK_PLAN", work_plan_ref,
+                        {
+                            "work_plan_id": work_plan_id,
+                            "goal_id": goal_id,
+                            "feature_id": work_plan.get("feature_id"),
+                            "room_id": work_plan.get("room_id"),
+                            "run_id": work_plan.get("run_id"),
+                            "source_message_id": work_plan.get("source_message_id"),
+                            "author_binding_id": work_plan.get("author_binding_id"),
+                            "plan_digest": work_plan.get("plan_digest"),
+                            "title": plan.get("title"),
+                            "summary": plan.get("summary"),
+                            "milestone_count": milestone_count,
+                            "todo_count": todo_count,
+                            "state": work_plan.get("state"),
+                            "created_at": work_plan.get("created_at"),
+                            "updated_at": work_plan.get("updated_at"),
+                            "plan_in_graph": False,
+                        },
+                    )
+                    if goal_node is not None:
+                        add_edge("GOAL_HAS_WORK_PLAN", goal_node, work_plan_node, work_plan_ref)
+                        if work_plan_id == adopted_work_plan_id:
+                            add_edge("GOAL_ADOPTS_WORK_PLAN", goal_node, work_plan_node, f"universe://goals/{goal_id}/work-plan-adoption")
 
         room_message_nodes: dict[str, str] = {}
         room_message_parents: list[tuple[str, str]] = []
@@ -27485,9 +27816,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         prompt = (
             "You are participating in a bounded Universe Feature Meeting. "
             "Use only the incoming delta below, do not assume execution authority, "
-            "and return a self-contained candidate implementation specification "
-            "that another reviewer can compare with alternatives. Include outcome, "
-            "architecture, key flow, constraints, risks, and validation.\n\n"
+            "and return one self-contained candidate in the exact format requested "
+            "by that delta so another reviewer can compare it with alternatives.\n\n"
             f"Incoming delta:\n{delta_body}"
         )[:12000]
         terminal: dict[str, Any] = {}
@@ -27682,6 +28012,66 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "authority_created": False,
             "execution_assignment_created": False,
         }
+
+    @staticmethod
+    def _parse_goal_work_plan_output(body_text: str) -> dict[str, Any]:
+        text = str(body_text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"): lines = lines[1:]
+            if lines and lines[-1].strip() == "```": lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise UniverseError("GOAL_WORK_PLAN_JSON_INVALID", "provider Work Plan output must be one JSON object") from error
+        return normalize_goal_work_plan(parsed)
+
+    def run_goal_work_plan_meeting(self, goal_id: str, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        surface = self.store.goal_work_plan_surface(goal_id)
+        goal = surface["goal"]
+        if goal["state"] != "DESIGNING": raise UniverseError("GOAL_WORK_PLAN_GOAL_STATE_INVALID", "Work Plan generation requires a DESIGNING Goal", HTTPStatus.CONFLICT)
+        derivation = surface["feature_goal_derivation"]
+        if derivation is None: raise UniverseError("GOAL_FEATURE_PROVENANCE_REQUIRED", "Goal must come from an adopted Feature path", HTTPStatus.CONFLICT)
+        if surface["adoption"] is not None: raise UniverseError("GOAL_WORK_PLAN_ALREADY_ADOPTED", "Goal already adopted a Work Plan", HTTPStatus.CONFLICT)
+        feature = self.store.get_feature_node(derivation["feature_id"])
+        room_id = str(feature.get("meeting_room_id") or "")
+        path = next((item for item in feature["expected_paths"] if item["expected_path_id"] == derivation["expected_path_id"]), None)
+        if path is None: raise UniverseError("FEATURE_ADOPTED_PATH_INVALID", "Goal provenance Expected Path is unavailable", HTTPStatus.CONFLICT)
+        artifact = self.multi_rooms.get_artifact(room_id, path["artifact_id"])
+        bindings=[item for item in self.multi_rooms.list_bindings(room_id) if item.get("slot_role")=="MODEL" and item.get("provider") and item.get("provider_session_ref") and isinstance(item.get("metadata"),Mapping) and str(item["metadata"].get("provider_chat_key") or "").strip()]
+        if len(bindings)<2: raise UniverseError("GOAL_WORK_PLAN_MODELS_REQUIRED", "Work Plan generation requires at least two verified provider sessions", HTTPStatus.CONFLICT)
+        run_id=_required_text(request.get("run_id") or "goal_work_plan_"+secrets.token_hex(12),"run_id")
+        raw_turns=request.get("max_turns",len(bindings)*2)
+        if isinstance(raw_turns,bool): raise UniverseError("MEETING_TURN_LIMIT_INVALID","max_turns must be an integer")
+        try: max_turns=int(raw_turns)
+        except (TypeError,ValueError) as error: raise UniverseError("MEETING_TURN_LIMIT_INVALID","max_turns must be an integer") from error
+        prompt=(
+            "Create an alternative implementation Work Plan for the Goal below. Return ONLY one JSON object with exactly this shape: "
+            '{"title":"...","summary":"...","milestones":[{"title":"...","description":"...","todos":[{"title":"...","detail":"...","acceptance":"...","priority":"AUTO|P0|P1|P2|P3"}]}]}. '
+            "Use 1-6 milestones, 1-8 Todos per milestone, and no more than 24 Todos. Do not create authority or claim execution.\n\n"
+            f"Goal: {goal['title']}\n{goal['description']}\n\nAdopted specification:\n{artifact.get('body_text') or ''}"
+        )[:20000]
+        try:
+            summary=self.multi_room_meetings.run(room_id,prompt=prompt,max_turns=max_turns,run_id=run_id,binding_ids=[str(item["binding_id"]) for item in bindings])
+        except MultiRoomError as error: raise UniverseError(error.code,str(error),HTTPStatus(error.status)) from error
+        messages={str(item.get("room_event_id") or ""):item for item in self.multi_rooms.list_messages(room_id,limit=500)}
+        latest={}
+        for turn in summary.get("turns",[]):
+            if turn.get("status")=="COMPLETED" and turn.get("output_event_id"): latest[str(turn["binding_id"])]=turn
+        candidates=[]; failures=[]
+        for binding in bindings:
+            turn=latest.get(str(binding["binding_id"])); message=messages.get(str((turn or {}).get("output_event_id") or ""))
+            if message is None: continue
+            try:
+                plan=self._parse_goal_work_plan_output(str(message.get("body_text") or ""))
+            except UniverseError as error:
+                failures.append({"binding_id":binding["binding_id"],"error_code":error.code})
+                continue
+            candidate,_=self.store.record_goal_work_plan_candidate(goal["goal_id"],{"feature_id":feature["feature_id"],"room_id":room_id,"run_id":run_id,"source_message_id":message["message_id"],"author_binding_id":binding["binding_id"],"plan":plan})
+            candidates.append(candidate)
+        return {"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_CANDIDATES_READY" if len(candidates)>=2 else "GOAL_WORK_PLAN_CANDIDATES_INCOMPLETE","goal":goal,"meeting":summary,"candidates":candidates,"candidate_failures":failures,"milestone_created":False,"todo_created":False,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False}
 
     def cancel_feature_meeting(
         self, feature_id: str, run_id: str, value: Any
@@ -31333,6 +31723,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        goal_work_plans = re.fullmatch(r"/v1/goals/([^/]+)/work-plans", path)
+        if goal_work_plans is not None:
+            try:
+                self._send(HTTPStatus.OK, self.server.store.goal_work_plan_surface(unquote(goal_work_plans.group(1))))
+            except UniverseError as error:
+                self._send_error(error)
+            return
         feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
         if feature_detail is not None:
             try:
@@ -33486,6 +33883,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "execution_assignment_created": False,
                     },
                 )
+                return
+            goal_work_plan_runs = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-runs", path)
+            if goal_work_plan_runs is not None:
+                self._send(HTTPStatus.OK, self.server.run_goal_work_plan_meeting(unquote(goal_work_plan_runs.group(1)), body))
+                return
+            goal_work_plan_adoptions = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-adoptions", path)
+            if goal_work_plan_adoptions is not None:
+                adoption, created = self.server.store.adopt_goal_work_plan(unquote(goal_work_plan_adoptions.group(1)), {**body, "adopted_by_role":"USER"})
+                self._send(HTTPStatus.CREATED if created else HTTPStatus.OK,{"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_ADOPTED" if created else "GOAL_WORK_PLAN_ADOPTION_REPLAYED","adoption":adoption,"surface":self.server.store.goal_work_plan_surface(unquote(goal_work_plan_adoptions.group(1))),"milestone_created":False,"todo_created":False,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False})
+                return
+            goal_work_plan_applications = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-applications", path)
+            if goal_work_plan_applications is not None:
+                application, created = self.server.store.apply_goal_work_plan(unquote(goal_work_plan_applications.group(1)), {**body, "applied_by_role":"USER"})
+                self._send(HTTPStatus.CREATED if created else HTTPStatus.OK,{"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_APPLIED" if created else "GOAL_WORK_PLAN_APPLICATION_REPLAYED","application":application,"surface":self.server.store.goal_work_plan_surface(unquote(goal_work_plan_applications.group(1))),"milestone_created":created,"todo_created":created,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False})
                 return
             todo_action_match = re.fullmatch(
                 r"/v1/todos/([^/]+)/actions", path

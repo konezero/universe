@@ -7709,6 +7709,144 @@ class UniverseLocalServiceTests(unittest.TestCase):
         expected_nodes = [node for node in graph["nodes"] if node["entity_type"] == "EXPECTED_PATH"]
         self.assertTrue(all("body_text" not in node["data"] for node in expected_nodes))
 
+        for provider, session_ref, chat_key in (
+            ("CODEX", "codex-work-plan-session", "codex-work-plan-chat"),
+            ("CLAUDE", "claude-work-plan-session", "claude-work-plan-chat"),
+        ):
+            self.server.multi_rooms.attach_session(
+                room_id,
+                {
+                    "slot_role": "MODEL",
+                    "provider": provider,
+                    "provider_session_ref": session_ref,
+                    "provider_chat_key": chat_key,
+                    "display_name": provider.title(),
+                },
+            )
+
+        def invoke_work_plan(binding, turn):
+            provider = str(binding["provider"])
+            return {
+                "status": "COMPLETED",
+                "body_text": json.dumps(
+                    {
+                        "title": f"{provider} delivery plan",
+                        "summary": f"Bounded {provider} plan for the adopted Expected Path.",
+                        "milestones": [
+                            {
+                                "title": f"{provider} foundation",
+                                "description": "Build the first reviewable planning slice.",
+                                "todos": [
+                                    {
+                                        "title": f"Implement {provider} slice",
+                                        "detail": "Create the bounded implementation increment.",
+                                        "acceptance": "Targeted tests pass and provenance remains visible.",
+                                        "priority": "AUTO",
+                                    },
+                                    {
+                                        "title": f"Verify {provider} slice",
+                                        "detail": "Review the increment without starting execution.",
+                                        "acceptance": "No Task Frame, authority, or assignment exists.",
+                                        "priority": "P2",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                "provider_event_id": f"work-plan-{provider.lower()}-{turn['turn_number']}",
+            }
+
+        self.server.multi_room_meetings.invoke_provider = invoke_work_plan
+        goal_id = materialized["goal"]["goal_id"]
+        status, plans = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/work-plan-runs",
+            {"run_id": "goal-work-plan-http-1", "max_turns": 4},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GOAL_WORK_PLAN_CANDIDATES_READY", plans["status"])
+        self.assertEqual(2, len(plans["candidates"]))
+        self.assertFalse(plans["milestone_created"])
+        self.assertFalse(plans["todo_created"])
+        self.assertEqual([], [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"])
+
+        status, apply_blocked = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/work-plan-applications",
+            {"expected_goal_revision": 1},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("GOAL_WORK_PLAN_ADOPTION_REQUIRED", apply_blocked["error_code"])
+
+        selected = plans["candidates"][1]
+        status, plan_adoption = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/work-plan-adoptions",
+            {
+                "work_plan_id": selected["work_plan_id"],
+                "expected_goal_revision": 1,
+                "rationale": "User selected the clearer bounded plan.",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("USER", plan_adoption["adoption"]["adopted_by_role"])
+        self.assertFalse(plan_adoption["milestone_created"])
+        self.assertFalse(plan_adoption["todo_created"])
+        plan_states = {item["state"] for item in plan_adoption["surface"]["candidates"]}
+        self.assertEqual({"ADOPTED", "NOT_SELECTED"}, plan_states)
+
+        status, applied = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/work-plan-applications",
+            {"expected_goal_revision": 1},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("GOAL_WORK_PLAN_APPLIED", applied["status"])
+        self.assertTrue(applied["milestone_created"])
+        self.assertTrue(applied["todo_created"])
+        self.assertFalse(applied["task_frame_created"])
+        self.assertFalse(applied["authority_created"])
+        self.assertFalse(applied["execution_assignment_created"])
+        self.assertEqual(1, applied["application"]["created_items"]["milestone_count"])
+        self.assertEqual(2, applied["application"]["created_items"]["todo_count"])
+        created_todos = [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"]
+        self.assertEqual({"BACKLOG"}, {todo["state"] for todo in created_todos})
+
+        status, apply_replay = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/work-plan-applications",
+            {"expected_goal_revision": 1},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GOAL_WORK_PLAN_APPLICATION_REPLAYED", apply_replay["status"])
+        self.assertFalse(apply_replay["milestone_created"])
+        self.assertFalse(apply_replay["todo_created"])
+        self.assertEqual(2, len([todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"]))
+
+        status, work_plan_surface = self.request(
+            "GET", f"/v1/goals/{goal_id}/work-plans", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(selected["work_plan_id"], work_plan_surface["adoption"]["work_plan_id"])
+        self.assertEqual(selected["work_plan_id"], work_plan_surface["application"]["work_plan_id"])
+
+        planned_graph = self.server.store.semantic_project_graph("GCS")
+        planned_node_types = {node["entity_type"] for node in planned_graph["nodes"]}
+        planned_edge_types = {edge["edge_type"] for edge in planned_graph["edges"]}
+        self.assertIn("GOAL_WORK_PLAN", planned_node_types)
+        self.assertIn("GOAL_HAS_WORK_PLAN", planned_edge_types)
+        self.assertIn("GOAL_ADOPTS_WORK_PLAN", planned_edge_types)
+        work_plan_nodes = [node for node in planned_graph["nodes"] if node["entity_type"] == "GOAL_WORK_PLAN"]
+        self.assertEqual(2, len(work_plan_nodes))
+        self.assertTrue(all("plan" not in node["data"] for node in work_plan_nodes))
+        self.assertTrue(all(node["data"]["plan_in_graph"] is False for node in work_plan_nodes))
+
     def test_feature_meeting_run_materializes_last_specification_per_model(self) -> None:
         self.server.store.register_project(self.registration())
         created = self.server.multi_rooms.create_meeting_room(

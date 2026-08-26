@@ -122,6 +122,8 @@ const state = {
   multiRoomFeatureCreateKey: null,
   multiRoomMeetingRunId: null,
   multiRoomMeetingRunBusy: false,
+  goalWorkPlanRunId: null,
+  goalWorkPlanRunBusy: false,
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -6762,6 +6764,70 @@ async function materializeFeatureGoal() {
   toast(`Goal created · ${result.goal.title}`);
 }
 
+async function runActiveGoalWorkPlans() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  if (!room || !feature || !goal) throw new Error("Create a provenance-bound Goal first");
+  const verifiedModels = (state.activeMultiRoomSnapshot?.bindings || []).filter(
+    (binding) => binding.slot_role === "MODEL" && binding.provider_session_ref && binding.metadata?.provider_chat_key
+  );
+  if (verifiedModels.length < 2) throw new Error("Attach at least two verified provider sessions");
+  const maxTurns = Math.max(2, Math.min(24, Number(elements.meetingRunTurns?.value || verifiedModels.length * 2)));
+  const runId = `goal-work-plan-${goal.goal_id}-${crypto.randomUUID()}`;
+  state.goalWorkPlanRunId = runId;
+  state.goalWorkPlanRunBusy = true;
+  renderActiveMultiRoom();
+  try {
+    const result = await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/work-plan-runs`, {
+      method: "POST",
+      body: { run_id: runId, max_turns: maxTurns },
+    });
+    state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+    await refreshActiveRoomFeatures({ render: false });
+    await refreshFeatureSemanticGraph(room.project_id);
+    toast(`${result.candidates?.length || 0} Work Plan candidates generated`);
+  } finally {
+    state.goalWorkPlanRunBusy = false;
+    renderActiveMultiRoom();
+  }
+}
+
+async function adoptGoalWorkPlan(workPlanId) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  const rationale = elements.meetingFeatureRationale?.value.trim() || "";
+  if (!room || !goal) throw new Error("Create a Goal first");
+  if (!rationale) throw new Error("Adoption rationale is required");
+  if (!window.confirm("Adopt this Work Plan? Other candidates will be marked not selected.")) return;
+  await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/work-plan-adoptions`, {
+    method: "POST",
+    body: { work_plan_id: workPlanId, expected_goal_revision: goal.revision, rationale },
+  });
+  elements.meetingFeatureRationale.value = "";
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Work Plan adopted");
+}
+
+async function applyGoalWorkPlan() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  if (!room || !goal) throw new Error("Create a Goal first");
+  if (!window.confirm("Create PLANNED Milestones and BACKLOG Todos from the adopted Work Plan?")) return;
+  const result = await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/work-plan-applications`, {
+    method: "POST",
+    body: { expected_goal_revision: goal.revision },
+  });
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast(`Created ${result.application.created_items.milestone_count} milestone(s) and ${result.application.created_items.todo_count} Todo(s)`);
+}
+
 function renderMeetingFeaturePanel(room) {
   const panel = node("section", "feature-path-list");
   if (room.room_type !== "MEETING") return panel;
@@ -6863,11 +6929,54 @@ function renderMeetingFeaturePanel(room) {
     const goalRow = node("article", "remote-access-row feature-path-card");
     const goalCopy = node("div", "remote-access-copy");
     if (derivation?.goal) {
+      const workPlans = derivation.work_plans || { candidates: [], adoption: null, application: null };
+      const candidates = workPlans.candidates || [];
       goalCopy.append(
         node("strong", "", `GOAL · ${derivation.goal.title}`),
         node("small", "", `${derivation.goal.state} · owner ${derivation.goal.owner}`),
         node("small", "", `Pinned to specification revision ${derivation.artifact_revision} · sha256 ${String(derivation.specification_digest || "").slice(0, 16)}…`)
       );
+      if (!workPlans.adoption) {
+        const generate = node("button", "secondary-button compact-action", state.goalWorkPlanRunBusy ? "Generating…" : "Generate Work Plans");
+        generate.type = "button";
+        generate.disabled = verifiedModels.length < 2 || state.goalWorkPlanRunBusy;
+        generate.title = generate.disabled && !state.goalWorkPlanRunBusy ? "At least two verified provider sessions are required" : "Generate bounded alternative Work Plans";
+        generate.addEventListener("click", () => runActiveGoalWorkPlans().catch((error) => toast(error.message, true)));
+        goalRow.append(generate);
+      }
+      for (const candidate of candidates) {
+        const plan = candidate.plan || {};
+        const milestoneCount = (plan.milestones || []).length;
+        const todoCount = (plan.milestones || []).reduce((count, milestone) => count + (milestone.todos || []).length, 0);
+        const planRow = node("article", "remote-access-row feature-path-card");
+        planRow.dataset.state = candidate.state;
+        const planCopy = node("div", "remote-access-copy");
+        planCopy.append(
+          node("strong", "", `${candidate.state} · ${plan.title || "Work Plan"}`),
+          node("small", "", `${milestoneCount} milestone(s) · ${todoCount} Todo(s)`),
+          node("small", "", plan.summary || ""),
+          node("small", "feature-path-digest", `sha256 ${String(candidate.plan_digest || "").slice(0, 16)}…`)
+        );
+        planRow.append(planCopy);
+        if (candidate.state === "CANDIDATE" && !workPlans.adoption) {
+          const adopt = node("button", "primary-button compact-action", "Adopt Plan");
+          adopt.type = "button";
+          adopt.disabled = candidates.filter((item) => item.state === "CANDIDATE").length < 2;
+          adopt.addEventListener("click", () => adoptGoalWorkPlan(candidate.work_plan_id).catch((error) => toast(error.message, true)));
+          planRow.append(adopt);
+        }
+        panel.append(planRow);
+      }
+      if (workPlans.adoption && !workPlans.application) {
+        const apply = node("button", "primary-button compact-action", "Apply Adopted Plan");
+        apply.type = "button";
+        apply.addEventListener("click", () => applyGoalWorkPlan().catch((error) => toast(error.message, true)));
+        goalRow.append(apply);
+      }
+      if (workPlans.application) {
+        const created = workPlans.application.created_items || {};
+        goalCopy.append(node("small", "", `APPLIED · ${created.milestone_count || 0} PLANNED milestone(s) · ${created.todo_count || 0} BACKLOG Todo(s)`));
+      }
     } else {
       goalCopy.append(
         node("strong", "", "Adopted path is ready for Goal planning"),
@@ -6883,7 +6992,7 @@ function renderMeetingFeaturePanel(room) {
     goalRow.prepend(goalCopy);
     panel.append(goalRow);
   }
-  panel.append(node("small", "settings-help", "Goal creation requires an adopted path and an explicit USER action. No Todo, milestone, Task Frame, authority, or assignment is created."));
+  panel.append(node("small", "settings-help", "Goal creation and Work Plan adoption are explicit USER actions. Applying an adopted plan creates only PLANNED Milestones and BACKLOG Todos; it never creates a Task Frame, authority, or assignment."));
   return panel;
 }
 
@@ -6896,6 +7005,8 @@ async function openMultiRoom(roomId) {
   state.multiRoomFeatureCreateKey = null;
   state.multiRoomMeetingRunId = null;
   state.multiRoomMeetingRunBusy = false;
+  state.goalWorkPlanRunId = null;
+  state.goalWorkPlanRunBusy = false;
   state.multiRoomLiveOutput = {};
   if (elements.createRoomArtifact) {
     elements.createRoomArtifact.textContent = "Create artifact from Message";

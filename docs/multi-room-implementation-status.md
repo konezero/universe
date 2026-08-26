@@ -79,6 +79,9 @@ Database: **same Universe SQLite** (`universe.sqlite3` / service DB). Tables:
 | Durable meeting summary | **Done** (`MEETING_SUMMARY` control event) |
 | Live provider completion adapter / HTTP Feature run endpoint | **Done** — verified opaque provider sessions feed the bounded coordinator; completed per-model outputs become revision-pinned SPECIFICATION / Expected Path candidates |
 | Explicit adopted-path Goal materialization | **Done** — USER action creates one idempotent DESIGNING Goal with revision/digest provenance; no Todo, milestone, Task Frame, authority, or assignment |
+| Goal Work Plan alternatives | **Done** — linked Meeting Room + at least two verified provider sessions produce bounded structured candidates with message/binding/run provenance |
+| Explicit Work Plan adoption and apply | **Done** — USER adoption is separate from atomic idempotent application; application creates only PLANNED Milestones and BACKLOG Todos, never Task Frame, authority, assignment, READY, or IN_PROGRESS state |
+| Thin Meeting Room planning UI + semantic graph | **Done** — generate/adopt/apply controls and redacted `GOAL_WORK_PLAN` projection are visible without embedding full plan bodies |
 
 ### S4 — Boss room
 

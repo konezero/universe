@@ -250,8 +250,12 @@ The durable planning order is now represented directly by the local runtime:
 4. At least two candidate paths must exist before `POST /v1/feature-nodes/{feature_id}/adoptions` accepts an explicit USER selection.
 5. Adoption marks one path `ADOPTED` and the remaining candidates `NOT_SELECTED`; it does not create a Goal, Todo, Task Frame, authority, or execution assignment.
 6. A separate explicit USER `POST /v1/feature-nodes/{feature_id}/goals` action materializes exactly one idempotent `DESIGNING` project Goal. Its provenance pins the adoption, Expected Path, specification revision, and digest; its owner remains `UNASSIGNED`, and it creates no Todo, milestone, Task Frame, authority, or execution assignment.
+7. `POST /v1/goals/{goal_id}/work-plan-runs` reuses the linked Meeting Room and at least two verified provider sessions to collect strict, bounded JSON Work Plan alternatives. Invalid model output is recorded as a candidate failure; durable store/provenance failures are not hidden as model failures.
+8. Candidate generation creates no Milestone or Todo. `POST /v1/goals/{goal_id}/work-plan-adoptions` requires an explicit USER rationale and at least two alternatives, then marks exactly one plan `ADOPTED`.
+9. A separate explicit USER `POST /v1/goals/{goal_id}/work-plan-applications` atomically creates deterministic `PLANNED` Milestones and `BACKLOG` Todos. Replay is idempotent and creates no duplicates.
+10. Planning never creates a Task Frame, authority, execution assignment, or `READY`/`IN_PROGRESS` work. Those remain later governed transitions.
 
-Read routes are `GET /v1/projects/{project_id}/feature-nodes` and `GET /v1/feature-nodes/{feature_id}`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, their Meeting Room and specification links, the adopted edge, and provenance edges from the Feature and adopted path to the derived Goal without embedding specification bodies.
+Read routes are `GET /v1/projects/{project_id}/feature-nodes`, `GET /v1/feature-nodes/{feature_id}`, and `GET /v1/goals/{goal_id}/work-plans`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, `GOAL_WORK_PLAN`, adoption and provenance edges without embedding specification or full Work Plan bodies.
 
 ## 9. Non-goals (program-level)
 
