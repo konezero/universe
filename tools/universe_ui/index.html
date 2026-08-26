@@ -556,6 +556,40 @@
             </div>
             <div id="multi-room-list" class="remote-access-list"></div>
             <div id="multi-room-detail" class="remote-access-endpoint"></div>
+            <section id="meeting-feature-controls" class="meeting-feature-controls" hidden>
+              <div class="settings-section-heading">
+                <div>
+                  <strong>Feature route planning</strong>
+                  <small>Feature → Meeting specifications → Expected Paths → explicit USER adoption</small>
+                </div>
+              </div>
+              <div class="meeting-feature-grid">
+                <label for="meeting-feature-select">
+                  Active Feature
+                  <select id="meeting-feature-select"><option value="">Create a Feature below</option></select>
+                </label>
+                <label for="meeting-feature-title">
+                  New Feature title
+                  <input id="meeting-feature-title" type="text" maxlength="200" placeholder="What capability are we designing?" autocomplete="off" />
+                </label>
+                <label class="meeting-feature-wide" for="meeting-feature-intent">
+                  Feature intent
+                  <textarea id="meeting-feature-intent" rows="2" placeholder="Outcome and user value; no Todo decomposition yet"></textarea>
+                </label>
+                <div class="remote-access-actions meeting-feature-wide">
+                  <button id="create-meeting-feature-button" type="button" class="secondary-button">Create Feature Node</button>
+                  <small class="settings-help">The active Meeting Room is linked automatically.</small>
+                </div>
+                <label class="meeting-feature-wide" for="meeting-expected-path-summary">
+                  Candidate summary override
+                  <input id="meeting-expected-path-summary" type="text" maxlength="500" placeholder="Optional; otherwise uses the specification body" autocomplete="off" />
+                </label>
+                <label class="meeting-feature-wide" for="meeting-feature-rationale">
+                  Adoption rationale
+                  <textarea id="meeting-feature-rationale" rows="2" placeholder="Required when adopting one Expected Path"></textarea>
+                </label>
+              </div>
+            </section>
             <label for="multi-room-message">
               Message (role enforced server-side)
               <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>

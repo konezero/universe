@@ -728,6 +728,31 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('deliveryState === "ACCEPTED_BY_MASTER"', APP)
         self.assertNotIn("DELIVERED_TO_MASTER", APP)
 
+
+    def test_meeting_room_feature_expected_path_ui_is_explicit_and_non_authoritative(
+        self,
+    ) -> None:
+        self.assertIn('id="meeting-feature-controls"', HTML)
+        self.assertIn('id="meeting-feature-select"', HTML)
+        self.assertIn('id="meeting-feature-rationale"', HTML)
+        self.assertIn("async function createFeatureForActiveMeeting", APP)
+        self.assertIn("async function addArtifactAsExpectedPath", APP)
+        self.assertIn("async function adoptExpectedPath", APP)
+        self.assertIn('/feature-nodes', APP)
+        self.assertIn('/expected-paths', APP)
+        self.assertIn('/adoptions', APP)
+        feature_slice = APP[
+            APP.index("async function refreshActiveRoomFeatures") : APP.index(
+                "async function openMultiRoom"
+            )
+        ]
+        self.assertIn("expected_feature_revision: feature.revision", feature_slice)
+        self.assertIn("path.artifact_revision", APP)
+        self.assertIn("No Goal, Todo, Task Frame, authority, or assignment", APP)
+        self.assertNotIn('/goals', feature_slice)
+        self.assertNotIn('/todos', feature_slice)
+        self.assertIn(".meeting-feature-controls", CSS)
+
     def test_semantic_project_graph_is_separate_from_session_graph(self) -> None:
         self.assertIn('/semantic-graph', APP)
         self.assertIn('function buildSemanticProjectGraph', APP)

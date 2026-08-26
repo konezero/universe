@@ -1899,6 +1899,47 @@ dialog {
   gap: 6px;
 }
 
+.meeting-feature-controls {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, #c084fc 45%, var(--line));
+  border-radius: 6px;
+  background: color-mix(in srgb, #c084fc 7%, var(--surface-quiet));
+}
+
+.meeting-feature-controls[hidden] {
+  display: none;
+}
+
+.meeting-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.meeting-feature-wide {
+  grid-column: 1 / -1;
+}
+
+.feature-path-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.feature-path-card[data-state="ADOPTED"] {
+  border-color: color-mix(in srgb, var(--green) 55%, var(--line));
+}
+
+.feature-path-card[data-state="NOT_SELECTED"] {
+  opacity: 0.62;
+}
+
+.feature-path-digest {
+  font-family: var(--font-mono);
+}
+
 .remote-access-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

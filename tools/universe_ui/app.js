@@ -117,6 +117,9 @@ const state = {
   activeMultiRoomSnapshot: null,
   multiRoomTargetBindingIds: [],
   multiRoomArtifactDraft: null,
+  multiRoomFeatures: [],
+  activeMultiRoomFeatureId: null,
+  multiRoomFeatureCreateKey: null,
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -359,6 +362,13 @@ const elements = {
   multiRoomArtifactTitle: document.querySelector("#multi-room-artifact-title"),
   multiRoomArtifactEvidence: document.querySelector("#multi-room-artifact-evidence"),
   createRoomArtifact: document.querySelector("#create-room-artifact-button"),
+  meetingFeatureControls: document.querySelector("#meeting-feature-controls"),
+  meetingFeatureSelect: document.querySelector("#meeting-feature-select"),
+  meetingFeatureTitle: document.querySelector("#meeting-feature-title"),
+  meetingFeatureIntent: document.querySelector("#meeting-feature-intent"),
+  meetingExpectedPathSummary: document.querySelector("#meeting-expected-path-summary"),
+  meetingFeatureRationale: document.querySelector("#meeting-feature-rationale"),
+  createMeetingFeature: document.querySelector("#create-meeting-feature-button"),
   multiRoomFindingType: document.querySelector("#multi-room-finding-type"),
   multiRoomFindingSummary: document.querySelector("#multi-room-finding-summary"),
   multiRoomFindingFeatures: document.querySelector("#multi-room-finding-features"),
@@ -6504,16 +6514,213 @@ async function refreshMultiRooms() {
   }
 }
 
+
+async function refreshActiveRoomFeatures({ render = true } = {}) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || !room.project_id) {
+    state.multiRoomFeatures = [];
+    state.activeMultiRoomFeatureId = null;
+    if (render) renderActiveMultiRoom();
+    return;
+  }
+  const listed = await api(
+    `/v1/projects/${encodeURIComponent(room.project_id)}/feature-nodes`
+  );
+  const linked = (listed.features || []).filter(
+    (feature) => feature.meeting_room_id === room.room_id
+  );
+  state.multiRoomFeatures = await Promise.all(
+    linked.map((feature) =>
+      api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}`).then(
+        (result) => result.feature
+      )
+    )
+  );
+  if (
+    !state.multiRoomFeatures.some(
+      (feature) => feature.feature_id === state.activeMultiRoomFeatureId
+    )
+  ) {
+    state.activeMultiRoomFeatureId = state.multiRoomFeatures[0]?.feature_id || null;
+  }
+  if (render) renderActiveMultiRoom();
+}
+
+function activeMeetingFeature() {
+  return (state.multiRoomFeatures || []).find(
+    (feature) => feature.feature_id === state.activeMultiRoomFeatureId
+  ) || null;
+}
+
+async function refreshFeatureSemanticGraph(projectId) {
+  if (!projectId || state.selectedProject?.project_id !== projectId) return;
+  state.semanticGraph = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`
+  ).catch(() => state.semanticGraph);
+  buildGraph();
+}
+
+async function createFeatureForActiveMeeting() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || !room.project_id) {
+    throw new Error("Open a project Meeting Room first");
+  }
+  const title = elements.meetingFeatureTitle?.value.trim() || "";
+  const intentText = elements.meetingFeatureIntent?.value.trim() || "";
+  if (!title || !intentText) throw new Error("Feature title and intent are required");
+  state.multiRoomFeatureCreateKey ||= `ui-${room.room_id}-${crypto.randomUUID()}`;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(room.project_id)}/feature-nodes`,
+    {
+      method: "POST",
+      body: {
+        idempotency_key: state.multiRoomFeatureCreateKey,
+        title,
+        intent_text: intentText,
+        meeting_room_id: room.room_id,
+        evidence_refs: [`universe://chat-rooms/${room.room_id}`],
+      },
+    }
+  );
+  state.multiRoomFeatureCreateKey = null;
+  state.activeMultiRoomFeatureId = result.feature.feature_id;
+  elements.meetingFeatureTitle.value = "";
+  elements.meetingFeatureIntent.value = "";
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Feature Node created");
+}
+
+async function addArtifactAsExpectedPath(artifact) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature) throw new Error("Select or create a Feature first");
+  if (artifact.artifact_type !== "SPECIFICATION") {
+    throw new Error("Only SPECIFICATION artifacts can become Expected Paths");
+  }
+  const summaryOverride = elements.meetingExpectedPathSummary?.value.trim() || "";
+  const summary = summaryOverride || String(artifact.body_text || artifact.title || "").trim().slice(0, 500);
+  if (!summary) throw new Error("Expected Path summary is required");
+  await api(
+    `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/expected-paths`,
+    {
+      method: "POST",
+      body: {
+        room_id: room.room_id,
+        artifact_id: artifact.artifact_id,
+        summary,
+      },
+    }
+  );
+  if (elements.meetingExpectedPathSummary) {
+    elements.meetingExpectedPathSummary.value = "";
+  }
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Expected Path candidate added");
+}
+
+async function adoptExpectedPath(expectedPathId) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature) throw new Error("Select a Feature first");
+  const rationale = elements.meetingFeatureRationale?.value.trim() || "";
+  if (!rationale) throw new Error("Adoption rationale is required");
+  if (!window.confirm("Adopt this Expected Path? Other candidates will be marked not selected.")) {
+    return;
+  }
+  await api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/adoptions`, {
+    method: "POST",
+    body: {
+      expected_path_id: expectedPathId,
+      expected_feature_revision: feature.revision,
+      rationale,
+      evidence_refs: [`universe://chat-rooms/${room.room_id}`],
+    },
+  });
+  elements.meetingFeatureRationale.value = "";
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Expected Path adopted");
+}
+
+function renderMeetingFeaturePanel(room) {
+  const panel = node("section", "feature-path-list");
+  if (room.room_type !== "MEETING") return panel;
+  const features = state.multiRoomFeatures || [];
+  const feature = activeMeetingFeature();
+  if (elements.meetingFeatureControls) elements.meetingFeatureControls.hidden = false;
+  if (elements.meetingFeatureSelect) {
+    elements.meetingFeatureSelect.replaceChildren();
+    if (!features.length) {
+      const empty = node("option", "", "Create a Feature below");
+      empty.value = "";
+      elements.meetingFeatureSelect.append(empty);
+    }
+    for (const item of features) {
+      const option = node("option", "", `${item.title} · ${item.state}`);
+      option.value = item.feature_id;
+      option.selected = item.feature_id === state.activeMultiRoomFeatureId;
+      elements.meetingFeatureSelect.append(option);
+    }
+  }
+  if (!feature) {
+    panel.append(node("p", "empty-copy", "Create a Feature Node to turn room specifications into comparable Expected Paths."));
+    return panel;
+  }
+  const header = node("article", "remote-access-row");
+  const headerCopy = node("div", "remote-access-copy");
+  headerCopy.append(
+    node("strong", "", `FEATURE · ${feature.title}`),
+    node("small", "", `${feature.state} · revision ${feature.revision} · paths ${(feature.expected_paths || []).length}`),
+    node("small", "", feature.intent_text || "")
+  );
+  header.append(headerCopy);
+  panel.append(header);
+  for (const path of feature.expected_paths || []) {
+    const row = node("article", "remote-access-row feature-path-card");
+    row.dataset.state = path.state;
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${path.state} · ${path.title}`),
+      node("small", "", `artifact revision ${path.artifact_revision} · evidence ${(path.evidence_refs || []).length}`),
+      node("small", "", path.summary || ""),
+      node("small", "feature-path-digest", `sha256 ${String(path.specification_digest || "").slice(0, 16)}…`)
+    );
+    row.append(copy);
+    if (path.state === "CANDIDATE" && feature.state !== "ADOPTED") {
+      const adopt = node("button", "primary-button compact-action", "Adopt");
+      adopt.type = "button";
+      adopt.disabled = (feature.expected_paths || []).filter((item) => item.state === "CANDIDATE").length < 2;
+      adopt.title = adopt.disabled ? "At least two candidate paths are required" : "Adopt this path as USER";
+      adopt.addEventListener("click", () => {
+        adoptExpectedPath(path.expected_path_id).catch((error) => toast(error.message, true));
+      });
+      row.append(adopt);
+    }
+    panel.append(row);
+  }
+  panel.append(node("small", "settings-help", "No Goal, Todo, Task Frame, authority, or assignment is created by this surface."));
+  return panel;
+}
+
 async function openMultiRoom(roomId) {
   state.activeMultiRoomId = roomId;
   state.multiRoomTargetBindingIds = [];
   state.multiRoomArtifactDraft = null;
+  state.multiRoomFeatures = [];
+  state.activeMultiRoomFeatureId = null;
+  state.multiRoomFeatureCreateKey = null;
   state.multiRoomLiveOutput = {};
   if (elements.createRoomArtifact) {
     elements.createRoomArtifact.textContent = "Create artifact from Message";
   }
   const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
   state.activeMultiRoomSnapshot = snap;
+  await refreshActiveRoomFeatures({ render: false });
   renderActiveMultiRoom();
   openMultiRoomStream(roomId);
 }
@@ -6642,6 +6849,10 @@ function renderActiveMultiRoom() {
     }
     findingList.append(row);
   }
+  if (elements.meetingFeatureControls) {
+    elements.meetingFeatureControls.hidden = room.room_type !== "MEETING";
+  }
+  const featurePanel = renderMeetingFeaturePanel(room);
   const artifactList = node("div", "remote-access-list");
   const artifacts = snap.artifacts || [];
   if (room.room_type === "MEETING" && !artifacts.length) {
@@ -6684,6 +6895,25 @@ function renderActiveMultiRoom() {
         toast("Artifact revision loaded");
       });
       row.append(revise);
+      const feature = activeMeetingFeature();
+      const alreadyLinked = (feature?.expected_paths || []).some(
+        (path) =>
+          path.artifact_id === artifact.artifact_id &&
+          path.artifact_revision === artifact.current_revision
+      );
+      if (artifact.artifact_type === "SPECIFICATION" && feature && feature.state !== "ADOPTED") {
+        const addPath = node(
+          "button",
+          "secondary-button compact-action",
+          alreadyLinked ? "Path added" : "Add Expected Path"
+        );
+        addPath.type = "button";
+        addPath.disabled = alreadyLinked;
+        addPath.addEventListener("click", () => {
+          addArtifactAsExpectedPath(artifact).catch((error) => toast(error.message, true));
+        });
+        row.append(addPath);
+      }
     }
     artifactList.append(row);
   }
@@ -6696,6 +6926,7 @@ function renderActiveMultiRoom() {
     summary,
     participantList,
     permissionList,
+    featurePanel,
     findingList,
     artifactList,
     transcript
@@ -13584,6 +13815,20 @@ function bindEvents() {
     elements.createMeetingRoom.addEventListener("click", () => {
       createMeetingRoomThin().catch((error) => {
         elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.meetingFeatureSelect) {
+    elements.meetingFeatureSelect.addEventListener("change", () => {
+      state.activeMultiRoomFeatureId = elements.meetingFeatureSelect.value || null;
+      renderActiveMultiRoom();
+    });
+  }
+  if (elements.createMeetingFeature) {
+    elements.createMeetingFeature.addEventListener("click", () => {
+      createFeatureForActiveMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
       });
     });
   }
