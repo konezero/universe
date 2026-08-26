@@ -125,6 +125,7 @@ const state = {
   multiRoomMeetingRunBusy: false,
   goalWorkPlanRunId: null,
   goalWorkPlanRunBusy: false,
+  goalAutomationSurfaces: {},
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -6564,6 +6565,20 @@ async function refreshActiveRoomFeatures({ render = true } = {}) {
       )
     )
   );
+  const goalIds = state.multiRoomFeatures
+    .map((feature) => feature.goal_derivation?.goal?.goal_id)
+    .filter(Boolean);
+  const automationEntries = await Promise.all(
+    goalIds.map(async (goalId) => {
+      const surface = await api(
+        `/v1/goals/${encodeURIComponent(goalId)}/automation`
+      ).catch(() => null);
+      return [goalId, surface];
+    })
+  );
+  state.goalAutomationSurfaces = Object.fromEntries(
+    automationEntries.filter(([, surface]) => surface)
+  );
   if (
     !state.multiRoomFeatures.some(
       (feature) => feature.feature_id === state.activeMultiRoomFeatureId
@@ -6860,6 +6875,8 @@ async function advanceGoalAutomation() {
     },
   });
   const surface = result.surface || {};
+  state.goalAutomationSurfaces[goal.goal_id] = surface;
+  renderActiveMultiRoom();
   toast(`Conductor · ${surface.automation_state || result.status} · next ${surface.next_operation || "WAIT"}`);
 }
 
@@ -7010,7 +7027,18 @@ function renderMeetingFeaturePanel(room) {
       }
       if (workPlans.application) {
         const created = workPlans.application.created_items || {};
+        const automation = state.goalAutomationSurfaces[derivation.goal.goal_id];
+        const todoExecution = automation?.todo_execution || {};
         goalCopy.append(node("small", "", `APPLIED · ${created.milestone_count || 0} PLANNED milestone(s) · ${created.todo_count || 0} BACKLOG Todo(s)`));
+        if (automation) {
+          const selectedCount = todoExecution.selection?.todo_ids?.length || 0;
+          const receiptCount = todoExecution.action_receipts?.length || 0;
+          const resultCount = todoExecution.task_frame_results?.length || 0;
+          goalCopy.append(
+            node("small", "", `CONDUCTOR · ${automation.automation_state} · next ${automation.next_operation}`),
+            node("small", "", `Execution · ${selectedCount}/${todoExecution.eligible_todo_ids?.length || 0} Todo(s) selected · ${resultCount} result(s) · ${receiptCount} receipt(s)`)
+          );
+        }
         const deliver = node("button", "primary-button compact-action", "Advance Conductor");
         deliver.type = "button";
         deliver.title = "Create or advance the receipt-backed Goal execution loop";
@@ -7047,6 +7075,7 @@ async function openMultiRoom(roomId) {
   state.multiRoomMeetingRunBusy = false;
   state.goalWorkPlanRunId = null;
   state.goalWorkPlanRunBusy = false;
+  state.goalAutomationSurfaces = {};
   state.multiRoomLiveOutput = {};
   if (elements.createRoomArtifact) {
     elements.createRoomArtifact.textContent = "Create artifact from Message";

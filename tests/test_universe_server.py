@@ -8029,6 +8029,193 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         create_frame.assert_called_once()
 
+        actor_session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "goal-automation-conductor-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "goal-automation-conductor-provider",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        actor = {
+            "provider": "CODEX",
+            "provider_session_ref": "goal-automation-conductor-provider",
+            "session_id": actor_session["session_id"],
+            "session_anchor_ref": actor_session["session_anchor_ref"],
+            "expected_goal_revision": 1,
+        }
+        todo_ids = applied["application"]["created_items"]["todo_ids"]
+        status, before_selection = self.request(
+            "GET", f"/v1/goals/{goal_id}/automation", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "SELECT_TODOS_FOR_EXECUTION", before_selection["next_operation"]
+        )
+        self.assertEqual(
+            todo_ids, before_selection["todo_execution"]["eligible_todo_ids"]
+        )
+
+        status, selected_todos = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-selection",
+            {**actor, "approval": "SELECT_TODOS", "todo_ids": todo_ids},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "GOAL_TODOS_SELECTED_FOR_EXECUTION", selected_todos["status"]
+        )
+        self.assertEqual(todo_ids, selected_todos["selection"]["todo_ids"])
+        self.assertEqual(
+            {"IN_PROGRESS"},
+            {item["todo"]["state"] for item in selected_todos["actions"]},
+        )
+        self.assertTrue(
+            all(item["receipt"]["status"] == "CONSUMED" for item in selected_todos["actions"])
+        )
+
+        status, selection_replay = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-selection",
+            {**actor, "approval": "SELECT_TODOS", "todo_ids": todo_ids},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "GOAL_TODO_EXECUTION_SELECTION_REPLAYED", selection_replay["status"]
+        )
+        self.assertTrue(all(item["replayed"] for item in selection_replay["actions"]))
+
+        status, selection_conflict = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-selection",
+            {**actor, "approval": "SELECT_TODOS", "todo_ids": todo_ids[:1]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "GOAL_TODO_SELECTION_CONFLICT", selection_conflict["error_code"]
+        )
+
+        self.server.task_frame_lineage.create_task_frame(
+            frame_ref="goal-plan-frame-001",
+            origin_session_anchor_ref=actor_session["session_anchor_ref"],
+        )
+        result, _ = self.server.task_frame_lineage.attach_result(
+            result_ref="goal-plan-result-partial-001",
+            frame_ref="goal-plan-frame-001",
+            origin_session_anchor_ref=actor_session["session_anchor_ref"],
+            result={
+                "todo_actions": [
+                    {
+                        "todo_id": todo_ids[0],
+                        "outcome": "COMPLETED",
+                        "evidence_ref": "task-frame://goal-plan-frame-001/result/first",
+                        "validation": {
+                            "status": "PASSED",
+                            "evidence_ref": "test-run://goal-plan-frame-001/first/pass",
+                        },
+                    }
+                ]
+            },
+        )
+        status, projected = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-results",
+            {**actor, "approval": "APPLY_RESULT", "result_ref": result["result_ref"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GOAL_TASK_FRAME_TODO_RESULT_APPLIED", projected["status"])
+        self.assertEqual("DONE", self.server.store.get_todo(todo_ids[0])["state"])
+        self.assertEqual(
+            "IN_PROGRESS", self.server.store.get_todo(todo_ids[1])["state"]
+        )
+        self.assertEqual(3, len(projected["surface"]["todo_execution"]["action_receipts"]))
+        self.assertEqual(
+            "APPLY_TASK_FRAME_RESULT", projected["surface"]["next_operation"]
+        )
+
+        status, result_replay = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-results",
+            {**actor, "approval": "APPLY_RESULT", "result_ref": result["result_ref"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(result_replay["actions"][0]["replayed"])
+
+        invalid_result, _ = self.server.task_frame_lineage.attach_result(
+            result_ref="goal-plan-result-invalid-002",
+            frame_ref="goal-plan-frame-001",
+            origin_session_anchor_ref=actor_session["session_anchor_ref"],
+            result={
+                "todo_actions": [
+                    {
+                        "todo_id": todo_ids[1],
+                        "outcome": "COMPLETED",
+                        "evidence_ref": "task-frame://goal-plan-frame-001/result/second",
+                    }
+                ]
+            },
+        )
+        status, validation_blocked = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-results",
+            {
+                **actor,
+                "approval": "APPLY_RESULT",
+                "result_ref": invalid_result["result_ref"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "TODO_COMPLETION_VALIDATION_REQUIRED",
+            validation_blocked["error_code"],
+        )
+        self.assertEqual(
+            "IN_PROGRESS", self.server.store.get_todo(todo_ids[1])["state"]
+        )
+
+        outside_result, _ = self.server.task_frame_lineage.attach_result(
+            result_ref="goal-plan-result-outside-selection-003",
+            frame_ref="goal-plan-frame-001",
+            origin_session_anchor_ref=actor_session["session_anchor_ref"],
+            result={
+                "todo_actions": [
+                    {
+                        "todo_id": "todo_outside_goal_selection",
+                        "outcome": "FAILED",
+                        "evidence_ref": "task-frame://goal-plan-frame-001/result/outside",
+                    }
+                ]
+            },
+        )
+        status, outside_blocked = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/todo-results",
+            {
+                **actor,
+                "approval": "APPLY_RESULT",
+                "result_ref": outside_result["result_ref"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "GOAL_TASK_FRAME_RESULT_TODO_MISMATCH",
+            outside_blocked["error_code"],
+        )
+        self.assertEqual(
+            "IN_PROGRESS", self.server.store.get_todo(todo_ids[1])["state"]
+        )
+
         status, work_plan_surface = self.request(
             "GET", f"/v1/goals/{goal_id}/work-plans", None, self.token
         )

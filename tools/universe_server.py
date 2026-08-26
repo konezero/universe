@@ -396,6 +396,9 @@ PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
 PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA = (
     "universe.project-master-handoff-task-frame-binding.v1"
 )
+GOAL_TODO_EXECUTION_SELECTION_SCHEMA = (
+    "universe.goal-todo-execution-selection.v1"
+)
 PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA = (
     "universe.project-skill-plan-master-application.v1"
 )
@@ -3292,6 +3295,119 @@ def normalize_goal_automation_advance_request(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_goal_automation_actor(request: Mapping[str, Any]) -> dict[str, Any]:
+    provider = _required_text(request["provider"], "provider").upper()
+    if provider not in TODO_MUTATION_PROVIDERS:
+        raise UniverseError(
+            "GOAL_AUTOMATION_PROVIDER_INVALID",
+            "provider must be CODEX, CLAUDE, or GROK",
+        )
+    provider_session_ref = _required_text(
+        request["provider_session_ref"], "provider_session_ref"
+    )
+    if len(provider_session_ref) > 1000:
+        raise UniverseError(
+            "GOAL_AUTOMATION_PROVIDER_SESSION_REF_INVALID",
+            "provider_session_ref is too long",
+        )
+    ttl_seconds = request.get("ttl_seconds", TODO_MUTATION_RECEIPT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds < 1
+        or ttl_seconds > TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "GOAL_AUTOMATION_TTL_INVALID",
+            f"ttl_seconds must be between 1 and {TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS}",
+        )
+    revision = request["expected_goal_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise UniverseError(
+            "GOAL_REVISION_INVALID",
+            "expected_goal_revision must be a positive integer",
+        )
+    return {
+        "provider": provider,
+        "provider_session_ref": provider_session_ref,
+        "session_id": _identifier(request["session_id"], "session_id"),
+        "session_anchor_ref": _required_text(
+            request["session_anchor_ref"], "session_anchor_ref"
+        ),
+        "expected_goal_revision": revision,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+def normalize_goal_todo_execution_selection_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_todo_execution_selection_request",
+        required=frozenset(
+            {
+                "approval",
+                "expected_goal_revision",
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "todo_ids",
+            }
+        ),
+        optional=frozenset({"ttl_seconds"}),
+    )
+    if request["approval"] != "SELECT_TODOS":
+        raise UniverseError(
+            "GOAL_TODO_SELECTION_APPROVAL_REQUIRED",
+            "approval must be SELECT_TODOS",
+            HTTPStatus.CONFLICT,
+        )
+    todo_ids = [
+        _identifier(item, "todo_ids[]")
+        for item in _array(request["todo_ids"], "todo_ids")
+    ]
+    if not todo_ids or len(todo_ids) > 100 or len(set(todo_ids)) != len(todo_ids):
+        raise UniverseError(
+            "GOAL_TODO_SELECTION_INVALID",
+            "todo_ids must contain 1..100 unique Todo ids",
+        )
+    return {
+        **_normalize_goal_automation_actor(request),
+        "approval": "SELECT_TODOS",
+        "todo_ids": todo_ids,
+    }
+
+
+def normalize_goal_todo_result_projection_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_todo_result_projection_request",
+        required=frozenset(
+            {
+                "approval",
+                "expected_goal_revision",
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "result_ref",
+            }
+        ),
+        optional=frozenset({"ttl_seconds"}),
+    )
+    if request["approval"] != "APPLY_RESULT":
+        raise UniverseError(
+            "GOAL_TODO_RESULT_APPROVAL_REQUIRED",
+            "approval must be APPLY_RESULT",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        **_normalize_goal_automation_actor(request),
+        "approval": "APPLY_RESULT",
+        "result_ref": _required_text(request["result_ref"], "result_ref"),
+    }
+
+
 def normalize_experience_case_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -5702,6 +5818,30 @@ class UniverseStore:
                 ON project_master_handoff_task_frame(
                     project_id, bound_at, handoff_id
                 );
+
+                CREATE TABLE IF NOT EXISTS goal_todo_execution_selection (
+                    selection_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    application_id TEXT NOT NULL
+                        REFERENCES goal_work_plan_application(application_id)
+                        ON DELETE CASCADE,
+                    handoff_id TEXT NOT NULL UNIQUE
+                        REFERENCES project_master_handoff(handoff_id)
+                        ON DELETE CASCADE,
+                    task_frame_id TEXT NOT NULL UNIQUE,
+                    todo_ids_json TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    selection_digest TEXT NOT NULL UNIQUE,
+                    selected_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_todo_execution_selection_goal
+                ON goal_todo_execution_selection(goal_id, selected_at, selection_id);
 
                 CREATE TABLE IF NOT EXISTS project_skill_plan_master_application (
                     handoff_id TEXT PRIMARY KEY
@@ -13554,6 +13694,129 @@ class UniverseStore:
             ).fetchone()
         assert row is not None
         return self._master_handoff_task_frame_binding_row(row), True
+
+    @staticmethod
+    def _goal_todo_execution_selection_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_TODO_EXECUTION_SELECTION_SCHEMA,
+            "selection_id": str(row["selection_id"]),
+            "goal_id": str(row["goal_id"]),
+            "application_id": str(row["application_id"]),
+            "handoff_id": str(row["handoff_id"]),
+            "task_frame_id": str(row["task_frame_id"]),
+            "todo_ids": json.loads(row["todo_ids_json"]),
+            "provider": str(row["provider"]),
+            "provider_session_ref_hash": str(row["provider_session_ref_hash"]),
+            "session_id": str(row["session_id"]),
+            "session_anchor_ref": str(row["session_anchor_ref"]),
+            "selection_digest": str(row["selection_digest"]),
+            "selected_at": str(row["selected_at"]),
+        }
+
+    def get_goal_todo_execution_selection(
+        self, goal_id: str
+    ) -> dict[str, Any] | None:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM goal_todo_execution_selection WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        return None if row is None else self._goal_todo_execution_selection_row(row)
+
+    def record_goal_todo_execution_selection(
+        self,
+        *,
+        goal_id: str,
+        application_id: str,
+        handoff_id: str,
+        task_frame_id: str,
+        todo_ids: list[str],
+        provider: str,
+        provider_session_ref: str,
+        session_id: str,
+        session_anchor_ref: str,
+    ) -> tuple[dict[str, Any], bool]:
+        material = {
+            "schema": GOAL_TODO_EXECUTION_SELECTION_SCHEMA,
+            "goal_id": _identifier(goal_id, "goal_id"),
+            "application_id": _identifier(application_id, "application_id"),
+            "handoff_id": _identifier(handoff_id, "handoff_id"),
+            "task_frame_id": _identifier(task_frame_id, "task_frame_id"),
+            "todo_ids": list(todo_ids),
+            "provider": _required_text(provider, "provider").upper(),
+            "provider_session_ref_hash": hashlib.sha256(
+                _required_text(
+                    provider_session_ref, "provider_session_ref"
+                ).encode("utf-8")
+            ).hexdigest(),
+            "session_id": _identifier(session_id, "session_id"),
+            "session_anchor_ref": _required_text(
+                session_anchor_ref, "session_anchor_ref"
+            ),
+        }
+        selection_digest = _json_sha256(material)
+        selection_id = "goal_todo_selection_" + selection_digest[:24]
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM goal_todo_execution_selection WHERE goal_id = ?",
+                (material["goal_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = self._goal_todo_execution_selection_row(existing)
+                if current["selection_digest"] != selection_digest:
+                    raise UniverseError(
+                        "GOAL_TODO_SELECTION_CONFLICT",
+                        "Goal already has a different Task Frame Todo selection",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            selected_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO goal_todo_execution_selection(
+                    selection_id, goal_id, application_id, handoff_id,
+                    task_frame_id, todo_ids_json, provider,
+                    provider_session_ref_hash, session_id, session_anchor_ref,
+                    selection_digest, selected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    selection_id,
+                    material["goal_id"],
+                    material["application_id"],
+                    material["handoff_id"],
+                    material["task_frame_id"],
+                    _canonical_json(material["todo_ids"]),
+                    material["provider"],
+                    material["provider_session_ref_hash"],
+                    material["session_id"],
+                    material["session_anchor_ref"],
+                    selection_digest,
+                    selected_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM goal_todo_execution_selection WHERE selection_id = ?",
+                (selection_id,),
+            ).fetchone()
+        assert row is not None
+        return self._goal_todo_execution_selection_row(row), True
+
+    def list_goal_todo_action_receipts(
+        self, goal_id: str
+    ) -> list[dict[str, Any]]:
+        prefix = f"goal-automation://{_identifier(goal_id, 'goal_id')}/%"
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM todo_action_mutation_receipt
+                WHERE instruction_ref LIKE ? ESCAPE '\\'
+                ORDER BY prepared_at, receipt_id
+                """,
+                (prefix,),
+            ).fetchall()
+        return [self._todo_action_mutation_receipt_row(row) for row in rows]
 
     @staticmethod
     def _master_handoff_task_frame_binding_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -23076,10 +23339,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         handoff = None
         matching_proposals: list[dict[str, Any]] = []
         binding = None
+        todo_execution = {
+            "eligible_todo_ids": [],
+            "selection": None,
+            "action_receipts": [],
+            "task_frame_results": [],
+        }
         if application is None:
             state = "WAITING_USER_WORK_PLAN_APPLICATION"
             next_operation = "APPLY_ADOPTED_WORK_PLAN"
         else:
+            todo_execution["eligible_todo_ids"] = list(
+                application.get("created_items", {}).get("todo_ids", [])
+            )
             handoff = self.store.find_goal_work_plan_handoff(
                 goal["project_id"], application["application_id"]
             )
@@ -23113,7 +23385,34 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         next_operation = "BIND_INSTRUCTION_TASK_FRAME"
                     else:
                         state = "TASK_FRAME_READY"
-                        next_operation = "RUN_TASK_FRAME"
+                        selection = self.store.get_goal_todo_execution_selection(
+                            goal["goal_id"]
+                        )
+                        todo_execution["selection"] = selection
+                        todo_execution["action_receipts"] = (
+                            self.store.list_goal_todo_action_receipts(goal["goal_id"])
+                        )
+                        try:
+                            lineage = self.task_frame_lineage.get_task_frame(
+                                binding["task_frame_id"]
+                            )
+                        except TaskFrameLineageError:
+                            lineage = None
+                        if isinstance(lineage, Mapping):
+                            todo_execution["task_frame_results"] = [
+                                {
+                                    "result_ref": result["result_ref"],
+                                    "result_digest": result["result_digest"],
+                                    "attached_at": result["attached_at"],
+                                }
+                                for result in lineage.get("results", [])
+                            ]
+                        if selection is None:
+                            next_operation = "SELECT_TODOS_FOR_EXECUTION"
+                        elif todo_execution["task_frame_results"]:
+                            next_operation = "APPLY_TASK_FRAME_RESULT"
+                        else:
+                            next_operation = "RUN_TASK_FRAME"
         return {
             "schema": API_SCHEMA,
             "status": "GOAL_AUTOMATION_STATE_PROJECTED",
@@ -23122,6 +23421,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "handoff": handoff,
             "matching_proposals": matching_proposals,
             "binding": binding,
+            "todo_execution": todo_execution,
             "automation_state": state,
             "next_operation": next_operation,
             "effects": {
@@ -23130,6 +23430,273 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "authority_created": False,
                 "execution_assignment_created": False,
             },
+        }
+
+    @staticmethod
+    def _goal_todo_action_request(
+        actor: Mapping[str, Any],
+        *,
+        instruction_ref: str,
+        todo_id: str,
+        action: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "provider": actor["provider"],
+            "provider_session_ref": actor["provider_session_ref"],
+            "session_id": actor["session_id"],
+            "session_anchor_ref": actor["session_anchor_ref"],
+            "instruction_ref": instruction_ref,
+            "todo_id": todo_id,
+            "action": dict(action),
+            "ttl_seconds": actor["ttl_seconds"],
+        }
+
+    def _apply_goal_todo_action(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        receipt, _created = self.store.prepare_todo_action_mutation_receipt(request)
+        consumed, action, replayed = self.store.consume_todo_action_mutation_receipt(
+            receipt["receipt_id"], request
+        )
+        return {
+            "receipt": consumed,
+            "action": action,
+            "todo": action["todo"],
+            "replayed": replayed,
+        }
+
+    def select_goal_todos_for_execution(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_todo_execution_selection_request(value)
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before Todo execution selection",
+                HTTPStatus.CONFLICT,
+            )
+        if surface["automation_state"] != "TASK_FRAME_READY":
+            raise UniverseError(
+                "GOAL_TASK_FRAME_BINDING_REQUIRED",
+                "bind the Goal handoff to a Task Frame before selecting Todos",
+                HTTPStatus.CONFLICT,
+            )
+        self.resolve_todo_mutation_session(request)
+        application = surface["application"]
+        handoff = surface["handoff"]
+        binding = surface["binding"]
+        assert isinstance(application, Mapping)
+        assert isinstance(handoff, Mapping)
+        assert isinstance(binding, Mapping)
+        eligible = set(
+            application.get("created_items", {}).get("todo_ids", [])
+        )
+        requested_ids = request["todo_ids"]
+        if any(todo_id not in eligible for todo_id in requested_ids):
+            raise UniverseError(
+                "GOAL_TODO_SELECTION_SCOPE_MISMATCH",
+                "selection contains a Todo not created by the applied Work Plan",
+                HTTPStatus.CONFLICT,
+            )
+        for todo_id in requested_ids:
+            todo = self.store.get_todo(todo_id)
+            if todo.get("goal_id") != goal["goal_id"]:
+                raise UniverseError(
+                    "GOAL_TODO_SELECTION_SCOPE_MISMATCH",
+                    "selection Todo is not bound to this Goal",
+                    HTTPStatus.CONFLICT,
+                )
+            if todo.get("state") == "DONE":
+                raise UniverseError(
+                    "GOAL_TODO_SELECTION_STATE_INVALID",
+                    "completed Todos cannot be selected for a new execution",
+                    HTTPStatus.CONFLICT,
+                )
+        selection, created = self.store.record_goal_todo_execution_selection(
+            goal_id=goal["goal_id"],
+            application_id=application["application_id"],
+            handoff_id=handoff["handoff_id"],
+            task_frame_id=binding["task_frame_id"],
+            todo_ids=requested_ids,
+            provider=request["provider"],
+            provider_session_ref=request["provider_session_ref"],
+            session_id=request["session_id"],
+            session_anchor_ref=request["session_anchor_ref"],
+        )
+        actions = []
+        for todo_id in selection["todo_ids"]:
+            action = {
+                "action_id": "goal-execution-start-"
+                + _json_sha256(
+                    {"selection_id": selection["selection_id"], "todo_id": todo_id}
+                )[:24],
+                "outcome": "STARTED",
+                "source": "GOAL_AUTOMATION",
+                "evidence_ref": (
+                    f"universe://goal-execution-selections/{selection['selection_id']}"
+                    f"/todos/{todo_id}"
+                ),
+            }
+            action_request = self._goal_todo_action_request(
+                request,
+                instruction_ref=(
+                    f"goal-automation://{goal['goal_id']}/selections/"
+                    f"{selection['selection_id']}/todos/{todo_id}/started"
+                ),
+                todo_id=todo_id,
+                action=action,
+            )
+            actions.append(self._apply_goal_todo_action(action_request))
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "GOAL_TODOS_SELECTED_FOR_EXECUTION"
+                if created
+                else "GOAL_TODO_EXECUTION_SELECTION_REPLAYED"
+            ),
+            "goal_id": goal["goal_id"],
+            "binding": binding,
+            "selection": selection,
+            "actions": actions,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
+        }
+
+    def apply_goal_task_frame_todo_result(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_todo_result_projection_request(value)
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before Task Frame result projection",
+                HTTPStatus.CONFLICT,
+            )
+        binding = surface.get("binding")
+        selection = surface.get("todo_execution", {}).get("selection")
+        if not isinstance(binding, Mapping) or not isinstance(selection, Mapping):
+            raise UniverseError(
+                "GOAL_TODO_EXECUTION_SELECTION_REQUIRED",
+                "select exact Work Plan Todos before applying a Task Frame result",
+                HTTPStatus.CONFLICT,
+            )
+        self.resolve_todo_mutation_session(request)
+        try:
+            lineage = self.task_frame_lineage.get_task_frame(
+                binding["task_frame_id"]
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+        result = next(
+            (
+                item
+                for item in lineage.get("results", [])
+                if item.get("result_ref") == request["result_ref"]
+            ),
+            None,
+        )
+        if not isinstance(result, Mapping):
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_NOT_FOUND",
+                "result_ref is not attached to the bound Goal Task Frame",
+                HTTPStatus.NOT_FOUND,
+            )
+        result_payload = result.get("result")
+        if not isinstance(result_payload, Mapping):
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_INVALID",
+                "Task Frame result payload must be an object",
+                HTTPStatus.CONFLICT,
+            )
+        raw_actions = _array(
+            result_payload.get("todo_actions"), "task_frame_result.todo_actions"
+        )
+        if not raw_actions or len(raw_actions) > 100:
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_ACTIONS_INVALID",
+                "Task Frame result must contain 1..100 Todo actions",
+                HTTPStatus.CONFLICT,
+            )
+        selected_ids = set(selection["todo_ids"])
+        normalized_actions: list[tuple[str, dict[str, Any]]] = []
+        observed_ids: set[str] = set()
+        for raw_action in raw_actions:
+            entry = _exact_object_fields(
+                raw_action,
+                field="task_frame_result.todo_actions[]",
+                required=frozenset({"todo_id", "outcome", "evidence_ref"}),
+                optional=frozenset({"validation"}),
+            )
+            todo_id = _identifier(entry["todo_id"], "todo_id")
+            if todo_id not in selected_ids:
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_TODO_MISMATCH",
+                    "Task Frame result contains a Todo outside its execution selection",
+                    HTTPStatus.CONFLICT,
+                )
+            if todo_id in observed_ids:
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_TODO_DUPLICATE",
+                    "Task Frame result contains more than one action for a Todo",
+                    HTTPStatus.CONFLICT,
+                )
+            observed_ids.add(todo_id)
+            outcome = _required_text(entry["outcome"], "outcome").upper()
+            if outcome not in {"COMPLETED", "FAILED"}:
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_OUTCOME_INVALID",
+                    "Task Frame result outcome must be COMPLETED or FAILED",
+                    HTTPStatus.CONFLICT,
+                )
+            action_material = {
+                "action_id": "goal-task-frame-result-"
+                + _json_sha256(
+                    {
+                        "result_digest": result["result_digest"],
+                        "todo_id": todo_id,
+                        "outcome": outcome,
+                    }
+                )[:24],
+                "outcome": outcome,
+                "source": "GOAL_AUTOMATION_TASK_FRAME",
+                "evidence_ref": entry["evidence_ref"],
+            }
+            if "validation" in entry:
+                action_material["validation"] = entry["validation"]
+            normalized_actions.append(
+                (todo_id, normalize_todo_action_payload(todo_id, action_material))
+            )
+        actions = []
+        for todo_id, action in normalized_actions:
+            action.pop("todo_id", None)
+            action.pop("state", None)
+            instruction_ref = (
+                f"goal-automation://{goal['goal_id']}/results/"
+                f"{result['result_digest']}/todos/{todo_id}/{action['outcome'].lower()}"
+            )
+            action_request = self._goal_todo_action_request(
+                request,
+                instruction_ref=instruction_ref,
+                todo_id=todo_id,
+                action=action,
+            )
+            actions.append(self._apply_goal_todo_action(action_request))
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_TASK_FRAME_TODO_RESULT_APPLIED",
+            "goal_id": goal["goal_id"],
+            "binding": binding,
+            "selection": selection,
+            "result": {
+                "result_ref": result["result_ref"],
+                "result_digest": result["result_digest"],
+                "attached_at": result["attached_at"],
+            },
+            "actions": actions,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
         }
 
     def advance_goal_automation(
@@ -34629,6 +35196,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self.server.advance_goal_automation(
                         unquote(goal_automation_advance.group(1)), body
+                    ),
+                )
+                return
+            goal_todo_selection = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/todo-selection", path
+            )
+            if goal_todo_selection is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.select_goal_todos_for_execution(
+                        unquote(goal_todo_selection.group(1)), body
+                    ),
+                )
+                return
+            goal_todo_result = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/todo-results", path
+            )
+            if goal_todo_result is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.apply_goal_task_frame_todo_result(
+                        unquote(goal_todo_result.group(1)), body
                     ),
                 )
                 return
