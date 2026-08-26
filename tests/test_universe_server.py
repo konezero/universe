@@ -7832,6 +7832,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertFalse(apply_replay["todo_created"])
         self.assertEqual(2, len([todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"]))
 
+        status, automation_ready = self.request(
+            "GET", f"/v1/goals/{goal_id}/automation", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "READY_FOR_MASTER_HANDOFF", automation_ready["automation_state"]
+        )
+        self.assertEqual(
+            "CREATE_AND_DELIVER_MASTER_HANDOFF",
+            automation_ready["next_operation"],
+        )
+
         status, handoff_result = self.request(
             "POST",
             "/v1/projects/GCS/master-handoffs",
@@ -7882,6 +7894,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(handoff["handoff_id"], repeated_handoff["handoff"]["handoff_id"])
 
+        status, handoff_ready = self.request(
+            "GET", f"/v1/goals/{goal_id}/automation", token=self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("MASTER_HANDOFF_READY", handoff_ready["automation_state"])
+
         proposal = self.create_task_proposal_fixture(
             request_ref=handoff["instruction_ref"]
         )
@@ -7901,17 +7919,24 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status)
         self.assertEqual("MASTER_HANDOFF_DELIVERY_REQUIRED", not_delivered["error_code"])
 
-        with self.server.store._connection() as connection:
-            connection.execute(
-                """
-                UPDATE project_master_handoff
-                SET delivery_state = 'QUEUED_FOR_MASTER',
-                    room_message_id = 'room_0123456789abcdef0123456789abcdef',
-                    delivered_at = ?
-                WHERE handoff_id = ?
-                """,
-                ("2026-08-27T00:00:00Z", handoff["handoff_id"]),
-            )
+        status, advanced_handoff = self.request(
+            "POST",
+            f"/v1/goals/{goal_id}/automation/advance",
+            {"approval": "ADVANCE", "expected_goal_revision": 1},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "GOAL_AUTOMATION_TASK_FRAME_INPUT_REQUIRED",
+            advanced_handoff["status"],
+        )
+        self.assertEqual(
+            ["MASTER_HANDOFF_DELIVERED"], advanced_handoff["operations"]
+        )
+        self.assertEqual(
+            "MASTER_PROPOSAL_READY",
+            advanced_handoff["surface"]["automation_state"],
+        )
         proposal_database = (
             self.project_root
             / ".ai"
@@ -7968,25 +7993,39 @@ class UniverseLocalServiceTests(unittest.TestCase):
         ) as create_frame:
             status, bound = self.request(
                 "POST",
-                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}"
-                "/instruction-task-frame",
-                frame_request,
+                f"/v1/goals/{goal_id}/automation/advance",
+                {
+                    "approval": "ADVANCE",
+                    "expected_goal_revision": 1,
+                    "task_frame": frame_request["task_frame"],
+                },
                 self.token,
             )
             replay_status, replay_binding = self.request(
                 "POST",
-                f"/v1/projects/GCS/master-handoffs/{handoff['handoff_id']}"
-                "/instruction-task-frame",
-                frame_request,
+                f"/v1/goals/{goal_id}/automation/advance",
+                {
+                    "approval": "ADVANCE",
+                    "expected_goal_revision": 1,
+                    "task_frame": frame_request["task_frame"],
+                },
                 self.token,
             )
-        self.assertEqual(HTTPStatus.CREATED, status)
-        self.assertEqual("GOAL_HANDOFF_TASK_FRAME_BOUND", bound["status"])
-        self.assertEqual("goal-plan-frame-001", bound["binding"]["task_frame_id"])
-        self.assertEqual(handoff["instruction_ref"], bound["binding"]["instruction_ref"])
-        self.assertEqual(HTTPStatus.OK, replay_status)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("GOAL_AUTOMATION_ADVANCED", bound["status"])
+        self.assertEqual(["TASK_FRAME_BOUND"], bound["operations"])
         self.assertEqual(
-            "GOAL_HANDOFF_TASK_FRAME_ALREADY_BOUND", replay_binding["status"]
+            "goal-plan-frame-001", bound["surface"]["binding"]["task_frame_id"]
+        )
+        self.assertEqual(
+            handoff["instruction_ref"],
+            bound["surface"]["binding"]["instruction_ref"],
+        )
+        self.assertEqual(HTTPStatus.OK, replay_status)
+        self.assertEqual("GOAL_AUTOMATION_ADVANCED", replay_binding["status"])
+        self.assertEqual([], replay_binding["operations"])
+        self.assertEqual(
+            "TASK_FRAME_READY", replay_binding["surface"]["automation_state"]
         )
         create_frame.assert_called_once()
 
@@ -11614,6 +11653,76 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.NOT_FOUND, status)
         self.assertEqual("MASTER_HANDOFF_SOURCE_NOT_FOUND", unknown["error_code"])
+
+    def test_goal_automation_advance_creates_and_delivers_handoff_once(self) -> None:
+        goal = {"goal_id": "goal_auto_001", "project_id": "GCS", "revision": 1}
+        application = {"application_id": "work_plan_application_auto_001"}
+        ready_handoff = {
+            "handoff_id": "handoff_0123456789abcdef01234567",
+            "delivery_state": "PROPOSAL_ONLY",
+        }
+        delivered_handoff = {
+            **ready_handoff,
+            "delivery_state": "QUEUED_FOR_MASTER",
+            "room_message_id": "room_0123456789abcdef0123456789abcdef",
+        }
+        base = {
+            "goal": goal,
+            "application": application,
+            "matching_proposals": [],
+            "binding": None,
+        }
+        surfaces = [
+            {
+                **base,
+                "handoff": None,
+                "automation_state": "READY_FOR_MASTER_HANDOFF",
+                "next_operation": "CREATE_AND_DELIVER_MASTER_HANDOFF",
+            },
+            {
+                **base,
+                "handoff": ready_handoff,
+                "automation_state": "MASTER_HANDOFF_READY",
+                "next_operation": "DELIVER_MASTER_HANDOFF",
+            },
+            {
+                **base,
+                "handoff": delivered_handoff,
+                "automation_state": "WAITING_MASTER_PROPOSAL",
+                "next_operation": "WAIT",
+            },
+        ]
+        with (
+            patch.object(
+                self.server, "goal_automation_surface", side_effect=surfaces
+            ),
+            patch.object(
+                self.server.store,
+                "create_master_handoff",
+                return_value=(ready_handoff, True),
+            ) as create_handoff,
+            patch.object(
+                self.server,
+                "deliver_master_handoff",
+                return_value=(delivered_handoff, True, None),
+            ) as deliver_handoff,
+        ):
+            result = self.server.advance_goal_automation(
+                goal["goal_id"],
+                {"approval": "ADVANCE", "expected_goal_revision": 1},
+            )
+        self.assertEqual("GOAL_AUTOMATION_ADVANCED", result["status"])
+        self.assertEqual(
+            ["MASTER_HANDOFF_CREATED", "MASTER_HANDOFF_DELIVERED"],
+            result["operations"],
+        )
+        self.assertEqual(
+            "WAITING_MASTER_PROPOSAL", result["surface"]["automation_state"]
+        )
+        create_handoff.assert_called_once()
+        deliver_handoff.assert_called_once_with(
+            "GCS", ready_handoff["handoff_id"], {"approval": "DELIVER"}
+        )
 
     def test_experience_case_contains_only_recorded_observations(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

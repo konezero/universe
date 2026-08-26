@@ -10,18 +10,17 @@ CSS = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8"
 
 
 class ProviderSessionUiContractTests(unittest.TestCase):
-    def test_applied_goal_work_plan_uses_receipt_backed_master_handoff(self) -> None:
-        self.assertIn("async function deliverGoalWorkPlanToMaster()", APP)
-        start = APP.index("async function deliverGoalWorkPlanToMaster()")
+    def test_applied_goal_work_plan_uses_conductor_advance_route(self) -> None:
+        self.assertIn("async function advanceGoalAutomation()", APP)
+        start = APP.index("async function advanceGoalAutomation()")
         end = APP.index("function renderMeetingFeaturePanel", start)
         delivery = APP[start:end]
-        self.assertIn('kind: "GOAL_WORK_PLAN"', delivery)
-        self.assertIn("application_id: application.application_id", delivery)
-        self.assertIn("/master-handoffs`,", delivery)
-        self.assertIn("/deliver`,", delivery)
-        self.assertIn('approval: "DELIVER"', delivery)
+        self.assertIn("/automation/advance`,", delivery)
+        self.assertIn('approval: "ADVANCE"', delivery)
+        self.assertIn("expected_goal_revision: goal.revision", delivery)
+        self.assertNotIn("/master-handoffs", delivery)
         self.assertNotIn("task-frame", delivery.lower())
-        self.assertIn('"Send to Master"', APP)
+        self.assertIn('"Advance Conductor"', APP)
 
     def test_selected_session_uses_native_provider_endpoint_not_room_queue(self) -> None:
         self.assertIn('kind: "PROVIDER_SESSION"', APP)

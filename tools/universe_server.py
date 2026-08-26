@@ -3259,6 +3259,39 @@ def normalize_master_handoff_task_frame_request(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_goal_automation_advance_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_automation_advance_request",
+        required=frozenset({"approval", "expected_goal_revision"}),
+        optional=frozenset({"task_frame"}),
+    )
+    if request["approval"] != "ADVANCE":
+        raise UniverseError(
+            "GOAL_AUTOMATION_ADVANCE_APPROVAL_REQUIRED",
+            "approval must be ADVANCE",
+            HTTPStatus.CONFLICT,
+        )
+    revision = request["expected_goal_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise UniverseError(
+            "GOAL_REVISION_INVALID",
+            "expected_goal_revision must be a positive integer",
+        )
+    normalized: dict[str, Any] = {
+        "approval": "ADVANCE",
+        "expected_goal_revision": revision,
+    }
+    if "task_frame" in request:
+        if not isinstance(request["task_frame"], Mapping):
+            raise UniverseError(
+                "GOAL_AUTOMATION_TASK_FRAME_INVALID",
+                "task_frame must be an object",
+            )
+        normalized["task_frame"] = dict(request["task_frame"])
+    return normalized
+
+
 def normalize_experience_case_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -13428,6 +13461,24 @@ class UniverseStore:
             )
         return self._master_handoff_row(row)
 
+    def find_goal_work_plan_handoff(
+        self, project_id: str, application_id: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        normalized_application = _identifier(application_id, "application_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT handoff_json, delivery_state, room_message_id,
+                       created_at, delivered_at
+                FROM project_master_handoff
+                WHERE project_id = ? AND source_kind = 'GOAL_WORK_PLAN'
+                  AND source_adoption_id = ?
+                """,
+                (project["project_id"], normalized_application),
+            ).fetchone()
+        return None if row is None else self._master_handoff_row(row)
+
     def get_master_handoff_task_frame_binding(
         self, project_id: str, handoff_id: str
     ) -> dict[str, Any] | None:
@@ -23018,6 +23069,153 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "task_frame": created_frame,
         }, bound
 
+    def goal_automation_surface(self, goal_id: str) -> dict[str, Any]:
+        work_plans = self.store.goal_work_plan_surface(goal_id)
+        goal = work_plans["goal"]
+        application = work_plans["application"]
+        handoff = None
+        matching_proposals: list[dict[str, Any]] = []
+        binding = None
+        if application is None:
+            state = "WAITING_USER_WORK_PLAN_APPLICATION"
+            next_operation = "APPLY_ADOPTED_WORK_PLAN"
+        else:
+            handoff = self.store.find_goal_work_plan_handoff(
+                goal["project_id"], application["application_id"]
+            )
+            if handoff is None:
+                state = "READY_FOR_MASTER_HANDOFF"
+                next_operation = "CREATE_AND_DELIVER_MASTER_HANDOFF"
+            elif handoff["delivery_state"] == "PROPOSAL_ONLY":
+                state = "MASTER_HANDOFF_READY"
+                next_operation = "DELIVER_MASTER_HANDOFF"
+            else:
+                instruction_ref = handoff.get("instruction_ref")
+                matching_proposals = [
+                    proposal
+                    for proposal in self.list_project_governance_proposals(
+                        goal["project_id"]
+                    )
+                    if proposal.get("request_ref") == instruction_ref
+                ]
+                if not matching_proposals:
+                    state = "WAITING_MASTER_PROPOSAL"
+                    next_operation = "WAIT"
+                elif len(matching_proposals) > 1:
+                    state = "AMBIGUOUS_MASTER_PROPOSALS"
+                    next_operation = "USER_RESOLUTION_REQUIRED"
+                else:
+                    binding = self.store.get_master_handoff_task_frame_binding(
+                        goal["project_id"], handoff["handoff_id"]
+                    )
+                    if binding is None:
+                        state = "MASTER_PROPOSAL_READY"
+                        next_operation = "BIND_INSTRUCTION_TASK_FRAME"
+                    else:
+                        state = "TASK_FRAME_READY"
+                        next_operation = "RUN_TASK_FRAME"
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_AUTOMATION_STATE_PROJECTED",
+            "goal": goal,
+            "application": application,
+            "handoff": handoff,
+            "matching_proposals": matching_proposals,
+            "binding": binding,
+            "automation_state": state,
+            "next_operation": next_operation,
+            "effects": {
+                "task_frame_run": "NONE",
+                "todo_state_change": "NONE",
+                "authority_created": False,
+                "execution_assignment_created": False,
+            },
+        }
+
+    def advance_goal_automation(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_automation_advance_request(value)
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before automation advance",
+                HTTPStatus.CONFLICT,
+            )
+        if surface["application"] is None:
+            raise UniverseError(
+                "GOAL_WORK_PLAN_APPLICATION_REQUIRED",
+                "apply the USER-adopted Work Plan before automation",
+                HTTPStatus.CONFLICT,
+            )
+        operations: list[str] = []
+        if surface["handoff"] is None:
+            handoff, created = self.store.create_master_handoff(
+                goal["project_id"],
+                {
+                    "source": {
+                        "kind": "GOAL_WORK_PLAN",
+                        "application_id": surface["application"]["application_id"],
+                    },
+                    "purpose": "Execute the USER-adopted Goal Work Plan.",
+                },
+            )
+            operations.append(
+                "MASTER_HANDOFF_CREATED" if created else "MASTER_HANDOFF_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        if surface["automation_state"] == "MASTER_HANDOFF_READY":
+            handoff = surface["handoff"]
+            assert isinstance(handoff, Mapping)
+            _delivered, delivered, _application = self.deliver_master_handoff(
+                goal["project_id"], handoff["handoff_id"], {"approval": "DELIVER"}
+            )
+            operations.append(
+                "MASTER_HANDOFF_DELIVERED"
+                if delivered
+                else "MASTER_HANDOFF_DELIVERY_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        if surface["automation_state"] == "AMBIGUOUS_MASTER_PROPOSALS":
+            raise UniverseError(
+                "GOAL_AUTOMATION_MASTER_PROPOSAL_AMBIGUOUS",
+                "multiple Master proposals cite the same Goal instruction_ref",
+                HTTPStatus.CONFLICT,
+            )
+        if surface["automation_state"] == "MASTER_PROPOSAL_READY":
+            task_frame = request.get("task_frame")
+            if task_frame is None:
+                return {
+                    "schema": API_SCHEMA,
+                    "status": "GOAL_AUTOMATION_TASK_FRAME_INPUT_REQUIRED",
+                    "operations": operations,
+                    "surface": surface,
+                }
+            proposal = surface["matching_proposals"][0]
+            handoff = surface["handoff"]
+            result, created = self.create_goal_handoff_instruction_task_frame(
+                goal["project_id"],
+                handoff["handoff_id"],
+                {
+                    "handoff_digest": handoff["handoff_digest"],
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                    "task_frame": task_frame,
+                },
+            )
+            operations.append(
+                "TASK_FRAME_BOUND" if created else "TASK_FRAME_BINDING_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_AUTOMATION_ADVANCED",
+            "operations": operations,
+            "surface": surface,
+        }
+
     def _ensure_task_frame_room(
         self,
         project_id: str,
@@ -32243,6 +32441,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        goal_automation = re.fullmatch(r"/v1/goals/([^/]+)/automation", path)
+        if goal_automation is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.goal_automation_surface(
+                        unquote(goal_automation.group(1))
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
         if feature_detail is not None:
             try:
@@ -34410,6 +34620,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if goal_work_plan_applications is not None:
                 application, created = self.server.store.apply_goal_work_plan(unquote(goal_work_plan_applications.group(1)), {**body, "applied_by_role":"USER"})
                 self._send(HTTPStatus.CREATED if created else HTTPStatus.OK,{"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_APPLIED" if created else "GOAL_WORK_PLAN_APPLICATION_REPLAYED","application":application,"surface":self.server.store.goal_work_plan_surface(unquote(goal_work_plan_applications.group(1))),"milestone_created":created,"todo_created":created,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False})
+                return
+            goal_automation_advance = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/advance", path
+            )
+            if goal_automation_advance is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.advance_goal_automation(
+                        unquote(goal_automation_advance.group(1)), body
+                    ),
+                )
                 return
             todo_action_match = re.fullmatch(
                 r"/v1/todos/([^/]+)/actions", path
