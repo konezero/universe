@@ -240,6 +240,18 @@ push + multi-stream early. **S4–S5** complete the Master/Boss hierarchy.
 
 ---
 
+## Feature Node and Expected Path first vertical slice
+
+The durable planning order is now represented directly by the local runtime:
+
+1. `POST /v1/projects/{project_id}/feature-nodes` records the Feature Node before any Goal or Todo.
+2. A Feature Node may bind one existing `MEETING` room in the same project.
+3. `POST /v1/feature-nodes/{feature_id}/expected-paths` pins a room `SPECIFICATION` artifact to its exact revision and content digest.
+4. At least two candidate paths must exist before `POST /v1/feature-nodes/{feature_id}/adoptions` accepts an explicit USER selection.
+5. Adoption marks one path `ADOPTED` and the remaining candidates `NOT_SELECTED`; it does not create a Goal, Todo, Task Frame, authority, or execution assignment.
+
+Read routes are `GET /v1/projects/{project_id}/feature-nodes` and `GET /v1/feature-nodes/{feature_id}`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, their Meeting Room and specification links, and the adopted edge without embedding specification bodies.
+
 ## 9. Non-goals (program-level)
 
 - Replacing Career governance or inventing authority from chat/attach.

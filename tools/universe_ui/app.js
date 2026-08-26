@@ -8095,15 +8095,19 @@ function buildSemanticProjectGraph() {
   const sourceNodes = projection.nodes || [];
   const layerByType = {
     PROJECT: 0,
-    GOAL: 1,
-    MILESTONE: 2,
-    TODO: 3,
+    FEATURE_NODE: 1,
+    EXPECTED_PATH: 2,
+    GOAL: 3,
+    MILESTONE: 4,
+    TODO: 5,
     PREDICTION: 2,
     MEMORY: 2,
     BENCH: 2,
   };
   const kindByType = {
     PROJECT: "project",
+    FEATURE_NODE: "feature",
+    EXPECTED_PATH: "expected-path",
     GOAL: "goal",
     MILESTONE: "milestone",
     TODO: "todo",
@@ -8113,6 +8117,8 @@ function buildSemanticProjectGraph() {
   };
   setGraphLegend([
     { kind: "project", label: "Project" },
+    { kind: "feature", label: "Feature" },
+    { kind: "expected-path", label: "Expected Path" },
     { kind: "goal", label: "Goal" },
     { kind: "milestone", label: "Milestone" },
     { kind: "todo", label: "Todo" },
@@ -9280,6 +9286,12 @@ function drawGraph() {
 /** Colors express node meaning. Do not derive semantic UI state from an ID hash. */
 function graphAccentColor(item) {
   const networkRole = String(item?.data?.network_role || "");
+  if (item.kind === "feature") {
+    return { fill: "rgba(76, 45, 112, 0.94)", stroke: "#c084fc", soft: "rgba(192, 132, 252, 0.24)" };
+  }
+  if (item.kind === "expected-path") {
+    return { fill: "rgba(105, 66, 20, 0.94)", stroke: "#f59e0b", soft: "rgba(245, 158, 11, 0.24)" };
+  }
   if (item.kind === "predicted") {
     return {
       fill: "rgba(74, 48, 112, 0.92)",

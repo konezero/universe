@@ -452,6 +452,9 @@ TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
 TODO_MUTATION_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
 TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
 TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
+FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
+EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v1"
+FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
@@ -5102,6 +5105,54 @@ class UniverseStore:
                 ON project_todo(
                     scope_kind, project_id, node_ref, state, priority,
                     sort_order, updated_at, todo_id
+                );
+
+                CREATE TABLE IF NOT EXISTS feature_node (
+                    feature_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    intent_text TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('DRAFT', 'EXPLORING', 'ADOPTED', 'ARCHIVED')),
+                    meeting_room_id TEXT,
+                    created_by_role TEXT NOT NULL CHECK(created_by_role IN ('USER', 'CONDUCTOR')),
+                    evidence_refs_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_node_project_order
+                ON feature_node(project_id, updated_at DESC, feature_id);
+
+                CREATE TABLE IF NOT EXISTS feature_expected_path (
+                    expected_path_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    room_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    artifact_revision INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    specification_digest TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('CANDIDATE', 'ADOPTED', 'NOT_SELECTED', 'SUPERSEDED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(feature_id, artifact_id, artifact_revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_expected_path_feature_order
+                ON feature_expected_path(feature_id, created_at, expected_path_id);
+
+                CREATE TABLE IF NOT EXISTS feature_path_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL UNIQUE REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    expected_path_id TEXT NOT NULL UNIQUE REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    adopted_by_role TEXT NOT NULL CHECK(adopted_by_role = 'USER'),
+                    rationale TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS todo_mutation_receipt (
@@ -10203,6 +10254,293 @@ class UniverseStore:
                     (normalized_receipt_id,),
                 ).fetchone()
         return self._todo_action_mutation_receipt_row(receipt), result, replayed
+
+    @staticmethod
+    def _feature_effects() -> dict[str, Any]:
+        return {
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame_created": False,
+            "goal_created": False,
+            "todo_created": False,
+        }
+
+    @staticmethod
+    def _feature_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_NODE_SCHEMA,
+            "feature_id": str(row["feature_id"]),
+            "project_id": str(row["project_id"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "title": str(row["title"]),
+            "intent_text": str(row["intent_text"]),
+            "state": str(row["state"]),
+            "meeting_room_id": row["meeting_room_id"],
+            "created_by_role": str(row["created_by_role"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "revision": int(row["revision"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "effects": UniverseStore._feature_effects(),
+        }
+
+    @staticmethod
+    def _expected_path_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": EXPECTED_PATH_SCHEMA,
+            "expected_path_id": str(row["expected_path_id"]),
+            "feature_id": str(row["feature_id"]),
+            "room_id": str(row["room_id"]),
+            "artifact_id": str(row["artifact_id"]),
+            "artifact_revision": int(row["artifact_revision"]),
+            "title": str(row["title"]),
+            "summary": str(row["summary"]),
+            "specification_digest": str(row["specification_digest"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "state": str(row["state"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "effects": UniverseStore._feature_effects(),
+        }
+
+    @staticmethod
+    def _adoption_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_PATH_ADOPTION_SCHEMA,
+            "adoption_id": str(row["adoption_id"]),
+            "feature_id": str(row["feature_id"]),
+            "expected_path_id": str(row["expected_path_id"]),
+            "adopted_by_role": str(row["adopted_by_role"]),
+            "rationale": str(row["rationale"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "adopted_at": str(row["adopted_at"]),
+            "effects": UniverseStore._feature_effects(),
+        }
+
+    @staticmethod
+    def _feature_refs(value: Any, field: str) -> list[str]:
+        refs = _string_array(value if value is not None else [], field)
+        if len(refs) > 50:
+            raise UniverseError("FEATURE_EVIDENCE_INVALID", f"{field} exceeds 50 entries")
+        return refs
+
+    def create_feature_node(self, project_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = _exact_object_fields(
+            value,
+            field="feature_node",
+            required=frozenset({"idempotency_key", "title", "intent_text", "created_by_role"}),
+            optional=frozenset({"meeting_room_id", "evidence_refs"}),
+        )
+        key = _identifier(request["idempotency_key"], "idempotency_key")
+        title = _required_text(request["title"], "title")
+        intent_text = _required_text(request["intent_text"], "intent_text")
+        role = _identifier(request["created_by_role"], "created_by_role").upper()
+        if role not in {"USER", "CONDUCTOR"}:
+            raise UniverseError("FEATURE_CREATOR_ROLE_INVALID", "Feature Node creator must be USER or CONDUCTOR")
+        refs = self._feature_refs(request.get("evidence_refs"), "evidence_refs")
+        room_id = None
+        if request.get("meeting_room_id") is not None:
+            room_id = _identifier(request["meeting_room_id"], "meeting_room_id")
+            try:
+                room = self.multi_rooms.get_room(room_id)
+            except MultiRoomError as error:
+                raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+            if room.get("room_type") != "MEETING" or room.get("project_id") != project["project_id"]:
+                raise UniverseError(
+                    "FEATURE_MEETING_ROOM_INVALID",
+                    "meeting_room_id must identify a MEETING room in the same project",
+                    HTTPStatus.CONFLICT,
+                )
+        feature_id = "feature_" + _json_sha256(
+            {"project_id": project["project_id"], "idempotency_key": key}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM feature_node WHERE project_id = ? AND idempotency_key = ?",
+                (project["project_id"], key),
+            ).fetchone()
+            if existing is not None:
+                material = (title, intent_text, room_id, role, refs)
+                actual = (
+                    existing["title"], existing["intent_text"], existing["meeting_room_id"],
+                    existing["created_by_role"], json.loads(existing["evidence_refs_json"]),
+                )
+                if actual != material:
+                    raise UniverseError(
+                        "FEATURE_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to different Feature Node material",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self._feature_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO feature_node(
+                    feature_id, project_id, idempotency_key, title, intent_text, state,
+                    meeting_room_id, created_by_role, evidence_refs_json, revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    feature_id, project["project_id"], key, title, intent_text,
+                    "EXPLORING" if room_id else "DRAFT", room_id, role,
+                    _canonical_json(refs), now, now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM feature_node WHERE feature_id = ?", (feature_id,)).fetchone()
+        return self._feature_row(row), True
+
+    def list_feature_nodes(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM feature_node WHERE project_id = ? ORDER BY updated_at DESC, feature_id",
+                (project["project_id"],),
+            ).fetchall()
+        return [self._feature_row(row) for row in rows]
+
+    def get_feature_node(self, feature_id: str) -> dict[str, Any]:
+        fid = _identifier(feature_id, "feature_id")
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM feature_node WHERE feature_id = ?", (fid,)).fetchone()
+            if row is None:
+                raise UniverseError("FEATURE_NODE_NOT_FOUND", "Feature Node does not exist", HTTPStatus.NOT_FOUND)
+            paths = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE feature_id = ? ORDER BY created_at, expected_path_id",
+                (fid,),
+            ).fetchall()
+            adoption = connection.execute(
+                "SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)
+            ).fetchone()
+        result = self._feature_row(row)
+        result["expected_paths"] = [self._expected_path_row(path) for path in paths]
+        result["adoption"] = self._adoption_row(adoption) if adoption is not None else None
+        return result
+
+    def create_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        feature = self.get_feature_node(feature_id)
+        if feature["state"] == "ADOPTED":
+            raise UniverseError("FEATURE_ALREADY_ADOPTED", "adopted Feature Node cannot accept new paths", HTTPStatus.CONFLICT)
+        request = _exact_object_fields(
+            value,
+            field="expected_path",
+            required=frozenset({"room_id", "artifact_id", "summary"}),
+            optional=frozenset({"title", "evidence_refs"}),
+        )
+        room_id = _identifier(request["room_id"], "room_id")
+        artifact_id = _identifier(request["artifact_id"], "artifact_id")
+        try:
+            room = self.multi_rooms.get_room(room_id)
+            artifact = self.multi_rooms.get_artifact(room_id, artifact_id)
+        except MultiRoomError as error:
+            raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        if room.get("room_type") != "MEETING" or room.get("project_id") != feature["project_id"]:
+            raise UniverseError("EXPECTED_PATH_ROOM_INVALID", "Expected Path must come from a MEETING room in the Feature project", HTTPStatus.CONFLICT)
+        if feature.get("meeting_room_id") and feature["meeting_room_id"] != room_id:
+            raise UniverseError("EXPECTED_PATH_ROOM_MISMATCH", "Expected Path room does not match the Feature Node room", HTTPStatus.CONFLICT)
+        if artifact.get("artifact_type") != "SPECIFICATION":
+            raise UniverseError("EXPECTED_PATH_SPECIFICATION_REQUIRED", "Expected Path requires a SPECIFICATION artifact", HTTPStatus.CONFLICT)
+        revision = int(artifact["current_revision"])
+        title = _required_text(request.get("title") or artifact.get("title"), "title")
+        summary = _required_text(request["summary"], "summary")
+        refs = list(artifact.get("evidence_refs") or [])
+        for ref in self._feature_refs(request.get("evidence_refs"), "evidence_refs"):
+            if ref not in refs:
+                refs.append(ref)
+        if len(refs) > 50:
+            raise UniverseError("FEATURE_EVIDENCE_INVALID", "combined Expected Path evidence exceeds 50 entries")
+        path_id = "expected_path_" + _json_sha256(
+            {"feature_id": feature["feature_id"], "artifact_id": artifact_id, "revision": revision}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE feature_id = ? AND artifact_id = ? AND artifact_revision = ?",
+                (feature["feature_id"], artifact_id, revision),
+            ).fetchone()
+            if existing is not None:
+                material = (title, summary, str(artifact["content_digest"]), refs)
+                actual = (
+                    existing["title"], existing["summary"], existing["specification_digest"],
+                    json.loads(existing["evidence_refs_json"]),
+                )
+                if actual != material:
+                    raise UniverseError("EXPECTED_PATH_CONFLICT", "artifact revision is already linked with different path material", HTTPStatus.CONFLICT)
+                return self._expected_path_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO feature_expected_path(
+                    expected_path_id, feature_id, room_id, artifact_id, artifact_revision,
+                    title, summary, specification_digest, evidence_refs_json, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CANDIDATE', ?, ?)
+                """,
+                (
+                    path_id, feature["feature_id"], room_id, artifact_id, revision,
+                    title, summary, str(artifact["content_digest"]), _canonical_json(refs), now, now,
+                ),
+            )
+            connection.execute(
+                "UPDATE feature_node SET state = 'EXPLORING', revision = revision + 1, updated_at = ? WHERE feature_id = ?",
+                (now, feature["feature_id"]),
+            )
+            row = connection.execute("SELECT * FROM feature_expected_path WHERE expected_path_id = ?", (path_id,)).fetchone()
+        return self._expected_path_row(row), True
+
+    def adopt_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_path_adoption",
+            required=frozenset({"expected_path_id", "expected_feature_revision", "rationale", "adopted_by_role"}),
+            optional=frozenset({"evidence_refs"}),
+        )
+        fid = _identifier(feature_id, "feature_id")
+        path_id = _identifier(request["expected_path_id"], "expected_path_id")
+        role = _identifier(request["adopted_by_role"], "adopted_by_role").upper()
+        if role != "USER":
+            raise UniverseError("EXPECTED_PATH_USER_ADOPTION_REQUIRED", "only USER may adopt an Expected Path", HTTPStatus.FORBIDDEN)
+        expected_revision = request["expected_feature_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("FEATURE_REVISION_INVALID", "expected_feature_revision must be a positive integer")
+        rationale = _required_text(request["rationale"], "rationale")
+        refs = self._feature_refs(request.get("evidence_refs"), "evidence_refs")
+        now = utc_now()
+        with self._connection() as connection:
+            feature = connection.execute("SELECT * FROM feature_node WHERE feature_id = ?", (fid,)).fetchone()
+            if feature is None:
+                raise UniverseError("FEATURE_NODE_NOT_FOUND", "Feature Node does not exist", HTTPStatus.NOT_FOUND)
+            existing = connection.execute("SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)).fetchone()
+            if existing is not None:
+                if existing["expected_path_id"] != path_id:
+                    raise UniverseError("FEATURE_PATH_ALREADY_ADOPTED", "Feature Node already adopted another Expected Path", HTTPStatus.CONFLICT)
+                if existing["rationale"] != rationale or json.loads(existing["evidence_refs_json"]) != refs:
+                    raise UniverseError("FEATURE_PATH_ADOPTION_CONFLICT", "adopted path replay contains different decision material", HTTPStatus.CONFLICT)
+                return self._adoption_row(existing), False
+            if int(feature["revision"]) != expected_revision:
+                raise UniverseError("FEATURE_REVISION_CONFLICT", "Feature Node revision changed before adoption", HTTPStatus.CONFLICT)
+            candidates = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE feature_id = ? AND state = 'CANDIDATE' ORDER BY expected_path_id",
+                (fid,),
+            ).fetchall()
+            if len(candidates) < 2:
+                raise UniverseError("EXPECTED_PATH_ALTERNATIVES_REQUIRED", "at least two Expected Path candidates are required before adoption", HTTPStatus.CONFLICT)
+            selected = next((candidate for candidate in candidates if candidate["expected_path_id"] == path_id), None)
+            if selected is None:
+                raise UniverseError("EXPECTED_PATH_NOT_CANDIDATE", "selected Expected Path is not a candidate for this Feature Node", HTTPStatus.CONFLICT)
+            adoption_id = "feature_adoption_" + _json_sha256({"feature_id": fid, "expected_path_id": path_id})[:24]
+            connection.execute(
+                "INSERT INTO feature_path_adoption(adoption_id, feature_id, expected_path_id, adopted_by_role, rationale, evidence_refs_json, adopted_at) VALUES (?, ?, ?, 'USER', ?, ?, ?)",
+                (adoption_id, fid, path_id, rationale, _canonical_json(refs), now),
+            )
+            connection.execute(
+                "UPDATE feature_expected_path SET state = CASE WHEN expected_path_id = ? THEN 'ADOPTED' ELSE 'NOT_SELECTED' END, updated_at = ? WHERE feature_id = ? AND state = 'CANDIDATE'",
+                (path_id, now, fid),
+            )
+            connection.execute(
+                "UPDATE feature_node SET state = 'ADOPTED', revision = revision + 1, updated_at = ? WHERE feature_id = ?",
+                (now, fid),
+            )
+            adoption = connection.execute("SELECT * FROM feature_path_adoption WHERE adoption_id = ?", (adoption_id,)).fetchone()
+        return self._adoption_row(adoption), True
 
     def list_todos(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -16742,6 +17080,9 @@ class UniverseStore:
                         f"universe://memory-candidates/{candidate_id}",
                     )
 
+        room_nodes_by_id: dict[str, str] = {}
+        artifact_nodes_by_id: dict[str, str] = {}
+
         # Rooms are a separate conversation plane from the legacy Project Room
         # message feed below.  Project the durable room/binding records here so
         # graph consumers can navigate the exact session-anchor relationship
@@ -16765,6 +17106,7 @@ class UniverseStore:
                     if room.get(key) is not None
                 },
             )
+            room_nodes_by_id[room_id] = room_node
             add_edge("PROJECT_HAS_CHAT_ROOM", project_node, room_node, source_ref)
             for binding in self.multi_rooms.list_bindings(room_id):
                 binding_id = str(binding.get("binding_id") or "")
@@ -17017,6 +17359,7 @@ class UniverseStore:
                     }
                     | {"body_in_graph": False},
                 )
+                artifact_nodes_by_id[artifact_id] = artifact_node
                 add_edge("CHAT_ROOM_HAS_ARTIFACT", room_node, artifact_node, artifact_ref)
                 detailed = self.multi_rooms.get_artifact(room_id, artifact_id)
                 for revision in detailed.get("revisions") or []:
@@ -17108,6 +17451,52 @@ class UniverseStore:
                         },
                     )
                     add_edge("CHAT_ROOM_HAS_CONTROL_EVENT", room_node, control_node, event_ref)
+
+
+        # Feature Nodes precede work planning. Expected Paths are revision-pinned
+        # Meeting Room specifications, and adoption is an explicit USER decision.
+        for feature in self.list_feature_nodes(project_id):
+            feature_id = str(feature["feature_id"])
+            feature_ref = f"universe://feature-nodes/{feature_id}"
+            feature_node = add_node(
+                "FEATURE_NODE", feature_id, str(feature["title"]), str(feature["state"]),
+                "FEATURE_NODE", feature_ref,
+                {key: feature.get(key) for key in (
+                    "feature_id", "project_id", "intent_text", "state", "meeting_room_id",
+                    "created_by_role", "evidence_refs", "revision", "created_at", "updated_at",
+                )},
+            )
+            add_edge("PROJECT_HAS_FEATURE_NODE", project_node, feature_node, feature_ref)
+            meeting_room_id = str(feature.get("meeting_room_id") or "")
+            if meeting_room_id in room_nodes_by_id:
+                add_edge("FEATURE_NODE_EXPLORED_IN_MEETING_ROOM", feature_node, room_nodes_by_id[meeting_room_id], feature_ref)
+            detailed_feature = self.get_feature_node(feature_id)
+            path_nodes: dict[str, str] = {}
+            for path in detailed_feature["expected_paths"]:
+                path_id = str(path["expected_path_id"])
+                path_ref = f"{feature_ref}/expected-paths/{path_id}"
+                path_node = add_node(
+                    "EXPECTED_PATH", path_id, str(path["title"]), str(path["state"]),
+                    "FEATURE_EXPECTED_PATH", path_ref,
+                    {key: path.get(key) for key in (
+                        "expected_path_id", "feature_id", "room_id", "artifact_id",
+                        "artifact_revision", "summary", "specification_digest", "evidence_refs",
+                        "state", "created_at", "updated_at",
+                    )},
+                )
+                path_nodes[path_id] = path_node
+                add_edge("FEATURE_NODE_HAS_EXPECTED_PATH", feature_node, path_node, path_ref)
+                if str(path["room_id"]) in room_nodes_by_id:
+                    add_edge("EXPECTED_PATH_FROM_MEETING_ROOM", path_node, room_nodes_by_id[str(path["room_id"])], path_ref)
+                if str(path["artifact_id"]) in artifact_nodes_by_id:
+                    add_edge("EXPECTED_PATH_PINS_SPECIFICATION", path_node, artifact_nodes_by_id[str(path["artifact_id"])], path_ref)
+            adoption = detailed_feature.get("adoption")
+            if adoption and str(adoption["expected_path_id"]) in path_nodes:
+                add_edge(
+                    "FEATURE_NODE_ADOPTS_EXPECTED_PATH", feature_node,
+                    path_nodes[str(adoption["expected_path_id"])],
+                    f"{feature_ref}/adoption",
+                )
 
         room_message_nodes: dict[str, str] = {}
         room_message_parents: list[tuple[str, str]] = []
@@ -30341,6 +30730,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
+        if feature_detail is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_COLLECTED",
+                        "feature": self.server.store.get_feature_node(unquote(feature_detail.group(1))),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_features = re.fullmatch(r"/v1/projects/([^/]+)/feature-nodes", path)
+        if project_features is not None:
+            try:
+                project_id = unquote(project_features.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODES_COLLECTED",
+                        "project_id": project_id,
+                        "features": self.server.store.list_feature_nodes(project_id),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         project_work_surface = re.fullmatch(r"/v1/projects/([^/]+)/work-surface", path)
         if project_work_surface is not None:
             try:
@@ -32359,6 +32778,37 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         else "PROJECT_REFRESHED",
                         "project": project,
                     },
+                )
+                return
+            project_features = re.fullmatch(r"/v1/projects/([^/]+)/feature-nodes", path)
+            if project_features is not None:
+                feature, created = self.server.store.create_feature_node(
+                    unquote(project_features.group(1)), {**body, "created_by_role": "USER"}
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "FEATURE_NODE_RECORDED" if created else "FEATURE_NODE_REPLAYED", "feature": feature},
+                )
+                return
+            expected_paths = re.fullmatch(r"/v1/feature-nodes/([^/]+)/expected-paths", path)
+            if expected_paths is not None:
+                expected_path, created = self.server.store.create_feature_expected_path(
+                    unquote(expected_paths.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "EXPECTED_PATH_RECORDED" if created else "EXPECTED_PATH_REPLAYED", "expected_path": expected_path},
+                )
+                return
+            feature_adoptions = re.fullmatch(r"/v1/feature-nodes/([^/]+)/adoptions", path)
+            if feature_adoptions is not None:
+                adoption, created = self.server.store.adopt_feature_expected_path(
+                    unquote(feature_adoptions.group(1)), {**body, "adopted_by_role": "USER"}
+                )
+                feature = self.server.store.get_feature_node(unquote(feature_adoptions.group(1)))
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "EXPECTED_PATH_ADOPTED" if created else "EXPECTED_PATH_ADOPTION_REPLAYED", "adoption": adoption, "feature": feature},
                 )
                 return
             todo_action_match = re.fullmatch(

@@ -7501,6 +7501,160 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
         self.assertEqual("partial answer", events[0]["payload"]["delta"])
 
+    def test_feature_node_expected_path_adoption_http_and_graph(self) -> None:
+        self.server.store.register_project(self.registration())
+        created = self.server.multi_rooms.create_meeting_room(
+            {"title": "Feature planning", "topic": "Expected Paths", "project_id": "GCS"}
+        )
+        room_id = created["room"]["room_id"]
+        status, feature_payload = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-nodes",
+            {
+                "idempotency_key": "meeting-room-feature-v1",
+                "title": "Meeting Room coordination",
+                "intent_text": "Agents produce several implementation specifications for user adoption.",
+                "meeting_room_id": room_id,
+                "evidence_refs": ["docs://multi-room-chat-architecture"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        feature = feature_payload["feature"]
+        self.assertEqual("EXPLORING", feature["state"])
+        self.assertFalse(feature["effects"]["goal_created"])
+        self.assertFalse(feature["effects"]["todo_created"])
+
+        artifacts = []
+        for title, body in (("Path A", "Use event-first orchestration"), ("Path B", "Use artifact-first orchestration")):
+            artifact = self.server.multi_rooms.create_artifact(
+                room_id,
+                {
+                    "artifact_type": "SPECIFICATION",
+                    "title": title,
+                    "body_text": body,
+                    "state": "CANDIDATE",
+                    "author_role": "USER",
+                    "evidence_refs": [f"evidence://{title.lower().replace(' ', '-')}"],
+                },
+            )
+            artifacts.append(artifact)
+
+        status, first_payload = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/expected-paths",
+            {"room_id": room_id, "artifact_id": artifacts[0]["artifact_id"], "summary": "Event-first candidate"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        first_path = first_payload["expected_path"]
+        self.assertEqual(artifacts[0]["content_digest"], first_path["specification_digest"])
+        self.assertEqual(1, first_path["artifact_revision"])
+
+        status, blocked = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/adoptions",
+            {"expected_path_id": first_path["expected_path_id"], "expected_feature_revision": 2, "rationale": "Select A"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("EXPECTED_PATH_ALTERNATIVES_REQUIRED", blocked["error_code"])
+
+        status, second_payload = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/expected-paths",
+            {"room_id": room_id, "artifact_id": artifacts[1]["artifact_id"], "summary": "Artifact-first candidate"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        second_path = second_payload["expected_path"]
+
+        status, adopted = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/adoptions",
+            {
+                "expected_path_id": second_path["expected_path_id"],
+                "expected_feature_revision": 3,
+                "rationale": "Better evidence lineage",
+                "evidence_refs": ["decision://user-selection"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("USER", adopted["adoption"]["adopted_by_role"])
+        self.assertEqual("ADOPTED", adopted["feature"]["state"])
+        states = {item["expected_path_id"]: item["state"] for item in adopted["feature"]["expected_paths"]}
+        self.assertEqual("NOT_SELECTED", states[first_path["expected_path_id"]])
+        self.assertEqual("ADOPTED", states[second_path["expected_path_id"]])
+        self.assertFalse(adopted["adoption"]["effects"]["goal_created"])
+        self.assertFalse(adopted["adoption"]["effects"]["todo_created"])
+
+        adoption_request = {
+            "expected_path_id": second_path["expected_path_id"],
+            "expected_feature_revision": 3,
+            "rationale": "Better evidence lineage",
+            "evidence_refs": ["decision://user-selection"],
+        }
+        status, adoption_replay = self.request(
+            "POST", f"/v1/feature-nodes/{feature['feature_id']}/adoptions", adoption_request, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("EXPECTED_PATH_ADOPTION_REPLAYED", adoption_replay["status"])
+        status, adoption_conflict = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/adoptions",
+            {**adoption_request, "rationale": "Changed rationale"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("FEATURE_PATH_ADOPTION_CONFLICT", adoption_conflict["error_code"])
+
+        status, replay = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-nodes",
+            {
+                "idempotency_key": "meeting-room-feature-v1",
+                "title": "Meeting Room coordination",
+                "intent_text": "Agents produce several implementation specifications for user adoption.",
+                "meeting_room_id": room_id,
+                "evidence_refs": ["docs://multi-room-chat-architecture"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FEATURE_NODE_REPLAYED", replay["status"])
+
+        status, feature_list = self.request(
+            "GET", "/v1/projects/GCS/feature-nodes", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([feature["feature_id"]], [item["feature_id"] for item in feature_list["features"]])
+        status, feature_detail = self.request(
+            "GET", f"/v1/feature-nodes/{feature['feature_id']}", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(2, len(feature_detail["feature"]["expected_paths"]))
+        self.assertEqual([], self.server.store.list_project_goals("GCS"))
+        self.assertEqual([], [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"])
+
+        status, rejected = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/adoptions",
+            {"expected_path_id": first_path["expected_path_id"], "expected_feature_revision": 4, "rationale": "Change selection"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("FEATURE_PATH_ALREADY_ADOPTED", rejected["error_code"])
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        node_types = {node["entity_type"] for node in graph["nodes"]}
+        edge_types = {edge["edge_type"] for edge in graph["edges"]}
+        self.assertIn("FEATURE_NODE", node_types)
+        self.assertIn("EXPECTED_PATH", node_types)
+        self.assertIn("FEATURE_NODE_ADOPTS_EXPECTED_PATH", edge_types)
+        expected_nodes = [node for node in graph["nodes"] if node["entity_type"] == "EXPECTED_PATH"]
+        self.assertTrue(all("body_text" not in node["data"] for node in expected_nodes))
+
     def test_meeting_room_finding_http_records_and_collects_source_links(self) -> None:
         created = self.server.multi_rooms.create_meeting_room(
             {"title": "HTTP finding room", "topic": "research"}
