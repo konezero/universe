@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sys
@@ -19,14 +20,17 @@ sys.path.insert(0, str(ROOT / "tools"))
 from host_profile import HostProfileStore  # noqa: E402
 from intent_skill_routing import (  # noqa: E402
     IntentRoutingError,
+    SKILL_PACK_ARTIFACT_SCHEMA,
     SKILL_PACK_MANIFEST_SCHEMA,
     build_adopted_registry_snapshot,
+    canonical_skill_pack_artifact_bytes,
     digest,
     empty_registry_snapshot,
     execute_plan_fallback,
     normalize_intent_decision,
     normalize_planning_phrase,
     normalize_registry_snapshot,
+    normalize_skill_pack_artifact,
     normalize_skill_pack_manifest,
     resolve_skill,
 )
@@ -35,6 +39,25 @@ from universe_server import create_server, universe_mode_contract  # noqa: E402
 
 def sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def skill_pack_artifact(pack_id: str, version: str = "1") -> dict:
+    content = b"---\nname: project-planning\n---\n# Project Planning\n"
+    return {
+        "schema": SKILL_PACK_ARTIFACT_SCHEMA,
+        "pack_id": pack_id,
+        "version": version,
+        "files": [
+            {
+                "path": "project-planning/SKILL.md",
+                "role": "SKILL",
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "byte_length": len(content),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "source_path": "runtime-source/.ai/skills/common/project-planning/SKILL.md",
+            }
+        ],
+    }
 
 
 def decision_request(*, intent_class: str = "PLAN_REQUEST", capability: str = "PLAN_CREATE", effect: str = "NONE", route: str = "RESOLVE_SKILL") -> dict:
@@ -122,6 +145,24 @@ class IntentSkillRoutingUnitTests(unittest.TestCase):
         self.assertEqual("common-plan", selected["selected_skill_id"])
         self.assertEqual("EXPLICIT", selected["selection_scope"])
 
+    def test_skill_pack_artifact_verifies_paths_content_and_canonical_digest(self) -> None:
+        artifact = skill_pack_artifact("common.memory-sync")
+        normalized = normalize_skill_pack_artifact(artifact)
+        payload = canonical_skill_pack_artifact_bytes(artifact)
+        self.assertEqual(normalized, json.loads(payload.decode("utf-8")))
+        self.assertTrue(payload.endswith(b"\n"))
+
+        for mutate in (
+            lambda candidate: candidate["files"][0].update({"sha256": sha("tampered")}),
+            lambda candidate: candidate["files"][0].update({"content_base64": "not-base64!"}),
+            lambda candidate: candidate["files"][0].update({"path": "../SKILL.md"}),
+        ):
+            invalid = json.loads(json.dumps(artifact))
+            mutate(invalid)
+            with self.assertRaises(IntentRoutingError) as caught:
+                normalize_skill_pack_artifact(invalid)
+            self.assertEqual("SKILL_PACK_ARTIFACT_INVALID", caught.exception.code)
+
     def test_skill_pack_manifest_is_digest_addressed_and_scope_bound(self) -> None:
         manifest = normalize_skill_pack_manifest({
             "schema": SKILL_PACK_MANIFEST_SCHEMA,
@@ -134,6 +175,7 @@ class IntentSkillRoutingUnitTests(unittest.TestCase):
             ],
         })
         self.assertEqual("skill_pack_" + manifest["manifest_digest"][:24], manifest["release_id"])
+        self.assertEqual(manifest, normalize_skill_pack_manifest(manifest))
         adopted = build_adopted_registry_snapshot(empty_registry_snapshot(), manifest)
         self.assertEqual("memory-sync", adopted["skills"][0]["skill_id"])
         invalid = dict(manifest)
@@ -249,13 +291,15 @@ class IntentSkillRoutingApiTests(unittest.TestCase):
         candidate = candidate_result["candidate"]
         self.assertEqual("ELIGIBLE", candidate["candidate_state"])
         self.assertEqual("NOT_INSTALLED", candidate["installation_state"])
+        artifact_payload = skill_pack_artifact("universe.project-planning")
+        artifact_digest = hashlib.sha256(canonical_skill_pack_artifact_bytes(artifact_payload)).hexdigest()
         manifest = {
             "schema": SKILL_PACK_MANIFEST_SCHEMA,
             "pack_id": "universe.project-planning",
             "version": "1",
             "scope": "PROJECT",
             "project_id": "universe",
-            "artifact": {"source_ref": "release://planning-v1", "sha256": sha("planning-v1-artifact")},
+            "artifact": {"source_ref": "release://planning-v1", "sha256": artifact_digest},
             "skills": [{"skill_id": "project-planning", "version": "1", "scope": "PROJECT", "project_id": "universe", "intents": ["PLAN_REQUEST"], "capabilities": ["PLAN_CREATE"], "effects": ["NONE"], "output_contract": "universe.structured-plan.v1", "priority": 100}],
         }
         adoption_request = {
@@ -269,6 +313,30 @@ class IntentSkillRoutingApiTests(unittest.TestCase):
         status, denied = self.request("POST", "/v1/skill-release-adoptions", denied_request)
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("SKILL_RELEASE_ADOPTION_USER_REQUIRED", denied["error_code"])
+        status, not_imported = self.request("POST", "/v1/skill-release-adoptions", adoption_request)
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("SKILL_PACK_ARTIFACT_NOT_IMPORTED", not_imported["error_code"])
+        status, imported = self.request("POST", "/v1/skill-pack-artifacts", artifact_payload)
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual(artifact_digest, imported["artifact"]["artifact_digest"])
+        status, repeated_import = self.request("POST", "/v1/skill-pack-artifacts", artifact_payload)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(artifact_digest, repeated_import["artifact"]["artifact_digest"])
+        conflicting_artifact = json.loads(json.dumps(artifact_payload))
+        conflicting_content = b"different canonical Skill content\n"
+        conflicting_artifact["files"][0].update(
+            {
+                "sha256": hashlib.sha256(conflicting_content).hexdigest(),
+                "byte_length": len(conflicting_content),
+                "content_base64": base64.b64encode(conflicting_content).decode("ascii"),
+            }
+        )
+        status, artifact_conflict = self.request("POST", "/v1/skill-pack-artifacts", conflicting_artifact)
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("SKILL_PACK_ARTIFACT_VERSION_CONFLICT", artifact_conflict["error_code"])
+        status, artifacts = self.request("GET", "/v1/skill-pack-artifacts")
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(artifacts["artifacts"]))
         status, adopted = self.request("POST", "/v1/skill-release-adoptions", adoption_request)
         self.assertEqual(HTTPStatus.CREATED, status)
         adoption = adopted["adoption"]
@@ -288,6 +356,11 @@ class IntentSkillRoutingApiTests(unittest.TestCase):
         self.assertEqual("SKILL_RELEASE_ADOPTION_VERSION_CONFLICT", conflict["error_code"])
         status, old = self.request("GET", f"/v1/skill-resolutions/{fallback['resolution_id']}")
         self.assertTrue(old["resolution"]["fallback_used"])
+        stored_artifact = self.server.store.skill_pack_artifact_root / f"{artifact_digest}.skillpack.json"
+        stored_artifact.write_bytes(b"tampered\n")
+        status, storage_invalid = self.request("POST", "/v1/skill-release-adoptions", adoption_request)
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("SKILL_PACK_ARTIFACT_STORAGE_INVALID", storage_invalid["error_code"])
 
 
 if __name__ == "__main__":

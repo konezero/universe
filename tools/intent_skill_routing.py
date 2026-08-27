@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
 
 
@@ -12,6 +14,7 @@ SKILL_RESOLUTION_SCHEMA = "universe.skill-resolution.v1"
 STRUCTURED_PLAN_SCHEMA = "universe.structured-plan.v1"
 SKILL_GAP_SCHEMA = "universe.skill-gap-observation.v1"
 SKILL_CANDIDATE_SCHEMA = "universe.skill-candidate.v1"
+SKILL_PACK_ARTIFACT_SCHEMA = "ai-career.skill-pack-artifact.v1"
 SKILL_PACK_MANIFEST_SCHEMA = "universe.skill-pack-manifest.v1"
 SKILL_RELEASE_ADOPTION_SCHEMA = "universe.skill-release-adoption.v1"
 
@@ -194,6 +197,94 @@ def normalize_registry_snapshot(value: Any) -> dict[str, Any]:
     return material
 
 
+def _artifact_relative_path(value: Any, field: str) -> str:
+    normalized = _text(value, field, maximum=512)
+    path = PurePosixPath(normalized)
+    if (
+        "\\" in normalized
+        or path.is_absolute()
+        or path.as_posix() != normalized
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or (path.parts and ":" in path.parts[0])
+    ):
+        raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", f"{field} must be a canonical relative POSIX path")
+    return normalized
+
+
+def normalize_skill_pack_artifact(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact must be an object")
+    _exact_fields(
+        value,
+        {"schema", "pack_id", "version", "files"},
+        set(),
+        "SKILL_PACK_ARTIFACT_INVALID",
+    )
+    if value["schema"] != SKILL_PACK_ARTIFACT_SCHEMA:
+        raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact schema is unsupported")
+    files_value = value["files"]
+    if not isinstance(files_value, list) or not 1 <= len(files_value) <= 64:
+        raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "files must be a non-empty bounded list")
+    files: list[dict[str, Any]] = []
+    paths: set[str] = set()
+    total_bytes = 0
+    for index, file_value in enumerate(files_value):
+        if not isinstance(file_value, Mapping):
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", f"files[{index}] must be an object")
+        _exact_fields(
+            file_value,
+            {"path", "role", "sha256", "byte_length", "content_base64", "source_path"},
+            set(),
+            "SKILL_PACK_ARTIFACT_INVALID",
+        )
+        path = _artifact_relative_path(file_value["path"], f"files[{index}].path")
+        source_path = _artifact_relative_path(file_value["source_path"], f"files[{index}].source_path")
+        if path in paths:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact contains a duplicate file path")
+        paths.add(path)
+        role = _identifier(file_value["role"], f"files[{index}].role").upper()
+        if role not in {"SKILL", "ASSET", "REFERENCE"}:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact file role is unsupported")
+        byte_length = file_value["byte_length"]
+        if isinstance(byte_length, bool) or not isinstance(byte_length, int) or not 0 <= byte_length <= 1024 * 1024:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact file byte_length is invalid")
+        content_base64 = _text(file_value["content_base64"], f"files[{index}].content_base64", maximum=2 * 1024 * 1024)
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except (ValueError, TypeError) as error:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact file content_base64 is invalid") from error
+        if len(content) != byte_length:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact file byte_length does not match content")
+        file_sha256 = _text(file_value["sha256"], f"files[{index}].sha256", maximum=64).lower()
+        if len(file_sha256) != 64 or any(character not in "0123456789abcdef" for character in file_sha256):
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact file sha256 must be SHA-256")
+        if hashlib.sha256(content).hexdigest() != file_sha256:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact file sha256 does not match content")
+        total_bytes += byte_length
+        if total_bytes > 8 * 1024 * 1024:
+            raise IntentRoutingError("SKILL_PACK_ARTIFACT_INVALID", "artifact decoded content exceeds the size limit")
+        files.append(
+            {
+                "path": path,
+                "role": role,
+                "sha256": file_sha256,
+                "byte_length": byte_length,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "source_path": source_path,
+            }
+        )
+    return {
+        "schema": SKILL_PACK_ARTIFACT_SCHEMA,
+        "pack_id": _identifier(value["pack_id"], "pack_id"),
+        "version": _identifier(value["version"], "version"),
+        "files": sorted(files, key=lambda item: item["path"]),
+    }
+
+
+def canonical_skill_pack_artifact_bytes(value: Any) -> bytes:
+    return (canonical_json(normalize_skill_pack_artifact(value)) + "\n").encode("utf-8")
+
+
 def normalize_skill_pack_manifest(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "manifest must be an object")
@@ -201,7 +292,7 @@ def normalize_skill_pack_manifest(value: Any) -> dict[str, Any]:
     _exact_fields(
         request,
         {"schema", "pack_id", "version", "scope", "artifact", "skills"},
-        {"project_id", "node_ref"},
+        {"project_id", "node_ref", "manifest_digest", "release_id"},
         "SKILL_PACK_MANIFEST_INVALID",
     )
     if request["schema"] != SKILL_PACK_MANIFEST_SCHEMA:
@@ -270,6 +361,14 @@ def normalize_skill_pack_manifest(value: Any) -> dict[str, Any]:
     }
     material["manifest_digest"] = digest(material)
     material["release_id"] = "skill_pack_" + material["manifest_digest"][:24]
+    if request.get("manifest_digest") is not None:
+        claimed_digest = _text(request["manifest_digest"], "manifest_digest", maximum=64).lower()
+        if claimed_digest != material["manifest_digest"]:
+            raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "manifest_digest does not match the manifest")
+    if request.get("release_id") is not None:
+        claimed_release_id = _identifier(request["release_id"], "release_id")
+        if claimed_release_id != material["release_id"]:
+            raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "release_id does not match the manifest")
     return material
 
 

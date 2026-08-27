@@ -97,12 +97,14 @@ from project_rag_freshness import (
 from intent_skill_routing import (
     IntentRoutingError,
     SKILL_RELEASE_ADOPTION_SCHEMA,
+    canonical_skill_pack_artifact_bytes,
     build_adopted_registry_snapshot,
     build_skill_candidate,
     execute_plan_fallback,
     normalize_gap_observation,
     normalize_intent_decision,
     normalize_registry_snapshot,
+    normalize_skill_pack_artifact,
     normalize_skill_pack_manifest,
     resolve_skill,
 )
@@ -5234,6 +5236,8 @@ class UniverseStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.release_artifact_root = self.database_path.parent / "release-artifacts"
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
+        self.skill_pack_artifact_root = self.database_path.parent / "skill-pack-artifacts"
+        self.skill_pack_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.remote_access = RemoteAccessStore(self.database_path)
         self.provider_session_observer = ProviderSessionObserverStore(
@@ -5602,6 +5606,16 @@ class UniverseStore:
                     registry_digest TEXT NOT NULL UNIQUE,
                     snapshot_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_pack_artifact (
+                    artifact_sha256 TEXT PRIMARY KEY,
+                    pack_id TEXT NOT NULL,
+                    pack_version TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
+                    artifact_json TEXT NOT NULL,
+                    imported_at TEXT NOT NULL,
+                    UNIQUE(pack_id, pack_version)
                 );
 
                 CREATE TABLE IF NOT EXISTS skill_release_adoption (
@@ -11609,6 +11623,164 @@ class UniverseStore:
             ).fetchall()
         return [{**json.loads(row["snapshot_json"]), "created_at": row["created_at"]} for row in rows]
 
+    @staticmethod
+    def _public_skill_pack_artifact(row: sqlite3.Row) -> dict[str, Any]:
+        artifact = json.loads(row["artifact_json"])
+        return {
+            "schema": "universe.skill-pack-artifact-import.v1",
+            "status": "VERIFIED",
+            "artifact_digest": row["artifact_sha256"],
+            "pack_id": row["pack_id"],
+            "pack_version": row["pack_version"],
+            "byte_length": len(canonical_skill_pack_artifact_bytes(artifact)),
+            "file_count": len(artifact["files"]),
+            "imported_at": row["imported_at"],
+        }
+
+    def _verify_skill_pack_artifact_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        expected_pack_id: str | None = None,
+        expected_version: str | None = None,
+    ) -> dict[str, Any]:
+        digest_value = row["artifact_sha256"]
+        expected_path = (self.skill_pack_artifact_root / f"{digest_value}.skillpack.json").resolve()
+        recorded_path = Path(row["artifact_path"]).resolve()
+        if recorded_path != expected_path or recorded_path.parent != self.skill_pack_artifact_root.resolve():
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact path is outside the canonical digest-addressed location",
+                HTTPStatus.CONFLICT,
+            )
+        if not recorded_path.is_file():
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact is missing or not a regular file",
+                HTTPStatus.CONFLICT,
+            )
+        payload = recorded_path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != digest_value:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact digest does not match its identity",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+            artifact = normalize_skill_pack_artifact(parsed)
+            canonical = canonical_skill_pack_artifact_bytes(artifact)
+        except (UnicodeDecodeError, json.JSONDecodeError, IntentRoutingError) as error:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact is not a valid canonical artifact",
+                HTTPStatus.CONFLICT,
+            ) from error
+        if canonical != payload or _canonical_json(artifact) != row["artifact_json"]:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact bytes are not canonical",
+                HTTPStatus.CONFLICT,
+            )
+        if expected_pack_id is not None and artifact["pack_id"] != expected_pack_id:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_IDENTITY_MISMATCH",
+                "stored artifact pack_id does not match the release manifest",
+                HTTPStatus.CONFLICT,
+            )
+        if expected_version is not None and artifact["version"] != expected_version:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_IDENTITY_MISMATCH",
+                "stored artifact version does not match the release manifest",
+                HTTPStatus.CONFLICT,
+            )
+        return artifact
+
+    def import_skill_pack_artifact(self, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            artifact = normalize_skill_pack_artifact(value)
+            payload = canonical_skill_pack_artifact_bytes(artifact)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        artifact_digest = hashlib.sha256(payload).hexdigest()
+        artifact_path = (self.skill_pack_artifact_root / f"{artifact_digest}.skillpack.json").resolve()
+        now = utc_now()
+        with self._connection() as connection:
+            version_row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE pack_id = ? AND pack_version = ?",
+                (artifact["pack_id"], artifact["version"]),
+            ).fetchone()
+            if version_row is not None:
+                if version_row["artifact_sha256"] != artifact_digest:
+                    raise UniverseError(
+                        "SKILL_PACK_ARTIFACT_VERSION_CONFLICT",
+                        "pack_id and version already refer to a different artifact",
+                        HTTPStatus.CONFLICT,
+                    )
+                self._verify_skill_pack_artifact_row(version_row)
+                return self._public_skill_pack_artifact(version_row), False
+            digest_row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE artifact_sha256 = ?",
+                (artifact_digest,),
+            ).fetchone()
+            if digest_row is not None:
+                self._verify_skill_pack_artifact_row(digest_row)
+                return self._public_skill_pack_artifact(digest_row), False
+            if artifact_path.exists():
+                if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact_digest:
+                    raise UniverseError(
+                        "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                        "digest-addressed Skill Pack artifact path contains different bytes",
+                        HTTPStatus.CONFLICT,
+                    )
+            else:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{artifact_digest}.", suffix=".tmp", dir=self.skill_pack_artifact_root
+                )
+                temporary_path = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary_path, artifact_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+            connection.execute(
+                "INSERT INTO skill_pack_artifact(artifact_sha256, pack_id, pack_version, artifact_path, artifact_json, imported_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    artifact_digest,
+                    artifact["pack_id"],
+                    artifact["version"],
+                    str(artifact_path),
+                    _canonical_json(artifact),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE artifact_sha256 = ?",
+                (artifact_digest,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "Skill Pack artifact import did not produce a durable record",
+                HTTPStatus.CONFLICT,
+            )
+        self._verify_skill_pack_artifact_row(row)
+        return self._public_skill_pack_artifact(row), True
+
+    def list_skill_pack_artifacts(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM skill_pack_artifact ORDER BY imported_at DESC, artifact_sha256 DESC"
+            ).fetchall()
+        artifacts = []
+        for row in rows:
+            self._verify_skill_pack_artifact_row(row)
+            artifacts.append(self._public_skill_pack_artifact(row))
+        return artifacts
+
     def adopt_skill_release(self, value: Any) -> tuple[dict[str, Any], bool]:
         request = _exact_object_fields(
             value,
@@ -11639,18 +11811,33 @@ class UniverseStore:
                 "SELECT adoption_json FROM skill_release_adoption WHERE manifest_digest = ?",
                 (manifest["manifest_digest"],),
             ).fetchone()
-            if existing is not None:
-                return json.loads(existing["adoption_json"]), False
             version_conflict = connection.execute(
                 "SELECT manifest_digest FROM skill_release_adoption WHERE pack_id = ? AND pack_version = ?",
                 (manifest["pack_id"], manifest["version"]),
             ).fetchone()
-            if version_conflict is not None:
+            if version_conflict is not None and version_conflict["manifest_digest"] != manifest["manifest_digest"]:
                 raise UniverseError(
                     "SKILL_RELEASE_ADOPTION_VERSION_CONFLICT",
                     "pack_id and version already refer to a different manifest",
                     HTTPStatus.CONFLICT,
                 )
+            artifact_row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE artifact_sha256 = ?",
+                (manifest["artifact"]["sha256"],),
+            ).fetchone()
+            if artifact_row is None:
+                raise UniverseError(
+                    "SKILL_PACK_ARTIFACT_NOT_IMPORTED",
+                    "Skill Release adoption requires the referenced artifact to be imported first",
+                    HTTPStatus.CONFLICT,
+                )
+            self._verify_skill_pack_artifact_row(
+                artifact_row,
+                expected_pack_id=manifest["pack_id"],
+                expected_version=manifest["version"],
+            )
+            if existing is not None:
+                return json.loads(existing["adoption_json"]), False
             current = connection.execute(
                 "SELECT snapshot.snapshot_json FROM skill_registry_current AS current "
                 "JOIN skill_registry_snapshot AS snapshot "
@@ -34118,6 +34305,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/skill-pack-artifacts":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_PACK_ARTIFACTS_COLLECTED",
+                    "artifacts": self.server.store.list_skill_pack_artifacts(),
+                },
+            )
+            return
         if path == "/v1/skill-release-adoptions":
             self._send(
                 HTTPStatus.OK,
@@ -36313,6 +36510,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "SKILL_REGISTRY_SNAPSHOT_RECORDED" if created else "SKILL_REGISTRY_SNAPSHOT_ALREADY_RECORDED",
                         "snapshot": snapshot,
+                    },
+                )
+                return
+            if path == "/v1/skill-pack-artifacts":
+                artifact, created = self.server.store.import_skill_pack_artifact(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_PACK_ARTIFACT_IMPORTED" if created else "SKILL_PACK_ARTIFACT_ALREADY_IMPORTED",
+                        "artifact": artifact,
                     },
                 )
                 return
