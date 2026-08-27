@@ -383,6 +383,16 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.replies: list[dict[str, Any]] = []
         self.streams: list[dict[str, Any]] = []
 
+    def test_claude_runtime_normalizes_canonical_resume_coordinate(self) -> None:
+        self.state.observe_provider_session(
+            "CLAUDE", "claude-code:stable-session"
+        )
+
+        runtime = ClaudeProjectMasterRuntime(self.root, "GCS", self.state)
+
+        self.assertEqual("stable-session", runtime.session_id)
+        self.assertEqual("claude-code:stable-session", runtime.session_ref)
+
     def tearDown(self) -> None:
         self.temp.cleanup()
 

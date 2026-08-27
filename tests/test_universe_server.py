@@ -8763,19 +8763,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_meeting_provider_adapter_waits_for_verified_terminal_result(self) -> None:
         terminal_body = "Self-contained verified specification"
 
-        def submit(chat_key, value, *, on_accepted=None, on_terminal=None):
-            self.assertEqual("provider_chat_verified", chat_key)
-            self.assertIn("Incoming delta", value["body"])
-            self.assertIsNone(on_accepted)
-            self.assertIsNotNone(on_terminal)
-            on_terminal(
-                {
-                    "message_id": "provider-reply-1",
-                    "state": "COMPLETED",
-                    "body": terminal_body,
-                }
+        def turn(descriptor, body, message_id):
+            self.assertEqual("CODEX", descriptor["provider"])
+            self.assertIn("Incoming delta", body)
+            self.assertEqual(
+                "feature-meeting:meeting-adapter-1:0:bind-provider-1",
+                message_id,
             )
-            return {"reply": {"message_id": "provider-reply-1"}}
+            return {"body": terminal_body}
 
         with patch.object(
             self.server,
@@ -8784,7 +8779,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "provider": "CODEX",
                 "provider_session_ref": "provider-session-1",
             },
-        ), patch.object(self.server.provider_sessions, "submit", side_effect=submit):
+        ), patch.object(self.server.session_broker, "turn", side_effect=turn):
             result = self.server._invoke_multi_room_meeting_provider(
                 {
                     "binding_id": "bind-provider-1",
@@ -8800,7 +8795,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         self.assertEqual("COMPLETED", result["status"])
         self.assertEqual(terminal_body, result["body_text"])
-        self.assertEqual("provider-reply-1", result["provider_event_id"])
+        self.assertEqual(
+            "feature-meeting:meeting-adapter-1:0:bind-provider-1",
+            result["provider_event_id"],
+        )
 
     def test_meeting_room_finding_http_records_and_collects_source_links(self) -> None:
         created = self.server.multi_rooms.create_meeting_room(

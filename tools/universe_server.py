@@ -270,6 +270,7 @@ from universe_app.provider_session_service import (
     ProviderSessionError,
     ProviderSessionService,
 )
+from session_broker_host import SessionBrokerClient, SessionBrokerError
 from universe_app.work_loop_prediction import (
     WORK_LOOP_PREDICTION_SCHEMA,
     WORK_LOOP_RESULT_FANOUT_SCHEMA,
@@ -23434,6 +23435,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_master_provider_factory: Any = None,
         room_participant_permission_resolver: Callable[[str, str, str], bool] | None = None,
         provider_session_host_factory: Any = None,
+        session_broker_client: Any = None,
         host_profile: HostProfileStore | None = None,
         provider_model_catalog: ProviderModelCatalogStore | None = None,
         service_state_path: Path | None = None,
@@ -23567,6 +23569,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             action_store=self.store,
             action_observer=self._observe_provider_session_action,
+        )
+        self.session_broker = session_broker_client or SessionBrokerClient(
+            self.store.database_path.parent / "session-broker-state.json",
+            self.store.database_path.parent / "session-broker.sqlite3",
+            timeout=620.0,
         )
         self.task_frame_lineage = store.task_frame_lineage
         self.session_anchor_transport = SessionAnchorTransport(
@@ -30851,47 +30858,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         prompt = (
             "You are participating in a bounded Universe Feature Meeting. "
-            "Use only the incoming delta below, do not assume execution authority, "
-            "and return one self-contained candidate in the exact format requested "
-            "by that delta so another reviewer can compare it with alternatives.\n\n"
+            "Use only the incoming delta below and do not assume execution authority. "
+            "Do not call tools, read files, run commands, or write files; all required "
+            "information is already present. Return only the requested artifact with "
+            "no preface or explanation. When JSON is requested, return one raw JSON "
+            "object without Markdown fences. "
+            "Return one self-contained candidate in the exact format requested by "
+            "that delta so another reviewer can compare it with alternatives.\n\n"
             f"Incoming delta:\n{delta_body}"
-        )[:12000]
-        terminal: dict[str, Any] = {}
-        finished = threading.Event()
-
-        def on_terminal(message: Mapping[str, Any]) -> None:
-            terminal.update(dict(message))
-            finished.set()
-
-        accepted = self.provider_sessions.submit(
-            chat_key,
-            {
-                "body": prompt,
-                "idempotency_key": (
-                    f"feature-meeting:{turn.get('run_id')}:"
-                    f"{turn.get('turn_number')}:{binding.get('binding_id')}"
-                ),
-            },
-            on_terminal=on_terminal,
+        )[:24000]
+        provider_event_id = (
+            f"feature-meeting:{turn.get('run_id')}:"
+            f"{turn.get('turn_number')}:{binding.get('binding_id')}"
         )
-        if not finished.wait(self._meeting_provider_timeout_seconds):
-            self.provider_sessions.cancel(chat_key)
+        try:
+            completed = self.session_broker.turn(
+                descriptor, prompt, provider_event_id
+            )
+        except SessionBrokerError as error:
             return {
                 "status": "FAILED",
-                "reason": "MEETING_PROVIDER_TIMEOUT",
-                "provider_event_id": accepted.get("reply", {}).get("message_id"),
-            }
-        terminal_state = str(terminal.get("state") or "FAILED").upper()
-        if terminal_state != "COMPLETED":
-            return {
-                "status": terminal_state,
-                "reason": terminal.get("error_code") or terminal_state,
-                "provider_event_id": terminal.get("message_id"),
+                "reason": error.code,
+                "provider_event_id": provider_event_id,
             }
         return {
             "status": "COMPLETED",
-            "body_text": str(terminal.get("body") or ""),
-            "provider_event_id": terminal.get("message_id"),
+            "body_text": str(completed.get("body") or ""),
+            "provider_event_id": provider_event_id,
         }
 
     def run_feature_meeting(self, feature_id: str, value: Any) -> dict[str, Any]:
@@ -31086,7 +31079,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         prompt=(
             "Create an alternative implementation Work Plan for the Goal below. Return ONLY one JSON object with exactly this shape: "
             '{"title":"...","summary":"...","milestones":[{"title":"...","description":"...","todos":[{"title":"...","detail":"...","acceptance":"...","priority":"AUTO|P0|P1|P2|P3"}]}]}. '
-            "Use 1-6 milestones, 1-8 Todos per milestone, and no more than 24 Todos. Do not create authority or claim execution.\n\n"
+            "Keep the entire JSON under 12000 characters. Use 1-4 milestones, 1-4 Todos per milestone, "
+            "and no more than 16 concise Todos. "
+            "Keep title and milestone titles at most 160 characters, summary at most 1000, "
+            "milestone descriptions at most 4000, Todo detail at most 3000, and Todo acceptance "
+            "at most 1000. Do not call tools, use Markdown fences, create authority, or claim execution.\n\n"
             f"Goal: {goal['title']}\n{goal['description']}\n\nAdopted specification:\n{artifact.get('body_text') or ''}"
         )[:20000]
         try:
@@ -39683,6 +39680,7 @@ def create_server(
     project_master_provider_factory: Any = None,
     room_participant_permission_resolver: Callable[[str, str, str], bool] | None = None,
     provider_session_host_factory: Any = None,
+    session_broker_client: Any = None,
     host_profile: HostProfileStore | None = None,
     provider_model_catalog: ProviderModelCatalogStore | None = None,
     service_state_path: Path | None = None,
@@ -39719,6 +39717,7 @@ def create_server(
         project_master_provider_factory=project_master_provider_factory,
         room_participant_permission_resolver=room_participant_permission_resolver,
         provider_session_host_factory=provider_session_host_factory,
+        session_broker_client=session_broker_client,
         host_profile=host_profile,
         provider_model_catalog=provider_model_catalog,
         service_state_path=service_state_path,

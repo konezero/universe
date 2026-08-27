@@ -4622,7 +4622,12 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             supervisor_session_id=supervisor_session_id,
             session_anchor_ref=session_anchor_ref,
         )
-        self.session_id = None if new_session else store.session_ref_for("CLAUDE")
+        stored_session_ref = None if new_session else store.session_ref_for("CLAUDE")
+        self.session_id = (
+            stored_session_ref.removeprefix("claude-code:")
+            if stored_session_ref
+            else None
+        )
         self.max_turns = max(1, int(max_turns))
         self._permission_broker: ClaudePermissionBroker | None = None
         self._mcp_config_root: Path | None = None
