@@ -96,11 +96,14 @@ from project_rag_freshness import (
 )
 from intent_skill_routing import (
     IntentRoutingError,
+    SKILL_RELEASE_ADOPTION_SCHEMA,
+    build_adopted_registry_snapshot,
     build_skill_candidate,
     execute_plan_fallback,
     normalize_gap_observation,
     normalize_intent_decision,
     normalize_registry_snapshot,
+    normalize_skill_pack_manifest,
     resolve_skill,
 )
 from project_seed_apply import build_project_seed_asset_approval
@@ -5599,6 +5602,26 @@ class UniverseStore:
                     registry_digest TEXT NOT NULL UNIQUE,
                     snapshot_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_release_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    manifest_digest TEXT NOT NULL UNIQUE,
+                    pack_id TEXT NOT NULL,
+                    pack_version TEXT NOT NULL,
+                    artifact_digest TEXT NOT NULL,
+                    previous_registry_digest TEXT NOT NULL,
+                    registry_digest TEXT NOT NULL,
+                    adoption_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL,
+                    UNIQUE(pack_id, pack_version)
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_registry_current (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    registry_digest TEXT NOT NULL,
+                    adoption_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS intent_decision (
@@ -11586,13 +11609,136 @@ class UniverseStore:
             ).fetchall()
         return [{**json.loads(row["snapshot_json"]), "created_at": row["created_at"]} for row in rows]
 
+    def adopt_skill_release(self, value: Any) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="skill_release_adoption",
+            required=frozenset({"manifest", "actor"}),
+        )
+        actor = _exact_object_fields(
+            request["actor"],
+            field="skill_release_adoption.actor",
+            required=frozenset({"kind", "actor_ref", "decision_ref"}),
+        )
+        actor_kind = _identifier(actor["kind"], "actor.kind").upper()
+        if actor_kind != "USER":
+            raise UniverseError(
+                "SKILL_RELEASE_ADOPTION_USER_REQUIRED",
+                "Skill Release adoption requires an explicit USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        try:
+            manifest = normalize_skill_pack_manifest(request["manifest"])
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        actor_ref = _identifier(actor["actor_ref"], "actor.actor_ref")
+        decision_ref = _identifier(actor["decision_ref"], "actor.decision_ref")
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT adoption_json FROM skill_release_adoption WHERE manifest_digest = ?",
+                (manifest["manifest_digest"],),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["adoption_json"]), False
+            version_conflict = connection.execute(
+                "SELECT manifest_digest FROM skill_release_adoption WHERE pack_id = ? AND pack_version = ?",
+                (manifest["pack_id"], manifest["version"]),
+            ).fetchone()
+            if version_conflict is not None:
+                raise UniverseError(
+                    "SKILL_RELEASE_ADOPTION_VERSION_CONFLICT",
+                    "pack_id and version already refer to a different manifest",
+                    HTTPStatus.CONFLICT,
+                )
+            current = connection.execute(
+                "SELECT snapshot.snapshot_json FROM skill_registry_current AS current "
+                "JOIN skill_registry_snapshot AS snapshot "
+                "ON snapshot.registry_digest = current.registry_digest "
+                "WHERE current.singleton = 1"
+            ).fetchone()
+            if current is None:
+                current = connection.execute(
+                    "SELECT snapshot_json FROM skill_registry_snapshot ORDER BY created_at DESC, snapshot_id DESC LIMIT 1"
+                ).fetchone()
+            previous = (
+                json.loads(current["snapshot_json"])
+                if current is not None
+                else normalize_registry_snapshot(
+                    {"skills": [], "source_ref": "universe://skill-registry/empty"}
+                )
+            )
+            snapshot = build_adopted_registry_snapshot(previous, manifest)
+            connection.execute(
+                "INSERT OR IGNORE INTO skill_registry_snapshot(snapshot_id, registry_digest, snapshot_json, created_at) VALUES (?, ?, ?, ?)",
+                (snapshot["snapshot_id"], snapshot["registry_digest"], _canonical_json(snapshot), now),
+            )
+            adoption = {
+                "schema": SKILL_RELEASE_ADOPTION_SCHEMA,
+                "adoption_id": "skill_adoption_" + manifest["manifest_digest"][:24],
+                "status": "ADOPTED",
+                "manifest_digest": manifest["manifest_digest"],
+                "pack_id": manifest["pack_id"],
+                "pack_version": manifest["version"],
+                "artifact_digest": manifest["artifact"]["sha256"],
+                "previous_registry_digest": previous["registry_digest"],
+                "registry_digest": snapshot["registry_digest"],
+                "actor": {
+                    "kind": actor_kind,
+                    "actor_ref": actor_ref,
+                    "decision_ref": decision_ref,
+                },
+                "manifest": manifest,
+                "effects": {
+                    "authority": "NONE",
+                    "execution_assignment": "NONE",
+                    "runtime_mutation_permission": "NONE",
+                },
+            }
+            connection.execute(
+                "INSERT INTO skill_release_adoption(adoption_id, manifest_digest, pack_id, pack_version, artifact_digest, previous_registry_digest, registry_digest, adoption_json, adopted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    adoption["adoption_id"], adoption["manifest_digest"],
+                    adoption["pack_id"], adoption["pack_version"],
+                    adoption["artifact_digest"], adoption["previous_registry_digest"],
+                    adoption["registry_digest"], _canonical_json(adoption), now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO skill_registry_current(singleton, registry_digest, adoption_id, updated_at) VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET registry_digest = excluded.registry_digest, adoption_id = excluded.adoption_id, updated_at = excluded.updated_at",
+                (adoption["registry_digest"], adoption["adoption_id"], now),
+            )
+        return adoption, True
+
+    def list_skill_release_adoptions(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT adoption_json, adopted_at FROM skill_release_adoption ORDER BY adopted_at DESC, adoption_id DESC"
+            ).fetchall()
+        return [
+            {**json.loads(row["adoption_json"]), "adopted_at": row["adopted_at"]}
+            for row in rows
+        ]
+
     def _skill_registry_snapshot(self, registry_digest: str | None) -> dict[str, Any]:
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT snapshot_json FROM skill_registry_snapshot "
-                + ("WHERE registry_digest = ?" if registry_digest else "ORDER BY created_at DESC, snapshot_id DESC LIMIT 1"),
-                ((registry_digest,) if registry_digest else ()),
-            ).fetchone()
+            if registry_digest:
+                row = connection.execute(
+                    "SELECT snapshot_json FROM skill_registry_snapshot WHERE registry_digest = ?",
+                    (registry_digest,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT snapshot.snapshot_json FROM skill_registry_current AS current "
+                    "JOIN skill_registry_snapshot AS snapshot "
+                    "ON snapshot.registry_digest = current.registry_digest "
+                    "WHERE current.singleton = 1"
+                ).fetchone()
+                if row is None:
+                    row = connection.execute(
+                        "SELECT snapshot_json FROM skill_registry_snapshot ORDER BY created_at DESC, snapshot_id DESC LIMIT 1"
+                    ).fetchone()
         if row is not None:
             return json.loads(row["snapshot_json"])
         if registry_digest:
@@ -33972,6 +34118,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/skill-release-adoptions":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_RELEASE_ADOPTIONS_COLLECTED",
+                    "adoptions": self.server.store.list_skill_release_adoptions(),
+                },
+            )
+            return
         skill_resolution_get = re.fullmatch(r"/v1/skill-resolutions/([^/]+)", path)
         if skill_resolution_get is not None:
             try:
@@ -36157,6 +36313,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "SKILL_REGISTRY_SNAPSHOT_RECORDED" if created else "SKILL_REGISTRY_SNAPSHOT_ALREADY_RECORDED",
                         "snapshot": snapshot,
+                    },
+                )
+                return
+            if path == "/v1/skill-release-adoptions":
+                adoption, created = self.server.store.adopt_skill_release(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_RELEASE_ADOPTED" if created else "SKILL_RELEASE_ALREADY_ADOPTED",
+                        "adoption": adoption,
                     },
                 )
                 return

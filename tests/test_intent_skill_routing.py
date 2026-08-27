@@ -19,12 +19,15 @@ sys.path.insert(0, str(ROOT / "tools"))
 from host_profile import HostProfileStore  # noqa: E402
 from intent_skill_routing import (  # noqa: E402
     IntentRoutingError,
+    SKILL_PACK_MANIFEST_SCHEMA,
+    build_adopted_registry_snapshot,
     digest,
     empty_registry_snapshot,
     execute_plan_fallback,
     normalize_intent_decision,
     normalize_planning_phrase,
     normalize_registry_snapshot,
+    normalize_skill_pack_manifest,
     resolve_skill,
 )
 from universe_server import create_server, universe_mode_contract  # noqa: E402
@@ -118,6 +121,28 @@ class IntentSkillRoutingUnitTests(unittest.TestCase):
         selected = resolve_skill(decision, snapshot, {"explicit_skill_id": "common-plan"})
         self.assertEqual("common-plan", selected["selected_skill_id"])
         self.assertEqual("EXPLICIT", selected["selection_scope"])
+
+    def test_skill_pack_manifest_is_digest_addressed_and_scope_bound(self) -> None:
+        manifest = normalize_skill_pack_manifest({
+            "schema": SKILL_PACK_MANIFEST_SCHEMA,
+            "pack_id": "common.memory-sync",
+            "version": "1",
+            "scope": "COMMON",
+            "artifact": {"source_ref": "release://common.memory-sync/1", "sha256": sha("artifact")},
+            "skills": [
+                {"skill_id": "memory-sync", "version": "1", "scope": "COMMON", "intents": ["MEMORY_SYNC_REQUEST"], "capabilities": ["MEMORY_SYNC"], "effects": ["NONE"], "output_contract": "universe.memory-candidates.v1", "priority": 100},
+            ],
+        })
+        self.assertEqual("skill_pack_" + manifest["manifest_digest"][:24], manifest["release_id"])
+        adopted = build_adopted_registry_snapshot(empty_registry_snapshot(), manifest)
+        self.assertEqual("memory-sync", adopted["skills"][0]["skill_id"])
+        invalid = dict(manifest)
+        invalid.pop("manifest_digest")
+        invalid.pop("release_id")
+        invalid["artifact"] = {"source_ref": "release://common.memory-sync/1", "sha256": "not-a-digest"}
+        with self.assertRaises(IntentRoutingError) as caught:
+            normalize_skill_pack_manifest(invalid)
+        self.assertEqual("SKILL_PACK_MANIFEST_INVALID", caught.exception.code)
 
     def test_effectful_fallback_fails_closed_without_registered_adapter(self) -> None:
         for capability, effect, handler in (
@@ -224,10 +249,43 @@ class IntentSkillRoutingApiTests(unittest.TestCase):
         candidate = candidate_result["candidate"]
         self.assertEqual("ELIGIBLE", candidate["candidate_state"])
         self.assertEqual("NOT_INSTALLED", candidate["installation_state"])
-        status, registry = self.request("POST", "/v1/skill-registry-snapshots", {"source_ref": "release://planning-v1", "skills": [{"skill_id": "project-planning", "version": "1", "scope": "PROJECT", "project_id": "universe", "intents": ["PLAN_REQUEST"], "capabilities": ["PLAN_CREATE"], "effects": ["NONE"], "output_contract": "universe.structured-plan.v1", "priority": 100}]})
+        manifest = {
+            "schema": SKILL_PACK_MANIFEST_SCHEMA,
+            "pack_id": "universe.project-planning",
+            "version": "1",
+            "scope": "PROJECT",
+            "project_id": "universe",
+            "artifact": {"source_ref": "release://planning-v1", "sha256": sha("planning-v1-artifact")},
+            "skills": [{"skill_id": "project-planning", "version": "1", "scope": "PROJECT", "project_id": "universe", "intents": ["PLAN_REQUEST"], "capabilities": ["PLAN_CREATE"], "effects": ["NONE"], "output_contract": "universe.structured-plan.v1", "priority": 100}],
+        }
+        adoption_request = {
+            "manifest": manifest,
+            "actor": {"kind": "USER", "actor_ref": "user.konezero", "decision_ref": "ui-action.adopt-planning-v1"},
+        }
+        denied_request = {
+            **adoption_request,
+            "actor": {"kind": "CONDUCTOR", "actor_ref": "conductor.codex", "decision_ref": "automation.try-adopt"},
+        }
+        status, denied = self.request("POST", "/v1/skill-release-adoptions", denied_request)
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("SKILL_RELEASE_ADOPTION_USER_REQUIRED", denied["error_code"])
+        status, adopted = self.request("POST", "/v1/skill-release-adoptions", adoption_request)
         self.assertEqual(HTTPStatus.CREATED, status)
-        status, installed_resolution = self.request("POST", "/v1/skill-resolutions", {"intent_decision_id": decision["decision_id"], "project_id": "universe", "registry_digest": registry["snapshot"]["registry_digest"]})
+        adoption = adopted["adoption"]
+        self.assertEqual("ADOPTED", adoption["status"])
+        self.assertEqual("NONE", adoption["effects"]["runtime_mutation_permission"])
+        status, repeated = self.request("POST", "/v1/skill-release-adoptions", adoption_request)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(adoption["adoption_id"], repeated["adoption"]["adoption_id"])
+        status, adoptions = self.request("GET", "/v1/skill-release-adoptions")
+        self.assertEqual(1, len(adoptions["adoptions"]))
+        status, installed_resolution = self.request("POST", "/v1/skill-resolutions", {"intent_decision_id": decision["decision_id"], "project_id": "universe"})
         self.assertEqual("project-planning", installed_resolution["resolution"]["selected_skill_id"])
+        conflicting = json.loads(json.dumps(adoption_request))
+        conflicting["manifest"]["artifact"]["sha256"] = sha("different-artifact")
+        status, conflict = self.request("POST", "/v1/skill-release-adoptions", conflicting)
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("SKILL_RELEASE_ADOPTION_VERSION_CONFLICT", conflict["error_code"])
         status, old = self.request("GET", f"/v1/skill-resolutions/{fallback['resolution_id']}")
         self.assertTrue(old["resolution"]["fallback_used"])
 

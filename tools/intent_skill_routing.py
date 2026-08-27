@@ -12,6 +12,8 @@ SKILL_RESOLUTION_SCHEMA = "universe.skill-resolution.v1"
 STRUCTURED_PLAN_SCHEMA = "universe.structured-plan.v1"
 SKILL_GAP_SCHEMA = "universe.skill-gap-observation.v1"
 SKILL_CANDIDATE_SCHEMA = "universe.skill-candidate.v1"
+SKILL_PACK_MANIFEST_SCHEMA = "universe.skill-pack-manifest.v1"
+SKILL_RELEASE_ADOPTION_SCHEMA = "universe.skill-release-adoption.v1"
 
 ROUTES = frozenset({"RESOLVE_SKILL", "READ_ONLY_RESPONSE", "PROPOSE", "ASK", "WAIT", "STRICT_GATE"})
 EFFECTS = frozenset({"NONE", "RUNTIME_STATE_WRITE", "USER_ARTIFACT_WRITE", "BOUNDED_LOCAL_WORK", "STRICT_MUTATION"})
@@ -192,6 +194,106 @@ def normalize_registry_snapshot(value: Any) -> dict[str, Any]:
     return material
 
 
+def normalize_skill_pack_manifest(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "manifest must be an object")
+    request = value
+    _exact_fields(
+        request,
+        {"schema", "pack_id", "version", "scope", "artifact", "skills"},
+        {"project_id", "node_ref"},
+        "SKILL_PACK_MANIFEST_INVALID",
+    )
+    if request["schema"] != SKILL_PACK_MANIFEST_SCHEMA:
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "manifest schema is unsupported")
+    scope = _identifier(request["scope"], "scope").upper()
+    if scope not in {"NODE", "PROJECT", "UNIVERSE", "COMMON"}:
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "manifest scope is unsupported")
+    project_id = (
+        _identifier(request["project_id"], "project_id")
+        if request.get("project_id") is not None
+        else None
+    )
+    node_ref = (
+        _identifier(request["node_ref"], "node_ref")
+        if request.get("node_ref") is not None
+        else None
+    )
+    if scope == "PROJECT" and not project_id:
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "PROJECT pack requires project_id")
+    if scope == "NODE" and (not project_id or not node_ref):
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "NODE pack requires project_id and node_ref")
+    if scope in {"UNIVERSE", "COMMON"} and (project_id is not None or node_ref is not None):
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "global pack cannot declare Project coordinates")
+    artifact = request["artifact"]
+    if not isinstance(artifact, Mapping):
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "artifact must be an object")
+    _exact_fields(
+        artifact,
+        {"source_ref", "sha256"},
+        set(),
+        "SKILL_PACK_MANIFEST_INVALID",
+    )
+    artifact_sha256 = _text(artifact["sha256"], "artifact.sha256", maximum=64).lower()
+    if len(artifact_sha256) != 64 or any(c not in "0123456789abcdef" for c in artifact_sha256):
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "artifact.sha256 must be SHA-256")
+    if not isinstance(request["skills"], list) or not 1 <= len(request["skills"]) <= 64:
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "skills must be a non-empty bounded list")
+    try:
+        skills = normalize_registry_snapshot(
+            {"skills": request["skills"], "source_ref": "universe://skill-pack/validation"}
+        )["skills"]
+    except IntentRoutingError as error:
+        raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", error.detail) from error
+    identities: set[tuple[Any, ...]] = set()
+    for skill in skills:
+        if skill["scope"] != scope:
+            raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "Skill scope must match pack scope")
+        if skill.get("project_id") != project_id or skill.get("node_ref") != node_ref:
+            raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "Skill coordinates must match pack coordinates")
+        identity = (skill["skill_id"], skill["scope"], skill.get("project_id"), skill.get("node_ref"))
+        if identity in identities:
+            raise IntentRoutingError("SKILL_PACK_MANIFEST_INVALID", "pack contains duplicate Skill identity")
+        identities.add(identity)
+    material = {
+        "schema": SKILL_PACK_MANIFEST_SCHEMA,
+        "pack_id": _identifier(request["pack_id"], "pack_id"),
+        "version": _identifier(request["version"], "version"),
+        "scope": scope,
+        "project_id": project_id,
+        "node_ref": node_ref,
+        "artifact": {
+            "source_ref": _identifier(artifact["source_ref"], "artifact.source_ref"),
+            "sha256": artifact_sha256,
+        },
+        "skills": skills,
+    }
+    material["manifest_digest"] = digest(material)
+    material["release_id"] = "skill_pack_" + material["manifest_digest"][:24]
+    return material
+
+
+def build_adopted_registry_snapshot(
+    snapshot: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    incoming = {
+        (skill["skill_id"], skill["scope"], skill.get("project_id"), skill.get("node_ref"))
+        for skill in manifest["skills"]
+    }
+    retained = [
+        skill
+        for skill in snapshot.get("skills", [])
+        if (skill["skill_id"], skill["scope"], skill.get("project_id"), skill.get("node_ref"))
+        not in incoming
+    ]
+    return normalize_registry_snapshot(
+        {
+            "skills": [*retained, *manifest["skills"]],
+            "source_ref": "skill-pack-adoption:" + manifest["manifest_digest"],
+        }
+    )
+
+
 def empty_registry_snapshot() -> dict[str, Any]:
     return normalize_registry_snapshot({"skills": [], "source_ref": "universe://skill-registry/empty"})
 
@@ -351,5 +453,5 @@ def build_skill_candidate(project_id: str, observations: Sequence[Mapping[str, A
 
 
 __all__ = [name for name in globals() if name.isupper()] + [
-    "IntentRoutingError", "build_skill_candidate", "empty_registry_snapshot", "execute_plan_fallback", "normalize_gap_observation", "normalize_intent_decision", "normalize_planning_phrase", "normalize_registry_snapshot", "resolve_skill"
+    "IntentRoutingError", "build_adopted_registry_snapshot", "build_skill_candidate", "empty_registry_snapshot", "execute_plan_fallback", "normalize_gap_observation", "normalize_intent_decision", "normalize_planning_phrase", "normalize_registry_snapshot", "normalize_skill_pack_manifest", "resolve_skill"
 ]
