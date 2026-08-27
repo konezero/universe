@@ -399,6 +399,7 @@ PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA = (
 GOAL_TODO_EXECUTION_SELECTION_SCHEMA = (
     "universe.goal-todo-execution-selection.v1"
 )
+GOAL_AUTOMATION_SCHEDULER_SCHEMA = "universe.goal-automation-scheduler.v1"
 PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA = (
     "universe.project-skill-plan-master-application.v1"
 )
@@ -3408,6 +3409,43 @@ def normalize_goal_todo_result_projection_request(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_goal_automation_scheduler_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_automation_scheduler_request",
+        required=frozenset({"action", "expected_goal_revision"}),
+        optional=frozenset({"interval_seconds"}),
+    )
+    action = _required_text(request["action"], "action").upper()
+    if action not in {"START", "PAUSE"}:
+        raise UniverseError(
+            "GOAL_AUTOMATION_SCHEDULER_ACTION_INVALID",
+            "action must be START or PAUSE",
+        )
+    revision = request["expected_goal_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise UniverseError(
+            "GOAL_REVISION_INVALID",
+            "expected_goal_revision must be a positive integer",
+        )
+    interval_seconds = request.get("interval_seconds", 5)
+    if (
+        isinstance(interval_seconds, bool)
+        or not isinstance(interval_seconds, int)
+        or interval_seconds < 1
+        or interval_seconds > 300
+    ):
+        raise UniverseError(
+            "GOAL_AUTOMATION_SCHEDULER_INTERVAL_INVALID",
+            "interval_seconds must be between 1 and 300",
+        )
+    return {
+        "action": action,
+        "expected_goal_revision": revision,
+        "interval_seconds": interval_seconds,
+    }
+
+
 def normalize_experience_case_request(value: Any) -> dict[str, Any]:
     request = _exact_object_fields(
         value,
@@ -5842,6 +5880,33 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS goal_todo_execution_selection_goal
                 ON goal_todo_execution_selection(goal_id, selected_at, selection_id);
+
+                CREATE TABLE IF NOT EXISTS goal_automation_scheduler (
+                    goal_id TEXT PRIMARY KEY
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    expected_goal_revision INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL,
+                    next_tick_at TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    last_tick_at TEXT,
+                    last_stop_reason TEXT,
+                    last_error_code TEXT,
+                    last_error_detail TEXT,
+                    last_surface_json TEXT NOT NULL,
+                    tick_count INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_automation_scheduler_due
+                ON goal_automation_scheduler(
+                    enabled, status, next_tick_at, lease_expires_at, goal_id
+                );
 
                 CREATE TABLE IF NOT EXISTS project_skill_plan_master_application (
                     handoff_id TEXT PRIMARY KEY
@@ -13817,6 +13882,220 @@ class UniverseStore:
                 (prefix,),
             ).fetchall()
         return [self._todo_action_mutation_receipt_row(row) for row in rows]
+
+    @staticmethod
+    def _goal_automation_scheduler_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+            "goal_id": str(row["goal_id"]),
+            "expected_goal_revision": int(row["expected_goal_revision"]),
+            "enabled": bool(row["enabled"]),
+            "status": str(row["status"]),
+            "interval_seconds": int(row["interval_seconds"]),
+            "next_tick_at": row["next_tick_at"],
+            "lease_owner": row["lease_owner"],
+            "lease_expires_at": row["lease_expires_at"],
+            "last_tick_at": row["last_tick_at"],
+            "last_stop_reason": row["last_stop_reason"],
+            "last_error_code": row["last_error_code"],
+            "last_error_detail": row["last_error_detail"],
+            "last_surface": json.loads(str(row["last_surface_json"] or "{}")),
+            "tick_count": int(row["tick_count"]),
+            "revision": int(row["revision"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_goal_automation_scheduler(
+        self, goal_id: str
+    ) -> dict[str, Any] | None:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        return None if row is None else self._goal_automation_scheduler_row(row)
+
+    def configure_goal_automation_scheduler(
+        self,
+        goal_id: str,
+        *,
+        action: str,
+        expected_goal_revision: int,
+        interval_seconds: int,
+    ) -> tuple[dict[str, Any], bool]:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO goal_automation_scheduler(
+                        goal_id, expected_goal_revision, enabled, status,
+                        interval_seconds, next_tick_at, lease_owner,
+                        lease_expires_at, last_tick_at, last_stop_reason,
+                        last_error_code, last_error_detail, last_surface_json,
+                        tick_count, revision, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL,
+                              '{}', 0, 1, ?, ?)
+                    """,
+                    (
+                        normalized_goal,
+                        expected_goal_revision,
+                        1 if action == "START" else 0,
+                        "READY" if action == "START" else "PAUSED",
+                        interval_seconds,
+                        now if action == "START" else None,
+                        None if action == "START" else "USER_PAUSED",
+                        now,
+                        now,
+                    ),
+                )
+                created = True
+            else:
+                connection.execute(
+                    """
+                    UPDATE goal_automation_scheduler
+                    SET expected_goal_revision = ?, enabled = ?, status = ?,
+                        interval_seconds = ?, next_tick_at = ?, lease_owner = NULL,
+                        lease_expires_at = NULL, last_stop_reason = ?,
+                        last_error_code = NULL, last_error_detail = NULL,
+                        revision = revision + 1, updated_at = ?
+                    WHERE goal_id = ?
+                    """,
+                    (
+                        expected_goal_revision,
+                        1 if action == "START" else 0,
+                        "READY" if action == "START" else "PAUSED",
+                        interval_seconds,
+                        now if action == "START" else None,
+                        None if action == "START" else "USER_PAUSED",
+                        now,
+                        normalized_goal,
+                    ),
+                )
+                created = False
+            row = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        assert row is not None
+        return self._goal_automation_scheduler_row(row), created
+
+    def claim_due_goal_automation_scheduler(
+        self, lease_owner: str, *, lease_seconds: int = 15
+    ) -> dict[str, Any] | None:
+        owner = _required_text(lease_owner, "lease_owner")
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=max(1, min(int(lease_seconds), 300)))
+        ).isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler
+                WHERE enabled = 1 AND status IN ('READY', 'RUNNING')
+                  AND next_tick_at IS NOT NULL AND next_tick_at <= ?
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                ORDER BY next_tick_at, goal_id
+                LIMIT 1
+                """,
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = connection.execute(
+                """
+                UPDATE goal_automation_scheduler
+                SET status = 'RUNNING', lease_owner = ?, lease_expires_at = ?,
+                    revision = revision + 1, updated_at = ?
+                WHERE goal_id = ? AND revision = ?
+                """,
+                (owner, expires_at, now, row["goal_id"], row["revision"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (row["goal_id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._goal_automation_scheduler_row(claimed)
+
+    def finish_goal_automation_scheduler_tick(
+        self,
+        goal_id: str,
+        *,
+        lease_owner: str,
+        status: str,
+        stop_reason: str,
+        surface: Mapping[str, Any] | None,
+        error_code: str | None = None,
+        error_detail: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        owner = _required_text(lease_owner, "lease_owner")
+        normalized_status = _required_text(status, "status").upper()
+        if normalized_status not in {"WAITING", "BLOCKED", "COMPLETED"}:
+            raise UniverseError(
+                "GOAL_AUTOMATION_SCHEDULER_STATUS_INVALID",
+                "scheduler tick status must be WAITING, BLOCKED, or COMPLETED",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_NOT_FOUND",
+                    "Goal automation scheduler does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["lease_owner"] != owner or row["status"] != "RUNNING":
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_LEASE_MISMATCH",
+                    "scheduler tick no longer owns the durable lease",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                UPDATE goal_automation_scheduler
+                SET enabled = 0, status = ?, next_tick_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    last_tick_at = ?, last_stop_reason = ?,
+                    last_error_code = ?, last_error_detail = ?,
+                    last_surface_json = ?, tick_count = tick_count + 1,
+                    revision = revision + 1, updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (
+                    normalized_status,
+                    now,
+                    _required_text(stop_reason, "stop_reason"),
+                    error_code,
+                    error_detail,
+                    _canonical_json(dict(surface or {})),
+                    now,
+                    normalized_goal,
+                ),
+            )
+            finished = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        assert finished is not None
+        return self._goal_automation_scheduler_row(finished)
 
     @staticmethod
     def _master_handoff_task_frame_binding_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -21877,6 +22156,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         memory_scheduler_clock: Any = None,
         memory_scheduler_poll_seconds: float = 30.0,
         auto_start_memory_scheduler: bool = True,
+        auto_start_goal_scheduler: bool = True,
         use_pty_supervisor: bool = False,
     ):
         self.store = store
@@ -21936,6 +22216,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             clock=memory_scheduler_clock,
         )
         self._auto_start_memory_scheduler = bool(auto_start_memory_scheduler)
+        self._goal_scheduler_stop = threading.Event()
+        self._goal_scheduler_wake = threading.Event()
+        self._goal_scheduler_owner = "goal_scheduler_" + uuid.uuid4().hex
+        self._goal_scheduler_last_tick: dict[str, Any] | None = None
+        self._auto_start_goal_scheduler = bool(auto_start_goal_scheduler)
         python_tool = self.host_profile.resolve("python")
         self.continuity_coordinator = (
             ProjectContinuityCoordinator(
@@ -22135,6 +22420,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._supervisor_maintenance_worker.start()
+        self._goal_scheduler_worker = threading.Thread(
+            target=self._goal_automation_scheduler_loop,
+            name="universe-goal-automation-scheduler",
+            daemon=True,
+        )
+        if self._auto_start_goal_scheduler:
+            self._goal_scheduler_worker.start()
         self.rendezvous_service: UniverseRendezvousService | None = None
         self._rendezvous_start_error: dict[str, str] | None = None
         self._remote_access_resume: dict[str, Any] | None = None
@@ -23335,6 +23627,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def goal_automation_surface(self, goal_id: str) -> dict[str, Any]:
         work_plans = self.store.goal_work_plan_surface(goal_id)
         goal = work_plans["goal"]
+        scheduler = self.store.get_goal_automation_scheduler(goal["goal_id"])
+        if scheduler is not None:
+            scheduler = {
+                key: value
+                for key, value in scheduler.items()
+                if key != "last_surface"
+            }
         application = work_plans["application"]
         handoff = None
         matching_proposals: list[dict[str, Any]] = []
@@ -23422,6 +23721,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "matching_proposals": matching_proposals,
             "binding": binding,
             "todo_execution": todo_execution,
+            "scheduler": scheduler,
             "automation_state": state,
             "next_operation": next_operation,
             "effects": {
@@ -23782,6 +24082,157 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "operations": operations,
             "surface": surface,
         }
+
+    def configure_goal_automation_scheduler(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_automation_scheduler_request(value)
+        goal = self.store.get_goal(goal_id)
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before scheduler configuration",
+                HTTPStatus.CONFLICT,
+            )
+        scheduler, created = self.store.configure_goal_automation_scheduler(
+            goal["goal_id"],
+            action=request["action"],
+            expected_goal_revision=request["expected_goal_revision"],
+            interval_seconds=request["interval_seconds"],
+        )
+        if request["action"] == "START":
+            self._goal_scheduler_wake.set()
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "GOAL_AUTOMATION_SCHEDULER_STARTED"
+                if request["action"] == "START"
+                else "GOAL_AUTOMATION_SCHEDULER_PAUSED"
+            ),
+            "created": created,
+            "scheduler": scheduler,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
+            "effects": {
+                "task_frame_run": "NONE",
+                "todo_state_change": "NONE",
+                "authority_created": False,
+                "execution_assignment_created": False,
+            },
+        }
+
+    @staticmethod
+    def _goal_scheduler_stop_reason(surface: Mapping[str, Any]) -> str:
+        operation = str(surface.get("next_operation") or "UNKNOWN").upper()
+        state = str(surface.get("automation_state") or "UNKNOWN").upper()
+        return {
+            "APPLY_ADOPTED_WORK_PLAN": "USER_WORK_PLAN_APPLICATION_REQUIRED",
+            "WAIT": state,
+            "USER_RESOLUTION_REQUIRED": state,
+            "BIND_INSTRUCTION_TASK_FRAME": "TASK_FRAME_INPUT_REQUIRED",
+            "SELECT_TODOS_FOR_EXECUTION": "TODO_EXECUTION_SELECTION_REQUIRED",
+            "RUN_TASK_FRAME": "TASK_FRAME_RUN_REQUIRED",
+            "APPLY_TASK_FRAME_RESULT": "TASK_FRAME_RESULT_APPLICATION_REQUIRED",
+        }.get(operation, f"STOP_AT_{operation}")
+
+    def run_goal_automation_scheduler_once(self) -> dict[str, Any]:
+        job = self.store.claim_due_goal_automation_scheduler(
+            self._goal_scheduler_owner
+        )
+        if job is None:
+            result = {
+                "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                "status": "NO_DUE_GOAL_AUTOMATION",
+            }
+            self._goal_scheduler_last_tick = result
+            return result
+        goal_id = job["goal_id"]
+        surface: dict[str, Any] | None = None
+        operations: list[str] = []
+        try:
+            for _ in range(4):
+                surface = self.goal_automation_surface(goal_id)
+                goal = surface["goal"]
+                if goal["revision"] != job["expected_goal_revision"]:
+                    raise UniverseError(
+                        "GOAL_REVISION_CONFLICT",
+                        "Goal revision changed before the scheduled tick",
+                        HTTPStatus.CONFLICT,
+                    )
+                operation = str(surface.get("next_operation") or "UNKNOWN")
+                if operation not in {
+                    "CREATE_AND_DELIVER_MASTER_HANDOFF",
+                    "DELIVER_MASTER_HANDOFF",
+                }:
+                    scheduler = self.store.finish_goal_automation_scheduler_tick(
+                        goal_id,
+                        lease_owner=self._goal_scheduler_owner,
+                        status="WAITING",
+                        stop_reason=self._goal_scheduler_stop_reason(surface),
+                        surface=surface,
+                    )
+                    result = {
+                        "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                        "status": "GOAL_AUTOMATION_SCHEDULER_STOPPED",
+                        "operations": operations,
+                        "scheduler": scheduler,
+                        "surface": surface,
+                    }
+                    self._goal_scheduler_last_tick = result
+                    return result
+                advanced = self.advance_goal_automation(
+                    goal_id,
+                    {
+                        "approval": "ADVANCE",
+                        "expected_goal_revision": job["expected_goal_revision"],
+                    },
+                )
+                operations.extend(advanced.get("operations", []))
+                surface = advanced["surface"]
+            raise UniverseError(
+                "GOAL_AUTOMATION_SCHEDULER_LOOP_LIMIT",
+                "scheduled advance exceeded the bounded four-step loop",
+                HTTPStatus.CONFLICT,
+            )
+        except UniverseError as error:
+            scheduler = self.store.finish_goal_automation_scheduler_tick(
+                goal_id,
+                lease_owner=self._goal_scheduler_owner,
+                status="BLOCKED",
+                stop_reason=error.code,
+                surface=surface,
+                error_code=error.code,
+                error_detail=error.detail,
+            )
+            result = {
+                "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                "status": "GOAL_AUTOMATION_SCHEDULER_BLOCKED",
+                "operations": operations,
+                "scheduler": scheduler,
+                "surface": surface,
+                "error_code": error.code,
+                "detail": error.detail,
+            }
+            self._goal_scheduler_last_tick = result
+            return result
+
+    def _goal_automation_scheduler_loop(self) -> None:
+        while not self._goal_scheduler_stop.is_set():
+            self._goal_scheduler_wake.wait(0.5)
+            self._goal_scheduler_wake.clear()
+            if self._goal_scheduler_stop.is_set():
+                return
+            try:
+                while True:
+                    result = self.run_goal_automation_scheduler_once()
+                    if result.get("status") == "NO_DUE_GOAL_AUTOMATION":
+                        break
+            except Exception as error:  # noqa: BLE001 - background loop remains observable
+                self._goal_scheduler_last_tick = {
+                    "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                    "status": "GOAL_AUTOMATION_SCHEDULER_LOOP_FAILED",
+                    "error_code": type(error).__name__,
+                    "detail": str(error),
+                }
 
     def _ensure_task_frame_room(
         self,
@@ -32221,6 +32672,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "remote_access_resume_worker",
                 lambda: self._remote_access_resume_worker.join(timeout=5),
             )
+        self._goal_scheduler_stop.set()
+        self._goal_scheduler_wake.set()
+        if self._goal_scheduler_worker.is_alive():
+            close_step(
+                "goal_automation_scheduler",
+                lambda: self._goal_scheduler_worker.join(timeout=5),
+            )
         self._supervisor_maintenance_stop.set()
         if self._supervisor_maintenance_worker.is_alive():
             close_step(
@@ -35199,6 +35657,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
+            goal_automation_scheduler = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/scheduler", path
+            )
+            if goal_automation_scheduler is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.configure_goal_automation_scheduler(
+                        unquote(goal_automation_scheduler.group(1)), body
+                    ),
+                )
+                return
             goal_todo_selection = re.fullmatch(
                 r"/v1/goals/([^/]+)/automation/todo-selection", path
             )
@@ -37650,6 +38119,7 @@ def create_server(
     remote_connector_config_path: Path | None = None,
     directory_selector: Callable[[], str | None] | None = None,
     file_selector: Callable[[str], str | None] | None = None,
+    auto_start_goal_scheduler: bool = True,
     use_pty_supervisor: bool = False,
 ) -> UniverseHTTPServer:
     try:
@@ -37685,6 +38155,7 @@ def create_server(
         remote_connector_config_path=remote_connector_config_path,
         directory_selector=directory_selector,
         file_selector=file_selector,
+        auto_start_goal_scheduler=auto_start_goal_scheduler,
         use_pty_supervisor=use_pty_supervisor,
     )
 

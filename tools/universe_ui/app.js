@@ -6880,6 +6880,31 @@ async function advanceGoalAutomation() {
   toast(`Conductor · ${surface.automation_state || result.status} · next ${surface.next_operation || "WAIT"}`);
 }
 
+async function setGoalAutomationScheduler(action) {
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  if (!goal) throw new Error("Create a Goal first");
+  const normalized = String(action || "").toUpperCase();
+  const prompt = normalized === "START"
+    ? "Start the durable Conductor scheduler until its next governed stop?"
+    : "Pause the Conductor scheduler?";
+  if (!window.confirm(prompt)) return;
+  const result = await api(
+    `/v1/goals/${encodeURIComponent(goal.goal_id)}/automation/scheduler`,
+    {
+      method: "POST",
+      body: {
+        action: normalized,
+        expected_goal_revision: goal.revision,
+        interval_seconds: 5,
+      },
+    }
+  );
+  state.goalAutomationSurfaces[goal.goal_id] = result.surface || {};
+  renderActiveMultiRoom();
+  toast(`Scheduler · ${result.scheduler?.status || result.status}`);
+}
+
 function renderMeetingFeaturePanel(room) {
   const panel = node("section", "feature-path-list");
   if (room.room_type !== "MEETING") return panel;
@@ -7034,10 +7059,23 @@ function renderMeetingFeaturePanel(room) {
           const selectedCount = todoExecution.selection?.todo_ids?.length || 0;
           const receiptCount = todoExecution.action_receipts?.length || 0;
           const resultCount = todoExecution.task_frame_results?.length || 0;
+          const scheduler = automation.scheduler;
           goalCopy.append(
             node("small", "", `CONDUCTOR · ${automation.automation_state} · next ${automation.next_operation}`),
-            node("small", "", `Execution · ${selectedCount}/${todoExecution.eligible_todo_ids?.length || 0} Todo(s) selected · ${resultCount} result(s) · ${receiptCount} receipt(s)`)
+            node("small", "", `Execution · ${selectedCount}/${todoExecution.eligible_todo_ids?.length || 0} Todo(s) selected · ${resultCount} result(s) · ${receiptCount} receipt(s)`),
+            node("small", "", scheduler ? `Scheduler · ${scheduler.status} · ${scheduler.last_stop_reason || "no stop yet"} · tick ${scheduler.tick_count}` : "Scheduler · not configured")
           );
+          const schedulerAction = node(
+            "button",
+            "secondary-button compact-action",
+            scheduler?.enabled ? "Pause Scheduler" : "Start Scheduler"
+          );
+          schedulerAction.type = "button";
+          schedulerAction.addEventListener("click", () => {
+            setGoalAutomationScheduler(scheduler?.enabled ? "PAUSE" : "START")
+              .catch((error) => toast(error.message, true));
+          });
+          goalRow.append(schedulerAction);
         }
         const deliver = node("button", "primary-button compact-action", "Advance Conductor");
         deliver.type = "button";

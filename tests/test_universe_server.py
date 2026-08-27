@@ -330,6 +330,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             remote_gateway_state_path=temp_root / "remote-gateway.json",
             remote_connector_state_path=temp_root / "remote-connector.json",
             remote_connector_config_path=temp_root / "remote-connector-config.json",
+            auto_start_goal_scheduler=False,
         )
         self.host_tool_patchers = [
             patch(
@@ -11910,6 +11911,128 @@ class UniverseLocalServiceTests(unittest.TestCase):
         deliver_handoff.assert_called_once_with(
             "GCS", ready_handoff["handoff_id"], {"approval": "DELIVER"}
         )
+
+    def test_goal_automation_scheduler_stops_and_recovers_expired_lease(self) -> None:
+        self.server.store.register_project(self.registration())
+        goal = self.server.store.create_goal(
+            "GCS",
+            {
+                "title": "Schedule the bounded Goal loop",
+                "description": "Stop at every governed input boundary.",
+                "owner": "Project Master",
+                "state": "ACTIVE",
+                "sort_order": 0,
+            },
+        )
+        status, started = self.request(
+            "POST",
+            f"/v1/goals/{goal['goal_id']}/automation/scheduler",
+            {
+                "action": "START",
+                "expected_goal_revision": goal["revision"],
+                "interval_seconds": 5,
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("READY", started["scheduler"]["status"])
+        self.assertTrue(started["scheduler"]["enabled"])
+
+        ready = {
+            "goal": goal,
+            "automation_state": "READY_FOR_MASTER_HANDOFF",
+            "next_operation": "CREATE_AND_DELIVER_MASTER_HANDOFF",
+        }
+        waiting = {
+            "goal": goal,
+            "automation_state": "WAITING_MASTER_PROPOSAL",
+            "next_operation": "WAIT",
+        }
+        with (
+            patch.object(
+                self.server,
+                "goal_automation_surface",
+                side_effect=[ready, waiting],
+            ),
+            patch.object(
+                self.server,
+                "advance_goal_automation",
+                return_value={
+                    "status": "GOAL_AUTOMATION_ADVANCED",
+                    "operations": [
+                        "MASTER_HANDOFF_CREATED",
+                        "MASTER_HANDOFF_DELIVERED",
+                    ],
+                    "surface": waiting,
+                },
+            ) as advance,
+        ):
+            stopped = self.server.run_goal_automation_scheduler_once()
+        self.assertEqual("GOAL_AUTOMATION_SCHEDULER_STOPPED", stopped["status"])
+        self.assertEqual(
+            ["MASTER_HANDOFF_CREATED", "MASTER_HANDOFF_DELIVERED"],
+            stopped["operations"],
+        )
+        self.assertEqual(
+            "WAITING_MASTER_PROPOSAL",
+            stopped["scheduler"]["last_stop_reason"],
+        )
+        self.assertFalse(stopped["scheduler"]["enabled"])
+        self.assertEqual(1, stopped["scheduler"]["tick_count"])
+        advance.assert_called_once_with(
+            goal["goal_id"],
+            {"approval": "ADVANCE", "expected_goal_revision": goal["revision"]},
+        )
+
+        self.server.configure_goal_automation_scheduler(
+            goal["goal_id"],
+            {
+                "action": "START",
+                "expected_goal_revision": goal["revision"],
+                "interval_seconds": 5,
+            },
+        )
+        claimed = self.server.store.claim_due_goal_automation_scheduler(
+            "expired-service-owner"
+        )
+        self.assertIsNotNone(claimed)
+        connection = sqlite3.connect(self.server.store.database_path)
+        try:
+            connection.execute(
+                "UPDATE goal_automation_scheduler SET lease_expires_at = ? WHERE goal_id = ?",
+                ("2000-01-01T00:00:00Z", goal["goal_id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with patch.object(
+            self.server, "goal_automation_surface", return_value=waiting
+        ):
+            recovered = self.server.run_goal_automation_scheduler_once()
+        self.assertEqual(
+            "GOAL_AUTOMATION_SCHEDULER_STOPPED", recovered["status"]
+        )
+        self.assertEqual(2, recovered["scheduler"]["tick_count"])
+        self.assertIsNone(recovered["scheduler"]["lease_owner"])
+
+        status, resumed = self.request(
+            "POST",
+            f"/v1/goals/{goal['goal_id']}/automation/scheduler",
+            {"action": "START", "expected_goal_revision": goal["revision"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(resumed["scheduler"]["enabled"])
+        status, paused = self.request(
+            "POST",
+            f"/v1/goals/{goal['goal_id']}/automation/scheduler",
+            {"action": "PAUSE", "expected_goal_revision": goal["revision"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("PAUSED", paused["scheduler"]["status"])
+        self.assertEqual("USER_PAUSED", paused["scheduler"]["last_stop_reason"])
+        self.assertFalse(paused["scheduler"]["enabled"])
 
     def test_experience_case_contains_only_recorded_observations(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
