@@ -471,6 +471,7 @@ TODO_MUTATION_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
 TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
 TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
 FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
+NODE_PLANNING_CONTEXT_SCHEMA = "universe.node-planning-context.v1"
 EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v1"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
@@ -5481,6 +5482,21 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS feature_node_proposal_project_order
                 ON feature_node_proposal(project_id, updated_at DESC, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS node_planning_context (
+                    context_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL UNIQUE REFERENCES feature_node_proposal(proposal_id) ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                    feature_id TEXT NOT NULL REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    room_id TEXT NOT NULL,
+                    context_digest TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS node_planning_context_project_order
+                ON node_planning_context(project_id, created_at DESC, context_id);
 
                 CREATE TABLE IF NOT EXISTS feature_expected_path (
                     expected_path_id TEXT PRIMARY KEY,
@@ -11018,7 +11034,37 @@ class UniverseStore:
         persisted: list[dict[str, Any]] = []
         now = utc_now()
         with self._connection() as connection:
+            materialized_rows = connection.execute(
+                """
+                SELECT proposal.*
+                FROM feature_node_proposal proposal
+                JOIN node_planning_context context
+                  ON context.proposal_id = proposal.proposal_id
+                WHERE proposal.project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            materialized_by_evidence = {
+                _canonical_json(
+                    {
+                        "cluster_refs": item.get("cluster_refs") or [],
+                        "evidence_refs": item.get("evidence_refs") or [],
+                    }
+                ): row
+                for row in materialized_rows
+                for item in [self._feature_node_proposal_row(row)]
+            }
             for proposal in proposals:
+                evidence_key = _canonical_json(
+                    {
+                        "cluster_refs": proposal.get("cluster_refs") or [],
+                        "evidence_refs": proposal.get("evidence_refs") or [],
+                    }
+                )
+                materialized = materialized_by_evidence.get(evidence_key)
+                if materialized is not None:
+                    persisted.append(self._feature_node_proposal_row(materialized))
+                    continue
                 existing = connection.execute(
                     "SELECT * FROM feature_node_proposal WHERE project_id = ? AND proposal_digest = ?",
                     (project["project_id"], proposal["proposal_digest"]),
@@ -11048,6 +11094,10 @@ class UniverseStore:
                 ).fetchone()
                 persisted.append(self._feature_node_proposal_row(row))
                 created_count += 1
+        for proposal in persisted:
+            proposal["planning_context"] = self.find_node_planning_context_for_proposal(
+                proposal["proposal_id"]
+            )
         return {
             "schema": "universe.feature-node-proposal-generation.v1",
             "project_id": project["project_id"],
@@ -11080,7 +11130,12 @@ class UniverseStore:
                 """,
                 (project["project_id"], max(1, min(int(limit), 200))),
             ).fetchall()
-        return [self._feature_node_proposal_row(row) for row in rows]
+        proposals = [self._feature_node_proposal_row(row) for row in rows]
+        for proposal in proposals:
+            proposal["planning_context"] = self.find_node_planning_context_for_proposal(
+                proposal["proposal_id"]
+            )
+        return proposals
 
     def get_feature_node_proposal(self, proposal_id: str) -> dict[str, Any]:
         normalized = _identifier(proposal_id, "proposal_id")
@@ -11095,7 +11150,11 @@ class UniverseStore:
                 "Feature Node proposal does not exist",
                 HTTPStatus.NOT_FOUND,
             )
-        return self._feature_node_proposal_row(row)
+        proposal = self._feature_node_proposal_row(row)
+        proposal["planning_context"] = self.find_node_planning_context_for_proposal(
+            proposal["proposal_id"]
+        )
+        return proposal
 
     def review_feature_node_proposal(
         self, proposal_id: str, value: Any
@@ -11152,6 +11211,253 @@ class UniverseStore:
                     HTTPStatus.CONFLICT,
                 )
         return self.get_feature_node_proposal(current["proposal_id"]), True
+
+    @staticmethod
+    def _node_planning_context_row(row: sqlite3.Row) -> dict[str, Any]:
+        context = json.loads(row["context_json"])
+        context["created_at"] = str(row["created_at"])
+        return context
+
+    def find_node_planning_context_for_proposal(
+        self, proposal_id: str
+    ) -> dict[str, Any] | None:
+        normalized = _identifier(proposal_id, "proposal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM node_planning_context WHERE proposal_id = ?",
+                (normalized,),
+            ).fetchone()
+        return self._node_planning_context_row(row) if row is not None else None
+
+    def get_node_planning_context(self, context_id: str) -> dict[str, Any]:
+        normalized = _identifier(context_id, "context_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM node_planning_context WHERE context_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "NODE_PLANNING_CONTEXT_NOT_FOUND",
+                "Node Planning Context does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._node_planning_context_row(row)
+
+    def _attach_feature_meeting_room(
+        self, feature_id: str, room_id: str
+    ) -> dict[str, Any]:
+        feature = self.get_feature_node(feature_id)
+        current_room = str(feature.get("meeting_room_id") or "")
+        if current_room:
+            if current_room != room_id:
+                raise UniverseError(
+                    "FEATURE_MEETING_ROOM_CONFLICT",
+                    "Feature Node is already attached to another Meeting Room",
+                    HTTPStatus.CONFLICT,
+                )
+            return feature
+        if feature["state"] in {"ADOPTED", "ARCHIVED"}:
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_STATE_INVALID",
+                "adopted or archived Feature Node cannot start another planning room",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE feature_node
+                SET meeting_room_id = ?, state = 'EXPLORING', revision = revision + 1,
+                    updated_at = ?
+                WHERE feature_id = ? AND meeting_room_id IS NULL
+                """,
+                (room_id, now, feature["feature_id"]),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "FEATURE_MEETING_ROOM_CONFLICT",
+                    "Feature Node meeting attachment changed",
+                    HTTPStatus.CONFLICT,
+                )
+        return self.get_feature_node(feature["feature_id"])
+
+    def explore_feature_node_proposal(
+        self, proposal_id: str, value: Any
+    ) -> tuple[
+        dict[str, Any], dict[str, Any], dict[str, Any], bool, bool, bool
+    ]:
+        request = _exact_object_fields(
+            value,
+            field="feature_node_proposal_exploration",
+            required=frozenset({"expected_proposal_digest"}),
+        )
+        expected_digest = _required_text(
+            request["expected_proposal_digest"], "expected_proposal_digest"
+        ).lower()
+        proposal = self.get_feature_node_proposal(proposal_id)
+        if proposal["proposal_digest"] != expected_digest:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_DIGEST_CONFLICT",
+                "proposal changed before planning could start",
+                HTTPStatus.CONFLICT,
+            )
+        if proposal["state"] != "EXPLORE":
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_EXPLORATION_REVIEW_REQUIRED",
+                "proposal must have an EXPLORE user review before planning starts",
+                HTTPStatus.CONFLICT,
+            )
+        existing = self.find_node_planning_context_for_proposal(
+            proposal["proposal_id"]
+        )
+        if existing is not None:
+            feature = self.get_feature_node(existing["feature_id"])
+            try:
+                room = self.multi_rooms.get_room(existing["room_id"])
+            except MultiRoomError as error:
+                raise UniverseError(
+                    "NODE_PLANNING_ROOM_MISSING",
+                    "recorded Node Planning Context room is missing",
+                    HTTPStatus.CONFLICT,
+                ) from error
+            return existing, feature, room, False, False, False
+
+        target_feature: dict[str, Any] | None = None
+        if proposal["proposal_kind"] == "LINK_EXISTING":
+            target_ref = _required_text(
+                proposal.get("target_node_ref"), "target_node_ref"
+            )
+            target_feature = self.get_feature_node(target_ref)
+            if target_feature["project_id"] != proposal["project_id"]:
+                raise UniverseError(
+                    "FEATURE_NODE_PROPOSAL_TARGET_INVALID",
+                    "existing Feature target belongs to another project",
+                    HTTPStatus.CONFLICT,
+                )
+
+        room_id = str((target_feature or {}).get("meeting_room_id") or "")
+        room_created = False
+        if room_id:
+            try:
+                room = self.multi_rooms.get_room(room_id)
+            except MultiRoomError as error:
+                raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        else:
+            try:
+                room_result = self.multi_rooms.create_meeting_room(
+                    {
+                        "idempotency_key": f"feature-proposal:{proposal['proposal_id']}",
+                        "title": f"Feature planning / {proposal['title']}",
+                        "topic": proposal["intent_text"],
+                        "project_id": proposal["project_id"],
+                    }
+                )
+            except MultiRoomError as error:
+                raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+            room = room_result["room"]
+            room_id = str(room["room_id"])
+            room_created = room_result["status"] == "MEETING_ROOM_CREATED"
+
+        evidence_refs = list(proposal.get("evidence_refs") or [])
+        proposal_ref = f"universe://feature-node-proposals/{proposal['proposal_id']}"
+        if proposal_ref not in evidence_refs:
+            evidence_refs.append(proposal_ref)
+        if target_feature is None:
+            feature, feature_created = self.create_feature_node(
+                proposal["project_id"],
+                {
+                    "idempotency_key": f"proposal-{proposal['proposal_id']}",
+                    "title": proposal["title"],
+                    "intent_text": proposal["intent_text"],
+                    "created_by_role": "USER",
+                    "meeting_room_id": room_id,
+                    "evidence_refs": evidence_refs,
+                },
+            )
+        else:
+            feature = self._attach_feature_meeting_room(
+                target_feature["feature_id"], room_id
+            )
+            feature_created = False
+
+        context_material = {
+            "schema": NODE_PLANNING_CONTEXT_SCHEMA,
+            "context_id": "planning_context_" + proposal["proposal_digest"][:24],
+            "project_id": proposal["project_id"],
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "feature_id": feature["feature_id"],
+            "room_id": room_id,
+            "title": proposal["title"],
+            "intent_text": proposal["intent_text"],
+            "proposal_kind": proposal["proposal_kind"],
+            "evidence_refs": list(proposal.get("evidence_refs") or []),
+            "cluster_refs": list(proposal.get("cluster_refs") or []),
+            "constraints": list(proposal.get("constraints") or []),
+            "neighbor_feature_refs": (
+                [feature["feature_id"]]
+                if proposal["proposal_kind"] == "LINK_EXISTING"
+                else []
+            ),
+            "review": proposal.get("review"),
+            "redaction": "REFERENCES_AND_PROPOSAL_SUMMARY_ONLY",
+            "next_operation": "MEETING_PATH_PROPOSALS",
+            "effects": {
+                "goal_created": False,
+                "todo_created": False,
+                "task_frame_created": False,
+                "authority_created": False,
+                "execution_assignment_created": False,
+                "rag_adopted": False,
+            },
+        }
+        context_digest = _json_sha256(context_material)
+        context_material["context_digest"] = context_digest
+        now = utc_now()
+        with self._connection() as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO node_planning_context(
+                        context_id, proposal_id, proposal_digest, project_id,
+                        feature_id, room_id, context_digest, context_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        context_material["context_id"],
+                        proposal["proposal_id"],
+                        proposal["proposal_digest"],
+                        proposal["project_id"],
+                        feature["feature_id"],
+                        room_id,
+                        context_digest,
+                        _canonical_json(context_material),
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                replay = self.find_node_planning_context_for_proposal(
+                    proposal["proposal_id"]
+                )
+                if replay is None:
+                    raise
+                return (
+                    replay,
+                    self.get_feature_node(replay["feature_id"]),
+                    room,
+                    False,
+                    False,
+                    False,
+                )
+        return (
+            self.get_node_planning_context(context_material["context_id"]),
+            feature,
+            room,
+            True,
+            feature_created,
+            room_created,
+        )
 
     def get_feature_node(self, feature_id: str) -> dict[str, Any]:
         fid = _identifier(feature_id, "feature_id")
@@ -19269,6 +19575,7 @@ class UniverseStore:
                         f"universe://memory-candidates/{candidate_id}",
                     )
 
+        proposal_nodes_by_id: dict[str, str] = {}
         for proposal in self.list_feature_node_proposals(project_id, limit=200):
             proposal_id = str(proposal.get("proposal_id") or "")
             if not proposal_id:
@@ -19296,6 +19603,7 @@ class UniverseStore:
                     "body_in_graph": False,
                 },
             )
+            proposal_nodes_by_id[proposal_id] = proposal_node
             add_edge(
                 "PROJECT_HAS_FEATURE_NODE_PROPOSAL",
                 project_node,
@@ -19678,6 +19986,7 @@ class UniverseStore:
 
         # Feature Nodes precede work planning. Expected Paths are revision-pinned
         # Meeting Room specifications, and adoption is an explicit USER decision.
+        feature_nodes_by_id: dict[str, str] = {}
         for feature in self.list_feature_nodes(project_id):
             feature_id = str(feature["feature_id"])
             feature_ref = f"universe://feature-nodes/{feature_id}"
@@ -19689,6 +19998,7 @@ class UniverseStore:
                     "created_by_role", "evidence_refs", "revision", "created_at", "updated_at",
                 )},
             )
+            feature_nodes_by_id[feature_id] = feature_node
             add_edge("PROJECT_HAS_FEATURE_NODE", project_node, feature_node, feature_ref)
             meeting_room_id = str(feature.get("meeting_room_id") or "")
             if meeting_room_id in room_nodes_by_id:
@@ -19777,6 +20087,69 @@ class UniverseStore:
                         add_edge("GOAL_HAS_WORK_PLAN", goal_node, work_plan_node, work_plan_ref)
                         if work_plan_id == adopted_work_plan_id:
                             add_edge("GOAL_ADOPTS_WORK_PLAN", goal_node, work_plan_node, f"universe://goals/{goal_id}/work-plan-adoption")
+
+        for proposal in self.list_feature_node_proposals(project_id, limit=200):
+            context = proposal.get("planning_context")
+            if not isinstance(context, Mapping):
+                continue
+            context_id = str(context.get("context_id") or "")
+            if not context_id:
+                continue
+            context_ref = f"universe://node-planning-contexts/{context_id}"
+            context_node = add_node(
+                "NODE_PLANNING_CONTEXT",
+                context_id,
+                str(context.get("title") or context_id),
+                "READY_FOR_MEETING",
+                "NODE_PLANNING_CONTEXT",
+                context_ref,
+                {
+                    "context_id": context_id,
+                    "project_id": context.get("project_id"),
+                    "proposal_id": context.get("proposal_id"),
+                    "proposal_digest": context.get("proposal_digest"),
+                    "feature_id": context.get("feature_id"),
+                    "room_id": context.get("room_id"),
+                    "context_digest": context.get("context_digest"),
+                    "proposal_kind": context.get("proposal_kind"),
+                    "evidence_count": len(context.get("evidence_refs") or []),
+                    "neighbor_feature_refs": context.get("neighbor_feature_refs") or [],
+                    "redaction": context.get("redaction"),
+                    "next_operation": context.get("next_operation"),
+                    "effects": context.get("effects"),
+                    "body_in_graph": False,
+                },
+            )
+            add_edge(
+                "PROJECT_HAS_NODE_PLANNING_CONTEXT",
+                project_node,
+                context_node,
+                context_ref,
+            )
+            proposal_node = proposal_nodes_by_id.get(str(context.get("proposal_id") or ""))
+            if proposal_node is not None:
+                add_edge(
+                    "FEATURE_NODE_PROPOSAL_STARTS_PLANNING",
+                    proposal_node,
+                    context_node,
+                    context_ref,
+                )
+            feature_node = feature_nodes_by_id.get(str(context.get("feature_id") or ""))
+            if feature_node is not None:
+                add_edge(
+                    "NODE_PLANNING_CONTEXT_FOR_FEATURE",
+                    context_node,
+                    feature_node,
+                    context_ref,
+                )
+            room_node = room_nodes_by_id.get(str(context.get("room_id") or ""))
+            if room_node is not None:
+                add_edge(
+                    "NODE_PLANNING_CONTEXT_OPENS_MEETING_ROOM",
+                    context_node,
+                    room_node,
+                    context_ref,
+                )
 
         room_message_nodes: dict[str, str] = {}
         room_message_parents: list[tuple[str, str]] = []
@@ -34417,6 +34790,32 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        proposal_planning_context = re.fullmatch(
+            r"/v1/feature-node-proposals/([^/]+)/planning-context", path
+        )
+        if proposal_planning_context is not None:
+            try:
+                proposal_id = unquote(proposal_planning_context.group(1))
+                context = self.server.store.find_node_planning_context_for_proposal(
+                    proposal_id
+                )
+                if context is None:
+                    raise UniverseError(
+                        "NODE_PLANNING_CONTEXT_NOT_FOUND",
+                        "Node Planning Context does not exist",
+                        HTTPStatus.NOT_FOUND,
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "NODE_PLANNING_CONTEXT_COLLECTED",
+                        "planning_context": context,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         feature_proposal_detail = re.fullmatch(
             r"/v1/feature-node-proposals/([^/]+)", path
         )
@@ -36599,6 +36998,46 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "FEATURE_NODE_PROPOSALS_REPLAYED"
                         ),
                         **result,
+                    },
+                )
+                return
+            feature_proposal_explorations = re.fullmatch(
+                r"/v1/feature-node-proposals/([^/]+)/explorations", path
+            )
+            if feature_proposal_explorations is not None:
+                (
+                    context,
+                    feature,
+                    room,
+                    created,
+                    feature_created,
+                    room_created,
+                ) = (
+                    self.server.store.explore_feature_node_proposal(
+                        unquote(feature_proposal_explorations.group(1)), body
+                    )
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FEATURE_NODE_EXPLORATION_STARTED"
+                            if created
+                            else "FEATURE_NODE_EXPLORATION_REPLAYED"
+                        ),
+                        "planning_context": context,
+                        "feature": feature,
+                        "room": room,
+                        "feature_node_created": feature_created,
+                        "meeting_room_created": room_created,
+                        "planning_context_created": created,
+                        "goal_created": False,
+                        "todo_created": False,
+                        "task_frame_created": False,
+                        "authority_created": False,
+                        "execution_assignment_created": False,
+                        "rag_adopted": False,
                     },
                 )
                 return

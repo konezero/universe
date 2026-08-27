@@ -2143,18 +2143,84 @@ class MultiRoomStore:
         title = _text(value.get("title") or "Meeting", "title", limit=200)
         project_id = _optional_text(value.get("project_id"), "project_id", limit=120)
         topic = _optional_text(value.get("topic"), "topic", limit=2000)
+        idempotency_key = _optional_text(
+            value.get("idempotency_key"), "idempotency_key", limit=200
+        )
         models = value.get("models") or value.get("model_slots") or []
         if not isinstance(models, list):
             raise MultiRoomError("MEETING_MODELS_INVALID", "models must be a list")
+        room_id = None
+        if idempotency_key is not None:
+            room_id = "room_" + hashlib.sha256(
+                f"MEETING\0{project_id or ''}\0{idempotency_key}".encode("utf-8")
+            ).hexdigest()[:24]
+            try:
+                existing = self.get_room(room_id)
+            except MultiRoomError as error:
+                if error.code != "ROOM_NOT_FOUND":
+                    raise
+            else:
+                if existing.get("state") != "OPEN":
+                    raise MultiRoomError(
+                        "MEETING_IDEMPOTENCY_CLOSED",
+                        "idempotent Meeting Room is closed",
+                        409,
+                    )
+                expected = (
+                    "MEETING",
+                    project_id,
+                    title,
+                    topic,
+                    idempotency_key,
+                )
+                actual = (
+                    existing.get("room_type"),
+                    existing.get("project_id"),
+                    existing.get("title"),
+                    (existing.get("metadata") or {}).get("topic"),
+                    (existing.get("metadata") or {}).get("idempotency_key"),
+                )
+                if actual != expected:
+                    raise MultiRoomError(
+                        "MEETING_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to different Meeting material",
+                        409,
+                    )
+                bindings = self.list_bindings(room_id)
+                if not any(
+                    item.get("slot_role") == "CONDUCTOR"
+                    and item.get("state") == "ACTIVE"
+                    for item in bindings
+                ):
+                    self.attach_session(
+                        room_id,
+                        {
+                            "slot_role": "CONDUCTOR",
+                            "display_name": value.get("conductor_name") or "Conductor",
+                            "provider": value.get("conductor_provider"),
+                            "provider_session_ref": value.get("conductor_session_ref"),
+                        },
+                    )
+                    bindings = self.list_bindings(room_id)
+                return {
+                    "schema": ROOM_SCHEMA,
+                    "status": "MEETING_ROOM_REPLAYED",
+                    "room": self.get_room(room_id),
+                    "bindings": bindings,
+                    "authority": "UNASSIGNED",
+                    "execution_assignment": "UNASSIGNED",
+                }
         room = self.create_room(
             room_type="MEETING",
             title=title,
             host_role="CONDUCTOR",
             project_id=project_id,
+            room_id=room_id,
             metadata={
                 "topic": topic,
                 "source": "meeting-room.create",
                 "created_by": "skill_or_api",
+                "idempotency_key": idempotency_key,
             },
         )
         self.attach_session(

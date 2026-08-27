@@ -7597,7 +7597,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         app = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn("/feature-node-proposals", app)
         self.assertIn("renderFeatureNodeProposalDetails", app)
-        self.assertIn("Explore records product intent only", app)
+        self.assertIn("Start planning", app)
+        self.assertIn("/explorations", app)
 
         status, listed = self.request(
             "GET", "/v1/projects/GCS/feature-node-proposals", None, self.token
@@ -7628,6 +7629,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn(
             "PROJECT_HAS_FEATURE_NODE_PROPOSAL",
             {edge["edge_type"] for edge in graph["edges"]},
+        )
+
+        status, review_required = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/explorations",
+            {"expected_proposal_digest": proposal["proposal_digest"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "FEATURE_NODE_PROPOSAL_EXPLORATION_REVIEW_REQUIRED",
+            review_required["error_code"],
         )
 
         review_request = {
@@ -7671,6 +7684,116 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT", conflict["error_code"]
         )
 
+        status, stale = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/explorations",
+            {"expected_proposal_digest": "0" * 64},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("FEATURE_NODE_PROPOSAL_DIGEST_CONFLICT", stale["error_code"])
+
+        exploration_request = {
+            "expected_proposal_digest": proposal["proposal_digest"]
+        }
+        status, started = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/explorations",
+            exploration_request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("FEATURE_NODE_EXPLORATION_STARTED", started["status"])
+        context = started["planning_context"]
+        feature = started["feature"]
+        room = started["room"]
+        self.assertEqual("universe.node-planning-context.v1", context["schema"])
+        self.assertEqual(proposal["proposal_id"], context["proposal_id"])
+        self.assertEqual(proposal["proposal_digest"], context["proposal_digest"])
+        self.assertEqual(feature["feature_id"], context["feature_id"])
+        self.assertEqual(room["room_id"], context["room_id"])
+        self.assertEqual("REFERENCES_AND_PROPOSAL_SUMMARY_ONLY", context["redaction"])
+        self.assertNotIn("Use compact symbol IR for agent editing.", json.dumps(context))
+        self.assertEqual("EXPLORING", feature["state"])
+        self.assertEqual("MEETING", room["room_type"])
+        self.assertTrue(started["feature_node_created"])
+        self.assertTrue(started["meeting_room_created"])
+        self.assertTrue(started["planning_context_created"])
+        for key in (
+            "goal_created",
+            "todo_created",
+            "task_frame_created",
+            "authority_created",
+            "execution_assignment_created",
+            "rag_adopted",
+        ):
+            self.assertFalse(started[key])
+        bindings = self.server.multi_rooms.list_bindings(room["room_id"])
+        self.assertEqual(
+            1,
+            len(
+                [
+                    item
+                    for item in bindings
+                    if item["slot_role"] == "CONDUCTOR" and item["state"] == "ACTIVE"
+                ]
+            ),
+        )
+
+        status, collected_context = self.request(
+            "GET",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/planning-context",
+            None,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            context["context_digest"],
+            collected_context["planning_context"]["context_digest"],
+        )
+        status, replayed_exploration = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/explorations",
+            exploration_request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "FEATURE_NODE_EXPLORATION_REPLAYED", replayed_exploration["status"]
+        )
+        self.assertEqual(
+            context["context_id"], replayed_exploration["planning_context"]["context_id"]
+        )
+        self.assertEqual(feature["feature_id"], replayed_exploration["feature"]["feature_id"])
+        self.assertEqual(room["room_id"], replayed_exploration["room"]["room_id"])
+        self.assertEqual(1, len(self.server.store.list_feature_nodes("GCS")))
+        graph_after = self.server.store.semantic_project_graph("GCS")
+        context_nodes = [
+            node
+            for node in graph_after["nodes"]
+            if node["entity_type"] == "NODE_PLANNING_CONTEXT"
+        ]
+        self.assertEqual(1, len(context_nodes))
+        self.assertFalse(context_nodes[0]["data"]["body_in_graph"])
+        edge_types = {edge["edge_type"] for edge in graph_after["edges"]}
+        self.assertTrue(
+            {
+                "PROJECT_HAS_NODE_PLANNING_CONTEXT",
+                "FEATURE_NODE_PROPOSAL_STARTS_PLANNING",
+                "NODE_PLANNING_CONTEXT_FOR_FEATURE",
+                "NODE_PLANNING_CONTEXT_OPENS_MEETING_ROOM",
+            }.issubset(edge_types)
+        )
+        self.assertEqual([], self.server.store.list_project_goals("GCS"))
+        self.assertEqual(
+            [],
+            [
+                todo
+                for todo in self.server.store.list_todos()
+                if todo["project_id"] == "GCS"
+            ],
+        )
+
         status, replayed_generation = self.request(
             "POST",
             "/v1/projects/GCS/feature-node-proposals/generate",
@@ -7681,6 +7804,58 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(0, replayed_generation["created_count"])
         self.assertEqual(1, replayed_generation["replayed_count"])
         self.assertEqual("EXPLORE", replayed_generation["proposals"][0]["state"])
+
+    def test_existing_feature_proposal_opens_planning_without_duplicate_feature(self) -> None:
+        self.server.store.register_project(self.registration())
+        existing, created = self.server.store.create_feature_node(
+            "GCS",
+            {
+                "idempotency_key": "existing-semantic-editor",
+                "title": "Native semantic editor protocol",
+                "intent_text": "Compact symbol IR for agent editing",
+                "created_by_role": "USER",
+                "evidence_refs": [],
+            },
+        )
+        self.assertTrue(created)
+        self.server.store.create_project_memory(
+            "GCS",
+            {
+                "title": "Native semantic editor protocol",
+                "body": "Do not include this raw body in planning context.",
+                "state": "DECISION_NOTE",
+            },
+        )
+        generated = self.server.store.generate_feature_node_proposals("GCS")
+        self.assertEqual(1, generated["created_count"])
+        proposal = generated["proposals"][0]
+        self.assertEqual("LINK_EXISTING", proposal["proposal_kind"])
+        self.assertEqual(existing["feature_id"], proposal["target_node_ref"])
+        self.server.store.review_feature_node_proposal(
+            proposal["proposal_id"],
+            {"decision": "EXPLORE", "rationale": "Extend existing node"},
+        )
+        context, feature, room, context_created, feature_created, room_created = (
+            self.server.store.explore_feature_node_proposal(
+                proposal["proposal_id"],
+                {"expected_proposal_digest": proposal["proposal_digest"]},
+            )
+        )
+        self.assertTrue(context_created)
+        self.assertFalse(feature_created)
+        self.assertTrue(room_created)
+        self.assertEqual(existing["feature_id"], feature["feature_id"])
+        self.assertEqual(2, feature["revision"])
+        self.assertEqual("EXPLORING", feature["state"])
+        self.assertEqual(room["room_id"], feature["meeting_room_id"])
+        self.assertEqual([existing["feature_id"]], context["neighbor_feature_refs"])
+        replay = self.server.store.explore_feature_node_proposal(
+            proposal["proposal_id"],
+            {"expected_proposal_digest": proposal["proposal_digest"]},
+        )
+        self.assertEqual(context["context_id"], replay[0]["context_id"])
+        self.assertEqual((False, False, False), replay[3:])
+        self.assertEqual(1, len(self.server.store.list_feature_nodes("GCS")))
 
     def test_feature_node_expected_path_adoption_http_and_graph(self) -> None:
         self.server.store.register_project(self.registration())

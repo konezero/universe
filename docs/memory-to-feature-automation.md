@@ -1,6 +1,6 @@
 # Memory-to-Feature Proposal and Goal Automation
 
-Status: approved Goal direction; first review-only vertical slice implemented and locally validated
+Status: approved Goal direction; proposal and planning-context slices implemented and locally validated
 Owner: Universe Conductor for proposal coordination; Project Master for implementation
 Scope: project-local conversation, Memory, semantic graph, Feature Node planning, and governed Goal automation
 
@@ -183,9 +183,9 @@ Stop states include insufficient evidence, conflicting proposal, quota, missing 
 session, missing Task Frame lineage, scope expansion, validation failure, and user
 intervention. Every stop exposes a stable code and next permitted action.
 
-## First vertical slice
+## Implemented vertical slices
 
-The first implementation slice is deliberately review-only:
+The first two implementation slices preserve review before materialization:
 
 1. Build deterministic Feature Node proposals from selected project Memory and Work
    Loop evidence.
@@ -193,11 +193,13 @@ The first implementation slice is deliberately review-only:
 3. Expose list, generate, and per-proposal review APIs.
 4. Project proposals as `FEATURE_NODE_PROPOSAL` ghost nodes in the semantic graph.
 5. Add a thin Proposed Nodes Inbox in the current Project Inspector.
-6. On `EXPLORE`, create no Feature Node yet; the next slice will add the explicit
-   receipt-backed materialization action and Meeting Room creation.
+6. `EXPLORE` records the user's review without materialization.
+7. `Start planning` is the explicit digest-pinned action that materializes one
+   Feature Node, one bounded Node Planning Context, and one idempotent Meeting Room.
 
-This slice never creates Goal, Todo, authority, execution assignment, Task Frame, or
-canonical RAG knowledge.
+The implemented planning slice still never creates Goal, Todo, authority, execution
+assignment, Task Frame, or canonical RAG knowledge. Expected Path generation remains
+the next P0 slice.
 
 ## Implementation sequence
 

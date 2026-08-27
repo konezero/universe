@@ -10403,6 +10403,26 @@ async function generateFeatureNodeProposals() {
   );
 }
 
+async function startFeatureNodePlanning(proposal) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/feature-node-proposals/${encodeURIComponent(proposal.proposal_id)}/explorations`,
+    {
+      method: "POST",
+      body: { expected_proposal_digest: proposal.proposal_digest },
+    }
+  );
+  await refreshFeatureNodeProposals();
+  await refreshFeatureSemanticGraph(projectId);
+  renderDetails();
+  toast(
+    result.status === "FEATURE_NODE_EXPLORATION_STARTED"
+      ? "Feature Node and planning room created"
+      : "Feature planning already active"
+  );
+}
+
 async function reviewFeatureNodeProposal(proposalId, decision) {
   const projectId = state.selectedProject?.project_id;
   if (!projectId) return;
@@ -10439,7 +10459,7 @@ function renderFeatureNodeProposalDetails() {
     node(
       "p",
       "empty-copy",
-      "Explore records product intent only. It does not create a Feature Node, Goal, Todo, Task Frame, authority, or RAG adoption."
+      "Explore records the user review. Start planning then creates one Feature Node, bounded Planning Context, and Meeting Room; it never creates a Goal, Todo, Task Frame, authority, or RAG adoption."
     )
   );
   if (!proposals.length) {
@@ -10479,8 +10499,34 @@ function renderFeatureNodeProposalDetails() {
         actions.append(button);
       }
       card.append(actions);
-    } else if (proposal.review?.rationale) {
-      card.append(node("small", "", `Rationale · ${proposal.review.rationale}`));
+    } else {
+      if (proposal.review?.rationale) {
+        card.append(node("small", "", `Rationale · ${proposal.review.rationale}`));
+      }
+      if (proposal.state === "EXPLORE" && !proposal.planning_context) {
+        const actions = node("div", "detail-heading-actions");
+        const start = node(
+          "button",
+          "primary-button compact-action",
+          "Start planning"
+        );
+        start.type = "button";
+        start.addEventListener("click", () =>
+          startFeatureNodePlanning(proposal).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        actions.append(start);
+        card.append(actions);
+      } else if (proposal.planning_context) {
+        card.append(
+          node(
+            "small",
+            "",
+            `Planning · ${proposal.planning_context.feature_id} · ${proposal.planning_context.room_id}`
+          )
+        );
+      }
     }
     group.append(card);
   }
