@@ -34,12 +34,19 @@ from universe_app.managed_shell import (
     SHELL_IDLE,
     AttachEvidence,
     ManagedShell,
+    ManagedShellError,
     ProcessIdentity,
     ShellObservation,
     host_process_probes,
+    managed_provider_command_line,
     managed_shell_cmdline,
     observe_process_tree,
     plan_hook_timeout_recovery,
+)
+from universe_app.reconnection_host import (
+    ReconnectionHostError,
+    ReconnectionHostRegistry,
+    ReconnectionPty,
 )
 
 
@@ -371,7 +378,8 @@ def managed_shell_identity_path(root: Path, terminal_id: str) -> Path:
 
 
 def write_managed_shell_identity(path: Path, session: Any) -> None:
-    shell = getattr(getattr(session, "managed_shell", None), "shell", None)
+    managed = getattr(session, "managed_shell", None)
+    shell = getattr(managed, "shell", None)
     if shell is None:
         return
     payload = {
@@ -385,6 +393,13 @@ def write_managed_shell_identity(path: Path, session: Any) -> None:
         "mode": session.mode,
         "provider": session.provider,
         "cwd": session.cwd,
+        "cli_launch_requested_at": getattr(managed, "cli_launch_requested_at", None),
+        "cli_ever_attached": bool(getattr(managed, "cli_ever_attached", False)),
+        "attach_evidence": (
+            managed.attach_evidence.as_dict()
+            if getattr(managed, "attach_evidence", None) is not None
+            else None
+        ),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
@@ -438,6 +453,8 @@ class TerminalSession:
     session_anchor_ref: str = ""
     managed_shell: Any = None
     managed_shell_identity_file: str = ""
+    backend_owner: str = "PYTHON_CONPTY"
+    reconnection_host_id: str = ""
 
     def public(self) -> dict[str, Any]:
         return {
@@ -452,6 +469,8 @@ class TerminalSession:
             "supervisor_session_id": self.supervisor_session_id,
             "session_anchor_ref": self.session_anchor_ref,
             "managed_shell_identity_file": self.managed_shell_identity_file,
+            "backend_owner": self.backend_owner,
+            "reconnection_host_id": self.reconnection_host_id,
             "shell_process": (
                 self.managed_shell.shell.as_dict()
                 if getattr(self.managed_shell, "shell", None) is not None
@@ -608,6 +627,7 @@ class TerminalHost:
         spawn: Callable[..., Any] | None = None,
         database_path: Path | str | None = None,
         audit_database_path: Path | str | None = None,
+        reconnection_registry: ReconnectionHostRegistry | None = None,
     ) -> None:
         from universe_app.session_bus import SessionBus
 
@@ -616,6 +636,7 @@ class TerminalHost:
         self._spawn = spawn or spawn_conpty
         self._lock = threading.Lock()
         self._sessions: dict[str, TerminalSession] = {}
+        self._reconnection_registry = reconnection_registry
         self.bus = SessionBus(database_path=database_path)
         self.audit = TerminalAuditStore(audit_database_path or database_path)
 
@@ -680,10 +701,30 @@ class TerminalHost:
             if terminal_id in active_terminal_ids or latest.get(terminal_id) in terminal_states:
                 continue
             details = event.get("details")
+            details = details if isinstance(details, Mapping) else {}
+            if (
+                details.get("backend_owner") == "RUST_RECONNECTION_HOST"
+                and self._reconnection_registry is not None
+            ):
+                anchor_ref = str(details.get("session_anchor_ref") or "").strip()
+                if anchor_ref:
+                    try:
+                        client = self._reconnection_registry.discover(anchor_ref)
+                        host = client.status()
+                    except ReconnectionHostError:
+                        pass
+                    else:
+                        results.append(
+                            {
+                                "terminal_id": terminal_id,
+                                "status": "HOST_OWNED_ORPHAN_PRESERVED",
+                                "pid": host.get("child_pid"),
+                                "host_id": host.get("host_id"),
+                            }
+                        )
+                        continue
             path_text = str(
                 details.get("managed_shell_identity_file")
-                if isinstance(details, Mapping)
-                else ""
             ).strip()
             if not path_text:
                 continue
@@ -756,6 +797,187 @@ class TerminalHost:
             )
         return results
 
+    def reconcile_reconnection_hosts(self) -> list[dict[str, Any]]:
+        """Rebuild process-local TerminalSession rows from live Rust Hosts."""
+
+        registry = self._reconnection_registry
+        if registry is None:
+            return []
+        with self._lock:
+            active_terminal_ids = set(self._sessions)
+        events = self.audit.list(limit=1000)
+        latest: dict[str, str] = {}
+        created: dict[str, Mapping[str, Any]] = {}
+        for event in events:
+            terminal_id = str(event.get("terminal_id") or "").strip()
+            if not terminal_id:
+                continue
+            latest.setdefault(terminal_id, str(event.get("event_type") or ""))
+            if (
+                terminal_id not in created
+                and str(event.get("event_type") or "") == "TERMINAL_CREATED"
+            ):
+                created[terminal_id] = event
+        terminal_states = {"TERMINAL_CLOSED", "TERMINAL_ORPHAN_RECLAIMED"}
+        results: list[dict[str, Any]] = []
+        for terminal_id, event in created.items():
+            if terminal_id in active_terminal_ids or latest.get(terminal_id) in terminal_states:
+                continue
+            details = event.get("details")
+            details = details if isinstance(details, Mapping) else {}
+            if details.get("backend_owner") != "RUST_RECONNECTION_HOST":
+                continue
+            anchor_ref = str(details.get("session_anchor_ref") or "").strip()
+            cwd = str(details.get("cwd") or "").strip()
+            executable = str(details.get("executable") or "").strip()
+            if not anchor_ref or not cwd or not executable:
+                results.append(
+                    {"terminal_id": terminal_id, "status": "HOST_METADATA_INCOMPLETE"}
+                )
+                continue
+            try:
+                client = registry.discover(anchor_ref)
+                status = client.status()
+                if status.get("runtime_state") != "LIVE":
+                    raise ReconnectionHostError("Host terminal is not live")
+                backend = ReconnectionPty(
+                    client,
+                    f"terminal-host-{os.getpid()}-{terminal_id}",
+                )
+            except ReconnectionHostError as error:
+                results.append(
+                    {
+                        "terminal_id": terminal_id,
+                        "status": "HOST_REATTACH_FAILED",
+                        "detail": str(error),
+                    }
+                )
+                continue
+            provider = str(event.get("provider") or "").strip().upper()
+            mode = str(event.get("mode") or "").strip().upper()
+            project_id = str(event.get("project_id") or "").strip()
+            supervisor_session_id = str(
+                event.get("supervisor_session_id") or ""
+            ).strip()
+            launch_profile = str(
+                details.get("launch_profile") or "INTERACTIVE"
+            ).strip().upper()
+            channel_broker: ClaudeChannelBroker | None = None
+            channel_state = "NOT_APPLICABLE"
+            if provider == "CLAUDE" and launch_profile == "INTERACTIVE":
+                try:
+                    channel_broker = ClaudeChannelBroker(
+                        terminal_id=terminal_id,
+                        project_id=project_id,
+                        mode=mode,
+                        provider=provider,
+                        supervisor_session_id=supervisor_session_id,
+                    ).start()
+                    channel_state = "REBOUND"
+                except Exception:  # noqa: BLE001 - PTY recovery remains usable
+                    channel_state = "UNAVAILABLE"
+            session = TerminalSession(
+                terminal_id=terminal_id,
+                project_id=project_id,
+                mode=mode,
+                provider=provider,
+                supervisor_session_id=supervisor_session_id,
+                cwd=cwd,
+                executable=executable,
+                created_at=str(details.get("created_at") or event.get("occurred_at") or _now()),
+                model_ref=str(details.get("model_ref") or ""),
+                effort=str(details.get("effort") or "AUTO"),
+                launch_profile=launch_profile,
+                state="LIVE",
+                cols=max(80, int(details.get("cols") or 120)),
+                rows=max(24, int(details.get("rows") or 32)),
+                backend=backend,
+                channel_broker=channel_broker,
+                session_anchor_ref=anchor_ref,
+                managed_shell_identity_file=str(
+                    details.get("managed_shell_identity_file") or ""
+                ),
+                backend_owner="RUST_RECONNECTION_HOST",
+                reconnection_host_id=str(status.get("host_id") or backend.host_id),
+            )
+            managed = ManagedShell(
+                terminal_id=terminal_id,
+                session_anchor_ref=anchor_ref,
+                provider=provider,
+            )
+            managed.bind_shell_identity(resolve_shell_identity(session.live_pid()))
+            identity_path = Path(session.managed_shell_identity_file)
+            try:
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                identity = {}
+            if (
+                isinstance(identity, Mapping)
+                and identity.get("schema") == MANAGED_SHELL_IDENTITY_SCHEMA
+                and str(identity.get("terminal_id") or "") == terminal_id
+                and str(identity.get("session_anchor_ref") or "") == anchor_ref
+            ):
+                launched_at = identity.get("cli_launch_requested_at")
+                if isinstance(launched_at, (int, float)):
+                    managed.record_cli_launch(at=float(launched_at))
+                attach = identity.get("attach_evidence")
+                if isinstance(attach, Mapping) and managed.shell is not None:
+                    try:
+                        cli_pid = int(attach.get("cli_pid") or 0)
+                        cli_started_at = float(attach.get("cli_started_at") or 0.0)
+                        restored = AttachEvidence(
+                            terminal_id=str(attach.get("terminal_id") or ""),
+                            shell=ProcessIdentity(
+                                pid=int(attach.get("shell_pid") or 0),
+                                started_at=float(attach.get("shell_started_at") or 0.0),
+                            ),
+                            cli=(
+                                ProcessIdentity(pid=cli_pid, started_at=cli_started_at)
+                                if cli_pid > 0 and cli_started_at > 0
+                                else None
+                            ),
+                            provider=str(attach.get("provider") or provider),
+                            provider_session_ref=str(
+                                attach.get("provider_session_ref") or ""
+                            ),
+                            session_anchor_ref=str(
+                                attach.get("session_anchor_ref") or ""
+                            ),
+                            observed_at=str(attach.get("observed_at") or ""),
+                        )
+                        managed.record_attach_evidence(restored)
+                    except (ManagedShellError, TypeError, ValueError):
+                        pass
+            session.managed_shell = managed
+            with self._lock:
+                if terminal_id in self._sessions:
+                    backend.close()
+                    if channel_broker is not None:
+                        channel_broker.close()
+                    continue
+                self._sessions[terminal_id] = session
+            self.record_audit_event(
+                "TERMINAL_REATTACHED",
+                terminal=session.public(),
+                context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
+                details={
+                    "host_id": session.reconnection_host_id,
+                    "session_anchor_ref": anchor_ref,
+                    "channel_state": channel_state,
+                },
+            )
+            self._ensure_pump(session)
+            active_terminal_ids.add(terminal_id)
+            results.append(
+                {
+                    "terminal_id": terminal_id,
+                    "status": "TERMINAL_REATTACHED",
+                    "host_id": session.reconnection_host_id,
+                    "pid": session.live_pid(),
+                }
+            )
+        return results
+
     def get(self, terminal_id: str) -> TerminalSession:
         with self._lock:
             session = self._sessions.get(str(terminal_id or "").strip())
@@ -802,6 +1024,15 @@ class TerminalHost:
                 "TERMINAL_ANCHOR_REQUIRED",
                 "a resolved Session Anchor is required before spawning a terminal",
             )
+        with self._lock:
+            if any(
+                item.state == "LIVE" and item.session_anchor_ref == anchor_ref
+                for item in self._sessions.values()
+            ):
+                raise TerminalHostError(
+                    "TERMINAL_ANCHOR_ALREADY_HOSTED",
+                    "this Session Anchor already has a live terminal",
+                )
         selected = str(provider or "AUTO").strip().upper()
         executable = resolve_cli_executable(selected)
         resolved_provider = selected if selected != "AUTO" else infer_provider(executable)
@@ -909,23 +1140,53 @@ class TerminalHost:
         # separately, so the whole flag list belongs in the hosted command.
         # A raw command line, not an argv list: the /s form cannot survive a
         # second round of quoting (see managed_shell_cmdline).
+        pipe_console_input = (
+            profile == "SUPERVISED_STDIO" and resolved_provider == "CLAUDE"
+        )
+        provider_command = managed_provider_command_line(
+            [executable, *argv],
+            pipe_console_input=pipe_console_input,
+        )
         shell_argv = managed_shell_cmdline(
             [executable, *argv],
-            pipe_console_input=(
-                profile == "SUPERVISED_STDIO" and resolved_provider == "CLAUDE"
-            ),
+            pipe_console_input=pipe_console_input,
         )
         child_environment["UNIVERSE_MANAGED_SHELL"] = "1"
         child_environment["UNIVERSE_SESSION_ANCHOR_REF"] = anchor_ref
         try:
-            session.backend = self._spawn(
-                shell_executable,
-                session.cwd,
-                session.cols,
-                session.rows,
-                shell_argv,
-                child_environment,
-            )
+            if self._reconnection_registry is not None:
+                host_environment = dict(child_environment)
+                host_environment.setdefault("TERM", "xterm-256color")
+                host_environment.setdefault("COLORTERM", "truecolor")
+                client = self._reconnection_registry.launch(
+                    anchor_ref,
+                    shell=shell_executable,
+                    cwd=Path(session.cwd),
+                    shell_args=("/d", "/q", "/k"),
+                    environment=host_environment,
+                    cols=session.cols,
+                    rows=session.rows,
+                )
+                session.backend = ReconnectionPty(
+                    client,
+                    f"terminal-host-{os.getpid()}-{terminal_id}",
+                )
+                session.backend_owner = "RUST_RECONNECTION_HOST"
+                session.reconnection_host_id = session.backend.host_id
+                # A newly created Windows pseudo-console asks its terminal for
+                # the cursor position before rendering the first prompt.  The
+                # Host must answer even when no browser/xterm is attached yet.
+                session.backend.write(b"\x1b[1;1R")
+                session.backend.write(provider_command.encode("utf-8") + b"\r\n")
+            else:
+                session.backend = self._spawn(
+                    shell_executable,
+                    session.cwd,
+                    session.cols,
+                    session.rows,
+                    shell_argv,
+                    child_environment,
+                )
         except Exception as error:  # noqa: BLE001 - surface spawn failure
             if channel_broker is not None:
                 channel_broker.close()
@@ -956,7 +1217,20 @@ class TerminalHost:
             "TERMINAL_CREATED",
             terminal=created,
             context=audit_context,
-            details={"managed_shell_identity_file": str(shell_identity_path)},
+            details={
+                "managed_shell_identity_file": str(shell_identity_path),
+                "session_anchor_ref": anchor_ref,
+                "backend_owner": session.backend_owner,
+                "reconnection_host_id": session.reconnection_host_id,
+                "cwd": session.cwd,
+                "executable": session.executable,
+                "model_ref": session.model_ref,
+                "effort": session.effort,
+                "launch_profile": session.launch_profile,
+                "cols": session.cols,
+                "rows": session.rows,
+                "created_at": session.created_at,
+            },
         )
         # The Supervisor must drain and monitor every managed shell even
         # when no UI client subscribes.  Lifecycle polling therefore
@@ -1044,6 +1318,9 @@ class TerminalHost:
             session_anchor_ref=str(evidence.get("session_anchor_ref") or ""),
         )
         shell.record_attach_evidence(attach)
+        identity_path = str(session.managed_shell_identity_file or "").strip()
+        if identity_path:
+            write_managed_shell_identity(Path(identity_path), session)
         return {
             "status": "MANAGED_SHELL_ATTACHED",
             "terminal_id": terminal_id,

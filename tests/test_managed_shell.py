@@ -33,6 +33,7 @@ from universe_app.managed_shell import (  # noqa: E402
     ManagedShellError,
     ProcessIdentity,
     ShellObservation,
+    managed_provider_command_line,
     managed_shell_cmdline,
     observe_process_tree,
     plan_hook_timeout_recovery,
@@ -95,6 +96,14 @@ class ManagedShellCmdlineTests(unittest.TestCase):
         line = managed_shell_cmdline(["claude.exe", "--flag", "value"])
         self.assertTrue(line.startswith("/d /q /s /k "), line)
         self.assertIn("claude.exe --flag value", line)
+
+    def test_provider_command_can_be_written_into_a_host_owned_shell(self) -> None:
+        self.assertEqual(
+            '"C:\\Program Files\\Claude\\claude.exe" --flag value',
+            managed_provider_command_line(
+                ["C:\\Program Files\\Claude\\claude.exe", "--flag", "value"]
+            ),
+        )
 
     def test_stream_protocol_can_receive_console_input_through_one_cmd(self) -> None:
         line = managed_shell_cmdline(

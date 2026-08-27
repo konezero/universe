@@ -25,7 +25,11 @@ from universe_app.pty_supervisor import (  # noqa: E402
     spawn_supervisor,
 )
 from universe_app.terminal_host import TerminalHost  # noqa: E402
-from universe_pty_supervisor import PtySupervisor, Server  # noqa: E402
+from universe_pty_supervisor import (  # noqa: E402
+    PtySupervisor,
+    Server,
+    reconnection_registry_from_environment,
+)
 
 
 class FakePty:
@@ -93,6 +97,46 @@ class PtySupervisorTests(unittest.TestCase):
             self.assertGreaterEqual(host.calls, 2)
         finally:
             supervisor.close()
+
+    def test_supervisor_reconciles_hosts_before_orphan_reclaim(self) -> None:
+        calls: list[str] = []
+
+        class FakeHost:
+            def reconcile_reconnection_hosts(self):
+                calls.append("reconcile")
+                return []
+
+            def reclaim_orphaned_managed_shells(self):
+                calls.append("reclaim")
+                return []
+
+        supervisor = PtySupervisor(host=FakeHost(), reclaim_poll_seconds=60)
+        try:
+            self.assertEqual(["reconcile", "reclaim"], calls[:2])
+        finally:
+            supervisor.close()
+
+    def test_reconnection_registry_requires_explicit_feature_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "universe-session-host.exe"
+            binary.write_bytes(b"test")
+            state_path = root / "pty-supervisor.json"
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertIsNone(reconnection_registry_from_environment(state_path))
+            with patch.dict(
+                os.environ,
+                {
+                    "UNIVERSE_RECONNECTION_HOST_ENABLED": "1",
+                    "UNIVERSE_RECONNECTION_HOST_BINARY": str(binary),
+                    "UNIVERSE_RECONNECTION_HOST_REGISTRY": str(root / "registry"),
+                },
+                clear=True,
+            ):
+                registry = reconnection_registry_from_environment(state_path)
+            self.assertIsNotNone(registry)
+            self.assertEqual(binary, registry.binary)
+            self.assertEqual(root / "registry", registry.root)
 
     def test_spawn_supervisor_hides_its_windows_console(self) -> None:
         script = ROOT / "tools" / "universe_pty_supervisor.py"

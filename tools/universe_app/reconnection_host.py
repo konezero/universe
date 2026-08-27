@@ -27,6 +27,17 @@ STATE_SCHEMA = "universe.reconnection-host-state.v1"
 RESPONSE_SCHEMA = "universe.reconnection-host-response.v1"
 MAX_STATE_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+SESSION_MARKER_ENVIRONMENT = (
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CONVERSATION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "GROK_SESSION_ID",
+    "XAI_SESSION_ID",
+    "GROK_CONVERSATION_ID",
+)
 
 
 class ReconnectionHostError(RuntimeError):
@@ -118,7 +129,15 @@ class ReconnectionHostClient:
         return payload
 
     def status(self) -> dict[str, Any]:
-        return self.request("status")["host"]
+        last_error: ReconnectionHostError | None = None
+        for attempt in range(3):
+            try:
+                return self.request("status")["host"]
+            except ReconnectionHostError as error:
+                last_error = error
+                if attempt < 2:
+                    time.sleep(0.025)
+        raise ReconnectionHostError(f"Host status failed: {last_error}") from last_error
 
     def shutdown(self) -> None:
         self.request("shutdown")
@@ -131,12 +150,25 @@ class ReconnectionHostRegistry:
         self.root = Path(root)
         self.binary = Path(binary)
         self.start_tolerance = start_tolerance
+        self._launched_processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def state_path(self, anchor_ref: str) -> Path:
         if not anchor_ref.strip():
             raise ValueError("anchor_ref must not be empty")
         digest = hashlib.sha256(anchor_ref.encode("utf-8")).hexdigest()
         return self.root / f"anchor-{digest}.json"
+
+    def reap_launched_process(self, anchor_ref: str, *, timeout: float = 5.0) -> int | None:
+        """Wait for a Host launched by this registry after an explicit shutdown."""
+        process = self._launched_processes.get(anchor_ref)
+        if process is None:
+            return None
+        try:
+            return_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        self._launched_processes.pop(anchor_ref, None)
+        return return_code
 
     def _read_state(self, anchor_ref: str) -> ReconnectionHostState:
         path = self.state_path(anchor_ref)
@@ -253,15 +285,21 @@ class ReconnectionHostRegistry:
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        subprocess.Popen(
+        process = subprocess.Popen(
             args,
             cwd=self.binary.parent,
+            env={
+                name: value
+                for name, value in os.environ.items()
+                if name not in SESSION_MARKER_ENVIRONMENT
+            },
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
             creationflags=creationflags,
         )
+        self._launched_processes[anchor_ref] = process
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -300,6 +338,14 @@ class ReconnectionPty:
         return self._pid
 
     @property
+    def host_id(self) -> str:
+        return self.client.state.host_id
+
+    @property
+    def anchor_ref(self) -> str:
+        return self.client.state.anchor_ref
+
+    @property
     def output_cursor(self) -> int:
         return self._cursor
 
@@ -317,11 +363,17 @@ class ReconnectionPty:
             return b""
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
-            response = self.client.request(
-                "read",
-                supervisor_id=self.supervisor_id,
-                after_cursor=self._cursor,
-            )
+            try:
+                response = self.client.request(
+                    "read",
+                    supervisor_id=self.supervisor_id,
+                    after_cursor=self._cursor,
+                )
+            except ReconnectionHostError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.025, max(0.0, deadline - time.monotonic())))
+                continue
             output = response["output"]
             self._cursor = int(output["next_cursor"])
             data = base64.b64decode(output["data_base64"])

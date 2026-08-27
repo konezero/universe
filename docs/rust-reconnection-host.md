@@ -50,7 +50,31 @@ The Host launch contract accepts the shell executable, repeated shell arguments,
 
 `ReconnectionPty` projects the Host endpoint through the existing PTY backend shape (`write`, bounded `read`, `resize`, `is_alive`, and `close`). Closing this adapter only detaches the Supervisor. Explicit Host shutdown remains a separate operation, so losing or replacing a Supervisor does not implicitly terminate cmd.
 
-This adapter is an additive migration seam. The existing `TerminalHost` spawn and orphan cleanup path remains unchanged until the bridge has been exercised in production routing; this avoids silently changing current cleanup semantics before Anchor reconciliation and cleanup policy are wired together.
+## Production migration switch
+
+The standalone PTY Supervisor can opt into the Host-backed production path with:
+
+```text
+UNIVERSE_RECONNECTION_HOST_ENABLED=1
+UNIVERSE_RECONNECTION_HOST_BINARY=<absolute universe-session-host.exe>  # optional when the local release/debug binary exists
+UNIVERSE_RECONNECTION_HOST_REGISTRY=<Host-owned registry directory>     # optional
+```
+
+The switch is off by default. When disabled, `TerminalHost` keeps the existing Python-owned ConPTY behavior. When enabled, terminal creation launches or reuses the exact Anchor's Rust Host, attaches a `ReconnectionPty`, and writes the provider command into the Host-owned persistent cmd. The Rust Host inherits a sanitized environment so a new provider cannot accidentally inherit Codex, Claude, or Grok session markers from its Supervisor.
+
+`TERMINAL_CREATED` audit evidence now records the backend owner and the bounded metadata needed to rebuild the process-local `TerminalSession`. On Supervisor start and every lifecycle poll, reconciliation runs before legacy orphan cleanup:
+
+```text
+audit Terminal metadata + exact Anchor
+  -> registry state
+  -> PID/start-time validation
+  -> authenticated Host status
+  -> attach replacement Supervisor
+  -> rebuild TerminalSession and output pump
+  -> legacy orphan cleanup
+```
+
+Only an authenticated, live `RUST_RECONNECTION_HOST` record suppresses legacy cmd termination. A missing, stale, mismatched, or unreachable Host falls back to the existing exact PID/start-time cleanup path. Managed-shell identity files retain verified SessionStart attach evidence so reconstruction does not invent provider attachment from PID liveness.
 
 ## Non-goals
 
@@ -66,4 +90,4 @@ The discovery file is evidence used to find an endpoint. It contains the bearer 
 
 ## Next slice
 
-Wire this additive adapter into `TerminalHost` creation behind an explicit migration switch, reconcile Host registry records during Supervisor polling, and replace kill-on-restart orphan cleanup only for terminals confirmed to be Host-owned. Windows ACL provisioning and durable stale-record cleanup also remain. Goal, authority, BOOT, provider identity, and Anchor currentness stay outside the Host.
+Package the Rust binary as a release artifact, provision Windows ACLs for the registry, and add durable stale-record cleanup after operational dogfooding. Claude channel rebinding is best-effort during PTY reconstruction and must remain separately observable from PTY continuity. Goal, authority, BOOT, provider identity, and Anchor currentness stay outside the Host.

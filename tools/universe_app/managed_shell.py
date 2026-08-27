@@ -463,6 +463,24 @@ def quote_windows_argument(value: str) -> str:
     return "".join(quoted)
 
 
+def managed_provider_command_line(
+    command: Sequence[str], *, pipe_console_input: bool = False
+) -> str:
+    """Build the exact command written into the persistent managed shell."""
+
+    parts = [str(part) for part in command if str(part).strip()]
+    if not parts:
+        raise ManagedShellError(
+            "MANAGED_SHELL_COMMAND_REQUIRED", "a CLI command is required"
+        )
+    joined = " ".join(quote_windows_argument(part) for part in parts)
+    if pipe_console_input:
+        # Claude stream-json refuses a TTY stdin. Windows' built-in MORE is a
+        # transparent console-to-pipe bridge inside the one managed cmd.
+        joined = f"more | {joined}"
+    return joined
+
+
 def managed_shell_cmdline(
     command: Sequence[str], *, pipe_console_input: bool = False
 ) -> str:
@@ -494,17 +512,9 @@ def managed_shell_cmdline(
     backend appends to the program name.
     """
 
-    parts = [str(part) for part in command if str(part).strip()]
-    if not parts:
-        raise ManagedShellError(
-            "MANAGED_SHELL_COMMAND_REQUIRED", "a CLI command is required"
-        )
-    joined = " ".join(quote_windows_argument(part) for part in parts)
-    if pipe_console_input:
-        # Claude stream-json refuses a TTY stdin. Windows' built-in MORE is a
-        # transparent console-to-pipe bridge inside the one Supervisor-owned
-        # cmd; it is not a second launcher or ownership path.
-        joined = f"more | {joined}"
+    joined = managed_provider_command_line(
+        command, pipe_console_input=pipe_console_input
+    )
     return f'/d /q /s /k "{joined}"'
 
 

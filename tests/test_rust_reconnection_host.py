@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from universe_app.reconnection_host import (  # noqa: E402
     ReconnectionHostRegistry,
 )
 from universe_app.windows_process import process_is_alive  # noqa: E402
+from universe_app.terminal_host import TerminalHost  # noqa: E402
 
 
 MANIFEST = ROOT / "tools" / "session_host" / "Cargo.toml"
@@ -178,6 +180,112 @@ class RustReconnectionHostTests(unittest.TestCase):
                     ):
                         time.sleep(0.05)
                     client.shutdown()
+                    registry.reap_launched_process("anchor-cross-process")
+                except Exception:
+                    pass
+                if host_pid is not None:
+                    deadline = time.monotonic() + 5
+                    while process_is_alive(host_pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertFalse(process_is_alive(host_pid))
+
+    def test_production_terminal_host_reconstructs_same_rust_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            terminal_cwd = root / "terminal-cwd"
+            terminal_cwd.mkdir()
+            audit_path = root / "universe.sqlite3"
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            anchor_ref = "anchor-production-terminal-host"
+            host_pid: int | None = None
+            terminal_id = ""
+            second: TerminalHost | None = None
+            try:
+                with patch(
+                    "universe_app.terminal_host.resolve_cli_executable",
+                    return_value="cmd.exe",
+                ), patch(
+                    "universe_app.terminal_host.startup_argv",
+                    return_value=["/c", "echo", "PRODUCTION_RECONNECT_MARKER"],
+                ):
+                    first = TerminalHost(
+                        audit_database_path=audit_path,
+                        reconnection_registry=registry,
+                    )
+                    created = first.create(
+                        project_id="universe",
+                        mode="MASTER",
+                        cwd=str(terminal_cwd),
+                        session_anchor_ref=anchor_ref,
+                        provider="CODEX",
+                        supervisor_session_id="provider-session",
+                    )
+                terminal_id = str(created["terminal_id"])
+                host_pid = registry.discover(anchor_ref).state.pid
+                deadline = time.monotonic() + 10
+                snapshot = b""
+                while time.monotonic() < deadline:
+                    snapshot = base64.b64decode(
+                        first.terminal_snapshot(terminal_id)["data_base64"]
+                    )
+                    if b"PRODUCTION_RECONNECT_MARKER" in snapshot:
+                        break
+                    time.sleep(0.05)
+                self.assertIn(b"PRODUCTION_RECONNECT_MARKER", snapshot)
+                first_session = first.get(terminal_id)
+                first_session.pump_stop.set()
+                if first_session.pump_thread is not None:
+                    first_session.pump_thread.join(timeout=2)
+                    first_session.pump_thread = None
+
+                second = TerminalHost(
+                    audit_database_path=audit_path,
+                    reconnection_registry=registry,
+                )
+                preserved = second.reclaim_orphaned_managed_shells(
+                    terminate_instance=lambda *_args: self.fail(
+                        "confirmed Host-owned cmd must survive Supervisor replacement"
+                    )
+                )
+                self.assertEqual(
+                    "HOST_OWNED_ORPHAN_PRESERVED", preserved[0]["status"]
+                )
+                reconciled = second.reconcile_reconnection_hosts()
+                self.assertEqual("TERMINAL_REATTACHED", reconciled[0]["status"])
+                recovered = second.get(terminal_id).public()
+                self.assertEqual(created["pid"], recovered["pid"])
+                self.assertEqual(created["reconnection_host_id"], recovered["reconnection_host_id"])
+                self.assertEqual("RUST_RECONNECTION_HOST", recovered["backend_owner"])
+                self.assertTrue(process_is_alive(host_pid))
+            finally:
+                if second is not None and terminal_id:
+                    try:
+                        second.close(terminal_id)
+                    except Exception:
+                        pass
+                try:
+                    client = registry.discover(anchor_ref)
+                    client.request("attach", supervisor_id="production-test-cleanup")
+                    try:
+                        client.request(
+                            "write",
+                            supervisor_id="production-test-cleanup",
+                            input_base64=base64.b64encode(b"\x1b[1;1R").decode("ascii"),
+                        )
+                        client.request(
+                            "write",
+                            supervisor_id="production-test-cleanup",
+                            input_base64=base64.b64encode(b"exit\r\n").decode("ascii"),
+                        )
+                        deadline = time.monotonic() + 5
+                        while (
+                            client.status().get("runtime_state") == "LIVE"
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.05)
+                    finally:
+                        client.shutdown()
+                        registry.reap_launched_process(anchor_ref)
                 except Exception:
                     pass
                 if host_pid is not None:

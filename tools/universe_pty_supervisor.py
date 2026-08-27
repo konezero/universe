@@ -43,6 +43,7 @@ from universe_app.pty_supervisor import (  # noqa: E402
     SCHEMA,
     default_state_path,
 )
+from universe_app.reconnection_host import ReconnectionHostRegistry  # noqa: E402
 from universe_app.session_bus import SessionBusError  # noqa: E402
 from universe_app.terminal_host import (  # noqa: E402
     TerminalHost,
@@ -54,6 +55,35 @@ API_SCHEMA = "universe.pty-supervisor-api.v1"
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def reconnection_registry_from_environment(
+    state_path: Path,
+) -> ReconnectionHostRegistry | None:
+    enabled = str(os.environ.get("UNIVERSE_RECONNECTION_HOST_ENABLED") or "")
+    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    configured = str(os.environ.get("UNIVERSE_RECONNECTION_HOST_BINARY") or "").strip()
+    if configured:
+        binary = Path(configured).expanduser()
+    else:
+        host_root = TOOLS / "session_host" / "target"
+        candidates = (
+            host_root / "release" / "universe-session-host.exe",
+            host_root / "debug" / "universe-session-host.exe",
+        )
+        binary = next((path for path in candidates if path.is_file()), candidates[0])
+    if not binary.is_file():
+        raise RuntimeError(f"Rust Reconnection Host binary is absent: {binary}")
+    registry_text = str(
+        os.environ.get("UNIVERSE_RECONNECTION_HOST_REGISTRY") or ""
+    ).strip()
+    registry_root = (
+        Path(registry_text).expanduser()
+        if registry_text
+        else state_path.parent / "reconnection-hosts"
+    )
+    return ReconnectionHostRegistry(registry_root, binary)
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -81,9 +111,10 @@ class PtySupervisor:
         self._attaches: dict[str, tuple[str, queue.Queue]] = {}
         self._reclaim_poll_seconds = max(0.1, float(reclaim_poll_seconds))
         self._monitor_stop = threading.Event()
-        # A previous Supervisor cannot hand its ConPTY handles to this process.
-        # Reclaim only exact PID/start-time cmd instances described by its
-        # owned identity files before accepting new terminals.
+        self._reconcile_reconnection_hosts()
+        # Legacy Python-owned ConPTY handles cannot be handed to this process.
+        # Reclaim only exact PID/start-time instances after the Rust Host path
+        # had a chance to reattach its durable sessions.
         self.host.reclaim_orphaned_managed_shells()
         self._monitor = threading.Thread(
             target=self._monitor_orphaned_shells,
@@ -92,9 +123,15 @@ class PtySupervisor:
         )
         self._monitor.start()
 
+    def _reconcile_reconnection_hosts(self) -> None:
+        reconcile = getattr(self.host, "reconcile_reconnection_hosts", None)
+        if callable(reconcile):
+            reconcile()
+
     def _monitor_orphaned_shells(self) -> None:
         while not self._monitor_stop.wait(self._reclaim_poll_seconds):
             try:
+                self._reconcile_reconnection_hosts()
                 self.host.reclaim_orphaned_managed_shells()
             except Exception:  # noqa: BLE001 - monitor must remain resident
                 continue
@@ -573,7 +610,11 @@ def main() -> int:
     state_path = default_state_path()
     token = secrets.token_urlsafe(24)
     audit_database_path = state_path.parent / "universe.sqlite3"
-    terminal_host = TerminalHost(audit_database_path=audit_database_path)
+    reconnection_registry = reconnection_registry_from_environment(state_path)
+    terminal_host = TerminalHost(
+        audit_database_path=audit_database_path,
+        reconnection_registry=reconnection_registry,
+    )
     server = Server(token, host=terminal_host)
     host, port = server.server_address[:2]
     endpoint = f"http://{host}:{port}"
@@ -591,7 +632,11 @@ def main() -> int:
     terminal_host.record_audit_event(
         "SUPERVISOR_STARTED",
         context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
-        details={"pid": os.getpid(), "endpoint": endpoint},
+        details={
+            "pid": os.getpid(),
+            "endpoint": endpoint,
+            "reconnection_host_enabled": reconnection_registry is not None,
+        },
     )
     try:
         server.serve_forever()

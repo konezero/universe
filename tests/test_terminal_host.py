@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -46,7 +47,131 @@ class FakePty:
         self.closed = True
 
 
+class FakeReconnectionClient:
+    def __init__(self, anchor_ref: str) -> None:
+        self.state = SimpleNamespace(
+            anchor_ref=anchor_ref,
+            host_id="host-test",
+            pid=5252,
+            started_at_unix_ms=1000,
+            child_pid=4242,
+        )
+        self.attached_supervisor_id: str | None = None
+        self.generation = 0
+        self.writes: list[bytes] = []
+
+    def _host(self) -> dict[str, object]:
+        return {
+            "host_id": self.state.host_id,
+            "anchor_ref": self.state.anchor_ref,
+            "pid": self.state.pid,
+            "started_at_unix_ms": self.state.started_at_unix_ms,
+            "child_pid": self.state.child_pid,
+            "attachment_generation": self.generation,
+            "attached_supervisor_id": self.attached_supervisor_id,
+            "runtime_state": "LIVE",
+        }
+
+    def request(self, action: str, **fields):
+        if action == "attach":
+            self.attached_supervisor_id = fields["supervisor_id"]
+            self.generation += 1
+            return {"host": self._host()}
+        if action == "detach":
+            self.attached_supervisor_id = None
+            return {"host": self._host()}
+        if action == "write":
+            self.writes.append(base64.b64decode(fields["input_base64"]))
+            return {"host": self._host()}
+        if action == "read":
+            return {
+                "host": self._host(),
+                "output": {
+                    "data_base64": "",
+                    "start_cursor": fields.get("after_cursor", 0),
+                    "next_cursor": fields.get("after_cursor", 0),
+                    "truncated": False,
+                },
+            }
+        return {"host": self._host()}
+
+    def status(self):
+        return self._host()
+
+
+class FakeReconnectionRegistry:
+    def __init__(self) -> None:
+        self.clients: dict[str, FakeReconnectionClient] = {}
+        self.launches: list[dict[str, object]] = []
+
+    def launch(self, anchor_ref: str, **config):
+        self.launches.append({"anchor_ref": anchor_ref, **config})
+        return self.clients.setdefault(anchor_ref, FakeReconnectionClient(anchor_ref))
+
+    def discover(self, anchor_ref: str):
+        return self.clients[anchor_ref]
+
+
 class TerminalHostTests(unittest.TestCase):
+    def test_rust_host_creation_and_audit_reconstruction_share_one_terminal(self) -> None:
+        registry = FakeReconnectionRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv",
+            return_value=["/c", "echo", "RUST_HOST_MARKER"],
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            root = Path(tmp)
+            audit_path = root / "audit.sqlite3"
+            first = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            created = first.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-rust-host",
+                provider="CODEX",
+                supervisor_session_id="provider-session",
+            )
+            first_session = first.get(created["terminal_id"])
+            first_session.pump_stop.set()
+            if first_session.pump_thread is not None:
+                first_session.pump_thread.join(timeout=1)
+                first_session.pump_thread = None
+            client = registry.clients["anchor-rust-host"]
+            self.assertEqual("RUST_RECONNECTION_HOST", created["backend_owner"])
+            self.assertEqual("host-test", created["reconnection_host_id"])
+            self.assertIn(b"\x1b[1;1R", client.writes)
+            self.assertIn(b"cmd.exe /c echo RUST_HOST_MARKER\r\n", client.writes)
+            launch = registry.launches[0]
+            self.assertEqual(("/d", "/q", "/k"), launch["shell_args"])
+            self.assertEqual("xterm-256color", launch["environment"]["TERM"])
+
+            second = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            preserved = second.reclaim_orphaned_managed_shells(
+                start_time_of=lambda _pid: 123.5,
+                terminate_instance=lambda *_args: self.fail(
+                    "a confirmed Host-owned cmd must not be terminated"
+                ),
+            )
+            self.assertEqual("HOST_OWNED_ORPHAN_PRESERVED", preserved[0]["status"])
+            reconciled = second.reconcile_reconnection_hosts()
+            self.assertEqual("TERMINAL_REATTACHED", reconciled[0]["status"])
+            recovered = second.get(created["terminal_id"])
+            self.assertEqual(created["terminal_id"], recovered.terminal_id)
+            self.assertEqual(created["pid"], recovered.live_pid())
+            self.assertEqual("host-test", recovered.reconnection_host_id)
+            self.assertEqual(2, client.generation)
+            second.close(created["terminal_id"])
+
     def test_create_list_and_close_without_vendor_jsonl(self) -> None:
         spawned: list[tuple] = []
 
