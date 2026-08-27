@@ -134,6 +134,55 @@ class TodoMutationGateway:
         receipt_id = str(prepared["receipt"]["receipt_id"])
         return self.consume_action(receipt_id, request)
 
+    @staticmethod
+    def scheduler_mutation_request(
+        *,
+        provider: str,
+        provider_session_ref: str,
+        session_id: str,
+        session_anchor_ref: str,
+        instruction_ref: str,
+        goal_id: str,
+        action: str,
+        expected_goal_revision: int,
+        interval_seconds: int = 5,
+        ttl_seconds: int = 120,
+    ) -> dict[str, Any]:
+        return {
+            "schema": "universe.goal-automation-scheduler-mutation-request.v1",
+            "provider": provider,
+            "provider_session_ref": provider_session_ref,
+            "session_id": session_id,
+            "session_anchor_ref": session_anchor_ref,
+            "instruction_ref": instruction_ref,
+            "goal_id": goal_id,
+            "scheduler": {
+                "action": action,
+                "expected_goal_revision": expected_goal_revision,
+                "interval_seconds": interval_seconds,
+            },
+            "ttl_seconds": ttl_seconds,
+        }
+
+    def prepare_scheduler(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self._post(
+            "/v1/goal-automation-scheduler-mutation-receipts", request
+        )
+
+    def consume_scheduler(
+        self, receipt_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/v1/goal-automation-scheduler-mutation-receipts/{receipt_id}/consume",
+            request,
+        )
+
+    def configure_scheduler(self, **coordinates: Any) -> dict[str, Any]:
+        request = self.scheduler_mutation_request(**coordinates)
+        prepared = self.prepare_scheduler(request)
+        receipt_id = str(prepared["receipt"]["receipt_id"])
+        return self.consume_scheduler(receipt_id, request)
+
     def _post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if self.token:
@@ -163,5 +212,5 @@ class TodoMutationGateway:
         except (OSError, URLError) as error:
             raise TodoMutationGatewayError(
                 "TODO_GATEWAY_UNAVAILABLE",
-                "Todo mutation service is unavailable; raw /v1/todos fallback is forbidden",
+                "Universe mutation service is unavailable; raw mutation fallback is forbidden",
             ) from error

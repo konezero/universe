@@ -1042,6 +1042,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         self.assertEqual("TODO_MUTATION_RECEIPT_CONFLICT", caught.exception.code)
 
+        started = gateway.apply_action(
+            provider="CODEX",
+            provider_session_ref="todo-attached-provider-ref",
+            session_id=attached["session_id"],
+            session_anchor_ref=attached["session_anchor_ref"],
+            instruction_ref="conversation://test/attached-todo-start",
+            todo_id=attached_result["todo"]["todo_id"],
+            action={
+                "action_id": "guarded-start-001",
+                "outcome": "STARTED",
+                "source": "CODEX_DESKTOP",
+                "evidence_ref": "conversation://test/started-without-validation",
+            },
+        )
+        self.assertEqual("TODO_ACTION_MUTATION_APPLIED", started["status"])
+        self.assertEqual("IN_PROGRESS", started["todo"]["state"])
+
         completed_action = {
             "action_id": "guarded-completion-001",
             "outcome": "COMPLETED",
@@ -3767,6 +3784,44 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "HOOK_OBSERVATION_FOR_SESSION",
             {item["edge_type"] for item in graph["edges"]},
         )
+
+    def test_generic_session_start_preserves_existing_current_mode(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        existing, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "generic-hook-current-conductor",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "generic-hook-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        status, injected = self.request(
+            "POST",
+            "/v1/sessions/inject",
+            {
+                "project_id": "GCS",
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "generic-hook-provider-ref",
+                "state": "STARTING",
+                "hook_observation": {
+                    "schema": "universe.hook-session-observation.v1",
+                    "trigger": "session_start",
+                    "observed_at": "2026-08-27T00:00:00Z",
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        supervised = injected["supervisor_session"]
+        self.assertEqual(existing["session_id"], supervised["session_id"])
+        self.assertEqual("CONDUCTOR", supervised["mode"])
+        self.assertEqual(existing["session_anchor_ref"], supervised["session_anchor_ref"])
 
     def test_cross_session_delegation_fails_closed_without_project_room_delivery(
         self,
@@ -11914,6 +11969,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
     def test_goal_automation_scheduler_stops_and_recovers_expired_lease(self) -> None:
         self.server.store.register_project(self.registration())
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "goal-scheduler-current-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "goal-scheduler-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        gateway = TodoMutationGateway(self.endpoint, self.token)
         goal = self.server.store.create_goal(
             "GCS",
             {
@@ -11934,7 +12002,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
             },
             self.token,
         )
-        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REQUIRED",
+            started["error_code"],
+        )
+        started = gateway.configure_scheduler(
+            provider="CODEX",
+            provider_session_ref="goal-scheduler-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref=session["session_anchor_ref"],
+            instruction_ref="conversation://test/goal-scheduler-start",
+            goal_id=goal["goal_id"],
+            action="START",
+            expected_goal_revision=goal["revision"],
+            interval_seconds=5,
+        )
+        self.assertEqual(
+            "GOAL_AUTOMATION_SCHEDULER_MUTATION_APPLIED", started["status"]
+        )
+        self.assertEqual("CONSUMED", started["receipt"]["status"])
         self.assertEqual("READY", started["scheduler"]["status"])
         self.assertTrue(started["scheduler"]["enabled"])
 
@@ -12015,24 +12102,88 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(2, recovered["scheduler"]["tick_count"])
         self.assertIsNone(recovered["scheduler"]["lease_owner"])
 
-        status, resumed = self.request(
-            "POST",
-            f"/v1/goals/{goal['goal_id']}/automation/scheduler",
-            {"action": "START", "expected_goal_revision": goal["revision"]},
-            self.token,
+        resumed = gateway.configure_scheduler(
+            provider="CODEX",
+            provider_session_ref="goal-scheduler-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref=session["session_anchor_ref"],
+            instruction_ref="conversation://test/goal-scheduler-resume",
+            goal_id=goal["goal_id"],
+            action="START",
+            expected_goal_revision=goal["revision"],
         )
-        self.assertEqual(HTTPStatus.OK, status)
         self.assertTrue(resumed["scheduler"]["enabled"])
-        status, paused = self.request(
-            "POST",
-            f"/v1/goals/{goal['goal_id']}/automation/scheduler",
-            {"action": "PAUSE", "expected_goal_revision": goal["revision"]},
-            self.token,
+        replayed = gateway.configure_scheduler(
+            provider="CODEX",
+            provider_session_ref="goal-scheduler-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref=session["session_anchor_ref"],
+            instruction_ref="conversation://test/goal-scheduler-resume",
+            goal_id=goal["goal_id"],
+            action="START",
+            expected_goal_revision=goal["revision"],
         )
-        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(replayed["replayed"])
+        with self.assertRaises(TodoMutationGatewayError) as conflict:
+            gateway.configure_scheduler(
+                provider="CODEX",
+                provider_session_ref="goal-scheduler-provider-ref",
+                session_id=session["session_id"],
+                session_anchor_ref=session["session_anchor_ref"],
+                instruction_ref="conversation://test/goal-scheduler-resume",
+                goal_id=goal["goal_id"],
+                action="PAUSE",
+                expected_goal_revision=goal["revision"],
+            )
+        self.assertEqual(
+            "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_CONFLICT",
+            conflict.exception.code,
+        )
+        paused = gateway.configure_scheduler(
+            provider="CODEX",
+            provider_session_ref="goal-scheduler-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref=session["session_anchor_ref"],
+            instruction_ref="conversation://test/goal-scheduler-pause",
+            goal_id=goal["goal_id"],
+            action="PAUSE",
+            expected_goal_revision=goal["revision"],
+        )
         self.assertEqual("PAUSED", paused["scheduler"]["status"])
         self.assertEqual("USER_PAUSED", paused["scheduler"]["last_stop_reason"])
         self.assertFalse(paused["scheduler"]["enabled"])
+
+        with self.assertRaises(TodoMutationGatewayError) as wrong_anchor:
+            gateway.configure_scheduler(
+                provider="CODEX",
+                provider_session_ref="goal-scheduler-provider-ref",
+                session_id=session["session_id"],
+                session_anchor_ref="session_anchor_wrong",
+                instruction_ref="conversation://test/goal-scheduler-wrong-anchor",
+                goal_id=goal["goal_id"],
+                action="PAUSE",
+                expected_goal_revision=goal["revision"],
+            )
+        self.assertEqual(
+            "GOAL_AUTOMATION_SCHEDULER_MUTATION_ANCHOR_MISMATCH",
+            wrong_anchor.exception.code,
+        )
+        with self.server.store._connection() as connection:
+            connection.execute(
+                "UPDATE project_goal SET revision = revision + 1 WHERE goal_id = ?",
+                (goal["goal_id"],),
+            )
+        replay_after_goal_change = gateway.configure_scheduler(
+            provider="CODEX",
+            provider_session_ref="goal-scheduler-provider-ref",
+            session_id=session["session_id"],
+            session_anchor_ref=session["session_anchor_ref"],
+            instruction_ref="conversation://test/goal-scheduler-pause",
+            goal_id=goal["goal_id"],
+            action="PAUSE",
+            expected_goal_revision=goal["revision"],
+        )
+        self.assertTrue(replay_after_goal_change["replayed"])
 
     def test_experience_case_contains_only_recorded_observations(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

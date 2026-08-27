@@ -6880,25 +6880,54 @@ async function advanceGoalAutomation() {
   toast(`Conductor · ${surface.automation_state || result.status} · next ${surface.next_operation || "WAIT"}`);
 }
 
+function currentConductorMutationSession() {
+  const candidates = (state.supervisorSessions || []).filter(
+    (session) =>
+      String(session.mode || "").toUpperCase() === "CONDUCTOR" &&
+      nodeModeSessionIsCurrent(session) &&
+      String(session.provider || "").trim() &&
+      String(session.provider_session_ref || "").trim() &&
+      String(session.session_id || "").trim() &&
+      String(session.session_anchor_ref || "").trim()
+  );
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 async function setGoalAutomationScheduler(action) {
   const feature = activeMeetingFeature();
   const goal = feature?.goal_derivation?.goal;
   if (!goal) throw new Error("Create a Goal first");
+  const session = currentConductorMutationSession();
+  if (!session) {
+    throw new Error("Exactly one current Conductor session is required");
+  }
   const normalized = String(action || "").toUpperCase();
   const prompt = normalized === "START"
     ? "Start the durable Conductor scheduler until its next governed stop?"
     : "Pause the Conductor scheduler?";
   if (!window.confirm(prompt)) return;
-  const result = await api(
-    `/v1/goals/${encodeURIComponent(goal.goal_id)}/automation/scheduler`,
-    {
-      method: "POST",
-      body: {
+  const mutation = {
+    schema: "universe.goal-automation-scheduler-mutation-request.v1",
+    provider: String(session.provider).toUpperCase(),
+    provider_session_ref: session.provider_session_ref,
+    session_id: session.session_id,
+    session_anchor_ref: session.session_anchor_ref,
+    instruction_ref: `ui://goal-automation-scheduler/${goal.goal_id}/${normalized}/${crypto.randomUUID()}`,
+    goal_id: goal.goal_id,
+    scheduler: {
         action: normalized,
         expected_goal_revision: goal.revision,
         interval_seconds: 5,
-      },
-    }
+    },
+    ttl_seconds: 120,
+  };
+  const prepared = await api(
+    "/v1/goal-automation-scheduler-mutation-receipts",
+    { method: "POST", body: mutation }
+  );
+  const result = await api(
+    `/v1/goal-automation-scheduler-mutation-receipts/${encodeURIComponent(prepared.receipt.receipt_id)}/consume`,
+    { method: "POST", body: mutation }
   );
   state.goalAutomationSurfaces[goal.goal_id] = result.surface || {};
   renderActiveMultiRoom();
@@ -7071,6 +7100,10 @@ function renderMeetingFeaturePanel(room) {
             scheduler?.enabled ? "Pause Scheduler" : "Start Scheduler"
           );
           schedulerAction.type = "button";
+          schedulerAction.disabled = !currentConductorMutationSession();
+          schedulerAction.title = schedulerAction.disabled
+            ? "Exactly one current Conductor session is required"
+            : "Uses a one-time current Session Anchor mutation receipt";
           schedulerAction.addEventListener("click", () => {
             setGoalAutomationScheduler(scheduler?.enabled ? "PAUSE" : "START")
               .catch((error) => toast(error.message, true));

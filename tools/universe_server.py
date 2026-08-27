@@ -1948,8 +1948,14 @@ def normalize_todo_action_mutation_request(value: Any) -> dict[str, Any]:
     action = normalize_todo_action_payload(normalized_todo_id, request["action"])
     normalized_action = {
         key: action[key]
-        for key in ("action_id", "outcome", "source", "evidence_ref", "validation")
+        for key in ("action_id", "outcome", "source", "evidence_ref")
     }
+    # STARTED/FAILED/REOPENED actions do not require validation.  Keep the
+    # canonical payload idempotent across the HTTP normalizer and the Store's
+    # second defensive normalization instead of turning an absent value into
+    # an invalid empty object.
+    if action["validation"]:
+        normalized_action["validation"] = action["validation"]
     return {
         "provider": provider,
         "provider_session_ref": provider_session_ref,
@@ -3443,6 +3449,52 @@ def normalize_goal_automation_scheduler_request(value: Any) -> dict[str, Any]:
         "action": action,
         "expected_goal_revision": revision,
         "interval_seconds": interval_seconds,
+    }
+
+
+def normalize_goal_automation_scheduler_mutation_request(
+    value: Any,
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_automation_scheduler_mutation_request",
+        required=frozenset(
+            {
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "instruction_ref",
+                "goal_id",
+                "scheduler",
+            }
+        ),
+        optional=frozenset({"schema", "ttl_seconds"}),
+    )
+    actor = _normalize_goal_automation_actor(
+        {
+            **request,
+            "expected_goal_revision": request["scheduler"].get(
+                "expected_goal_revision"
+            )
+            if isinstance(request["scheduler"], Mapping)
+            else None,
+        }
+    )
+    instruction_ref = _required_text(
+        request["instruction_ref"], "instruction_ref"
+    )
+    if len(instruction_ref) > 512:
+        raise UniverseError(
+            "GOAL_AUTOMATION_SCHEDULER_MUTATION_INSTRUCTION_REF_INVALID",
+            "instruction_ref is too long",
+        )
+    scheduler = normalize_goal_automation_scheduler_request(request["scheduler"])
+    return {
+        **actor,
+        "instruction_ref": instruction_ref,
+        "goal_id": _identifier(request["goal_id"], "goal_id"),
+        "scheduler": scheduler,
     }
 
 
@@ -5522,6 +5574,25 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS todo_action_mutation_receipt_status_expiry
                 ON todo_action_mutation_receipt(status, expires_at, receipt_id);
+
+                CREATE TABLE IF NOT EXISTS goal_automation_scheduler_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    instruction_ref TEXT NOT NULL,
+                    goal_id TEXT NOT NULL REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PREPARED', 'CONSUMED')),
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(session_id, instruction_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_automation_scheduler_mutation_receipt_status_expiry
+                ON goal_automation_scheduler_mutation_receipt(status, expires_at, receipt_id);
 
                 CREATE TABLE IF NOT EXISTS skill_registry_snapshot (
                     snapshot_id TEXT PRIMARY KEY,
@@ -13884,6 +13955,265 @@ class UniverseStore:
         return [self._todo_action_mutation_receipt_row(row) for row in rows]
 
     @staticmethod
+    def _goal_automation_scheduler_mutation_receipt_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        return {
+            "schema": "universe.goal-automation-scheduler-mutation-receipt.v1",
+            "receipt_id": row["receipt_id"],
+            "session_id": row["session_id"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "provider": row["provider"],
+            "provider_session_ref_hash": row["provider_session_ref_hash"],
+            "instruction_ref": row["instruction_ref"],
+            "goal_id": row["goal_id"],
+            "payload_sha256": row["payload_sha256"],
+            "status": row["status"],
+            "prepared_at": row["prepared_at"],
+            "expires_at": row["expires_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    @staticmethod
+    def _bound_goal_automation_scheduler_mutation(
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str, str]:
+        scheduler = normalize_goal_automation_scheduler_request(
+            request["scheduler"]
+        )
+        payload_sha256 = _json_sha256(
+            {"goal_id": request["goal_id"], "scheduler": scheduler}
+        )
+        provider_ref_hash = hashlib.sha256(
+            str(request["provider_session_ref"]).encode("utf-8")
+        ).hexdigest()
+        return scheduler, payload_sha256, provider_ref_hash
+
+    def prepare_goal_automation_scheduler_mutation_receipt(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        scheduler, payload_sha256, provider_ref_hash = (
+            self._bound_goal_automation_scheduler_mutation(request)
+        )
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=int(request["ttl_seconds"]))
+        ).isoformat().replace("+00:00", "Z")
+        receipt_id = "goal_scheduler_receipt_" + _json_sha256(
+            {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+            }
+        )[:24]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE session_id = ? AND instruction_ref = ?
+                """,
+                (request["session_id"], request["instruction_ref"]),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["goal_id"],
+                    payload_sha256,
+                )
+                actual = (
+                    existing["session_anchor_ref"],
+                    existing["provider"],
+                    existing["provider_session_ref_hash"],
+                    existing["goal_id"],
+                    existing["payload_sha256"],
+                )
+                if actual != expected:
+                    raise UniverseError(
+                        "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_CONFLICT",
+                        "instruction_ref is already bound to different scheduler material",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "PREPARED" and datetime.fromisoformat(
+                    str(existing["expires_at"]).replace("Z", "+00:00")
+                ) <= now_datetime:
+                    connection.execute(
+                        """
+                        UPDATE goal_automation_scheduler_mutation_receipt
+                        SET prepared_at = ?, expires_at = ? WHERE receipt_id = ?
+                        """,
+                        (now, expires_at, existing["receipt_id"]),
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT * FROM goal_automation_scheduler_mutation_receipt
+                        WHERE receipt_id = ?
+                        """,
+                        (existing["receipt_id"],),
+                    ).fetchone()
+                return (
+                    self._goal_automation_scheduler_mutation_receipt_row(existing),
+                    False,
+                )
+            goal = connection.execute(
+                "SELECT revision FROM project_goal WHERE goal_id = ?",
+                (request["goal_id"],),
+            ).fetchone()
+            if goal is None:
+                raise UniverseError(
+                    "GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND
+                )
+            if int(goal["revision"]) != scheduler["expected_goal_revision"]:
+                raise UniverseError(
+                    "GOAL_REVISION_CONFLICT",
+                    "Goal revision changed before scheduler receipt preparation",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                INSERT INTO goal_automation_scheduler_mutation_receipt(
+                    receipt_id, session_id, session_anchor_ref, provider,
+                    provider_session_ref_hash, instruction_ref, goal_id,
+                    payload_sha256, status, prepared_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL)
+                """,
+                (
+                    receipt_id,
+                    request["session_id"],
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["instruction_ref"],
+                    request["goal_id"],
+                    payload_sha256,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE receipt_id = ?
+                """,
+                (receipt_id,),
+            ).fetchone()
+        assert row is not None
+        return self._goal_automation_scheduler_mutation_receipt_row(row), True
+
+    def consume_goal_automation_scheduler_mutation_receipt(
+        self, receipt_id: str, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        normalized_receipt_id = _identifier(receipt_id, "receipt_id")
+        scheduler_request, payload_sha256, provider_ref_hash = (
+            self._bound_goal_automation_scheduler_mutation(request)
+        )
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE receipt_id = ?
+                """,
+                (normalized_receipt_id,),
+            ).fetchone()
+            if receipt is None:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_NOT_FOUND",
+                    "Scheduler mutation receipt does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            expected = (
+                request["session_id"],
+                request["session_anchor_ref"],
+                request["provider"],
+                provider_ref_hash,
+                request["instruction_ref"],
+                request["goal_id"],
+                payload_sha256,
+            )
+            actual = (
+                receipt["session_id"],
+                receipt["session_anchor_ref"],
+                receipt["provider"],
+                receipt["provider_session_ref_hash"],
+                receipt["instruction_ref"],
+                receipt["goal_id"],
+                receipt["payload_sha256"],
+            )
+            if actual != expected:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "receipt is not bound to this session, Anchor, instruction, Goal, and scheduler payload",
+                    HTTPStatus.CONFLICT,
+                )
+            if receipt["status"] == "CONSUMED":
+                row = connection.execute(
+                    "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                    (request["goal_id"],),
+                ).fetchone()
+                if row is None:
+                    raise UniverseError(
+                        "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_CORRUPT",
+                        "consumed receipt has no scheduler state",
+                        HTTPStatus.CONFLICT,
+                    )
+                return (
+                    self._goal_automation_scheduler_mutation_receipt_row(receipt),
+                    self._goal_automation_scheduler_row(row),
+                    True,
+                )
+            if datetime.fromisoformat(
+                str(receipt["expires_at"]).replace("Z", "+00:00")
+            ) <= now_datetime:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_EXPIRED",
+                    "Scheduler mutation receipt expired before consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            scheduler, _created = (
+                self._configure_goal_automation_scheduler_in_connection(
+                    connection,
+                    request["goal_id"],
+                    action=scheduler_request["action"],
+                    expected_goal_revision=scheduler_request[
+                        "expected_goal_revision"
+                    ],
+                    interval_seconds=scheduler_request["interval_seconds"],
+                )
+            )
+            updated = connection.execute(
+                """
+                UPDATE goal_automation_scheduler_mutation_receipt
+                SET status = 'CONSUMED', consumed_at = ?
+                WHERE receipt_id = ? AND status = 'PREPARED'
+                """,
+                (now, normalized_receipt_id),
+            )
+            if updated.rowcount != 1:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "Scheduler mutation receipt changed during consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            receipt = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE receipt_id = ?
+                """,
+                (normalized_receipt_id,),
+            ).fetchone()
+        assert receipt is not None
+        return (
+            self._goal_automation_scheduler_mutation_receipt_row(receipt),
+            scheduler,
+            False,
+        )
+
+    @staticmethod
     def _goal_automation_scheduler_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
@@ -13926,65 +14256,95 @@ class UniverseStore:
         interval_seconds: int,
     ) -> tuple[dict[str, Any], bool]:
         normalized_goal = _identifier(goal_id, "goal_id")
-        now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
-                (normalized_goal,),
-            ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO goal_automation_scheduler(
-                        goal_id, expected_goal_revision, enabled, status,
-                        interval_seconds, next_tick_at, lease_owner,
-                        lease_expires_at, last_tick_at, last_stop_reason,
-                        last_error_code, last_error_detail, last_surface_json,
-                        tick_count, revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL,
-                              '{}', 0, 1, ?, ?)
-                    """,
-                    (
-                        normalized_goal,
-                        expected_goal_revision,
-                        1 if action == "START" else 0,
-                        "READY" if action == "START" else "PAUSED",
-                        interval_seconds,
-                        now if action == "START" else None,
-                        None if action == "START" else "USER_PAUSED",
-                        now,
-                        now,
-                    ),
-                )
-                created = True
-            else:
-                connection.execute(
-                    """
-                    UPDATE goal_automation_scheduler
-                    SET expected_goal_revision = ?, enabled = ?, status = ?,
-                        interval_seconds = ?, next_tick_at = ?, lease_owner = NULL,
-                        lease_expires_at = NULL, last_stop_reason = ?,
-                        last_error_code = NULL, last_error_detail = NULL,
-                        revision = revision + 1, updated_at = ?
-                    WHERE goal_id = ?
-                    """,
-                    (
-                        expected_goal_revision,
-                        1 if action == "START" else 0,
-                        "READY" if action == "START" else "PAUSED",
-                        interval_seconds,
-                        now if action == "START" else None,
-                        None if action == "START" else "USER_PAUSED",
-                        now,
-                        normalized_goal,
-                    ),
-                )
-                created = False
-            row = connection.execute(
-                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
-                (normalized_goal,),
-            ).fetchone()
+            return self._configure_goal_automation_scheduler_in_connection(
+                connection,
+                normalized_goal,
+                action=action,
+                expected_goal_revision=expected_goal_revision,
+                interval_seconds=interval_seconds,
+            )
+
+    def _configure_goal_automation_scheduler_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        goal_id: str,
+        *,
+        action: str,
+        expected_goal_revision: int,
+        interval_seconds: int,
+    ) -> tuple[dict[str, Any], bool]:
+        goal = connection.execute(
+            "SELECT revision FROM project_goal WHERE goal_id = ?", (goal_id,)
+        ).fetchone()
+        if goal is None:
+            raise UniverseError(
+                "GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND
+            )
+        if int(goal["revision"]) != expected_goal_revision:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before scheduler configuration",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        existing = connection.execute(
+            "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO goal_automation_scheduler(
+                    goal_id, expected_goal_revision, enabled, status,
+                    interval_seconds, next_tick_at, lease_owner,
+                    lease_expires_at, last_tick_at, last_stop_reason,
+                    last_error_code, last_error_detail, last_surface_json,
+                    tick_count, revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL,
+                          '{}', 0, 1, ?, ?)
+                """,
+                (
+                    goal_id,
+                    expected_goal_revision,
+                    1 if action == "START" else 0,
+                    "READY" if action == "START" else "PAUSED",
+                    interval_seconds,
+                    now if action == "START" else None,
+                    None if action == "START" else "USER_PAUSED",
+                    now,
+                    now,
+                ),
+            )
+            created = True
+        else:
+            connection.execute(
+                """
+                UPDATE goal_automation_scheduler
+                SET expected_goal_revision = ?, enabled = ?, status = ?,
+                    interval_seconds = ?, next_tick_at = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, last_stop_reason = ?,
+                    last_error_code = NULL, last_error_detail = NULL,
+                    revision = revision + 1, updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (
+                    expected_goal_revision,
+                    1 if action == "START" else 0,
+                    "READY" if action == "START" else "PAUSED",
+                    interval_seconds,
+                    now if action == "START" else None,
+                    None if action == "START" else "USER_PAUSED",
+                    now,
+                    goal_id,
+                ),
+            )
+            created = False
+        row = connection.execute(
+            "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchone()
         assert row is not None
         return self._goal_automation_scheduler_row(row), created
 
@@ -22505,6 +22865,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self,
         request: Mapping[str, Any],
     ) -> dict[str, Any]:
+        return self._resolve_current_provider_mutation_session(
+            request,
+            error_prefix="TODO_MUTATION",
+            subject="Todo mutation",
+        )
+
+    def resolve_goal_automation_scheduler_mutation_session(
+        self,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._resolve_current_provider_mutation_session(
+            request,
+            error_prefix="GOAL_AUTOMATION_SCHEDULER_MUTATION",
+            subject="Scheduler mutation",
+        )
+
+    def _resolve_current_provider_mutation_session(
+        self,
+        request: Mapping[str, Any],
+        *,
+        error_prefix: str,
+        subject: str,
+    ) -> dict[str, Any]:
         matching = [
             session
             for session in self.session_supervisor.list_sessions(include_hidden=True)
@@ -22520,27 +22903,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         ]
         if not current:
             raise UniverseError(
-                "TODO_MUTATION_SESSION_NOT_CURRENT",
+                f"{error_prefix}_SESSION_NOT_CURRENT",
                 "provider session is not current in the Session Supervisor",
                 HTTPStatus.CONFLICT,
             )
         if len(current) != 1:
             raise UniverseError(
-                "TODO_MUTATION_SESSION_AMBIGUOUS",
+                f"{error_prefix}_SESSION_AMBIGUOUS",
                 "provider session resolves to more than one current supervised session",
                 HTTPStatus.CONFLICT,
             )
         session = current[0]
         if session["session_id"] != request["session_id"]:
             raise UniverseError(
-                "TODO_MUTATION_SESSION_MISMATCH",
-                "request session_id does not match the current provider session",
+                f"{error_prefix}_SESSION_MISMATCH",
+                f"{subject} session_id does not match the current provider session",
                 HTTPStatus.CONFLICT,
             )
         if session["session_anchor_ref"] != request["session_anchor_ref"]:
             raise UniverseError(
-                "TODO_MUTATION_ANCHOR_MISMATCH",
-                "request Session Anchor is not current for the provider session",
+                f"{error_prefix}_ANCHOR_MISMATCH",
+                f"{subject} Session Anchor is not current for the provider session",
                 HTTPStatus.CONFLICT,
             )
         return session
@@ -35661,13 +36044,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 r"/v1/goals/([^/]+)/automation/scheduler", path
             )
             if goal_automation_scheduler is not None:
-                self._send(
-                    HTTPStatus.OK,
-                    self.server.configure_goal_automation_scheduler(
-                        unquote(goal_automation_scheduler.group(1)), body
-                    ),
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REQUIRED",
+                    "Scheduler START/PAUSE requires the current Session Anchor prepare/consume route",
+                    HTTPStatus.CONFLICT,
                 )
-                return
             goal_todo_selection = re.fullmatch(
                 r"/v1/goals/([^/]+)/automation/todo-selection", path
             )
@@ -35800,6 +36181,67 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "result": self.server.store.run_skill_resolution_fallback(
                             unquote(skill_fallback.group(1)), body
                         ),
+                    },
+                )
+                return
+
+            if path == "/v1/goal-automation-scheduler-mutation-receipts":
+                request = normalize_goal_automation_scheduler_mutation_request(
+                    body
+                )
+                self.server.resolve_goal_automation_scheduler_mutation_session(
+                    request
+                )
+                receipt, created = (
+                    self.server.store.prepare_goal_automation_scheduler_mutation_receipt(
+                        request
+                    )
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_PREPARED",
+                        "receipt": receipt,
+                    },
+                )
+                return
+            goal_scheduler_mutation_consume = re.fullmatch(
+                r"/v1/goal-automation-scheduler-mutation-receipts/([^/]+)/consume",
+                path,
+            )
+            if goal_scheduler_mutation_consume is not None:
+                request = normalize_goal_automation_scheduler_mutation_request(
+                    body
+                )
+                self.server.resolve_goal_automation_scheduler_mutation_session(
+                    request
+                )
+                receipt, scheduler, replayed = (
+                    self.server.store.consume_goal_automation_scheduler_mutation_receipt(
+                        unquote(goal_scheduler_mutation_consume.group(1)),
+                        request,
+                    )
+                )
+                if request["scheduler"]["action"] == "START":
+                    self.server._goal_scheduler_wake.set()
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_AUTOMATION_SCHEDULER_MUTATION_APPLIED",
+                        "receipt": receipt,
+                        "scheduler": scheduler,
+                        "surface": self.server.goal_automation_surface(
+                            request["goal_id"]
+                        ),
+                        "replayed": replayed,
+                        "effects": {
+                            "task_frame_run": "NONE",
+                            "todo_state_change": "NONE",
+                            "authority_created": False,
+                            "execution_assignment_created": False,
+                        },
                     },
                 )
                 return
@@ -38549,11 +38991,42 @@ def perform_session_ref_inject(
     # and the caller did not state node/mode.  A SessionStart hook must not be
     # able to relabel a live CONDUCTOR session as MASTER by omission.
     stored_session: Mapping[str, Any] = {}
+    resolved_existing_session_id = ""
     if explicit_session_id:
         try:
             stored_session = session_supervisor.get_session(explicit_session_id) or {}
         except SessionSupervisorError:
             stored_session = {}
+    elif normalized_ref:
+        # Desktop SessionStart does not always receive the Supervisor session
+        # id.  The provider identity is still durable, so resolve its single
+        # existing current owner before applying PROJECT/MASTER defaults.  This
+        # keeps a current CONDUCTOR session in CONDUCTOR when the generic hook
+        # fires again after a turn or reconnect.
+        identity_matches = [
+            item
+            for item in session_supervisor.list_sessions(include_hidden=True)
+            if str(item.get("provider") or "").upper() == normalized_provider
+            and str(item.get("provider_session_ref") or "") == normalized_ref
+        ]
+        current_identity_matches = [
+            item
+            for item in identity_matches
+            if str(item.get("currentness") or "").upper() == "CURRENT"
+            or str(item.get("state") or "").upper() in {"LIVE", "STARTING"}
+        ]
+        selected_identity = (
+            current_identity_matches[0]
+            if len(current_identity_matches) == 1
+            else identity_matches[0]
+            if len(identity_matches) == 1
+            else None
+        )
+        if selected_identity is not None:
+            stored_session = selected_identity
+            resolved_existing_session_id = str(
+                selected_identity.get("session_id") or ""
+            ).strip()
     normalized_node = str(
         body.get("node") or stored_session.get("node") or project_id or "CONDUCTOR"
     ).strip()
@@ -38566,11 +39039,15 @@ def perform_session_ref_inject(
         or "MASTER"
     )
 
-    session_id = explicit_session_id or supervisor_session_id_for(
-        node=normalized_node,
-        mode=normalized_mode,
-        provider=normalized_provider,
-        provider_session_ref=normalized_ref,
+    session_id = (
+        explicit_session_id
+        or resolved_existing_session_id
+        or supervisor_session_id_for(
+            node=normalized_node,
+            mode=normalized_mode,
+            provider=normalized_provider,
+            provider_session_ref=normalized_ref,
+        )
     )
     # A provider may not expose its own conversation id until after the first
     # interactive turn.  A SessionStart hook still identifies the durable

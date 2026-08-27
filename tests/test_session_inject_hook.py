@@ -338,6 +338,26 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("UNASSIGNED", result["authority"])
         self.assertTrue(result.get("observation_path"))
 
+    def test_generic_session_start_leaves_mode_for_server_identity_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ai" / "runtime" / "tmp").mkdir(parents=True)
+            result = run_hook(
+                _args(
+                    repo_root=root,
+                    project_id="proj_current_mode",
+                    provider="CODEX",
+                    session_ref="current-provider-ref",
+                    dry_run=True,
+                    trigger="session_start",
+                ),
+                environment={},
+            )
+        self.assertEqual("DRY_RUN", result["status"])
+        self.assertEqual("", result["mode"])
+        self.assertNotIn("mode", result["inject_body"])
+        self.assertNotIn("node", result["inject_body"])
+
     def test_patch_real_observer_overwrites_existing_observer(self) -> None:
         from universe_session_inject_hook import patch_mode_current_anchor
 
