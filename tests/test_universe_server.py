@@ -7600,6 +7600,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("featureProposalEvidenceItems", app)
         self.assertIn("Why this was proposed", app)
         self.assertIn("Source evidence is candidate-only", app)
+        self.assertIn("appendFeatureProposalReview", app)
+        self.assertIn("proposal-review-editor", app)
+        self.assertIn("Submit rejection", app)
+        self.assertNotIn("window.prompt(", app)
         self.assertIn("Start planning", app)
         self.assertIn("/explorations", app)
 

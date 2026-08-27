@@ -10423,23 +10423,89 @@ async function startFeatureNodePlanning(proposal) {
   );
 }
 
-async function reviewFeatureNodeProposal(proposalId, decision) {
+async function reviewFeatureNodeProposal(proposalId, decision, rationale) {
   const projectId = state.selectedProject?.project_id;
-  if (!projectId) return;
-  const rationale = window.prompt(
-    decision === "EXPLORE"
-      ? "Why should Universe explore this Feature?"
-      : "Why should Universe reject this proposal?"
-  );
-  if (!rationale?.trim()) return;
+  const reviewRationale = String(rationale || "").trim();
+  if (!projectId || !reviewRationale) return;
   await api(
     `/v1/feature-node-proposals/${encodeURIComponent(proposalId)}/reviews`,
-    { method: "POST", body: { decision, rationale: rationale.trim() } }
+    { method: "POST", body: { decision, rationale: reviewRationale } }
   );
   await refreshFeatureNodeProposals();
   await refreshFeatureSemanticGraph(projectId);
   renderDetails();
   toast(decision === "EXPLORE" ? "Feature exploration recorded" : "Feature proposal rejected");
+}
+
+function appendFeatureProposalReview(card, proposal) {
+  const actions = node("div", "detail-heading-actions");
+  const editor = node("div", "proposal-review-editor hidden");
+  const prompt = node("label", "proposal-review-prompt", "");
+  const rationale = node("textarea", "proposal-review-rationale");
+  rationale.rows = 3;
+  const error = node("small", "proposal-review-error", "");
+  const editorActions = node("div", "detail-heading-actions");
+  const submit = node("button", "primary-button compact-action", "Submit review");
+  const cancel = node("button", "secondary-button compact-action", "Cancel");
+  submit.type = "button";
+  cancel.type = "button";
+  let selectedDecision = "";
+
+  function openEditor(decision) {
+    selectedDecision = decision;
+    const rejecting = decision === "REJECT";
+    prompt.textContent = rejecting
+      ? "Why should Universe reject this proposal?"
+      : "Why should Universe explore this Feature?";
+    rationale.placeholder = rejecting
+      ? "Explain why this should not become a Feature Node."
+      : "Explain why this is worth exploring.";
+    submit.textContent = rejecting ? "Submit rejection" : "Submit exploration";
+    error.textContent = "";
+    editor.classList.remove("hidden");
+    rationale.focus();
+  }
+
+  for (const decision of ["EXPLORE", "REJECT"]) {
+    const button = node(
+      "button",
+      "secondary-button compact-action",
+      decision === "EXPLORE" ? "Explore" : "Reject"
+    );
+    button.type = "button";
+    button.addEventListener("click", () => openEditor(decision));
+    actions.append(button);
+  }
+
+  cancel.addEventListener("click", () => {
+    selectedDecision = "";
+    rationale.value = "";
+    error.textContent = "";
+    editor.classList.add("hidden");
+  });
+  submit.addEventListener("click", async () => {
+    if (!selectedDecision || !rationale.value.trim()) {
+      error.textContent = "A rationale is required.";
+      return;
+    }
+    submit.disabled = true;
+    cancel.disabled = true;
+    try {
+      await reviewFeatureNodeProposal(
+        proposal.proposal_id,
+        selectedDecision,
+        rationale.value
+      );
+    } catch (reviewError) {
+      toast(reviewError.message, true);
+      submit.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+
+  editorActions.append(submit, cancel);
+  editor.append(prompt, rationale, error, editorActions);
+  card.append(actions, editor);
 }
 
 function featureProposalEvidenceItems(proposal) {
@@ -10571,22 +10637,7 @@ function renderFeatureNodeProposalDetails() {
     }
     appendFeatureProposalEvidence(card, proposal);
     if (proposal.state === "PROPOSAL_ONLY") {
-      const actions = node("div", "detail-heading-actions");
-      for (const decision of ["EXPLORE", "REJECT"]) {
-        const button = node(
-          "button",
-          "secondary-button compact-action",
-          decision === "EXPLORE" ? "Explore" : "Reject"
-        );
-        button.type = "button";
-        button.addEventListener("click", () =>
-          reviewFeatureNodeProposal(proposal.proposal_id, decision).catch((error) =>
-            toast(error.message, true)
-          )
-        );
-        actions.append(button);
-      }
-      card.append(actions);
+      appendFeatureProposalReview(card, proposal);
     } else {
       if (proposal.review?.rationale) {
         card.append(node("small", "", `Rationale · ${proposal.review.rationale}`));

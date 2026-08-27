@@ -1563,6 +1563,32 @@ body.inspector-open .inspector {
   font-weight: 700;
 }
 
+.proposal-review-editor {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+}
+
+.proposal-review-prompt {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.proposal-review-rationale {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+}
+
+.proposal-review-error {
+  min-height: 1em;
+  color: var(--danger, #ef6b73);
+}
+
 .detail-grid {
   display: grid;
   grid-template-columns: 82px minmax(0, 1fr);
