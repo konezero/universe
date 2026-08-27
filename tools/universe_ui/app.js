@@ -4538,6 +4538,7 @@ async function selectProject(
     memoryBatchConfigResult,
     memoryBatchRunResult,
     memoryCandidateResult,
+    featureProposalResult,
     workLoopResult,
     semanticGraphResult,
   ] = await Promise.all([
@@ -4601,6 +4602,9 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`
     ).catch(() => ({ candidates: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals`
+    ).catch(() => ({ proposals: [] })),
     api(`/v1/projects/${encodeURIComponent(projectId)}/work-loop`).catch(
       () => ({
         predictions: [],
@@ -4649,6 +4653,7 @@ async function selectProject(
   state.memoryBatchConfigs = memoryBatchConfigResult.configs || [];
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
   state.memoryCandidates = memoryCandidateResult.candidates || [];
+  state.featureNodeProposals = featureProposalResult.proposals || [];
   state.workLoop = workLoopResult || null;
   state.semanticGraph = semanticGraphResult || null;
   const universeGoalResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
@@ -10372,6 +10377,116 @@ function selectGraphNode(event) {
   showInspectorTab("details");
 }
 
+async function refreshFeatureNodeProposals() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals`
+  );
+  state.featureNodeProposals = result.proposals || [];
+}
+
+async function generateFeatureNodeProposals() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals/generate`,
+    { method: "POST", body: {} }
+  );
+  state.featureNodeProposals = result.proposals || [];
+  await refreshFeatureSemanticGraph(projectId);
+  renderDetails();
+  toast(
+    result.created_count
+      ? `${result.created_count} Proposed Node candidate(s) recorded`
+      : "Proposed Nodes already current"
+  );
+}
+
+async function reviewFeatureNodeProposal(proposalId, decision) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const rationale = window.prompt(
+    decision === "EXPLORE"
+      ? "Why should Universe explore this Feature?"
+      : "Why should Universe reject this proposal?"
+  );
+  if (!rationale?.trim()) return;
+  await api(
+    `/v1/feature-node-proposals/${encodeURIComponent(proposalId)}/reviews`,
+    { method: "POST", body: { decision, rationale: rationale.trim() } }
+  );
+  await refreshFeatureNodeProposals();
+  await refreshFeatureSemanticGraph(projectId);
+  renderDetails();
+  toast(decision === "EXPLORE" ? "Feature exploration recorded" : "Feature proposal rejected");
+}
+
+function renderFeatureNodeProposalDetails() {
+  const proposals = state.featureNodeProposals || [];
+  const group = node("div", "detail-group");
+  const heading = node("div", "detail-heading-row");
+  heading.append(node("h3", "", `Proposed Nodes (${proposals.length})`));
+  const generate = node("button", "secondary-button compact-action", "Discover");
+  generate.type = "button";
+  generate.title = "Build review-only Feature Node proposals from selected project evidence";
+  generate.addEventListener("click", () =>
+    generateFeatureNodeProposals().catch((error) => toast(error.message, true))
+  );
+  heading.append(generate);
+  group.append(heading);
+  group.append(
+    node(
+      "p",
+      "empty-copy",
+      "Explore records product intent only. It does not create a Feature Node, Goal, Todo, Task Frame, authority, or RAG adoption."
+    )
+  );
+  if (!proposals.length) {
+    group.append(node("p", "empty-copy", "No Proposed Nodes yet."));
+    return group;
+  }
+  for (const proposal of proposals.slice(0, 12)) {
+    const card = node("div", "context-card");
+    card.append(
+      node("strong", "", `${proposal.state} · ${proposal.proposal_kind} · ${proposal.title}`),
+      node(
+        "small",
+        "",
+        `${Math.round(Number(proposal.confidence || 0) * 100)}% · ${(proposal.evidence_refs || []).length} evidence · ${proposal.proposal_id}`
+      )
+    );
+    if (proposal.intent_text) {
+      card.append(node("p", "empty-copy", proposal.intent_text));
+    }
+    if (proposal.target_node_ref) {
+      card.append(node("small", "", `Existing target · ${proposal.target_node_ref}`));
+    }
+    if (proposal.state === "PROPOSAL_ONLY") {
+      const actions = node("div", "detail-heading-actions");
+      for (const decision of ["EXPLORE", "REJECT"]) {
+        const button = node(
+          "button",
+          "secondary-button compact-action",
+          decision === "EXPLORE" ? "Explore" : "Reject"
+        );
+        button.type = "button";
+        button.addEventListener("click", () =>
+          reviewFeatureNodeProposal(proposal.proposal_id, decision).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        actions.append(button);
+      }
+      card.append(actions);
+    } else if (proposal.review?.rationale) {
+      card.append(node("small", "", `Rationale · ${proposal.review.rationale}`));
+    }
+    group.append(card);
+  }
+  return group;
+}
+
 async function refreshSelectedWorkLoop() {
   const projectId = state.selectedProject?.project_id;
   if (!projectId) return;
@@ -10697,6 +10812,7 @@ function renderDetails() {
   elements.details.append(todoGroup);
 
   if (state.selectedProject) {
+    elements.details.append(renderFeatureNodeProposalDetails());
     elements.details.append(renderWorkLoopDetails());
   }
 

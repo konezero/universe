@@ -276,6 +276,11 @@ from universe_app.work_loop_prediction import (
     build_result_fanout,
     build_work_loop_predictions,
 )
+from universe_app.feature_node_proposal import (
+    FEATURE_NODE_PROPOSAL_DECISIONS,
+    FEATURE_NODE_PROPOSAL_SCHEMA,
+    build_feature_node_proposals,
+)
 from runtime_state_trust_gate import is_active_ing_state
 from universe_file_index import (
     FileIndexError,
@@ -5459,6 +5464,23 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS feature_node_project_order
                 ON feature_node(project_id, updated_at DESC, feature_id);
+
+                CREATE TABLE IF NOT EXISTS feature_node_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('PROPOSAL_ONLY', 'EXPLORE', 'REJECTED', 'SUPERSEDED')),
+                    reviewed_by_role TEXT,
+                    rationale TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    UNIQUE(project_id, proposal_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_node_proposal_project_order
+                ON feature_node_proposal(project_id, updated_at DESC, proposal_id);
 
                 CREATE TABLE IF NOT EXISTS feature_expected_path (
                     expected_path_id TEXT PRIMARY KEY,
@@ -10963,6 +10985,173 @@ class UniverseStore:
                 (project["project_id"],),
             ).fetchall()
         return [self._feature_row(row) for row in rows]
+
+    @staticmethod
+    def _feature_node_proposal_row(row: sqlite3.Row) -> dict[str, Any]:
+        proposal = json.loads(row["proposal_json"])
+        proposal["state"] = str(row["state"])
+        proposal["created_at"] = str(row["created_at"])
+        proposal["updated_at"] = str(row["updated_at"])
+        proposal["review"] = (
+            {
+                "decision": str(row["state"]),
+                "reviewed_by_role": str(row["reviewed_by_role"]),
+                "rationale": str(row["rationale"] or ""),
+                "reviewed_at": str(row["reviewed_at"]),
+            }
+            if row["reviewed_at"] is not None
+            else None
+        )
+        return proposal
+
+    def generate_feature_node_proposals(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        proposals = build_feature_node_proposals(
+            project_id=project["project_id"],
+            memories=self.list_project_memories(project["project_id"], limit=200),
+            memory_candidates=self.list_memory_candidates(
+                project["project_id"], limit=200
+            ),
+            feature_nodes=self.list_feature_nodes(project["project_id"]),
+        )
+        created_count = 0
+        persisted: list[dict[str, Any]] = []
+        now = utc_now()
+        with self._connection() as connection:
+            for proposal in proposals:
+                existing = connection.execute(
+                    "SELECT * FROM feature_node_proposal WHERE project_id = ? AND proposal_digest = ?",
+                    (project["project_id"], proposal["proposal_digest"]),
+                ).fetchone()
+                if existing is not None:
+                    persisted.append(self._feature_node_proposal_row(existing))
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO feature_node_proposal(
+                        proposal_id, project_id, proposal_digest, proposal_json, state,
+                        reviewed_by_role, rationale, created_at, updated_at, reviewed_at
+                    ) VALUES (?, ?, ?, ?, 'PROPOSAL_ONLY', NULL, NULL, ?, ?, NULL)
+                    """,
+                    (
+                        proposal["proposal_id"],
+                        project["project_id"],
+                        proposal["proposal_digest"],
+                        _canonical_json(proposal),
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM feature_node_proposal WHERE proposal_id = ?",
+                    (proposal["proposal_id"],),
+                ).fetchone()
+                persisted.append(self._feature_node_proposal_row(row))
+                created_count += 1
+        return {
+            "schema": "universe.feature-node-proposal-generation.v1",
+            "project_id": project["project_id"],
+            "proposals": persisted,
+            "created_count": created_count,
+            "replayed_count": len(persisted) - created_count,
+            "effects": {
+                "feature_node_created": False,
+                "goal_created": False,
+                "todo_created": False,
+                "task_frame_created": False,
+                "authority_created": False,
+                "execution_assignment_created": False,
+                "rag_adopted": False,
+            },
+            "next_operation": "USER_REVIEW_ONLY",
+        }
+
+    def list_feature_node_proposals(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM feature_node_proposal
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, proposal_id
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 200))),
+            ).fetchall()
+        return [self._feature_node_proposal_row(row) for row in rows]
+
+    def get_feature_node_proposal(self, proposal_id: str) -> dict[str, Any]:
+        normalized = _identifier(proposal_id, "proposal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM feature_node_proposal WHERE proposal_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_NOT_FOUND",
+                "Feature Node proposal does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._feature_node_proposal_row(row)
+
+    def review_feature_node_proposal(
+        self, proposal_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_node_proposal_review",
+            required=frozenset({"decision", "rationale"}),
+        )
+        decision = _identifier(request["decision"], "decision").upper()
+        if decision not in FEATURE_NODE_PROPOSAL_DECISIONS:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_DECISION_INVALID",
+                "decision must be EXPLORE or REJECT",
+                HTTPStatus.CONFLICT,
+            )
+        next_state = "EXPLORE" if decision == "EXPLORE" else "REJECTED"
+        rationale = _required_text(request["rationale"], "rationale")
+        if len(rationale) > 1000:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_REVIEW_INVALID",
+                "rationale is too long",
+            )
+        current = self.get_feature_node_proposal(proposal_id)
+        if current["state"] == next_state:
+            if (current.get("review") or {}).get("rationale") != rationale:
+                raise UniverseError(
+                    "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT",
+                    "proposal already has a different rationale",
+                    HTTPStatus.CONFLICT,
+                )
+            return current, False
+        if current["state"] != "PROPOSAL_ONLY":
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT",
+                "proposal already has another review decision",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE feature_node_proposal
+                SET state = ?, reviewed_by_role = 'USER', rationale = ?,
+                    updated_at = ?, reviewed_at = ?
+                WHERE proposal_id = ? AND state = 'PROPOSAL_ONLY'
+                """,
+                (next_state, rationale, now, now, current["proposal_id"]),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT",
+                    "proposal review state changed",
+                    HTTPStatus.CONFLICT,
+                )
+        return self.get_feature_node_proposal(current["proposal_id"]), True
 
     def get_feature_node(self, feature_id: str) -> dict[str, Any]:
         fid = _identifier(feature_id, "feature_id")
@@ -19079,6 +19268,40 @@ class UniverseStore:
                         f"MEMORY_CANDIDATE_{relation_type}", source_node, target_node,
                         f"universe://memory-candidates/{candidate_id}",
                     )
+
+        for proposal in self.list_feature_node_proposals(project_id, limit=200):
+            proposal_id = str(proposal.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            proposal_ref = f"universe://feature-node-proposals/{proposal_id}"
+            proposal_node = add_node(
+                "FEATURE_NODE_PROPOSAL",
+                proposal_id,
+                str(proposal.get("title") or proposal_id),
+                str(proposal.get("state") or "PROPOSAL_ONLY"),
+                "FEATURE_NODE_PROPOSAL",
+                proposal_ref,
+                {
+                    "proposal_id": proposal_id,
+                    "project_id": proposal.get("project_id"),
+                    "proposal_kind": proposal.get("proposal_kind"),
+                    "target_node_ref": proposal.get("target_node_ref"),
+                    "cluster_refs": proposal.get("cluster_refs") or [],
+                    "evidence_refs": proposal.get("evidence_refs") or [],
+                    "evidence_count": len(proposal.get("evidence_refs") or []),
+                    "confidence": proposal.get("confidence"),
+                    "proposal_digest": proposal.get("proposal_digest"),
+                    "review": proposal.get("review"),
+                    "effects": proposal.get("effects"),
+                    "body_in_graph": False,
+                },
+            )
+            add_edge(
+                "PROJECT_HAS_FEATURE_NODE_PROPOSAL",
+                project_node,
+                proposal_node,
+                proposal_ref,
+            )
 
         room_nodes_by_id: dict[str, str] = {}
         artifact_nodes_by_id: dict[str, str] = {}
@@ -34194,6 +34417,45 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        feature_proposal_detail = re.fullmatch(
+            r"/v1/feature-node-proposals/([^/]+)", path
+        )
+        if feature_proposal_detail is not None:
+            try:
+                proposal = self.server.store.get_feature_node_proposal(
+                    unquote(feature_proposal_detail.group(1))
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_PROPOSAL_COLLECTED",
+                        "proposal": proposal,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_feature_proposals = re.fullmatch(
+            r"/v1/projects/([^/]+)/feature-node-proposals", path
+        )
+        if project_feature_proposals is not None:
+            try:
+                project_id = unquote(project_feature_proposals.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_PROPOSALS_COLLECTED",
+                        "project_id": project_id,
+                        "proposals": self.server.store.list_feature_node_proposals(
+                            project_id
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
         if feature_detail is not None:
             try:
@@ -36310,6 +36572,60 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         if created
                         else "PROJECT_REFRESHED",
                         "project": project,
+                    },
+                )
+                return
+            project_feature_proposal_generation = re.fullmatch(
+                r"/v1/projects/([^/]+)/feature-node-proposals/generate", path
+            )
+            if project_feature_proposal_generation is not None:
+                if body != {}:
+                    raise UniverseError(
+                        "FEATURE_NODE_PROPOSAL_GENERATION_INVALID",
+                        "proposal generation body must be an empty object",
+                    )
+                result = self.server.store.generate_feature_node_proposals(
+                    unquote(project_feature_proposal_generation.group(1))
+                )
+                self._send(
+                    HTTPStatus.CREATED
+                    if result["created_count"]
+                    else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FEATURE_NODE_PROPOSALS_RECORDED"
+                            if result["created_count"]
+                            else "FEATURE_NODE_PROPOSALS_REPLAYED"
+                        ),
+                        **result,
+                    },
+                )
+                return
+            feature_proposal_reviews = re.fullmatch(
+                r"/v1/feature-node-proposals/([^/]+)/reviews", path
+            )
+            if feature_proposal_reviews is not None:
+                proposal, changed = self.server.store.review_feature_node_proposal(
+                    unquote(feature_proposal_reviews.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FEATURE_NODE_PROPOSAL_REVIEW_RECORDED"
+                            if changed
+                            else "FEATURE_NODE_PROPOSAL_REVIEW_REPLAYED"
+                        ),
+                        "proposal": proposal,
+                        "feature_node_created": False,
+                        "goal_created": False,
+                        "todo_created": False,
+                        "task_frame_created": False,
+                        "authority_created": False,
+                        "execution_assignment_created": False,
+                        "rag_adopted": False,
                     },
                 )
                 return

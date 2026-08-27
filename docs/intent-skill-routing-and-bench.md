@@ -262,6 +262,63 @@ Intent Gate is the real-time routing surface. Skill Bench is the asynchronous
 learning surface. Intent Gate emits observations but never authors or installs
 a Skill.
 
+### Promotion and Registry Tiers
+
+Skill authoring and Skill Pack release are separate promotion pipelines. A
+newly generated Skill may be exercised across local sessions before it becomes
+an official Universe source, but that experimental registration must not make
+it an adopted default.
+
+```text
+SESSION_DRAFT
+-> BENCH_CANDIDATE
+-> EXPERIMENTAL_REGISTRY
+-> SOURCE_ADOPTED
+-> PACKAGED
+-> VERIFIED
+-> ADOPTED
+```
+
+The visibility and resolution boundary for each state is:
+
+| State | Visibility and use |
+| --- | --- |
+| `SESSION_DRAFT` | Temporary use by the authoring session only. |
+| `BENCH_CANDIDATE` | Review, edit, compare, reject, or supersede in Bench; not a default resolver target. |
+| `EXPERIMENTAL_REGISTRY` | Explicitly enabled local experimentation across sessions in the same Universe; always identified as experimental. |
+| `SOURCE_ADOPTED` | User-approved canonical Universe Skill source with version, provenance, capability, effect, and evidence metadata. |
+| `PACKAGED` | Deterministic Skill Pack candidate; no Registry activation. |
+| `VERIFIED` | Digest and manifest verified and eligible for Release adoption; still inactive. |
+| `ADOPTED` | Included in an immutable current Registry snapshot and eligible for normal resolution within its scope. |
+
+Two explicit user decisions remain distinct:
+
+1. **Skill source adoption** promotes an experimental Skill into the canonical
+   Universe source tree.
+2. **Skill Pack Release adoption** promotes one verified Pack version into the
+   current immutable Registry snapshot.
+
+Registering a Skill in the Experimental Registry is not either adoption. It
+exists so more than one session can dogfood the exact candidate while the
+resolver preserves stable adopted defaults and records experimental use.
+Rejection removes eligibility for future resolution without rewriting past
+receipts. A replacement creates a new candidate or version and links the prior
+record through `supersedes`.
+
+The first implementation slice for this promotion pipeline is:
+
+```text
+Bench Candidate
+-> explicit local experimental registration
+-> cross-session resolution only when experimental use is enabled
+-> usage and validation evidence returned to Bench
+-> user source-adoption decision
+-> canonical source handoff for the next deterministic Pack build
+```
+
+This slice must not auto-author canonical source, auto-build a Pack, or
+auto-adopt a Release.
+
 ```text
 fallback execution
 -> Skill Gap Observation

@@ -262,6 +262,8 @@ The durable planning order is now represented directly by the local runtime:
 
 Read routes are `GET /v1/projects/{project_id}/feature-nodes`, `GET /v1/feature-nodes/{feature_id}`, and `GET /v1/goals/{goal_id}/work-plans`. The semantic project graph projects `FEATURE_NODE`, `EXPECTED_PATH`, `GOAL_WORK_PLAN`, adoption and provenance edges without embedding specification or full Work Plan bodies.
 
+The upstream Memory and Conductor conversation to Proposed Feature Node pipeline, its human decision boundaries, Goal Start receipt, and execution-driver sequence are specified in `docs/memory-to-feature-automation.md`. That pipeline extends this architecture; it does not create a parallel Feature, Goal, or Task Frame subsystem.
+
 ## 9. Non-goals (program-level)
 
 - Replacing Career governance or inventing authority from chat/attach.

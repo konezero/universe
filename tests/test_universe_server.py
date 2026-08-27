@@ -28,6 +28,7 @@ JsonObject = dict[str, Any]
 
 
 from core_release import build_release  # noqa: E402
+from universe_app.feature_node_proposal import FEATURE_NODE_PROPOSAL_SCHEMA  # noqa: E402
 from host_profile import HostProfileStore  # noqa: E402
 from todo_mutation_gateway import TodoMutationGateway, TodoMutationGatewayError  # noqa: E402
 from project_master_host import (  # noqa: E402
@@ -7559,6 +7560,127 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("MASTER_STREAM", events[0]["payload"]["type"])
         self.assertEqual("partial answer", events[0]["payload"]["delta"])
+
+    def test_feature_node_proposals_are_reviewable_and_never_materialize_work(self) -> None:
+        self.server.store.register_project(self.registration())
+        status, memory_payload = self.request(
+            "POST",
+            "/v1/projects/GCS/memories",
+            {
+                "title": "Rust native semantic editor protocol",
+                "body": "Use compact symbol IR for agent editing.",
+                "state": "DECISION_NOTE",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        memory_id = memory_payload["memory"]["memory_id"]
+
+        status, generated = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-node-proposals/generate",
+            {},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual(1, generated["created_count"])
+        self.assertEqual(0, generated["replayed_count"])
+        proposal = generated["proposals"][0]
+        self.assertEqual(FEATURE_NODE_PROPOSAL_SCHEMA, proposal["schema"])
+        self.assertEqual("NEW_FEATURE", proposal["proposal_kind"])
+        self.assertEqual("PROPOSAL_ONLY", proposal["state"])
+        self.assertEqual(
+            [f"universe://memories/{memory_id}"], proposal["evidence_refs"]
+        )
+        self.assertTrue(all(value is False for value in generated["effects"].values()))
+
+        app = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("/feature-node-proposals", app)
+        self.assertIn("renderFeatureNodeProposalDetails", app)
+        self.assertIn("Explore records product intent only", app)
+
+        status, listed = self.request(
+            "GET", "/v1/projects/GCS/feature-node-proposals", None, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            [proposal["proposal_id"]],
+            [item["proposal_id"] for item in listed["proposals"]],
+        )
+        status, detail = self.request(
+            "GET",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}",
+            None,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(proposal["proposal_digest"], detail["proposal"]["proposal_digest"])
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        proposal_nodes = [
+            node
+            for node in graph["nodes"]
+            if node["entity_type"] == "FEATURE_NODE_PROPOSAL"
+        ]
+        self.assertEqual(1, len(proposal_nodes))
+        self.assertEqual(1, proposal_nodes[0]["data"]["evidence_count"])
+        self.assertFalse(proposal_nodes[0]["data"]["body_in_graph"])
+        self.assertIn(
+            "PROJECT_HAS_FEATURE_NODE_PROPOSAL",
+            {edge["edge_type"] for edge in graph["edges"]},
+        )
+
+        review_request = {
+            "decision": "EXPLORE",
+            "rationale": "Generate alternative Expected Paths",
+        }
+        status, reviewed = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/reviews",
+            review_request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("EXPLORE", reviewed["proposal"]["state"])
+        self.assertEqual("USER", reviewed["proposal"]["review"]["reviewed_by_role"])
+        self.assertFalse(reviewed["feature_node_created"])
+        self.assertFalse(reviewed["goal_created"])
+        self.assertFalse(reviewed["todo_created"])
+        self.assertEqual([], self.server.store.list_feature_nodes("GCS"))
+        self.assertEqual([], self.server.store.list_project_goals("GCS"))
+        self.assertEqual([], [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"])
+
+        status, replayed_review = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/reviews",
+            review_request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "FEATURE_NODE_PROPOSAL_REVIEW_REPLAYED", replayed_review["status"]
+        )
+        status, conflict = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/reviews",
+            {"decision": "REJECT", "rationale": "Changed decision"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT", conflict["error_code"]
+        )
+
+        status, replayed_generation = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-node-proposals/generate",
+            {},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(0, replayed_generation["created_count"])
+        self.assertEqual(1, replayed_generation["replayed_count"])
+        self.assertEqual("EXPLORE", replayed_generation["proposals"][0]["state"])
 
     def test_feature_node_expected_path_adoption_http_and_graph(self) -> None:
         self.server.store.register_project(self.registration())
