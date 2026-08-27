@@ -10442,6 +10442,93 @@ async function reviewFeatureNodeProposal(proposalId, decision) {
   toast(decision === "EXPLORE" ? "Feature exploration recorded" : "Feature proposal rejected");
 }
 
+function featureProposalEvidenceItems(proposal) {
+  const memoriesById = new Map(
+    (state.memories || []).map((memory) => [memory.memory_id, memory])
+  );
+  const candidatesById = new Map(
+    (state.memoryCandidates || []).map((candidate) => [
+      candidate.candidate_id,
+      candidate,
+    ])
+  );
+  return (proposal.evidence_refs || []).map((evidenceRef) => {
+    const evidenceId = String(evidenceRef || "").split("/").filter(Boolean).pop() || "";
+    const memory = memoriesById.get(evidenceId);
+    if (memory) {
+      return {
+        kind: "Memory",
+        title: memory.title || evidenceId,
+        meta: [memory.state, memory.link_state].filter(Boolean).join(" · "),
+        detail: truncate(memory.body || "Memory body unavailable.", 360),
+        hasSourceBody: Boolean(String(memory.body || "").trim()),
+      };
+    }
+    const candidate = candidatesById.get(evidenceId);
+    if (candidate) {
+      const upstream = (candidate.relations || [])
+        .map((relation) => candidatesById.get(relation.candidate_id))
+        .filter(Boolean)
+        .map((source) => source.summary)
+        .filter(Boolean);
+      const upstreamText = upstream.length
+        ? `Upstream summaries: ${upstream.join(" | ")}`
+        : "No upstream summary is available.";
+      return {
+        kind: "Memory candidate",
+        title: candidate.summary || evidenceId,
+        meta: [candidate.kind, candidate.stage, candidate.state]
+          .filter(Boolean)
+          .join(" · "),
+        detail: truncate(upstreamText, 360),
+        hasSourceBody: false,
+      };
+    }
+    return {
+      kind: "Evidence",
+      title: evidenceId || "Unknown evidence",
+      meta: "Reference only",
+      detail: String(evidenceRef || "Evidence reference unavailable."),
+      hasSourceBody: false,
+    };
+  });
+}
+
+function appendFeatureProposalEvidence(card, proposal) {
+  const evidenceItems = featureProposalEvidenceItems(proposal);
+  const evidence = node("details", "proposal-evidence");
+  evidence.open = true;
+  evidence.append(
+    node(
+      "summary",
+      "",
+      `Why this was proposed · ${evidenceItems.length} source${evidenceItems.length === 1 ? "" : "s"}`
+    )
+  );
+  if (!evidenceItems.length) {
+    evidence.append(node("p", "empty-copy", "No source evidence is available."));
+  }
+  for (const item of evidenceItems) {
+    const row = node("div", "proposal-evidence-item");
+    row.append(
+      node("small", "proposal-evidence-meta", `${item.kind} · ${item.meta}`),
+      node("strong", "", item.title),
+      node("p", "empty-copy", item.detail)
+    );
+    evidence.append(row);
+  }
+  if (evidenceItems.length && !evidenceItems.some((item) => item.hasSourceBody)) {
+    evidence.append(
+      node(
+        "p",
+        "proposal-evidence-warning",
+        "Review warning · Source evidence is candidate-only; no original Memory body is attached."
+      )
+    );
+  }
+  card.append(evidence);
+}
+
 function renderFeatureNodeProposalDetails() {
   const proposals = state.featureNodeProposals || [];
   const group = node("div", "detail-group");
@@ -10459,7 +10546,7 @@ function renderFeatureNodeProposalDetails() {
     node(
       "p",
       "empty-copy",
-      "Explore records the user review. Start planning then creates one Feature Node, bounded Planning Context, and Meeting Room; it never creates a Goal, Todo, Task Frame, authority, or RAG adoption."
+      "Read the source evidence before choosing Explore or Reject. Start planning creates one Feature Node, bounded Planning Context, and Meeting Room; it never creates a Goal, Todo, Task Frame, authority, or RAG adoption."
     )
   );
   if (!proposals.length) {
@@ -10467,7 +10554,7 @@ function renderFeatureNodeProposalDetails() {
     return group;
   }
   for (const proposal of proposals.slice(0, 12)) {
-    const card = node("div", "context-card");
+    const card = node("div", "context-card proposal-card");
     card.append(
       node("strong", "", `${proposal.state} · ${proposal.proposal_kind} · ${proposal.title}`),
       node(
@@ -10476,12 +10563,13 @@ function renderFeatureNodeProposalDetails() {
         `${Math.round(Number(proposal.confidence || 0) * 100)}% · ${(proposal.evidence_refs || []).length} evidence · ${proposal.proposal_id}`
       )
     );
-    if (proposal.intent_text) {
+    if (proposal.intent_text && proposal.intent_text !== proposal.title) {
       card.append(node("p", "empty-copy", proposal.intent_text));
     }
     if (proposal.target_node_ref) {
       card.append(node("small", "", `Existing target · ${proposal.target_node_ref}`));
     }
+    appendFeatureProposalEvidence(card, proposal);
     if (proposal.state === "PROPOSAL_ONLY") {
       const actions = node("div", "detail-heading-actions");
       for (const decision of ["EXPLORE", "REJECT"]) {

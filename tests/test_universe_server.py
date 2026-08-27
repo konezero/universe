@@ -7597,6 +7597,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         app = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
         self.assertIn("/feature-node-proposals", app)
         self.assertIn("renderFeatureNodeProposalDetails", app)
+        self.assertIn("featureProposalEvidenceItems", app)
+        self.assertIn("Why this was proposed", app)
+        self.assertIn("Source evidence is candidate-only", app)
         self.assertIn("Start planning", app)
         self.assertIn("/explorations", app)
 
