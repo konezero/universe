@@ -24,6 +24,11 @@ struct Config {
     anchor_ref: String,
     token: String,
     shell: String,
+    cwd: Option<PathBuf>,
+    shell_args: Vec<String>,
+    environment: Vec<(String, String)>,
+    cols: u16,
+    rows: u16,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -36,9 +41,11 @@ struct HostSnapshot {
     started_at_unix_ms: u128,
     attachment_generation: u64,
     attached_supervisor_id: Option<String>,
-    runtime_state: &'static str,
+    runtime_state: String,
     shell: String,
+    cwd: Option<String>,
     child_pid: Option<u32>,
+    child_exit_code: Option<u32>,
     handle_kinds: [&'static str; 3],
     auth_token: String,
 }
@@ -49,7 +56,10 @@ struct HostRequest {
     action: String,
     supervisor_id: Option<String>,
     input: Option<String>,
+    input_base64: Option<String>,
     after_cursor: Option<u64>,
+    cols: Option<u16>,
+    rows: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,9 +86,11 @@ struct PublicSnapshot {
     started_at_unix_ms: u128,
     attachment_generation: u64,
     attached_supervisor_id: Option<String>,
-    runtime_state: &'static str,
+    runtime_state: String,
     shell: String,
+    cwd: Option<String>,
     child_pid: Option<u32>,
+    child_exit_code: Option<u32>,
     handle_kinds: [&'static str; 3],
 }
 
@@ -131,25 +143,33 @@ impl OutputBuffer {
 }
 
 struct TerminalRuntime {
-    _master: Mutex<Box<dyn MasterPty>>,
+    master: Mutex<Box<dyn MasterPty>>,
     writer: Mutex<Box<dyn Write + Send>>,
-    _child: Mutex<Box<dyn portable_pty::Child>>,
+    child: Mutex<Box<dyn portable_pty::Child>>,
     output: Arc<Mutex<OutputBuffer>>,
 }
 
 impl TerminalRuntime {
-    fn spawn(shell: &str) -> Result<(Self, Option<u32>), String> {
+    fn spawn(config: &Config) -> Result<(Self, Option<u32>), String> {
         let pair = NativePtySystem::default()
             .openpty(PtySize {
-                rows: 30,
-                cols: 120,
+                rows: config.rows,
+                cols: config.cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|error| error.to_string())?;
+        let mut command = CommandBuilder::new(&config.shell);
+        command.args(&config.shell_args);
+        if let Some(cwd) = config.cwd.as_deref() {
+            command.cwd(cwd);
+        }
+        for (name, value) in &config.environment {
+            command.env(name, value);
+        }
         let child = pair
             .slave
-            .spawn_command(CommandBuilder::new(shell))
+            .spawn_command(command)
             .map_err(|error| error.to_string())?;
         let child_pid = child.process_id();
         let mut reader = pair
@@ -180,22 +200,22 @@ impl TerminalRuntime {
         });
         Ok((
             Self {
-                _master: Mutex::new(pair.master),
+                master: Mutex::new(pair.master),
                 writer: Mutex::new(writer),
-                _child: Mutex::new(child),
+                child: Mutex::new(child),
                 output,
             },
             child_pid,
         ))
     }
 
-    fn write(&self, input: &str) -> Result<(), String> {
+    fn write(&self, input: &[u8]) -> Result<(), String> {
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| "terminal writer lock is unavailable".to_owned())?;
         writer
-            .write_all(input.as_bytes())
+            .write_all(input)
             .and_then(|_| writer.flush())
             .map_err(|error| error.to_string())
     }
@@ -205,6 +225,31 @@ impl TerminalRuntime {
             .lock()
             .map(|output| output.read_after(cursor))
             .map_err(|_| "terminal output lock is unavailable".to_owned())
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        if cols == 0 || rows == 0 {
+            return Err("terminal size must be positive".to_owned());
+        }
+        self.master
+            .lock()
+            .map_err(|_| "terminal master lock is unavailable".to_owned())?
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn child_status(&self) -> Result<Option<u32>, String> {
+        self.child
+            .lock()
+            .map_err(|_| "terminal child lock is unavailable".to_owned())?
+            .try_wait()
+            .map(|status| status.map(|value| value.exit_code()))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -219,9 +264,11 @@ impl From<&HostSnapshot> for PublicSnapshot {
             started_at_unix_ms: value.started_at_unix_ms,
             attachment_generation: value.attachment_generation,
             attached_supervisor_id: value.attached_supervisor_id.clone(),
-            runtime_state: value.runtime_state,
+            runtime_state: value.runtime_state.clone(),
             shell: value.shell.clone(),
+            cwd: value.cwd.clone(),
             child_pid: value.child_pid,
+            child_exit_code: value.child_exit_code,
             handle_kinds: value.handle_kinds,
         }
     }
@@ -242,25 +289,81 @@ fn required_arg(args: &[String], name: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+fn optional_arg(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|value| value == name)
+        .and_then(|position| args.get(position + 1))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn repeated_args(args: &[String], name: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == name {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{name} requires a value"))?;
+            values.push(value.clone());
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(values)
+}
+
+fn terminal_dimension(args: &[String], name: &str, default: u16) -> Result<u16, String> {
+    match optional_arg(args, name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("{name} must be an integer between 1 and 65535")),
+    }
+}
+
+fn environment_overlays(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    repeated_args(args, "--env")?
+        .into_iter()
+        .map(|entry| {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or_else(|| "--env requires NAME=VALUE".to_owned())?;
+            if name.trim().is_empty() {
+                return Err("--env name must not be empty".to_owned());
+            }
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 fn parse_config() -> Result<Config, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("serve") {
         return Err(
-            "usage: universe-session-host serve --state-file PATH --anchor-ref REF --token TOKEN"
+            "usage: universe-session-host serve --state-file PATH --anchor-ref REF --token TOKEN [--shell PATH] [--cwd PATH] [--shell-arg VALUE] [--env NAME=VALUE] [--cols N] [--rows N]"
                 .to_owned(),
         );
+    }
+    let cwd = optional_arg(&args, "--cwd").map(PathBuf::from);
+    if let Some(path) = cwd.as_deref()
+        && !path.is_dir()
+    {
+        return Err("--cwd must name an existing directory".to_owned());
     }
     Ok(Config {
         state_file: PathBuf::from(required_arg(&args, "--state-file")?),
         anchor_ref: required_arg(&args, "--anchor-ref")?,
         token: required_arg(&args, "--token")?,
-        shell: args
-            .iter()
-            .position(|value| value == "--shell")
-            .and_then(|position| args.get(position + 1))
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "cmd.exe".to_owned()),
+        shell: optional_arg(&args, "--shell").unwrap_or_else(|| "cmd.exe".to_owned()),
+        cwd,
+        shell_args: repeated_args(&args, "--shell-arg")?,
+        environment: environment_overlays(&args)?,
+        cols: terminal_dimension(&args, "--cols", 120)?,
+        rows: terminal_dimension(&args, "--rows", 30)?,
     })
 }
 
@@ -336,6 +439,23 @@ fn require_attached_supervisor(
     Ok(())
 }
 
+fn refresh_runtime_state(
+    state: &mut HostSnapshot,
+    terminal: &TerminalRuntime,
+) -> Result<(), String> {
+    match terminal.child_status()? {
+        Some(exit_code) => {
+            state.runtime_state = "EXITED".to_owned();
+            state.child_exit_code = Some(exit_code);
+        }
+        None => {
+            state.runtime_state = "LIVE".to_owned();
+            state.child_exit_code = None;
+        }
+    }
+    Ok(())
+}
+
 fn apply_request(
     state: &mut HostSnapshot,
     request: HostRequest,
@@ -380,13 +500,23 @@ fn apply_request(
             if let Err(response) = require_attached_supervisor(state, &request) {
                 return *response;
             }
-            let Some(input) = request.input.as_deref() else {
-                return failure("HOST_INPUT_REQUIRED", "write requires input");
+            let input = match (request.input_base64.as_deref(), request.input.as_deref()) {
+                (Some(value), _) => match base64::engine::general_purpose::STANDARD.decode(value) {
+                    Ok(value) => value,
+                    Err(error) => return failure("HOST_INPUT_INVALID", error.to_string()),
+                },
+                (None, Some(value)) => value.as_bytes().to_vec(),
+                (None, None) => {
+                    return failure(
+                        "HOST_INPUT_REQUIRED",
+                        "write requires input_base64 or input",
+                    );
+                }
             };
             let Some(terminal) = terminal else {
                 return failure("HOST_TERMINAL_UNAVAILABLE", "terminal is unavailable");
             };
-            match terminal.write(input) {
+            match terminal.write(&input) {
                 Ok(()) => success(state),
                 Err(error) => failure("HOST_INPUT_WRITE_FAILED", error),
             }
@@ -401,6 +531,21 @@ fn apply_request(
             match terminal.read_after(request.after_cursor.unwrap_or(0)) {
                 Ok(output) => terminal_success(state, output),
                 Err(error) => failure("HOST_OUTPUT_READ_FAILED", error),
+            }
+        }
+        "resize" => {
+            if let Err(response) = require_attached_supervisor(state, &request) {
+                return *response;
+            }
+            let (Some(cols), Some(rows)) = (request.cols, request.rows) else {
+                return failure("HOST_SIZE_REQUIRED", "resize requires cols and rows");
+            };
+            let Some(terminal) = terminal else {
+                return failure("HOST_TERMINAL_UNAVAILABLE", "terminal is unavailable");
+            };
+            match terminal.resize(cols, rows) {
+                Ok(()) => success(state),
+                Err(error) => failure("HOST_RESIZE_FAILED", error),
             }
         }
         _ => failure("HOST_ACTION_UNSUPPORTED", "unsupported host action"),
@@ -457,10 +602,18 @@ fn handle_connection(
     };
     let before_generation = state.attachment_generation;
     let before_supervisor = state.attached_supervisor_id.clone();
+    let before_runtime_state = state.runtime_state.clone();
+    let before_exit_code = state.child_exit_code;
+    if let Err(error) = refresh_runtime_state(&mut state, &terminal) {
+        write_response(stream, &failure("HOST_CHILD_STATUS_FAILED", error));
+        return;
+    }
     let response = apply_request(&mut state, request, &shutdown, Some(&terminal));
     if response.status == "OK"
         && (before_generation != state.attachment_generation
-            || before_supervisor != state.attached_supervisor_id)
+            || before_supervisor != state.attached_supervisor_id
+            || before_runtime_state != state.runtime_state
+            || before_exit_code != state.child_exit_code)
         && let Err(error) = atomic_write_state(&state_file, &state)
     {
         write_response(stream, &failure("HOST_STATE_WRITE_FAILED", error));
@@ -476,7 +629,11 @@ fn serve(config: Config) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let address: SocketAddr = listener.local_addr().map_err(|error| error.to_string())?;
     let started_at = now_unix_ms();
-    let (terminal, child_pid) = TerminalRuntime::spawn(&config.shell)?;
+    let (terminal, child_pid) = TerminalRuntime::spawn(&config)?;
+    let cwd = config
+        .cwd
+        .as_deref()
+        .map(|path| path.to_string_lossy().into_owned());
     let state = HostSnapshot {
         schema: STATE_SCHEMA,
         host_id: format!("host-{}-{started_at:x}", process::id()),
@@ -486,9 +643,11 @@ fn serve(config: Config) -> Result<(), String> {
         started_at_unix_ms: started_at,
         attachment_generation: 0,
         attached_supervisor_id: None,
-        runtime_state: "LIVE",
+        runtime_state: "LIVE".to_owned(),
         shell: config.shell,
+        cwd,
         child_pid,
+        child_exit_code: None,
         handle_kinds: ["CONPTY", "INPUT_WRITER", "OUTPUT_READER"],
         auth_token: config.token,
     };
@@ -538,9 +697,11 @@ mod tests {
             started_at_unix_ms: 1,
             attachment_generation: 0,
             attached_supervisor_id: None,
-            runtime_state: "LIVE",
+            runtime_state: "LIVE".to_owned(),
             shell: "cmd.exe".to_owned(),
+            cwd: None,
             child_pid: Some(2),
+            child_exit_code: None,
             handle_kinds: ["CONPTY", "INPUT_WRITER", "OUTPUT_READER"],
             auth_token: "token".to_owned(),
         }
@@ -557,7 +718,10 @@ mod tests {
                 action: "attach".to_owned(),
                 supervisor_id: Some("supervisor-a".to_owned()),
                 input: None,
+                input_base64: None,
                 after_cursor: None,
+                cols: None,
+                rows: None,
             },
             &shutdown,
             None,
@@ -571,7 +735,10 @@ mod tests {
                 action: "attach".to_owned(),
                 supervisor_id: Some("supervisor-b".to_owned()),
                 input: None,
+                input_base64: None,
                 after_cursor: None,
+                cols: None,
+                rows: None,
             },
             &shutdown,
             None,
@@ -596,7 +763,10 @@ mod tests {
                 action: "attach".to_owned(),
                 supervisor_id: Some("supervisor-a".to_owned()),
                 input: None,
+                input_base64: None,
                 after_cursor: None,
+                cols: None,
+                rows: None,
             },
             &shutdown,
             None,

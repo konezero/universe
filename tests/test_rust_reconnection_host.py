@@ -4,8 +4,8 @@ import base64
 import json
 import os
 import shutil
-import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -13,7 +13,16 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+from universe_app.reconnection_host import (  # noqa: E402
+    ReconnectionHostRegistry,
+)
+from universe_app.windows_process import process_is_alive  # noqa: E402
+
+
 MANIFEST = ROOT / "tools" / "session_host" / "Cargo.toml"
+SUPERVISOR_CLIENT = ROOT / "tests" / "fixtures" / "reconnection_supervisor_client.py"
 UNIVERSE_CARGO = (
     Path(os.environ.get("LOCALAPPDATA", ""))
     / "Universe"
@@ -32,66 +41,6 @@ def cargo_executable() -> Path | None:
     if resolved:
         return Path(resolved)
     return UNIVERSE_CARGO if UNIVERSE_CARGO.is_file() else None
-
-
-def request(
-    endpoint: str,
-    token: str,
-    action: str,
-    supervisor_id: str | None = None,
-    *,
-    input_text: str | None = None,
-    after_cursor: int | None = None,
-):
-    host, port = endpoint.removeprefix("tcp://").rsplit(":", 1)
-    body = {"token": token, "action": action}
-    if supervisor_id is not None:
-        body["supervisor_id"] = supervisor_id
-    if input_text is not None:
-        body["input"] = input_text
-    if after_cursor is not None:
-        body["after_cursor"] = after_cursor
-    with socket.create_connection((host, int(port)), timeout=5) as client:
-        client.sendall(json.dumps(body).encode("utf-8") + b"\n")
-        response = bytearray()
-        while True:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            response.extend(chunk)
-            if b"\n" in response:
-                break
-    return json.loads(response.split(b"\n", 1)[0])
-
-
-def wait_for_output(
-    endpoint: str,
-    token: str,
-    supervisor_id: str,
-    marker: bytes,
-    after_cursor: int,
-) -> tuple[bytes, int]:
-    deadline = time.monotonic() + 10
-    observed = bytearray()
-    cursor = after_cursor
-    while time.monotonic() < deadline:
-        response = request(
-            endpoint,
-            token,
-            "read",
-            supervisor_id,
-            after_cursor=cursor,
-        )
-        if response.get("status") != "OK":
-            raise AssertionError(f"terminal read failed: {response!r}")
-        output = response["output"]
-        chunk = base64.b64decode(output["data_base64"])
-        observed.extend(chunk)
-        cursor = output["next_cursor"]
-        if marker in observed:
-            return bytes(observed), cursor
-        time.sleep(0.05)
-    raise AssertionError(f"terminal output did not contain {marker!r}: {observed!r}")
 
 
 class RustReconnectionHostTests(unittest.TestCase):
@@ -124,113 +73,118 @@ class RustReconnectionHostTests(unittest.TestCase):
         )
         cls.binary = MANIFEST.parent / "target" / "debug" / "universe-session-host.exe"
 
-    def test_replacement_supervisor_attaches_to_same_independent_host(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            state_file = Path(directory) / "host-state.json"
-            token = "test-token"
-            process = subprocess.Popen(
-                [
-                    str(self.binary),
-                    "serve",
-                    "--state-file",
-                    str(state_file),
-                    "--anchor-ref",
-                    "anchor-test",
-                    "--token",
-                    token,
-                ],
-                cwd=ROOT,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
+    def run_supervisor(
+        self,
+        role: str,
+        registry_root: Path,
+        terminal_cwd: Path,
+        *,
+        after_cursor: int = 0,
+    ) -> dict[str, object]:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SUPERVISOR_CLIENT),
+                "--role",
+                role,
+                "--registry-root",
+                str(registry_root),
+                "--binary",
+                str(self.binary),
+                "--anchor",
+                "anchor-cross-process",
+                "--terminal-cwd",
+                str(terminal_cwd),
+                "--after-cursor",
+                str(after_cursor),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            self.fail(
+                f"Supervisor helper {role} failed with {completed.returncode}: "
+                f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
             )
+        return json.loads(completed.stdout)
+
+    def test_anchor_state_filename_does_not_expose_anchor_text(self) -> None:
+        registry = ReconnectionHostRegistry(Path("registry"), self.binary)
+        state_path = registry.state_path("anchor/with/user-visible/details")
+        self.assertTrue(state_path.name.startswith("anchor-"))
+        self.assertNotIn("with", state_path.name)
+        self.assertEqual(".json", state_path.suffix)
+
+    def test_two_supervisor_processes_reattach_same_host_and_cmd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry_root = root / "registry"
+            terminal_cwd = root / "terminal-cwd"
+            terminal_cwd.mkdir()
+            registry = ReconnectionHostRegistry(registry_root, self.binary)
+            host_pid: int | None = None
             try:
-                deadline = time.monotonic() + 10
-                while not state_file.is_file() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if not state_file.is_file():
-                    process.terminate()
-                    process.wait(timeout=5)
-                    stderr = process.stderr.read() if process.stderr else ""
-                    self.fail(f"Host did not publish state: {stderr}")
-                state = json.loads(state_file.read_text(encoding="utf-8"))
-                first = request(state["endpoint"], token, "attach", "supervisor-a")
-                self.assertEqual("OK", first["status"])
-                original_host_id = first["host"]["host_id"]
-                original_pid = first["host"]["pid"]
-                original_child_pid = first["host"]["child_pid"]
-                self.assertIsInstance(original_child_pid, int)
-                self.assertIn("CONPTY", first["host"]["handle_kinds"])
+                first = self.run_supervisor("launch", registry_root, terminal_cwd)
+                host_pid = int(first["host_pid"])
+                self.assertTrue(process_is_alive(host_pid))
+                self.assertEqual("LIVE", first["runtime_state"])
+                self.assertEqual(1, first["attachment_generation"])
+                self.assertEqual("supervisor-process-a", first["attached_supervisor_id"])
+                self.assertIn("UNIVERSE_PROCESS_A_CONFIGURED", first["output"])
+                self.assertIn(str(terminal_cwd).lower(), str(first["output"]).lower())
 
-                terminal_ready = request(
-                    state["endpoint"],
-                    token,
-                    "write",
-                    "supervisor-a",
-                    input_text="\x1b[1;1R",
-                )
-                self.assertEqual("OK", terminal_ready["status"])
-                first_write = request(
-                    state["endpoint"],
-                    token,
-                    "write",
-                    "supervisor-a",
-                    input_text="echo UNIVERSE_FIRST_MARKER\r\n",
-                )
-                self.assertEqual("OK", first_write["status"])
-                _, output_cursor = wait_for_output(
-                    state["endpoint"],
-                    token,
-                    "supervisor-a",
-                    b"UNIVERSE_FIRST_MARKER",
-                    0,
-                )
+                reused = registry.launch(
+                    "anchor-cross-process",
+                    cwd=terminal_cwd,
+                    environment={"UNIVERSE_HOST_TEST": "MUST_NOT_RELAUNCH"},
+                ).status()
+                self.assertEqual(first["host_id"], reused["host_id"])
+                self.assertEqual(first["host_pid"], reused["pid"])
+                self.assertEqual(first["child_pid"], reused["child_pid"])
 
-                # Supervisor A's connection is gone here; the Host remains resident.
-                observed = request(state["endpoint"], token, "status")
-                self.assertEqual(original_host_id, observed["host"]["host_id"])
-                self.assertEqual(original_pid, observed["host"]["pid"])
-                self.assertEqual(original_child_pid, observed["host"]["child_pid"])
-
-                second = request(state["endpoint"], token, "attach", "supervisor-b")
-                self.assertEqual(original_host_id, second["host"]["host_id"])
-                self.assertEqual(original_pid, second["host"]["pid"])
-                self.assertEqual(original_child_pid, second["host"]["child_pid"])
-                self.assertEqual(2, second["host"]["attachment_generation"])
-                self.assertEqual(
-                    "supervisor-b", second["host"]["attached_supervisor_id"]
+                second = self.run_supervisor(
+                    "reattach",
+                    registry_root,
+                    terminal_cwd,
+                    after_cursor=int(first["cursor"]),
                 )
-                request(
-                    state["endpoint"],
-                    token,
-                    "write",
-                    "supervisor-b",
-                    input_text="echo UNIVERSE_SECOND_MARKER\r\n",
-                )
-                second_output, _ = wait_for_output(
-                    state["endpoint"],
-                    token,
-                    "supervisor-b",
-                    b"UNIVERSE_SECOND_MARKER",
-                    output_cursor,
-                )
-                self.assertNotIn(b"UNIVERSE_FIRST_MARKER", second_output)
-                request(
-                    state["endpoint"],
-                    token,
-                    "write",
-                    "supervisor-b",
-                    input_text="exit\r\n",
-                )
-                request(state["endpoint"], token, "shutdown")
-                process.wait(timeout=5)
-                self.assertEqual(0, process.returncode)
+                for field in (
+                    "host_id",
+                    "host_pid",
+                    "host_started_at_unix_ms",
+                    "child_pid",
+                ):
+                    self.assertEqual(first[field], second[field], field)
+                self.assertEqual(2, second["attachment_generation"])
+                self.assertEqual("supervisor-process-b", second["attached_supervisor_id"])
+                self.assertIn("UNIVERSE_PROCESS_B", second["output"])
+                self.assertNotIn("UNIVERSE_PROCESS_A_CONFIGURED", second["output"])
             finally:
-                if process.poll() is None:
-                    process.terminate()
-                    process.wait(timeout=5)
-                if process.stderr is not None:
-                    process.stderr.close()
+                try:
+                    client = registry.discover("anchor-cross-process")
+                    client.request("attach", supervisor_id="supervisor-test-cleanup")
+                    client.request(
+                        "write",
+                        supervisor_id="supervisor-test-cleanup",
+                        input_base64=base64.b64encode(b"exit\r\n").decode("ascii"),
+                    )
+                    deadline = time.monotonic() + 5
+                    while (
+                        client.status().get("runtime_state") == "LIVE"
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.05)
+                    client.shutdown()
+                except Exception:
+                    pass
+                if host_pid is not None:
+                    deadline = time.monotonic() + 5
+                    while process_is_alive(host_pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertFalse(process_is_alive(host_pid))
 
 
 if __name__ == "__main__":
