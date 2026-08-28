@@ -8712,6 +8712,39 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("FEATURE_MEETING_SUMMARY_COLLECTED", summary["status"])
         self.assertEqual("COMPLETED", summary["meeting"]["status"])
 
+    def test_provider_chat_attach_materializes_supervisor_and_project_binding(self) -> None:
+        self.server.store.register_project(self.registration())
+        identity = {
+            "chat_key": "provider_chat_attach_materialized",
+            "provider": "CODEX",
+            "provider_session_id": "provider-session-materialized",
+            "source_path": str(self.project_root / "rollout-provider-session.jsonl"),
+            "source_kind": "CODEX_ROLLOUT_JSONL",
+            "source_version": "v1",
+            "display_name": "Codex materialized session",
+        }
+        with patch.object(
+            self.server, "resolve_provider_chat_identity", return_value=identity
+        ):
+            attached = self.server.attach_provider_chat_room(
+                identity["chat_key"],
+                {"project_id": "GCS", "mode": "MASTER", "make_default": False},
+            )
+
+        self.assertEqual("PROVIDER_CHAT_ROOM_ATTACHED", attached["status"])
+        session = attached["supervisor_session"]
+        self.assertEqual("GCS", session["node"])
+        self.assertEqual("MASTER", session["mode"])
+        self.assertEqual("CODEX", session["provider"])
+        self.assertEqual(
+            "provider-session-materialized", session["provider_session_ref"]
+        )
+        self.assertEqual(
+            "provider-session-materialized",
+            attached["room_binding"]["provider_session_ref"],
+        )
+        self.assertEqual("MASTER", attached["room_binding"]["slot_role"])
+
     def test_meeting_provider_session_attach_uses_opaque_verified_chat_key(self) -> None:
         self.server.store.register_project(self.registration())
         room_id = self.server.multi_rooms.create_meeting_room(

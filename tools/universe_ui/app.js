@@ -7722,6 +7722,9 @@ async function injectSessionRefThin() {
 
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
+  setSettingsTab(state.settingsTab || "service");
+  if (!elements.settingsDialog.open) elements.settingsDialog.showModal();
+  startRendezvousRefreshTimer();
   [
     state.providerSettings,
     state.workerBindings,
@@ -7764,8 +7767,6 @@ async function openProviderSettings() {
   renderRendezvousSettings();
   refreshMultiRooms().catch(() => {});
   setSettingsTab(state.settingsTab || "service");
-  elements.settingsDialog.showModal();
-  startRendezvousRefreshTimer();
 }
 
 function setDialogCategoryTab(root, { tabAttr, panelAttr, stateKey, allowed, fallback }) {

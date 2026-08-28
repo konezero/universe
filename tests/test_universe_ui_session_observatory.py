@@ -765,7 +765,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("/work-plan-adoptions", feature_slice)
         self.assertIn("/work-plan-applications", feature_slice)
         self.assertIn("PLANNED Milestones and BACKLOG Todos", APP)
-        self.assertIn("never creates a Task Frame, authority, or assignment", APP)
+        self.assertIn("It never runs a Task Frame or changes Todo state.", APP)
         self.assertIn('/goals', feature_slice)
         self.assertIn('Create Goal', feature_slice)
         self.assertNotIn('/todos', feature_slice)
@@ -950,6 +950,18 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             "refreshSupervisorSessions({ maxAgeMs: 10_000 })",
             open_slice,
         )
+
+    def test_rooms_dialog_opens_before_settings_requests_finish(self) -> None:
+        helper = APP[
+            APP.index("async function openProviderSettings") : APP.index(
+                "function setDialogCategoryTab"
+            )
+        ]
+        self.assertLess(
+            helper.index("elements.settingsDialog.showModal()"),
+            helper.index("await Promise.all"),
+        )
+        self.assertIn("if (!elements.settingsDialog.open)", helper)
 
     def test_mobile_observatory_is_labeled_opaque_and_single_scroll(self) -> None:
         self.assertIn(

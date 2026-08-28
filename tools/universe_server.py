@@ -29479,11 +29479,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "source_version": identity.get("source_version") or "v1",
             }
         )
+        mode = str(payload.get("mode") or "MASTER").strip().upper() or "MASTER"
+        injected = perform_session_ref_inject(
+            session_supervisor=self.session_supervisor,
+            multi_rooms=self.multi_rooms,
+            terminal_host=self.terminal_host,
+            body={
+                "project_id": project_id,
+                "node": project_id,
+                "mode": mode,
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "provider": identity["provider"],
+                "provider_session_ref": identity["provider_session_id"],
+                "alias": (
+                    payload.get("alias")
+                    or identity.get("display_name")
+                    or f"{project_id} {mode}"
+                ),
+                "make_default": payload.get("make_default") is True,
+                "bounded_summary": "Provider catalog session attached from the UI",
+            },
+        )
         return {
             "schema": API_SCHEMA,
-            "status": "PROVIDER_CHAT_ROOM_OBSERVED",
+            "status": "PROVIDER_CHAT_ROOM_ATTACHED",
             "chat_key": str(identity["chat_key"]),
             "project_id": project_id,
+            "supervisor_session": injected.get("supervisor_session"),
+            "room_binding": injected.get("binding"),
             "catalog": self.provider_chat_catalog(),
         }
 
