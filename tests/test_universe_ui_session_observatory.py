@@ -286,8 +286,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("openPlanTodos(goal.todos)", plan_slice)
         self.assertIn('todos.filter((todo) => todo.state === "DONE")', plan_slice)
 
-    def test_session_graph_is_a_separate_read_only_navigation_surface(self) -> None:
-        self.assertIn('data-primary-view="sessions"', HTML)
+    def test_sessions_are_diagnostics_not_primary_navigation(self) -> None:
+        self.assertNotIn('data-primary-view="sessions"', HTML)
+        self.assertIn('data-primary-view="fleet"', HTML)
+        self.assertIn('id="session-observatory-topbar-button"', HTML)
         self.assertIn('api("/v1/session-graph")', APP)
         self.assertIn("function buildSessionGraph()", APP)
         self.assertIn("function sessionGraphNodeLabel(item)", APP)
@@ -783,6 +785,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
     def test_semantic_project_graph_is_separate_from_session_graph(self) -> None:
         self.assertIn('/semantic-graph', APP)
         self.assertIn('function buildSemanticProjectGraph', APP)
+        self.assertIn('const galaxyEntityTypes = new Set([', APP)
+        self.assertIn('galaxyEntityTypes.has(String(item.entity_type', APP)
+        self.assertIn('elements.graphHint.textContent = `Galaxy ·', APP)
         self.assertIn('projection only', APP)
         self.assertIn('if (state.view === "semantic")', APP)
 

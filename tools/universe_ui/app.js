@@ -8801,7 +8801,18 @@ function setGraphLegend(items) {
 
 function buildSemanticProjectGraph() {
   const projection = state.semanticGraph || {};
-  const sourceNodes = projection.nodes || [];
+  const galaxyEntityTypes = new Set([
+    "PROJECT",
+    "FEATURE_NODE",
+    "EXPECTED_PATH",
+    "GOAL",
+    "MILESTONE",
+    "TODO",
+    "PREDICTION",
+  ]);
+  const sourceNodes = (projection.nodes || []).filter((item) =>
+    galaxyEntityTypes.has(String(item.entity_type || "").toUpperCase())
+  );
   const layerByType = {
     PROJECT: 0,
     FEATURE_NODE: 1,
@@ -8810,8 +8821,6 @@ function buildSemanticProjectGraph() {
     MILESTONE: 4,
     TODO: 5,
     PREDICTION: 2,
-    MEMORY: 2,
-    BENCH: 2,
   };
   const kindByType = {
     PROJECT: "project",
@@ -8821,8 +8830,6 @@ function buildSemanticProjectGraph() {
     MILESTONE: "milestone",
     TODO: "todo",
     PREDICTION: "predicted",
-    MEMORY: "memory",
-    BENCH: "bench",
   };
   setGraphLegend([
     { kind: "project", label: "Project" },
@@ -8832,8 +8839,6 @@ function buildSemanticProjectGraph() {
     { kind: "milestone", label: "Milestone" },
     { kind: "todo", label: "Todo" },
     { kind: "predicted", label: "Prediction" },
-    { kind: "memory", label: "Memory" },
-    { kind: "bench", label: "Bench candidate" },
   ]);
   const graphNodes = sourceNodes.map((item) => ({
     id: item.id,
@@ -8863,7 +8868,7 @@ function buildSemanticProjectGraph() {
   elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
   if (elements.graphHint) {
     elements.graphHint.classList.toggle("hidden", !graphNodes.length);
-    elements.graphHint.textContent = `Project Graph · ${state.selectedProject?.project_id || "Unknown"} · ${graphNodes.length} typed node(s) · projection only`;
+    elements.graphHint.textContent = `Galaxy · ${state.selectedProject?.project_id || "Unknown"} · ${graphNodes.length} typed node(s) · projection only`;
   }
   drawGraph();
 }
@@ -14821,9 +14826,14 @@ function bindEvents() {
       const button = event.target.closest("[data-primary-view]");
       if (!button) return;
       const view = button.getAttribute("data-primary-view");
-      // Graph surfaces (single place — not also on left rail / toolbar).
+      // Galaxy is the semantic product map; Fleet owns execution navigation.
       if (view === "work") {
         showGoalPlanView();
+        return;
+      }
+      if (view === "fleet") {
+        openTodoDialog(false);
+        syncPrimaryNavSelection("fleet");
         return;
       }
       if (view === "map" || view === "network" || view === "project" || view === "ecosystem") {
@@ -14921,6 +14931,10 @@ function bindGoalPlanEvents() {
     if (!button) return;
     const view = button.getAttribute("data-primary-view");
     if (view === "work") showGoalPlanView();
+    else if (view === "fleet") {
+      openTodoDialog(false);
+      syncPrimaryNavSelection("fleet");
+    }
     else if (view === "map") showGraphView(state.selectedProject ? "semantic" : "universe");
     else if (view === "documents") showGraphView("documents");
     else if (view === "sessions") showGraphView("sessions");
