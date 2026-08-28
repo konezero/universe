@@ -1,6 +1,6 @@
 # Memory-to-Feature Proposal and Goal Automation
 
-Status: approved Goal direction; proposal and planning-context slices implemented and locally validated
+Status: approved Goal direction; proposal, planning-context, and Expected Path v2 route slices implemented
 Owner: Universe Conductor for proposal coordination; Project Master for implementation
 Scope: project-local conversation, Memory, semantic graph, Feature Node planning, and governed Goal automation
 
@@ -198,14 +198,17 @@ The first two implementation slices preserve review before materialization:
    Feature Node, one bounded Node Planning Context, and one idempotent Meeting Room.
 
 The implemented planning slice still never creates Goal, Todo, authority, execution
-assignment, Task Frame, or canonical RAG knowledge. Expected Path generation remains
-the next P0 slice.
+assignment, Task Frame, or canonical RAG knowledge. Meeting-generated Expected Paths
+now pin a normalized v2 route with steps, dependencies, branches, phases, decisions,
+risks, acceptance conditions, estimates, evidence, and a route digest. Galaxy projects
+those predicted steps and route edges without embedding the full specification body.
+The combined path-selection and Goal Start receipt is the next P0 slice.
 
 ## Implementation sequence
 
 1. P0 Proposal Compiler and Proposed Nodes Inbox.
 2. P0 Node Planning Context and Meeting Room auto-preparation.
-3. P0 Expected Path v2 route graph.
+3. P0 Expected Path v2 route graph. **Implemented**
 4. P0 combined path selection and Goal Start receipt.
 5. P0 Project Master execution driver over existing guarded transitions.
 6. P1 prediction-versus-outcome calibration and Fleet/Activity projection.

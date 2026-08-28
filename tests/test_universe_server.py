@@ -7905,16 +7905,39 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
             artifacts.append(artifact)
 
+        def route(prefix: str) -> dict[str, Any]:
+            return {
+                "steps": [
+                    {"step_id": f"{prefix}-design", "title": "Design", "summary": "Pin the contract", "phase": "Design"},
+                    {"step_id": f"{prefix}-build", "title": "Build", "summary": "Implement the slice", "phase": "Delivery"},
+                ],
+                "dependencies": [
+                    {"from_step_id": f"{prefix}-design", "to_step_id": f"{prefix}-build", "kind": "PRECEDES"}
+                ],
+                "branches": [],
+                "architecture_decisions": ["Use the existing room artifact contract"],
+                "implementation_phases": [
+                    {"title": "Design", "step_ids": [f"{prefix}-design"]},
+                    {"title": "Delivery", "step_ids": [f"{prefix}-build"]},
+                ],
+                "risks": [{"risk": "Schema drift", "mitigation": "Pin the route digest"}],
+                "acceptance_conditions": ["The route is visible in Galaxy"],
+                "estimates": {"effort": "SMALL", "cost": "LOCAL", "quota": "LOW"},
+                "evidence_refs": [f"evidence://{prefix}"],
+            }
+
         status, first_payload = self.request(
             "POST",
             f"/v1/feature-nodes/{feature['feature_id']}/expected-paths",
-            {"room_id": room_id, "artifact_id": artifacts[0]["artifact_id"], "summary": "Event-first candidate"},
+            {"room_id": room_id, "artifact_id": artifacts[0]["artifact_id"], "summary": "Event-first candidate", "route": route("event")},
             self.token,
         )
         self.assertEqual(HTTPStatus.CREATED, status)
         first_path = first_payload["expected_path"]
         self.assertEqual(artifacts[0]["content_digest"], first_path["specification_digest"])
         self.assertEqual(1, first_path["artifact_revision"])
+        self.assertEqual(2, len(first_path["route"]["steps"]))
+        self.assertTrue(first_path["route_digest"])
 
         status, blocked = self.request(
             "POST",
@@ -7928,7 +7951,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, second_payload = self.request(
             "POST",
             f"/v1/feature-nodes/{feature['feature_id']}/expected-paths",
-            {"room_id": room_id, "artifact_id": artifacts[1]["artifact_id"], "summary": "Artifact-first candidate"},
+            {"room_id": room_id, "artifact_id": artifacts[1]["artifact_id"], "summary": "Artifact-first candidate", "route": route("artifact")},
             self.token,
         )
         self.assertEqual(HTTPStatus.CREATED, status)
@@ -8067,10 +8090,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
         edge_types = {edge["edge_type"] for edge in graph["edges"]}
         self.assertIn("FEATURE_NODE", node_types)
         self.assertIn("EXPECTED_PATH", node_types)
+        self.assertIn("EXPECTED_PATH_STEP", node_types)
         self.assertIn("GOAL", node_types)
         self.assertIn("FEATURE_NODE_ADOPTS_EXPECTED_PATH", edge_types)
         self.assertIn("FEATURE_NODE_DERIVES_GOAL", edge_types)
         self.assertIn("EXPECTED_PATH_DERIVES_GOAL", edge_types)
+        self.assertIn("EXPECTED_PATH_HAS_STEP", edge_types)
+        self.assertIn("EXPECTED_PATH_STEP_PRECEDES", edge_types)
         expected_nodes = [node for node in graph["nodes"] if node["entity_type"] == "EXPECTED_PATH"]
         self.assertTrue(all("body_text" not in node["data"] for node in expected_nodes))
 

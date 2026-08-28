@@ -1077,6 +1077,10 @@ body.inspector-open .graph-hint {
   background: var(--red);
 }
 
+.node-key.route-step {
+  background: #9b7cff;
+}
+
 .node-key.mode {
   background: #b9a3ff;
 }
@@ -2022,6 +2026,14 @@ dialog {
 
 .feature-path-digest {
   font-family: var(--font-mono);
+}
+
+.feature-path-route {
+  display: grid;
+  gap: 2px;
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, #9b7cff 55%, var(--line));
 }
 
 .remote-access-row {

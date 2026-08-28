@@ -761,6 +761,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         ]
         self.assertIn("expected_feature_revision: feature.revision", feature_slice)
         self.assertIn("path.artifact_revision", APP)
+        self.assertIn("path.route?.steps?.length", APP)
+        self.assertIn('"EXPECTED_PATH_STEP"', APP)
+        self.assertIn('kind: "route-step"', APP)
+        self.assertIn(".feature-path-route", CSS)
         self.assertIn("Generate Work Plans", feature_slice)
         self.assertIn("Apply Adopted Plan", feature_slice)
         self.assertIn("/work-plan-runs", feature_slice)

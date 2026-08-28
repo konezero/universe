@@ -473,7 +473,8 @@ TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
 TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
 FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
 NODE_PLANNING_CONTEXT_SCHEMA = "universe.node-planning-context.v1"
-EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v1"
+EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v2"
+EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
 GOAL_WORK_PLAN_SCHEMA = "universe.goal-work-plan.v1"
@@ -2240,6 +2241,148 @@ def normalize_goal_work_plan(value: Any) -> dict[str, Any]:
     if todo_count > 24:
         raise UniverseError("GOAL_WORK_PLAN_TOO_LARGE", "work plan may contain at most 24 Todos")
     return {"schema": GOAL_WORK_PLAN_SCHEMA, "title": title, "summary": summary, "milestones": milestones}
+
+
+def normalize_expected_path_route(value: Any) -> dict[str, Any]:
+    route = _exact_object_fields(
+        value,
+        field="expected_path.route",
+        required=frozenset(
+            {
+                "steps",
+                "dependencies",
+                "branches",
+                "architecture_decisions",
+                "implementation_phases",
+                "risks",
+                "acceptance_conditions",
+                "estimates",
+                "evidence_refs",
+            }
+        ),
+        optional=frozenset({"schema"}),
+    )
+    if "schema" in route and route["schema"] != EXPECTED_PATH_ROUTE_SCHEMA:
+        raise UniverseError("EXPECTED_PATH_ROUTE_SCHEMA_INVALID", "Expected Path route schema is unsupported")
+    raw_steps = _array(route["steps"], "expected_path.route.steps")
+    if not 1 <= len(raw_steps) <= 24:
+        raise UniverseError("EXPECTED_PATH_ROUTE_STEPS_INVALID", "Expected Path route requires 1 to 24 steps")
+    steps: list[dict[str, str]] = []
+    step_ids: set[str] = set()
+    for index, raw_step in enumerate(raw_steps):
+        step = _exact_object_fields(
+            raw_step,
+            field=f"expected_path.route.steps[{index}]",
+            required=frozenset({"step_id", "title", "summary"}),
+            optional=frozenset({"phase"}),
+        )
+        step_id = _identifier(step["step_id"], "step_id")
+        if step_id in step_ids:
+            raise UniverseError("EXPECTED_PATH_ROUTE_STEP_DUPLICATE", "Expected Path step IDs must be unique")
+        step_ids.add(step_id)
+        title = _required_text(step["title"], "step.title")
+        summary = _required_text(step["summary"], "step.summary")
+        phase = str(step.get("phase") or "").strip()
+        if len(title) > 160 or len(summary) > 1200 or len(phase) > 160:
+            raise UniverseError("EXPECTED_PATH_ROUTE_STEP_TEXT_INVALID", "Expected Path step text is too long")
+        material = {"step_id": step_id, "title": title, "summary": summary}
+        if phase:
+            material["phase"] = phase
+        steps.append(material)
+
+    dependencies: list[dict[str, str]] = []
+    for index, raw_dependency in enumerate(_array(route["dependencies"], "expected_path.route.dependencies")):
+        dependency = _exact_object_fields(
+            raw_dependency,
+            field=f"expected_path.route.dependencies[{index}]",
+            required=frozenset({"from_step_id", "to_step_id", "kind"}),
+        )
+        source = _identifier(dependency["from_step_id"], "from_step_id")
+        target = _identifier(dependency["to_step_id"], "to_step_id")
+        kind = _identifier(dependency["kind"], "kind").upper()
+        if source not in step_ids or target not in step_ids or source == target:
+            raise UniverseError("EXPECTED_PATH_ROUTE_DEPENDENCY_INVALID", "dependencies must connect distinct route steps")
+        if kind not in {"REQUIRES", "PRECEDES", "ENABLES"}:
+            raise UniverseError("EXPECTED_PATH_ROUTE_DEPENDENCY_KIND_INVALID", "unsupported route dependency kind")
+        dependencies.append({"from_step_id": source, "to_step_id": target, "kind": kind})
+    if len(dependencies) > 64:
+        raise UniverseError("EXPECTED_PATH_ROUTE_DEPENDENCIES_INVALID", "Expected Path route has too many dependencies")
+
+    branches: list[dict[str, Any]] = []
+    for index, raw_branch in enumerate(_array(route["branches"], "expected_path.route.branches")):
+        branch = _exact_object_fields(
+            raw_branch,
+            field=f"expected_path.route.branches[{index}]",
+            required=frozenset({"from_step_id", "condition", "to_step_ids"}),
+        )
+        source = _identifier(branch["from_step_id"], "from_step_id")
+        targets = _string_array(branch["to_step_ids"], "to_step_ids")
+        if source not in step_ids or not targets or any(target not in step_ids for target in targets):
+            raise UniverseError("EXPECTED_PATH_ROUTE_BRANCH_INVALID", "branches must reference route steps")
+        condition = _required_text(branch["condition"], "branch.condition")
+        if len(condition) > 500:
+            raise UniverseError("EXPECTED_PATH_ROUTE_BRANCH_INVALID", "branch condition is too long")
+        branches.append({"from_step_id": source, "condition": condition, "to_step_ids": targets})
+    if len(branches) > 24:
+        raise UniverseError("EXPECTED_PATH_ROUTE_BRANCH_INVALID", "Expected Path route has too many branches")
+
+    phases: list[dict[str, Any]] = []
+    for index, raw_phase in enumerate(_array(route["implementation_phases"], "expected_path.route.implementation_phases")):
+        phase = _exact_object_fields(
+            raw_phase,
+            field=f"expected_path.route.implementation_phases[{index}]",
+            required=frozenset({"title", "step_ids"}),
+        )
+        title = _required_text(phase["title"], "phase.title")
+        phase_steps = _string_array(phase["step_ids"], "phase.step_ids")
+        if len(title) > 160 or not phase_steps or any(item not in step_ids for item in phase_steps):
+            raise UniverseError("EXPECTED_PATH_ROUTE_PHASE_INVALID", "implementation phases must reference route steps")
+        phases.append({"title": title, "step_ids": phase_steps})
+    if not 1 <= len(phases) <= 12:
+        raise UniverseError("EXPECTED_PATH_ROUTE_PHASE_INVALID", "Expected Path route requires 1 to 12 phases")
+
+    risks: list[dict[str, str]] = []
+    for index, raw_risk in enumerate(_array(route["risks"], "expected_path.route.risks")):
+        risk = _exact_object_fields(
+            raw_risk,
+            field=f"expected_path.route.risks[{index}]",
+            required=frozenset({"risk", "mitigation"}),
+        )
+        risk_text = _required_text(risk["risk"], "risk")
+        mitigation = _required_text(risk["mitigation"], "mitigation")
+        if len(risk_text) > 500 or len(mitigation) > 1000:
+            raise UniverseError("EXPECTED_PATH_ROUTE_RISK_INVALID", "Expected Path risk text is too long")
+        risks.append({"risk": risk_text, "mitigation": mitigation})
+    if len(risks) > 16:
+        raise UniverseError("EXPECTED_PATH_ROUTE_RISK_INVALID", "Expected Path route has too many risks")
+
+    decisions = _string_array(route["architecture_decisions"], "architecture_decisions")
+    acceptance = _string_array(route["acceptance_conditions"], "acceptance_conditions")
+    evidence_refs = _string_array(route["evidence_refs"], "evidence_refs")
+    if len(decisions) > 16 or len(acceptance) > 24 or len(evidence_refs) > 50:
+        raise UniverseError("EXPECTED_PATH_ROUTE_LIST_INVALID", "Expected Path route list exceeds its limit")
+    estimates = _exact_object_fields(
+        route["estimates"],
+        field="expected_path.route.estimates",
+        required=frozenset({"effort", "cost", "quota"}),
+    )
+    normalized_estimates = {
+        key: _required_text(estimates[key], f"estimates.{key}") for key in ("effort", "cost", "quota")
+    }
+    if any(len(item) > 500 for item in normalized_estimates.values()):
+        raise UniverseError("EXPECTED_PATH_ROUTE_ESTIMATE_INVALID", "Expected Path estimate is too long")
+    return {
+        "schema": EXPECTED_PATH_ROUTE_SCHEMA,
+        "steps": steps,
+        "dependencies": dependencies,
+        "branches": branches,
+        "architecture_decisions": decisions,
+        "implementation_phases": phases,
+        "risks": risks,
+        "acceptance_conditions": acceptance,
+        "estimates": normalized_estimates,
+        "evidence_refs": evidence_refs,
+    }
 
 
 def _array(value: Any, field: str) -> list[Any]:
@@ -5517,6 +5660,14 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS feature_expected_path_feature_order
                 ON feature_expected_path(feature_id, created_at, expected_path_id);
+
+                CREATE TABLE IF NOT EXISTS feature_expected_path_route (
+                    expected_path_id TEXT PRIMARY KEY REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    route_digest TEXT NOT NULL,
+                    route_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS feature_path_adoption (
                     adoption_id TEXT PRIMARY KEY,
@@ -10831,8 +10982,10 @@ class UniverseStore:
         }
 
     @staticmethod
-    def _expected_path_row(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+    def _expected_path_row(
+        row: sqlite3.Row, route_row: sqlite3.Row | None = None
+    ) -> dict[str, Any]:
+        result = {
             "schema": EXPECTED_PATH_SCHEMA,
             "expected_path_id": str(row["expected_path_id"]),
             "feature_id": str(row["feature_id"]),
@@ -10848,6 +11001,13 @@ class UniverseStore:
             "updated_at": str(row["updated_at"]),
             "effects": UniverseStore._feature_effects(),
         }
+        result["route"] = (
+            json.loads(route_row["route_json"]) if route_row is not None else None
+        )
+        result["route_digest"] = (
+            str(route_row["route_digest"]) if route_row is not None else None
+        )
+        return result
 
     @staticmethod
     def _adoption_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -11470,6 +11630,15 @@ class UniverseStore:
                 "SELECT * FROM feature_expected_path WHERE feature_id = ? ORDER BY created_at, expected_path_id",
                 (fid,),
             ).fetchall()
+            route_rows = {
+                str(item["expected_path_id"]): item
+                for item in connection.execute(
+                    "SELECT route.* FROM feature_expected_path_route route "
+                    "JOIN feature_expected_path path ON path.expected_path_id = route.expected_path_id "
+                    "WHERE path.feature_id = ?",
+                    (fid,),
+                ).fetchall()
+            }
             adoption = connection.execute(
                 "SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)
             ).fetchone()
@@ -11477,7 +11646,10 @@ class UniverseStore:
                 "SELECT * FROM feature_goal_derivation WHERE feature_id = ?", (fid,)
             ).fetchone()
         result = self._feature_row(row)
-        result["expected_paths"] = [self._expected_path_row(path) for path in paths]
+        result["expected_paths"] = [
+            self._expected_path_row(path, route_rows.get(str(path["expected_path_id"])))
+            for path in paths
+        ]
         result["adoption"] = self._adoption_row(adoption) if adoption is not None else None
         result["goal_derivation"] = (
             self._feature_goal_derivation_row(derivation)
@@ -11501,7 +11673,7 @@ class UniverseStore:
             value,
             field="expected_path",
             required=frozenset({"room_id", "artifact_id", "summary"}),
-            optional=frozenset({"title", "evidence_refs"}),
+            optional=frozenset({"title", "evidence_refs", "route"}),
         )
         room_id = _identifier(request["room_id"], "room_id")
         artifact_id = _identifier(request["artifact_id"], "artifact_id")
@@ -11519,6 +11691,12 @@ class UniverseStore:
         revision = int(artifact["current_revision"])
         title = _required_text(request.get("title") or artifact.get("title"), "title")
         summary = _required_text(request["summary"], "summary")
+        route = (
+            normalize_expected_path_route(request["route"])
+            if request.get("route") is not None
+            else None
+        )
+        route_digest = _json_sha256(route) if route is not None else None
         refs = list(artifact.get("evidence_refs") or [])
         for ref in self._feature_refs(request.get("evidence_refs"), "evidence_refs"):
             if ref not in refs:
@@ -11535,14 +11713,19 @@ class UniverseStore:
                 (feature["feature_id"], artifact_id, revision),
             ).fetchone()
             if existing is not None:
-                material = (title, summary, str(artifact["content_digest"]), refs)
+                existing_route = connection.execute(
+                    "SELECT * FROM feature_expected_path_route WHERE expected_path_id = ?",
+                    (path_id,),
+                ).fetchone()
+                material = (title, summary, str(artifact["content_digest"]), refs, route_digest)
                 actual = (
                     existing["title"], existing["summary"], existing["specification_digest"],
                     json.loads(existing["evidence_refs_json"]),
+                    str(existing_route["route_digest"]) if existing_route is not None else None,
                 )
                 if actual != material:
                     raise UniverseError("EXPECTED_PATH_CONFLICT", "artifact revision is already linked with different path material", HTTPStatus.CONFLICT)
-                return self._expected_path_row(existing), False
+                return self._expected_path_row(existing, existing_route), False
             connection.execute(
                 """
                 INSERT INTO feature_expected_path(
@@ -11555,12 +11738,22 @@ class UniverseStore:
                     title, summary, str(artifact["content_digest"]), _canonical_json(refs), now, now,
                 ),
             )
+            if route is not None:
+                connection.execute(
+                    "INSERT INTO feature_expected_path_route(expected_path_id, route_digest, route_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (path_id, route_digest, _canonical_json(route), now, now),
+                )
             connection.execute(
                 "UPDATE feature_node SET state = 'EXPLORING', revision = revision + 1, updated_at = ? WHERE feature_id = ?",
                 (now, feature["feature_id"]),
             )
             row = connection.execute("SELECT * FROM feature_expected_path WHERE expected_path_id = ?", (path_id,)).fetchone()
-        return self._expected_path_row(row), True
+            route_row = connection.execute(
+                "SELECT * FROM feature_expected_path_route WHERE expected_path_id = ?",
+                (path_id,),
+            ).fetchone()
+        return self._expected_path_row(row, route_row), True
 
     def adopt_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         request = _exact_object_fields(
@@ -20015,7 +20208,7 @@ class UniverseStore:
                     {key: path.get(key) for key in (
                         "expected_path_id", "feature_id", "room_id", "artifact_id",
                         "artifact_revision", "summary", "specification_digest", "evidence_refs",
-                        "state", "created_at", "updated_at",
+                        "state", "route_digest", "created_at", "updated_at",
                     )},
                 )
                 path_nodes[path_id] = path_node
@@ -20024,6 +20217,54 @@ class UniverseStore:
                     add_edge("EXPECTED_PATH_FROM_MEETING_ROOM", path_node, room_nodes_by_id[str(path["room_id"])], path_ref)
                 if str(path["artifact_id"]) in artifact_nodes_by_id:
                     add_edge("EXPECTED_PATH_PINS_SPECIFICATION", path_node, artifact_nodes_by_id[str(path["artifact_id"])], path_ref)
+                route = path.get("route") if isinstance(path.get("route"), Mapping) else None
+                route_step_nodes: dict[str, str] = {}
+                if route is not None:
+                    for ordinal, step in enumerate(route.get("steps") or [], start=1):
+                        step_id = str(step.get("step_id") or "")
+                        if not step_id:
+                            continue
+                        step_ref = f"{path_ref}/route/steps/{step_id}"
+                        step_node = add_node(
+                            "EXPECTED_PATH_STEP",
+                            f"{path_id}:{step_id}",
+                            str(step.get("title") or step_id),
+                            "PREDICTED",
+                            "EXPECTED_PATH_ROUTE_STEP",
+                            step_ref,
+                            {
+                                "expected_path_id": path_id,
+                                "step_id": step_id,
+                                "ordinal": ordinal,
+                                "summary": step.get("summary"),
+                                "phase": step.get("phase"),
+                                "route_digest": path.get("route_digest"),
+                                "predicted": True,
+                            },
+                        )
+                        route_step_nodes[step_id] = step_node
+                        add_edge("EXPECTED_PATH_HAS_STEP", path_node, step_node, step_ref)
+                    for dependency in route.get("dependencies") or []:
+                        source = route_step_nodes.get(str(dependency.get("from_step_id") or ""))
+                        target = route_step_nodes.get(str(dependency.get("to_step_id") or ""))
+                        if source is not None and target is not None:
+                            add_edge(
+                                "EXPECTED_PATH_STEP_" + str(dependency.get("kind") or "PRECEDES"),
+                                source,
+                                target,
+                                path_ref + "/route/dependencies",
+                            )
+                    for branch_index, branch in enumerate(route.get("branches") or []):
+                        source = route_step_nodes.get(str(branch.get("from_step_id") or ""))
+                        for target_id in branch.get("to_step_ids") or []:
+                            target = route_step_nodes.get(str(target_id))
+                            if source is not None and target is not None:
+                                add_edge(
+                                    "EXPECTED_PATH_BRANCH",
+                                    source,
+                                    target,
+                                    f"{path_ref}/route/branches/{branch_index}",
+                                )
             adoption = detailed_feature.get("adoption")
             if adoption and str(adoption["expected_path_id"]) in path_nodes:
                 add_edge(
@@ -31122,9 +31363,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         prompt = (
             f"Feature: {feature['title']}\n"
             f"Intent: {feature['intent_text']}\n\n"
-            "Produce alternative, detailed implementation specifications. "
-            "Every turn must remain a self-contained candidate and must not create "
-            "Goals, Todos, Task Frames, authority, or execution assignments."
+            "Produce one alternative detailed implementation route. Return ONLY one JSON object "
+            "with this shape: "
+            '{"title":"...","summary":"...","specification":"...","route":{'
+            '"steps":[{"step_id":"step-1","title":"...","summary":"...","phase":"..."}],'
+            '"dependencies":[{"from_step_id":"step-1","to_step_id":"step-2","kind":"PRECEDES"}],'
+            '"branches":[{"from_step_id":"step-1","condition":"...","to_step_ids":["step-2"]}],'
+            '"architecture_decisions":["..."],'
+            '"implementation_phases":[{"title":"...","step_ids":["step-1"]}],'
+            '"risks":[{"risk":"...","mitigation":"..."}],'
+            '"acceptance_conditions":["..."],'
+            '"estimates":{"effort":"...","cost":"...","quota":"..."},'
+            '"evidence_refs":[]}}. '
+            "Use 2-12 concise steps with stable IDs, valid dependency/branch references, and 1-6 phases. "
+            "Every turn must remain a self-contained candidate and must not create Goals, Todos, "
+            "Task Frames, authority, or execution assignments."
         )
         if user_prompt:
             prompt += f"\n\nUser direction:\n{user_prompt}"
@@ -31155,10 +31408,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 binding = binding_by_id.get(str(binding_id))
                 if message is None or binding is None:
                     continue
-                body_text = str(message.get("body_text") or "").strip()
-                if not body_text:
+                provider_body = str(message.get("body_text") or "").strip()
+                if not provider_body:
                     continue
-                title = (
+                fallback_title = (
                     f"{feature['title']} · "
                     f"{binding.get('display_name') or binding.get('provider')} path"
                 )
@@ -31166,6 +31419,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     f"universe://chat-rooms/{room_id}/messages/{message['message_id']}",
                     f"universe://feature-nodes/{feature['feature_id']}/meeting-runs/{run_id}",
                 ]
+                candidate = self._parse_expected_path_candidate_output(
+                    provider_body, fallback_title=fallback_title
+                )
+                route = dict(candidate["route"])
+                route["evidence_refs"] = list(
+                    dict.fromkeys([*(route.get("evidence_refs") or []), *evidence_refs])
+                )
+                route = normalize_expected_path_route(route)
+                title = candidate["title"]
+                body_text = candidate["specification"]
                 try:
                     artifact = self.multi_rooms.create_artifact(
                         room_id,
@@ -31186,8 +31449,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             "room_id": room_id,
                             "artifact_id": artifact["artifact_id"],
                             "title": title,
-                            "summary": " ".join(body_text.split())[:500],
+                            "summary": candidate["summary"],
                             "evidence_refs": evidence_refs,
+                            "route": route,
                         },
                     )
                 except MultiRoomError as error:
@@ -31227,6 +31491,74 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "task_frame_created": False,
             "authority_created": False,
             "execution_assignment_created": False,
+        }
+
+    @staticmethod
+    def _parse_expected_path_candidate_output(
+        body_text: str, *, fallback_title: str
+    ) -> dict[str, Any]:
+        text = str(body_text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("route"), dict):
+            candidate = _exact_object_fields(
+                parsed,
+                field="expected_path_candidate",
+                required=frozenset({"title", "summary", "specification", "route"}),
+            )
+            title = _required_text(candidate["title"], "expected_path_candidate.title")
+            summary = _required_text(candidate["summary"], "expected_path_candidate.summary")
+            specification = _required_text(
+                candidate["specification"], "expected_path_candidate.specification"
+            )
+            if len(title) > 200 or len(summary) > 500 or len(specification) > 24000:
+                raise UniverseError(
+                    "EXPECTED_PATH_CANDIDATE_TEXT_INVALID",
+                    "Expected Path candidate text exceeds its limit",
+                )
+            return {
+                "title": title,
+                "summary": summary,
+                "specification": specification,
+                "route": normalize_expected_path_route(candidate["route"]),
+            }
+        specification = _required_text(text, "expected_path_candidate.specification")
+        summary = " ".join(specification.split())[:500]
+        return {
+            "title": fallback_title,
+            "summary": summary,
+            "specification": specification,
+            "route": normalize_expected_path_route(
+                {
+                    "steps": [
+                        {
+                            "step_id": "specification",
+                            "title": "Implement the specification",
+                            "summary": summary,
+                            "phase": "Implementation",
+                        }
+                    ],
+                    "dependencies": [],
+                    "branches": [],
+                    "architecture_decisions": [],
+                    "implementation_phases": [
+                        {"title": "Implementation", "step_ids": ["specification"]}
+                    ],
+                    "risks": [],
+                    "acceptance_conditions": ["The pinned specification is implemented and validated"],
+                    "estimates": {"effort": "UNKNOWN", "cost": "UNKNOWN", "quota": "UNKNOWN"},
+                    "evidence_refs": [],
+                }
+            ),
         }
 
     @staticmethod

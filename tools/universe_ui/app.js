@@ -7065,10 +7065,27 @@ function renderMeetingFeaturePanel(room) {
     const copy = node("div", "remote-access-copy");
     copy.append(
       node("strong", "", `${path.state} · ${path.title}`),
-      node("small", "", `artifact revision ${path.artifact_revision} · evidence ${(path.evidence_refs || []).length}`),
+      node(
+        "small",
+        "",
+        `artifact revision ${path.artifact_revision} · route ${path.route?.steps?.length || 0} steps · evidence ${(path.evidence_refs || []).length}`
+      ),
       node("small", "", path.summary || ""),
       node("small", "feature-path-digest", `sha256 ${String(path.specification_digest || "").slice(0, 16)}…`)
     );
+    if (path.route?.steps?.length) {
+      const routeSummary = node("div", "feature-path-route");
+      for (const [index, step] of path.route.steps.entries()) {
+        routeSummary.append(
+          node(
+            "small",
+            "",
+            `${index + 1}. ${step.title}${step.phase ? ` · ${step.phase}` : ""}`
+          )
+        );
+      }
+      copy.append(routeSummary);
+    }
     row.append(copy);
     if (path.state === "CANDIDATE" && feature.state !== "ADOPTED") {
       const adopt = node("button", "primary-button compact-action", "Adopt");
@@ -8851,6 +8868,7 @@ function buildSemanticProjectGraph() {
     "PROJECT",
     "FEATURE_NODE",
     "EXPECTED_PATH",
+    "EXPECTED_PATH_STEP",
     "GOAL",
     "MILESTONE",
     "TODO",
@@ -8863,15 +8881,17 @@ function buildSemanticProjectGraph() {
     PROJECT: 0,
     FEATURE_NODE: 1,
     EXPECTED_PATH: 2,
-    GOAL: 3,
-    MILESTONE: 4,
-    TODO: 5,
+    EXPECTED_PATH_STEP: 3,
+    GOAL: 4,
+    MILESTONE: 5,
+    TODO: 6,
     PREDICTION: 2,
   };
   const kindByType = {
     PROJECT: "project",
     FEATURE_NODE: "feature",
     EXPECTED_PATH: "expected-path",
+    EXPECTED_PATH_STEP: "route-step",
     GOAL: "goal",
     MILESTONE: "milestone",
     TODO: "todo",
@@ -8881,6 +8901,7 @@ function buildSemanticProjectGraph() {
     { kind: "project", label: "Project" },
     { kind: "feature", label: "Feature" },
     { kind: "expected-path", label: "Expected Path" },
+    { kind: "route-step", label: "Predicted Route Step" },
     { kind: "goal", label: "Goal" },
     { kind: "milestone", label: "Milestone" },
     { kind: "todo", label: "Todo" },
