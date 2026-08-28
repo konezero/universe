@@ -83,6 +83,28 @@ class MultiRoomStoreTests(unittest.TestCase):
             },
         )
 
+    def test_close_room_detaches_active_participants_but_keeps_history(self) -> None:
+        room = self.store.create_meeting_room(
+            {"title": "Lifecycle", "project_id": "proj_demo"}
+        )["room"]
+        attached = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CODEX",
+                "provider_session_ref": "fresh-1",
+                "provider_chat_key": "meeting_chat_1",
+                "metadata": {"lifecycle_owner": "MEETING", "archive_on_close": True},
+            },
+        )
+
+        self.store.close_room(room["room_id"])
+
+        self.assertEqual([], self.store.list_bindings(room["room_id"]))
+        historical = self.store.get_binding(attached["binding"]["binding_id"])
+        self.assertEqual("DETACHED", historical["state"])
+        self.assertEqual("MEETING", historical["metadata"]["lifecycle_owner"])
+
     def test_boss_room_user_cannot_write(self) -> None:
         room = self.store.create_boss_room(
             project_id="proj_demo",

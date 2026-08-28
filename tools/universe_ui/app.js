@@ -377,6 +377,8 @@ const elements = {
   createMeetingFeature: document.querySelector("#create-meeting-feature-button"),
   meetingProviderSession: document.querySelector("#meeting-provider-session-select"),
   attachMeetingProvider: document.querySelector("#attach-meeting-provider-button"),
+  createFreshMeetingSessions: document.querySelector("#create-fresh-meeting-sessions-button"),
+  endMeeting: document.querySelector("#end-meeting-button"),
   meetingRunPrompt: document.querySelector("#meeting-run-prompt"),
   meetingRunTurns: document.querySelector("#meeting-run-turns"),
   startMeetingRun: document.querySelector("#start-meeting-run-button"),
@@ -6685,6 +6687,33 @@ async function attachMeetingProviderSession() {
   toast("Provider session attached to Meeting Room");
 }
 
+async function createFreshMeetingSessions() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || room.state !== "OPEN") {
+    throw new Error("Open a live Meeting Room first");
+  }
+  await api(`/v1/rooms/${encodeURIComponent(room.room_id)}/fresh-provider-sessions`, {
+    method: "POST",
+    body: { providers: ["CODEX", "CLAUDE", "GROK"] },
+  });
+  state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+  renderActiveMultiRoom();
+  toast("Fresh meeting reviewers created");
+}
+
+async function endActiveMeeting() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || room.state !== "OPEN") {
+    throw new Error("Open a live Meeting Room first");
+  }
+  await api(`/v1/rooms/${encodeURIComponent(room.room_id)}/close`, {
+    method: "POST",
+    body: {},
+  });
+  await refreshMultiRooms();
+  toast("Meeting ended; fresh reviewers were archived");
+}
+
 async function runActiveFeatureMeeting() {
   const room = state.activeMultiRoomSnapshot?.room;
   const feature = activeMeetingFeature();
@@ -6994,7 +7023,13 @@ function renderMeetingFeaturePanel(room) {
       binding.metadata?.provider_chat_key
   );
   if (elements.attachMeetingProvider) {
-    elements.attachMeetingProvider.disabled = !availableSessions.length || state.multiRoomMeetingRunBusy;
+    elements.attachMeetingProvider.disabled = room.state !== "OPEN" || !availableSessions.length || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.createFreshMeetingSessions) {
+    elements.createFreshMeetingSessions.disabled = room.state !== "OPEN" || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.endMeeting) {
+    elements.endMeeting.disabled = room.state !== "OPEN" || state.multiRoomMeetingRunBusy;
   }
   if (elements.startMeetingRun) {
     elements.startMeetingRun.disabled = !feature || feature.state === "ADOPTED" || verifiedModels.length < 2 || state.multiRoomMeetingRunBusy;
@@ -15025,6 +15060,22 @@ function bindEvents() {
   if (elements.attachMeetingProvider) {
     elements.attachMeetingProvider.addEventListener("click", () => {
       attachMeetingProviderSession().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.createFreshMeetingSessions) {
+    elements.createFreshMeetingSessions.addEventListener("click", () => {
+      createFreshMeetingSessions().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.endMeeting) {
+    elements.endMeeting.addEventListener("click", () => {
+      endActiveMeeting().catch((error) => {
         elements.settingsError.textContent = error.message;
         toast(error.message, true);
       });

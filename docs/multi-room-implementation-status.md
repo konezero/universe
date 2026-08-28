@@ -82,6 +82,9 @@ Database: **same Universe SQLite** (`universe.sqlite3` / service DB). Tables:
 | Goal Work Plan alternatives | **Done** — linked Meeting Room + at least two verified provider sessions produce bounded structured candidates with message/binding/run provenance |
 | Explicit Work Plan adoption and apply | **Done** — USER adoption is separate from atomic idempotent application; application creates only PLANNED Milestones and BACKLOG Todos, never Task Frame, authority, assignment, READY, or IN_PROGRESS state |
 | Thin Meeting Room planning UI + semantic graph | **Done** — generate/adopt/apply controls and redacted `GOAL_WORK_PLAN` projection are visible without embedding full plan bodies |
+| Independent fresh meeting reviewers | **Done** — the Session Broker creates provider sessions with `session_action=NEW`; bindings record `lifecycle_owner=MEETING` and bypass the reusable Provider Chat catalog only for that exact broker-owned identity |
+| Meeting close/archive lifecycle | **Done** — closing archives only meeting-owned fresh sessions, detaches active room bindings, keeps durable room history, and never terminates reused Master/Conductor sessions |
+| Catalog-lag attachment recovery | **Done** — an `INDEPENDENT` catalog projection may resolve only when one exact Supervisor provider/session record supplies a non-empty Session Anchor; ambiguous or unanchored matches still fail closed |
 
 ### S4 — Boss room
 
@@ -119,9 +122,11 @@ Base: Universe local service (`http://127.0.0.1:<port>`).
 | GET | `/v1/rooms/{room_id}/stream` | SSE (`snapshot`, `room`, `ping`) |
 | POST | `/v1/rooms/{room_id}/messages` | Post message (`author_role`, `body_text`) |
 | POST | `/v1/rooms/{room_id}/attach` | Push session into slot |
+| POST | `/v1/rooms/{room_id}/provider-sessions` | Attach one reusable, Anchor-verified Provider Chat session as a meeting model |
+| POST | `/v1/rooms/{room_id}/fresh-provider-sessions` | Create independent meeting-owned reviewer sessions through the Session Broker |
 | POST | `/v1/rooms/{room_id}/call-master` | Boss→Master call event |
 | POST | `/v1/rooms/{room_id}/worker-report` | Worker→Boss report |
-| POST | `/v1/rooms/{room_id}/close` | Close room |
+| POST | `/v1/rooms/{room_id}/close` | Archive meeting-owned fresh sessions, detach bindings, and close the room |
 | POST | `/v1/sessions/inject` | Harness session-ref inject |
 | POST | `/v1/projects/ensure-room` | Ensure PROJECT multi-room |
 | POST | `/v1/projects/{id}/master-session/prepare` | Also ensures PROJECT multi-room + bridge_line |

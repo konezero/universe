@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -178,6 +179,71 @@ class SessionBrokerService:
             "persistence_state": "SAVED",
         }
 
+    def create_session(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        descriptor = dict(value.get("descriptor") or value)
+        chat_key = _required(descriptor.get("chat_key"), "descriptor.chat_key")
+        provider = _required(descriptor.get("provider"), "descriptor.provider").upper()
+        if descriptor.get("provider_session_ref"):
+            raise SessionBrokerError(
+                "SESSION_BROKER_NEW_SESSION_REF_FORBIDDEN",
+                "a fresh broker session cannot supply a resume reference",
+                409,
+            )
+        with self._lock:
+            if chat_key in self._hosts:
+                raise SessionBrokerError(
+                    "SESSION_BROKER_SESSION_EXISTS",
+                    "the broker chat key already owns a live session",
+                    409,
+                )
+            host = self.host_factory(descriptor)
+            try:
+                connection = host.prepare(provider, session_action="NEW")
+                active_ref = getattr(host, "active_provider_session_ref", lambda: None)()
+                provider_ref = _required(active_ref, "provider_session_ref")
+            except Exception as error:
+                host.close()
+                code = str(
+                    getattr(error, "code", None) or str(error) or type(error).__name__
+                ).upper()
+                raise SessionBrokerError(code, str(error), 409) from error
+            descriptor["provider"] = provider
+            descriptor["provider_session_ref"] = provider_ref
+            fingerprint = self._fingerprint(descriptor)
+            self._hosts[chat_key] = (fingerprint, host)
+        return {
+            "schema": SESSION_BROKER_SCHEMA,
+            "status": "SESSION_BROKER_SESSION_CREATED",
+            "chat_key": chat_key,
+            "provider": provider,
+            "provider_session_ref": provider_ref,
+            "connection": connection,
+            "runtime_state": "LIVE",
+            "persistence_state": "SAVED",
+            "lifecycle_owner": "MEETING",
+        }
+
+    def archive_session(self, chat_key: str) -> dict[str, Any]:
+        key = _required(chat_key, "chat_key")
+        with self._lock:
+            resident = self._hosts.pop(key, None)
+        if resident is None:
+            return {
+                "schema": SESSION_BROKER_SCHEMA,
+                "status": "SESSION_BROKER_SESSION_ALREADY_ARCHIVED",
+                "chat_key": key,
+                "runtime_state": "ARCHIVED",
+                "persistence_state": "SAVED",
+            }
+        resident[1].close()
+        return {
+            "schema": SESSION_BROKER_SCHEMA,
+            "status": "SESSION_BROKER_SESSION_ARCHIVED",
+            "chat_key": key,
+            "runtime_state": "ARCHIVED",
+            "persistence_state": "SAVED",
+        }
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             sessions = []
@@ -250,9 +316,6 @@ class _BrokerHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._write(401, {"error_code": "SESSION_BROKER_UNAUTHORIZED"})
             return
-        if self.path != "/v1/turn":
-            self._write(404, {"error_code": "SESSION_BROKER_ROUTE_NOT_FOUND"})
-            return
         try:
             length = int(self.headers.get("Content-Length") or "0")
             value = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -260,7 +323,17 @@ class _BrokerHandler(BaseHTTPRequestHandler):
                 raise SessionBrokerError(
                     "SESSION_BROKER_REQUEST_INVALID", "request must be an object", 400
                 )
-            self._write(200, self.server.service.turn(value))
+            if self.path == "/v1/turn":
+                result = self.server.service.turn(value)
+            elif self.path == "/v1/sessions":
+                result = self.server.service.create_session(value)
+            else:
+                archive_match = re.fullmatch(r"/v1/sessions/([^/]+)/archive", self.path)
+                if archive_match is None:
+                    self._write(404, {"error_code": "SESSION_BROKER_ROUTE_NOT_FOUND"})
+                    return
+                result = self.server.service.archive_session(archive_match.group(1))
+            self._write(200, result)
         except SessionBrokerError as error:
             self._write(
                 error.status,
@@ -371,6 +444,14 @@ class SessionBrokerClient:
             "/v1/turn",
             {"descriptor": dict(descriptor), "body": body, "message_id": message_id},
         )
+
+    def create_session(self, descriptor: Mapping[str, Any]) -> dict[str, Any]:
+        self.ensure()
+        return self._call("POST", "/v1/sessions", {"descriptor": dict(descriptor)})
+
+    def archive_session(self, chat_key: str) -> dict[str, Any]:
+        self.ensure()
+        return self._call("POST", f"/v1/sessions/{chat_key}/archive", {})
 
 
 def serve(state_path: Path, database_path: Path) -> int:

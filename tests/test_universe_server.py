@@ -44,6 +44,7 @@ from universe_server import (  # noqa: E402
     UniverseError,
     UniverseStore,
     _vendor_chat_key,
+    _provider_source_key,
     attach_supervisor_session,
     load_server_state,
     load_universe_mode_registry,
@@ -8745,6 +8746,63 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("MASTER", attached["room_binding"]["slot_role"])
 
+    def test_provider_chat_resolution_uses_exact_supervisor_anchor_when_catalog_lags(self) -> None:
+        self.server.store.register_project(self.registration())
+        provider_ref = "provider-session-catalog-lag"
+        chat_key = "provider_chat_" + _provider_source_key(
+            {
+                "provider": "CODEX",
+                "provider_session_id": provider_ref,
+                "source_path": "",
+            }
+        ).removeprefix("provider_source_")
+        identity = {
+            "chat_key": chat_key,
+            "provider": "CODEX",
+            "provider_session_id": provider_ref,
+            "source_path": str(self.project_root / "rollout-catalog-lag.jsonl"),
+            "source_kind": "CODEX_ROLLOUT_JSONL",
+            "source_version": "v1",
+            "display_name": "Codex catalog lag",
+        }
+        with patch.object(
+            self.server, "resolve_provider_chat_identity", return_value=identity
+        ):
+            attached = self.server.attach_provider_chat_room(
+                chat_key, {"project_id": "GCS", "mode": "MASTER", "make_default": False}
+            )
+        self.assertTrue(attached["supervisor_session"]["session_anchor_ref"])
+        lagging_room = {
+            "chat_key": chat_key,
+            "provider": "CODEX",
+            "session_kind": "CHAT",
+            "display_name": "Codex catalog lag",
+            "binding": {"state": "INDEPENDENT"},
+        }
+        discovered = {
+            "provider": "CODEX",
+            "provider_session_id": provider_ref,
+            "source_path": identity["source_path"],
+            "session_kind": "CHAT",
+            "identity_state": "VERIFIED",
+            "last_modified_at": "2026-08-28T00:00:00Z",
+        }
+        with patch.object(
+            self.server, "provider_chat_catalog", return_value={"rooms": [lagging_room]}
+        ), patch.object(
+            self.server.store,
+            "discover_provider_session_sources",
+            return_value=[discovered],
+        ):
+            descriptor = self.server.resolve_provider_chat_session(chat_key)
+
+        self.assertEqual(provider_ref, descriptor["provider_session_ref"])
+        self.assertEqual("GCS", descriptor["project_id"])
+        self.assertEqual(
+            attached["supervisor_session"]["session_anchor_ref"],
+            descriptor["origin_session_anchor_ref"],
+        )
+
     def test_meeting_provider_session_attach_uses_opaque_verified_chat_key(self) -> None:
         self.server.store.register_project(self.registration())
         room_id = self.server.multi_rooms.create_meeting_room(
@@ -8793,6 +8851,42 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("private-provider-ref-1", attached["binding"]["provider_session_ref"])
         self.assertEqual(HTTPStatus.CREATED, replay_status)
         self.assertEqual("MEETING_PROVIDER_SESSION_ALREADY_ATTACHED", replay["status"])
+
+    def test_fresh_meeting_sessions_are_archived_when_room_closes(self) -> None:
+        self.server.store.register_project(self.registration())
+        room_id = self.server.multi_rooms.create_meeting_room(
+            {"title": "Fresh reviewers", "project_id": "GCS"}
+        )["room"]["room_id"]
+        created_refs = iter(["codex-fresh", "claude-fresh"])
+
+        def create_session(descriptor):
+            return {
+                "status": "SESSION_BROKER_SESSION_CREATED",
+                "chat_key": descriptor["chat_key"],
+                "provider": descriptor["provider"],
+                "provider_session_ref": next(created_refs),
+            }
+
+        with patch.object(
+            self.server.session_broker, "create_session", side_effect=create_session
+        ), patch.object(
+            self.server.session_broker,
+            "archive_session",
+            side_effect=lambda chat_key: {"status": "SESSION_BROKER_SESSION_ARCHIVED", "chat_key": chat_key},
+        ) as archive:
+            created = self.server.create_fresh_meeting_sessions(
+                room_id, {"providers": ["CODEX", "CLAUDE"]}
+            )
+            closed = self.server.close_multi_room(room_id)
+
+        self.assertEqual("MEETING_FRESH_SESSIONS_CREATED", created["status"])
+        self.assertEqual(2, len(created["sessions"]))
+        self.assertTrue(
+            all(item["binding"]["metadata"]["meeting_session"] for item in created["sessions"])
+        )
+        self.assertEqual(2, archive.call_count)
+        self.assertEqual("CLOSED", closed["room"]["state"])
+        self.assertEqual([], self.server.multi_rooms.list_bindings(room_id))
 
     def test_meeting_provider_adapter_waits_for_verified_terminal_result(self) -> None:
         terminal_body = "Self-contained verified specification"

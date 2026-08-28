@@ -29058,11 +29058,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         binding = room.get("binding") or {}
         if binding.get("state") not in {"BOUND", "ANCHOR_OBSERVED"}:
-            raise ProviderSessionError(
-                "PROVIDER_SESSION_NOT_ATTACHED",
-                "Attach the Provider Session to a Project Anchor before opening it",
-                HTTPStatus.CONFLICT,
-            )
+            provider = str(room.get("provider") or "UNKNOWN").upper()
+            source_refs: list[str] = []
+            for source in self.store.discover_provider_session_sources(provider):
+                if str(source.get("session_kind") or "CHAT").upper() == "WORKER":
+                    continue
+                identity = {
+                    "provider": provider,
+                    "provider_session_id": str(source.get("provider_session_id") or ""),
+                    "source_path": (
+                        ""
+                        if source.get("identity_state") == "VERIFIED"
+                        else _canonical_provider_source_path(source.get("source_path"))
+                    ),
+                }
+                candidate_key = "provider_chat_" + _provider_source_key(identity).removeprefix(
+                    "provider_source_"
+                )
+                if candidate_key == key and identity["provider_session_id"]:
+                    source_refs.append(identity["provider_session_id"])
+            exact_sessions = [
+                item
+                for item in self.session_supervisor.list_sessions(include_hidden=True)
+                if str(item.get("provider") or "").upper() == provider
+                and str(item.get("provider_session_ref") or "") in source_refs
+                and str(item.get("session_anchor_ref") or "").strip()
+                and str(item.get("session_kind") or "CHAT").upper() != "WORKER"
+            ]
+            if len(exact_sessions) != 1:
+                raise ProviderSessionError(
+                    "PROVIDER_SESSION_NOT_ATTACHED",
+                    "Attach the Provider Session to a Project Anchor before opening it",
+                    HTTPStatus.CONFLICT,
+                )
+            observed = exact_sessions[0]
+            binding = {
+                **binding,
+                "state": "ANCHOR_OBSERVED",
+                "current_project_id": observed.get("current_project_id")
+                or observed.get("node"),
+                "node": observed.get("node"),
+                "mode": observed.get("mode"),
+                "universe_session_id": observed.get("session_id"),
+                "session_anchor_ref": observed.get("session_anchor_ref"),
+                "current_anchor_ref": observed.get("anchor_ref"),
+                "alias": observed.get("alias"),
+            }
         project_id = str(
             binding.get("current_project_id") or binding.get("node") or ""
         ).strip()
@@ -30842,6 +30883,110 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "binding": attached["binding"],
         }
 
+    def create_fresh_meeting_sessions(self, room_id: str, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        room = self.multi_rooms.get_room(room_id)
+        if room.get("room_type") != "MEETING" or room.get("state") != "OPEN":
+            raise UniverseError(
+                "MEETING_ROOM_NOT_OPEN",
+                "fresh participants require an open Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        project_id = _required_text(room.get("project_id"), "room.project_id")
+        project = self.store.get_project(project_id)
+        raw_providers = request.get("providers") or ["CODEX", "CLAUDE", "GROK"]
+        if not isinstance(raw_providers, list):
+            raise UniverseError(
+                "MEETING_PROVIDERS_INVALID", "providers must be a list", HTTPStatus.BAD_REQUEST
+            )
+        providers = list(dict.fromkeys(str(item or "").upper() for item in raw_providers))
+        if not providers or any(item not in {"CODEX", "CLAUDE", "GROK"} for item in providers):
+            raise UniverseError(
+                "MEETING_PROVIDERS_INVALID",
+                "providers must contain CODEX, CLAUDE, or GROK",
+                HTTPStatus.BAD_REQUEST,
+            )
+        created: list[dict[str, Any]] = []
+        for provider in providers:
+            chat_key = "meeting_chat_" + secrets.token_hex(12)
+            setting = self.store.provider_setting("PROJECT_MASTER", project_id)
+            descriptor = {
+                "chat_key": chat_key,
+                "provider": provider,
+                "project_id": project_id,
+                "node": project_id,
+                "mode": "MASTER",
+                "repository_root": str(project["project_root"]),
+                "current_anchor_ref": "UNKNOWN",
+                "alias": f"{provider} independent meeting reviewer",
+                "model_ref": setting.get("model_ref") or "UNKNOWN",
+            }
+            try:
+                resident = self.session_broker.create_session(descriptor)
+            except SessionBrokerError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus(error.status)) from error
+            provider_ref = _required_text(
+                resident.get("provider_session_ref"), "provider_session_ref"
+            )
+            attached = self.multi_rooms.attach_session(
+                room_id,
+                {
+                    "slot_role": "MODEL",
+                    "provider": provider,
+                    "provider_session_ref": provider_ref,
+                    "session_anchor_ref": f"meeting-session://{chat_key}",
+                    "provider_chat_key": chat_key,
+                    "display_name": f"{provider} fresh reviewer",
+                    "metadata": {
+                        "meeting_session": True,
+                        "session_origin": "FRESH",
+                        "lifecycle_owner": "MEETING",
+                        "archive_on_close": True,
+                        "project_id": project_id,
+                        "node": project_id,
+                        "mode": "MASTER",
+                        "repository_root": str(project["project_root"]),
+                        "model_ref": setting.get("model_ref") or "UNKNOWN",
+                    },
+                },
+            )
+            created.append({"resident": resident, "binding": attached["binding"]})
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEETING_FRESH_SESSIONS_CREATED",
+            "room_id": room_id,
+            "sessions": created,
+        }
+
+    def close_multi_room(self, room_id: str) -> dict[str, Any]:
+        room = self.multi_rooms.get_room(room_id)
+        archived: list[dict[str, Any]] = []
+        if room.get("room_type") == "MEETING":
+            for binding in self.multi_rooms.list_bindings(room_id):
+                metadata = binding.get("metadata")
+                if not isinstance(metadata, Mapping):
+                    continue
+                if metadata.get("lifecycle_owner") != "MEETING" or not metadata.get(
+                    "archive_on_close"
+                ):
+                    continue
+                chat_key = str(metadata.get("provider_chat_key") or "").strip()
+                if not chat_key:
+                    continue
+                try:
+                    archived.append(self.session_broker.archive_session(chat_key))
+                except SessionBrokerError as error:
+                    archived.append(
+                        {"chat_key": chat_key, "status": "ARCHIVE_FAILED", "reason": error.code}
+                    )
+        closed = self.multi_rooms.close_room(room_id)
+        return {
+            "schema": API_SCHEMA,
+            "status": "ROOM_CLOSED",
+            "room": closed,
+            "archived_sessions": archived,
+        }
+
     def _invoke_multi_room_meeting_provider(
         self,
         binding: Mapping[str, Any],
@@ -30859,7 +31004,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Meeting model binding has no verified provider chat key",
                 HTTPStatus.CONFLICT,
             )
-        descriptor = self.resolve_provider_chat_session(chat_key)
+        meeting_owned = (
+            isinstance(metadata, Mapping)
+            and metadata.get("meeting_session") is True
+            and metadata.get("lifecycle_owner") == "MEETING"
+        )
+        if meeting_owned:
+            descriptor = {
+                "chat_key": chat_key,
+                "provider": binding.get("provider"),
+                "provider_session_ref": binding.get("provider_session_ref"),
+                "project_id": metadata.get("project_id"),
+                "node": metadata.get("node") or metadata.get("project_id"),
+                "mode": metadata.get("mode") or "MASTER",
+                "repository_root": metadata.get("repository_root"),
+                "current_anchor_ref": "UNKNOWN",
+                "model_ref": metadata.get("model_ref") or "UNKNOWN",
+            }
+        else:
+            descriptor = self.resolve_provider_chat_session(chat_key)
         if (
             str(descriptor.get("provider") or "").upper()
             != str(binding.get("provider") or "").upper()
@@ -36381,6 +36544,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     else:
                         self._send_provider_session_error(error)
                 return
+            meeting_fresh_sessions = re.fullmatch(
+                r"/v1/rooms/([^/]+)/fresh-provider-sessions$", path
+            )
+            if meeting_fresh_sessions is not None:
+                try:
+                    self._send(
+                        HTTPStatus.CREATED,
+                        self.server.create_fresh_meeting_sessions(
+                            unquote(meeting_fresh_sessions.group(1)), body or {}
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
             feature_meeting_cancel = re.fullmatch(
                 r"/v1/feature-nodes/([^/]+)/meeting-runs/([^/]+)/cancel$", path
             )
@@ -36732,16 +36911,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             room_close = re.fullmatch(r"/v1/rooms/([^/]+)/close$", path)
             if room_close is not None:
                 try:
-                    room = self.server.multi_rooms.close_room(
-                        unquote(room_close.group(1))
-                    )
                     self._send(
                         HTTPStatus.OK,
-                        {
-                            "schema": API_SCHEMA,
-                            "status": "ROOM_CLOSED",
-                            "room": room,
-                        },
+                        self.server.close_multi_room(unquote(room_close.group(1))),
                     )
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)

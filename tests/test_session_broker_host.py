@@ -47,6 +47,9 @@ class _Host:
     def status(self) -> dict[str, object]:
         return {"resident": not self.closed}
 
+    def active_provider_session_ref(self) -> str:
+        return "fresh-provider-session"
+
     def close(self) -> None:
         self.closed = True
 
@@ -136,6 +139,24 @@ class SessionBrokerServiceTests(unittest.TestCase):
             self.assertEqual(2, len(hosts))
             self.assertTrue(hosts[0].closed)
 
+    def test_fresh_session_is_owned_until_explicit_archive(self) -> None:
+        with TemporaryDirectory() as directory:
+            host = _Host()
+            service = SessionBrokerService(
+                Path(directory) / "broker.sqlite3", host_factory=lambda _descriptor: host
+            )
+            descriptor = _descriptor()
+            descriptor.pop("provider_session_ref")
+
+            created = service.create_session({"descriptor": descriptor})
+            archived = service.archive_session(descriptor["chat_key"])
+
+            self.assertEqual("SESSION_BROKER_SESSION_CREATED", created["status"])
+            self.assertEqual("fresh-provider-session", created["provider_session_ref"])
+            self.assertEqual([("CLAUDE", "NEW")], host.prepared)
+            self.assertEqual("SESSION_BROKER_SESSION_ARCHIVED", archived["status"])
+            self.assertTrue(host.closed)
+
 
 class SessionBrokerHTTPTests(unittest.TestCase):
     def test_client_uses_authenticated_broker_ipc(self) -> None:
@@ -165,6 +186,14 @@ class SessionBrokerHTTPTests(unittest.TestCase):
                 result = client.turn(_descriptor(), "hello", "message-1")
                 self.assertEqual("SESSION_BROKER_TURN_COMPLETED", result["status"])
                 self.assertEqual("CLAUDE:hello", result["body"])
+
+                fresh = _descriptor()
+                fresh["chat_key"] = "meeting_chat_1"
+                fresh.pop("provider_session_ref")
+                created = client.create_session(fresh)
+                self.assertEqual("SESSION_BROKER_SESSION_CREATED", created["status"])
+                archived = client.archive_session("meeting_chat_1")
+                self.assertEqual("SESSION_BROKER_SESSION_ARCHIVED", archived["status"])
             finally:
                 server.shutdown()
                 server.server_close()

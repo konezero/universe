@@ -621,6 +621,11 @@ class MultiRoomStore:
                 "UPDATE chat_room SET state = 'CLOSED', updated_at = ? WHERE room_id = ?",
                 (now, rid),
             )
+            connection.execute(
+                "UPDATE chat_room_session SET state = 'DETACHED', updated_at = ? "
+                "WHERE room_id = ? AND state = 'ACTIVE'",
+                (now, rid),
+            )
             connection.commit()
         room = self.get_room(rid)
         self.hub.publish(rid, {"type": "ROOM_CLOSED", "room": room})
@@ -655,7 +660,10 @@ class MultiRoomStore:
             "session_anchor_ref",
             limit=256,
         )
-        binding_metadata: dict[str, Any] = {}
+        raw_metadata = value.get("metadata")
+        binding_metadata: dict[str, Any] = (
+            dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        )
         if session_anchor_ref is not None:
             binding_metadata["session_anchor_ref"] = session_anchor_ref
         provider_chat_key = _optional_text(
