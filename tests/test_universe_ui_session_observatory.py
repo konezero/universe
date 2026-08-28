@@ -810,7 +810,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('row.dataset.bound = "false"', APP)
         self.assertIn("unbound_in_progress_count", APP)
         self.assertIn("Work ownership / ${ownershipSummary.task_frame_count}", APP)
+        self.assertIn("function todoAutomationControlProjection", APP)
+        self.assertIn("GOAL_LINK_REQUIRED", APP)
+        self.assertIn("WORK_PLAN_SCOPE_MISMATCH", APP)
+        self.assertIn('surface.automation_state === "TASK_FRAME_READY"', APP)
+        self.assertIn("Exactly one current Conductor session is required", APP)
+        self.assertIn("/automation/todo-selection", APP)
+        self.assertIn('approval: "SELECT_TODOS"', APP)
+        self.assertIn("renderTodoAutomationControl(todo)", APP)
         self.assertIn(".todo-ownership", CSS)
+        self.assertIn(".todo-automation-control", CSS)
 
     def test_project_graph_labels_functional_nodes_with_seed_provenance(self) -> None:
         self.assertIn("Project Seed node", HTML)

@@ -11961,6 +11961,144 @@ function todoOwnershipSummary(todos) {
   };
 }
 
+const todoAutomationNextStepLabels = {
+  APPLY_ADOPTED_WORK_PLAN: "Apply adopted Work Plan",
+  CREATE_AND_DELIVER_MASTER_HANDOFF: "Create and deliver Master handoff",
+  DELIVER_MASTER_HANDOFF: "Deliver Master handoff",
+  WAIT: "Waiting for Master proposal",
+  USER_RESOLUTION_REQUIRED: "Resolve Master proposal ambiguity",
+  BIND_INSTRUCTION_TASK_FRAME: "Bind instruction to Task Frame",
+  SELECT_TODOS_FOR_EXECUTION: "Select Todo for Task Frame run",
+  RUN_TASK_FRAME: "Run assigned Task Frame",
+  APPLY_TASK_FRAME_RESULT: "Apply Task Frame result",
+};
+
+function todoAutomationControlProjection(todo) {
+  if (!todo || (todo.state !== "IN_PROGRESS" && !todo.goal_id)) return null;
+  const goalId = String(todo.goal_id || "");
+  if (!goalId) {
+    return {
+      code: "GOAL_LINK_REQUIRED",
+      label: "Connect this Todo to a Goal",
+      detail: "No Goal owns this in-progress work, so automation cannot assign it.",
+      actionable: false,
+      enabled: false,
+    };
+  }
+  const surface = state.goalAutomationSurfaces?.[goalId];
+  if (!surface?.goal) {
+    return {
+      code: "GOAL_AUTOMATION_STATE_UNAVAILABLE",
+      label: "Load Goal automation state",
+      detail: "The Goal link exists, but its automation surface is not available yet.",
+      actionable: false,
+      enabled: false,
+    };
+  }
+  const todoExecution = surface.todo_execution || {};
+  const eligibleTodoIds = todoExecution.eligible_todo_ids || [];
+  const selectedTodoIds = todoExecution.selection?.todo_ids || [];
+  if (selectedTodoIds.includes(todo.todo_id)) return null;
+  if (surface.application && !eligibleTodoIds.includes(todo.todo_id)) {
+    return {
+      code: "WORK_PLAN_SCOPE_MISMATCH",
+      label: "Add this Todo through an adopted Work Plan",
+      detail: "The applied Work Plan did not create this Todo, so its Task Frame cannot select it.",
+      actionable: false,
+      enabled: false,
+    };
+  }
+  const operation = String(surface.next_operation || "WAIT");
+  if (
+    surface.automation_state === "TASK_FRAME_READY" &&
+    operation === "SELECT_TODOS_FOR_EXECUTION" &&
+    eligibleTodoIds.includes(todo.todo_id)
+  ) {
+    const enabled = Boolean(currentConductorMutationSession());
+    return {
+      code: operation,
+      label: todoAutomationNextStepLabels[operation],
+      detail: enabled
+        ? "The governed Task Frame is ready to own and start this Todo."
+        : "Exactly one current Conductor session is required to perform the selection.",
+      actionable: true,
+      enabled,
+    };
+  }
+  return {
+    code: operation,
+    label: todoAutomationNextStepLabels[operation] || operation.replaceAll("_", " "),
+    detail: `Goal automation is ${surface.automation_state || "UNKNOWN"}; this gate is not bypassed.`,
+    actionable: false,
+    enabled: false,
+  };
+}
+
+async function selectTodoForGoalExecution(todo) {
+  const surface = state.goalAutomationSurfaces?.[todo.goal_id];
+  const session = currentConductorMutationSession();
+  if (!surface?.goal) throw new Error("Goal automation state is unavailable");
+  if (!session) throw new Error("Exactly one current Conductor session is required");
+  if (!window.confirm(`Select this Todo for the bound Task Frame?\n\n${todo.title}`)) return;
+  const result = await api(
+    `/v1/goals/${encodeURIComponent(todo.goal_id)}/automation/todo-selection`,
+    {
+      method: "POST",
+      body: {
+        approval: "SELECT_TODOS",
+        expected_goal_revision: surface.goal.revision,
+        provider: String(session.provider).toUpperCase(),
+        provider_session_ref: session.provider_session_ref,
+        session_id: session.session_id,
+        session_anchor_ref: session.session_anchor_ref,
+        todo_ids: [todo.todo_id],
+        ttl_seconds: 120,
+      },
+    }
+  );
+  state.goalAutomationSurfaces[todo.goal_id] = result.surface || surface;
+  for (const action of result.actions || []) {
+    const updatedTodo = action.todo;
+    if (!updatedTodo) continue;
+    state.todos = state.todos.map((item) =>
+      item.todo_id === updatedTodo.todo_id ? updatedTodo : item
+    );
+  }
+  renderProjects();
+  renderTodos();
+  renderDetails();
+  renderActivity();
+  drawGraph();
+  renderActiveMultiRoom();
+  toast("Todo selected for the governed Task Frame");
+}
+
+function renderTodoAutomationControl(todo) {
+  const projection = todoAutomationControlProjection(todo);
+  if (!projection) return null;
+  const row = node("div", "todo-automation-control");
+  row.dataset.code = projection.code;
+  const copy = node("div", "todo-automation-copy");
+  copy.append(
+    node("strong", "", projection.label),
+    node("small", "", projection.detail)
+  );
+  row.append(copy);
+  if (projection.actionable) {
+    const action = node("button", "secondary-button compact-action", "Assign");
+    action.type = "button";
+    action.disabled = !projection.enabled;
+    action.title = projection.enabled
+      ? "Select this Todo for the bound Task Frame"
+      : projection.detail;
+    action.addEventListener("click", () =>
+      selectTodoForGoalExecution(todo).catch((error) => toast(error.message, true))
+    );
+    row.append(action);
+  }
+  return row;
+}
+
 function renderTodoOwnership(todo) {
   const ownership = todoOwnershipProjection(todo);
   if (!ownership && todo.state !== "IN_PROGRESS") return null;
@@ -12511,8 +12649,10 @@ function renderTodos() {
     remove.addEventListener("click", () => deleteTodo(todo));
     controls.append(priority, todoState, save, remove);
     const ownership = renderTodoOwnership(todo);
+    const automationControl = renderTodoAutomationControl(todo);
     item.append(header);
     if (ownership) item.append(ownership);
+    if (automationControl) item.append(automationControl);
     item.append(title, detail, controls);
     elements.todoList.append(item);
   }

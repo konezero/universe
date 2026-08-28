@@ -2812,6 +2812,34 @@ dialog label {
   background: rgba(74, 222, 128, 0.08);
 }
 
+.todo-automation-control {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(251, 191, 36, 0.24);
+  border-radius: 8px;
+  background: rgba(251, 191, 36, 0.06);
+}
+
+.todo-automation-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.todo-automation-copy strong {
+  color: #fde68a;
+  font-size: 11px;
+}
+
+.todo-automation-copy small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .todo-context-ownership {
   margin: 0 0 8px;
   color: #c4b5fd;
