@@ -27,6 +27,7 @@ STATE_SCHEMA = "universe.reconnection-host-state.v1"
 RESPONSE_SCHEMA = "universe.reconnection-host-response.v1"
 MAX_STATE_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+DEFAULT_STALE_AFTER_SECONDS = 24 * 60 * 60
 SESSION_MARKER_ENVIRONMENT = (
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_SESSION_ID",
@@ -42,6 +43,54 @@ SESSION_MARKER_ENVIRONMENT = (
 
 class ReconnectionHostError(RuntimeError):
     """Raised when discovery, validation, or authenticated IPC fails."""
+
+
+def provision_private_registry_directory(
+    root: Path,
+    *,
+    platform_name: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    """Create the registry and restrict it to the current user plus SYSTEM."""
+
+    target = Path(root)
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(target, 0o700)
+    except OSError:
+        pass
+    if (platform_name or os.name) != "nt":
+        return
+    values = environment if environment is not None else os.environ
+    username = str(values.get("USERNAME") or "").strip()
+    domain = str(values.get("USERDOMAIN") or "").strip()
+    if not username:
+        raise ReconnectionHostError("Windows user identity is unavailable for Host ACL")
+    principal = f"{domain}\\{username}" if domain else username
+    system_root = Path(str(values.get("SystemRoot") or r"C:\Windows"))
+    executable = system_root / "System32" / "icacls.exe"
+    completed = subprocess.run(
+        [
+            str(executable),
+            str(target),
+            "/inheritance:r",
+            "/grant:r",
+            f"{principal}:(OI)(CI)F",
+            "*S-1-5-18:(OI)(CI)F",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+        shell=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise ReconnectionHostError(f"Host registry ACL provisioning failed: {detail}")
 
 
 def _require_string(value: Any, name: str) -> str:
@@ -146,11 +195,26 @@ class ReconnectionHostClient:
 class ReconnectionHostRegistry:
     """Discover a live Host by exact Anchor, or launch one when absent."""
 
-    def __init__(self, root: Path, binary: Path, *, start_tolerance: float = 10.0) -> None:
+    def __init__(
+        self,
+        root: Path,
+        binary: Path,
+        *,
+        start_tolerance: float = 10.0,
+        stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
+    ) -> None:
         self.root = Path(root)
         self.binary = Path(binary)
         self.start_tolerance = start_tolerance
+        self.stale_after_seconds = max(0.0, float(stale_after_seconds))
         self._launched_processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._prepared = False
+
+    def prepare(self) -> None:
+        if self._prepared:
+            return
+        provision_private_registry_directory(self.root)
+        self._prepared = True
 
     def state_path(self, anchor_ref: str) -> Path:
         if not anchor_ref.strip():
@@ -170,8 +234,7 @@ class ReconnectionHostRegistry:
         self._launched_processes.pop(anchor_ref, None)
         return return_code
 
-    def _read_state(self, anchor_ref: str) -> ReconnectionHostState:
-        path = self.state_path(anchor_ref)
+    def _read_state_path(self, path: Path) -> ReconnectionHostState:
         try:
             if path.stat().st_size > MAX_STATE_BYTES:
                 raise ReconnectionHostError("Host state exceeds size limit")
@@ -182,9 +245,95 @@ class ReconnectionHostRegistry:
             raise ReconnectionHostError("Host state is absent") from error
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ReconnectionHostError(f"Host state is unreadable: {error}") from error
+        return state
+
+    def _read_state(self, anchor_ref: str) -> ReconnectionHostState:
+        path = self.state_path(anchor_ref)
+        state = self._read_state_path(path)
         if state.anchor_ref != anchor_ref:
             raise ReconnectionHostError("Host state Anchor does not match the requested Anchor")
         return state
+
+    def cleanup_stale_records(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        """Remove only validated dead discovery records older than retention."""
+
+        self.prepare()
+        observed_at = time.time() if now is None else float(now)
+        results: list[dict[str, Any]] = []
+        for path in sorted(self.root.glob("anchor-*.json")):
+            if path.is_symlink() or not path.is_file():
+                results.append({"path": str(path), "status": "INVALID_RECORD_PRESERVED"})
+                continue
+            try:
+                state = self._read_state_path(path)
+                if self.state_path(state.anchor_ref) != path:
+                    raise ReconnectionHostError("Host state filename does not match Anchor")
+            except ReconnectionHostError as error:
+                results.append(
+                    {
+                        "path": str(path),
+                        "status": "INVALID_RECORD_PRESERVED",
+                        "detail": str(error),
+                    }
+                )
+                continue
+            observed_start = process_start_time(state.pid)
+            expected_start = state.started_at_unix_ms / 1000.0
+            exact_process_live = (
+                process_is_alive(state.pid)
+                and observed_start is not None
+                and abs(observed_start - expected_start) <= self.start_tolerance
+            )
+            if exact_process_live:
+                results.append(
+                    {
+                        "path": str(path),
+                        "status": "LIVE_RECORD_PRESERVED",
+                        "host_id": state.host_id,
+                    }
+                )
+                continue
+            try:
+                age_seconds = max(0.0, observed_at - path.stat().st_mtime)
+            except OSError as error:
+                results.append(
+                    {
+                        "path": str(path),
+                        "status": "INVALID_RECORD_PRESERVED",
+                        "detail": str(error),
+                    }
+                )
+                continue
+            if age_seconds < self.stale_after_seconds:
+                results.append(
+                    {
+                        "path": str(path),
+                        "status": "STALE_RECORD_DEFERRED",
+                        "host_id": state.host_id,
+                        "age_seconds": age_seconds,
+                    }
+                )
+                continue
+            try:
+                path.unlink()
+            except OSError as error:
+                results.append(
+                    {
+                        "path": str(path),
+                        "status": "STALE_RECORD_REMOVE_FAILED",
+                        "detail": str(error),
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "path": str(path),
+                    "status": "STALE_RECORD_REMOVED",
+                    "host_id": state.host_id,
+                    "age_seconds": age_seconds,
+                }
+            )
+        return results
 
     def discover(self, anchor_ref: str) -> ReconnectionHostClient:
         state = self._read_state(anchor_ref)
@@ -236,11 +385,7 @@ class ReconnectionHostRegistry:
     ) -> ReconnectionHostClient:
         if not self.binary.is_file():
             raise ReconnectionHostError(f"Reconnection Host binary is absent: {self.binary}")
-        self.root.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.root, 0o700)
-        except OSError:
-            pass
+        self.prepare()
         state_path = self.state_path(anchor_ref)
         if state_path.exists():
             try:

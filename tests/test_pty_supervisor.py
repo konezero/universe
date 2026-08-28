@@ -110,9 +110,13 @@ class PtySupervisorTests(unittest.TestCase):
                 calls.append("reclaim")
                 return []
 
+            def cleanup_reconnection_host_registry(self):
+                calls.append("cleanup")
+                return []
+
         supervisor = PtySupervisor(host=FakeHost(), reclaim_poll_seconds=60)
         try:
-            self.assertEqual(["reconcile", "reclaim"], calls[:2])
+            self.assertEqual(["reconcile", "cleanup", "reclaim"], calls[:3])
         finally:
             supervisor.close()
 
@@ -132,11 +136,15 @@ class PtySupervisorTests(unittest.TestCase):
                     "UNIVERSE_RECONNECTION_HOST_REGISTRY": str(root / "registry"),
                 },
                 clear=True,
-            ):
+            ), patch(
+                "universe_pty_supervisor.ReconnectionHostRegistry.prepare"
+            ) as prepare:
                 registry = reconnection_registry_from_environment(state_path)
             self.assertIsNotNone(registry)
             self.assertEqual(binary, registry.binary)
             self.assertEqual(root / "registry", registry.root)
+            self.assertEqual(86400, registry.stale_after_seconds)
+            prepare.assert_called_once_with()
 
     def test_spawn_supervisor_hides_its_windows_console(self) -> None:
         script = ROOT / "tools" / "universe_pty_supervisor.py"

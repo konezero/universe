@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,13 @@ class BuildPortableTests(unittest.TestCase):
     def test_build_portable_folder_and_zip(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             out = Path(temp)
-            result = build_portable(out, make_zip=True)
+            host_binary = out / "release-universe-session-host.exe"
+            host_binary.write_bytes(b"release-host-binary")
+            result = build_portable(
+                out,
+                make_zip=True,
+                session_host_binary=host_binary,
+            )
             package = Path(result["package_dir"])
             self.assertTrue(package.is_dir())
             self.assertTrue((package / "tools" / "universe_server.py").is_file())
@@ -73,9 +80,25 @@ class BuildPortableTests(unittest.TestCase):
             self.assertEqual(source_icon.read_bytes(), packaged_icon.read_bytes())
             self.assertGreater(len(packaged_icon.read_bytes()), 32)
             self.assertTrue((package / "data" / ".gitkeep").is_file())
+            packaged_host = (
+                package
+                / "runtime"
+                / "session-host"
+                / "universe-session-host.exe"
+            )
+            self.assertEqual(host_binary.read_bytes(), packaged_host.read_bytes())
+            self.assertFalse((package / "tools" / "session_host" / "target").exists())
             self.assertTrue((package / "VERSION.txt").is_file())
             version = json.loads((package / "VERSION.txt").read_text(encoding="utf-8"))
             self.assertFalse(version["includes_python"])
+            self.assertEqual(
+                "runtime/session-host/universe-session-host.exe",
+                version["reconnection_host"]["path"],
+            )
+            self.assertEqual(
+                hashlib.sha256(host_binary.read_bytes()).hexdigest(),
+                version["reconnection_host"]["sha256"],
+            )
             catalog_manifest_path = package / "project-integration-catalog.json"
             self.assertTrue(catalog_manifest_path.is_file())
             catalog_manifest = json.loads(catalog_manifest_path.read_text(encoding="utf-8"))
@@ -91,6 +114,11 @@ class BuildPortableTests(unittest.TestCase):
             )
             launcher = (package / "Start-Universe.cmd").read_text(encoding="utf-8")
             self.assertIn("UNIVERSE_PYTHON", launcher)
+            self.assertIn("UNIVERSE_RECONNECTION_HOST_ENABLED=1", launcher)
+            self.assertIn(
+                r"runtime\session-host\universe-session-host.exe",
+                launcher,
+            )
             zip_path = Path(result["zip_path"])
             self.assertTrue(zip_path.is_file())
             with zipfile.ZipFile(zip_path) as archive:
@@ -100,6 +128,10 @@ class BuildPortableTests(unittest.TestCase):
                     names,
                 )
             self.assertTrue(any(name.endswith("tools/universe_server.py") for name in names))
+            self.assertTrue(
+                any(name.endswith("runtime/session-host/universe-session-host.exe") for name in names)
+            )
+            self.assertFalse(any("/tools/session_host/target/" in name for name in names))
             zipped_ai_files = sorted(
                 name
                 for name in names

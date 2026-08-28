@@ -9,8 +9,10 @@ Portable data lives under <package>/data.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
+import subprocess
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -48,7 +50,11 @@ SKIP_DIR_NAMES = {
     "continuity",
     "tmp",
     "task_frames",
+    "target",
 }
+
+SESSION_HOST_MANIFEST = ROOT / "tools" / "session_host" / "Cargo.toml"
+SESSION_HOST_BINARY_NAME = "universe-session-host.exe"
 
 # Official Windows embeddable package (amd64). Override with --python-zip.
 DEFAULT_EMBED_PYTHON_URL = (
@@ -98,7 +104,13 @@ def write_project_integration_catalog(package_root: Path) -> dict:
     }
 
 
-def env_snippet(*, python_cmd: str) -> str:
+def env_snippet(*, python_cmd: str, includes_session_host: bool = False) -> str:
+    session_host = ""
+    if includes_session_host:
+        session_host = rf"""set "UNIVERSE_RECONNECTION_HOST_ENABLED=1"
+set "UNIVERSE_RECONNECTION_HOST_BINARY=%UNIVERSE_PORTABLE_ROOT%\runtime\session-host\{SESSION_HOST_BINARY_NAME}"
+set "UNIVERSE_RECONNECTION_HOST_REGISTRY=%UNIVERSE_DATA_DIR%\reconnection-hosts"
+"""
     return rf"""@echo off
 set "UNIVERSE_PORTABLE_ROOT=%~dp0"
 if "%UNIVERSE_PORTABLE_ROOT:~-1%"=="\" set "UNIVERSE_PORTABLE_ROOT=%UNIVERSE_PORTABLE_ROOT:~0,-1%"
@@ -108,19 +120,27 @@ set "UNIVERSE_DATABASE=%UNIVERSE_DATA_DIR%\universe.sqlite3"
 set "UNIVERSE_LOG_FILE=%UNIVERSE_PORTABLE_ROOT%\logs\service.log"
 set "UNIVERSE_MODE_REGISTRY=%UNIVERSE_PORTABLE_ROOT%\.ai\runtime\project_instance\mode_registry.json"
 set "UNIVERSE_PYTHON={python_cmd}"
-if not exist "%UNIVERSE_DATA_DIR%" mkdir "%UNIVERSE_DATA_DIR%"
+{session_host}if not exist "%UNIVERSE_DATA_DIR%" mkdir "%UNIVERSE_DATA_DIR%"
 if not exist "%UNIVERSE_PORTABLE_ROOT%\logs" mkdir "%UNIVERSE_PORTABLE_ROOT%\logs"
 cd /d "%UNIVERSE_PORTABLE_ROOT%"
 """
 
 
-def write_launchers(package_root: Path, *, includes_python: bool) -> None:
+def write_launchers(
+    package_root: Path,
+    *,
+    includes_python: bool,
+    includes_session_host: bool = False,
+) -> None:
     python_cmd = (
         r"%UNIVERSE_PORTABLE_ROOT%\runtime\python\python.exe"
         if includes_python
         else "python"
     )
-    base = env_snippet(python_cmd=python_cmd)
+    base = env_snippet(
+        python_cmd=python_cmd,
+        includes_session_host=includes_session_host,
+    )
     # env_snippet already sets UNIVERSE_PYTHON; for PATH mode still allow runtime override
     if not includes_python:
         base = base.replace(
@@ -197,6 +217,53 @@ def download_file(url: str, dest: Path) -> Path:
     return dest
 
 
+def build_session_host(cargo_executable: str | Path = "cargo") -> Path:
+    """Build the Windows Reconnection Host from the locked Rust manifest."""
+
+    cargo_text = str(cargo_executable)
+    resolved = shutil.which(cargo_text)
+    cargo = Path(resolved) if resolved else Path(cargo_text)
+    if not cargo.is_file():
+        raise FileNotFoundError(f"cargo executable is missing: {cargo_executable}")
+    completed = subprocess.run(
+        [
+            str(cargo),
+            "build",
+            "--locked",
+            "--release",
+            "--manifest-path",
+            str(SESSION_HOST_MANIFEST),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"Rust Reconnection Host build failed: {detail}")
+    binary = SESSION_HOST_MANIFEST.parent / "target" / "release" / SESSION_HOST_BINARY_NAME
+    if not binary.is_file():
+        raise FileNotFoundError(f"release Host binary is missing after build: {binary}")
+    return binary
+
+
+def package_session_host(package_root: Path, binary: Path) -> dict:
+    source = Path(binary)
+    if not source.is_file():
+        raise FileNotFoundError(f"Reconnection Host binary is missing: {source}")
+    target = package_root / "runtime" / "session-host" / SESSION_HOST_BINARY_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    payload = target.read_bytes()
+    return {
+        "path": target.relative_to(package_root).as_posix(),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "byte_length": len(payload),
+    }
+
+
 def build_portable(
     output_dir: Path,
     *,
@@ -204,6 +271,7 @@ def build_portable(
     with_python: bool = False,
     python_zip: Path | None = None,
     python_url: str = DEFAULT_EMBED_PYTHON_URL,
+    session_host_binary: Path | None = None,
 ) -> dict:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     package_name = f"UniversePortable-{stamp}"
@@ -247,7 +315,16 @@ def build_portable(
             python_zip = cached
         python_meta = embed_python(package_root, python_zip)
 
-    write_launchers(package_root, includes_python=with_python)
+    session_host_meta = (
+        package_session_host(package_root, session_host_binary)
+        if session_host_binary is not None
+        else None
+    )
+    write_launchers(
+        package_root,
+        includes_python=with_python,
+        includes_session_host=session_host_meta is not None,
+    )
     project_integration_catalog = write_project_integration_catalog(package_root)
 
     req_line = (
@@ -255,11 +332,17 @@ def build_portable(
         if with_python
         else "Requires: Python 3 on PATH (or place embeddable package under runtime\\python)"
     )
+    host_line = (
+        "Rust Reconnection Host: bundled and enabled"
+        if session_host_meta is not None
+        else "Rust Reconnection Host: not bundled"
+    )
     readme = f"""Universe portable package
 =========================
 
 Built: {stamp} (UTC)
 {req_line}
+{host_line}
 
 Quick start
 -----------
@@ -277,6 +360,8 @@ Environment (set by launchers)
 ------------------------------
 UNIVERSE_DATA_DIR, UNIVERSE_STATE_FILE, UNIVERSE_DATABASE,
 UNIVERSE_LOG_FILE, UNIVERSE_MODE_REGISTRY, UNIVERSE_PYTHON
+When bundled: UNIVERSE_RECONNECTION_HOST_ENABLED,
+UNIVERSE_RECONNECTION_HOST_BINARY, UNIVERSE_RECONNECTION_HOST_REGISTRY
 
 Docs
 ----
@@ -299,6 +384,7 @@ copied templates. VERSION.txt records the same catalog digest.
         "includes_python": with_python,
         "data_dir": "data",
         "python": python_meta,
+        "reconnection_host": session_host_meta,
         "project_integration_catalog": project_integration_catalog,
     }
     (package_root / "VERSION.txt").write_text(
@@ -324,6 +410,7 @@ copied templates. VERSION.txt records the same catalog digest.
         "zip_path": str(zip_path) if zip_path else None,
         "package_name": package_name,
         "includes_python": with_python,
+        "includes_reconnection_host": session_host_meta is not None,
     }
 
 
@@ -356,14 +443,37 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_EMBED_PYTHON_URL,
         help="Embeddable CPython zip URL when --with-python and no --python-zip",
     )
+    parser.add_argument(
+        "--without-session-host",
+        action="store_true",
+        help="Build a legacy package without the Rust Reconnection Host",
+    )
+    parser.add_argument(
+        "--session-host-binary",
+        type=Path,
+        default=None,
+        help="Use an existing release Host executable instead of invoking cargo",
+    )
+    parser.add_argument(
+        "--cargo",
+        default="cargo",
+        help="Cargo executable used for the default locked release build",
+    )
     args = parser.parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.without_session_host:
+        session_host_binary = None
+    elif args.session_host_binary is not None:
+        session_host_binary = args.session_host_binary
+    else:
+        session_host_binary = build_session_host(args.cargo)
     result = build_portable(
         args.output_dir,
         make_zip=not args.no_zip,
         with_python=bool(args.with_python),
         python_zip=args.python_zip,
         python_url=args.python_url,
+        session_host_binary=session_host_binary,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

@@ -62,6 +62,10 @@ UNIVERSE_RECONNECTION_HOST_REGISTRY=<Host-owned registry directory>     # option
 
 The switch is off by default. When disabled, `TerminalHost` keeps the existing Python-owned ConPTY behavior. When enabled, terminal creation launches or reuses the exact Anchor's Rust Host, attaches a `ReconnectionPty`, and writes the provider command into the Host-owned persistent cmd. The Rust Host inherits a sanitized environment so a new provider cannot accidentally inherit Codex, Claude, or Grok session markers from its Supervisor.
 
+Portable builds now compile the locked Rust manifest in release mode and copy only `runtime/session-host/universe-session-host.exe` into the artifact. Cargo `target` trees are excluded from the portable copy. The generated launchers enable the Host and point its registry at `data/reconnection-hosts`. Builders can supply a prebuilt executable with `--session-host-binary`; `--without-session-host` exists only for an explicit legacy package.
+
+When the feature is enabled on Windows, Supervisor startup provisions the registry DACL through an exact-argv `icacls.exe` call. Inheritance is removed and full control is retained only for the current Windows user and SYSTEM. ACL failure is fail-closed: the Host-backed Supervisor does not start with a registry that could expose bearer tokens.
+
 `TERMINAL_CREATED` audit evidence now records the backend owner and the bounded metadata needed to rebuild the process-local `TerminalSession`. On Supervisor start and every lifecycle poll, reconciliation runs before legacy orphan cleanup:
 
 ```text
@@ -76,6 +80,8 @@ audit Terminal metadata + exact Anchor
 
 Only an authenticated, live `RUST_RECONNECTION_HOST` record suppresses legacy cmd termination. A missing, stale, mismatched, or unreachable Host falls back to the existing exact PID/start-time cleanup path. Managed-shell identity files retain verified SessionStart attach evidence so reconstruction does not invent provider attachment from PID liveness.
 
+Registry cleanup runs after reattachment and before legacy orphan cleanup. It deletes only a schema-valid record whose filename matches its Anchor, whose exact PID/start-time identity is no longer live, and whose file age exceeds `UNIVERSE_RECONNECTION_HOST_STALE_AFTER_SECONDS` (default 86400). Recent dead records are deferred; live exact identities and malformed or mismatched records are preserved for diagnosis.
+
 ## Non-goals
 
 The Host does not know or own:
@@ -88,6 +94,6 @@ The Host does not know or own:
 
 The discovery file is evidence used to find an endpoint. It contains the bearer token needed for reattachment, so callers must place the registry in a Host-owned access-controlled Runtime directory. The adapter applies owner-only mode where supported, but Windows ACL provisioning remains a deployment responsibility. IPC responses never expose the token.
 
-## Next slice
+## Remaining boundary
 
-Package the Rust binary as a release artifact, provision Windows ACLs for the registry, and add durable stale-record cleanup after operational dogfooding. Claude channel rebinding is best-effort during PTY reconstruction and must remain separately observable from PTY continuity. Goal, authority, BOOT, provider identity, and Anchor currentness stay outside the Host.
+Claude channel rebinding is best-effort during PTY reconstruction and remains separately observable from PTY continuity. Goal, authority, BOOT, provider identity, and Anchor currentness stay outside the Host.

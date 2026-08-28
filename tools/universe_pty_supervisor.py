@@ -83,7 +83,26 @@ def reconnection_registry_from_environment(
         if registry_text
         else state_path.parent / "reconnection-hosts"
     )
-    return ReconnectionHostRegistry(registry_root, binary)
+    stale_text = str(
+        os.environ.get("UNIVERSE_RECONNECTION_HOST_STALE_AFTER_SECONDS") or "86400"
+    ).strip()
+    try:
+        stale_after_seconds = float(stale_text)
+    except ValueError as error:
+        raise RuntimeError(
+            "UNIVERSE_RECONNECTION_HOST_STALE_AFTER_SECONDS must be numeric"
+        ) from error
+    if stale_after_seconds < 0:
+        raise RuntimeError(
+            "UNIVERSE_RECONNECTION_HOST_STALE_AFTER_SECONDS must not be negative"
+        )
+    registry = ReconnectionHostRegistry(
+        registry_root,
+        binary,
+        stale_after_seconds=stale_after_seconds,
+    )
+    registry.prepare()
+    return registry
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -112,6 +131,7 @@ class PtySupervisor:
         self._reclaim_poll_seconds = max(0.1, float(reclaim_poll_seconds))
         self._monitor_stop = threading.Event()
         self._reconcile_reconnection_hosts()
+        self._cleanup_reconnection_host_registry()
         # Legacy Python-owned ConPTY handles cannot be handed to this process.
         # Reclaim only exact PID/start-time instances after the Rust Host path
         # had a chance to reattach its durable sessions.
@@ -128,10 +148,16 @@ class PtySupervisor:
         if callable(reconcile):
             reconcile()
 
+    def _cleanup_reconnection_host_registry(self) -> None:
+        cleanup = getattr(self.host, "cleanup_reconnection_host_registry", None)
+        if callable(cleanup):
+            cleanup()
+
     def _monitor_orphaned_shells(self) -> None:
         while not self._monitor_stop.wait(self._reclaim_poll_seconds):
             try:
                 self._reconcile_reconnection_hosts()
+                self._cleanup_reconnection_host_registry()
                 self.host.reclaim_orphaned_managed_shells()
             except Exception:  # noqa: BLE001 - monitor must remain resident
                 continue

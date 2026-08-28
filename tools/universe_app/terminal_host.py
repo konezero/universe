@@ -978,6 +978,14 @@ class TerminalHost:
             )
         return results
 
+    def cleanup_reconnection_host_registry(self) -> list[dict[str, Any]]:
+        """Apply the registry's validated dead-record retention policy."""
+
+        registry = self._reconnection_registry
+        if registry is None:
+            return []
+        return registry.cleanup_stale_records()
+
     def get(self, terminal_id: str) -> TerminalSession:
         with self._lock:
             session = self._sessions.get(str(terminal_id or "").strip())
