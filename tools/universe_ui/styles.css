@@ -1661,6 +1661,22 @@ body.inspector-open .inspector {
   color: var(--blue);
 }
 
+.activity-context {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 10px;
+  padding: 9px 10px;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 6px;
+  background: rgba(34, 211, 238, 0.06);
+}
+
+.activity-context small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .timeline {
   display: flex;
   flex-direction: column;
@@ -2757,9 +2773,16 @@ dialog label {
   gap: 8px 12px;
   padding: 10px;
   border: 1px solid var(--line);
+  border-left-width: 4px;
   border-radius: 6px;
   background: var(--surface-quiet);
 }
+
+.todo-item[data-state="BACKLOG"] { border-left-color: #94a3b8; }
+.todo-item[data-state="READY"] { border-left-color: #a3e635; }
+.todo-item[data-state="IN_PROGRESS"] { border-left-color: #22d3ee; }
+.todo-item[data-state="BLOCKED"] { border-left-color: #fb7185; }
+.todo-item[data-state="DONE"] { border-left-color: #4ade80; }
 
 .todo-item-header {
   display: flex;

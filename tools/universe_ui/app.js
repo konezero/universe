@@ -10075,6 +10075,24 @@ function graphNodeMetrics(item) {
   return { shape: "other", radius: 16, hitR: 20 };
 }
 
+function todoStateColor(todoState) {
+  return {
+    BLOCKED: "#fb7185",
+    IN_PROGRESS: "#22d3ee",
+    READY: "#a3e635",
+    BACKLOG: "#94a3b8",
+  }[todoState] || "#f6c76a";
+}
+
+function todoProjectionForGraphNode(graphNode) {
+  const todos = openTodosForGraphNode(graphNode);
+  if (!todos.length) return null;
+  const rank = { BLOCKED: 0, IN_PROGRESS: 1, READY: 2, BACKLOG: 3 };
+  const stateName = [...todos]
+    .sort((left, right) => (rank[left.state] ?? 9) - (rank[right.state] ?? 9))[0]?.state;
+  return { count: todos.length, state: stateName, color: todoStateColor(stateName) };
+}
+
 function drawGraphNodeIcon(context, item, depthStyle) {
   const style = depthStyle.byId.get(item.id) || {
     alpha: 1,
@@ -10091,6 +10109,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   const metrics = graphNodeMetrics(item);
   const accent = graphAccentColor(item);
   const r = metrics.radius * (selected ? 1.08 : hovered ? 1.05 : 1);
+  const todoProjection = todoProjectionForGraphNode(item);
   context.globalAlpha = style.alpha;
   if (selected || hovered) {
     context.shadowColor = "rgba(61, 224, 255, 0.8)";
@@ -10141,6 +10160,14 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.stroke();
   }
 
+  if (todoProjection) {
+    context.beginPath();
+    context.arc(item.x, item.y, r + 4, 0, Math.PI * 2);
+    context.strokeStyle = todoProjection.color;
+    context.lineWidth = 2.5;
+    context.stroke();
+  }
+
   context.shadowBlur = 0;
   context.fillStyle = selected || hovered ? "#f2fbff" : "#e6f2ff";
   context.font = `${metrics.shape === "system" ? "600 10px" : "700 12px"} Segoe UI`;
@@ -10148,17 +10175,16 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   context.textBaseline = "middle";
   context.fillText(nodeMonogram(item), item.x, item.y + 0.5);
 
-  const todoCount = openTodosForGraphNode(item).length;
-  if (todoCount) {
+  if (todoProjection) {
     const badgeX = item.x + r * 0.72;
     const badgeY = item.y - r * 0.72;
     context.beginPath();
     context.arc(badgeX, badgeY, 8, 0, Math.PI * 2);
-    context.fillStyle = "#f6c76a";
+    context.fillStyle = todoProjection.color;
     context.fill();
     context.fillStyle = "#111827";
     context.font = "700 9px Segoe UI";
-    context.fillText(String(Math.min(todoCount, 99)), badgeX, badgeY + 0.5);
+    context.fillText(String(Math.min(todoProjection.count, 99)), badgeX, badgeY + 0.5);
   }
 }
 
@@ -10380,6 +10406,7 @@ function selectGraphNode(event) {
   state.selectedNode = selected;
   drawGraph();
   renderDetails();
+  renderActivity();
   showInspectorTab("details");
 }
 
@@ -11129,10 +11156,62 @@ function addDetail(list, key, value) {
   list.append(node("dt", "", key), node("dd", "", String(value)));
 }
 
+function semanticActivityItemsForGraphNode(graphNode) {
+  const activityTypes = new Set([
+    "EVENT",
+    "ROOM_CONTROL_EVENT",
+    "ROOM_MESSAGE",
+    "TASK_FRAME_RESULT",
+  ]);
+  const reachable = semanticDescendantIds(graphNode?.id);
+  return (state.semanticGraph?.nodes || [])
+    .filter((item) => reachable.has(item.id) && activityTypes.has(item.entity_type))
+    .sort((left, right) =>
+      String(right.data?.created_at || "").localeCompare(String(left.data?.created_at || ""))
+    )
+    .slice(0, 40);
+}
+
+function renderSemanticNodeActivity(graphNode) {
+  const context = node("div", "activity-context");
+  context.append(
+    node("strong", "", graphNode.label || "Selected node"),
+    node("small", "", "Project activity ledger · filtered by semantic lineage")
+  );
+  elements.activity.append(context);
+  const activityItems = semanticActivityItemsForGraphNode(graphNode);
+  if (!activityItems.length) {
+    elements.activity.append(
+      node("p", "empty-copy", "No activity is linked to this node lineage yet")
+    );
+    return;
+  }
+  const timeline = node("div", "timeline");
+  for (const item of activityItems) {
+    const copy = node("div", "timeline-copy");
+    copy.append(
+      node("strong", "", item.label || item.data?.event_type || item.entity_type),
+      node("small", "", `${item.lifecycle_state || "RECORDED"} · ${item.data?.created_at || "Unknown time"}`)
+    );
+    const row = node("div", "timeline-item semantic-activity-item");
+    row.append(copy);
+    timeline.append(row);
+  }
+  elements.activity.append(timeline);
+}
+
 function renderActivity() {
   elements.activity.replaceChildren();
   if (!state.selectedProject) {
     elements.activity.append(node("p", "empty-copy", "No project selected"));
+    return;
+  }
+  if (
+    state.view === "semantic" &&
+    state.selectedNode &&
+    state.selectedNode.kind !== "project"
+  ) {
+    renderSemanticNodeActivity(state.selectedNode);
     return;
   }
   if (
@@ -11538,6 +11617,14 @@ function conductorUiContext() {
 
 
 function todosForSelectedContext() {
+  if (
+    state.view === "semantic" &&
+    state.selectedNode &&
+    state.selectedNode.kind !== "project"
+  ) {
+    const todoIds = semanticTodoIdsForGraphNode(state.selectedNode);
+    return state.todos.filter((todo) => todoIds.has(todo.todo_id));
+  }
   const nodeRef = selectedNodeRef();
   if (nodeRef && state.selectedProject) {
     return state.todos.filter(
@@ -11558,6 +11645,59 @@ function todosForSelectedContext() {
   );
 }
 
+let semanticLineageCache = {
+  graph: null,
+  nodesById: new Map(),
+  outgoing: new Map(),
+  descendants: new Map(),
+};
+
+function prepareSemanticLineageCache() {
+  const graph = state.semanticGraph;
+  if (semanticLineageCache.graph === graph) return semanticLineageCache;
+  const nodesById = new Map((graph?.nodes || []).map((item) => [item.id, item]));
+  const outgoing = new Map();
+  for (const edge of graph?.edges || []) {
+    const targets = outgoing.get(edge.from) || [];
+    targets.push(edge.to);
+    outgoing.set(edge.from, targets);
+  }
+  semanticLineageCache = { graph, nodesById, outgoing, descendants: new Map() };
+  return semanticLineageCache;
+}
+
+function semanticGraphNode(nodeId) {
+  return prepareSemanticLineageCache().nodesById.get(nodeId) || null;
+}
+
+function semanticDescendantIds(seedId) {
+  const cache = prepareSemanticLineageCache();
+  if (!seedId || !cache.nodesById.has(seedId)) return new Set();
+  const cached = cache.descendants.get(seedId);
+  if (cached) return cached;
+  const visited = new Set([seedId]);
+  const pending = [seedId];
+  while (pending.length) {
+    const current = pending.shift();
+    for (const target of cache.outgoing.get(current) || []) {
+      if (visited.has(target)) continue;
+      visited.add(target);
+      pending.push(target);
+    }
+  }
+  cache.descendants.set(seedId, visited);
+  return visited;
+}
+
+function semanticTodoIdsForGraphNode(graphNode) {
+  const reachable = semanticDescendantIds(graphNode?.id);
+  return new Set(
+    [...reachable]
+      .filter((nodeId) => semanticGraphNode(nodeId)?.entity_type === "TODO")
+      .map((nodeId) => nodeId.replace(/^todo:/, ""))
+  );
+}
+
 function openTodosForGraphNode(graphNode) {
   if (graphNode?.kind === "project") {
     // Count against the graph project's id, not the currently selected one.
@@ -11568,6 +11708,12 @@ function openTodosForGraphNode(graphNode) {
     return state.todos.filter(
       (todo) =>
         todoBelongsToProject(todo, projectId) && todo.state !== "DONE"
+    );
+  }
+  const semanticTodoIds = semanticTodoIdsForGraphNode(graphNode);
+  if (semanticTodoIds.size) {
+    return state.todos.filter(
+      (todo) => semanticTodoIds.has(todo.todo_id) && todo.state !== "DONE"
     );
   }
   const nodeRef = graphNode?.data?.node_id;
@@ -11733,6 +11879,17 @@ function todoScopeLabel(todo) {
   if (todo.scope_kind === "UNIVERSE") return "Universe";
   if (todo.scope_kind === "PROJECT") return todo.project_id;
   return `${todo.project_id} / ${todo.node_ref}`;
+}
+
+function todoLineageLabel(todo) {
+  const labels = [];
+  const goal = todo.goal_id ? semanticGraphNode(`goal:${todo.goal_id}`) : null;
+  const milestone = todo.milestone_id
+    ? semanticGraphNode(`milestone:${todo.milestone_id}`)
+    : null;
+  if (goal?.label) labels.push(goal.label);
+  if (milestone?.label) labels.push(milestone.label);
+  return labels.length ? labels.join(" / ") : todoScopeLabel(todo);
 }
 
 function normalizeTodoProjectId(value) {
@@ -12194,10 +12351,11 @@ function renderTodos() {
   for (const todo of todos) {
     const item = node("article", "todo-item");
     item.dataset.todoId = todo.todo_id;
+    item.dataset.state = todo.state;
     const header = node("div", "todo-item-header");
     header.append(
       node("span", `todo-priority ${todo.priority.toLowerCase()}`, todo.priority),
-      node("span", "todo-location", todoScopeLabel(todo)),
+      node("span", "todo-location", todoLineageLabel(todo)),
       node("small", "", `r${todo.revision}`)
     );
     const title = node("input", "todo-item-title");

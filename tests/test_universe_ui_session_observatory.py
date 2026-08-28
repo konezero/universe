@@ -791,6 +791,19 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('projection only', APP)
         self.assertIn('if (state.view === "semantic")', APP)
 
+    def test_galaxy_and_fleet_project_shared_lineage_state(self) -> None:
+        self.assertIn("function semanticDescendantIds", APP)
+        self.assertIn("function semanticTodoIdsForGraphNode", APP)
+        self.assertIn("const todoIds = semanticTodoIdsForGraphNode(state.selectedNode)", APP)
+        self.assertIn("function todoProjectionForGraphNode", APP)
+        self.assertIn("item.dataset.state = todo.state", APP)
+        self.assertIn("todoLineageLabel(todo)", APP)
+        self.assertIn('todo-item[data-state="IN_PROGRESS"]', CSS)
+        self.assertIn("function semanticActivityItemsForGraphNode", APP)
+        self.assertIn("Project activity ledger · filtered by semantic lineage", APP)
+        self.assertIn("renderSemanticNodeActivity(state.selectedNode)", APP)
+        self.assertIn(".activity-context", CSS)
+
     def test_project_graph_labels_functional_nodes_with_seed_provenance(self) -> None:
         self.assertIn("Project Seed node", HTML)
         self.assertIn('projection_origin: "PROJECT_SEED"', APP)
