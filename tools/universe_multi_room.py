@@ -28,6 +28,9 @@ ROOM_DURABLE_EVENT_SCHEMA = "universe.chat-room-durable-event.v1"
 ROOM_CURSOR_SCHEMA = "universe.chat-room-cursor.v1"
 MEETING_COORDINATOR_SCHEMA = "universe.meeting-coordinator.v1"
 MEETING_SUMMARY_SCHEMA = "universe.meeting-summary.v1"
+MEETING_PROTOCOLS = frozenset(
+    {"INCREMENTAL_DELTA_ONLY", "INDEPENDENT_PROPOSAL_REVIEW"}
+)
 ROOM_ARTIFACT_SCHEMA = "universe.chat-room-artifact.v1"
 ROOM_ARTIFACT_REVISION_SCHEMA = "universe.chat-room-artifact-revision.v1"
 ROOM_FINDING_SCHEMA = "universe.chat-room-finding.v1"
@@ -2856,11 +2859,13 @@ class MultiRoomNativeControlRegistry:
 
 
 class MultiRoomMeetingCoordinator:
-    """Run a bounded, deterministic round-robin meeting over model bindings.
+    """Run a bounded, deterministic meeting over model bindings.
 
-    Provider adapters receive only the immediately preceding room delta. The
-    durable room remains the source of the observable transcript; the
-    coordinator never constructs or forwards a full transcript to a provider.
+    The legacy protocol forwards only the immediately preceding room delta.
+    Role-aware meetings first fan out the same prompt independently, then send
+    bounded excerpts of those proposals for one structured review phase. The
+    durable room remains the source of the observable transcript; neither
+    protocol forwards the unbounded room transcript.
     """
 
     def __init__(
@@ -2912,6 +2917,8 @@ class MultiRoomMeetingCoordinator:
         run_id: str | None = None,
         cancel_check: Callable[[Mapping[str, Any]], bool] | None = None,
         binding_ids: list[str] | tuple[str, ...] | None = None,
+        protocol: str = "INCREMENTAL_DELTA_ONLY",
+        participant_briefs: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         rid = _text(room_id, "room_id", limit=80)
         with self._run_lock:
@@ -2930,6 +2937,8 @@ class MultiRoomMeetingCoordinator:
                 run_id=run_id,
                 cancel_check=cancel_check,
                 binding_ids=binding_ids,
+                protocol=protocol,
+                participant_briefs=participant_briefs,
             )
         finally:
             with self._run_lock:
@@ -2944,6 +2953,8 @@ class MultiRoomMeetingCoordinator:
         run_id: str | None,
         cancel_check: Callable[[Mapping[str, Any]], bool] | None,
         binding_ids: list[str] | tuple[str, ...] | None,
+        protocol: str,
+        participant_briefs: Mapping[str, Mapping[str, Any]] | None,
     ) -> dict[str, Any]:
         room = self.store.get_room(room_id)
         if room["room_type"] != "MEETING":
@@ -2973,6 +2984,12 @@ class MultiRoomMeetingCoordinator:
                 "MEETING_CANCEL_CHECK_INVALID",
                 "cancel_check must be callable",
             )
+        meeting_protocol = str(protocol or "INCREMENTAL_DELTA_ONLY").upper()
+        if meeting_protocol not in MEETING_PROTOCOLS:
+            raise MultiRoomError(
+                "MEETING_PROTOCOL_INVALID",
+                f"unsupported meeting protocol: {meeting_protocol}",
+            )
         selected_binding_ids = (
             None
             if binding_ids is None
@@ -2996,6 +3013,52 @@ class MultiRoomMeetingCoordinator:
                 "meeting requires at least one active MODEL binding",
                 409,
             )
+        briefs: dict[str, dict[str, Any]] = {}
+        if participant_briefs is not None:
+            if not isinstance(participant_briefs, Mapping):
+                raise MultiRoomError(
+                    "MEETING_PARTICIPANT_BRIEFS_INVALID",
+                    "participant_briefs must be an object keyed by binding_id",
+                )
+            model_ids = {str(item["binding_id"]) for item in models}
+            for binding_id, raw_brief in participant_briefs.items():
+                bid = _text(binding_id, "participant_briefs.binding_id", limit=80)
+                if bid not in model_ids or not isinstance(raw_brief, Mapping):
+                    raise MultiRoomError(
+                        "MEETING_PARTICIPANT_BRIEFS_INVALID",
+                        "participant brief must target a selected MODEL binding",
+                    )
+                role = _text(raw_brief.get("role"), "participant_brief.role", limit=120)
+                mandate = _text(
+                    raw_brief.get("mandate"), "participant_brief.mandate", limit=2000
+                )
+                raw_assistants = raw_brief.get("assistants") or []
+                if not isinstance(raw_assistants, list) or len(raw_assistants) > 8:
+                    raise MultiRoomError(
+                        "MEETING_PARTICIPANT_BRIEFS_INVALID",
+                        "participant assistants must be a list of at most 8 names",
+                    )
+                assistants = [
+                    _text(item, "participant_brief.assistant", limit=120)
+                    for item in raw_assistants
+                ]
+                briefs[bid] = {
+                    "role": role,
+                    "mandate": mandate,
+                    "assistants": assistants,
+                }
+        if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+            missing = [item["binding_id"] for item in models if item["binding_id"] not in briefs]
+            if missing:
+                raise MultiRoomError(
+                    "MEETING_PARTICIPANT_BRIEFS_REQUIRED",
+                    "independent proposal review requires one brief per MODEL binding",
+                )
+            if bounded_turns < len(models) * 2:
+                raise MultiRoomError(
+                    "MEETING_TURN_LIMIT_INVALID",
+                    "independent proposal review requires at least two turns per participant",
+                )
         meeting_run_id = _text(
             run_id or "meeting_" + secrets.token_hex(12),
             "run_id",
@@ -3018,6 +3081,7 @@ class MultiRoomMeetingCoordinator:
         started_at = utc_now()
         turns: list[dict[str, Any]] = []
         current_delta: dict[str, Any] | None = None
+        proposal_outputs: dict[str, dict[str, Any]] = {}
         status = "COMPLETED"
         reason = "BOUNDED_TURNS_REACHED"
         prompt_message = self.store.post_message(
@@ -3038,7 +3102,7 @@ class MultiRoomMeetingCoordinator:
                 "run_id": meeting_run_id,
                 "max_turns": bounded_turns,
                 "participant_order": [item["binding_id"] for item in models],
-                "delivery_mode": "INCREMENTAL_DELTA_ONLY",
+                "delivery_mode": meeting_protocol,
                 "transcript_forwarded": False,
                 "cancel_policy": "TURN_BOUNDARY_FAIL_CLOSED",
             },
@@ -3072,6 +3136,40 @@ class MultiRoomMeetingCoordinator:
                     status = "FAILED"
                     reason = "INCREMENTAL_DELTA_MISSING"
                     break
+                phase = "DISCUSSION"
+                turn_delta = current_delta
+                brief = briefs.get(str(binding["binding_id"]))
+                if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+                    phase = "PROPOSAL" if turn_number < len(models) else "REVIEW"
+                    assistant_text = ", ".join((brief or {}).get("assistants") or []) or "none"
+                    role_text = (
+                        f"Assigned role: {(brief or {}).get('role')}\n"
+                        f"Role mandate: {(brief or {}).get('mandate')}\n"
+                        f"Research assistants available by function: {assistant_text}\n"
+                    )
+                    if phase == "PROPOSAL":
+                        delta_body = (
+                            f"{prompt}\n\n{role_text}\n"
+                            "Independent proposal phase: produce a genuinely distinct candidate from your "
+                            "assigned role. You cannot see other participants' proposals."
+                        )
+                    else:
+                        excerpt_budget = max(1000, min(5000, 14000 // len(models)))
+                        proposal_text = "\n\n".join(
+                            f"Candidate {index + 1} ({item.get('display_name') or item.get('provider')}):\n"
+                            f"{proposal_outputs[str(item['binding_id'])]['body_text'][:excerpt_budget]}"
+                            for index, item in enumerate(models)
+                        )
+                        delta_body = (
+                            f"{prompt[:6000]}\n\n{role_text}\n"
+                            "Review phase: compare every independent candidate below. Preserve real "
+                            "disagreements, correct weaknesses from your assigned role, and return one "
+                            "complete revised candidate in the original requested format. Do not merely "
+                            "repeat another candidate.\n\n"
+                            f"Independent candidates:\n{proposal_text}"
+                        )
+                    turn_delta = dict(prompt_message)
+                    turn_delta["body_text"] = delta_body
                 turn = {
                     "schema": MEETING_COORDINATOR_SCHEMA,
                     "run_id": meeting_run_id,
@@ -3080,9 +3178,12 @@ class MultiRoomMeetingCoordinator:
                     "binding_id": binding["binding_id"],
                     "provider": binding.get("provider"),
                     "provider_session_ref": binding.get("provider_session_ref"),
-                    "input_mode": "INCREMENTAL_DELTA_ONLY",
+                    "input_mode": meeting_protocol,
+                    "phase": phase,
+                    "meeting_role": (brief or {}).get("role"),
+                    "assistant_roles": list((brief or {}).get("assistants") or []),
                     "transcript_forwarded": False,
-                    "delta": dict(current_delta),
+                    "delta": dict(turn_delta),
                 }
                 self.store.record_control_event(
                     room["room_id"], "MEETING_TURN_STARTED", turn
@@ -3096,7 +3197,9 @@ class MultiRoomMeetingCoordinator:
                         )
                 except Exception as error:  # provider failure is observable and terminal
                     status = "FAILED"
-                    reason = f"PROVIDER_ERROR:{type(error).__name__}"
+                    error_code = str(getattr(error, "code", "") or type(error).__name__)
+                    error_detail = " ".join(str(error).split())[:240]
+                    reason = f"PROVIDER_ERROR:{error_code}:{error_detail}"
                     turns.append(
                         {
                             "turn_number": turn_number,
@@ -3152,13 +3255,47 @@ class MultiRoomMeetingCoordinator:
                         }
                     )
                     break
+                output_artifact = None
+                room_body = body
+                if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+                    output_artifact = self.store.create_artifact(
+                        room["room_id"],
+                        {
+                            "artifact_type": (
+                                "PROPOSAL" if phase == "PROPOSAL" else "SPECIFICATION"
+                            ),
+                            "title": (
+                                f"{(brief or {}).get('role') or binding.get('display_name') or 'Reviewer'} "
+                                f"{phase.title()} turn {turn_number + 1}"
+                            ),
+                            "body_text": body,
+                            "state": "CANDIDATE",
+                            "author_role": "MODEL",
+                            "author_binding_id": binding["binding_id"],
+                            "evidence_refs": [],
+                        },
+                    )
+                    artifact_ref = (
+                        f"universe://chat-rooms/{room['room_id']}/artifacts/"
+                        f"{output_artifact['artifact_id']}"
+                    )
+                    room_body = json.dumps(
+                        {
+                            "phase": phase,
+                            "role": (brief or {}).get("role"),
+                            "artifact_ref": artifact_ref,
+                            "summary": " ".join(body.split())[:600],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                 try:
                     output_message = self.store.post_message(
                         room["room_id"],
                         {
                             "author_role": "MODEL",
                             "author_binding_id": binding["binding_id"],
-                            "body_text": body,
+                            "body_text": room_body,
                             "idempotency_key": f"meeting:{meeting_run_id}:turn:{turn_number}",
                             "provider_event_id": provider_result.get("provider_event_id"),
                             "correlation_id": meeting_run_id,
@@ -3166,7 +3303,9 @@ class MultiRoomMeetingCoordinator:
                     )
                 except Exception as error:
                     status = "FAILED"
-                    reason = f"ROOM_OUTPUT_ERROR:{type(error).__name__}"
+                    error_code = str(getattr(error, "code", "") or type(error).__name__)
+                    error_detail = " ".join(str(error).split())[:240]
+                    reason = f"ROOM_OUTPUT_ERROR:{error_code}:{error_detail}"
                     turns.append(
                         {
                             "turn_number": turn_number,
@@ -3179,10 +3318,20 @@ class MultiRoomMeetingCoordinator:
                     )
                     break
                 current_delta = output_message
+                if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW" and phase == "PROPOSAL":
+                    proposal_outputs[str(binding["binding_id"])] = {
+                        **output_message,
+                        "body_text": body,
+                        "artifact_id": (output_artifact or {}).get("artifact_id"),
+                    }
                 turns.append(
                     {
                         "turn_number": turn_number,
                         "binding_id": binding["binding_id"],
+                        "phase": phase,
+                        "meeting_role": (brief or {}).get("role"),
+                        "artifact_id": (output_artifact or {}).get("artifact_id"),
+                        "output_warning": provider_result.get("output_warning"),
                         "status": "COMPLETED",
                         "reason": "NONE",
                         "input_event_id": turn["delta"].get("room_event_id"),
@@ -3201,6 +3350,8 @@ class MultiRoomMeetingCoordinator:
             "started_at": started_at,
             "completed_at": finished_at,
             "max_turns": bounded_turns,
+            "protocol": meeting_protocol,
+            "participant_briefs": briefs,
             "turn_count": len(turns),
             "round_count": (len(turns) + len(models) - 1) // len(models),
             "participant_order": [item["binding_id"] for item in models],

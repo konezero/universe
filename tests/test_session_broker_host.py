@@ -110,7 +110,9 @@ class SessionBrokerServiceTests(unittest.TestCase):
             self.assertEqual(1, len(hosts))
             self.assertEqual([("CLAUDE", "claude-session-1")], hosts[0].store.observed)
             self.assertEqual("BROKER_IPC", hosts[0].messages[0]["runtime_context"]["conversation_transport"])
-            self.assertEqual("LIVE", service.snapshot()["sessions"][0]["runtime_state"])
+            snapshot = service.snapshot()
+            self.assertEqual("LIVE", snapshot["sessions"][0]["runtime_state"])
+            self.assertIn("session.create", snapshot["capabilities"])
             service.close()
             self.assertTrue(hosts[0].closed)
 
@@ -159,6 +161,22 @@ class SessionBrokerServiceTests(unittest.TestCase):
 
 
 class SessionBrokerHTTPTests(unittest.TestCase):
+    def test_client_rejects_reachable_broker_without_required_capability(self) -> None:
+        with TemporaryDirectory() as directory:
+            client = SessionBrokerClient(
+                Path(directory) / "state.json",
+                Path(directory) / "broker.sqlite3",
+            )
+            with patch.object(
+                client,
+                "_call",
+                return_value={"status": "SESSION_BROKER_READY", "sessions": []},
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "does not advertise session.create"
+                ):
+                    client.ensure(capability="session.create")
+
     def test_client_uses_authenticated_broker_ipc(self) -> None:
         with TemporaryDirectory() as directory:
             host = _Host()

@@ -478,6 +478,33 @@ EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
 FEATURE_GOAL_START_RECEIPT_SCHEMA = "universe.feature-goal-start-receipt.v1"
+FEATURE_MEETING_ROLE_TEMPLATES = (
+    {
+        "role": "Visionary and Trend Scout",
+        "mandate": (
+            "Challenge current assumptions, propose an ambitious product experience, and identify "
+            "technology or interaction trends that could make the design stale before delivery. "
+            "Keep the proposal implementable in stages and label evidence gaps."
+        ),
+        "assistants": ["Web Research Scout", "RAG Librarian"],
+    },
+    {
+        "role": "Architecture Steward and Veteran QA",
+        "mandate": (
+            "Protect ownership boundaries and invariants, retrieve analogous past failures, ask what "
+            "changed since the last failed attempt, and require restart, recovery, and regression proof."
+        ),
+        "assistants": ["RAG Librarian", "Code Archaeologist", "Reproduction Assistant"],
+    },
+    {
+        "role": "Pragmatic Implementer and Acting Conductor",
+        "mandate": (
+            "Translate useful ideas into the smallest vertical slices, name migration and test costs, "
+            "preserve incompatible alternatives, and package choices without hiding implementation pain."
+        ),
+        "assistants": ["Code Archaeologist", "Effort Estimator"],
+    },
+)
 GOAL_WORK_PLAN_SCHEMA = "universe.goal-work-plan.v1"
 GOAL_WORK_PLAN_ADOPTION_SCHEMA = "universe.goal-work-plan-adoption.v1"
 GOAL_WORK_PLAN_APPLICATION_SCHEMA = "universe.goal-work-plan-application.v1"
@@ -24167,7 +24194,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             action_observer=self._observe_provider_session_action,
         )
         self.session_broker = session_broker_client or SessionBrokerClient(
-            self.store.database_path.parent / "session-broker-state.json",
+            self.store.database_path.parent / "session-broker-state-v2.json",
             self.store.database_path.parent / "session-broker.sqlite3",
             timeout=620.0,
         )
@@ -31659,7 +31686,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "no preface or explanation. When JSON is requested, return one raw JSON "
             "object without Markdown fences. "
             "Return one self-contained candidate in the exact format requested by "
-            "that delta so another reviewer can compare it with alternatives.\n\n"
+            "that delta so another reviewer can compare it with alternatives. "
+            "The complete response must stay under 18000 characters.\n\n"
             f"Incoming delta:\n{delta_body}"
         )[:24000]
         provider_event_id = (
@@ -31676,9 +31704,67 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "reason": error.code,
                 "provider_event_id": provider_event_id,
             }
+        body_text = str(completed.get("body") or "")
+
+        def candidate_error(value: str) -> str | None:
+            if len(value) > 20000:
+                return "OUTPUT_TOO_LARGE"
+            candidate_text = value.strip()
+            if candidate_text.startswith("```"):
+                lines = candidate_text.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                candidate_text = "\n".join(lines).strip()
+            try:
+                parsed = json.loads(candidate_text)
+            except json.JSONDecodeError:
+                return "JSON_INVALID"
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("route"), dict):
+                return "JSON_SHAPE_INVALID"
+            try:
+                self._parse_expected_path_candidate_output(
+                    candidate_text,
+                    fallback_title="Feature Meeting candidate",
+                )
+            except UniverseError as error:
+                return error.code
+            return None
+
+        validation_error = candidate_error(body_text)
+        if validation_error is not None:
+            provider_event_id += ":repair"
+            repair_prompt = (
+                f"Your previous Feature Meeting response failed {validation_error}. "
+                "Return the same candidate again as one complete valid raw JSON object. "
+                "Keep title under 160 characters, summary under 400, specification under "
+                "6000, the complete JSON under 18000, and use 2-8 concise route steps. "
+                "Preserve every required top-level and route field. Do not call tools and "
+                "do not add Markdown fences."
+            )
+            try:
+                completed = self.session_broker.turn(
+                    descriptor, repair_prompt, provider_event_id
+                )
+            except SessionBrokerError as error:
+                return {
+                    "status": "FAILED",
+                    "reason": error.code,
+                    "provider_event_id": provider_event_id,
+                }
+            body_text = str(completed.get("body") or "")
+            validation_error = candidate_error(body_text)
+        if validation_error is not None:
+            return {
+                "status": "COMPLETED",
+                "body_text": body_text,
+                "output_warning": f"MEETING_PROVIDER_OUTPUT_INVALID:{validation_error}",
+                "provider_event_id": provider_event_id,
+            }
         return {
             "status": "COMPLETED",
-            "body_text": str(completed.get("body") or ""),
+            "body_text": body_text,
             "provider_event_id": provider_event_id,
         }
 
@@ -31707,6 +31793,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and isinstance(item.get("metadata"), Mapping)
             and str(item["metadata"].get("provider_chat_key") or "").strip()
         ]
+        raw_binding_ids = request.get("binding_ids")
+        if raw_binding_ids is not None:
+            if not isinstance(raw_binding_ids, list) or not raw_binding_ids:
+                raise UniverseError(
+                    "FEATURE_MEETING_BINDINGS_INVALID",
+                    "binding_ids must be a non-empty list of active MODEL binding IDs",
+                )
+            requested_binding_ids = list(
+                dict.fromkeys(_identifier(item, "binding_id") for item in raw_binding_ids)
+            )
+            binding_by_id = {str(item["binding_id"]): item for item in bindings}
+            if any(binding_id not in binding_by_id for binding_id in requested_binding_ids):
+                raise UniverseError(
+                    "FEATURE_MEETING_BINDINGS_INVALID",
+                    "every requested binding must be an active verified MODEL binding in this room",
+                    HTTPStatus.CONFLICT,
+                )
+            bindings = [binding_by_id[binding_id] for binding_id in requested_binding_ids]
         if len(bindings) < 2:
             raise UniverseError(
                 "FEATURE_MEETING_MODELS_REQUIRED",
@@ -31727,6 +31831,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "run_id",
         )
         user_prompt = str(request.get("prompt") or "").strip()
+        raw_roles = request.get("participant_roles")
+        role_specs: list[Mapping[str, Any]]
+        if raw_roles is None:
+            role_specs = [
+                FEATURE_MEETING_ROLE_TEMPLATES[index % len(FEATURE_MEETING_ROLE_TEMPLATES)]
+                for index in range(len(bindings))
+            ]
+        else:
+            if not isinstance(raw_roles, list) or len(raw_roles) != len(bindings):
+                raise UniverseError(
+                    "FEATURE_MEETING_ROLES_INVALID",
+                    "participant_roles must contain exactly one role object per selected MODEL binding",
+                )
+            role_specs = []
+            for index, raw_role in enumerate(raw_roles):
+                role = _exact_object_fields(
+                    raw_role,
+                    field=f"participant_roles[{index}]",
+                    required=frozenset({"role", "mandate"}),
+                    optional=frozenset({"assistants"}),
+                )
+                role_specs.append(role)
+        participant_briefs: dict[str, dict[str, Any]] = {}
+        for binding, role_spec in zip(bindings, role_specs, strict=True):
+            assistants = role_spec.get("assistants") or []
+            if not isinstance(assistants, list):
+                raise UniverseError(
+                    "FEATURE_MEETING_ROLES_INVALID",
+                    "participant role assistants must be a list",
+                )
+            participant_briefs[str(binding["binding_id"])] = {
+                "role": _required_text(role_spec.get("role"), "participant_role.role"),
+                "mandate": _required_text(
+                    role_spec.get("mandate"), "participant_role.mandate"
+                ),
+                "assistants": [
+                    _required_text(item, "participant_role.assistant") for item in assistants
+                ],
+            }
         prompt = (
             f"Feature: {feature['title']}\n"
             f"Intent: {feature['intent_text']}\n\n"
@@ -31743,6 +31886,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             '"estimates":{"effort":"...","cost":"...","quota":"..."},'
             '"evidence_refs":[]}}. '
             "Use 2-12 concise steps with stable IDs, valid dependency/branch references, and 1-6 phases. "
+            "Keep title at most 160 characters, summary at most 400 characters, "
+            "specification at most 6000 characters, and the complete JSON under 18000 characters. "
             "Every turn must remain a self-contained candidate and must not create Goals, Todos, "
             "Task Frames, authority, or execution assignments."
         )
@@ -31755,10 +31900,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 max_turns=max_turns,
                 run_id=run_id,
                 binding_ids=[str(item["binding_id"]) for item in bindings],
+                protocol="INDEPENDENT_PROPOSAL_REVIEW",
+                participant_briefs=participant_briefs,
             )
         except MultiRoomError as error:
             raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
         candidates: list[dict[str, Any]] = []
+        candidate_failures: list[dict[str, str]] = []
+        duplicate_candidates: list[dict[str, str]] = []
+        semantic_candidates: dict[str, str] = {}
         if summary.get("status") == "COMPLETED":
             messages = {
                 str(item.get("room_event_id") or ""): item
@@ -31775,7 +31925,30 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 binding = binding_by_id.get(str(binding_id))
                 if message is None or binding is None:
                     continue
-                provider_body = str(message.get("body_text") or "").strip()
+                output_warning = str((turn or {}).get("output_warning") or "").strip()
+                if output_warning:
+                    candidate_failures.append(
+                        {
+                            "binding_id": str(binding_id),
+                            "error_code": output_warning.split(":", 1)[0],
+                            "detail": output_warning,
+                        }
+                    )
+                    continue
+                source_artifact = None
+                source_artifact_id = str((turn or {}).get("artifact_id") or "").strip()
+                if source_artifact_id:
+                    try:
+                        source_artifact = self.multi_rooms.get_artifact(
+                            room_id, source_artifact_id
+                        )
+                    except MultiRoomError:
+                        source_artifact = None
+                provider_body = str(
+                    (source_artifact or {}).get("body_text")
+                    or message.get("body_text")
+                    or ""
+                ).strip()
                 if not provider_body:
                     continue
                 fallback_title = (
@@ -31786,9 +31959,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     f"universe://chat-rooms/{room_id}/messages/{message['message_id']}",
                     f"universe://feature-nodes/{feature['feature_id']}/meeting-runs/{run_id}",
                 ]
-                candidate = self._parse_expected_path_candidate_output(
-                    provider_body, fallback_title=fallback_title
+                try:
+                    candidate = self._parse_expected_path_candidate_output(
+                        provider_body, fallback_title=fallback_title
+                    )
+                except UniverseError as error:
+                    candidate_failures.append(
+                        {
+                            "binding_id": str(binding_id),
+                            "error_code": error.code,
+                            "detail": str(error),
+                        }
+                    )
+                    continue
+                semantic_route = dict(candidate["route"])
+                semantic_route["evidence_refs"] = []
+                semantic_digest = _json_sha256(
+                    {
+                        "title": candidate["title"],
+                        "summary": candidate["summary"],
+                        "specification": candidate["specification"],
+                        "route": normalize_expected_path_route(semantic_route),
+                    }
                 )
+                duplicate_of = semantic_candidates.get(semantic_digest)
+                if duplicate_of is not None:
+                    duplicate_candidates.append(
+                        {
+                            "binding_id": binding_id,
+                            "duplicate_of_binding_id": duplicate_of,
+                            "semantic_digest": semantic_digest,
+                        }
+                    )
+                    continue
+                semantic_candidates[semantic_digest] = binding_id
                 route = dict(candidate["route"])
                 route["evidence_refs"] = list(
                     dict.fromkeys([*(route.get("evidence_refs") or []), *evidence_refs])
@@ -31797,19 +32001,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 title = candidate["title"]
                 body_text = candidate["specification"]
                 try:
-                    artifact = self.multi_rooms.create_artifact(
-                        room_id,
-                        {
-                            "artifact_type": "SPECIFICATION",
-                            "title": title,
-                            "body_text": body_text,
-                            "state": "CANDIDATE",
-                            "author_role": "MODEL",
-                            "author_binding_id": binding_id,
-                            "source_message_id": message["message_id"],
-                            "evidence_refs": evidence_refs,
-                        },
-                    )
+                    if (
+                        source_artifact is not None
+                        and source_artifact.get("artifact_type") == "SPECIFICATION"
+                    ):
+                        artifact = source_artifact
+                    else:
+                        artifact = self.multi_rooms.create_artifact(
+                            room_id,
+                            {
+                                "artifact_type": "SPECIFICATION",
+                                "title": title,
+                                "body_text": body_text,
+                                "state": "CANDIDATE",
+                                "author_role": "MODEL",
+                                "author_binding_id": binding_id,
+                                "source_message_id": message["message_id"],
+                                "evidence_refs": evidence_refs,
+                            },
+                        )
                     expected_path, _ = self.store.create_feature_expected_path(
                         feature["feature_id"],
                         {
@@ -31836,6 +32046,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "feature_id": feature["feature_id"],
                 "meeting_status": summary.get("status"),
                 "candidate_count": len(candidates),
+                "candidate_failure_count": len(candidate_failures),
+                "duplicate_candidate_count": len(duplicate_candidates),
                 "expected_path_ids": [
                     item["expected_path"]["expected_path_id"] for item in candidates
                 ],
@@ -31853,6 +32065,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "feature": self.store.get_feature_node(feature["feature_id"]),
             "meeting": summary,
             "candidates": candidates,
+            "candidate_failures": candidate_failures,
+            "duplicate_candidates": duplicate_candidates,
+            "participant_briefs": participant_briefs,
             "goal_created": False,
             "todo_created": False,
             "task_frame_created": False,

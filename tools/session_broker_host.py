@@ -29,8 +29,13 @@ from urllib.request import Request, urlopen
 from project_master_host import ResidentModeSessionHost
 
 
-SESSION_BROKER_SCHEMA = "universe.session-broker.v1"
-SESSION_BROKER_STATE_SCHEMA = "universe.session-broker-state.v1"
+SESSION_BROKER_SCHEMA = "universe.session-broker.v2"
+SESSION_BROKER_STATE_SCHEMA = "universe.session-broker-state.v2"
+SESSION_BROKER_CAPABILITIES = (
+    "provider.turn",
+    "session.create",
+    "session.archive",
+)
 
 
 def _utc_now() -> str:
@@ -266,6 +271,7 @@ class SessionBrokerService:
             "schema": SESSION_BROKER_SCHEMA,
             "status": "SESSION_BROKER_READY",
             "pid": os.getpid(),
+            "capabilities": list(SESSION_BROKER_CAPABILITIES),
             "sessions": sessions,
         }
 
@@ -398,41 +404,54 @@ class SessionBrokerClient:
             )
         return result
 
-    def ensure(self) -> dict[str, Any]:
+    def ensure(self, *, capability: str | None = None) -> dict[str, Any]:
         with self._lock:
             try:
-                return self._call("GET", "/v1/status")
+                status = self._call("GET", "/v1/status")
             except SessionBrokerError:
-                pass
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            command = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "serve",
-                "--state",
-                str(self.state_path),
-                "--database",
-                str(self.database_path),
-            ]
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            subprocess.Popen(
-                command,
-                cwd=str(Path(__file__).resolve().parents[1]),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                creationflags=creationflags,
-            )
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                time.sleep(0.05)
-                try:
-                    return self._call("GET", "/v1/status")
-                except SessionBrokerError:
-                    continue
+                status = None
+            if status is None:
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                command = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "serve",
+                    "--state",
+                    str(self.state_path),
+                    "--database",
+                    str(self.database_path),
+                ]
+                creationflags = 0
+                if os.name == "nt":
+                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                subprocess.Popen(
+                    command,
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    creationflags=creationflags,
+                )
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    try:
+                        status = self._call("GET", "/v1/status")
+                        break
+                    except SessionBrokerError:
+                        continue
+            if status is not None:
+                capabilities = status.get("capabilities")
+                if capability and (
+                    not isinstance(capabilities, list) or capability not in capabilities
+                ):
+                    raise SessionBrokerError(
+                        "SESSION_BROKER_CAPABILITY_UNAVAILABLE",
+                        f"Session Broker does not advertise {capability}",
+                        409,
+                    )
+                return status
         raise SessionBrokerError(
             "SESSION_BROKER_START_FAILED", "Session Broker did not become ready", 503
         )
@@ -446,11 +465,11 @@ class SessionBrokerClient:
         )
 
     def create_session(self, descriptor: Mapping[str, Any]) -> dict[str, Any]:
-        self.ensure()
+        self.ensure(capability="session.create")
         return self._call("POST", "/v1/sessions", {"descriptor": dict(descriptor)})
 
     def archive_session(self, chat_key: str) -> dict[str, Any]:
-        self.ensure()
+        self.ensure(capability="session.archive")
         return self._call("POST", f"/v1/sessions/{chat_key}/archive", {})
 
 

@@ -8808,6 +8808,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "binding_id": binding["binding_id"],
                     "turn_number": turn["turn_number"],
                     "delta": turn["delta"]["body_text"],
+                    "phase": turn["phase"],
+                    "meeting_role": turn["meeting_role"],
                 }
             )
             return {
@@ -8843,6 +8845,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertFalse(result["execution_assignment_created"])
         self.assertEqual(4, len(seen))
         self.assertIn("Feature: Automated path generation", str(seen[0]["delta"]))
+        self.assertIn("Feature: Automated path generation", str(seen[1]["delta"]))
+        self.assertNotIn("Specification Codex", str(seen[1]["delta"]))
+        self.assertEqual(["PROPOSAL", "PROPOSAL", "REVIEW", "REVIEW"], [item["phase"] for item in seen])
+        self.assertEqual(2, len({item["meeting_role"] for item in seen[:2]}))
+        self.assertIn("final turn 0", str(seen[2]["delta"]))
+        self.assertIn("final turn 1", str(seen[2]["delta"]))
+        self.assertEqual("INDEPENDENT_PROPOSAL_REVIEW", result["meeting"]["protocol"])
+        self.assertEqual(2, len(result["participant_briefs"]))
+        self.assertEqual([], result["candidate_failures"])
+        self.assertEqual([], result["duplicate_candidates"])
         artifact_bodies = {
             item["artifact"]["body_text"] for item in result["candidates"]
         }
@@ -8871,6 +8883,82 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("FEATURE_MEETING_SUMMARY_COLLECTED", summary["status"])
         self.assertEqual("COMPLETED", summary["meeting"]["status"])
+
+    def test_feature_meeting_collapses_semantically_identical_paths(self) -> None:
+        self.server.store.register_project(self.registration())
+        created = self.server.multi_rooms.create_meeting_room(
+            {"title": "Duplicate council", "project_id": "GCS"}
+        )
+        room_id = created["room"]["room_id"]
+        for provider in ("CODEX", "CLAUDE"):
+            self.server.multi_rooms.attach_session(
+                room_id,
+                {
+                    "slot_role": "MODEL",
+                    "provider": provider,
+                    "provider_session_ref": f"{provider.lower()}-duplicate-session",
+                    "provider_chat_key": f"{provider.lower()}-duplicate-chat",
+                    "display_name": provider.title(),
+                },
+            )
+        status, feature_payload = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-nodes",
+            {
+                "idempotency_key": "duplicate-feature-meeting-v1",
+                "title": "Duplicate candidate detection",
+                "intent_text": "Keep only semantically distinct expected paths.",
+                "meeting_room_id": room_id,
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        candidate = {
+            "title": "Same path",
+            "summary": "Same summary",
+            "specification": "Same specification",
+            "route": {
+                "steps": [
+                    {
+                        "step_id": "step-1",
+                        "title": "One step",
+                        "summary": "Do the same thing",
+                        "phase": "delivery",
+                    }
+                ],
+                "dependencies": [],
+                "branches": [],
+                "architecture_decisions": ["Same decision"],
+                "implementation_phases": [{"title": "delivery", "step_ids": ["step-1"]}],
+                "risks": [{"risk": "same", "mitigation": "same"}],
+                "acceptance_conditions": ["same result"],
+                "estimates": {"effort": "S", "cost": "low", "quota": "bounded"},
+                "evidence_refs": [],
+            },
+        }
+
+        def invoke(_binding, turn):
+            return {
+                "status": "COMPLETED",
+                "body_text": json.dumps(candidate),
+                "provider_event_id": f"duplicate-provider-{turn['turn_number']}",
+            }
+
+        self.server.multi_room_meetings.invoke_provider = invoke
+        status, result = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature_payload['feature']['feature_id']}/meeting-runs",
+            {"run_id": "duplicate-council-1", "max_turns": 4},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(result["candidates"]))
+        self.assertEqual(1, len(result["duplicate_candidates"]))
+        self.assertEqual(1, len(result["feature"]["expected_paths"]))
+        self.assertEqual(
+            result["candidates"][0]["artifact"]["author_binding_id"],
+            result["duplicate_candidates"][0]["duplicate_of_binding_id"],
+        )
 
     def test_provider_chat_attach_materializes_supervisor_and_project_binding(self) -> None:
         self.server.store.register_project(self.registration())
@@ -9048,7 +9136,33 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual([], self.server.multi_rooms.list_bindings(room_id))
 
     def test_meeting_provider_adapter_waits_for_verified_terminal_result(self) -> None:
-        terminal_body = "Self-contained verified specification"
+        terminal_body = json.dumps(
+            {
+                "title": "Verified specification",
+                "summary": "One bounded route",
+                "specification": "Self-contained verified specification",
+                "route": {
+                    "steps": [
+                        {
+                            "step_id": "step-1",
+                            "title": "Implement",
+                            "summary": "Implement the route",
+                            "phase": "delivery",
+                        }
+                    ],
+                    "dependencies": [],
+                    "branches": [],
+                    "architecture_decisions": [],
+                    "implementation_phases": [
+                        {"title": "delivery", "step_ids": ["step-1"]}
+                    ],
+                    "risks": [],
+                    "acceptance_conditions": ["route works"],
+                    "estimates": {"effort": "S", "cost": "low", "quota": "bounded"},
+                    "evidence_refs": [],
+                },
+            }
+        )
 
         def turn(descriptor, body, message_id):
             self.assertEqual("CODEX", descriptor["provider"])
@@ -9086,6 +9200,105 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "feature-meeting:meeting-adapter-1:0:bind-provider-1",
             result["provider_event_id"],
         )
+
+    def test_meeting_provider_adapter_reasks_for_oversized_output(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        compact = json.dumps(
+            {
+                "title": "compact",
+                "summary": "compact route",
+                "specification": "compact specification",
+                "route": {
+                    "steps": [
+                        {
+                            "step_id": "step-1",
+                            "title": "Implement",
+                            "summary": "Implement compactly",
+                            "phase": "delivery",
+                        }
+                    ],
+                    "dependencies": [],
+                    "branches": [],
+                    "architecture_decisions": [],
+                    "implementation_phases": [
+                        {"title": "delivery", "step_ids": ["step-1"]}
+                    ],
+                    "risks": [],
+                    "acceptance_conditions": ["compact route works"],
+                    "estimates": {"effort": "S", "cost": "low", "quota": "bounded"},
+                    "evidence_refs": [],
+                },
+            }
+        )
+
+        def turn(_descriptor, body, message_id):
+            calls.append((body, message_id))
+            if len(calls) == 1:
+                return {"body": "x" * 20001}
+            return {"body": compact}
+
+        with patch.object(
+            self.server,
+            "resolve_provider_chat_session",
+            return_value={
+                "provider": "CLAUDE",
+                "provider_session_ref": "provider-session-1",
+            },
+        ), patch.object(self.server.session_broker, "turn", side_effect=turn):
+            result = self.server._invoke_multi_room_meeting_provider(
+                {
+                    "binding_id": "bind-provider-1",
+                    "provider": "CLAUDE",
+                    "provider_session_ref": "provider-session-1",
+                    "metadata": {"provider_chat_key": "provider_chat_verified"},
+                },
+                {
+                    "run_id": "meeting-adapter-large",
+                    "turn_number": 0,
+                    "delta": {"body_text": "Feature intent"},
+                },
+            )
+
+        self.assertEqual("COMPLETED", result["status"])
+        self.assertEqual(compact, result["body_text"])
+        self.assertEqual(2, len(calls))
+        self.assertIn("under 18000 characters", calls[0][0])
+        self.assertTrue(calls[1][1].endswith(":repair"))
+
+    def test_meeting_provider_adapter_preserves_invalid_output_as_warning(self) -> None:
+        with patch.object(
+            self.server,
+            "resolve_provider_chat_session",
+            return_value={
+                "provider": "CLAUDE",
+                "provider_session_ref": "provider-session-1",
+            },
+        ), patch.object(
+            self.server.session_broker,
+            "turn",
+            return_value={"body": '{"title":"truncated"'},
+        ) as turn:
+            result = self.server._invoke_multi_room_meeting_provider(
+                {
+                    "binding_id": "bind-provider-1",
+                    "provider": "CLAUDE",
+                    "provider_session_ref": "provider-session-1",
+                    "metadata": {"provider_chat_key": "provider_chat_verified"},
+                },
+                {
+                    "run_id": "meeting-adapter-invalid",
+                    "turn_number": 0,
+                    "delta": {"body_text": "Feature intent"},
+                },
+            )
+
+        self.assertEqual("COMPLETED", result["status"])
+        self.assertEqual(
+            "MEETING_PROVIDER_OUTPUT_INVALID:JSON_INVALID",
+            result["output_warning"],
+        )
+        self.assertEqual(2, turn.call_count)
 
     def test_meeting_room_finding_http_records_and_collects_source_links(self) -> None:
         created = self.server.multi_rooms.create_meeting_room(

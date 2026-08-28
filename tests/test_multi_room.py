@@ -384,6 +384,109 @@ class MultiRoomStoreTests(unittest.TestCase):
             ),
         )
 
+    def test_role_meeting_proposals_are_independent_before_shared_review(self) -> None:
+        created = self.store.create_meeting_room(
+            {
+                "title": "Role council",
+                "models": [
+                    {"provider": "GROK", "display_name": "Visionary"},
+                    {"provider": "CLAUDE", "display_name": "Architect"},
+                    {"provider": "CODEX", "display_name": "Implementer"},
+                ],
+            }
+        )
+        room_id = created["room"]["room_id"]
+        bindings = sorted(
+            [item for item in self.store.list_bindings(room_id) if item["slot_role"] == "MODEL"],
+            key=lambda item: (item["created_at"], item["binding_id"]),
+        )
+        briefs = {
+            binding["binding_id"]: {
+                "role": role,
+                "mandate": mandate,
+                "assistants": assistants,
+            }
+            for binding, role, mandate, assistants in zip(
+                bindings,
+                ("Visionary", "Architect", "Implementer"),
+                ("invent", "protect boundaries", "ship slices"),
+                (["Web Scout"], ["RAG Librarian"], ["Code Archaeologist"]),
+                strict=True,
+            )
+        }
+        received: list[dict[str, object]] = []
+
+        def invoke(binding, turn):
+            received.append(
+                {
+                    "binding_id": binding["binding_id"],
+                    "phase": turn["phase"],
+                    "role": turn["meeting_role"],
+                    "delta": turn["delta"]["body_text"],
+                }
+            )
+            return {
+                "status": "COMPLETED",
+                "body_text": f"proposal-{turn['turn_number']}-{turn['meeting_role']}",
+            }
+
+        summary = MultiRoomMeetingCoordinator(self.store, invoke).run(
+            room_id,
+            prompt="same original brief",
+            max_turns=6,
+            run_id="role-council-1",
+            protocol="INDEPENDENT_PROPOSAL_REVIEW",
+            participant_briefs=briefs,
+        )
+
+        self.assertEqual("INDEPENDENT_PROPOSAL_REVIEW", summary["protocol"])
+        self.assertEqual(["PROPOSAL"] * 3, [item["phase"] for item in received[:3]])
+        self.assertTrue(all("same original brief" in str(item["delta"]) for item in received[:3]))
+        self.assertTrue(all("proposal-" not in str(item["delta"]) for item in received[:3]))
+        self.assertEqual(["REVIEW"] * 3, [item["phase"] for item in received[3:]])
+        self.assertTrue(all("proposal-0-Visionary" in str(item["delta"]) for item in received[3:]))
+        self.assertTrue(all("proposal-1-Architect" in str(item["delta"]) for item in received[3:]))
+        self.assertTrue(all("proposal-2-Implementer" in str(item["delta"]) for item in received[3:]))
+        self.assertTrue(all(item["artifact_id"] for item in summary["turns"]))
+        model_messages = [
+            item
+            for item in self.store.list_messages(room_id)
+            if item.get("author_role") == "MODEL"
+            and item.get("correlation_id") == "role-council-1"
+        ]
+        self.assertEqual(6, len(model_messages))
+        self.assertTrue(
+            all(json.loads(item["body_text"])["artifact_ref"] for item in model_messages)
+        )
+        first_artifact = self.store.get_artifact(
+            room_id, summary["turns"][0]["artifact_id"]
+        )
+        self.assertEqual("proposal-0-Visionary", first_artifact["body_text"])
+
+    def test_meeting_failure_preserves_provider_error_code_and_detail(self) -> None:
+        room_id = self.store.create_meeting_room(
+            {
+                "title": "Failure detail",
+                "models": [{"provider": "CLAUDE", "display_name": "Architect"}],
+            }
+        )["room"]["room_id"]
+
+        def fail_provider(_binding, _turn):
+            raise MultiRoomError("CLAUDE_OUTPUT_TOO_LARGE", "output exceeds room limit")
+
+        summary = MultiRoomMeetingCoordinator(self.store, fail_provider).run(
+            room_id,
+            prompt="compare routes",
+            max_turns=1,
+            run_id="meeting-failure-detail",
+        )
+
+        self.assertEqual("FAILED", summary["status"])
+        self.assertEqual(
+            "PROVIDER_ERROR:CLAUDE_OUTPUT_TOO_LARGE:output exceeds room limit",
+            summary["turns"][0]["reason"],
+        )
+
     def test_round_robin_meeting_cancels_at_turn_boundary(self) -> None:
         room_id = self.store.create_meeting_room(
             {
