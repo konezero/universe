@@ -12209,6 +12209,155 @@ class UniverseStore:
             "application": self._goal_work_plan_application_row(application) if application is not None else None,
         }
 
+    def find_goal_start_receipt_for_goal(self, goal_id: str) -> dict[str, Any] | None:
+        gid = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE goal_id = ?", (gid,)
+            ).fetchone()
+        return self._feature_goal_start_receipt_row(row) if row is not None else None
+
+    def materialize_goal_start_work_plan(self, goal_id: str) -> tuple[dict[str, Any], bool]:
+        goal = self.get_goal(goal_id)
+        existing_surface = self.goal_work_plan_surface(goal["goal_id"])
+        if existing_surface["application"] is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "GOAL_START_WORK_PLAN_REPLAYED",
+                "goal_start_receipt": self.find_goal_start_receipt_for_goal(goal["goal_id"]),
+                "work_plan": existing_surface,
+            }, False
+        with self._connection() as connection:
+            source = connection.execute(
+                "SELECT receipt.*, feature.title AS feature_title, path.title AS path_title, "
+                "path.summary AS path_summary, path.room_id, route.route_json "
+                "FROM feature_goal_start_receipt receipt "
+                "JOIN feature_node feature ON feature.feature_id = receipt.feature_id "
+                "JOIN feature_expected_path path ON path.expected_path_id = receipt.expected_path_id "
+                "JOIN feature_expected_path_route route ON route.expected_path_id = path.expected_path_id "
+                "WHERE receipt.goal_id = ?",
+                (goal["goal_id"],),
+            ).fetchone()
+        if source is None:
+            raise UniverseError(
+                "GOAL_START_RECEIPT_REQUIRED",
+                "automatic Work Plan materialization requires an active Goal Start Receipt",
+                HTTPStatus.CONFLICT,
+            )
+        route = normalize_expected_path_route(json.loads(source["route_json"]))
+        dependencies_by_step: dict[str, list[str]] = {}
+        for dependency in route["dependencies"]:
+            dependencies_by_step.setdefault(dependency["to_step_id"], []).append(
+                f"{dependency['kind']} {dependency['from_step_id']}"
+            )
+        acceptance = "; ".join(route["acceptance_conditions"])[:1000]
+        if not acceptance:
+            acceptance = "Complete the pinned Expected Path step and retain validation evidence."
+        steps = list(route["steps"])
+        milestones: list[dict[str, Any]] = []
+        for offset in range(0, len(steps), 4):
+            chunk = steps[offset : offset + 4]
+            phase_names = list(dict.fromkeys(str(step.get("phase") or "Delivery") for step in chunk))
+            title = " / ".join(phase_names)[:160]
+            todos = []
+            for step in chunk:
+                dependency_text = ", ".join(dependencies_by_step.get(step["step_id"], [])) or "None"
+                detail = (
+                    f"Expected Path step: {step['step_id']}\n"
+                    f"Phase: {step.get('phase') or 'Delivery'}\n"
+                    f"Summary: {step['summary']}\n"
+                    f"Dependencies: {dependency_text}\n"
+                    f"Route digest: {source['expected_path_digest']}\n"
+                    f"Goal Start Receipt: {source['receipt_id']}"
+                )[:3000]
+                todos.append(
+                    {
+                        "title": step["title"],
+                        "detail": detail,
+                        "acceptance": acceptance,
+                        "priority": "AUTO",
+                    }
+                )
+            milestones.append(
+                {
+                    "title": title,
+                    "description": (
+                        f"Deterministic projection of Expected Path steps {offset + 1} through "
+                        f"{offset + len(chunk)} under Goal Start Receipt {source['receipt_id']}."
+                    ),
+                    "todos": todos,
+                }
+            )
+        plan = normalize_goal_work_plan(
+            {
+                "title": f"{source['feature_title']} · adopted route",
+                "summary": source["path_summary"],
+                "milestones": milestones,
+            }
+        )
+        plan_digest = _json_sha256(plan)
+        work_plan_id = "work_plan_" + _json_sha256(
+            {"goal_id": goal["goal_id"], "receipt_id": source["receipt_id"], "plan_digest": plan_digest}
+        )[:24]
+        adoption_id = "work_plan_adoption_" + _json_sha256(
+            {"goal_id": goal["goal_id"], "work_plan_id": work_plan_id}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            candidate = connection.execute(
+                "SELECT * FROM goal_work_plan_candidate WHERE work_plan_id = ?", (work_plan_id,)
+            ).fetchone()
+            if candidate is None:
+                connection.execute(
+                    "INSERT INTO goal_work_plan_candidate(work_plan_id, goal_id, feature_id, room_id, run_id, source_message_id, author_binding_id, plan_digest, plan_json, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ADOPTED', ?, ?)",
+                    (
+                        work_plan_id, goal["goal_id"], source["feature_id"], source["room_id"],
+                        source["receipt_id"], source["receipt_id"], source["receipt_id"],
+                        plan_digest, _canonical_json(plan), now, now,
+                    ),
+                )
+            elif candidate["plan_digest"] != plan_digest:
+                raise UniverseError(
+                    "GOAL_START_WORK_PLAN_CONFLICT",
+                    "Goal Start Work Plan replay produced different material",
+                    HTTPStatus.CONFLICT,
+                )
+            adoption = connection.execute(
+                "SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+            if adoption is None:
+                connection.execute(
+                    "INSERT INTO goal_work_plan_adoption(adoption_id, goal_id, work_plan_id, adopted_by_role, rationale, adopted_at) "
+                    "VALUES (?, ?, ?, 'USER', ?, ?)",
+                    (
+                        adoption_id,
+                        goal["goal_id"],
+                        work_plan_id,
+                        f"Authorized by Goal Start Receipt {source['receipt_id']}: {source['rationale']}",
+                        now,
+                    ),
+                )
+            elif adoption["work_plan_id"] != work_plan_id:
+                raise UniverseError(
+                    "GOAL_START_WORK_PLAN_CONFLICT",
+                    "Goal already has a different Work Plan adoption",
+                    HTTPStatus.CONFLICT,
+                )
+        application, applied = self.apply_goal_work_plan(
+            goal["goal_id"],
+            {"expected_goal_revision": goal["revision"], "applied_by_role": "USER"},
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_START_WORK_PLAN_MATERIALIZED" if applied else "GOAL_START_WORK_PLAN_REPLAYED",
+            "goal_start_receipt": self.find_goal_start_receipt_for_goal(goal["goal_id"]),
+            "plan_digest": plan_digest,
+            "application": application,
+            "work_plan": self.goal_work_plan_surface(goal["goal_id"]),
+        }, applied
+
     def record_goal_work_plan_candidate(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         goal = self.get_goal(goal_id)
         request = _exact_object_fields(
@@ -25393,6 +25542,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def goal_automation_surface(self, goal_id: str) -> dict[str, Any]:
         work_plans = self.store.goal_work_plan_surface(goal_id)
         goal = work_plans["goal"]
+        goal_start_receipt = self.store.find_goal_start_receipt_for_goal(goal["goal_id"])
         scheduler = self.store.get_goal_automation_scheduler(goal["goal_id"])
         if scheduler is not None:
             scheduler = {
@@ -25410,7 +25560,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "action_receipts": [],
             "task_frame_results": [],
         }
-        if application is None:
+        if application is None and goal_start_receipt is not None:
+            state = "READY_FOR_GOAL_START_PLAN"
+            next_operation = "MATERIALIZE_GOAL_START_PLAN"
+        elif application is None:
             state = "WAITING_USER_WORK_PLAN_APPLICATION"
             next_operation = "APPLY_ADOPTED_WORK_PLAN"
         else:
@@ -25483,6 +25636,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "GOAL_AUTOMATION_STATE_PROJECTED",
             "goal": goal,
             "application": application,
+            "goal_start_receipt": goal_start_receipt,
             "handoff": handoff,
             "matching_proposals": matching_proposals,
             "binding": binding,
@@ -25777,13 +25931,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Goal revision changed before automation advance",
                 HTTPStatus.CONFLICT,
             )
+        operations: list[str] = []
+        if surface["next_operation"] == "MATERIALIZE_GOAL_START_PLAN":
+            _materialized, created = self.store.materialize_goal_start_work_plan(goal["goal_id"])
+            operations.append(
+                "GOAL_START_PLAN_APPLIED" if created else "GOAL_START_PLAN_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
         if surface["application"] is None:
             raise UniverseError(
                 "GOAL_WORK_PLAN_APPLICATION_REQUIRED",
                 "apply the USER-adopted Work Plan before automation",
                 HTTPStatus.CONFLICT,
             )
-        operations: list[str] = []
         if surface["handoff"] is None:
             handoff, created = self.store.create_master_handoff(
                 goal["project_id"],
@@ -25926,6 +26086,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 operation = str(surface.get("next_operation") or "UNKNOWN")
                 if operation not in {
+                    "MATERIALIZE_GOAL_START_PLAN",
                     "CREATE_AND_DELIVER_MASTER_HANDOFF",
                     "DELIVER_MASTER_HANDOFF",
                 }:
@@ -37866,6 +38027,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     {**body, "started_by_role": "USER"},
                 )
                 feature = self.server.store.get_feature_node(unquote(feature_goal_starts.group(1)))
+                plan_materialization, _plan_created = self.server.store.materialize_goal_start_work_plan(
+                    goal["goal_id"]
+                )
+                try:
+                    automation = self.server.advance_goal_automation(
+                        goal["goal_id"],
+                        {"approval": "ADVANCE", "expected_goal_revision": goal["revision"]},
+                    )
+                except UniverseError as error:
+                    automation = {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_AUTOMATION_BLOCKED",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                        "surface": self.server.goal_automation_surface(goal["goal_id"]),
+                    }
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
@@ -37876,13 +38053,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "adoption": adoption,
                         "derivation": derivation,
                         "goal": goal,
+                        "plan_materialization": plan_materialization,
+                        "automation": automation,
                         "goal_created": created,
                         "authority_created": created,
                         "execution_assignment_created": False,
                         "task_frame_created": False,
                         "rag_adopted": False,
                         "repository_pushed": False,
-                        "next_operation": "CONDUCTOR_PLAN",
+                        "next_operation": automation["surface"]["next_operation"],
                     },
                 )
                 return

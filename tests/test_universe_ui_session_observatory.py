@@ -763,6 +763,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("expected_path_digest: path.route_digest", feature_slice)
         self.assertIn('push_policy: "PUSH_PROHIBITED"', feature_slice)
         self.assertIn("Adopt + Start Goal", feature_slice)
+        self.assertIn("result.automation?.surface?.automation_state", feature_slice)
         self.assertIn("path.artifact_revision", APP)
         self.assertIn("path.route?.steps?.length", APP)
         self.assertIn('"EXPECTED_PATH_STEP"', APP)

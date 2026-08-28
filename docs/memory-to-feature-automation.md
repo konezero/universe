@@ -206,9 +206,14 @@ those predicted steps and route edges without embedding the full specification b
 The combined Goal Start endpoint is one explicit USER action. It selects the route,
 pins the Feature revision and route digest, records project/node/write scope,
 constraints, validation, local-commit policy, and an invariant push prohibition, then
-materializes one provenance-bound DESIGNING Goal. Replays require byte-for-byte
-equivalent authority material. It does not create an execution assignment or Task
-Frame, adopt RAG, run automation, or push. Its next operation is `CONDUCTOR_PLAN`.
+materializes one provenance-bound DESIGNING Goal. The Project Master driver then
+deterministically projects the selected route into at most six Milestones and twenty-four
+Todos, applies that projection under the same Goal Start Receipt, creates and delivers
+the Master handoff, and stops at `WAITING_MASTER_PROPOSAL`. Replays require byte-for-byte
+equivalent authority material. The driver does not invent another user choice, create an
+execution assignment or Task Frame without the existing guarded inputs, adopt RAG, or
+push. Missing Master proposal, Task Frame input, Todo selection, execution result, quota,
+or validation remains an explicit visible stop state.
 
 ## Implementation sequence
 
@@ -216,7 +221,7 @@ Frame, adopt RAG, run automation, or push. Its next operation is `CONDUCTOR_PLAN
 2. P0 Node Planning Context and Meeting Room auto-preparation.
 3. P0 Expected Path v2 route graph. **Implemented**
 4. P0 combined path selection and Goal Start receipt. **Implemented**
-5. P0 Project Master execution driver over existing guarded transitions.
+5. P0 Project Master execution driver over existing guarded transitions. **Implemented**
 6. P1 prediction-versus-outcome calibration and Fleet/Activity projection.
 7. P1 Fresh Project Wizard convergence on the same proposal and Goal contracts.
 

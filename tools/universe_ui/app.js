@@ -6832,7 +6832,8 @@ async function startExpectedPathGoal(expectedPathId) {
   await refreshActiveRoomFeatures({ render: false });
   await refreshFeatureSemanticGraph(room.project_id);
   renderActiveMultiRoom();
-  toast(`Goal started · ${result.goal.title}`);
+  const automationState = result.automation?.surface?.automation_state || "GOAL_STARTED";
+  toast(`Goal started · ${result.goal.title} · ${automationState}`);
 }
 
 async function materializeFeatureGoal() {
