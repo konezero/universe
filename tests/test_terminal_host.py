@@ -111,6 +111,9 @@ class FakeReconnectionRegistry:
     def discover(self, anchor_ref: str):
         return self.clients[anchor_ref]
 
+    def list_live_clients(self):
+        return list(self.clients.values())
+
 
 class TerminalHostTests(unittest.TestCase):
     def test_rust_host_creation_and_audit_reconstruction_share_one_terminal(self) -> None:
@@ -170,6 +173,50 @@ class TerminalHostTests(unittest.TestCase):
             self.assertEqual(created["pid"], recovered.live_pid())
             self.assertEqual("host-test", recovered.reconnection_host_id)
             self.assertEqual(2, client.generation)
+            second.close(created["terminal_id"])
+
+    def test_reconcile_uses_complete_creation_history_for_live_registry_hosts(self) -> None:
+        registry = FakeReconnectionRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", return_value=["/c", "echo", "OLD"]
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            audit_path = Path(tmp) / "audit.sqlite3"
+            first = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            created = first.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-old-live-host",
+                provider="CODEX",
+                supervisor_session_id="provider-session-old",
+            )
+            first_session = first.get(created["terminal_id"])
+            first_session.pump_stop.set()
+            if first_session.pump_thread is not None:
+                first_session.pump_thread.join(timeout=1)
+                first_session.pump_thread = None
+            for index in range(1005):
+                first.record_audit_event(
+                    "NOISE",
+                    terminal={"terminal_id": f"noise-{index}"},
+                    context={"source": "TEST", "access_surface": "TEST"},
+                )
+
+            second = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            reconciled = second.reconcile_reconnection_hosts()
+            self.assertEqual("TERMINAL_REATTACHED", reconciled[0]["status"])
+            self.assertEqual(created["terminal_id"], reconciled[0]["terminal_id"])
             second.close(created["terminal_id"])
 
     def test_create_list_and_close_without_vendor_jsonl(self) -> None:

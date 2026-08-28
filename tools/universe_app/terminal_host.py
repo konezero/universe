@@ -617,6 +617,27 @@ class TerminalAuditStore:
             result.append(item)
         return result
 
+    def list_created_events(self) -> list[dict[str, Any]]:
+        """Return complete creation metadata; liveness is verified by the Host registry."""
+
+        if self._path is None:
+            return []
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM terminal_audit_event
+                WHERE event_type = 'TERMINAL_CREATED'
+                ORDER BY event_id DESC
+                """
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["schema"] = TERMINAL_AUDIT_SCHEMA
+            item["details"] = json.loads(item.pop("details_json") or "{}")
+            result.append(item)
+        return result
+
 
 class TerminalHost:
     """In-process registry of ConPTY-backed CLI tabs."""
@@ -805,19 +826,23 @@ class TerminalHost:
             return []
         with self._lock:
             active_terminal_ids = set(self._sessions)
-        events = self.audit.list(limit=1000)
         latest: dict[str, str] = {}
-        created: dict[str, Mapping[str, Any]] = {}
-        for event in events:
+        for event in self.audit.list(limit=1000):
             terminal_id = str(event.get("terminal_id") or "").strip()
-            if not terminal_id:
-                continue
-            latest.setdefault(terminal_id, str(event.get("event_type") or ""))
-            if (
-                terminal_id not in created
-                and str(event.get("event_type") or "") == "TERMINAL_CREATED"
-            ):
-                created[terminal_id] = event
+            if terminal_id:
+                latest.setdefault(terminal_id, str(event.get("event_type") or ""))
+        created = {
+            str(event.get("terminal_id") or "").strip(): event
+            for event in self.audit.list_created_events()
+            if str(event.get("terminal_id") or "").strip()
+        }
+        list_live_clients = getattr(registry, "list_live_clients", None)
+        live_clients = (
+            {client.state.anchor_ref: client for client in list_live_clients()}
+            if callable(list_live_clients)
+            else None
+        )
+        unmatched_live_anchors = set(live_clients or {})
         terminal_states = {"TERMINAL_CLOSED", "TERMINAL_ORPHAN_RECLAIMED"}
         results: list[dict[str, Any]] = []
         for terminal_id, event in created.items():
@@ -836,7 +861,13 @@ class TerminalHost:
                 )
                 continue
             try:
-                client = registry.discover(anchor_ref)
+                if live_clients is None:
+                    client = registry.discover(anchor_ref)
+                else:
+                    client = live_clients.get(anchor_ref)
+                    if client is None:
+                        continue
+                    unmatched_live_anchors.discard(anchor_ref)
                 status = client.status()
                 if status.get("runtime_state") != "LIVE":
                     raise ReconnectionHostError("Host terminal is not live")
@@ -974,6 +1005,16 @@ class TerminalHost:
                     "status": "TERMINAL_REATTACHED",
                     "host_id": session.reconnection_host_id,
                     "pid": session.live_pid(),
+                }
+            )
+        for anchor_ref in sorted(unmatched_live_anchors):
+            client = live_clients[anchor_ref] if live_clients is not None else None
+            results.append(
+                {
+                    "terminal_id": None,
+                    "status": "HOST_METADATA_INCOMPLETE",
+                    "host_id": client.state.host_id if client is not None else None,
+                    "session_anchor_ref": anchor_ref,
                 }
             )
         return results

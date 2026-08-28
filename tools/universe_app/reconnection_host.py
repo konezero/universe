@@ -371,6 +371,26 @@ class ReconnectionHostRegistry:
                 )
         return client
 
+    def list_live_clients(self) -> list[ReconnectionHostClient]:
+        """Return every registry Host that passes authenticated LIVE handshake."""
+
+        self.prepare()
+        clients: list[ReconnectionHostClient] = []
+        for path in sorted(self.root.glob("anchor-*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                state = self._read_state_path(path)
+                if self.state_path(state.anchor_ref) != path:
+                    continue
+                client = self.discover(state.anchor_ref)
+                if client.status().get("runtime_state") != "LIVE":
+                    continue
+            except ReconnectionHostError:
+                continue
+            clients.append(client)
+        return clients
+
     def launch(
         self,
         anchor_ref: str,

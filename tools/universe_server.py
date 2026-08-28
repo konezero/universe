@@ -1191,6 +1191,8 @@ def _public_pty_binding(binding: Mapping[str, Any] | None) -> dict[str, Any]:
         "pty_state": str(binding.get("pty_state") or "") or None,
         "pid": binding.get("pid"),
         "provider": str(binding.get("provider") or "") or None,
+        "backend_owner": str(binding.get("backend_owner") or "") or None,
+        "reconnection_host_id": str(binding.get("reconnection_host_id") or "") or None,
     }
 
 
@@ -28442,6 +28444,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "pty_state": terminal.get("state"),
             "pid": terminal.get("pid"),
             "provider": terminal.get("provider"),
+            "backend_owner": terminal.get("backend_owner"),
+            "reconnection_host_id": terminal.get("reconnection_host_id"),
         }
 
     def _pty_anchor_session(

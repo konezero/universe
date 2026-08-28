@@ -10,12 +10,14 @@ CSS = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8"
 
 
 class ProviderSessionUiContractTests(unittest.TestCase):
-    def test_goal_scheduler_uses_current_conductor_receipt_route(self) -> None:
-        start = APP.index("function currentConductorMutationSession()")
+    def test_goal_scheduler_uses_live_rust_host_receipt_route(self) -> None:
+        start = APP.index("function liveConductorHostSession()")
         end = APP.index("function renderMeetingFeaturePanel", start)
         scheduler = APP[start:end]
         self.assertIn('session.mode || "").toUpperCase() === "CONDUCTOR"', scheduler)
-        self.assertIn("nodeModeSessionIsCurrent(session)", scheduler)
+        self.assertIn('binding.backend_owner || "").toUpperCase() === "RUST_RECONNECTION_HOST"', scheduler)
+        self.assertIn("binding.reconnection_host_id", scheduler)
+        self.assertNotIn("nodeModeSessionIsCurrent(session)", scheduler)
         self.assertIn("/v1/goal-automation-scheduler-mutation-receipts", scheduler)
         self.assertIn("prepared.receipt.receipt_id", scheduler)
         self.assertIn("session_anchor_ref: session.session_anchor_ref", scheduler)

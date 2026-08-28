@@ -6940,26 +6940,32 @@ async function advanceGoalAutomation() {
   toast(`Conductor · ${surface.automation_state || result.status} · next ${surface.next_operation || "WAIT"}`);
 }
 
-function currentConductorMutationSession() {
-  const candidates = (state.supervisorSessions || []).filter(
-    (session) =>
+function liveConductorHostSession() {
+  const candidates = (state.supervisorSessions || []).filter((session) => {
+    const binding = session.pty_binding || {};
+    return (
       String(session.mode || "").toUpperCase() === "CONDUCTOR" &&
-      nodeModeSessionIsCurrent(session) &&
+      String(session.state || "").toUpperCase() === "LIVE" &&
+      String(binding.pty_state || "").toUpperCase() === "LIVE" &&
+      String(binding.backend_owner || "").toUpperCase() === "RUST_RECONNECTION_HOST" &&
+      String(binding.reconnection_host_id || "").trim() &&
       String(session.provider || "").trim() &&
       String(session.provider_session_ref || "").trim() &&
       String(session.session_id || "").trim() &&
       String(session.session_anchor_ref || "").trim()
-  );
-  return candidates.length === 1 ? candidates[0] : null;
+    );
+  });
+  candidates.sort((left, right) => sessionObservatoryRank(right) - sessionObservatoryRank(left));
+  return candidates[0] || null;
 }
 
 async function setGoalAutomationScheduler(action) {
   const feature = activeMeetingFeature();
   const goal = feature?.goal_derivation?.goal;
   if (!goal) throw new Error("Create a Goal first");
-  const session = currentConductorMutationSession();
+  const session = liveConductorHostSession();
   if (!session) {
-    throw new Error("Exactly one current Conductor session is required");
+    throw new Error("A live Conductor Rust Host bridge is required");
   }
   const normalized = String(action || "").toUpperCase();
   const prompt = normalized === "START"
@@ -7189,10 +7195,10 @@ function renderMeetingFeaturePanel(room) {
             scheduler?.enabled ? "Pause Scheduler" : "Start Scheduler"
           );
           schedulerAction.type = "button";
-          schedulerAction.disabled = !currentConductorMutationSession();
+          schedulerAction.disabled = !liveConductorHostSession();
           schedulerAction.title = schedulerAction.disabled
-            ? "Exactly one current Conductor session is required"
-            : "Uses a one-time current Session Anchor mutation receipt";
+            ? "A live Conductor Rust Host bridge is required"
+            : "Uses the selected live Host bridge for the bounded mutation";
           schedulerAction.addEventListener("click", () => {
             setGoalAutomationScheduler(scheduler?.enabled ? "PAUSE" : "START")
               .catch((error) => toast(error.message, true));
@@ -12090,13 +12096,13 @@ function todoAutomationControlProjection(todo) {
     operation === "SELECT_TODOS_FOR_EXECUTION" &&
     eligibleTodoIds.includes(todo.todo_id)
   ) {
-    const enabled = Boolean(currentConductorMutationSession());
+    const enabled = Boolean(liveConductorHostSession());
     return {
       code: operation,
       label: todoAutomationNextStepLabels[operation],
       detail: enabled
         ? "The governed Task Frame is ready to own and start this Todo."
-        : "Exactly one current Conductor session is required to perform the selection.",
+        : "A live Conductor Rust Host bridge is required to perform the selection.",
       actionable: true,
       enabled,
     };
@@ -12112,9 +12118,9 @@ function todoAutomationControlProjection(todo) {
 
 async function selectTodoForGoalExecution(todo) {
   const surface = state.goalAutomationSurfaces?.[todo.goal_id];
-  const session = currentConductorMutationSession();
+  const session = liveConductorHostSession();
   if (!surface?.goal) throw new Error("Goal automation state is unavailable");
-  if (!session) throw new Error("Exactly one current Conductor session is required");
+  if (!session) throw new Error("A live Conductor Rust Host bridge is required");
   if (!window.confirm(`Select this Todo for the bound Task Frame?\n\n${todo.title}`)) return;
   const result = await api(
     `/v1/goals/${encodeURIComponent(todo.goal_id)}/automation/todo-selection`,

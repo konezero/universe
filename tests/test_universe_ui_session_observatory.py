@@ -822,7 +822,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("GOAL_LINK_REQUIRED", APP)
         self.assertIn("WORK_PLAN_SCOPE_MISMATCH", APP)
         self.assertIn('surface.automation_state === "TASK_FRAME_READY"', APP)
-        self.assertIn("Exactly one current Conductor session is required", APP)
+        self.assertIn("A live Conductor Rust Host bridge is required", APP)
         self.assertIn("/automation/todo-selection", APP)
         self.assertIn('approval: "SELECT_TODOS"', APP)
         self.assertIn("renderTodoAutomationControl(todo)", APP)

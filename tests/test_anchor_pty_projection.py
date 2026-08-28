@@ -55,6 +55,8 @@ def _terminal(**overrides):
         "mode": "MASTER",
         "provider": "CLAUDE",
         "pid": 4242,
+        "backend_owner": "RUST_RECONNECTION_HOST",
+        "reconnection_host_id": "host-bound",
         "created_at": "2026-08-25T00:00:00Z",
         "supervisor_session_id": "session_bound",
         "active_session_anchor_ref": BOUND_ANCHOR,
@@ -109,6 +111,10 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         self.assertEqual(only["pty_binding"]["status"], "BOUND")
         self.assertEqual(only["pty_binding"]["terminal_id"], "term_bound")
         self.assertEqual(only["pty_binding"]["pid"], 4242)
+        self.assertEqual(
+            only["pty_binding"]["backend_owner"], "RUST_RECONNECTION_HOST"
+        )
+        self.assertEqual(only["pty_binding"]["reconnection_host_id"], "host-bound")
 
     def test_live_pty_without_anchor_reports_anchor_pending(self) -> None:
         server = _ProjectionServer(
