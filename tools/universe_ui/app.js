@@ -4661,6 +4661,17 @@ async function selectProject(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
   ).catch(() => ({ goals: [], unassigned_todos: [] }));
   state.goals = goalPlanResult.goals || [];
+  const automationEntries = await Promise.all(
+    state.goals.map(async (goal) => {
+      const surface = await api(
+        `/v1/goals/${encodeURIComponent(goal.goal_id)}/automation`
+      ).catch(() => null);
+      return [goal.goal_id, surface];
+    })
+  );
+  state.goalAutomationSurfaces = Object.fromEntries(
+    automationEntries.filter(([, surface]) => surface)
+  );
   state.universeGoals = universeGoalResult.goals || [];
   state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
     (todo) => todo.state !== "DONE"
@@ -6581,9 +6592,10 @@ async function refreshActiveRoomFeatures({ render = true } = {}) {
       return [goalId, surface];
     })
   );
-  state.goalAutomationSurfaces = Object.fromEntries(
-    automationEntries.filter(([, surface]) => surface)
-  );
+  state.goalAutomationSurfaces = {
+    ...state.goalAutomationSurfaces,
+    ...Object.fromEntries(automationEntries.filter(([, surface]) => surface)),
+  };
   if (
     !state.multiRoomFeatures.some(
       (feature) => feature.feature_id === state.activeMultiRoomFeatureId
@@ -7151,7 +7163,6 @@ async function openMultiRoom(roomId) {
   state.multiRoomMeetingRunBusy = false;
   state.goalWorkPlanRunId = null;
   state.goalWorkPlanRunBusy = false;
-  state.goalAutomationSurfaces = {};
   state.multiRoomLiveOutput = {};
   if (elements.createRoomArtifact) {
     elements.createRoomArtifact.textContent = "Create artifact from Message";
@@ -11008,6 +11019,19 @@ function renderDetails() {
   addTodo.addEventListener("click", () => openTodoDialog(true));
   todoHeading.append(addTodo);
   todoGroup.append(todoHeading);
+  const ownershipSummary = todoOwnershipSummary(matchingTodos);
+  if (
+    ownershipSummary.task_frame_count ||
+    ownershipSummary.unbound_in_progress_count
+  ) {
+    todoGroup.append(
+      node(
+        "p",
+        "todo-context-ownership",
+        `Work ownership / ${ownershipSummary.task_frame_count} Task Frame(s) / ${ownershipSummary.session_count} target Session Anchor(s) / ${ownershipSummary.live_pty_count} live PTY / ${ownershipSummary.unbound_in_progress_count} unbound active`
+      )
+    );
+  }
   if (!matchingTodos.length) {
     todoGroup.append(node("p", "empty-copy", "No open Todo for this context"));
   } else {
@@ -11881,6 +11905,92 @@ function todoScopeLabel(todo) {
   return `${todo.project_id} / ${todo.node_ref}`;
 }
 
+function semanticTaskFrameOwner(taskFrameId) {
+  if (!taskFrameId) return { anchor: null, session: null, terminal: null };
+  const frameNodeId = `task_frame:${taskFrameId}`;
+  const graph = state.semanticGraph || {};
+  const targetEdge = (graph.edges || []).find(
+    (edge) =>
+      edge.from === frameNodeId &&
+      edge.edge_type === "TASK_FRAME_TARGETS_SESSION_ANCHOR"
+  );
+  const anchorNode = semanticGraphNode(targetEdge?.to);
+  const anchorRef = String(anchorNode?.data?.session_anchor_ref || "");
+  const session = (state.supervisorSessions || []).find(
+    (item) => String(item.session_anchor_ref || "") === anchorRef
+  ) || null;
+  const terminal = (state.supervisorTerminals || state.terminals || []).find(
+    (item) =>
+      String(item.active_session_anchor_ref || item.session_anchor_ref || "") ===
+      anchorRef
+  ) || null;
+  return { anchor: anchorRef || null, session, terminal };
+}
+
+function todoOwnershipProjection(todo) {
+  const surface = state.goalAutomationSurfaces?.[todo.goal_id];
+  const selection = surface?.todo_execution?.selection;
+  if (!(selection?.todo_ids || []).includes(todo.todo_id)) return null;
+  const taskFrameId = String(surface?.binding?.task_frame_id || "");
+  if (!taskFrameId) return null;
+  const owner = semanticTaskFrameOwner(taskFrameId);
+  return {
+    task_frame_id: taskFrameId,
+    anchor_ref: owner.anchor,
+    session_id: owner.session?.session_id || null,
+    provider: owner.session?.provider || null,
+    mode: owner.session?.mode || null,
+    session_state: owner.session?.state || "UNKNOWN",
+    terminal_id: owner.terminal?.terminal_id || null,
+    pty_state: owner.terminal?.state || "DETACHED",
+  };
+}
+
+function todoOwnershipSummary(todos) {
+  const projections = todos.map(todoOwnershipProjection).filter(Boolean);
+  return {
+    projections,
+    task_frame_count: new Set(projections.map((item) => item.task_frame_id)).size,
+    session_count: new Set(
+      projections.map((item) => item.anchor_ref).filter(Boolean)
+    ).size,
+    live_pty_count: projections.filter((item) => item.pty_state === "LIVE").length,
+    unbound_in_progress_count: todos.filter(
+      (todo) => todo.state === "IN_PROGRESS" && !todoOwnershipProjection(todo)
+    ).length,
+  };
+}
+
+function renderTodoOwnership(todo) {
+  const ownership = todoOwnershipProjection(todo);
+  if (!ownership && todo.state !== "IN_PROGRESS") return null;
+  const row = node("div", "todo-ownership");
+  if (!ownership) {
+    row.dataset.bound = "false";
+    row.append(
+      node("span", "todo-ownership-chip", "No Task Frame owner"),
+      node("span", "todo-ownership-chip", "PTY unbound")
+    );
+    return row;
+  }
+  row.dataset.bound = "true";
+  row.dataset.live = ownership.pty_state === "LIVE" ? "true" : "false";
+  row.append(
+    node("span", "todo-ownership-chip", `Task Frame ${ownership.task_frame_id}`),
+    node(
+      "span",
+      "todo-ownership-chip",
+      ownership.provider
+        ? `${ownership.mode || "SESSION"} / ${ownership.provider}`
+        : ownership.anchor_ref
+          ? "Target Session Anchor"
+          : "Target owner pending"
+    ),
+    node("span", "todo-ownership-chip", `PTY ${ownership.pty_state}`)
+  );
+  return row;
+}
+
 function todoLineageLabel(todo) {
   const labels = [];
   const goal = todo.goal_id ? semanticGraphNode(`goal:${todo.goal_id}`) : null;
@@ -12400,7 +12510,10 @@ function renderTodos() {
     remove.setAttribute("aria-label", remove.title);
     remove.addEventListener("click", () => deleteTodo(todo));
     controls.append(priority, todoState, save, remove);
-    item.append(header, title, detail, controls);
+    const ownership = renderTodoOwnership(todo);
+    item.append(header);
+    if (ownership) item.append(ownership);
+    item.append(title, detail, controls);
     elements.todoList.append(item);
   }
 }

@@ -803,6 +803,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("Project activity ledger · filtered by semantic lineage", APP)
         self.assertIn("renderSemanticNodeActivity(state.selectedNode)", APP)
         self.assertIn(".activity-context", CSS)
+        self.assertIn("...state.goalAutomationSurfaces", APP)
+        self.assertIn("function todoOwnershipProjection", APP)
+        self.assertIn("TASK_FRAME_TARGETS_SESSION_ANCHOR", APP)
+        self.assertIn("renderTodoOwnership(todo)", APP)
+        self.assertIn('row.dataset.bound = "false"', APP)
+        self.assertIn("unbound_in_progress_count", APP)
+        self.assertIn("Work ownership / ${ownershipSummary.task_frame_count}", APP)
+        self.assertIn(".todo-ownership", CSS)
 
     def test_project_graph_labels_functional_nodes_with_seed_provenance(self) -> None:
         self.assertIn("Project Seed node", HTML)
