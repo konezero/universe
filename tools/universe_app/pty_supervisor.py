@@ -110,6 +110,17 @@ def supervisor_script() -> Path:
     return Path(__file__).resolve().parents[1] / "universe_pty_supervisor.py"
 
 
+def _reconnection_host_binary_available() -> bool:
+    host_root = supervisor_script().parent / "session_host" / "target"
+    return any(
+        path.is_file()
+        for path in (
+            host_root / "release" / "universe-session-host.exe",
+            host_root / "debug" / "universe-session-host.exe",
+        )
+    )
+
+
 def spawn_supervisor(*, state_path: Path | None = None) -> None:
     env = os.environ.copy()
     for _k in (
@@ -124,6 +135,11 @@ def spawn_supervisor(*, state_path: Path | None = None) -> None:
         "GROK_CONVERSATION_ID",
     ):
         env.pop(_k, None)
+    if (
+        "UNIVERSE_RECONNECTION_HOST_ENABLED" not in env
+        and _reconnection_host_binary_available()
+    ):
+        env["UNIVERSE_RECONNECTION_HOST_ENABLED"] = "1"
     if state_path is not None:
         env["UNIVERSE_PTY_SUPERVISOR_STATE"] = str(state_path)
     creationflags = 0

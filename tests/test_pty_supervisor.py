@@ -157,11 +157,18 @@ class PtySupervisorTests(unittest.TestCase):
         ), patch(
             "universe_app.pty_supervisor.supervisor_script", return_value=script
         ), patch(
+            "universe_app.pty_supervisor._reconnection_host_binary_available",
+            return_value=True,
+        ), patch(
             "universe_app.pty_supervisor.subprocess.Popen"
         ) as popen:
             spawn_supervisor()
 
         self.assertEqual(1 | 4, popen.call_args.kwargs["creationflags"])
+        self.assertEqual(
+            "1",
+            popen.call_args.kwargs["env"]["UNIVERSE_RECONNECTION_HOST_ENABLED"],
+        )
 
     def test_restart_ends_existing_supervisor_before_starting_replacement(self) -> None:
         state_path = Path(tempfile.mkdtemp(prefix="pty-restart-")) / "pty-supervisor.json"
