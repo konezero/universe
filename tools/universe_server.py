@@ -32656,6 +32656,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def list_governance_proposal_inbox(self) -> list[dict[str, Any]]:
         proposals: list[dict[str, Any]] = []
         for project in self.store.list_projects():
+            # A stale registration must not make the global UI unavailable.
+            # Project-specific governance still reports its own missing root,
+            # while the aggregate inbox keeps serving every reachable project.
+            if not Path(project["project_root"]).expanduser().is_dir():
+                continue
             proposals.extend(
                 self.list_project_governance_proposals(project["project_id"])
             )

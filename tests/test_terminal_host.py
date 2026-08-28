@@ -798,6 +798,49 @@ class TerminalHostTests(unittest.TestCase):
         self.assertNotIn("READY", restored)
         host.close(terminal_id)
 
+    def test_transient_backend_read_failure_keeps_live_terminal_attached(self) -> None:
+        class TransientPty(FakePty):
+            def __init__(self) -> None:
+                super().__init__()
+                self.read_count = 0
+
+            def read(self, timeout: float = 0.2) -> bytes:
+                self.read_count += 1
+                if self.read_count == 1:
+                    raise OSError("transient host IPC failure")
+                if self.read_count == 2:
+                    return b"DOGFOOD_RECOVERED"
+                time.sleep(min(timeout, 0.01))
+                return b""
+
+            def is_alive(self) -> bool:
+                return True
+
+        pty = TransientPty()
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
+        created = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            session_anchor_ref=TEST_ANCHOR,
+            provider="CODEX",
+        )
+        session = host.get(created["terminal_id"])
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            observed = b"".join(chunk for _cursor, chunk in session.output_chunks)
+            if b"DOGFOOD_RECOVERED" in observed:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual("LIVE", session.state)
+        self.assertIn(b"DOGFOOD_RECOVERED", observed)
+        self.assertNotIn(
+            "BACKEND_EXITED",
+            [event["event_type"] for event in host.audit_events(terminal_id=created["terminal_id"])],
+        )
+        host.close(created["terminal_id"])
+
     def test_durable_audit_distinguishes_control_close_and_backend_exit(self) -> None:
         database_path = Path(tempfile.mkdtemp(prefix="terminal-audit-")) / "audit.sqlite3"
         pty = FakePty()

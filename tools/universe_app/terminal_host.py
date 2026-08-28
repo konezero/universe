@@ -2049,6 +2049,13 @@ class TerminalHost:
             try:
                 chunk = backend.read(0.2)
             except Exception as error:
+                # A reconnectable Host may briefly reject or drop one IPC read
+                # while its listener is accepting concurrent UI and monitor
+                # requests. Treat the read as terminal only when the Host also
+                # proves that its owned process is no longer live.
+                if self._backend_is_alive(backend) is not False:
+                    time.sleep(0.05)
+                    continue
                 self._mark_backend_exit(session, str(error))
                 break
             if not chunk:

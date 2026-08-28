@@ -535,10 +535,10 @@ class ReconnectionPty:
         )
 
     def is_alive(self) -> bool:
-        try:
-            return self.client.status().get("runtime_state") == "LIVE"
-        except ReconnectionHostError:
-            return False
+        # Preserve the distinction between a proven non-LIVE Host and an IPC
+        # observation failure. TerminalHost treats an exception as UNKNOWN and
+        # retries; returning False here would incorrectly retire a live session.
+        return self.client.status().get("runtime_state") == "LIVE"
 
     isalive = is_alive
 

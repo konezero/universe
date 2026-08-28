@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -9669,6 +9670,25 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PROVIDER_SESSION_ACTION_DELETED", result["status"])
         self.assertEqual(action["action_id"], result["action"]["action_id"])
         self.assertEqual([], self.server.store.list_provider_session_actions(chat_key, limit=200))
+
+    def test_global_governance_inbox_skips_missing_project_root(self) -> None:
+        missing_root = self.temp_root / "missing-project"
+        missing_root.mkdir()
+        (missing_root / "REPOSITORY_MANIFEST.md").write_text(
+            "# missing-project\n", encoding="utf-8"
+        )
+        self.server.store.register_project(
+            {
+                "project_id": "missing-project",
+                "project_root": str(missing_root),
+            }
+        )
+        shutil.rmtree(missing_root)
+
+        proposals = self.server.list_governance_proposal_inbox()
+        self.assertNotIn(
+            "missing-project", {proposal["project_id"] for proposal in proposals}
+        )
 
     def test_governance_proposal_is_durable_visible_and_approved_by_one_api(
         self,

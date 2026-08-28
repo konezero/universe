@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_app.reconnection_host import (  # noqa: E402
     ReconnectionHostError,
     ReconnectionHostRegistry,
+    ReconnectionPty,
     STATE_SCHEMA,
     provision_private_registry_directory,
 )
@@ -48,6 +49,25 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
             encoding="utf-8",
         )
         return target
+
+    def test_pty_liveness_keeps_ipc_failure_unknown(self) -> None:
+        class FailingStatusClient:
+            def request(self, operation: str, **kwargs: object) -> dict[str, object]:
+                self.assert_operation(operation)
+                return {"host": {"child_pid": 1234}}
+
+            @staticmethod
+            def assert_operation(operation: str) -> None:
+                if operation != "attach":
+                    raise AssertionError(operation)
+
+            @staticmethod
+            def status() -> dict[str, object]:
+                raise ReconnectionHostError("transient IPC failure")
+
+        pty = ReconnectionPty(FailingStatusClient(), "supervisor-test")
+        with self.assertRaisesRegex(ReconnectionHostError, "transient IPC failure"):
+            pty.is_alive()
 
     def test_windows_acl_uses_exact_current_user_and_system_argv(self) -> None:
         with (
