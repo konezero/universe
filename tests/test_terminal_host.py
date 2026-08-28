@@ -209,6 +209,11 @@ class TerminalHostTests(unittest.TestCase):
                     terminal={"terminal_id": f"noise-{index}"},
                     context={"source": "TEST", "access_surface": "TEST"},
                 )
+            first.record_audit_event(
+                "TERMINAL_CLOSED",
+                terminal=created,
+                context={"source": "TEST", "access_surface": "TEST"},
+            )
 
             second = TerminalHost(
                 audit_database_path=audit_path,

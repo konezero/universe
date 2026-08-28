@@ -846,7 +846,9 @@ class TerminalHost:
         terminal_states = {"TERMINAL_CLOSED", "TERMINAL_ORPHAN_RECLAIMED"}
         results: list[dict[str, Any]] = []
         for terminal_id, event in created.items():
-            if terminal_id in active_terminal_ids or latest.get(terminal_id) in terminal_states:
+            if terminal_id in active_terminal_ids:
+                continue
+            if live_clients is None and latest.get(terminal_id) in terminal_states:
                 continue
             details = event.get("details")
             details = details if isinstance(details, Mapping) else {}
