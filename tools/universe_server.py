@@ -477,6 +477,7 @@ EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v2"
 EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
+FEATURE_GOAL_START_RECEIPT_SCHEMA = "universe.feature-goal-start-receipt.v1"
 GOAL_WORK_PLAN_SCHEMA = "universe.goal-work-plan.v1"
 GOAL_WORK_PLAN_ADOPTION_SCHEMA = "universe.goal-work-plan-adoption.v1"
 GOAL_WORK_PLAN_APPLICATION_SCHEMA = "universe.goal-work-plan-application.v1"
@@ -5693,6 +5694,25 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS feature_goal_derivation_goal
                 ON feature_goal_derivation(goal_id, feature_id);
+
+                CREATE TABLE IF NOT EXISTS feature_goal_start_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL UNIQUE REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE REFERENCES feature_path_adoption(adoption_id) ON DELETE CASCADE,
+                    expected_path_id TEXT NOT NULL UNIQUE REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE RESTRICT,
+                    expected_feature_revision INTEGER NOT NULL,
+                    expected_path_digest TEXT NOT NULL,
+                    approved_scope_json TEXT NOT NULL,
+                    constraints_json TEXT NOT NULL,
+                    validation_json TEXT NOT NULL,
+                    local_commit_policy TEXT NOT NULL CHECK(local_commit_policy IN ('LOCAL_COMMITS_ALLOWED', 'LOCAL_COMMITS_PROHIBITED')),
+                    push_policy TEXT NOT NULL CHECK(push_policy = 'PUSH_PROHIBITED'),
+                    rationale TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    started_by_role TEXT NOT NULL CHECK(started_by_role = 'USER'),
+                    created_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS goal_work_plan_candidate (
                     work_plan_id TEXT PRIMARY KEY,
@@ -11039,6 +11059,29 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _feature_goal_start_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_GOAL_START_RECEIPT_SCHEMA,
+            "receipt_id": str(row["receipt_id"]),
+            "feature_id": str(row["feature_id"]),
+            "adoption_id": str(row["adoption_id"]),
+            "expected_path_id": str(row["expected_path_id"]),
+            "goal_id": str(row["goal_id"]),
+            "expected_feature_revision": int(row["expected_feature_revision"]),
+            "expected_path_digest": str(row["expected_path_digest"]),
+            "approved_scope": json.loads(row["approved_scope_json"]),
+            "constraints": json.loads(row["constraints_json"]),
+            "validation": json.loads(row["validation_json"]),
+            "local_commit_policy": str(row["local_commit_policy"]),
+            "push_policy": str(row["push_policy"]),
+            "rationale": str(row["rationale"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "started_by_role": str(row["started_by_role"]),
+            "created_at": str(row["created_at"]),
+            "status": "ACTIVE",
+        }
+
+    @staticmethod
     def _goal_work_plan_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "schema": GOAL_WORK_PLAN_SCHEMA,
@@ -11645,6 +11688,9 @@ class UniverseStore:
             derivation = connection.execute(
                 "SELECT * FROM feature_goal_derivation WHERE feature_id = ?", (fid,)
             ).fetchone()
+            goal_start_receipt = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE feature_id = ?", (fid,)
+            ).fetchone()
         result = self._feature_row(row)
         result["expected_paths"] = [
             self._expected_path_row(path, route_rows.get(str(path["expected_path_id"])))
@@ -11654,6 +11700,11 @@ class UniverseStore:
         result["goal_derivation"] = (
             self._feature_goal_derivation_row(derivation)
             if derivation is not None
+            else None
+        )
+        result["goal_start_receipt"] = (
+            self._feature_goal_start_receipt_row(goal_start_receipt)
+            if goal_start_receipt is not None
             else None
         )
         if result["goal_derivation"] is not None:
@@ -11976,6 +12027,161 @@ class UniverseStore:
             self._goal_row(goal_row),
             True,
         )
+
+    def start_feature_goal(
+        self, feature_id: str, value: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_goal_start",
+            required=frozenset(
+                {
+                    "expected_path_id",
+                    "expected_feature_revision",
+                    "expected_path_digest",
+                    "approved_scope",
+                    "constraints",
+                    "validation",
+                    "local_commit_policy",
+                    "push_policy",
+                    "rationale",
+                    "started_by_role",
+                }
+            ),
+            optional=frozenset({"evidence_refs"}),
+        )
+        fid = _identifier(feature_id, "feature_id")
+        role = _identifier(request["started_by_role"], "started_by_role").upper()
+        if role != "USER":
+            raise UniverseError(
+                "GOAL_START_USER_ACTION_REQUIRED",
+                "only USER may create a Goal Start Receipt",
+                HTTPStatus.FORBIDDEN,
+            )
+        path_id = _identifier(request["expected_path_id"], "expected_path_id")
+        expected_revision = request["expected_feature_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("FEATURE_REVISION_INVALID", "expected_feature_revision must be a positive integer")
+        path_digest = _required_text(request["expected_path_digest"], "expected_path_digest").lower()
+        if re.fullmatch(r"[0-9a-f]{64}", path_digest) is None:
+            raise UniverseError("EXPECTED_PATH_DIGEST_INVALID", "expected_path_digest must be a sha256 digest")
+        scope = _exact_object_fields(
+            request["approved_scope"],
+            field="approved_scope",
+            required=frozenset({"project_id"}),
+            optional=frozenset({"node_refs", "write_roots"}),
+        )
+        approved_scope = {
+            "project_id": _identifier(scope["project_id"], "approved_scope.project_id"),
+            "node_refs": _string_array(scope.get("node_refs") or [], "approved_scope.node_refs"),
+            "write_roots": _string_array(scope.get("write_roots") or [], "approved_scope.write_roots"),
+        }
+        constraints = _string_array(request["constraints"], "constraints")
+        validation = _string_array(request["validation"], "validation")
+        if not constraints or not validation or len(constraints) > 30 or len(validation) > 30:
+            raise UniverseError("GOAL_START_BOUNDARY_INVALID", "constraints and validation require 1..30 entries")
+        local_commit_policy = _identifier(request["local_commit_policy"], "local_commit_policy").upper()
+        if local_commit_policy not in {"LOCAL_COMMITS_ALLOWED", "LOCAL_COMMITS_PROHIBITED"}:
+            raise UniverseError("GOAL_START_COMMIT_POLICY_INVALID", "local_commit_policy is invalid")
+        push_policy = _identifier(request["push_policy"], "push_policy").upper()
+        if push_policy != "PUSH_PROHIBITED":
+            raise UniverseError("GOAL_START_PUSH_POLICY_INVALID", "Goal Start must keep push prohibited")
+        rationale = _required_text(request["rationale"], "rationale")
+        evidence_refs = self._feature_refs(request.get("evidence_refs"), "evidence_refs")
+
+        feature = self.get_feature_node(fid)
+        if approved_scope["project_id"] != feature["project_id"]:
+            raise UniverseError("GOAL_START_SCOPE_MISMATCH", "approved scope must match the Feature project", HTTPStatus.CONFLICT)
+        with self._connection() as connection:
+            path = connection.execute(
+                "SELECT path.*, route.route_digest FROM feature_expected_path path "
+                "LEFT JOIN feature_expected_path_route route ON route.expected_path_id = path.expected_path_id "
+                "WHERE path.expected_path_id = ? AND path.feature_id = ?",
+                (path_id, fid),
+            ).fetchone()
+            existing = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE feature_id = ?", (fid,)
+            ).fetchone()
+        if path is None:
+            raise UniverseError("EXPECTED_PATH_NOT_FOUND", "Expected Path does not belong to this Feature", HTTPStatus.NOT_FOUND)
+        if path["route_digest"] is None:
+            raise UniverseError("EXPECTED_PATH_ROUTE_REQUIRED", "Goal Start requires a structured Expected Path route", HTTPStatus.CONFLICT)
+        if str(path["route_digest"]) != path_digest:
+            raise UniverseError("EXPECTED_PATH_DIGEST_CONFLICT", "Expected Path digest changed before Goal Start", HTTPStatus.CONFLICT)
+
+        material = (
+            path_id,
+            expected_revision,
+            path_digest,
+            approved_scope,
+            constraints,
+            validation,
+            local_commit_policy,
+            push_policy,
+            rationale,
+            evidence_refs,
+        )
+        if existing is not None:
+            current = self._feature_goal_start_receipt_row(existing)
+            actual = (
+                current["expected_path_id"],
+                current["expected_feature_revision"],
+                current["expected_path_digest"],
+                current["approved_scope"],
+                current["constraints"],
+                current["validation"],
+                current["local_commit_policy"],
+                current["push_policy"],
+                current["rationale"],
+                current["evidence_refs"],
+            )
+            if actual != material:
+                raise UniverseError("GOAL_START_RECEIPT_CONFLICT", "Goal Start replay contains different authority material", HTTPStatus.CONFLICT)
+            adoption = feature.get("adoption")
+            derivation = feature.get("goal_derivation")
+            if adoption is None or derivation is None:
+                raise UniverseError("GOAL_START_PROVENANCE_INVALID", "Goal Start Receipt lost its adoption or Goal provenance", HTTPStatus.CONFLICT)
+            return current, adoption, derivation, derivation["goal"], False
+
+        if int(feature["revision"]) != expected_revision:
+            raise UniverseError("FEATURE_REVISION_CONFLICT", "Feature Node revision changed before Goal Start", HTTPStatus.CONFLICT)
+        adoption, _ = self.adopt_feature_expected_path(
+            fid,
+            {
+                "expected_path_id": path_id,
+                "expected_feature_revision": expected_revision,
+                "rationale": rationale,
+                "adopted_by_role": "USER",
+                "evidence_refs": evidence_refs,
+            },
+        )
+        adopted_feature = self.get_feature_node(fid)
+        derivation, goal, _ = self.materialize_feature_goal(
+            fid,
+            {
+                "expected_feature_revision": adopted_feature["revision"],
+                "created_by_role": "USER",
+            },
+        )
+        receipt_id = "goal_start_" + _json_sha256(
+            {"feature_id": fid, "expected_path_id": path_id, "expected_path_digest": path_digest}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO feature_goal_start_receipt(receipt_id, feature_id, adoption_id, expected_path_id, goal_id, expected_feature_revision, expected_path_digest, approved_scope_json, constraints_json, validation_json, local_commit_policy, push_policy, rationale, evidence_refs_json, started_by_role, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USER', ?)",
+                (
+                    receipt_id, fid, adoption["adoption_id"], path_id, goal["goal_id"], expected_revision,
+                    path_digest, _canonical_json(approved_scope), _canonical_json(constraints),
+                    _canonical_json(validation), local_commit_policy, push_policy, rationale,
+                    _canonical_json(evidence_refs), now,
+                ),
+            )
+            receipt_row = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+        return self._feature_goal_start_receipt_row(receipt_row), adoption, derivation, goal, True
 
     def goal_work_plan_surface(self, goal_id: str) -> dict[str, Any]:
         goal = self.get_goal(goal_id)
@@ -37650,6 +37856,33 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "task_frame_created": False,
                         "authority_created": False,
                         "execution_assignment_created": False,
+                    },
+                )
+                return
+            feature_goal_starts = re.fullmatch(r"/v1/feature-nodes/([^/]+)/goal-start-receipts", path)
+            if feature_goal_starts is not None:
+                receipt, adoption, derivation, goal, created = self.server.store.start_feature_goal(
+                    unquote(feature_goal_starts.group(1)),
+                    {**body, "started_by_role": "USER"},
+                )
+                feature = self.server.store.get_feature_node(unquote(feature_goal_starts.group(1)))
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_GOAL_STARTED" if created else "FEATURE_GOAL_START_REPLAYED",
+                        "feature": feature,
+                        "goal_start_receipt": receipt,
+                        "adoption": adoption,
+                        "derivation": derivation,
+                        "goal": goal,
+                        "goal_created": created,
+                        "authority_created": created,
+                        "execution_assignment_created": False,
+                        "task_frame_created": False,
+                        "rag_adopted": False,
+                        "repository_pushed": False,
+                        "next_operation": "CONDUCTOR_PLAN",
                     },
                 )
                 return

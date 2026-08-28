@@ -1,6 +1,6 @@
 # Memory-to-Feature Proposal and Goal Automation
 
-Status: approved Goal direction; proposal, planning-context, and Expected Path v2 route slices implemented
+Status: approved Goal direction; proposal, planning-context, Expected Path v2, and Goal Start Receipt slices implemented
 Owner: Universe Conductor for proposal coordination; Project Master for implementation
 Scope: project-local conversation, Memory, semantic graph, Feature Node planning, and governed Goal automation
 
@@ -133,13 +133,13 @@ The receipt pins:
 
 ```text
 feature_id and feature revision
-expected_path_id and specification digest
+expected_path_id and structured route digest
 approved project and node scope
 constraints and exclusions
 local mutation boundary
 validation requirements
 local commit policy
-push policy: USER_APPROVAL_REQUIRED
+push policy: PUSH_PROHIBITED until a separate USER approval
 ```
 
 Within that boundary the Conductor may create and revise plans, allocate sessions,
@@ -202,14 +202,20 @@ assignment, Task Frame, or canonical RAG knowledge. Meeting-generated Expected P
 now pin a normalized v2 route with steps, dependencies, branches, phases, decisions,
 risks, acceptance conditions, estimates, evidence, and a route digest. Galaxy projects
 those predicted steps and route edges without embedding the full specification body.
-The combined path-selection and Goal Start receipt is the next P0 slice.
+
+The combined Goal Start endpoint is one explicit USER action. It selects the route,
+pins the Feature revision and route digest, records project/node/write scope,
+constraints, validation, local-commit policy, and an invariant push prohibition, then
+materializes one provenance-bound DESIGNING Goal. Replays require byte-for-byte
+equivalent authority material. It does not create an execution assignment or Task
+Frame, adopt RAG, run automation, or push. Its next operation is `CONDUCTOR_PLAN`.
 
 ## Implementation sequence
 
 1. P0 Proposal Compiler and Proposed Nodes Inbox.
 2. P0 Node Planning Context and Meeting Room auto-preparation.
 3. P0 Expected Path v2 route graph. **Implemented**
-4. P0 combined path selection and Goal Start receipt.
+4. P0 combined path selection and Goal Start receipt. **Implemented**
 5. P0 Project Master execution driver over existing guarded transitions.
 6. P1 prediction-versus-outcome calibration and Fleet/Activity projection.
 7. P1 Fresh Project Wizard convergence on the same proposal and Goal contracts.

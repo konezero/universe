@@ -739,7 +739,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('id="meeting-feature-rationale"', HTML)
         self.assertIn("async function createFeatureForActiveMeeting", APP)
         self.assertIn("async function addArtifactAsExpectedPath", APP)
-        self.assertIn("async function adoptExpectedPath", APP)
+        self.assertIn("async function startExpectedPathGoal", APP)
         self.assertIn("async function materializeFeatureGoal", APP)
         self.assertIn("async function runActiveGoalWorkPlans", APP)
         self.assertIn("async function adoptGoalWorkPlan", APP)
@@ -753,13 +753,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('/meeting-runs', APP)
         self.assertIn('/feature-nodes', APP)
         self.assertIn('/expected-paths', APP)
-        self.assertIn('/adoptions', APP)
+        self.assertIn('/goal-start-receipts', APP)
         feature_slice = APP[
             APP.index("async function refreshActiveRoomFeatures") : APP.index(
                 "async function openMultiRoom"
             )
         ]
         self.assertIn("expected_feature_revision: feature.revision", feature_slice)
+        self.assertIn("expected_path_digest: path.route_digest", feature_slice)
+        self.assertIn('push_policy: "PUSH_PROHIBITED"', feature_slice)
+        self.assertIn("Adopt + Start Goal", feature_slice)
         self.assertIn("path.artifact_revision", APP)
         self.assertIn("path.route?.steps?.length", APP)
         self.assertIn('"EXPECTED_PATH_STEP"', APP)

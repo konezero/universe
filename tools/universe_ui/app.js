@@ -6797,20 +6797,33 @@ async function addArtifactAsExpectedPath(artifact) {
   toast("Expected Path candidate added");
 }
 
-async function adoptExpectedPath(expectedPathId) {
+async function startExpectedPathGoal(expectedPathId) {
   const room = state.activeMultiRoomSnapshot?.room;
   const feature = activeMeetingFeature();
   if (!room || !feature) throw new Error("Select a Feature first");
   const rationale = elements.meetingFeatureRationale?.value.trim() || "";
   if (!rationale) throw new Error("Adoption rationale is required");
-  if (!window.confirm("Adopt this Expected Path? Other candidates will be marked not selected.")) {
+  const path = (feature.expected_paths || []).find((item) => item.expected_path_id === expectedPathId);
+  if (!path?.route_digest) throw new Error("A structured Expected Path route is required");
+  if (!window.confirm("Adopt this Expected Path and create its bounded Goal Start Receipt?")) {
     return;
   }
-  await api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/adoptions`, {
+  const result = await api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/goal-start-receipts`, {
     method: "POST",
     body: {
       expected_path_id: expectedPathId,
       expected_feature_revision: feature.revision,
+      expected_path_digest: path.route_digest,
+      approved_scope: { project_id: feature.project_id, node_refs: [], write_roots: [] },
+      constraints: [
+        "Conductor execution stays within the adopted Expected Path and approved project scope",
+        "Scope expansion stops for USER approval",
+      ],
+      validation: path.route.acceptance_conditions?.length
+        ? path.route.acceptance_conditions
+        : ["Validate the selected Expected Path before Goal completion"],
+      local_commit_policy: "LOCAL_COMMITS_ALLOWED",
+      push_policy: "PUSH_PROHIBITED",
       rationale,
       evidence_refs: [`universe://chat-rooms/${room.room_id}`],
     },
@@ -6819,7 +6832,7 @@ async function adoptExpectedPath(expectedPathId) {
   await refreshActiveRoomFeatures({ render: false });
   await refreshFeatureSemanticGraph(room.project_id);
   renderActiveMultiRoom();
-  toast("Expected Path adopted");
+  toast(`Goal started · ${result.goal.title}`);
 }
 
 async function materializeFeatureGoal() {
@@ -7088,12 +7101,12 @@ function renderMeetingFeaturePanel(room) {
     }
     row.append(copy);
     if (path.state === "CANDIDATE" && feature.state !== "ADOPTED") {
-      const adopt = node("button", "primary-button compact-action", "Adopt");
+      const adopt = node("button", "primary-button compact-action", "Adopt + Start Goal");
       adopt.type = "button";
       adopt.disabled = (feature.expected_paths || []).filter((item) => item.state === "CANDIDATE").length < 2;
-      adopt.title = adopt.disabled ? "At least two candidate paths are required" : "Adopt this path as USER";
+      adopt.title = adopt.disabled ? "At least two candidate paths are required" : "Pin this path and create the USER Goal Start Receipt";
       adopt.addEventListener("click", () => {
-        adoptExpectedPath(path.expected_path_id).catch((error) => toast(error.message, true));
+        startExpectedPathGoal(path.expected_path_id).catch((error) => toast(error.message, true));
       });
       row.append(adopt);
     }
@@ -7111,6 +7124,12 @@ function renderMeetingFeaturePanel(room) {
         node("small", "", `${derivation.goal.state} · owner ${derivation.goal.owner}`),
         node("small", "", `Pinned to specification revision ${derivation.artifact_revision} · sha256 ${String(derivation.specification_digest || "").slice(0, 16)}…`)
       );
+      if (feature.goal_start_receipt) {
+        goalCopy.append(
+          node("small", "", `Goal Start · ${String(feature.goal_start_receipt.expected_path_digest || "").slice(0, 16)}… · ${feature.goal_start_receipt.local_commit_policy}`),
+          node("small", "", `Push ${feature.goal_start_receipt.push_policy === "PUSH_PROHIBITED" ? "requires separate approval" : feature.goal_start_receipt.push_policy}`)
+        );
+      }
       if (!workPlans.adoption) {
         const generate = node("button", "secondary-button compact-action", state.goalWorkPlanRunBusy ? "Generating…" : "Generate Work Plans");
         generate.type = "button";

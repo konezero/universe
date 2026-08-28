@@ -8622,6 +8622,134 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(all("plan" not in node["data"] for node in work_plan_nodes))
         self.assertTrue(all(node["data"]["plan_in_graph"] is False for node in work_plan_nodes))
 
+    def test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority(self) -> None:
+        self.server.store.register_project(self.registration())
+        room = self.server.multi_rooms.create_meeting_room(
+            {"title": "Goal start", "topic": "Choose one route", "project_id": "GCS"}
+        )["room"]
+        status, feature_payload = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-nodes",
+            {
+                "idempotency_key": "goal-start-feature-v1",
+                "title": "Bounded Goal Start",
+                "intent_text": "Choose a route and start one governed Goal.",
+                "meeting_room_id": room["room_id"],
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        feature = feature_payload["feature"]
+
+        paths = []
+        for index in (1, 2):
+            artifact = self.server.multi_rooms.create_artifact(
+                room["room_id"],
+                {
+                    "artifact_type": "SPECIFICATION",
+                    "title": f"Route {index}",
+                    "body_text": f"Implementation route {index}",
+                    "state": "CANDIDATE",
+                    "author_role": "USER",
+                },
+            )
+            route = {
+                "steps": [
+                    {
+                        "step_id": f"route-{index}-build",
+                        "title": f"Build route {index}",
+                        "summary": "Deliver the bounded slice",
+                        "phase": "Delivery",
+                    }
+                ],
+                "dependencies": [],
+                "branches": [],
+                "architecture_decisions": ["Use the shared Goal Start endpoint"],
+                "implementation_phases": [
+                    {"title": "Delivery", "step_ids": [f"route-{index}-build"]}
+                ],
+                "risks": [{"risk": "Scope drift", "mitigation": "Pin the receipt"}],
+                "acceptance_conditions": ["The receipt pins the selected route"],
+                "estimates": {"effort": "SMALL", "cost": "LOCAL", "quota": "LOW"},
+                "evidence_refs": [f"evidence://route-{index}"],
+            }
+            status, path_payload = self.request(
+                "POST",
+                f"/v1/feature-nodes/{feature['feature_id']}/expected-paths",
+                {
+                    "room_id": room["room_id"],
+                    "artifact_id": artifact["artifact_id"],
+                    "summary": f"Route {index}",
+                    "route": route,
+                },
+                self.token,
+            )
+            self.assertEqual(HTTPStatus.CREATED, status)
+            paths.append(path_payload["expected_path"])
+
+        request = {
+            "expected_path_id": paths[1]["expected_path_id"],
+            "expected_feature_revision": 3,
+            "expected_path_digest": paths[1]["route_digest"],
+            "approved_scope": {"project_id": "GCS", "node_refs": [], "write_roots": []},
+            "constraints": ["Stay inside the adopted route", "Stop on scope expansion"],
+            "validation": ["The receipt pins the selected route"],
+            "local_commit_policy": "LOCAL_COMMITS_ALLOWED",
+            "push_policy": "PUSH_PROHIBITED",
+            "rationale": "This route has the clearest bounded delivery path",
+            "evidence_refs": [f"universe://chat-rooms/{room['room_id']}"],
+        }
+        status, bad_digest = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goal-start-receipts",
+            {**request, "expected_path_digest": "0" * 64},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("EXPECTED_PATH_DIGEST_CONFLICT", bad_digest["error_code"])
+
+        status, started = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goal-start-receipts",
+            request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("FEATURE_GOAL_STARTED", started["status"])
+        self.assertEqual("ACTIVE", started["goal_start_receipt"]["status"])
+        self.assertEqual(paths[1]["route_digest"], started["goal_start_receipt"]["expected_path_digest"])
+        self.assertEqual("PUSH_PROHIBITED", started["goal_start_receipt"]["push_policy"])
+        self.assertTrue(started["goal_created"])
+        self.assertTrue(started["authority_created"])
+        self.assertFalse(started["execution_assignment_created"])
+        self.assertFalse(started["repository_pushed"])
+        self.assertEqual("CONDUCTOR_PLAN", started["next_operation"])
+        self.assertEqual("ADOPTED", started["feature"]["state"])
+        self.assertEqual("DESIGNING", started["goal"]["state"])
+
+        status, replay = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goal-start-receipts",
+            request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FEATURE_GOAL_START_REPLAYED", replay["status"])
+        self.assertFalse(replay["goal_created"])
+        self.assertFalse(replay["authority_created"])
+        self.assertEqual(started["goal"]["goal_id"], replay["goal"]["goal_id"])
+
+        status, conflict = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goal-start-receipts",
+            {**request, "rationale": "A changed decision"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("GOAL_START_RECEIPT_CONFLICT", conflict["error_code"])
+        detail = self.server.store.get_feature_node(feature["feature_id"])
+        self.assertEqual(started["goal_start_receipt"]["receipt_id"], detail["goal_start_receipt"]["receipt_id"])
+
     def test_feature_meeting_run_materializes_last_specification_per_model(self) -> None:
         self.server.store.register_project(self.registration())
         created = self.server.multi_rooms.create_meeting_room(
