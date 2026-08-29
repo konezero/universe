@@ -69,6 +69,35 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ReconnectionHostError, "transient IPC failure"):
             pty.is_alive()
 
+    def test_pty_chunks_large_writes_below_host_request_limit(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.state = type(
+                    "State", (), {"child_pid": 1234, "host_id": "host-test", "anchor_ref": "anchor-test"}
+                )()
+                self.writes: list[bytes] = []
+
+            def request(self, action: str, **fields: object) -> dict[str, object]:
+                if action == "attach":
+                    return {"host": {"child_pid": 1234}}
+                if action == "write":
+                    import base64
+
+                    self.writes.append(
+                        base64.b64decode(str(fields["input_base64"]))
+                    )
+                    return {"host": {"child_pid": 1234}}
+                raise AssertionError(action)
+
+        client = RecordingClient()
+        pty = ReconnectionPty(client, "supervisor-test")
+        payload = b"x" * 20000
+
+        pty.write(payload)
+
+        self.assertEqual(payload, b"".join(client.writes))
+        self.assertEqual([8192, 8192, 3616], [len(item) for item in client.writes])
+
     def test_windows_acl_uses_exact_current_user_and_system_argv(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temp,

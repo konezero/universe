@@ -2021,14 +2021,20 @@ class TerminalHost:
 
     def subscribe(self, terminal_id: str) -> queue.Queue:
         session = self.get(terminal_id)
-        waiter: queue.Queue = queue.Queue(maxsize=256)
+        supervised_stdio = session.launch_profile == "SUPERVISED_STDIO"
+        waiter: queue.Queue = queue.Queue(maxsize=0 if supervised_stdio else 256)
         with session.lock:
             if session.state != "LIVE":
                 waiter.put_nowait(None)
                 return waiter
-            # Initial attachment receives the current screen projection only.
-            # Immutable output chunks remain separately pageable by cursor.
-            if session.screen_snapshot:
+            if supervised_stdio:
+                # A machine JSONL consumer needs every immutable byte emitted
+                # before it attached.  A rendered screen snapshot can begin in
+                # the middle of an event and cannot preserve protocol framing.
+                for _cursor, chunk in session.output_chunks:
+                    waiter.put_nowait(bytes(chunk))
+            elif session.screen_snapshot:
+                # Interactive attachments receive the current screen projection.
                 waiter.put_nowait(bytes(session.screen_snapshot))
             session.subscribers.append(waiter)
         self._ensure_pump(session)

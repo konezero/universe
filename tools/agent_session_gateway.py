@@ -712,22 +712,57 @@ def build_platform_approval_evidence(
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_SUPERVISED_SOFT_WRAP = re.compile(r"\r?\n\x1b\[\d+;\d+H")
+_SUPERVISED_DUPLICATED_SOFT_WRAP = re.compile(
+    r"(.)\r?\n\x1b\[\d+;\d+H\1", re.DOTALL
+)
+_SUPERVISED_CURSOR_PREFIX = re.compile(r"\x1b\[\d*(?:;\d*)?")
+
+
+def _join_supervised_soft_wraps(text: str) -> str:
+    collapsed = _SUPERVISED_DUPLICATED_SOFT_WRAP.sub(r"\1", text)
+    return _SUPERVISED_SOFT_WRAP.sub("", collapsed)
 
 
 def _supervised_json_lines(waiter: queue.Queue) -> Any:
     buffer = ""
-    while True:
-        chunk = waiter.get()
+    closed = False
+    while not closed:
+        force_boundary = False
+        try:
+            chunk = (
+                waiter.get(timeout=0.25)
+                if "\n" in buffer
+                else waiter.get()
+            )
+        except queue.Empty:
+            # A resident process does not close stdout after each turn. Once no
+            # cursor-position continuation arrives within one attach poll, the
+            # trailing newline is a real JSONL boundary.
+            chunk = b""
+            force_boundary = True
         if chunk is None:
-            break
-        buffer += bytes(chunk).decode("utf-8", errors="replace")
+            closed = True
+            force_boundary = True
+        else:
+            buffer += bytes(chunk).decode("utf-8", errors="replace")
+        buffer = _join_supervised_soft_wraps(buffer)
         while "\n" in buffer:
+            line_end = buffer.find("\n")
+            suffix = buffer[line_end + 1 :]
+            if not force_boundary and (
+                not suffix or _SUPERVISED_CURSOR_PREFIX.fullmatch(suffix)
+            ):
+                # A ConPTY soft wrap may be split across subscription chunks.
+                # Wait until the following cursor-position sequence is complete
+                # before deciding whether this is a real JSONL boundary.
+                break
             line, buffer = buffer.split("\n", 1)
             cleaned = _ANSI_ESCAPE.sub("", line).strip("\r ")
             opening = cleaned.find("{")
             if opening >= 0:
                 yield cleaned[opening:]
-    cleaned = _ANSI_ESCAPE.sub("", buffer).strip("\r ")
+    cleaned = _ANSI_ESCAPE.sub("", _join_supervised_soft_wraps(buffer)).strip("\r ")
     opening = cleaned.find("{")
     if opening >= 0:
         yield cleaned[opening:]

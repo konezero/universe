@@ -617,11 +617,6 @@ class ClaudeResidentSession:
             self._turn_done.clear()
             self._turn_deltas = []
             self._turn_text = []
-            if self.permission_ready is not None and not self.permission_ready():
-                # No approval path yet: refuse rather than run unguarded.
-                self._abort_permission_path()
-                self._set_state(SESSION_FAILED)
-                raise ClaudeResidentError("CLAUDE_PERMISSION_MCP_NOT_REGISTERED")
             self._turn_error = None
             self._on_delta = on_delta
             self._turn_id = uuid4().hex
@@ -629,7 +624,15 @@ class ClaudeResidentSession:
                 # Bind approvals to this exact turn.
                 self.permission_bridge.bind_turn(self._turn_id)
             self._set_state(SESSION_BUSY)
+            # Claude's streaming-input SDK starts MCP initialization only after
+            # the first user message is written.  Strict MCP config keeps the
+            # provider turn fail-closed while the permission server registers;
+            # never accept a result until that registration is observed.
             process.send_user_message(self._compose(text))
+            if self.permission_ready is not None and not self.permission_ready():
+                self._abort_permission_path()
+                self._set_state(SESSION_FAILED)
+                raise ClaudeResidentError("CLAUDE_PERMISSION_MCP_NOT_REGISTERED")
             if not self._turn_done.wait(self.turn_timeout_seconds):
                 self._set_state(SESSION_FAILED)
                 raise ClaudeResidentError("CLAUDE_TURN_TIMEOUT")

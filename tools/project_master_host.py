@@ -324,8 +324,13 @@ class ProjectModeCoordinator:
                 mode=self.requested_mode,
                 include_hidden=True,
             )
-            if str(item.get("provider_session_ref") or "").strip()
-            == self.host_session_ref
+            if str(item.get("provider") or "").upper()
+            in SUPPORTED_PROVIDERS
+            and _same_provider_session_ref(
+                str(item.get("provider") or ""),
+                item.get("provider_session_ref"),
+                self.host_session_ref,
+            )
         ]
         if len(candidates) != 1:
             return None
@@ -3427,58 +3432,71 @@ class ProjectMasterSessionStore:
         else:
             state = "REPLACED"
         if self.session_supervisor is not None:
-            sessions = self.session_supervisor.list_sessions(
-                node=self.session_node,
-                mode=self.requested_mode,
-            )
             with self._connection() as connection:
                 owned_row = connection.execute(
                     "SELECT value FROM host_metadata WHERE key = ?",
                     ("supervisor_session_id:PROJECT_MASTER",),
                 ).fetchone()
             owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
-            selected = next(
-                (
-                    session
-                    for session in sessions
-                    if owned_id and str(session.get("session_id") or "") == owned_id
-                ),
-                None,
-            )
-            if selected is None:
+            # Host startup can advance the same Supervisor row while the
+            # provider coordinate is being observed. Re-read and retry only
+            # that optimistic bind; never switch away from the owned slot.
+            for bind_attempt in range(3):
+                sessions = self.session_supervisor.list_sessions(
+                    node=self.session_node,
+                    mode=self.requested_mode,
+                )
                 selected = next(
-                    (session for session in sessions if session["is_default"]),
+                    (
+                        session
+                        for session in sessions
+                        if owned_id
+                        and str(session.get("session_id") or "") == owned_id
+                    ),
                     None,
                 )
-            if selected is not None:
+                if selected is None:
+                    selected = next(
+                        (session for session in sessions if session["is_default"]),
+                        None,
+                    )
+                if selected is None:
+                    supervisor_session_id = self._supervisor_session_id(
+                        normalized_provider, normalized_session
+                    )
+                    candidate, _ = self.session_supervisor.register_session(
+                        {
+                            "session_id": supervisor_session_id,
+                            "node": self.session_node,
+                            "mode": self.requested_mode,
+                            "provider": normalized_provider,
+                            "provider_session_ref": normalized_session,
+                            "state": "LIVE",
+                            "currentness": "UNKNOWN",
+                        }
+                    )
+                    break
                 supervisor_session_id = str(selected["session_id"])
                 if (
                     selected.get("provider") == normalized_provider
                     and selected.get("provider_session_ref") == normalized_session
                 ):
                     candidate = selected
-                else:
+                    break
+                try:
                     candidate = self.session_supervisor.bind_provider_session(
                         supervisor_session_id,
                         provider=normalized_provider,
                         provider_session_ref=normalized_session,
                         expected_version=selected["row_version"],
                     )
-            else:
-                supervisor_session_id = self._supervisor_session_id(
-                    normalized_provider, normalized_session
-                )
-                candidate, _ = self.session_supervisor.register_session(
-                    {
-                        "session_id": supervisor_session_id,
-                        "node": self.session_node,
-                        "mode": self.requested_mode,
-                        "provider": normalized_provider,
-                        "provider_session_ref": normalized_session,
-                        "state": "LIVE",
-                        "currentness": "UNKNOWN",
-                    }
-                )
+                    break
+                except SessionSupervisorError as error:
+                    if (
+                        error.code != "SESSION_VERSION_CONFLICT"
+                        or bind_attempt == 2
+                    ):
+                        raise
             supervisor_session_id = str(candidate["session_id"])
             if not owned_id and not candidate["is_default"]:
                 self.session_supervisor.set_default(
@@ -3584,38 +3602,50 @@ class ProjectMasterSessionStore:
     def observe_current_anchor(self, anchor_ref: str) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
-        sessions = self.session_supervisor.list_sessions(
-            node=self.session_node,
-            mode=self.requested_mode,
-        )
         with self._connection() as connection:
             owned_row = connection.execute(
                 "SELECT value FROM host_metadata WHERE key = ?",
                 ("supervisor_session_id:PROJECT_MASTER",),
             ).fetchone()
         owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
-        selected = next(
-            (
-                session
-                for session in sessions
-                if owned_id and str(session.get("session_id") or "") == owned_id
-            ),
-            None,
-        )
-        if selected is None:
+        for bind_attempt in range(3):
+            sessions = self.session_supervisor.list_sessions(
+                node=self.session_node,
+                mode=self.requested_mode,
+            )
             selected = next(
-                (session for session in sessions if session["is_default"]),
+                (
+                    session
+                    for session in sessions
+                    if owned_id
+                    and str(session.get("session_id") or "") == owned_id
+                ),
                 None,
             )
-        if selected is None:
-            raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
-        if selected.get("anchor_ref") == anchor_ref:
-            return selected
-        return self.session_supervisor.bind_current_anchor(
-            selected["session_id"],
-            anchor_ref=anchor_ref,
-            expected_version=selected["row_version"],
-        )
+            if selected is None:
+                selected = next(
+                    (session for session in sessions if session["is_default"]),
+                    None,
+                )
+            if selected is None:
+                raise ProjectMasterHostError(
+                    "SUPERVISOR_PROJECT_SESSION_UNAVAILABLE"
+                )
+            if selected.get("anchor_ref") == anchor_ref:
+                return selected
+            try:
+                return self.session_supervisor.bind_current_anchor(
+                    selected["session_id"],
+                    anchor_ref=anchor_ref,
+                    expected_version=selected["row_version"],
+                )
+            except SessionSupervisorError as error:
+                if (
+                    error.code != "SESSION_VERSION_CONFLICT"
+                    or bind_attempt == 2
+                ):
+                    raise
+        raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
 
     def _migrate_legacy_provider_sessions(self) -> None:
         current = self._legacy_provider_session()

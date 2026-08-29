@@ -375,6 +375,38 @@ class TerminalHostTests(unittest.TestCase):
             finally:
                 host.close(created["terminal_id"])
 
+    def test_supervised_stdio_subscription_replays_raw_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable",
+            return_value="claude.exe",
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(spawn=lambda *_a, **_k: FakePty())
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref=TEST_ANCHOR,
+                provider="CLAUDE",
+                supervisor_session_id="session-owned",
+                launch_profile="SUPERVISED_STDIO",
+                provider_arguments=["-p", "--output-format", "stream-json"],
+            )
+            waiter = None
+            try:
+                session = host.get(created["terminal_id"])
+                raw = b'{"type":"result","subtype":"success"}\r\n'
+                with session.lock:
+                    host._record_output(session, raw)
+                waiter = host.subscribe(created["terminal_id"])
+                self.assertEqual(raw, waiter.get_nowait())
+            finally:
+                if waiter is not None:
+                    host.unsubscribe(created["terminal_id"], waiter)
+                host.close(created["terminal_id"])
+
     def test_managed_shell_polling_starts_without_ui_subscription(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(
             "universe_app.terminal_host.resolve_shell_identity",

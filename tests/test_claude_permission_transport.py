@@ -441,8 +441,11 @@ class BootstrapExchangeTests(unittest.TestCase):
         with self.assertRaises(ClaudeResidentError) as caught:
             session.send_message("go", lambda _d: None)
         self.assertIn("MCP_NOT_REGISTERED", str(caught.exception))
-        # The prompt must never have been written.
-        self.assertEqual([], built[0].sent)
+        # Streaming input must trigger Claude's MCP initialization before the
+        # broker can register.  The failed registration still closes the turn
+        # and its result is never accepted.
+        self.assertEqual(["probe\n\ngo"], built[0].sent)
+        self.assertFalse(built[0].alive)
 
     def test_provider_launch_failure_cleans_permission_config_and_broker(self) -> None:
         from claude_resident_session import ClaudeResidentSession

@@ -483,6 +483,90 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
 
+    def test_provider_binding_retries_after_host_activity_advances_row(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "provider-bind-race.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "provider-bind-race-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        reserved = state.ensure_supervisor_session(
+            "CLAUDE",
+            new_session=True,
+            owner_key="PROJECT_MASTER",
+        )
+        self.assertIsNotNone(reserved)
+        original_bind = supervisor.bind_provider_session
+        bind_calls = 0
+
+        def race_once(*args, **kwargs):
+            nonlocal bind_calls
+            bind_calls += 1
+            if bind_calls == 1:
+                supervisor.observe_session_activity(
+                    str(reserved["session_id"]),
+                    event_type="HOST_STARTED",
+                    activity_state="STARTING",
+                    evidence_ref="test://host-start",
+                )
+            return original_bind(*args, **kwargs)
+
+        with patch.object(
+            supervisor,
+            "bind_provider_session",
+            side_effect=race_once,
+        ):
+            self.assertEqual(
+                "NEW",
+                state.observe_provider_session("CLAUDE", "claude-code:fresh"),
+            )
+
+        self.assertEqual(2, bind_calls)
+        current = supervisor.get_session(str(reserved["session_id"]))
+        self.assertEqual("claude-code:fresh", current["provider_session_ref"])
+
+    def test_current_anchor_binding_retries_after_host_activity_advances_row(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "anchor-bind-race.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "anchor-bind-race-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        reserved = state.ensure_supervisor_session(
+            "CLAUDE",
+            new_session=True,
+            owner_key="PROJECT_MASTER",
+        )
+        self.assertIsNotNone(reserved)
+        original_bind = supervisor.bind_current_anchor
+        bind_calls = 0
+
+        def race_once(*args, **kwargs):
+            nonlocal bind_calls
+            bind_calls += 1
+            if bind_calls == 1:
+                supervisor.observe_session_activity(
+                    str(reserved["session_id"]),
+                    event_type="HOST_READY",
+                    activity_state="READY",
+                    evidence_ref="test://host-ready",
+                )
+            return original_bind(*args, **kwargs)
+
+        with patch.object(
+            supervisor,
+            "bind_current_anchor",
+            side_effect=race_once,
+        ):
+            observed = state.observe_current_anchor("MASTER-CURRENT-FRESH")
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(2, bind_calls)
+        current = supervisor.get_session(str(reserved["session_id"]))
+        self.assertEqual("MASTER-CURRENT-FRESH", current["anchor_ref"])
+
     def test_new_session_creates_fresh_supervisor_anchor_lineage(self) -> None:
         supervisor = SessionSupervisorStore(self.root / "new-session-lineage.sqlite3")
         state = ProjectMasterSessionStore(
@@ -2471,6 +2555,52 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("COMMANDER_INPUT_OBSERVED", observation["status"])
         self.assertEqual(
             session["session_anchor_ref"], observation["snapshot"]["anchor_id"]
+        )
+
+    def test_project_mode_coordinator_matches_canonical_claude_session_ref(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        supervisor = SessionSupervisorStore(self.root / "claude-anchor.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "claude-project-state.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("CLAUDE")
+        state.observe_provider_session("CLAUDE", "fresh-claude-id")
+        supervisor.register_session(
+            {
+                "session_id": "session-unrelated-runtime",
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "RUNTIME",
+                "provider_session_ref": "runtime-host-1",
+                "state": "REGISTERED",
+                "currentness": "STALE",
+            }
+        )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "universe",
+            "claude-code:fresh-claude-id",
+            session_supervisor=supervisor,
+        )
+
+        preparation = coordinator.prepare()
+
+        self.assertEqual("SESSION_PREPARED", preparation["status"])
+        self.assertEqual(
+            next(
+                item["session_anchor_ref"]
+                for item in supervisor.list_sessions(
+                    node="universe", mode="MASTER"
+                )
+                if item["provider_session_ref"] == "fresh-claude-id"
+            ),
+            preparation["session_anchor_ref"],
         )
 
     def test_project_mode_coordinator_anchor_prepare_does_not_resolve_mode_role(self) -> None:

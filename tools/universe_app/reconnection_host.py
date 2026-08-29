@@ -27,6 +27,9 @@ STATE_SCHEMA = "universe.reconnection-host-state.v1"
 RESPONSE_SCHEMA = "universe.reconnection-host-response.v1"
 MAX_STATE_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+# The Rust Host accepts a 16 KiB JSON request. Base64 plus envelope metadata
+# leaves less than 12 KiB for raw PTY input, so stream larger writes safely.
+HOST_WRITE_CHUNK_BYTES = 8 * 1024
 DEFAULT_STALE_AFTER_SECONDS = 24 * 60 * 60
 SESSION_MARKER_ENVIRONMENT = (
     "CLAUDE_CODE_CHILD_SESSION",
@@ -517,11 +520,19 @@ class ReconnectionPty:
     def write(self, data: bytes) -> None:
         if self._closed:
             raise ReconnectionHostError("PTY adapter is closed")
-        self.client.request(
-            "write",
-            supervisor_id=self.supervisor_id,
-            input_base64=base64.b64encode(data).decode("ascii"),
+        raw = bytes(data)
+        chunks = (
+            [raw[offset : offset + HOST_WRITE_CHUNK_BYTES]
+             for offset in range(0, len(raw), HOST_WRITE_CHUNK_BYTES)]
+            if raw
+            else [b""]
         )
+        for chunk in chunks:
+            self.client.request(
+                "write",
+                supervisor_id=self.supervisor_id,
+                input_base64=base64.b64encode(chunk).decode("ascii"),
+            )
 
     def read(self, timeout: float = 0.0) -> bytes:
         if self._closed:

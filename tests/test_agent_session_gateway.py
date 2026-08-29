@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from agent_session_gateway import (  # noqa: E402
     GrokAcpSession,
     GitTrace2Observer,
     GitTrace2RepositoryObserver,
+    _supervised_json_lines,
     build_platform_approval_evidence,
     cli_auto_approve_status,
     normalize_permission_request,
@@ -151,6 +153,28 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_supervised_json_lines_rejoins_conpty_soft_wraps(self) -> None:
+        waiter: queue.Queue = queue.Queue()
+        waiter.put(b'\x1b]0;claude\x07{"type":"result","result":"CLAUDE_\r\n')
+        waiter.put(b'\x1b[39;')
+        waiter.put(b'240H_MCP_OK"}\r\n{"type":"system","subtype":"done"}\r\n')
+        waiter.put(None)
+
+        self.assertEqual(
+            [
+                '{"type":"result","result":"CLAUDE_MCP_OK"}',
+                '{"type":"system","subtype":"done"}',
+            ],
+            list(_supervised_json_lines(waiter)),
+        )
+
+        resident_waiter: queue.Queue = queue.Queue()
+        resident_waiter.put(b'{"type":"result","subtype":"success"}\r\n')
+        self.assertEqual(
+            '{"type":"result","subtype":"success"}',
+            next(_supervised_json_lines(resident_waiter)),
+        )
 
     def test_git_trace2_observer_emits_terminal_commit_and_push_once(self) -> None:
         observer = GitTrace2Observer(
